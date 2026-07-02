@@ -1,0 +1,32 @@
+name: alpaca-investing-placeholder
+
+services:
+  app-placeholder:
+    image: busybox:1.36
+    command: ["sh", "-c", "echo placeholder only; sleep 3600"]
+    profiles: ["placeholder"]
+    expose:
+      - "8000"
+    networks:
+      - internal
+
+  reverse-proxy-placeholder:
+    image: caddy:2-alpine
+    profiles: ["placeholder"]
+    ports:
+      - "127.0.0.1:8080:80"
+    networks:
+      - internal
+
+  metrics-placeholder:
+    image: busybox:1.36
+    command: ["sh", "-c", "echo metrics placeholder only; sleep 3600"]
+    profiles: ["placeholder"]
+    expose:
+      - "9090"
+    networks:
+      - internal
+
+networks:
+  internal:
+    internal: true

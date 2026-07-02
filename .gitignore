@@ -1,0 +1,34 @@
+# Local credentials and environment files
+.env
+.env.*
+!.env.example
+*.env
+*.env.*
+!*.env.example
+secrets/
+**/secrets/
+
+# Background Folder
+Alpaca\ Background\ Docs/
+
+# Local VPS access material
+.ssh/
+**/.ssh/
+.APILIVEKEY
+.APIPAPERKEY
+*.pem
+*.key
+*.p8
+*.p12
+id_ed25519
+**/id_ed25519
+id_rsa
+**/id_rsa
+
+# Runtime artifacts
+logs/
+backups/
+*.log
+
+# macOS
+.DS_Store
