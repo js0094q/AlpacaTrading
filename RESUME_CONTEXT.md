@@ -27,6 +27,13 @@
   - `npm run dashboard:build`
   - `npm run dashboard:start`
 - Dashboard API routes enforce `ALPACA_ENV=paper` and `LIVE_TRADING_ENABLED=false`; order submission additionally requires `PAPER_ORDER_EXECUTION_ENABLED=true`.
+- Vercel dashboard runtime is read-only for historical data:
+  - does not create `apps/dashboard/data`
+  - does not initialize local SQLite under `/var/task`
+  - returns `mode: "vercel-read-only"` fallback responses for historical routes
+  - still allows guarded live read-only paper account/positions if paper credentials are configured
+  - always blocks order submission on Vercel
+- VPS/local runtime remains the owner of SQLite history, scheduler, paper execution ledger, and paper submission.
 - Confirm-paper pre-submission gates:
   - `ALPACA_ENV=paper`
   - `LIVE_TRADING_ENABLED=false`

@@ -12,6 +12,13 @@ import { buildPaperReviewReport } from "../../../src/services/paperReviewService
 import { buildPaperRuntimeReport } from "../../../src/services/paperRuntimeService";
 import { runResearchDaily } from "../../../src/services/researchOrchestrator";
 import { assertPaperDashboardAccess } from "./guards";
+import {
+  VERCEL_HISTORICAL_STORAGE_WARNING,
+  VERCEL_HISTORICAL_UNAVAILABLE_MESSAGE,
+  VERCEL_READ_ONLY_MODE,
+  hasDashboardDurableStorageConfig,
+  shouldUseVercelReadOnlyFallback
+} from "./runtime";
 
 export type RiskProfileInput = "moderate" | "aggressive" | "conservative";
 
@@ -59,66 +66,116 @@ export const parsePaperActionInput = (value: unknown): PaperActionInput => {
 };
 
 export const latestResearchRuns = (limit = 5) =>
-  queryAll(
-    `
-    SELECT id, started_at, completed_at, status, risk_profile, options_enabled, candidates_selected
-    FROM research_runs
-    ORDER BY started_at DESC
-    LIMIT ?
-    `,
-    [safeLimit(limit, 5, 25)]
-  );
+  shouldUseVercelReadOnlyFallback()
+    ? []
+    : queryAll(
+        `
+        SELECT id, started_at, completed_at, status, risk_profile, options_enabled, candidates_selected
+        FROM research_runs
+        ORDER BY started_at DESC
+        LIMIT ?
+        `,
+        [safeLimit(limit, 5, 25)]
+      );
 
 export const latestPaperPlans = (limit = 10) =>
-  queryAll(
-    `
-    SELECT id, research_run_id, symbol, created_at, status, direction, expression, option_symbol, estimated_max_loss, estimated_max_profit
-    FROM paper_trade_plans
-    ORDER BY created_at DESC
-    LIMIT ?
-    `,
-    [safeLimit(limit, 10, 50)]
-  );
+  shouldUseVercelReadOnlyFallback()
+    ? []
+    : queryAll(
+        `
+        SELECT id, research_run_id, symbol, created_at, status, direction, expression, option_symbol, estimated_max_loss, estimated_max_profit
+        FROM paper_trade_plans
+        ORDER BY created_at DESC
+        LIMIT ?
+        `,
+        [safeLimit(limit, 10, 50)]
+      );
 
 export const latestOptionContracts = (limit = 10) =>
-  queryAll(
-    `
-    SELECT c.underlying_symbol, c.option_symbol, c.type, c.expiration_date, c.strike, c.tradable,
-      s.bid, s.ask, s.midpoint, s.last, s.timestamp
-    FROM option_contracts c
-    LEFT JOIN option_snapshots s ON s.option_symbol = c.option_symbol
-    ORDER BY COALESCE(s.timestamp, c.expiration_date) DESC
-    LIMIT ?
-    `,
-    [safeLimit(limit, 10, 50)]
-  );
+  shouldUseVercelReadOnlyFallback()
+    ? []
+    : queryAll(
+        `
+        SELECT c.underlying_symbol, c.option_symbol, c.type, c.expiration_date, c.strike, c.tradable,
+          s.bid, s.ask, s.midpoint, s.last, s.timestamp
+        FROM option_contracts c
+        LEFT JOIN option_snapshots s ON s.option_symbol = c.option_symbol
+        ORDER BY COALESCE(s.timestamp, c.expiration_date) DESC
+        LIMIT ?
+        `,
+        [safeLimit(limit, 10, 50)]
+      );
 
 export const latestApiRequestIds = (limit = 12) =>
-  queryAll(
-    `
-    SELECT provider, endpoint, method, status, request_id, created_at
-    FROM api_request_log
-    WHERE request_id IS NOT NULL
-    ORDER BY created_at DESC
-    LIMIT ?
-    `,
-    [safeLimit(limit, 12, 50)]
-  );
+  shouldUseVercelReadOnlyFallback()
+    ? []
+    : queryAll(
+        `
+        SELECT provider, endpoint, method, status, request_id, created_at
+        FROM api_request_log
+        WHERE request_id IS NOT NULL
+        ORDER BY created_at DESC
+        LIMIT ?
+        `,
+        [safeLimit(limit, 12, 50)]
+      );
 
 const capture = async <T>(label: string, fn: () => Promise<T> | T) => {
   try {
     return { ok: true as const, label, data: await fn() };
-  } catch {
+  } catch (error) {
     return {
       ok: false as const,
       label,
-      error: "Unavailable. Confirm paper environment, credentials, and local DB access."
+      error:
+        error instanceof Error &&
+        /Missing Alpaca paper credentials/.test(error.message)
+          ? "DASHBOARD_ALPACA_ENV_NOT_CONFIGURED"
+          : "Unavailable. Confirm paper environment, credentials, and local DB access."
     };
   }
 };
 
+const historicalUnavailable = (label: string) => ({
+  ok: false as const,
+  label,
+  error: VERCEL_HISTORICAL_UNAVAILABLE_MESSAGE
+});
+
 export const buildDashboardSnapshot = async () => {
   const state = assertPaperDashboardAccess();
+
+  if (shouldUseVercelReadOnlyFallback()) {
+    const [account, positions] = await Promise.all([
+      capture("account", () => getAlpacaAccountSnapshot()),
+      capture("positions", () => listAlpacaPositions())
+    ]);
+
+    return {
+      paperOnly: true,
+      environment: state.alpacaEnv,
+      liveTradingEnabled: state.liveTradingEnabled,
+      generatedAt: new Date().toISOString(),
+      mode: VERCEL_READ_ONLY_MODE,
+      historicalDataAvailable: false,
+      durableStorageConfigured: hasDashboardDurableStorageConfig(),
+      historicalWarning: VERCEL_HISTORICAL_UNAVAILABLE_MESSAGE,
+      durableStorageWarning: VERCEL_HISTORICAL_STORAGE_WARNING,
+      account,
+      positions,
+      runtime: historicalUnavailable("runtime"),
+      plan: historicalUnavailable("plan"),
+      review: historicalUnavailable("review"),
+      dryRun: historicalUnavailable("dryRun"),
+      latestResearch: [],
+      latestPaperPlans: [],
+      snapshots: [],
+      executions: historicalUnavailable("executions"),
+      optionContracts: [],
+      requestIds: []
+    };
+  }
+
   const [account, positions, runtime, plan, review, dryRun, executions] =
     await Promise.all([
       capture("account", () => getAlpacaAccountSnapshot()),
@@ -153,6 +210,11 @@ export const buildDashboardSnapshot = async () => {
     environment: state.alpacaEnv,
     liveTradingEnabled: state.liveTradingEnabled,
     generatedAt: new Date().toISOString(),
+    mode: "local-sqlite" as const,
+    historicalDataAvailable: true,
+    durableStorageConfigured: false,
+    historicalWarning: null,
+    durableStorageWarning: null,
     account,
     positions,
     runtime,

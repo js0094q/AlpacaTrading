@@ -14,11 +14,17 @@ const actions = [
   }
 ];
 
-export function ActionPanel() {
+export function ActionPanel({ readOnly = false }: { readOnly?: boolean }) {
   const [busy, setBusy] = useState<string | null>(null);
-  const [status, setStatus] = useState("Ready");
+  const [status, setStatus] = useState(
+    readOnly ? "Historical runtime data unavailable on Vercel." : "Ready"
+  );
 
   const runAction = async (path: string, label: string) => {
+    if (readOnly) {
+      return;
+    }
+
     setBusy(path);
     setStatus(`${label} requested...`);
     try {
@@ -52,7 +58,7 @@ export function ActionPanel() {
         {actions.map((action) => (
           <button
             className={`action-button${action.submit ? " submit" : ""}`}
-            disabled={busy !== null}
+            disabled={readOnly || busy !== null}
             key={action.path}
             onClick={() => runAction(action.path, action.label)}
             type="button"

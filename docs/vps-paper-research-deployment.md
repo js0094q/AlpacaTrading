@@ -79,7 +79,9 @@ Dashboard routes enforce `ALPACA_ENV=paper` and `LIVE_TRADING_ENABLED=false`. Su
 
 Use `PAPER_ORDER_EXECUTION_ENABLED=false` to keep the dashboard read-only while still allowing paper account, position, plan, review, dry-run, ledger, and analytics views.
 
-For Vercel, configure the project to build the dashboard app with `npm run dashboard:build` and provide paper-only environment variables:
+On the VPS, those historical views use local SQLite at `RESEARCH_DB_PATH` or `./data/research.db`. The VPS remains the owner of the scheduler, CLI runtime, research history, execution ledger, and local persistence.
+
+For Vercel, configure the project to build the dashboard app with `npm run dashboard:build` and provide paper-only guard variables:
 
 ```bash
 ALPACA_ENV=paper
@@ -88,13 +90,20 @@ ALPACA_LIVE_TRADE=false
 LIVE_TRADING_ENABLED=false
 PAPER_ORDER_EXECUTION_ENABLED=false
 PAPER_OPTIONS_EXECUTION_ENABLED=false
+```
+
+Optional live read-only paper account and position data can use the repo's paper credential names:
+
+```bash
 ALPACA_PAPER_API_KEY=...
 ALPACA_PAPER_SECRET_KEY=...
 ALPACA_PAPER_BASE_URL=https://paper-api.alpaca.markets
 ALPACA_DATA_BASE_URL=https://data.alpaca.markets
 ```
 
-Do not expose `.env`, `.env.txt`, API keys, secrets, raw process environment, live endpoint URLs, or live-trading toggles through dashboard routes. Vercel deployments also need explicit persistence planning before relying on historical SQLite-backed ledger or research data.
+Vercel dashboard deployments are read-only by default. They do not create `apps/dashboard/data`, do not initialize SQLite under `/var/task`, and do not use local app-bundle persistence for historical ledger or research data. Historical Vercel routes return empty data with a warning until a future external store such as Vercel Postgres, Neon, Supabase, or Turso is implemented.
+
+Do not expose `.env`, `.env.txt`, API keys, secrets, raw process environment, live endpoint URLs, or live-trading toggles through dashboard routes. Keep `PAPER_ORDER_EXECUTION_ENABLED=false` and `PAPER_OPTIONS_EXECUTION_ENABLED=false` on Vercel; order submission belongs on the explicitly gated VPS/local paper runtime, not the hosted dashboard.
 
 ## Run validation
 

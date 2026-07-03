@@ -35,6 +35,7 @@ export default async function DashboardPage() {
   const review = snapshot ? asResult(snapshot.review) : null;
   const dryRun = snapshot ? asResult(snapshot.dryRun) : null;
   const executions = snapshot ? asResult(snapshot.executions) : null;
+  const vercelReadOnly = snapshot?.mode === "vercel-read-only";
 
   return (
     <main className="shell">
@@ -57,8 +58,18 @@ export default async function DashboardPage() {
         </section>
       ) : null}
 
+      {snapshot?.historicalDataAvailable === false ? (
+        <section className="grid">
+          <div className="panel full">
+            <h2>Runtime History</h2>
+            <p className="warning">{snapshot.historicalWarning}</p>
+            <p className="subtle">{snapshot.durableStorageWarning}</p>
+          </div>
+        </section>
+      ) : null}
+
       <section className="grid">
-        <ActionPanel />
+        <ActionPanel readOnly={vercelReadOnly} />
 
         <div className="panel">
           <h2>Environment</h2>

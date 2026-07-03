@@ -1,4 +1,5 @@
 import { getTradingSafetyState } from "../../../src/services/tradingSafetyService";
+import { isVercelRuntime } from "./runtime";
 
 export class DashboardGuardError extends Error {
   status: number;
@@ -44,6 +45,13 @@ export const assertPaperDashboardAccess = () => {
 };
 
 export const assertPaperOrderSubmissionEnabled = () => {
+  if (isVercelRuntime()) {
+    throw new DashboardGuardError(
+      "PAPER_ORDER_EXECUTION_DISABLED_ON_VERCEL",
+      "Vercel dashboard deployments are read-only and cannot submit paper orders."
+    );
+  }
+
   if (!boolEnv("PAPER_ORDER_EXECUTION_ENABLED")) {
     throw new DashboardGuardError(
       "PAPER_ORDER_EXECUTION_DISABLED",
@@ -71,6 +79,19 @@ export const sanitizeDashboardError = (error: unknown) => {
           code: error.code,
           message: error.message
         }
+      }
+    };
+  }
+
+  if (
+    error instanceof Error &&
+    /Missing Alpaca paper credentials/.test(error.message)
+  ) {
+    return {
+      status: 200,
+      body: {
+        ok: false,
+        error: "DASHBOARD_ALPACA_ENV_NOT_CONFIGURED"
       }
     };
   }

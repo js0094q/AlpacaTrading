@@ -332,6 +332,8 @@ npm run dashboard:start
 
 The dashboard shows paper account state, buying power, equity, cash, positions, latest research candidates, latest paper plan/review/dry-run payloads, confirmed submissions, execution ledger, blocked reasons, option candidates/contracts, request IDs, stale-data warnings, outcome analytics, and a clear `PAPER ONLY` environment state.
 
+On local and VPS runtimes, historical dashboard sections read the local SQLite database at `RESEARCH_DB_PATH` or `./data/research.db`. On Vercel, the dashboard does not initialize local SQLite or create app-local data directories. Vercel historical sections render a read-only fallback warning because durable runtime history and the paper execution ledger live on the VPS/local runtime.
+
 Dashboard actions include:
 
 - Run research
@@ -340,7 +342,7 @@ Dashboard actions include:
 - Run dry-run execution
 - Submit to Alpaca Paper Account
 
-Every dashboard API route enforces `ALPACA_ENV=paper` and `LIVE_TRADING_ENABLED=false`. Order-submission routes additionally require `PAPER_ORDER_EXECUTION_ENABLED=true`, and option submissions require `PAPER_OPTIONS_EXECUTION_ENABLED=true`. Routes must not expose Alpaca keys, secrets, `.env` contents, raw process environment, live endpoint URLs, secret-bearing error messages, or live-trading toggles.
+Every dashboard API route enforces `ALPACA_ENV=paper` and `LIVE_TRADING_ENABLED=false`. Order-submission routes additionally require `PAPER_ORDER_EXECUTION_ENABLED=true`, and option submissions require `PAPER_OPTIONS_EXECUTION_ENABLED=true`. Vercel dashboard deployments remain read-only and do not allow order submission. Routes must not expose Alpaca keys, secrets, `.env` contents, raw process environment, live endpoint URLs, secret-bearing error messages, or live-trading toggles.
 
 ## Vercel Deployment
 
@@ -350,7 +352,7 @@ Build locally before deploying:
 npm run dashboard:build
 ```
 
-Deploy the repository to Vercel with the dashboard app as the project root or with a project configured to run the `dashboard:*` scripts from this repo. Required Vercel environment variables should use this repo's names:
+Deploy the repository to Vercel with the dashboard app as the project root or with a project configured to run the `dashboard:*` scripts from this repo. Required Vercel guard variables should use this repo's names:
 
 ```bash
 ALPACA_ENV=paper
@@ -359,15 +361,31 @@ ALPACA_LIVE_TRADE=false
 LIVE_TRADING_ENABLED=false
 PAPER_ORDER_EXECUTION_ENABLED=false
 PAPER_OPTIONS_EXECUTION_ENABLED=false
+```
+
+Optional read-only Alpaca account and position data uses the paper credential names from `src/config.ts`:
+
+```bash
 ALPACA_PAPER_API_KEY=...
 ALPACA_PAPER_SECRET_KEY=...
 ALPACA_PAPER_BASE_URL=https://paper-api.alpaca.markets
 ALPACA_DATA_BASE_URL=https://data.alpaca.markets
 ```
 
-Keep `PAPER_ORDER_EXECUTION_ENABLED=false` to run the dashboard read-only. Set it to `true` only when the paper order button should be able to submit eligible paper equity orders. Set `PAPER_OPTIONS_EXECUTION_ENABLED=true` only when paper option submissions should also be allowed.
+Keep `PAPER_ORDER_EXECUTION_ENABLED=false` and `PAPER_OPTIONS_EXECUTION_ENABLED=false` on Vercel. The hosted dashboard is read-only even if those variables are accidentally set to `true`; paper submission remains a local/VPS runtime concern.
 
-The dashboard uses the local SQLite database through Node APIs. For Vercel, configure a persistent database/storage path before relying on historical ledger or research data, or treat the deployment as a live Alpaca read/control surface with limited local history. Use a Node runtime compatible with the project's `node:sqlite` dependency; Node.js 24+ is the safest deployment target for the dashboard runtime.
+The Vercel serverless runtime must not rely on writable SQLite persistence under `/var/task`. Without future durable dashboard storage, historical API routes return:
+
+```json
+{
+  "ok": true,
+  "mode": "vercel-read-only",
+  "data": [],
+  "warning": "Historical runtime data is stored on the VPS. Configure durable dashboard storage to show this data on Vercel."
+}
+```
+
+Future durable Vercel history requires an external store such as Vercel Postgres, Neon, Supabase, or Turso. `DASHBOARD_DATABASE_URL` is reserved for a future durable dashboard adapter and is not used by the current SQLite-backed local/VPS runtime.
 
 ## Setup
 
@@ -519,7 +537,7 @@ Optional table options:
 
 ## Data persistence
 
-Persistence uses `data/research.db` by default with the following collections/tables:
+Local/VPS persistence uses `data/research.db` by default with the following collections/tables:
 
 - universe_symbols
 - market_bars
@@ -538,6 +556,8 @@ Persistence uses `data/research.db` by default with the following collections/ta
 - paper_execution_ledger
 
 Alpaca API request IDs are persisted in `api_request_log.request_id`.
+
+On Vercel, API request logging does not write to local SQLite. Historical dashboard state remains unavailable until an external durable dashboard store is added.
 
 ## API request IDs
 
@@ -597,7 +617,7 @@ The dashboard exposes paper-only API routes under `/api/paper/*`. CLI commands r
 
 ## Known limitations (phase 1)
 
-- Dashboard persistence depends on the configured SQLite database path. Serverless deployments need explicit persistence planning before relying on historical local data.
+- Dashboard persistence depends on the configured local/VPS SQLite database path. Vercel renders historical dashboard sections with a read-only fallback until an external durable store is added.
 - Options support uses Alpaca snapshot-based simulation approximations where historical option pricing is unavailable.
 - Multi-leg options are not implemented.
 - API responses and request IDs are logged, but route-level retry policy is intentionally minimal.

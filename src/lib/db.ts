@@ -1,10 +1,27 @@
 import { DatabaseSync, type DatabaseSync as DbHandle } from "node:sqlite";
 import { mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, resolve } from "node:path";
+import { isVercelRuntime } from "./runtime.js";
 
-const DB_PATH =
-  process.env.RESEARCH_DB_PATH ??
-  `${process.cwd()}/data/research.db`;
+export const LOCAL_SQLITE_UNAVAILABLE_ON_VERCEL =
+  "LOCAL_SQLITE_UNAVAILABLE_ON_VERCEL";
+
+export class LocalSqliteUnavailableError extends Error {
+  code = LOCAL_SQLITE_UNAVAILABLE_ON_VERCEL;
+
+  constructor(dbPath: string) {
+    super(
+      `Local SQLite persistence is unavailable for Vercel app bundle path: ${dbPath}`
+    );
+    this.name = "LocalSqliteUnavailableError";
+  }
+}
+
+export const getResearchDbPath = () =>
+  process.env.RESEARCH_DB_PATH ?? `${process.cwd()}/data/research.db`;
+
+const isVercelBundlePath = (dbPath: string) =>
+  resolve(dbPath).startsWith("/var/task/");
 
 const tableSchema = `
 PRAGMA foreign_keys = ON;
@@ -392,8 +409,13 @@ const initialize = (): DbHandle => {
     return database;
   }
 
-  mkdirSync(dirname(DB_PATH), { recursive: true });
-  const db = new DatabaseSync(DB_PATH);
+  const dbPath = getResearchDbPath();
+  if (isVercelRuntime() && isVercelBundlePath(dbPath)) {
+    throw new LocalSqliteUnavailableError(dbPath);
+  }
+
+  mkdirSync(dirname(dbPath), { recursive: true });
+  const db = new DatabaseSync(dbPath);
   db.exec(tableSchema);
   runMigrations(db);
   database = db;

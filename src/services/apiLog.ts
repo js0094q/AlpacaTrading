@@ -1,4 +1,5 @@
 import { getDb } from "../lib/db.js";
+import { isVercelRuntime } from "../lib/runtime.js";
 import { nowIso } from "../lib/utils.js";
 
 export interface ApiRequestLogInput {
@@ -10,6 +11,10 @@ export interface ApiRequestLogInput {
 }
 
 export const recordApiRequest = (input: ApiRequestLogInput) => {
+  if (isVercelRuntime()) {
+    return;
+  }
+
   getDb()
     .prepare(
       `
