@@ -1,8 +1,8 @@
-import { listPaperExecutionLedgerEntries } from "../../../../../../src/services/paperExecutionLedgerService";
 import { guardedHistoricalGet } from "../_lib/routeHelpers";
+import { latestPaperExecutions } from "../../../../lib/data";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export const GET = () =>
-  guardedHistoricalGet(() => listPaperExecutionLedgerEntries(100));
+  guardedHistoricalGet(() => latestPaperExecutions(100));

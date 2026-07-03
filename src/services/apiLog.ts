@@ -1,4 +1,3 @@
-import { getDb } from "../lib/db.js";
 import { isVercelRuntime } from "../lib/runtime.js";
 import { nowIso } from "../lib/utils.js";
 
@@ -10,12 +9,19 @@ export interface ApiRequestLogInput {
   requestId?: string | null;
 }
 
+const dbModule = isVercelRuntime() ? null : await import("../lib/db.js");
+
 export const recordApiRequest = (input: ApiRequestLogInput) => {
   if (isVercelRuntime()) {
     return;
   }
 
-  getDb()
+  const db = dbModule?.getDb();
+  if (!db) {
+    return;
+  }
+
+  db
     .prepare(
       `
       INSERT INTO api_request_log(

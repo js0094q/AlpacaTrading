@@ -1,16 +1,5 @@
-import { queryAll } from "../../../src/lib/db";
 import { getAlpacaAccountSnapshot } from "../../../src/services/alpacaAccountService";
 import { listAlpacaPositions } from "../../../src/services/alpacaPositionService";
-import {
-  buildPaperExecuteConfirmPaperReport,
-  buildPaperExecuteDryRunReport
-} from "../../../src/services/paperExecuteDryRunService";
-import { listPaperExecutionLedgerEntries } from "../../../src/services/paperExecutionLedgerService";
-import { buildPaperPlanReport } from "../../../src/services/paperPlanService";
-import { listPaperRecommendationSnapshots } from "../../../src/services/paperRecommendationSnapshotService";
-import { buildPaperReviewReport } from "../../../src/services/paperReviewService";
-import { buildPaperRuntimeReport } from "../../../src/services/paperRuntimeService";
-import { runResearchDaily } from "../../../src/services/researchOrchestrator";
 import { assertPaperDashboardAccess } from "./guards";
 import {
   VERCEL_HISTORICAL_STORAGE_WARNING,
@@ -54,6 +43,14 @@ const normalizeAssetClass = (value: unknown): "all" | "equity" | "option" => {
   return value === "equity" || value === "option" || value === "all" ? value : "all";
 };
 
+const queryAllRows = async <T = Record<string, unknown>>(
+  sql: string,
+  params: Array<string | number | null> = []
+): Promise<T[]> => {
+  const { queryAll } = await import("../../../src/lib/db");
+  return queryAll<T>(sql, params);
+};
+
 export const parsePaperActionInput = (value: unknown): PaperActionInput => {
   const record = value && typeof value === "object" ? value as Record<string, unknown> : {};
   return {
@@ -65,10 +62,10 @@ export const parsePaperActionInput = (value: unknown): PaperActionInput => {
   };
 };
 
-export const latestResearchRuns = (limit = 5) =>
+export const latestResearchRuns = async (limit = 5) =>
   shouldUseVercelReadOnlyFallback()
     ? []
-    : queryAll(
+    : queryAllRows(
         `
         SELECT id, started_at, completed_at, status, risk_profile, options_enabled, candidates_selected
         FROM research_runs
@@ -78,10 +75,10 @@ export const latestResearchRuns = (limit = 5) =>
         [safeLimit(limit, 5, 25)]
       );
 
-export const latestPaperPlans = (limit = 10) =>
+export const latestPaperPlans = async (limit = 10) =>
   shouldUseVercelReadOnlyFallback()
     ? []
-    : queryAll(
+    : queryAllRows(
         `
         SELECT id, research_run_id, symbol, created_at, status, direction, expression, option_symbol, estimated_max_loss, estimated_max_profit
         FROM paper_trade_plans
@@ -91,10 +88,10 @@ export const latestPaperPlans = (limit = 10) =>
         [safeLimit(limit, 10, 50)]
       );
 
-export const latestOptionContracts = (limit = 10) =>
+export const latestOptionContracts = async (limit = 10) =>
   shouldUseVercelReadOnlyFallback()
     ? []
-    : queryAll(
+    : queryAllRows(
         `
         SELECT c.underlying_symbol, c.option_symbol, c.type, c.expiration_date, c.strike, c.tradable,
           s.bid, s.ask, s.midpoint, s.last, s.timestamp
@@ -106,10 +103,10 @@ export const latestOptionContracts = (limit = 10) =>
         [safeLimit(limit, 10, 50)]
       );
 
-export const latestApiRequestIds = (limit = 12) =>
+export const latestApiRequestIds = async (limit = 12) =>
   shouldUseVercelReadOnlyFallback()
     ? []
-    : queryAll(
+    : queryAllRows(
         `
         SELECT provider, endpoint, method, status, request_id, created_at
         FROM api_request_log
@@ -141,6 +138,26 @@ const historicalUnavailable = (label: string) => ({
   label,
   error: VERCEL_HISTORICAL_UNAVAILABLE_MESSAGE
 });
+
+export const latestPaperExecutions = async (limit = 50) => {
+  if (shouldUseVercelReadOnlyFallback()) {
+    return [];
+  }
+  const { listPaperExecutionLedgerEntries } = await import(
+    "../../../src/services/paperExecutionLedgerService"
+  );
+  return listPaperExecutionLedgerEntries(limit);
+};
+
+const latestPaperRecommendationSnapshots = async (limit = 10) => {
+  if (shouldUseVercelReadOnlyFallback()) {
+    return [];
+  }
+  const { listPaperRecommendationSnapshots } = await import(
+    "../../../src/services/paperRecommendationSnapshotService"
+  );
+  return listPaperRecommendationSnapshots({ limit });
+};
 
 export const buildDashboardSnapshot = async () => {
   const state = assertPaperDashboardAccess();
@@ -180,30 +197,63 @@ export const buildDashboardSnapshot = async () => {
     await Promise.all([
       capture("account", () => getAlpacaAccountSnapshot()),
       capture("positions", () => listAlpacaPositions()),
-      capture("runtime", () => buildPaperRuntimeReport({
-        riskProfile: "aggressive",
-        optionsEnabled: true,
-        maxCandidates: 10
-      })),
-      capture("plan", () => buildPaperPlanReport({
-        riskProfile: "aggressive",
-        optionsEnabled: true,
-        maxCandidates: 10
-      })),
-      capture("review", () => buildPaperReviewReport({
-        riskProfile: "aggressive",
-        optionsEnabled: true,
-        maxCandidates: 10
-      })),
-      capture("dryRun", () => buildPaperExecuteDryRunReport({
-        dryRun: true,
-        riskProfile: "aggressive",
-        optionsEnabled: true,
-        maxCandidates: 10,
-        assetClass: "all"
-      })),
-      capture("executions", () => listPaperExecutionLedgerEntries(25))
+      capture("runtime", async () => {
+        const { buildPaperRuntimeReport } = await import(
+          "../../../src/services/paperRuntimeService"
+        );
+        return buildPaperRuntimeReport({
+          riskProfile: "aggressive",
+          optionsEnabled: true,
+          maxCandidates: 10
+        });
+      }),
+      capture("plan", async () => {
+        const { buildPaperPlanReport } = await import(
+          "../../../src/services/paperPlanService"
+        );
+        return buildPaperPlanReport({
+          riskProfile: "aggressive",
+          optionsEnabled: true,
+          maxCandidates: 10
+        });
+      }),
+      capture("review", async () => {
+        const { buildPaperReviewReport } = await import(
+          "../../../src/services/paperReviewService"
+        );
+        return buildPaperReviewReport({
+          riskProfile: "aggressive",
+          optionsEnabled: true,
+          maxCandidates: 10
+        });
+      }),
+      capture("dryRun", async () => {
+        const { buildPaperExecuteDryRunReport } = await import(
+          "../../../src/services/paperExecuteDryRunService"
+        );
+        return buildPaperExecuteDryRunReport({
+          dryRun: true,
+          riskProfile: "aggressive",
+          optionsEnabled: true,
+          maxCandidates: 10,
+          assetClass: "all"
+        });
+      }),
+      capture("executions", () => latestPaperExecutions(25))
     ]);
+  const [
+    latestResearch,
+    latestPlans,
+    snapshots,
+    optionContracts,
+    requestIds
+  ] = await Promise.all([
+    latestResearchRuns(5),
+    latestPaperPlans(10),
+    latestPaperRecommendationSnapshots(10),
+    latestOptionContracts(10),
+    latestApiRequestIds(12)
+  ]);
 
   return {
     paperOnly: true,
@@ -221,54 +271,68 @@ export const buildDashboardSnapshot = async () => {
     plan,
     review,
     dryRun,
-    latestResearch: latestResearchRuns(5),
-    latestPaperPlans: latestPaperPlans(10),
-    snapshots: listPaperRecommendationSnapshots({ limit: 10 }),
+    latestResearch,
+    latestPaperPlans: latestPlans,
+    snapshots,
     executions,
-    optionContracts: latestOptionContracts(10),
-    requestIds: latestApiRequestIds(12)
+    optionContracts,
+    requestIds
   };
 };
 
-export const runPaperResearch = (input: PaperActionInput) =>
-  runResearchDaily({
+export const runPaperResearch = async (input: PaperActionInput) => {
+  const { runResearchDaily } = await import("../../../src/services/researchOrchestrator");
+  return runResearchDaily({
     riskProfile: input.riskProfile,
     optionsEnabled: input.optionsEnabled,
     maxCandidates: input.maxCandidates,
     useAlpacaAssets: true
   });
+};
 
-export const runPaperPlan = (input: PaperActionInput) =>
-  buildPaperPlanReport({
+export const runPaperPlan = async (input: PaperActionInput) => {
+  const { buildPaperPlanReport } = await import("../../../src/services/paperPlanService");
+  return buildPaperPlanReport({
     riskProfile: input.riskProfile,
     optionsEnabled: input.optionsEnabled,
     maxCandidates: input.maxCandidates
   });
+};
 
-export const runPaperReview = (input: PaperActionInput) =>
-  buildPaperReviewReport({
+export const runPaperReview = async (input: PaperActionInput) => {
+  const { buildPaperReviewReport } = await import("../../../src/services/paperReviewService");
+  return buildPaperReviewReport({
     riskProfile: input.riskProfile,
     optionsEnabled: input.optionsEnabled,
     maxCandidates: input.maxCandidates
   });
+};
 
-export const runPaperDryRun = (input: PaperActionInput) =>
-  buildPaperExecuteDryRunReport({
+export const runPaperDryRun = async (input: PaperActionInput) => {
+  const { buildPaperExecuteDryRunReport } = await import(
+    "../../../src/services/paperExecuteDryRunService"
+  );
+  return buildPaperExecuteDryRunReport({
     dryRun: true,
     riskProfile: input.riskProfile,
     optionsEnabled: input.optionsEnabled,
     maxCandidates: input.maxCandidates,
     assetClass: input.assetClass
   });
+};
 
-export const runPaperConfirm = (input: PaperActionInput) =>
-  buildPaperExecuteConfirmPaperReport({
+export const runPaperConfirm = async (input: PaperActionInput) => {
+  const { buildPaperExecuteConfirmPaperReport } = await import(
+    "../../../src/services/paperExecuteDryRunService"
+  );
+  return buildPaperExecuteConfirmPaperReport({
     confirmPaper: true,
     riskProfile: input.riskProfile,
     optionsEnabled: input.optionsEnabled,
     maxCandidates: input.maxCandidates,
     assetClass: input.assetClass
   });
+};
 
 export const dashboardMoney = (value: unknown) => {
   const numeric = numberOrNull(value);
