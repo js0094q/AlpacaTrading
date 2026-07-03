@@ -1,0 +1,903 @@
+import { after, beforeEach, describe, test } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+process.env.RESEARCH_DB_PATH = join(
+  mkdtempSync(join(tmpdir(), "alpaca-paper-plan-test-")),
+  "research.db"
+);
+process.env.TRADING_MODE = "paper";
+process.env.ALPACA_LIVE_TRADE = "false";
+process.env.LIVE_TRADING_ENABLED = "false";
+process.env.ALPACA_ENV = "paper";
+process.env.ENABLE_AGGRESSIVE_PAPER_STRATEGIES = "true";
+process.env.ALPACA_PAPER_API_KEY = "paper-key";
+process.env.ALPACA_PAPER_SECRET_KEY = "paper-secret";
+process.env.ALPACA_PAPER_BASE_URL = "https://paper-api.alpaca.markets";
+
+import { getDb } from "../src/lib/db.js";
+import {
+  buildPaperPlanReport,
+  formatPaperPlanReportAsTable
+} from "../src/services/paperPlanService.js";
+
+const resetDatabase = () => {
+  const db = getDb();
+  db.exec(`
+    DELETE FROM paper_trade_candidates;
+    DELETE FROM paper_trade_plans;
+    DELETE FROM paper_trade_evaluations;
+    DELETE FROM option_snapshots;
+    DELETE FROM option_contracts;
+    DELETE FROM market_bars;
+    DELETE FROM research_runs;
+  `);
+};
+
+const makeMockResponse = (payload: unknown, status = 200) => ({
+  ok: status >= 200 && status < 300,
+  status,
+  headers: {
+    get: (name: string) => {
+      if (name.toLowerCase() === "x-request-id") {
+        return "mock-request-id";
+      }
+      if (name.toLowerCase() === "content-type") {
+        return "application/json";
+      }
+      return null;
+    }
+  },
+  text: async () => JSON.stringify(payload),
+  json: async () => payload
+}) as unknown as Response;
+
+interface AssetFixture {
+  class?: string;
+  tradable?: boolean;
+  status?: string;
+  fractionable?: boolean;
+}
+
+type FetcherFn = (input: string, init?: RequestInit) => Promise<Response>;
+
+const createMockFetcher = ({
+  account = { status: "ACTIVE", equity: "100000", cash: "100000", buying_power: "80000" },
+  positions = [] as Array<{ symbol: string; qty: string }>,
+  orders = [] as Array<{ symbol: string; id?: string }>,
+  assets = {
+    AAPL: { class: "us_equity", status: "active", tradable: true, fractionable: true },
+    NVDA: { class: "us_equity", status: "active", tradable: true, fractionable: true },
+    MSFT: { class: "us_equity", status: "active", tradable: true, fractionable: true },
+    TSLA: { class: "us_equity", status: "active", tradable: true, fractionable: true },
+    GOOGL: { class: "us_equity", status: "active", tradable: true, fractionable: true }
+  } as Record<string, AssetFixture>
+} = {}): FetcherFn => {
+  return async (input, init) => {
+    const method = String(init?.method || "GET").toUpperCase();
+    if (method !== "GET") {
+      throw new Error(`Unexpected non-GET request in paper plan path: ${method}`);
+    }
+
+    if (input.includes("/v2/account")) {
+      return makeMockResponse(account);
+    }
+    if (input.includes("/v2/positions")) {
+      return makeMockResponse(positions);
+    }
+    if (input.includes("/v2/orders?status=open")) {
+      return makeMockResponse(orders);
+    }
+    if (input.includes("/v2/assets/")) {
+      const symbol = decodeURIComponent(input.split("/v2/assets/").pop()?.split("?")[0] || "").toUpperCase();
+      const asset = assets[symbol];
+      if (!asset) {
+        return makeMockResponse({}, 404);
+      }
+      return makeMockResponse({
+        symbol,
+        class: asset.class || "us_equity",
+        status: asset.status || "active",
+        tradable: asset.tradable ?? true,
+        fractionable: asset.fractionable ?? true
+      });
+    }
+
+    return makeMockResponse({});
+  };
+};
+
+const setMockFetch = (fetcher: FetcherFn) => {
+  globalThis.fetch = (input, init) => fetcher(String(input), init as RequestInit | undefined);
+};
+
+const insertResearchRun = ({
+  runId,
+  riskProfile = "moderate",
+  optionsEnabled = false
+}: {
+  runId: string;
+  riskProfile?: "moderate" | "aggressive" | "conservative";
+  optionsEnabled?: boolean;
+}) => {
+  getDb().prepare(`
+    INSERT INTO research_runs(
+      id,
+      started_at,
+      completed_at,
+      status,
+      risk_profile,
+      options_enabled,
+      universe_size,
+      targets_generated,
+      candidates_selected,
+      error_message,
+      config_json,
+      summary_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    runId,
+    "2026-01-01T12:00:00.000Z",
+    "2026-01-01T12:00:00.000Z",
+    "completed",
+    riskProfile,
+    optionsEnabled ? 1 : 0,
+    5,
+    5,
+    5,
+    null,
+    JSON.stringify({ riskProfile, optionsEnabled }),
+    null
+  );
+};
+
+const insertCandidate = ({
+  runId,
+  symbol,
+  rank,
+  direction = "long",
+  preferredExpression = "shares",
+  asOf = "2026-01-01T12:00:00.000Z",
+  estimatedMaxLoss = 100,
+  estimatedMaxProfit = null,
+  riskProfile = "moderate",
+  optionSymbol = null,
+  strike = null,
+  shortStrike = null
+}: {
+  runId: string;
+  symbol: string;
+  rank: number;
+  direction?: string;
+  preferredExpression?: string;
+  asOf?: string;
+  estimatedMaxLoss?: number | null;
+  estimatedMaxProfit?: number | null;
+  riskProfile?: "moderate" | "aggressive" | "conservative";
+  optionSymbol?: string | null;
+  strike?: number | null;
+  shortStrike?: number | null;
+}) => {
+  getDb().prepare(`
+    INSERT INTO paper_trade_candidates(
+      id,
+      research_run_id,
+      symbol,
+      as_of,
+      rank,
+      direction,
+      horizon,
+      risk_profile,
+      preferred_expression,
+      score,
+      confidence,
+      expected_return,
+      estimated_max_loss,
+      estimated_max_profit,
+      rationale,
+      relevant_backtest_run_id,
+      historical_win_rate,
+      historical_avg_return,
+      historical_max_drawdown,
+      similar_setup_count,
+      option_liquidity_score,
+      volatility_score,
+      signal_freshness_days,
+      recent_learning_adjustment,
+      directional_accuracy,
+      option_outperformance_accuracy,
+      option_symbol,
+      strike,
+      short_strike
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    `cand-${runId}-${rank}`,
+    runId,
+    symbol,
+    asOf,
+    rank,
+    direction,
+    "5d",
+    riskProfile,
+    preferredExpression,
+    1.5,
+    0.8,
+    0.2,
+    estimatedMaxLoss,
+    estimatedMaxProfit,
+    "[]",
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    optionSymbol,
+    strike,
+    shortStrike
+  );
+};
+
+const futureDate = (daysFromNow: number) => {
+  const date = new Date(Date.now() + daysFromNow * 24 * 60 * 60 * 1000);
+  return date.toISOString().slice(0, 10);
+};
+
+const insertOptionContract = ({
+  optionSymbol,
+  underlying = "AAPL",
+  type = "call",
+  expirationDate = futureDate(30),
+  strike = 100,
+  tradable = 1
+}: {
+  optionSymbol: string;
+  underlying?: string;
+  type?: "call" | "put";
+  expirationDate?: string;
+  strike?: number;
+  tradable?: 0 | 1;
+}) => {
+  getDb().prepare(`
+    INSERT INTO option_contracts(
+      underlying_symbol,
+      option_symbol,
+      type,
+      expiration_date,
+      strike,
+      multiplier,
+      tradable,
+      source
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(underlying, optionSymbol, type, expirationDate, strike, 100, tradable, "alpaca");
+};
+
+const insertOptionSnapshot = ({
+  optionSymbol,
+  underlying = "AAPL",
+  bid = 0.7,
+  ask = 0.8,
+  midpoint = 0.75,
+  last = 0.75,
+  timestamp = "2026-01-01T12:00:00.000Z"
+}: {
+  optionSymbol: string;
+  underlying?: string;
+  bid?: number | null;
+  ask?: number | null;
+  midpoint?: number | null;
+  last?: number | null;
+  timestamp?: string;
+}) => {
+  getDb().prepare(`
+    INSERT INTO option_snapshots(
+      option_symbol,
+      underlying_symbol,
+      timestamp,
+      bid,
+      ask,
+      midpoint,
+      last,
+      volume,
+      open_interest,
+      implied_volatility,
+      delta,
+      gamma,
+      theta,
+      vega,
+      rho,
+      source
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    optionSymbol,
+    underlying,
+    timestamp,
+    bid,
+    ask,
+    midpoint,
+    last,
+    100,
+    100,
+    0.4,
+    0.5,
+    null,
+    null,
+    null,
+    null,
+    "alpaca"
+  );
+};
+
+const insertMarketBar = ({
+  symbol,
+  close,
+  timestamp = "2026-01-01T12:00:00.000Z"
+}: {
+  symbol: string;
+  close: number;
+  timestamp?: string;
+}) => {
+  getDb().prepare(`
+    INSERT INTO market_bars(
+      symbol,
+      timeframe,
+      timestamp,
+      open,
+      high,
+      low,
+      close,
+      volume,
+      source
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    symbol,
+    "1Day",
+    timestamp,
+    close,
+    close,
+    close,
+    close,
+    1000,
+    "alpaca"
+  );
+};
+
+beforeEach(() => {
+  resetDatabase();
+  delete process.env.PAPER_EQUITY_NOTIONAL_PER_ORDER;
+  delete process.env.PAPER_EQUITY_MAX_NOTIONAL_PER_ORDER;
+  delete process.env.PAPER_EQUITY_MAX_PORTFOLIO_DEPLOY_PCT;
+  delete process.env.PAPER_EQUITY_MAX_POSITION_PCT;
+  delete process.env.PAPER_EQUITY_MIN_CASH_RESERVE_PCT;
+  delete process.env.PAPER_PLAN_MAX_POSITION_NOTIONAL;
+  delete process.env.PAPER_PLAN_MAX_TOTAL_PLAN_NOTIONAL;
+  delete process.env.PAPER_OPTIONS_ALLOW_0DTE;
+  delete process.env.PAPER_OPTIONS_MAX_SPREAD_PCT;
+  delete process.env.PAPER_OPTIONS_MAX_CONTRACTS;
+  delete process.env.PAPER_OPTIONS_MAX_PREMIUM_PER_ORDER;
+  setMockFetch(createMockFetcher());
+});
+
+after(() => {
+  rmSync(process.env.RESEARCH_DB_PATH!.substring(0, process.env.RESEARCH_DB_PATH!.lastIndexOf("/")), {
+    recursive: true,
+    force: true
+  });
+});
+
+const planResultFor = (params: {
+  riskProfile?: "moderate" | "aggressive" | "conservative";
+  optionsEnabled?: boolean;
+  maxCandidates?: number;
+  maxNewPositions?: number;
+  maxPositionNotional?: number;
+  maxTotalPlanNotional?: number;
+  minBuyingPowerReservePct?: number;
+}) => buildPaperPlanReport({
+  riskProfile: params.riskProfile,
+  optionsEnabled: params.optionsEnabled,
+  maxCandidates: params.maxCandidates,
+  maxNewPositions: params.maxNewPositions,
+  maxPositionNotional: params.maxPositionNotional,
+  maxTotalPlanNotional: params.maxTotalPlanNotional,
+  minBuyingPowerReservePct: params.minBuyingPowerReservePct
+});
+
+describe("paper plan service", () => {
+  test("returns planned candidate when safe conditions pass", async () => {
+    insertResearchRun({ runId: "run-planned", riskProfile: "moderate", optionsEnabled: false });
+    insertCandidate({
+      runId: "run-planned",
+      symbol: "AAPL",
+      rank: 1,
+      asOf: "2026-01-01T12:00:00.000Z",
+      estimatedMaxLoss: 100
+    });
+    insertMarketBar({ symbol: "AAPL", close: 100 });
+
+    const report = await planResultFor({});
+    assert.equal(report.summary.plannedOrders, 1);
+    assert.equal(report.plan[0]?.decision, "planned");
+    assert.equal(report.plan[0]?.assetClass, "us_equity");
+    assert.equal(report.plan[0]?.estimatedQty, 10);
+    assert.equal(report.plan[0]?.estimatedNotional, 1000);
+    assert.equal(report.plan[0]?.sizingBasis?.basis, "account_relative");
+  });
+
+  test("uses PAPER_EQUITY_NOTIONAL_PER_ORDER env override", async () => {
+    process.env.PAPER_EQUITY_NOTIONAL_PER_ORDER = "2500";
+    insertResearchRun({ runId: "run-env-sizing", riskProfile: "moderate", optionsEnabled: false });
+    insertCandidate({
+      runId: "run-env-sizing",
+      symbol: "AAPL",
+      rank: 1,
+      estimatedMaxLoss: 100
+    });
+    insertMarketBar({ symbol: "AAPL", close: 100 });
+
+    const report = await planResultFor({});
+    assert.equal(report.config.equityNotionalPerOrder, 2500);
+    assert.equal(report.plan[0]?.estimatedNotional, 2500);
+    assert.equal(report.plan[0]?.estimatedQty, 25);
+  });
+
+  test("falls back to configured notional when account sizing values are unavailable", async () => {
+    insertResearchRun({ runId: "run-fallback-sizing", riskProfile: "moderate", optionsEnabled: false });
+    insertCandidate({
+      runId: "run-fallback-sizing",
+      symbol: "AAPL",
+      rank: 1,
+      estimatedMaxLoss: 100
+    });
+    insertMarketBar({ symbol: "AAPL", close: 100 });
+    setMockFetch(createMockFetcher({
+      account: { status: "ACTIVE", equity: "", cash: "", buying_power: "" }
+    }));
+
+    const report = await planResultFor({});
+    assert.equal(report.plan[0]?.decision, "planned");
+    assert.equal(report.plan[0]?.estimatedNotional, 1000);
+    assert.equal(report.plan[0]?.sizingBasis?.basis, "fallback");
+    assert.equal(report.plan[0]?.sizingBasis?.usedFallback, true);
+  });
+
+  test("marks candidates as watch when symbol already held", async () => {
+    insertResearchRun({ runId: "run-held", riskProfile: "moderate", optionsEnabled: false });
+    insertCandidate({
+      runId: "run-held",
+      symbol: "AAPL",
+      rank: 1,
+      estimatedMaxLoss: 80
+    });
+    insertMarketBar({ symbol: "AAPL", close: 100 });
+    setMockFetch(createMockFetcher({
+      positions: [{ symbol: "AAPL", qty: "2" }]
+    }));
+
+    const report = await planResultFor({});
+    const entry = report.plan[0];
+    assert.equal(entry?.decision, "watch");
+    assert.equal(entry?.reasonCodes.includes("ALREADY_HELD"), true);
+  });
+
+  test("skips candidates when open order already exists", async () => {
+    insertResearchRun({ runId: "run-open-order", riskProfile: "moderate", optionsEnabled: false });
+    insertCandidate({
+      runId: "run-open-order",
+      symbol: "AAPL",
+      rank: 1,
+      estimatedMaxLoss: 80
+    });
+    insertMarketBar({ symbol: "AAPL", close: 100 });
+    setMockFetch(createMockFetcher({
+      orders: [{ symbol: "AAPL", id: "ord-1" }]
+    }));
+
+    const report = await planResultFor({});
+    assert.equal(report.plan[0]?.decision, "skip");
+    assert.equal(report.plan[0]?.reasonCodes.includes("OPEN_ORDER_EXISTS"), true);
+  });
+
+  test("skips candidates when symbol is not tradable", async () => {
+    insertResearchRun({ runId: "run-not-tradable", riskProfile: "moderate", optionsEnabled: false });
+    insertCandidate({
+      runId: "run-not-tradable",
+      symbol: "AAPL",
+      rank: 1,
+      estimatedMaxLoss: 80
+    });
+    setMockFetch(createMockFetcher({
+      assets: {
+        AAPL: {
+          class: "us_equity",
+          status: "active",
+          tradable: false,
+          fractionable: true
+        }
+      }
+    }));
+
+    const report = await planResultFor({});
+    assert.equal(report.plan[0]?.decision, "skip");
+    assert.equal(report.plan[0]?.reasonCodes.includes("NOT_TRADABLE"), true);
+  });
+
+  test("reduces paper sizing when buying power is limited", async () => {
+    insertResearchRun({ runId: "run-buys", riskProfile: "moderate", optionsEnabled: false });
+    insertCandidate({
+      runId: "run-buys",
+      symbol: "AAPL",
+      rank: 1,
+      estimatedMaxLoss: 90
+    });
+    insertMarketBar({ symbol: "AAPL", close: 100 });
+    setMockFetch(createMockFetcher({
+      account: { status: "ACTIVE", equity: "100", cash: "100", buying_power: "10" }
+    }));
+
+    const report = await planResultFor({});
+    assert.equal(report.plan[0]?.decision, "planned");
+    assert.equal(report.plan[0]?.estimatedNotional, 8);
+    assert.equal(report.plan[0]?.sizingBasis?.basis, "account_relative");
+    assert.equal(report.plan[0]?.sizingBasis?.cashAfterOrder, 92);
+  });
+
+  test("watches candidates when estimated price is unavailable", async () => {
+    insertResearchRun({ runId: "run-no-price", riskProfile: "moderate", optionsEnabled: false });
+    insertCandidate({
+      runId: "run-no-price",
+      symbol: "AAPL",
+      rank: 1,
+      estimatedMaxLoss: 80
+    });
+
+    const report = await planResultFor({});
+    assert.equal(report.plan[0]?.decision, "watch");
+    assert.equal(report.plan[0]?.reasonCodes.includes("PRICE_UNKNOWN"), true);
+  });
+
+  test("enforces max new positions cap", async () => {
+    insertResearchRun({ runId: "run-max-new", riskProfile: "moderate", optionsEnabled: false });
+    insertCandidate({
+      runId: "run-max-new",
+      symbol: "AAPL",
+      rank: 1,
+      estimatedMaxLoss: 20
+    });
+    insertCandidate({
+      runId: "run-max-new",
+      symbol: "NVDA",
+      rank: 2,
+      estimatedMaxLoss: 20
+    });
+    insertMarketBar({ symbol: "AAPL", close: 100 });
+    insertMarketBar({ symbol: "NVDA", close: 100 });
+
+    const report = await planResultFor({ maxNewPositions: 1 });
+    assert.equal(report.summary.plannedOrders, 1);
+    assert.equal(report.summary.skipped, 1);
+    assert.equal(report.plan[1]?.decision, "skip");
+    assert.equal(report.plan[1]?.reasonCodes.includes("MAX_NEW_POSITIONS_REACHED"), true);
+  });
+
+  test("caps sizing at explicit max single-position notional", async () => {
+    insertResearchRun({ runId: "run-pos-cap", riskProfile: "moderate", optionsEnabled: false });
+    insertCandidate({
+      runId: "run-pos-cap",
+      symbol: "AAPL",
+      rank: 1,
+      estimatedMaxLoss: 200
+    });
+    insertMarketBar({ symbol: "AAPL", close: 100 });
+
+    const report = await planResultFor({ maxPositionNotional: 100 });
+    assert.equal(report.plan[0]?.decision, "planned");
+    assert.equal(report.plan[0]?.estimatedNotional, 100);
+    assert.equal(report.plan[0]?.sizingBasis?.targetNotional, 100);
+  });
+
+  test("enforces max total plan notional cap", async () => {
+    insertResearchRun({ runId: "run-total-cap", riskProfile: "moderate", optionsEnabled: false });
+    insertCandidate({
+      runId: "run-total-cap",
+      symbol: "AAPL",
+      rank: 1,
+      estimatedMaxLoss: 60
+    });
+    insertCandidate({
+      runId: "run-total-cap",
+      symbol: "NVDA",
+      rank: 2,
+      estimatedMaxLoss: 60
+    });
+    insertMarketBar({ symbol: "AAPL", close: 100 });
+    insertMarketBar({ symbol: "NVDA", close: 100 });
+
+    const report = await planResultFor({ maxTotalPlanNotional: 100, maxNewPositions: 2 });
+    assert.equal(report.plan[0]?.decision, "planned");
+    assert.equal(report.plan[1]?.decision, "skip");
+    assert.equal(report.plan[1]?.reasonCodes.includes("MAX_TOTAL_PLAN_NOTIONAL_EXCEEDED"), true);
+  });
+
+  test("respects cash reserve by reducing target notional", async () => {
+    insertResearchRun({ runId: "run-reserve", riskProfile: "moderate", optionsEnabled: false });
+    insertCandidate({
+      runId: "run-reserve",
+      symbol: "AAPL",
+      rank: 1,
+      estimatedMaxLoss: 700
+    });
+    insertMarketBar({ symbol: "AAPL", close: 100 });
+    setMockFetch(createMockFetcher({
+      account: { status: "ACTIVE", equity: "1000", cash: "600", buying_power: "600" }
+    }));
+
+    const report = await planResultFor({
+      maxPositionNotional: 1000,
+      maxTotalPlanNotional: 1000,
+      minBuyingPowerReservePct: 50
+    });
+    assert.equal(report.plan[0]?.decision, "planned");
+    assert.equal(report.plan[0]?.estimatedNotional, 100);
+    assert.equal(report.plan[0]?.sizingBasis?.cashReserveRequired, 500);
+    assert.equal((report.plan[0]?.sizingBasis?.cashAfterOrder ?? 0) >= 500, true);
+  });
+
+  test("returns empty plan when no completed research run exists", async () => {
+    const report = await planResultFor({});
+    assert.equal(report.summary.candidatesEvaluated, 0);
+    assert.equal(report.summary.plannedOrders, 0);
+    assert.equal(report.summary.skipped, 0);
+    assert.equal(report.summary.watched, 0);
+    assert.equal(report.plan.length, 0);
+    assert.equal(report.diagnostics.emptyReason, "NO_RESEARCH_SNAPSHOTS");
+    assert.equal(report.diagnostics.latestSnapshotAvailable, false);
+  });
+
+  test("diagnoses filters that do not match completed snapshots", async () => {
+    insertResearchRun({ runId: "run-filter-mismatch", riskProfile: "moderate", optionsEnabled: false });
+
+    const report = await planResultFor({ riskProfile: "aggressive", optionsEnabled: true });
+    assert.equal(report.summary.candidatesEvaluated, 0);
+    assert.equal(report.diagnostics.emptyReason, "NO_MATCHING_SNAPSHOTS_FOR_FILTERS");
+    assert.equal(report.diagnostics.latestSnapshotRunId, "run-filter-mismatch");
+    assert.equal(report.diagnostics.filtersMatchedSnapshots, false);
+  });
+
+  test("diagnoses matched research run with no runtime candidates", async () => {
+    insertResearchRun({ runId: "run-no-candidates", riskProfile: "moderate", optionsEnabled: false });
+
+    const report = await planResultFor({});
+    assert.equal(report.summary.candidatesEvaluated, 0);
+    assert.equal(report.diagnostics.emptyReason, "NO_RUNTIME_CANDIDATES");
+    assert.equal(report.diagnostics.filtersMatchedSnapshots, true);
+    assert.equal(report.diagnostics.runtimeCandidatesAvailable, false);
+  });
+
+  test("diagnoses skipped-only plans", async () => {
+    insertResearchRun({ runId: "run-skipped-only", riskProfile: "moderate", optionsEnabled: false });
+    insertCandidate({
+      runId: "run-skipped-only",
+      symbol: "AAPL",
+      rank: 1,
+      estimatedMaxLoss: 80
+    });
+    setMockFetch(createMockFetcher({
+      orders: [{ symbol: "AAPL", id: "ord-1" }]
+    }));
+
+    const report = await planResultFor({});
+    assert.equal(report.summary.candidatesEvaluated, 1);
+    assert.equal(report.summary.skipped, 1);
+    assert.equal(report.diagnostics.emptyReason, "ALL_CANDIDATES_SKIPPED");
+  });
+
+  test("marks option-expression candidates as watch when options execution is not implemented", async () => {
+    insertResearchRun({ runId: "run-options", riskProfile: "moderate", optionsEnabled: false });
+    insertCandidate({
+      runId: "run-options",
+      symbol: "AAPL",
+      rank: 1,
+      preferredExpression: "call",
+      estimatedMaxLoss: 80
+    });
+    insertMarketBar({ symbol: "AAPL", close: 100 });
+
+    const report = await planResultFor({ optionsEnabled: false });
+    assert.equal(report.plan[0]?.decision, "watch");
+    assert.equal(report.plan[0]?.reasonCodes.includes("OPTIONS_PLANNING_NOT_IMPLEMENTED"), true);
+  });
+
+  test("plans eligible long call options when options are enabled", async () => {
+    const optionSymbol = "AAPL260814C00100000";
+    insertResearchRun({ runId: "run-long-call", riskProfile: "moderate", optionsEnabled: true });
+    insertCandidate({
+      runId: "run-long-call",
+      symbol: "AAPL",
+      rank: 1,
+      preferredExpression: "long_call",
+      optionSymbol,
+      strike: 100,
+      estimatedMaxLoss: 75
+    });
+    insertOptionContract({ optionSymbol, type: "call" });
+    insertOptionSnapshot({ optionSymbol });
+
+    const report = await planResultFor({ optionsEnabled: true });
+    const entry = report.plan[0];
+    assert.equal(entry?.decision, "planned");
+    assert.equal(entry?.assetClass, "option");
+    assert.equal(entry?.strategy, "long_call");
+    assert.equal(entry?.contracts, 5);
+    assert.equal(entry?.estimatedPremium, 375);
+    assert.equal(entry?.reasonCodes.includes("SPECULATIVE_OPTION_PAPER_WARNING"), true);
+  });
+
+  test("allows 0DTE option planning by default and blocks when disabled", async () => {
+    const optionSymbol = "AAPL260703C00100000";
+    insertResearchRun({ runId: "run-0dte", riskProfile: "moderate", optionsEnabled: true });
+    insertCandidate({
+      runId: "run-0dte",
+      symbol: "AAPL",
+      rank: 1,
+      preferredExpression: "long_call",
+      optionSymbol,
+      strike: 100,
+      estimatedMaxLoss: 75
+    });
+    insertOptionContract({
+      optionSymbol,
+      type: "call",
+      expirationDate: new Date().toISOString().slice(0, 10)
+    });
+    insertOptionSnapshot({ optionSymbol });
+
+    const allowed = await planResultFor({ optionsEnabled: true });
+    assert.equal(allowed.plan[0]?.decision, "planned");
+    assert.equal(allowed.plan[0]?.reasonCodes.includes("OPTION_0DTE_ALLOWED"), true);
+
+    process.env.PAPER_OPTIONS_ALLOW_0DTE = "false";
+    const blocked = await planResultFor({ optionsEnabled: true });
+    assert.equal(blocked.plan[0]?.decision, "watch");
+    assert.equal(blocked.plan[0]?.reasonCodes.includes("OPTION_CONTRACT_NOT_TRADABLE"), true);
+  });
+
+  test("wide option spread is a warning below hard max and blocker above hard max", async () => {
+    const optionSymbol = "AAPL260814C00100000";
+    insertResearchRun({ runId: "run-wide-spread", riskProfile: "moderate", optionsEnabled: true });
+    insertCandidate({
+      runId: "run-wide-spread",
+      symbol: "AAPL",
+      rank: 1,
+      preferredExpression: "long_call",
+      optionSymbol,
+      strike: 100,
+      estimatedMaxLoss: 75
+    });
+    insertOptionContract({ optionSymbol, type: "call" });
+    insertOptionSnapshot({ optionSymbol, bid: 0.6, ask: 0.9, midpoint: 0.75 });
+
+    const warning = await planResultFor({ optionsEnabled: true });
+    assert.equal(warning.plan[0]?.decision, "planned");
+    assert.equal(warning.plan[0]?.reasonCodes.includes("OPTION_WIDE_SPREAD_WARNING"), true);
+
+    process.env.PAPER_OPTIONS_MAX_SPREAD_PCT = "20";
+    const blocked = await planResultFor({ optionsEnabled: true });
+    assert.equal(blocked.plan[0]?.decision, "watch");
+    assert.equal(blocked.plan[0]?.reasonCodes.includes("OPTION_SPREAD_TOO_WIDE"), true);
+  });
+
+  test("plan report is stable and marks dry-run non-mutating flags", async () => {
+    insertResearchRun({ runId: "run-shape", riskProfile: "moderate", optionsEnabled: false });
+    insertCandidate({
+      runId: "run-shape",
+      symbol: "AAPL",
+      rank: 1,
+      estimatedMaxLoss: 60
+    });
+    insertMarketBar({ symbol: "AAPL", close: 100 });
+
+    const report = await planResultFor({});
+    assert.equal(report.dryRun, true);
+    assert.equal(report.nonMutating, true);
+    assert.equal(report.paperOnly, true);
+    assert.equal(report.diagnostics.emptyReason, null);
+    assert.equal(typeof report.generatedAt, "string");
+    assert.equal(typeof report.summary.estimatedTotalNotional, "number");
+    assert.equal(typeof report.account.deployableBuyingPower, "number");
+  });
+
+  test("table output renders without throwing", async () => {
+    insertResearchRun({ runId: "run-table", riskProfile: "moderate", optionsEnabled: false });
+    insertCandidate({
+      runId: "run-table",
+      symbol: "AAPL",
+      rank: 1,
+      estimatedMaxLoss: 60
+    });
+    insertMarketBar({ symbol: "AAPL", close: 100 });
+
+    const report = await planResultFor({});
+    const output = formatPaperPlanReportAsTable(report);
+    assert.equal(typeof output, "string");
+    assert.equal(output.includes("Paper Plan (dry-run)"), true);
+    assert.equal(output.includes("Dry-run only. No orders were submitted."), true);
+  });
+
+  test("fails for live environment and disabled aggressive mode", async () => {
+    insertResearchRun({ runId: "run-guard", riskProfile: "aggressive", optionsEnabled: true });
+    insertCandidate({
+      runId: "run-guard",
+      symbol: "AAPL",
+      rank: 1,
+      estimatedMaxLoss: 40,
+      riskProfile: "aggressive"
+    });
+    insertMarketBar({ symbol: "AAPL", close: 100 });
+
+    const originalEnv = process.env.ALPACA_ENV;
+    const originalLive = process.env.LIVE_TRADING_ENABLED;
+    const originalAggressive = process.env.ENABLE_AGGRESSIVE_PAPER_STRATEGIES;
+    try {
+      process.env.ALPACA_ENV = "live";
+      await assert.rejects(
+        () => planResultFor({ riskProfile: "aggressive", optionsEnabled: true }),
+        /paper:plan requires ALPACA_ENV=paper/
+      );
+
+      process.env.ALPACA_ENV = originalEnv;
+      process.env.LIVE_TRADING_ENABLED = "true";
+      await assert.rejects(
+        () => planResultFor({ riskProfile: "moderate" }),
+        /paper:plan requires LIVE_TRADING_ENABLED=false/
+      );
+
+      process.env.LIVE_TRADING_ENABLED = originalLive;
+      process.env.ENABLE_AGGRESSIVE_PAPER_STRATEGIES = "false";
+      await assert.rejects(
+        () => planResultFor({ riskProfile: "aggressive" }),
+        /AGGRESSIVE mode requires ENABLE_AGGRESSIVE_PAPER_STRATEGIES=true/
+      );
+    } finally {
+      process.env.ALPACA_ENV = originalEnv;
+      process.env.LIVE_TRADING_ENABLED = originalLive;
+      process.env.ENABLE_AGGRESSIVE_PAPER_STRATEGIES = originalAggressive;
+    }
+  });
+
+  test("does not call mutation methods", async () => {
+    let nonGetRequested = false;
+    const originalFetch = globalThis.fetch;
+    try {
+      setMockFetch(async (input, init) => {
+        const method = String(init?.method || "GET").toUpperCase();
+        if (method !== "GET") {
+          nonGetRequested = true;
+        }
+        const fetcher = createMockFetcher();
+        return fetcher(input, init);
+      });
+
+      insertResearchRun({ runId: "run-mutation", riskProfile: "moderate", optionsEnabled: false });
+      insertCandidate({
+        runId: "run-mutation",
+        symbol: "AAPL",
+        rank: 1,
+        estimatedMaxLoss: 60
+      });
+      insertMarketBar({ symbol: "AAPL", close: 100 });
+
+      await planResultFor({});
+      assert.equal(nonGetRequested, false);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});

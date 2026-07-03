@@ -1,0 +1,422 @@
+import { DatabaseSync, type DatabaseSync as DbHandle } from "node:sqlite";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
+
+const DB_PATH =
+  process.env.RESEARCH_DB_PATH ??
+  `${process.cwd()}/data/research.db`;
+
+const tableSchema = `
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS universe_symbols (
+  symbol TEXT PRIMARY KEY,
+  asset_class TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  source TEXT NOT NULL,
+  tradable INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS market_bars (
+  symbol TEXT NOT NULL,
+  timeframe TEXT NOT NULL,
+  timestamp TEXT NOT NULL,
+  open REAL NOT NULL,
+  high REAL NOT NULL,
+  low REAL NOT NULL,
+  close REAL NOT NULL,
+  volume INTEGER NOT NULL,
+  source TEXT NOT NULL,
+  UNIQUE(symbol, timeframe, timestamp)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_bars_symbol_timeframe_timestamp
+  ON market_bars(symbol, timeframe, timestamp);
+
+CREATE TABLE IF NOT EXISTS option_contracts (
+  underlying_symbol TEXT NOT NULL,
+  option_symbol TEXT PRIMARY KEY,
+  type TEXT NOT NULL,
+  expiration_date TEXT NOT NULL,
+  strike REAL NOT NULL,
+  multiplier REAL NOT NULL,
+  tradable INTEGER NOT NULL,
+  source TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_option_contracts_underlying
+  ON option_contracts(underlying_symbol);
+
+CREATE TABLE IF NOT EXISTS option_snapshots (
+  option_symbol TEXT NOT NULL,
+  underlying_symbol TEXT NOT NULL,
+  timestamp TEXT NOT NULL,
+  bid REAL,
+  ask REAL,
+  midpoint REAL,
+  last REAL,
+  volume INTEGER,
+  open_interest INTEGER,
+  implied_volatility REAL,
+  delta REAL,
+  gamma REAL,
+  theta REAL,
+  vega REAL,
+  rho REAL,
+  source TEXT NOT NULL,
+  UNIQUE(option_symbol, timestamp)
+);
+
+CREATE INDEX IF NOT EXISTS idx_option_snapshots_underlying_timestamp
+  ON option_snapshots(underlying_symbol, timestamp);
+
+CREATE TABLE IF NOT EXISTS feature_snapshots (
+  symbol TEXT NOT NULL,
+  timestamp TEXT NOT NULL,
+  features TEXT NOT NULL,
+  PRIMARY KEY(symbol, timestamp)
+);
+
+CREATE TABLE IF NOT EXISTS target_snapshots (
+  symbol TEXT NOT NULL,
+  as_of TEXT NOT NULL,
+  direction TEXT NOT NULL,
+  horizon TEXT NOT NULL,
+  entry_reference REAL NOT NULL,
+  upside_target REAL NOT NULL,
+  downside_risk REAL NOT NULL,
+  stop_loss REAL,
+  take_profit REAL,
+  confidence REAL NOT NULL,
+  expected_return REAL,
+  volatility_adjusted_score REAL,
+  risk_profile TEXT NOT NULL,
+  preferred_expression TEXT NOT NULL,
+  rationale TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS options_strategy_snapshots (
+  symbol TEXT NOT NULL,
+  as_of TEXT NOT NULL,
+  direction TEXT NOT NULL,
+  preferred_expression TEXT NOT NULL,
+  alternatives TEXT NOT NULL,
+  rationale TEXT NOT NULL,
+  options_candidate TEXT
+);
+
+CREATE TABLE IF NOT EXISTS ingestion_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_type TEXT NOT NULL,
+  status TEXT NOT NULL,
+  symbols TEXT NOT NULL,
+  timeframe TEXT,
+  start_date TEXT,
+  end_date TEXT,
+  started_at TEXT NOT NULL,
+  completed_at TEXT,
+  rows_ingested INTEGER NOT NULL DEFAULT 0,
+  notes TEXT
+);
+
+CREATE TABLE IF NOT EXISTS backtest_runs (
+  id TEXT PRIMARY KEY,
+  started_at TEXT NOT NULL,
+  completed_at TEXT,
+  status TEXT NOT NULL,
+  config_json TEXT NOT NULL,
+  metrics_json TEXT,
+  notes TEXT
+);
+
+CREATE TABLE IF NOT EXISTS backtest_trades (
+  run_id TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  entry_date TEXT NOT NULL,
+  exit_date TEXT NOT NULL,
+  entry_price REAL NOT NULL,
+  exit_price REAL NOT NULL,
+  side TEXT NOT NULL,
+  quantity REAL NOT NULL,
+  pnl REAL NOT NULL,
+  return_pct REAL NOT NULL,
+  exit_reason TEXT NOT NULL,
+  FOREIGN KEY(run_id) REFERENCES backtest_runs(id)
+);
+
+CREATE TABLE IF NOT EXISTS backtest_options_trades (
+  run_id TEXT NOT NULL,
+  underlying_symbol TEXT NOT NULL,
+  option_symbol TEXT,
+  strategy TEXT NOT NULL,
+  entry_date TEXT NOT NULL,
+  exit_date TEXT NOT NULL,
+  expiration_date TEXT,
+  strike REAL,
+  short_strike REAL,
+  entry_premium REAL,
+  exit_premium REAL,
+  contracts REAL NOT NULL,
+  estimated_max_loss REAL,
+  estimated_max_profit REAL,
+  pnl REAL NOT NULL,
+  return_pct REAL NOT NULL,
+  exit_reason TEXT NOT NULL,
+  FOREIGN KEY(run_id) REFERENCES backtest_runs(id)
+);
+
+CREATE TABLE IF NOT EXISTS learning_runs (
+  id TEXT PRIMARY KEY,
+  model_name TEXT NOT NULL,
+  trained_at TEXT NOT NULL,
+  horizon TEXT NOT NULL,
+  universe_json TEXT NOT NULL,
+  metrics_json TEXT NOT NULL,
+  feature_importance_json TEXT,
+  strategy_performance_json TEXT,
+  notes_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS research_runs (
+  id TEXT PRIMARY KEY,
+  started_at TEXT NOT NULL,
+  completed_at TEXT,
+  status TEXT NOT NULL,
+  risk_profile TEXT NOT NULL,
+  options_enabled INTEGER NOT NULL,
+  universe_size INTEGER NOT NULL,
+  targets_generated INTEGER NOT NULL,
+  candidates_selected INTEGER NOT NULL,
+  error_message TEXT,
+  config_json TEXT NOT NULL,
+  summary_json TEXT
+);
+
+CREATE TABLE IF NOT EXISTS paper_trade_candidates (
+  id TEXT PRIMARY KEY,
+  research_run_id TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  as_of TEXT NOT NULL,
+  rank INTEGER NOT NULL,
+  direction TEXT NOT NULL,
+  horizon TEXT NOT NULL,
+  risk_profile TEXT NOT NULL,
+  preferred_expression TEXT NOT NULL,
+  score REAL NOT NULL,
+  confidence REAL NOT NULL,
+  expected_return REAL,
+  estimated_max_loss REAL,
+  estimated_max_profit REAL,
+  rationale TEXT NOT NULL,
+  relevant_backtest_run_id TEXT,
+  historical_win_rate REAL,
+  historical_avg_return REAL,
+  historical_max_drawdown REAL,
+  similar_setup_count INTEGER,
+  option_liquidity_score REAL,
+  volatility_score REAL,
+  signal_freshness_days INTEGER,
+  recent_learning_adjustment REAL,
+  directional_accuracy REAL,
+  option_outperformance_accuracy REAL,
+  option_symbol TEXT,
+  strike REAL,
+  short_strike REAL,
+  FOREIGN KEY(research_run_id) REFERENCES research_runs(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS paper_trade_plans (
+  id TEXT PRIMARY KEY,
+  research_run_id TEXT NOT NULL,
+  candidate_id TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  status TEXT NOT NULL,
+  direction TEXT NOT NULL,
+  expression TEXT NOT NULL,
+  entry_reference REAL NOT NULL,
+  stop_loss REAL,
+  take_profit REAL,
+  expiration_date TEXT,
+  option_symbol TEXT,
+  strike REAL,
+  short_strike REAL,
+  estimated_entry_cost REAL,
+  estimated_max_loss REAL,
+  estimated_max_profit REAL,
+  thesis TEXT NOT NULL,
+  invalidation TEXT NOT NULL,
+  learning_objective TEXT NOT NULL,
+  last_evaluated_at TEXT,
+  last_outcome TEXT,
+  last_return_pct REAL,
+  FOREIGN KEY(candidate_id) REFERENCES paper_trade_candidates(id) ON DELETE CASCADE,
+  FOREIGN KEY(research_run_id) REFERENCES research_runs(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS paper_trade_evaluations (
+  id TEXT PRIMARY KEY,
+  research_run_id TEXT NOT NULL,
+  candidate_id TEXT NOT NULL,
+  plan_id TEXT NOT NULL,
+  horizon TEXT NOT NULL,
+  evaluated_at TEXT NOT NULL,
+  mark_price REAL,
+  estimated_exit_value REAL,
+  unrealized_pnl REAL,
+  realized_pnl REAL,
+  return_pct REAL,
+  outcome TEXT NOT NULL,
+  notes TEXT NOT NULL,
+  FOREIGN KEY(plan_id) REFERENCES paper_trade_plans(id) ON DELETE CASCADE,
+  FOREIGN KEY(candidate_id) REFERENCES paper_trade_candidates(id) ON DELETE CASCADE,
+  FOREIGN KEY(research_run_id) REFERENCES research_runs(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS api_request_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  provider TEXT NOT NULL,
+  endpoint TEXT NOT NULL,
+  method TEXT NOT NULL,
+  status INTEGER NOT NULL,
+  request_id TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS paper_recommendation_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  snapshot_run_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  source TEXT NOT NULL,
+  group_by TEXT NOT NULL,
+  group_key TEXT NOT NULL,
+  filters_json TEXT NOT NULL,
+  candidate_count INTEGER NOT NULL,
+  evaluated_count INTEGER NOT NULL,
+  unevaluated_count INTEGER NOT NULL,
+  win_rate REAL NOT NULL,
+  avg_return_pct REAL NOT NULL,
+  median_return_pct REAL NOT NULL,
+  best_return_pct REAL NOT NULL,
+  worst_return_pct REAL NOT NULL,
+  avg_rank REAL NOT NULL,
+  recommendation_flag TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_recommendation_snapshots_created_at
+  ON paper_recommendation_snapshots(created_at);
+
+CREATE INDEX IF NOT EXISTS idx_paper_recommendation_snapshots_run
+  ON paper_recommendation_snapshots(snapshot_run_id);
+
+CREATE INDEX IF NOT EXISTS idx_paper_recommendation_snapshots_group
+  ON paper_recommendation_snapshots(group_by, group_key);
+
+CREATE TABLE IF NOT EXISTS paper_execution_ledger (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  mode TEXT NOT NULL,
+  asset_class TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  underlying_symbol TEXT,
+  strategy TEXT,
+  side TEXT,
+  order_type TEXT,
+  time_in_force TEXT,
+  qty TEXT,
+  notional TEXT,
+  limit_price TEXT,
+  estimated_premium REAL,
+  max_risk REAL,
+  dedupe_key TEXT NOT NULL,
+  client_order_id TEXT NOT NULL UNIQUE,
+  alpaca_order_id TEXT,
+  alpaca_status TEXT,
+  request_id TEXT,
+  source_plan_id TEXT,
+  source_candidate_id TEXT,
+  status TEXT NOT NULL,
+  reason TEXT,
+  blocked_reason TEXT,
+  error_message TEXT,
+  payload_json TEXT NOT NULL,
+  raw_payload_json TEXT,
+  raw_response_json TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_execution_ledger_created_at
+  ON paper_execution_ledger(created_at);
+
+CREATE INDEX IF NOT EXISTS idx_paper_execution_ledger_symbol
+  ON paper_execution_ledger(symbol, asset_class);
+
+CREATE INDEX IF NOT EXISTS idx_paper_execution_ledger_dedupe_key
+  ON paper_execution_ledger(dedupe_key);
+`;
+
+let database: DbHandle | null = null;
+
+const addColumnIfMissing = (db: DbHandle, table: string, column: string, ddl: string) => {
+  const existing = db
+    .prepare(`PRAGMA table_info(${table})`)
+    .all() as Array<{ name: string }>;
+  if (existing.some((row) => row.name === column)) {
+    return;
+  }
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+};
+
+const runMigrations = (db: DbHandle) => {
+  addColumnIfMissing(db, "paper_execution_ledger", "side", "side TEXT");
+  addColumnIfMissing(db, "paper_execution_ledger", "order_type", "order_type TEXT");
+  addColumnIfMissing(db, "paper_execution_ledger", "time_in_force", "time_in_force TEXT");
+  addColumnIfMissing(db, "paper_execution_ledger", "qty", "qty TEXT");
+  addColumnIfMissing(db, "paper_execution_ledger", "notional", "notional TEXT");
+  addColumnIfMissing(db, "paper_execution_ledger", "limit_price", "limit_price TEXT");
+  addColumnIfMissing(db, "paper_execution_ledger", "estimated_premium", "estimated_premium REAL");
+  addColumnIfMissing(db, "paper_execution_ledger", "max_risk", "max_risk REAL");
+  addColumnIfMissing(db, "paper_execution_ledger", "alpaca_status", "alpaca_status TEXT");
+  addColumnIfMissing(db, "paper_execution_ledger", "source_plan_id", "source_plan_id TEXT");
+  addColumnIfMissing(db, "paper_execution_ledger", "source_candidate_id", "source_candidate_id TEXT");
+  addColumnIfMissing(db, "paper_execution_ledger", "blocked_reason", "blocked_reason TEXT");
+  addColumnIfMissing(db, "paper_execution_ledger", "error_message", "error_message TEXT");
+  addColumnIfMissing(db, "paper_execution_ledger", "raw_payload_json", "raw_payload_json TEXT");
+  addColumnIfMissing(db, "paper_execution_ledger", "raw_response_json", "raw_response_json TEXT");
+};
+
+const initialize = (): DbHandle => {
+  if (database) {
+    return database;
+  }
+
+  mkdirSync(dirname(DB_PATH), { recursive: true });
+  const db = new DatabaseSync(DB_PATH);
+  db.exec(tableSchema);
+  runMigrations(db);
+  database = db;
+  return db;
+};
+
+export const getDb = (): DbHandle => initialize();
+
+export const queryAll = <T = Record<string, unknown>>(
+  sql: string,
+  params: Array<string | number | null> = []
+): T[] => {
+  return getDb()
+    .prepare(sql)
+    .all(...params) as unknown as T[];
+};
+
+export const queryOne = <T = Record<string, unknown>>(
+  sql: string,
+  params: Array<string | number | null> = []
+): T | null => {
+  const row = getDb()
+    .prepare(sql)
+    .get(...params) as unknown as T | undefined;
+  return row ?? null;
+};

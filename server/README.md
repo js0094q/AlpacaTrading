@@ -170,7 +170,7 @@ Before using Caddy:
 - bind app services only to localhost or a Docker internal network
 - let Caddy terminate HTTPS
 
-No public UI is deployed in this phase.
+No public UI is deployed by these server bootstrap scripts. The optional paper-only dashboard lives in `apps/dashboard/` and must be deployed separately behind its documented paper guards.
 
 ## Stop Future App Services
 
@@ -189,6 +189,6 @@ docker compose -f /opt/alpaca-investing/app/docker-compose.yml down
 - trading strategies
 - autonomous order submission
 - live trading enablement
-- public frontend
+- public frontend deployment from the server bootstrap scripts
 - public app ports
 - DNS changes

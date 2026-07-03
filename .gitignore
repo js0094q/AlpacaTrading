@@ -26,9 +26,18 @@ id_rsa
 **/id_rsa
 
 # Runtime artifacts
+node_modules/
+dist/
+.next/
+data/
 logs/
 backups/
 *.log
+*.sqlite
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
 
 # macOS
 .DS_Store

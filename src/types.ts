@@ -1,0 +1,270 @@
+export type Timeframe = "1Day" | "1Hour" | "15Min" | "5Min" | "1Min";
+export type TimeHorizon = "1d" | "5d" | "20d";
+export type AssetDirection = "long" | "short" | "neutral";
+export type RiskProfile = "aggressive" | "moderate" | "conservative";
+export type PreferredExpression =
+  | "shares"
+  | "long_call"
+  | "long_put"
+  | "call_spread"
+  | "put_spread"
+  | "covered_call"
+  | "cash_secured_put"
+  | "protective_put"
+  | "collar"
+  | "none";
+export type ExitReason =
+  | "stop_loss"
+  | "take_profit"
+  | "time_exit"
+  | "signal_exit"
+  | "trailing_stop";
+export type OptionExitReason = ExitReason | "expiration";
+
+export interface UniverseSymbolRow {
+  symbol: string;
+  assetClass: string;
+  enabled: 0 | 1;
+  source: string;
+  createdAt: string;
+  updatedAt: string;
+  tradable: 0 | 1;
+}
+
+export interface MarketBarRow {
+  symbol: string;
+  timeframe: Timeframe;
+  timestamp: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+  source: "alpaca";
+}
+
+export interface OptionContractRow {
+  underlyingSymbol: string;
+  optionSymbol: string;
+  type: "call" | "put";
+  expirationDate: string;
+  strike: number;
+  multiplier: number;
+  tradable: 0 | 1;
+  source: "alpaca";
+}
+
+export interface OptionSnapshotRow {
+  optionSymbol: string;
+  underlyingSymbol: string;
+  timestamp: string;
+  bid: number | null;
+  ask: number | null;
+  midpoint: number | null;
+  last: number | null;
+  volume: number | null;
+  openInterest: number | null;
+  impliedVolatility: number | null;
+  delta: number | null;
+  gamma: number | null;
+  theta: number | null;
+  vega: number | null;
+  rho: number | null;
+  source: "alpaca";
+}
+
+export interface FeatureSnapshotRow {
+  symbol: string;
+  timestamp: string;
+  features: Record<string, string | number | null>;
+}
+
+export interface TargetSnapshotRow {
+  symbol: string;
+  asOf: string;
+  direction: AssetDirection;
+  horizon: TimeHorizon;
+  entryReference: number;
+  upsideTarget: number;
+  downsideRisk: number;
+  stopLoss: number | null;
+  takeProfit: number | null;
+  confidence: number;
+  expectedReturn: number | null;
+  volatilityAdjustedScore: number | null;
+  riskProfile: RiskProfile;
+  preferredExpression: PreferredExpression;
+  rationale: string[];
+  optionsCandidate?: string | null;
+}
+
+export interface ResearchRunRow {
+  id: string;
+  startedAt: string;
+  completedAt: string | null;
+  status: "running" | "completed" | "failed";
+  riskProfile: RiskProfile;
+  optionsEnabled: boolean;
+  universeSize: number;
+  targetsGenerated: number;
+  candidatesSelected: number;
+  errorMessage: string | null;
+  configJson: string;
+  summaryJson: string | null;
+}
+
+export interface PaperTradeCandidateRow {
+  id: string;
+  researchRunId: string;
+  symbol: string;
+  asOf: string;
+  rank: number;
+  direction: "long" | "short" | "neutral";
+  horizon: TimeHorizon;
+  riskProfile: RiskProfile;
+  preferredExpression: PreferredExpression;
+  score: number;
+  confidence: number;
+  expectedReturn: number | null;
+  estimatedMaxLoss: number | null;
+  estimatedMaxProfit: number | null;
+  rationale: string[];
+  relevantBacktestRunId: string | null;
+  historicalWinRate: number | null;
+  historicalAvgReturn: number | null;
+  historicalMaxDrawdown: number | null;
+  similarSetupCount: number | null;
+  optionLiquidityScore: number | null;
+  volatilityAdjustedScore: number | null;
+  signalFreshnessDays: number | null;
+  recentLearningAdjustment: number | null;
+  directionalAccuracy: number | null;
+  optionOutperformanceAccuracy: number | null;
+  optionSymbol?: string | null;
+  strike?: number | null;
+  shortStrike?: number | null;
+  estimatedExitValue?: number | null;
+}
+
+export interface PaperTradePlanRow {
+  id: string;
+  researchRunId: string;
+  candidateId: string;
+  symbol: string;
+  createdAt: string;
+  status: "planned" | "entered" | "closed" | "expired" | "skipped";
+  direction: "long" | "short" | "neutral";
+  expression: string;
+  entryReference: number;
+  stopLoss: number | null;
+  takeProfit: number | null;
+  expirationDate: string | null;
+  optionSymbol: string | null;
+  strike: number | null;
+  shortStrike: number | null;
+  estimatedEntryCost: number | null;
+  estimatedMaxLoss: number | null;
+  estimatedMaxProfit: number | null;
+  thesis: string;
+  invalidation: string;
+  learningObjective: string;
+  lastEvaluatedAt: string | null;
+  lastOutcome: string | null;
+  lastReturnPct: number | null;
+}
+
+export interface PaperTradeEvaluationRow {
+  id: string;
+  researchRunId: string;
+  planId: string;
+  candidateId: string;
+  evaluatedAt: string;
+  markPrice: number | null;
+  estimatedExitValue: number | null;
+  unrealizedPnl: number | null;
+  realizedPnl: number | null;
+  returnPct: number | null;
+  outcome:
+    | "winner"
+    | "loser"
+    | "flat"
+    | "expired_worthless"
+    | "hit_stop"
+    | "hit_take_profit"
+    | "still_open"
+    | "insufficient_data";
+  notes: string[];
+  horizon: TimeHorizon;
+}
+
+export interface StrategySelectorResult {
+  symbol: string;
+  asOf: string;
+  direction: AssetDirection;
+  preferredExpression: PreferredExpression;
+  alternatives: PreferredExpression[];
+  optionsCandidate?: {
+    optionSymbol?: string;
+    expirationDate?: string;
+    strike?: number;
+    type?: "call" | "put";
+    estimatedEntryPrice?: number;
+    maxLoss?: number | null;
+    maxProfit?: number | null;
+    breakeven?: number | null;
+    liquidityScore?: number;
+  };
+  rationale: string[];
+}
+
+export interface IngestionRunRow {
+  id: number;
+  runType: "bars" | "options_contracts" | "options_snapshots";
+  status: "running" | "completed" | "failed";
+  symbols: string;
+  timeframe?: Timeframe | null;
+  startedAt: string;
+  completedAt: string | null;
+  rowsIngested: number;
+  notes: string | null;
+}
+
+export interface BacktestTradeRow {
+  symbol: string;
+  entryDate: string;
+  exitDate: string;
+  entryPrice: number;
+  exitPrice: number;
+  side: AssetDirection;
+  quantity: number;
+  pnl: number;
+  returnPct: number;
+  exitReason: ExitReason;
+}
+
+export interface BacktestOptionTradeRow {
+  underlyingSymbol: string;
+  optionSymbol?: string;
+  strategy:
+    | "long_call"
+    | "long_put"
+    | "call_spread"
+    | "put_spread"
+    | "covered_call"
+    | "cash_secured_put"
+    | "protective_put"
+    | "collar";
+  entryDate: string;
+  exitDate: string;
+  expirationDate?: string;
+  strike?: number;
+  shortStrike?: number;
+  entryPremium: number | null;
+  exitPremium: number | null;
+  contracts: number;
+  estimatedMaxLoss: number | null;
+  estimatedMaxProfit: number | null;
+  pnl: number;
+  returnPct: number;
+  exitReason: OptionExitReason;
+}

@@ -1,0 +1,78 @@
+# Resume Context: Alpaca Trading Research Infra
+
+- Added Alpaca Paper API read-only integration for account snapshots, positions, open orders, market clock, and asset tradability checks.
+- Added paper-only safety guardrails for mutation controls (`alpaca:health`, trading safety assertions, default non-mutating behavior).
+- Extended `research:daily` with optional `--useAlpacaAssets=true` filtering and preserved exclusion reasons in run output and run summary.
+- Extended `research:daily` to default to a 365-day daily-bar lookback (`--barLookbackDays=365`) so feature generation has enough history for rankable targets.
+- Added CLI commands for Alpaca inspection: `alpaca:health`, `alpaca:account`, `alpaca:positions`, `alpaca:orders`, `alpaca:asset`.
+- Added redacted Alpaca configuration diagnostic command:
+  - `alpaca:config`
+- Added `docs/vps-paper-research-deployment.md` with cron scheduling and cron-command examples for paper-only VPS workflows.
+- Added `.env.example` placeholders and scripts for read-only Alpaca commands plus the explicit paper-only `paper:execute --confirmPaper` gate; no live-order commands were added.
+- Added paper snapshot history read path for `paper:snapshots` with table and JSON output support.
+- Added paper intelligence read-only surface commands:
+  - `paper:trends`
+  - `paper:runtime`
+  - `paper:intel`
+- Added dry-run planning gate:
+  - `paper:plan`
+- Added review-only safety gate:
+  - `paper:review`
+- Added dry-run execution payload builder:
+  - `paper:execute -- --dryRun`
+- Added confirm-paper execution command:
+  - `paper:execute -- --confirmPaper`
+- Added paper-only Next.js dashboard under `apps/dashboard/`:
+  - `npm run dashboard:dev`
+  - `npm run dashboard:build`
+  - `npm run dashboard:start`
+- Dashboard API routes enforce `ALPACA_ENV=paper` and `LIVE_TRADING_ENABLED=false`; order submission additionally requires `PAPER_ORDER_EXECUTION_ENABLED=true`.
+- Confirm-paper pre-submission gates:
+  - `ALPACA_ENV=paper`
+  - `LIVE_TRADING_ENABLED=false`
+  - `PAPER_ORDER_EXECUTION_ENABLED=true`
+  - `PAPER_OPTIONS_EXECUTION_ENABLED=true` for option payloads
+- Added realistic paper equity sizing defaults:
+  - `PAPER_EQUITY_NOTIONAL_PER_ORDER=1000`
+  - `PAPER_EQUITY_MAX_NOTIONAL_PER_ORDER=5000`
+  - `PAPER_EQUITY_MAX_PORTFOLIO_DEPLOY_PCT=50`
+  - `PAPER_EQUITY_MAX_POSITION_PCT=10`
+  - `PAPER_EQUITY_MIN_CASH_RESERVE_PCT=20`
+- Added practical paper options execution defaults (execution disabled by default):
+  - `PAPER_OPTIONS_MAX_PREMIUM_PER_ORDER=1000`
+  - `PAPER_OPTIONS_MAX_CONTRACTS=5`
+  - `PAPER_OPTIONS_MIN_DTE=0`
+  - `PAPER_OPTIONS_MAX_DTE=90`
+  - `PAPER_OPTIONS_ALLOW_0DTE=true`
+  - `PAPER_OPTIONS_ALLOW_MARKET_ORDERS=false`
+  - `PAPER_OPTIONS_LIMIT_PRICE_BASIS=mid`
+  - `PAPER_OPTIONS_MAX_SPREAD_PCT=50`
+  - `PAPER_OPTIONS_MAX_PORTFOLIO_RISK_PCT=20`
+  - `PAPER_OPTIONS_MAX_POSITION_RISK_PCT=5`
+  - `PAPER_OPTIONS_ALLOW_LONG_CALLS=true`
+  - `PAPER_OPTIONS_ALLOW_LONG_PUTS=true`
+  - `PAPER_OPTIONS_ALLOW_CASH_SECURED_PUTS=true`
+  - `PAPER_OPTIONS_ALLOW_COVERED_CALLS=true`
+  - `PAPER_OPTIONS_ALLOW_NAKED_OPTIONS=false`
+- `paper:execute --confirmPaper` remains blocked unless dry-run or confirm flag requirements and all blocker checks pass.
+- Execution ledger now records built, blocked, submitted, accepted, rejected, failed, and duplicate-blocked attempts with payload/response audit fields where available.
+- Optional runtime duplicate reconciliation checks recent paper orders when `PAPER_RUNTIME_DUPLICATE_RECONCILIATION_ENABLED=true`.
+- Multi-leg options are still intentionally left for a future phase; do not model spreads as separate unrelated single-leg submissions.
+- If review reports `NO_RUNTIME_CANDIDATES`, confirm the latest research run used enough bar history before changing planner/review logic.
+- Current validation checklist:
+  - `npm run alpaca:config -- --format=json`
+  - `npm run alpaca:health -- --format=json`
+  - `npm run alpaca:account -- --format=json`
+  - `npm run alpaca:positions -- --format=json`
+  - `npm run alpaca:orders -- --format=json`
+  - `npm run alpaca:asset -- --symbol=AAPL --format=json`
+  - `npm run research:daily -- --riskProfile=aggressive --optionsEnabled=true --maxCandidates=10 --useAlpacaAssets=true`
+  - `npm run paper:snapshots -- --format=json --limit=5`
+  - `npm run paper:trends -- --format=json`
+  - `npm run paper:runtime -- --format=json`
+  - `npm run paper:intel -- --format=json`
+  - `npm run paper:plan -- --riskProfile=aggressive --optionsEnabled=true --format=json`
+  - `npm run paper:review -- --riskProfile=aggressive --optionsEnabled=true --format=json`
+  - `npm run paper:execute -- --dryRun --riskProfile=aggressive --optionsEnabled=true --format=json`
+  - `npm run paper:execute -- --confirmPaper --format=json`
+  - `npm run dashboard:build`
