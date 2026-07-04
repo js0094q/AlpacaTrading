@@ -5,6 +5,9 @@ import {
   VERCEL_HISTORICAL_STORAGE_WARNING,
   VERCEL_HISTORICAL_UNAVAILABLE_MESSAGE,
   VERCEL_READ_ONLY_MODE,
+  DASHBOARD_PAPER_BRIDGE_TOKEN,
+  DASHBOARD_PAPER_BRIDGE_URL,
+  isPaperDashboardBridgeEnabled,
   hasDashboardDurableStorageConfig,
   shouldUseVercelReadOnlyFallback
 } from "./runtime";
@@ -31,6 +34,150 @@ const safeLimit = (value: unknown, fallback: number, max: number) => {
   return Number.isFinite(parsed) && parsed > 0
     ? Math.min(max, Math.floor(parsed))
     : fallback;
+};
+
+type PaperBridgeSummary = {
+  paperOnly?: boolean;
+  environment?: string;
+  liveTradingEnabled?: boolean;
+  generatedAt?: string;
+  mode?: string;
+  historicalDataAvailable?: boolean;
+  durableStorageConfigured?: boolean;
+  historicalWarning?: string | null;
+  durableStorageWarning?: string | null;
+  account?: unknown;
+  positions?: unknown;
+  runtime?: unknown;
+  plan?: unknown;
+  review?: unknown;
+  dryRun?: unknown;
+  latestResearch?: unknown;
+  latestPaperPlans?: unknown;
+  snapshots?: unknown;
+  executions?: unknown;
+  optionContracts?: unknown;
+  requestIds?: unknown;
+};
+
+type DashboardResultError = {
+  ok: false;
+  label?: string;
+  error: string;
+};
+
+type DashboardResult<T> =
+  | {
+      ok: true;
+      label?: string;
+      data: T;
+    }
+  | DashboardResultError;
+
+export type DashboardSnapshotMode = "local-sqlite" | typeof VERCEL_READ_ONLY_MODE | string;
+
+export interface DashboardSnapshot {
+  paperOnly: true;
+  environment: string;
+  liveTradingEnabled: boolean;
+  generatedAt: string;
+  mode: DashboardSnapshotMode;
+  historicalDataAvailable: boolean;
+  durableStorageConfigured: boolean;
+  historicalWarning: string | null;
+  durableStorageWarning: string | null;
+  account: DashboardResult<unknown>;
+  positions: DashboardResult<unknown>;
+  runtime: DashboardResult<unknown> | { ok: false; label: string; error: string };
+  plan: DashboardResult<{ plan: Array<unknown>; planSummary?: unknown }>;
+  review: DashboardResult<{
+    review: { status: string; blockers: string[]; warnings: string[] };
+    planSummary: { plannedOrders: number };
+  }>;
+  dryRun: DashboardResult<{ summary: { wouldSubmitCount: number; payloadsBlocked: number }; assetClass: string }>;
+  latestResearch: unknown[];
+  latestPaperPlans: unknown[];
+  snapshots: unknown[];
+  executions: DashboardResult<unknown> | unknown[];
+  optionContracts: unknown[];
+  requestIds: unknown[];
+}
+
+type BridgeEnvelope<T> = { ok: true; data: T } | { ok: false; error?: unknown };
+
+const MAX_BRIDGE_TIMEOUT_MS = 8000;
+
+let bridgeSummaryPromise: Promise<PaperBridgeSummary> | null = null;
+
+const clampRows = <T>(rows: unknown, limit: number): T[] => {
+  if (!Array.isArray(rows)) {
+    return [];
+  }
+  return rows.slice(0, safeLimit(limit, rows.length > 0 ? rows.length : 1, 200)) as T[];
+};
+
+const bridgeUrlForPath = (path: string) => {
+  const base = DASHBOARD_PAPER_BRIDGE_URL?.trim();
+  if (!base) {
+    throw new Error("DASHBOARD_PAPER_BRIDGE_URL_NOT_CONFIGURED");
+  }
+  const normalizedBase = base.endsWith("/") ? base : `${base}/`;
+  const normalizedPath = path.replace(/^\//, "");
+  return `${normalizedBase}${normalizedPath}`;
+};
+
+const fetchPaperBridgePayload = async <T>(path: string): Promise<T> => {
+  const headers: Record<string, string> = {
+    Accept: "application/json"
+  };
+
+  if (DASHBOARD_PAPER_BRIDGE_TOKEN) {
+    headers.Authorization = `Bearer ${DASHBOARD_PAPER_BRIDGE_TOKEN}`;
+    headers["x-dashboard-bridge-token"] = DASHBOARD_PAPER_BRIDGE_TOKEN;
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), MAX_BRIDGE_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(bridgeUrlForPath(path), {
+      method: "GET",
+      headers,
+      cache: "no-store",
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      throw new Error(`DASHBOARD_BRIDGE_HTTP_${response.status}`);
+    }
+
+    const payload = (await response.json()) as unknown;
+    if (
+      payload !== null &&
+      typeof payload === "object" &&
+      "ok" in payload &&
+      typeof (payload as BridgeEnvelope<T>).ok === "boolean"
+    ) {
+      const envelope = payload as BridgeEnvelope<T>;
+      if (envelope.ok) {
+        return envelope.data;
+      }
+      throw new Error(
+        `DASHBOARD_BRIDGE_RESPONSE_ERROR:${String((payload as { error?: unknown }).error)}`
+      );
+    }
+
+    return payload as T;
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+const getPaperBridgeSummary = async () => {
+  if (!bridgeSummaryPromise) {
+    bridgeSummaryPromise = fetchPaperBridgePayload<PaperBridgeSummary>("api/paper/summary");
+  }
+  return bridgeSummaryPromise;
 };
 
 const normalizeRiskProfile = (value: unknown): RiskProfileInput => {
@@ -65,6 +212,8 @@ export const parsePaperActionInput = (value: unknown): PaperActionInput => {
 export const latestResearchRuns = async (limit = 5) =>
   shouldUseVercelReadOnlyFallback()
     ? []
+    : isPaperDashboardBridgeEnabled()
+      ? getPaperBridgeSummary().then((summary) => clampRows(summary.latestResearch, limit))
     : queryAllRows(
         `
         SELECT id, started_at, completed_at, status, risk_profile, options_enabled, candidates_selected
@@ -78,6 +227,8 @@ export const latestResearchRuns = async (limit = 5) =>
 export const latestPaperPlans = async (limit = 10) =>
   shouldUseVercelReadOnlyFallback()
     ? []
+    : isPaperDashboardBridgeEnabled()
+      ? getPaperBridgeSummary().then((summary) => clampRows(summary.latestPaperPlans, limit))
     : queryAllRows(
         `
         SELECT id, research_run_id, symbol, created_at, status, direction, expression, option_symbol, estimated_max_loss, estimated_max_profit
@@ -91,6 +242,8 @@ export const latestPaperPlans = async (limit = 10) =>
 export const latestOptionContracts = async (limit = 10) =>
   shouldUseVercelReadOnlyFallback()
     ? []
+    : isPaperDashboardBridgeEnabled()
+      ? getPaperBridgeSummary().then((summary) => clampRows(summary.optionContracts, limit))
     : queryAllRows(
         `
         SELECT c.underlying_symbol, c.option_symbol, c.type, c.expiration_date, c.strike, c.tradable,
@@ -106,6 +259,8 @@ export const latestOptionContracts = async (limit = 10) =>
 export const latestApiRequestIds = async (limit = 12) =>
   shouldUseVercelReadOnlyFallback()
     ? []
+    : isPaperDashboardBridgeEnabled()
+      ? getPaperBridgeSummary().then((summary) => clampRows(summary.requestIds, limit))
     : queryAllRows(
         `
         SELECT provider, endpoint, method, status, request_id, created_at
@@ -143,6 +298,10 @@ export const latestPaperExecutions = async (limit = 50) => {
   if (shouldUseVercelReadOnlyFallback()) {
     return [];
   }
+  if (isPaperDashboardBridgeEnabled()) {
+    const summary = await getPaperBridgeSummary();
+    return clampRows(summary.executions, limit);
+  }
   const { listPaperExecutionLedgerEntries } = await import(
     "../../../src/services/paperExecutionLedgerService"
   );
@@ -153,14 +312,28 @@ const latestPaperRecommendationSnapshots = async (limit = 10) => {
   if (shouldUseVercelReadOnlyFallback()) {
     return [];
   }
+  if (isPaperDashboardBridgeEnabled()) {
+    const summary = await getPaperBridgeSummary();
+    return clampRows(summary.snapshots, limit);
+  }
   const { listPaperRecommendationSnapshots } = await import(
     "../../../src/services/paperRecommendationSnapshotService"
   );
   return listPaperRecommendationSnapshots({ limit });
 };
 
-export const buildDashboardSnapshot = async () => {
+export const buildDashboardSnapshot = async (): Promise<DashboardSnapshot> => {
   const state = assertPaperDashboardAccess();
+
+  if (isPaperDashboardBridgeEnabled()) {
+    const bridgeSummary = await getPaperBridgeSummary();
+    return {
+      ...bridgeSummary,
+      generatedAt: bridgeSummary.generatedAt || new Date().toISOString(),
+      paperOnly: true,
+      mode: bridgeSummary.mode || VERCEL_READ_ONLY_MODE
+    } as DashboardSnapshot;
+  }
 
   if (shouldUseVercelReadOnlyFallback()) {
     const [account, positions] = await Promise.all([
@@ -277,7 +450,7 @@ export const buildDashboardSnapshot = async () => {
     executions,
     optionContracts,
     requestIds
-  };
+  } as DashboardSnapshot;
 };
 
 export const runPaperResearch = async (input: PaperActionInput) => {

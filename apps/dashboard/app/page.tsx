@@ -1,16 +1,76 @@
 import { ActionPanel } from "./components/ActionPanel";
-import { buildDashboardSnapshot, dashboardMoney } from "../lib/data";
+import { buildDashboardSnapshot, dashboardMoney, type DashboardSnapshot } from "../lib/data";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
-const asResult = <T,>(value: {
+type DashboardCaptureResult<T> = {
   ok: true;
   data: T;
-} | {
+  label?: string;
+};
+
+type DashboardCaptureError = {
   ok: false;
   error: string;
-}) => value;
+  label?: string;
+};
+
+const asResult = <T,>(value: DashboardCaptureResult<T> | DashboardCaptureError | null) =>
+  value as DashboardCaptureResult<T> | DashboardCaptureError | null;
+
+type PaperAccountSnapshot = {
+  status?: string;
+  equity?: string | number;
+  cash?: string | number;
+  buyingPower?: string | number;
+};
+
+type PaperPositionsSnapshot = {
+  positions: Array<{
+    symbol?: string;
+    qty?: string | number;
+    marketValue?: string | number;
+  }>;
+};
+
+type PaperPlanSnapshot = {
+  plan: Array<{
+    symbol?: string;
+    decision?: string;
+    latestRank?: number;
+    strategy?: string | null;
+    estimatedNotional?: number | null;
+  }>;
+};
+
+type PaperReviewSnapshot = {
+  review: {
+    status: string;
+    blockers: Array<string>;
+    warnings: Array<string>;
+  };
+  planSummary: {
+    plannedOrders: number;
+  };
+};
+
+type PaperDryRunSnapshot = {
+  summary: {
+    wouldSubmitCount: number;
+    payloadsBlocked: number;
+  };
+  assetClass: string;
+};
+
+type PaperExecutionSnapshot = {
+  symbol?: string;
+  id?: string;
+  status?: string;
+  strategy?: string;
+  requestId?: string;
+  clientOrderId?: string;
+};
 
 const Metric = ({ label, value }: { label: string; value: React.ReactNode }) => (
   <div className="metric">
@@ -20,7 +80,7 @@ const Metric = ({ label, value }: { label: string; value: React.ReactNode }) => 
 );
 
 export default async function DashboardPage() {
-  let snapshot: Awaited<ReturnType<typeof buildDashboardSnapshot>> | null = null;
+  let snapshot: DashboardSnapshot | null = null;
   let guardError: string | null = null;
 
   try {
@@ -29,12 +89,24 @@ export default async function DashboardPage() {
     guardError = error instanceof Error ? error.message : "Dashboard guard failed.";
   }
 
-  const account = snapshot ? asResult(snapshot.account) : null;
-  const positions = snapshot ? asResult(snapshot.positions) : null;
-  const plan = snapshot ? asResult(snapshot.plan) : null;
-  const review = snapshot ? asResult(snapshot.review) : null;
-  const dryRun = snapshot ? asResult(snapshot.dryRun) : null;
-  const executions = snapshot ? asResult(snapshot.executions) : null;
+  const account = snapshot
+    ? asResult<PaperAccountSnapshot>(snapshot.account as DashboardCaptureResult<PaperAccountSnapshot> | DashboardCaptureError)
+    : null;
+  const positions = snapshot
+    ? asResult<PaperPositionsSnapshot>(snapshot.positions as DashboardCaptureResult<PaperPositionsSnapshot> | DashboardCaptureError)
+    : null;
+  const plan = snapshot
+    ? asResult<PaperPlanSnapshot>(snapshot.plan as DashboardCaptureResult<PaperPlanSnapshot> | DashboardCaptureError)
+    : null;
+  const review = snapshot
+    ? asResult<PaperReviewSnapshot>(snapshot.review as DashboardCaptureResult<PaperReviewSnapshot> | DashboardCaptureError)
+    : null;
+  const dryRun = snapshot
+    ? asResult<PaperDryRunSnapshot>(snapshot.dryRun as DashboardCaptureResult<PaperDryRunSnapshot> | DashboardCaptureError)
+    : null;
+  const executions = snapshot
+    ? asResult<PaperExecutionSnapshot[]>(snapshot.executions as DashboardCaptureResult<PaperExecutionSnapshot[]> | DashboardCaptureError)
+    : null;
   const vercelReadOnly = snapshot?.mode === "vercel-read-only";
 
   return (
