@@ -30,13 +30,23 @@ type OptionQuoteRow = {
   delta: number | null;
 };
 
+type HistoricalIvRow = {
+  timestamp: string;
+  value: number;
+};
+
+interface OptionFeatureContext {
+  latestContractRows: Map<string, OptionQuoteRow[]>;
+  historicalImpliedVols: Map<string, HistoricalIvRow[]>;
+}
+
 const parseDate = (value: string): number | null => {
   const date = new Date(value);
   const millis = date.getTime();
   return Number.isNaN(millis) ? null : millis;
 };
 
-const getLatestContractRows = (symbol: string): OptionQuoteRow[] => {
+const readLatestContractRows = (symbol: string): OptionQuoteRow[] => {
   return getDb()
     .prepare(
       `
@@ -56,22 +66,57 @@ const getLatestContractRows = (symbol: string): OptionQuoteRow[] => {
     .all(symbol) as OptionQuoteRow[];
 };
 
-const getHistoricalImpliedVols = (symbol: string, asOf: string): number[] => {
+const getLatestContractRows = (
+  symbol: string,
+  context: OptionFeatureContext
+): OptionQuoteRow[] => {
+  const normalized = normalizeSymbol(symbol);
+  const cached = context.latestContractRows.get(normalized);
+  if (cached) {
+    return cached;
+  }
+  const rows = readLatestContractRows(normalized);
+  context.latestContractRows.set(normalized, rows);
+  return rows;
+};
+
+const readHistoricalImpliedVols = (symbol: string): HistoricalIvRow[] => {
   const rows = getDb()
     .prepare(
       `
-      SELECT s.implied_volatility
+      SELECT s.timestamp, s.implied_volatility
       FROM option_snapshots AS s
       JOIN option_contracts AS c ON c.option_symbol = s.option_symbol
       WHERE c.underlying_symbol = ?
         AND s.implied_volatility IS NOT NULL
-        AND s.timestamp <= ?
       `
     )
-    .all(normalizeSymbol(symbol), asOf) as Array<{ implied_volatility: number | null }>;
+    .all(normalizeSymbol(symbol)) as Array<{
+      timestamp: string;
+      implied_volatility: number | null;
+    }>;
   return rows
-    .map((row) => row.implied_volatility)
-    .filter((value): value is number => typeof value === "number");
+    .filter((row) => typeof row.implied_volatility === "number")
+    .map((row) => ({
+      timestamp: row.timestamp,
+      value: row.implied_volatility as number
+    }));
+};
+
+const getHistoricalImpliedVols = (
+  symbol: string,
+  asOf: string,
+  context: OptionFeatureContext
+): number[] => {
+  const normalized = normalizeSymbol(symbol);
+  const cached = context.historicalImpliedVols.get(normalized);
+  const rows = cached ?? readHistoricalImpliedVols(normalized);
+  if (!cached) {
+    context.historicalImpliedVols.set(normalized, rows);
+  }
+  return rows
+    .filter((row) => row.timestamp <= asOf)
+    .map((row) => row.value);
 };
 
 const impliedVolPercentile = (value: number | null, samples: number[]): number | null => {
@@ -86,7 +131,8 @@ const impliedVolPercentile = (value: number | null, samples: number[]): number |
 const buildOptionFeatures = (
   symbol: string,
   asOf: string,
-  close: number
+  close: number,
+  context: OptionFeatureContext
 ): {
   nearestExpiration: string | null;
   daysToExpiration: number | null;
@@ -101,7 +147,7 @@ const buildOptionFeatures = (
   optionSuitability: "suitable" | "marginal" | "unsuitable" | "insufficient_data";
 } => {
   const asOfTs = parseDate(asOf);
-  const rows = getLatestContractRows(symbol).filter((row) =>
+  const rows = getLatestContractRows(symbol, context).filter((row) =>
     row.bid != null || row.ask != null || row.midpoint != null || row.impliedVolatility != null || row.volume != null || row.openInterest != null
   );
 
@@ -169,7 +215,7 @@ const buildOptionFeatures = (
   const atmImpliedVol = selected?.impliedVolatility ?? null;
   const ivPercentile = impliedVolPercentile(
     atmImpliedVol,
-    getHistoricalImpliedVols(symbol, asOf)
+    getHistoricalImpliedVols(symbol, asOf, context)
   );
   const estimatedBidAskSpreadPct =
     selected?.bid == null || selected?.ask == null || selected.bid <= 0
@@ -260,7 +306,10 @@ const collectBars = (
     volume: Number(bar.volume)
   }));
 
-const calculateRows = (bars: BarRecord[]): FeatureMap[] => {
+const calculateRows = (
+  bars: BarRecord[],
+  optionContext: OptionFeatureContext
+): FeatureMap[] => {
   const closes = bars.map((row) => row.close);
   const highs = bars.map((row) => row.high);
   const lows = bars.map((row) => row.low);
@@ -309,7 +358,8 @@ const calculateRows = (bars: BarRecord[]): FeatureMap[] => {
     const optionMetrics = buildOptionFeatures(
       bars[i].symbol,
       bars[i].timestamp,
-      closes[i]
+      closes[i],
+      optionContext
     );
 
     out.push(
@@ -372,11 +422,15 @@ export const buildFeatures = async (options?: {
     VALUES (?, ?, ?)
     ON CONFLICT(symbol, timestamp) DO UPDATE SET features = excluded.features
   `);
+  const optionContext: OptionFeatureContext = {
+    latestContractRows: new Map(),
+    historicalImpliedVols: new Map()
+  };
   let total = 0;
   const results: FeatureMap[] = [];
   for (const symbol of symbols) {
     const bars = collectBars(symbol, timeframe, options?.start, options?.end);
-    const featureRows = calculateRows(bars);
+    const featureRows = calculateRows(bars, optionContext);
     for (const row of featureRows) {
       insert.run(row.symbol, row.timestamp, JSON.stringify(row.features));
       total += 1;
