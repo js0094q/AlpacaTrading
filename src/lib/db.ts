@@ -424,6 +424,13 @@ const initialize = (): DbHandle => {
 
 export const getDb = (): DbHandle => initialize();
 
+export const closeDbForTests = () => {
+  if (database) {
+    database.close();
+    database = null;
+  }
+};
+
 export const queryAll = <T = Record<string, unknown>>(
   sql: string,
   params: Array<string | number | null> = []

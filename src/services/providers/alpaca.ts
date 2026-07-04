@@ -27,6 +27,23 @@ const getAuthHeaders = (): Record<string, string> => {
     : {};
 };
 
+const MAX_MARKET_DATA_PAGES = 100;
+const normalizeBarsPayload = (
+  value: unknown
+): Record<string, RawBar[]> => {
+  if (!value || typeof value !== "object") {
+    return {};
+  }
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([, rows]) => Array.isArray(rows))
+      .filter(([symbol]) => symbol.trim().length > 0)
+      .map(([symbol, rows]) => [symbol.toUpperCase(), rows]) as Array<
+        [string, RawBar[]]
+      >
+  );
+};
+
 const requestJson = async <T>(
   endpoint: string,
   options: RequestInit = {},
@@ -196,8 +213,20 @@ export const fetchAllBars = async (
 ): Promise<{ symbol: string; bar: RawBar; requestIds: Array<string | null> }[]> => {
   let pageToken: string | null = options.pageToken ?? null;
   const out: { symbol: string; bar: RawBar; requestIds: Array<string | null> }[] = [];
+  const seenTokens = new Set<string>();
+  let pageCount = 0;
+  if (pageToken) {
+    seenTokens.add(pageToken);
+  }
 
   while (true) {
+    pageCount += 1;
+    if (pageCount > MAX_MARKET_DATA_PAGES) {
+      throw new Error(
+        `Alpaca bars pagination exceeded safety cap (${MAX_MARKET_DATA_PAGES} pages).`
+      );
+    }
+
     const params = toSearchParams({
       symbols: options.symbols?.join(","),
       timeframe: options.timeframe || "1Day",
@@ -210,20 +239,33 @@ export const fetchAllBars = async (
       `/v2/stocks/bars${params ? `?${params}` : ""}`,
       { method: "GET" }
     );
-    const bars = response.data.bars || {};
-      for (const [symbol, rows] of Object.entries(bars)) {
-        for (const bar of rows) {
-          out.push({
-            symbol,
-            bar,
-            requestIds: [response.requestId]
+    const bars = normalizeBarsPayload(response.data?.bars);
+    const hasBars = Object.values(bars).some((rows) => rows.length > 0);
+    for (const [symbol, rows] of Object.entries(bars)) {
+      for (const bar of rows) {
+        out.push({
+          symbol,
+          bar,
+          requestIds: [response.requestId]
         });
       }
     }
-    const next = response.data.next_page_token;
+
+    const next = response.data && response.data.next_page_token;
+    if (!next && !hasBars) {
+      break;
+    }
     if (!next) {
       break;
     }
+
+    if (typeof next !== "string" || next.length === 0) {
+      throw new Error(`Alpaca bars pagination returned invalid next token: ${String(next)}`);
+    }
+    if (seenTokens.has(next)) {
+      throw new Error(`Alpaca bars pagination repeated token: ${next}`);
+    }
+    seenTokens.add(next);
     pageToken = next;
   }
   return out;

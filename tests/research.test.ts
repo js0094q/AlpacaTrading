@@ -1,7 +1,7 @@
 import { after, beforeEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 
 process.env.RESEARCH_DB_PATH = join(mkdtempSync(join(tmpdir(), "alpaca-research-test-")), "research.db");
@@ -29,7 +29,8 @@ const [
   targetService,
   researchOrchestrator,
   candidateRankingService,
-  paperTradeService
+  paperTradeService,
+  providerAlpaca
 ] = await Promise.all([
   import("../src/lib/db.js"),
   import("../src/services/universeService.js"),
@@ -40,10 +41,11 @@ const [
   import("../src/services/targetService.js"),
   import("../src/services/researchOrchestrator.js"),
   import("../src/services/candidateRankingService.js"),
-  import("../src/services/paperTradeService.js")
+  import("../src/services/paperTradeService.js"),
+  import("../src/services/providers/alpaca.js")
 ]);
 
-const { getDb } = libDb;
+const { closeDbForTests, getDb } = libDb;
 const { seedInitialUniverse, addTicker, getAllUniverse } = universeService;
 const { buildFeatures } = featureService;
 const { toContractRow } = optionService;
@@ -53,6 +55,7 @@ const { generateTargets } = targetService;
 const { runResearchDaily } = researchOrchestrator;
 const { rankResearchCandidates } = candidateRankingService;
 const { buildPaperTradePlans, evaluatePaperTrades, buildResearchReport } = paperTradeService;
+const { fetchAllBars } = providerAlpaca;
 
 const resetDatabase = () => {
   const db = getDb();
@@ -167,7 +170,18 @@ const buildOptionSnapshotsPayload = (symbols: string[]) => ({
   )
 });
 
-const setMockFetchForSuccess = (includeOptions = false) => {
+const setMockFetchForSuccess = (
+  includeOptions = false,
+  barsBySymbol: Record<string, Array<{
+    t: string;
+    o: number;
+    h: number;
+    l: number;
+    c: number;
+    v: number;
+  }>> | null = null,
+  nextPageToken?: string | null
+) => {
   globalThis.fetch = async (input: string | Request | URL) => {
     const target = String(input);
     if (target.includes("/v2/stocks/bars")) {
@@ -176,9 +190,15 @@ const setMockFetchForSuccess = (includeOptions = false) => {
         .split(",")
         .filter(Boolean)
         .map((value) => value.toUpperCase());
-      const { barsBySymbol } = buildBarsPayload(symbols);
+      const payload = barsBySymbol ?? buildBarsPayload(symbols).barsBySymbol;
+      const response: Record<string, unknown> = {
+        bars: payload
+      };
+      if (nextPageToken !== undefined) {
+        response.next_page_token = nextPageToken;
+      }
       return makeMockResponse({
-        bars: barsBySymbol
+        ...response
       });
     }
 
@@ -247,7 +267,8 @@ beforeEach(() => {
 
 after(() => {
   const path = process.env.RESEARCH_DB_PATH!;
-  rmSync(path.substring(0, path.lastIndexOf("/")), { recursive: true, force: true });
+  closeDbForTests();
+  rmSync(dirname(path), { recursive: true, force: true });
 });
 
 describe("Universe management", () => {
@@ -606,7 +627,88 @@ describe("Target generation and learning influence", () => {
   });
 });
 
+describe("Alpaca provider pagination", () => {
+  test("stops pagination when next_page_token is omitted", async () => {
+    let pageCalls = 0;
+    globalThis.fetch = async (input: string | Request | URL) => {
+      const target = String(input);
+      if (target.includes("/v2/stocks/bars")) {
+        pageCalls += 1;
+        const endpoint = new URL(target);
+        const symbols = (endpoint.searchParams.get("symbols") || "")
+          .split(",")
+          .filter(Boolean)
+          .map((value) => value.toUpperCase());
+        return makeMockResponse({
+          bars: buildBarsPayload(symbols).barsBySymbol
+        });
+      }
+      return makeMockResponse({});
+    };
+
+    const rows = await fetchAllBars({
+      symbols: ["SPY"],
+      timeframe: "1Day",
+      start: ts(0)
+    });
+
+    assert.equal(pageCalls, 1);
+    assert.equal(rows.length, 60);
+  });
+
+  test("throws when bars pagination repeats the same next page token", async () => {
+    let pageCalls = 0;
+    const repeatedRows = buildBarsPayload(["SPY"]).barsBySymbol;
+    globalThis.fetch = async (input: string | Request | URL) => {
+      const target = String(input);
+      if (target.includes("/v2/stocks/bars")) {
+        pageCalls += 1;
+        return makeMockResponse({
+          bars: repeatedRows,
+          next_page_token: pageCalls === 1 ? "same-token" : "same-token"
+        });
+      }
+      return makeMockResponse({});
+    };
+
+    await assert.rejects(
+      () => fetchAllBars({ symbols: ["SPY"], timeframe: "1Day", start: ts(0) }),
+      /Alpaca bars pagination repeated token/i
+    );
+  });
+});
+
 describe("Research orchestration", () => {
+  test("completes when bars response includes next_page_token null", async () => {
+    setMockFetchForSuccess(false, null, null);
+    const result = await runResearchDaily({ riskProfile: "moderate", optionsEnabled: false, maxCandidates: 4 });
+
+    const run = getDb()
+      .prepare("SELECT status, targets_generated, candidates_selected FROM research_runs WHERE id = ?")
+      .get(result.runId) as {
+      status: string;
+      targets_generated: number;
+      candidates_selected: number;
+    };
+
+    assert.equal(run.status, "completed");
+    assert.equal(run.targets_generated, result.targetsGenerated);
+    assert.equal(run.candidates_selected, result.candidatesSelected);
+  });
+
+  test("completes when bars response is an empty object and next_page_token is null", async () => {
+    setMockFetchForSuccess(false, {}, null);
+    const result = await runResearchDaily({ riskProfile: "moderate", optionsEnabled: false, maxCandidates: 4 });
+
+    const run = getDb()
+      .prepare("SELECT status FROM research_runs WHERE id = ?")
+      .get(result.runId) as { status: string };
+    assert.equal(run.status, "completed");
+    assert.equal(typeof result.runId, "string");
+    assert.equal(result.universeSize >= 1, true);
+    assert.equal(result.candidatesSelected >= 0, true);
+  });
+
   test("creates research run records and paper plans on success", async () => {
     setMockFetchForSuccess(false);
     const result = await runResearchDaily({

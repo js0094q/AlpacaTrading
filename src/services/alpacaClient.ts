@@ -142,6 +142,22 @@ const parseResponseBody = async (response: Response): Promise<unknown> => {
   }
 };
 
+const executeWithTimeout = async <T>(
+  timeoutMs: number,
+  task: (signal: AbortSignal) => Promise<T>
+): Promise<T> => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, timeoutMs);
+
+  try {
+    return await task(controller.signal);
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
 export const getAlpacaPaperEndpoint = async <T>(endpoint: string): Promise<AlpacaApiResponse<T>> => {
   return requestJson<T>(endpoint, "trade");
 };
@@ -175,26 +191,23 @@ const requestPaperTradingJson = async <T>(
   let lastError: unknown = null;
 
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => {
-      controller.abort();
-    }, timeoutMs);
-
+    let response: Response;
     try {
-      const response = await fetch(url, {
-        ...options,
-        method,
-        headers: {
-          "APCA-API-KEY-ID": credentials.apiKey,
-          "APCA-API-SECRET-KEY": credentials.secretKey,
-          "User-Agent": config.alpaca.userAgent,
-          "Content-Type": "application/json",
-          ...(options.headers || {})
-        },
-        signal: controller.signal
-      });
+      response = await executeWithTimeout(timeoutMs, (signal) =>
+        fetch(url, {
+          ...options,
+          method,
+          headers: {
+            "APCA-API-KEY-ID": credentials.apiKey,
+            "APCA-API-SECRET-KEY": credentials.secretKey,
+            "User-Agent": config.alpaca.userAgent,
+            "Content-Type": "application/json",
+            ...(options.headers || {})
+          },
+          signal
+        })
+      );
 
-      clearTimeout(timeout);
       const requestId = response.headers.get("x-request-id") || undefined;
       const status = response.status;
       const parsedBody = await parseResponseBody(response);
@@ -225,7 +238,6 @@ const requestPaperTradingJson = async <T>(
         url
       };
     } catch (error) {
-      clearTimeout(timeout);
       if (error instanceof DOMException && error.name === "AbortError") {
         lastError = new Error(`Alpaca request timed out after ${timeoutMs}ms.`);
       } else {
@@ -297,24 +309,21 @@ const requestJson = async <T>(
   let lastError: unknown = null;
 
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => {
-      controller.abort();
-    }, timeoutMs);
-
+    let response: Response;
     try {
-      const response = await fetch(url, {
-        method: "GET",
-        headers: {
-          "APCA-API-KEY-ID": credentials.apiKey,
-          "APCA-API-SECRET-KEY": credentials.secretKey,
-          "User-Agent": config.alpaca.userAgent,
-          "Content-Type": "application/json"
-        },
-        signal: controller.signal
-      });
+      response = await executeWithTimeout(timeoutMs, (signal) =>
+        fetch(url, {
+          method: "GET",
+          headers: {
+            "APCA-API-KEY-ID": credentials.apiKey,
+            "APCA-API-SECRET-KEY": credentials.secretKey,
+            "User-Agent": config.alpaca.userAgent,
+            "Content-Type": "application/json"
+          },
+          signal
+        })
+      );
 
-      clearTimeout(timeout);
       const requestId = response.headers.get("x-request-id") || undefined;
       const status = response.status;
       const parsedBody = await parseResponseBody(response);
@@ -345,7 +354,6 @@ const requestJson = async <T>(
         url
       };
     } catch (error) {
-      clearTimeout(timeout);
       if (error instanceof DOMException && error.name === "AbortError") {
         lastError = new Error(`Alpaca request timed out after ${timeoutMs}ms.`);
       } else {
