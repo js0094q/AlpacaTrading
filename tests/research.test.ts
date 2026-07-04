@@ -9,6 +9,8 @@ process.env.TRADING_MODE = "paper";
 process.env.ALPACA_LIVE_TRADE = "false";
 process.env.ENABLE_AGGRESSIVE_PAPER_STRATEGIES = "true";
 process.env.ENABLE_OPTIONS_RESEARCH = "true";
+process.env.ALPACA_REQUEST_TIMEOUT_MS = "5";
+process.env.ALPACA_MAX_RETRIES = "0";
 
 globalThis.fetch = async () =>
   ({
@@ -284,6 +286,11 @@ describe("Universe management", () => {
 });
 
 describe("Market bar persistence", () => {
+  test("configures SQLite busy timeout for transient writer contention", () => {
+    const row = getDb().prepare("PRAGMA busy_timeout").get() as Record<string, number>;
+    assert.equal(Object.values(row)[0], 5000);
+  });
+
   test("stores bars without duplicate rows", () => {
     const statement = getDb().prepare(
       `
@@ -299,6 +306,20 @@ describe("Market bar persistence", () => {
     assert.equal(
       readCount(`SELECT COUNT(*) AS count FROM market_bars WHERE symbol = 'SPY' AND timestamp = '${date}'`),
       1
+    );
+  });
+
+  test("times out stalled Alpaca market data requests", async () => {
+    globalThis.fetch = async (_input: string | Request | URL, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          reject(new DOMException("Aborted", "AbortError"));
+        });
+      });
+
+    await assert.rejects(
+      () => fetchAllBars({ symbols: ["SPY"], timeframe: "1Day" }),
+      /Alpaca request timed out after 5ms/
     );
   });
 });

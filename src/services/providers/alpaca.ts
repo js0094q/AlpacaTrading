@@ -28,6 +28,26 @@ const getAuthHeaders = (): Record<string, string> => {
 };
 
 const MAX_MARKET_DATA_PAGES = 100;
+
+const executeWithTimeout = async <T>(
+  timeoutMs: number,
+  task: (signal: AbortSignal) => Promise<T>
+): Promise<T> => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, timeoutMs);
+
+  try {
+    return await task(controller.signal);
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
+const isAbortError = (error: unknown) =>
+  error instanceof DOMException && error.name === "AbortError";
+
 const normalizeBarsPayload = (
   value: unknown
 ): Record<string, RawBar[]> => {
@@ -52,14 +72,43 @@ const requestJson = async <T>(
   const apiRoot = baseUrl === "trade"
     ? (config.paperByDefault ? config.alpaca.paperBaseUrl : config.alpaca.liveBaseUrl)
     : config.alpaca.dataBaseUrl;
-  const response = await fetch(`${apiRoot}${endpoint}`, {
-    ...options,
-    headers: {
-      ...(options.headers || {}),
-      ...getAuthHeaders(),
-      "Content-Type": "application/json"
+  const timeoutMs = config.alpaca.requestTimeoutMs;
+  const maxRetries = config.alpaca.maxRetries;
+  let response: Response | null = null;
+  let lastError: unknown = null;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    try {
+      response = await executeWithTimeout(timeoutMs, (signal) =>
+        fetch(`${apiRoot}${endpoint}`, {
+          ...options,
+          headers: {
+            ...(options.headers || {}),
+            ...getAuthHeaders(),
+            "Content-Type": "application/json",
+            "User-Agent": config.alpaca.userAgent
+          },
+          signal
+        })
+      );
+      break;
+    } catch (error) {
+      lastError = isAbortError(error)
+        ? new Error(`Alpaca request timed out after ${timeoutMs}ms.`)
+        : error;
+
+      if (attempt >= maxRetries) {
+        throw lastError;
+      }
     }
-  });
+  }
+
+  if (!response) {
+    throw lastError instanceof Error
+      ? lastError
+      : new Error("Alpaca request failed and could not be completed.");
+  }
+
   const requestId = response.headers.get("x-request-id");
   const status = response.status;
   const text = await response.text();
