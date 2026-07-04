@@ -428,14 +428,22 @@ export const buildFeatures = async (options?: {
   };
   let total = 0;
   const results: FeatureMap[] = [];
-  for (const symbol of symbols) {
-    const bars = collectBars(symbol, timeframe, options?.start, options?.end);
-    const featureRows = calculateRows(bars, optionContext);
-    for (const row of featureRows) {
-      insert.run(row.symbol, row.timestamp, JSON.stringify(row.features));
-      total += 1;
-      results.push(row);
+  const db = getDb();
+  db.exec("BEGIN");
+  try {
+    for (const symbol of symbols) {
+      const bars = collectBars(symbol, timeframe, options?.start, options?.end);
+      const featureRows = calculateRows(bars, optionContext);
+      for (const row of featureRows) {
+        insert.run(row.symbol, row.timestamp, JSON.stringify(row.features));
+        total += 1;
+        results.push(row);
+      }
     }
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
   }
   return { featuresStored: total, symbolsProcessed: symbols.length, rows: results };
 };
