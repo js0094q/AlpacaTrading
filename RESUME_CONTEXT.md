@@ -1,5 +1,57 @@
 # Resume Context: Alpaca Trading Research Infra
 
+## Latest VPS Paper Runtime Handoff - 2026-07-04 UTC
+
+- VPS target confirmed:
+  - SSH user/host: `alpaca@185.193.127.15`
+  - Hostname: `jspaper`
+  - VPS repo path: `/home/alpaca/Alpaca-Trading`
+  - Runtime secrets path: `/opt/alpaca-investing/secrets/alpaca.env`
+- SSH key path from local repo:
+  - `/Users/josephstewart/Documents/Alpaca Trading/.ssh/id_ed25519`
+  - Key passphrase is stored in local `.ssh/.sshpw`; when automating, use the value after the `password=` prefix and do not commit or print it.
+- Local and VPS Git state were aligned on `main` against `origin/main`.
+- Paper credentials were placed on the VPS at `/opt/alpaca-investing/secrets/alpaca.env` with `600` permissions and `alpaca:alpaca` ownership.
+- VPS `alpaca:health -- --format=json` passed:
+  - `paperOnly: true`
+  - `liveTradingEnabled: false`
+  - `mutationAllowed: false`
+  - `accountReachable: true`
+  - `accountStatus: ACTIVE`
+- VPS `paper:runtime -- --format=json` passed and returned paper account state.
+- VPS `paper:review -- --riskProfile=moderate --optionsEnabled=true --format=json` completed but was blocked by `NO_RESEARCH_SNAPSHOTS`.
+- VPS `paper:plan -- --riskProfile=moderate --optionsEnabled=true --maxCandidates=10 --format=json` completed with no planned orders because there were no research snapshots.
+- `research:daily` follow-up was paused before a fresh snapshot was verified:
+  - Wide run with `--useAlpacaAssets=true` used a `timeout 600` guard and exited with status `124`; output file `/home/alpaca/research-daily-20260704T013221Z.json` only contained the npm command header.
+  - Static-universe run with `timeout 240` was manually stopped at the user's pause request before completion; no fresh snapshot was verified from it.
+  - After stopping, no `research:daily` / `tsx src/cli.ts research daily` processes remained on the VPS.
+- Current resume objective:
+  - Run one clean, bounded `research:daily` on the VPS until it exits successfully and writes fresh snapshots.
+  - Then rerun `paper:snapshots`, `paper:runtime`, `paper:review`, and `paper:plan` to confirm `NO_RESEARCH_SNAPSHOTS` is cleared.
+
+Suggested bounded resume sequence on VPS:
+
+```bash
+cd /home/alpaca/Alpaca-Trading
+export NVM_DIR="$HOME/.nvm"
+. "$NVM_DIR/nvm.sh"
+set -a
+. /opt/alpaca-investing/secrets/alpaca.env
+set +a
+ps -ef | grep -E "[t]sx src/cli.ts research daily|[n]ode .*src/cli.ts research daily|[t]imeout .*research:daily" || true
+timeout 300 npm run research:daily -- --riskProfile=aggressive --optionsEnabled=true --maxCandidates=3 --format=json --barLookbackDays=120
+npm run paper:snapshots -- --format=json --limit=5
+npm run paper:runtime -- --format=json
+npm run paper:review -- --riskProfile=aggressive --optionsEnabled=true --format=json
+npm run paper:plan -- --riskProfile=aggressive --optionsEnabled=true --maxCandidates=10 --format=json
+```
+
+- Keep paper-only gates intact:
+  - `ALPACA_ENV=paper`
+  - `LIVE_TRADING_ENABLED=false`
+  - no live trading path
+  - no `paper:execute --confirmPaper` unless explicitly requested.
+
 - Added Alpaca Paper API read-only integration for account snapshots, positions, open orders, market clock, and asset tradability checks.
 - Added paper-only safety guardrails for mutation controls (`alpaca:health`, trading safety assertions, default non-mutating behavior).
 - Extended `research:daily` with optional `--useAlpacaAssets=true` filtering and preserved exclusion reasons in run output and run summary.
