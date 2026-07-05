@@ -32,7 +32,8 @@ const [
   researchOrchestrator,
   candidateRankingService,
   paperTradeService,
-  providerAlpaca
+  providerAlpaca,
+  appConfig
 ] = await Promise.all([
   import("../src/lib/db.js"),
   import("../src/services/universeService.js"),
@@ -44,7 +45,8 @@ const [
   import("../src/services/researchOrchestrator.js"),
   import("../src/services/candidateRankingService.js"),
   import("../src/services/paperTradeService.js"),
-  import("../src/services/providers/alpaca.js")
+  import("../src/services/providers/alpaca.js"),
+  import("../src/config.js")
 ]);
 
 const { closeDbForTests, getDb } = libDb;
@@ -58,6 +60,7 @@ const { runResearchDaily } = researchOrchestrator;
 const { rankResearchCandidates } = candidateRankingService;
 const { buildPaperTradePlans, evaluatePaperTrades, buildResearchReport } = paperTradeService;
 const { fetchAllBars } = providerAlpaca;
+const { config: runtimeConfig } = appConfig;
 
 const resetDatabase = () => {
   const db = getDb();
@@ -286,6 +289,10 @@ describe("Universe management", () => {
 });
 
 describe("Market bar persistence", () => {
+  test("honors zero Alpaca retry override", () => {
+    assert.equal(runtimeConfig.alpaca.maxRetries, 0);
+  });
+
   test("configures SQLite busy timeout for transient writer contention", () => {
     const row = getDb().prepare("PRAGMA busy_timeout").get() as Record<string, number>;
     assert.equal(Object.values(row)[0], 5000);

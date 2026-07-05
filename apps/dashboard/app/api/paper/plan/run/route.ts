@@ -5,4 +5,8 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export const POST = (request: Request) =>
-  guardedHistoricalPost(request, runPaperPlan);
+  guardedHistoricalPost(request, runPaperPlan, {
+    vpsPath: "/api/v1/plan/run",
+    timeoutMs: 60_000,
+    requireAdminToken: true
+  });

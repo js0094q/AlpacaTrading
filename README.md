@@ -1,5 +1,35 @@
 # Alpaca Trading Research Infrastructure
 
+## Current continuation checkpoint (July 2026)
+
+- 2026-07-05: VPS was rebuilt from scratch and re-bootstrapped using `/opt/alpaca-investing/secrets/alpaca.env` for runtime secrets.
+- Current VPS state:
+  - Host alias: `njalla-vps` (target `alpaca@185.193.127.15`)
+  - Repo path on VPS: `/home/alpaca/Alpaca-Trading`
+  - Runtime repo service: `alpaca-dashboard-control` (systemd) is active and bound to `127.0.0.1:4100`.
+  - Health endpoint is reachable locally at `/api/v1/health` (paper-only checks enabled).
+  - `POST /api/v1/refresh` requires auth token and correctly returns paper-only guard results at present.
+- Current hardening posture after rebuild:
+  - SSH is key-only (`PasswordAuthentication no`, `KbdInteractiveAuthentication no`).
+  - Root key recovery remains intentionally preserved (`PermitRootLogin without-password`) until explicitly disabled.
+  - `UFW` and `fail2ban` have been revalidated after privilege/session changes.
+- Token coordination to verify before control actions:
+  - `VPS_CONTROL_TOKEN` must be present in both `/opt/alpaca-investing/secrets/alpaca.env` and Vercel production env.
+  - `DASHBOARD_ADMIN_TOKEN` should be confirmed in Vercel production for dashboard admin/mutating routes.
+- Verified dashboard bridge state:
+  - Public summary and refresh routes reach the VPS control service and return paper-only state.
+  - Public `POST /api/paper/research/run` completes with valid admin auth using bounded control-service research defaults.
+  - Latest review is blocked because all current candidates already have open paper orders, so no execution path is ready.
+- Fast resume command sequence:
+  - `ssh njalla-vps`
+  - load Node 22 and secrets from `/opt/alpaca-investing/secrets/alpaca.env`
+  - run:
+    - `bash server/verify_server.sh`
+    - `npm run paper:snapshots -- --format=json --limit=5`
+    - `npm run paper:runtime -- --format=json`
+    - `npm run paper:review -- --riskProfile=aggressive --optionsEnabled=true --format=json`
+    - `npm run paper:plan -- --riskProfile=aggressive --optionsEnabled=true --maxCandidates=10 --format=json`
+
 This repository now contains a durable paper-trading research stack with:
 
 - durable universe storage and management
@@ -69,6 +99,8 @@ ENABLE_SHORT_RESEARCH=true
 RESEARCH_DB_PATH=./data/research.db
 ALPACA_REQUEST_TIMEOUT_MS=15000
 ALPACA_MAX_RETRIES=2
+VPS_RESEARCH_REQUEST_TIMEOUT_MS=10000
+VPS_RESEARCH_MAX_RETRIES=0
 ```
 
 The CLI loads `.env` first, then `.env.txt` as fallback when keys are missing. If both files exist, `.env` values take precedence over `.env.txt`.
@@ -90,6 +122,8 @@ ALPACA_PAPER_SECRET_KEY=replace_me
 LIVE_TRADING_ENABLED=false
 ALPACA_REQUEST_TIMEOUT_MS=15000
 ALPACA_MAX_RETRIES=2
+VPS_RESEARCH_REQUEST_TIMEOUT_MS=10000
+VPS_RESEARCH_MAX_RETRIES=0
 ```
 
 ### Health check

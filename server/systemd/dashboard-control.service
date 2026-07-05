@@ -1,0 +1,26 @@
+[Unit]
+Description=Alpaca Trading Dashboard Control API
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=alpaca
+Group=alpaca
+WorkingDirectory=/home/alpaca/Alpaca-Trading
+EnvironmentFile=/opt/alpaca-investing/secrets/alpaca.env
+Environment=PATH=/usr/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=VPS_CONTROL_BIND_HOST=127.0.0.1
+Environment=VPS_CONTROL_PORT=4100
+Environment=VPS_CONTROL_AUDIT_PATH=/opt/alpaca-investing/logs/dashboard-control-audit.jsonl
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node /home/alpaca/Alpaca-Trading/node_modules/tsx/dist/cli.mjs server/dashboard-control/server.ts
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGINT
+TimeoutStopSec=30s
+StandardOutput=append:/opt/alpaca-investing/logs/dashboard-control.service.log
+StandardError=append:/opt/alpaca-investing/logs/dashboard-control.service.error.log
+
+[Install]
+WantedBy=multi-user.target

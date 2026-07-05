@@ -69,6 +69,23 @@ export const assertPaperOptionsSubmissionEnabled = () => {
   }
 };
 
+export const assertDashboardAdminToken = (token: string | null) => {
+  const expected = process.env.DASHBOARD_ADMIN_TOKEN;
+  if (!expected) {
+    throw new DashboardGuardError(
+      "DASHBOARD_ADMIN_TOKEN_MISSING",
+      "Dashboard admin token is not configured. Set DASHBOARD_ADMIN_TOKEN to enable dashboard actions."
+    );
+  }
+
+  if (!token || token !== expected) {
+    throw new DashboardGuardError(
+      "DASHBOARD_ADMIN_TOKEN_INVALID",
+      "Invalid dashboard admin token."
+    );
+  }
+};
+
 export const sanitizeDashboardError = (error: unknown) => {
   if (error instanceof DashboardGuardError) {
     return {

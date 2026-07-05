@@ -96,7 +96,7 @@ export const config = {
     dataBaseUrl: firstEnv("ALPACA_DATA_BASE_URL") || "https://data.alpaca.markets",
     requestTimeoutMs:
       Number.parseInt(process.env.ALPACA_REQUEST_TIMEOUT_MS || "15000", 10) || 15000,
-    maxRetries: Number.parseInt(process.env.ALPACA_MAX_RETRIES || "2", 10) || 2,
+    maxRetries: parseInteger(process.env.ALPACA_MAX_RETRIES, 2),
     userAgent: process.env.ALPACA_USER_AGENT || "alpaca-research-cli"
   }
 };

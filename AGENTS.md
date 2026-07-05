@@ -33,6 +33,24 @@ This repository is for preparing infrastructure for a future paper-first Alpaca 
 - Preserve the CLI-first architecture and existing dashboard route boundaries unless explicitly asked to broaden them.
 - Use existing modules and naming first, only add new abstractions when needed.
 
+## Current continuation note (2026-07-05)
+
+- VPS was rebuilt from empty and re-bootstrapped using `/opt/alpaca-investing/secrets/alpaca.env` as the runtime environment source.
+- Runtime endpoint status after rebuild:
+  - `alpaca-dashboard-control` service is running from `server/systemd/dashboard-control.service`.
+  - Control API currently listens on `127.0.0.1:4100`.
+  - `/opt/alpaca-investing/secrets/alpaca.env` includes `VPS_CONTROL_TOKEN`, `VPS_CONTROL_PORT`, `VPS_CONTROL_BIND_HOST`, and paper safety flags.
+- Coordination rule for the next handoff:
+  - `VPS_CONTROL_TOKEN` must match between VPS runtime env and Vercel runtime env.
+  - `DASHBOARD_ADMIN_TOKEN` should be set in Vercel production before mutating dashboard admin routes are used.
+- Verified bridge state:
+  - Public `https://www.jlsprojects.com/api/paper/summary` returns paper-only state through the VPS bridge.
+  - Public `POST /api/paper/research/run` succeeds with a valid admin token after the control service bounds research to `--barLookbackDays=120`, `ALPACA_REQUEST_TIMEOUT_MS=10000`, and `ALPACA_MAX_RETRIES=0`.
+  - `paper:review` is currently blocked by duplicate open orders (`OPEN_ORDER_EXISTS`) for the latest candidates, not by missing research snapshots.
+- Security state to preserve:
+  - SSH access is key-only; root password login is disabled while root key recovery remains intentionally preserved until the user says otherwise.
+  - `UFW` and `fail2ban` were revalidated after the rebuild.
+
 ## Core module map (for quick resume)
 
 - CLI: `src/cli.ts`

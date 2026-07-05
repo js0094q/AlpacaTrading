@@ -33,12 +33,13 @@
     "paper:review": "tsx src/cli.ts paper:review",
     "paper:execute": "tsx src/cli.ts paper:execute",
     "paper:evaluate": "tsx src/cli.ts paper evaluate",
+    "dashboard:control": "tsx server/dashboard-control/server.ts",
     "dashboard:dev": "next dev apps/dashboard --webpack",
     "dashboard:build": "next build apps/dashboard --webpack",
     "dashboard:start": "next start apps/dashboard",
     "lint": "npm run typecheck",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test tests/research.test.ts && tsx --test tests/paperOutcomeAnalytics.test.ts && tsx --test tests/paperRecommendationSnapshotService.test.ts && tsx --test tests/paperIntelligence.test.ts && tsx --test tests/paperPlanService.test.ts && tsx --test tests/paperReviewService.test.ts && tsx --test tests/paperExecuteDryRunService.test.ts && tsx --test tests/dashboardGuard.test.ts && tsx --test tests/dashboardVercelFallback.test.ts && tsx --test tests/alpacaConfigDiagnostic.test.ts && tsx --test tests/alpacaReadOnlyIntegration.test.ts",
+    "test": "tsx --test tests/research.test.ts && tsx --test tests/paperOutcomeAnalytics.test.ts && tsx --test tests/paperRecommendationSnapshotService.test.ts && tsx --test tests/paperIntelligence.test.ts && tsx --test tests/paperPlanService.test.ts && tsx --test tests/paperReviewService.test.ts && tsx --test tests/paperExecuteDryRunService.test.ts && tsx --test tests/dashboardGuard.test.ts && tsx --test tests/dashboardVercelFallback.test.ts && tsx --test tests/alpacaConfigDiagnostic.test.ts && tsx --test tests/alpacaReadOnlyIntegration.test.ts && tsx --test tests/dashboardControlServer.test.ts && tsx --test tests/dashboardVercelBridge.test.ts",
     "build": "tsc"
   },
   "devDependencies": {

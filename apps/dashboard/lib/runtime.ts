@@ -11,11 +11,26 @@ export const VERCEL_HISTORICAL_STORAGE_WARNING =
 export const hasDashboardDurableStorageConfig = () =>
   Boolean(process.env.DASHBOARD_DATABASE_URL?.trim());
 
-export const DASHBOARD_PAPER_BRIDGE_URL = process.env.PAPER_DASHBOARD_BRIDGE_URL?.trim();
-export const DASHBOARD_PAPER_BRIDGE_TOKEN = process.env.PAPER_DASHBOARD_BRIDGE_TOKEN?.trim();
+const readEnvValue = (name: string) => process.env[name]?.trim();
+
+export const DASHBOARD_PAPER_BRIDGE_URL = () => readEnvValue("PAPER_DASHBOARD_BRIDGE_URL");
+export const DASHBOARD_PAPER_BRIDGE_TOKEN = () => readEnvValue("PAPER_DASHBOARD_BRIDGE_TOKEN");
+
+export const resolveVpsControlBaseUrl = () =>
+  readEnvValue("VPS_CONTROL_BASE_URL") || DASHBOARD_PAPER_BRIDGE_URL();
+export const resolveDashboardControlToken = () =>
+  readEnvValue("VPS_CONTROL_TOKEN") || DASHBOARD_PAPER_BRIDGE_TOKEN();
+export const resolveDashboardAdminToken = () => readEnvValue("DASHBOARD_ADMIN_TOKEN");
+
+export const DASHBOARD_CONTROL_BASE_URL = () => resolveVpsControlBaseUrl();
+export const DASHBOARD_CONTROL_TOKEN = () => resolveDashboardControlToken();
+export const DASHBOARD_ADMIN_TOKEN = () => resolveDashboardAdminToken();
 
 export const isPaperDashboardBridgeEnabled = () =>
-  isVercelRuntime() && Boolean(DASHBOARD_PAPER_BRIDGE_URL);
+  isVercelRuntime() && Boolean(DASHBOARD_CONTROL_BASE_URL());
+
+export const isPaperDashboardAdminEnabled = () =>
+  isVercelRuntime() && Boolean(DASHBOARD_ADMIN_TOKEN());
 
 export const shouldUseVercelReadOnlyFallback = () =>
   isVercelRuntime() && !isPaperDashboardBridgeEnabled();

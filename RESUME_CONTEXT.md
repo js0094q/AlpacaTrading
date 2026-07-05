@@ -1,137 +1,69 @@
 # Resume Context: Alpaca Trading Research Infra
 
-## Latest VPS Paper Runtime Handoff - 2026-07-04 UTC
+## Latest VPS handoff status (2026-07-05 UTC)
 
-- VPS target confirmed:
-  - SSH user/host: `alpaca@185.193.127.15`
-  - Hostname: `jspaper`
-  - VPS repo path: `/home/alpaca/Alpaca-Trading`
-  - Runtime secrets path: `/opt/alpaca-investing/secrets/alpaca.env`
-- SSH key path from local repo:
-  - `/Users/josephstewart/Documents/Alpaca Trading/.ssh/id_ed25519`
-  - Key passphrase is stored in local `.ssh/.sshpw`; when automating, use the value after the `password=` prefix and do not commit or print it.
-- Local and VPS Git state were aligned on `main` against `origin/main`.
-- Paper credentials were placed on the VPS at `/opt/alpaca-investing/secrets/alpaca.env` with `600` permissions and `alpaca:alpaca` ownership.
-- VPS `alpaca:health -- --format=json` passed:
-  - `paperOnly: true`
-  - `liveTradingEnabled: false`
-  - `mutationAllowed: false`
-  - `accountReachable: true`
-  - `accountStatus: ACTIVE`
-- VPS `paper:runtime -- --format=json` passed and returned paper account state.
-- VPS `paper:review -- --riskProfile=moderate --optionsEnabled=true --format=json` completed but was blocked by `NO_RESEARCH_SNAPSHOTS`.
-- VPS `paper:plan -- --riskProfile=moderate --optionsEnabled=true --maxCandidates=10 --format=json` completed with no planned orders because there were no research snapshots.
-- `research:daily` follow-up was paused before a fresh snapshot was verified:
-  - Wide run with `--useAlpacaAssets=true` used a `timeout 600` guard and exited with status `124`; output file `/home/alpaca/research-daily-20260704T013221Z.json` only contained the npm command header.
-  - Static-universe run with `timeout 240` was manually stopped at the user's pause request before completion; no fresh snapshot was verified from it.
-  - After stopping, no `research:daily` / `tsx src/cli.ts research daily` processes remained on the VPS.
-- Current resume objective:
-  - Run one clean, bounded `research:daily` on the VPS until it exits successfully and writes fresh snapshots.
-  - Then rerun `paper:snapshots`, `paper:runtime`, `paper:review`, and `paper:plan` to confirm `NO_RESEARCH_SNAPSHOTS` is cleared.
-
-Suggested bounded resume sequence on VPS:
-
-```bash
-cd /home/alpaca/Alpaca-Trading
-export NVM_DIR="$HOME/.nvm"
-. "$NVM_DIR/nvm.sh"
-set -a
-. /opt/alpaca-investing/secrets/alpaca.env
-set +a
-ps -ef | grep -E "[t]sx src/cli.ts research daily|[n]ode .*src/cli.ts research daily|[t]imeout .*research:daily" || true
-timeout 300 npm run research:daily -- --riskProfile=aggressive --optionsEnabled=true --maxCandidates=3 --format=json --barLookbackDays=120
-npm run paper:snapshots -- --format=json --limit=5
-npm run paper:runtime -- --format=json
-npm run paper:review -- --riskProfile=aggressive --optionsEnabled=true --format=json
-npm run paper:plan -- --riskProfile=aggressive --optionsEnabled=true --maxCandidates=10 --format=json
-```
-
-- Keep paper-only gates intact:
+- VPS was rebuilt from empty and re-bootstrapped from this repo.
+- SSH target remains `alpaca@185.193.127.15` and can be reached as:
+  - `ssh njalla-vps`
+- VPS hostname is `jspaper`.
+- Repo location on VPS is `/home/alpaca/Alpaca-Trading`.
+- Runtime secrets are sourced from `/opt/alpaca-investing/secrets/alpaca.env`
+  - owned by `alpaca:alpaca`
+  - mode `600`
+- Runtime service layer currently expected:
+  - `alpaca-dashboard-control.service` (from `server/systemd/dashboard-control.service`)
+  - active and bound to `127.0.0.1:4100`.
+- Paper mode controls are still in force:
   - `ALPACA_ENV=paper`
+  - `ALPACA_LIVE_TRADE=false`
   - `LIVE_TRADING_ENABLED=false`
-  - no live trading path
-  - no `paper:execute --confirmPaper` unless explicitly requested.
+  - `PAPER_ORDER_EXECUTION_ENABLED=false`
+  - `PAPER_OPTIONS_EXECUTION_ENABLED=false`
+- Control bridge health:
+  - `GET /api/v1/health` without token returns a healthy 200.
+  - `POST /api/v1/refresh` without or with a bad token returns `401`.
+  - `POST /api/v1/refresh` with the control token returns 200 and remains non-mutating.
+  - Public `https://www.jlsprojects.com/api/paper/summary` returns paper-only state through the Vercel-to-VPS bridge.
+  - Public `POST https://www.jlsprojects.com/api/paper/research/run` succeeds with valid admin auth after the control action was bounded to `--barLookbackDays=120`, `ALPACA_REQUEST_TIMEOUT_MS=10000`, and `ALPACA_MAX_RETRIES=0`.
+- SSH hardening:
+  - key-based auth is active and password auth is disabled.
+  - root key recovery remains intentionally preserved (`PermitRootLogin without-password`) until the user explicitly disables it.
+  - `UFW` and `fail2ban` have been revalidated.
+- Runtime check results captured prior to pause:
+  - `alpaca:health` returned `paperOnly: true`.
+  - `paper:runtime -- --format=json` returned runtime state.
+  - latest `paper:runtime` sees 3 candidates.
+  - latest `paper:plan` finds the current research run but skips all candidates due to `OPEN_ORDER_EXISTS`.
+  - latest `paper:review` is blocked by `ALL_CANDIDATES_SKIPPED` and `NO_PLANNED_ORDERS`.
 
-- Added Alpaca Paper API read-only integration for account snapshots, positions, open orders, market clock, and asset tradability checks.
-- Added paper-only safety guardrails for mutation controls (`alpaca:health`, trading safety assertions, default non-mutating behavior).
-- Extended `research:daily` with optional `--useAlpacaAssets=true` filtering and preserved exclusion reasons in run output and run summary.
-- Extended `research:daily` to default to a 365-day daily-bar lookback (`--barLookbackDays=365`) so feature generation has enough history for rankable targets.
-- Added CLI commands for Alpaca inspection: `alpaca:health`, `alpaca:account`, `alpaca:positions`, `alpaca:orders`, `alpaca:asset`.
-- Added redacted Alpaca configuration diagnostic command:
-  - `alpaca:config`
-- Added `docs/vps-paper-research-deployment.md` with cron scheduling and cron-command examples for paper-only VPS workflows.
-- Added `.env.example` placeholders and scripts for read-only Alpaca commands plus the explicit paper-only `paper:execute --confirmPaper` gate; no live-order commands were added.
-- Added paper snapshot history read path for `paper:snapshots` with table and JSON output support.
-- Added paper intelligence read-only surface commands:
-  - `paper:trends`
-  - `paper:runtime`
-  - `paper:intel`
-- Added dry-run planning gate:
-  - `paper:plan`
-- Added review-only safety gate:
-  - `paper:review`
-- Added dry-run execution payload builder:
-  - `paper:execute -- --dryRun`
-- Added confirm-paper execution command:
-  - `paper:execute -- --confirmPaper`
-- Added paper-only Next.js dashboard under `apps/dashboard/`:
-  - `npm run dashboard:dev`
-  - `npm run dashboard:build`
-  - `npm run dashboard:start`
-- Dashboard API routes enforce `ALPACA_ENV=paper` and `LIVE_TRADING_ENABLED=false`; order submission additionally requires `PAPER_ORDER_EXECUTION_ENABLED=true`.
-- Vercel dashboard runtime is read-only for historical data:
-  - does not create `apps/dashboard/data`
-  - does not initialize local SQLite under `/var/task`
-  - returns `mode: "vercel-read-only"` fallback responses for historical routes
-  - still allows guarded live read-only paper account/positions if paper credentials are configured
-  - always blocks order submission on Vercel
-- VPS/local runtime remains the owner of SQLite history, scheduler, paper execution ledger, and paper submission.
-- Confirm-paper pre-submission gates:
-  - `ALPACA_ENV=paper`
-  - `LIVE_TRADING_ENABLED=false`
-  - `PAPER_ORDER_EXECUTION_ENABLED=true`
-  - `PAPER_OPTIONS_EXECUTION_ENABLED=true` for option payloads
-- Added realistic paper equity sizing defaults:
-  - `PAPER_EQUITY_NOTIONAL_PER_ORDER=1000`
-  - `PAPER_EQUITY_MAX_NOTIONAL_PER_ORDER=5000`
-  - `PAPER_EQUITY_MAX_PORTFOLIO_DEPLOY_PCT=50`
-  - `PAPER_EQUITY_MAX_POSITION_PCT=10`
-  - `PAPER_EQUITY_MIN_CASH_RESERVE_PCT=20`
-- Added practical paper options execution defaults (execution disabled by default):
-  - `PAPER_OPTIONS_MAX_PREMIUM_PER_ORDER=1000`
-  - `PAPER_OPTIONS_MAX_CONTRACTS=5`
-  - `PAPER_OPTIONS_MIN_DTE=0`
-  - `PAPER_OPTIONS_MAX_DTE=90`
-  - `PAPER_OPTIONS_ALLOW_0DTE=true`
-  - `PAPER_OPTIONS_ALLOW_MARKET_ORDERS=false`
-  - `PAPER_OPTIONS_LIMIT_PRICE_BASIS=mid`
-  - `PAPER_OPTIONS_MAX_SPREAD_PCT=50`
-  - `PAPER_OPTIONS_MAX_PORTFOLIO_RISK_PCT=20`
-  - `PAPER_OPTIONS_MAX_POSITION_RISK_PCT=5`
-  - `PAPER_OPTIONS_ALLOW_LONG_CALLS=true`
-  - `PAPER_OPTIONS_ALLOW_LONG_PUTS=true`
-  - `PAPER_OPTIONS_ALLOW_CASH_SECURED_PUTS=true`
-  - `PAPER_OPTIONS_ALLOW_COVERED_CALLS=true`
-  - `PAPER_OPTIONS_ALLOW_NAKED_OPTIONS=false`
-- `paper:execute --confirmPaper` remains blocked unless dry-run or confirm flag requirements and all blocker checks pass.
-- Execution ledger now records built, blocked, submitted, accepted, rejected, failed, and duplicate-blocked attempts with payload/response audit fields where available.
-- Optional runtime duplicate reconciliation checks recent paper orders when `PAPER_RUNTIME_DUPLICATE_RECONCILIATION_ENABLED=true`.
-- Multi-leg options are still intentionally left for a future phase; do not model spreads as separate unrelated single-leg submissions.
-- If review reports `NO_RUNTIME_CANDIDATES`, confirm the latest research run used enough bar history before changing planner/review logic.
-- Current validation checklist:
-  - `npm run alpaca:config -- --format=json`
-  - `npm run alpaca:health -- --format=json`
-  - `npm run alpaca:account -- --format=json`
-  - `npm run alpaca:positions -- --format=json`
-  - `npm run alpaca:orders -- --format=json`
-  - `npm run alpaca:asset -- --symbol=AAPL --format=json`
-  - `npm run research:daily -- --riskProfile=aggressive --optionsEnabled=true --maxCandidates=10 --useAlpacaAssets=true`
-  - `npm run paper:snapshots -- --format=json --limit=5`
-  - `npm run paper:trends -- --format=json`
-  - `npm run paper:runtime -- --format=json`
-  - `npm run paper:intel -- --format=json`
-  - `npm run paper:plan -- --riskProfile=aggressive --optionsEnabled=true --format=json`
-  - `npm run paper:review -- --riskProfile=aggressive --optionsEnabled=true --format=json`
-  - `npm run paper:execute -- --dryRun --riskProfile=aggressive --optionsEnabled=true --format=json`
-  - `npm run paper:execute -- --confirmPaper --format=json`
-  - `npm run dashboard:build`
+## Token/env coordination
+
+- `VPS_CONTROL_TOKEN` is configured in `/opt/alpaca-investing/secrets/alpaca.env`; Vercel must use the same value in `VPS_CONTROL_TOKEN`.
+- `DASHBOARD_ADMIN_TOKEN` belongs in Vercel production environment for dashboard mutating/admin routes.
+- Secrets must not be copied into repo files, client code, or Vercel frontend bundles.
+
+## Current continuation objective
+
+1. Open SSH control:
+   - `ssh njalla-vps`
+   - `cd /home/alpaca/Alpaca-Trading`
+   - load NVM and source `/opt/alpaca-investing/secrets/alpaca.env`.
+2. Confirm there are no stale research runs:
+   - `ps -ef | rg "tsx src/cli.ts research daily|npm run research:daily|timeout .*research:daily"`.
+3. Run bounded paper research only when a fresh research cycle is needed:
+   - `ALPACA_REQUEST_TIMEOUT_MS=10000 ALPACA_MAX_RETRIES=0 timeout 300 npm run research:daily -- --riskProfile=aggressive --optionsEnabled=true --maxCandidates=3 --format=json --barLookbackDays=120`.
+4. Verify output and re-run readiness chain:
+   - `npm run paper:snapshots -- --format=json --limit=5`
+   - `npm run paper:runtime -- --format=json`
+   - `npm run paper:review -- --riskProfile=aggressive --optionsEnabled=true --format=json`
+   - `npm run paper:plan -- --riskProfile=aggressive --optionsEnabled=true --maxCandidates=10 --format=json`.
+5. Once snapshots flow, re-check control bridge actions:
+   - `curl -sS -H "Authorization: Bearer $VPS_CONTROL_TOKEN" http://127.0.0.1:4100/api/v1/review/latest`
+   - `curl -sS -H "Authorization: Bearer $VPS_CONTROL_TOKEN" http://127.0.0.1:4100/api/v1/plan/latest`
+   - `curl -sS -X POST -H "Authorization: Bearer $VPS_CONTROL_TOKEN" -H "Content-Type: application/json" -d '{}' http://127.0.0.1:4100/api/v1/refresh`
+
+## Known safe boundaries
+
+- Do not enable any live or direct Alpaca execution on Vercel.
+- Keep dashboard actions behind explicit admin controls and VPS allowlisted commands.
+- Do not relax paper-only gates without an explicit request.

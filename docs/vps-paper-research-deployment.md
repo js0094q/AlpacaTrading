@@ -4,14 +4,21 @@
 
 This guide documents running the paper-only Alpaca research loop on a VPS for scheduled execution.
 
+## Current continuation checkpoint (2026-07-05 UTC)
+
+- VPS runtime has been rebuilt and currently reads secrets from `/opt/alpaca-investing/secrets/alpaca.env`.
+- The control bridge is running from `server/systemd/dashboard-control.service` on `127.0.0.1:4100`.
+- `VPS_CONTROL_TOKEN` is in the VPS runtime env and must match the same value in Vercel production env.
+- `DASHBOARD_ADMIN_TOKEN` must be present in Vercel production env for dashboard mutation actions.
+- SSH hardening is in place for key-only access; `UFW` and `fail2ban` were revalidated after bootstrap/minor privilege sequencing changed.
+
 ## Paper-only warning
 
 This phase is paper-first. Most CLI commands are read-only; `paper:execute --confirmPaper` is paper-only and submits paper orders only after explicit hard gates pass. The optional dashboard in `apps/dashboard/` uses the same paper-only service layer. No live trading is supported.
 
 ## Required Node version
 
-- Node.js 20+ is recommended for CLI workflows.
-- Node.js 24+ is recommended for the dashboard runtime because the local database layer uses `node:sqlite`.
+- Node.js 22+ is recommended for both CLI workflows and dashboard runtime.
 
 ## Required environment variables
 
@@ -50,6 +57,8 @@ PAPER_RUNTIME_DUPLICATE_RECONCILIATION_ENABLED=false
 ENABLE_AGGRESSIVE_PAPER_STRATEGIES=true
 ALPACA_REQUEST_TIMEOUT_MS=15000
 ALPACA_MAX_RETRIES=2
+VPS_RESEARCH_REQUEST_TIMEOUT_MS=10000
+VPS_RESEARCH_MAX_RETRIES=0
 ALPACA_USER_AGENT=alpaca-research-cli
 ```
 
@@ -79,6 +88,32 @@ Dashboard routes enforce `ALPACA_ENV=paper` and `LIVE_TRADING_ENABLED=false`. Su
 
 Use `PAPER_ORDER_EXECUTION_ENABLED=false` to keep the dashboard read-only while still allowing paper account, position, plan, review, dry-run, ledger, and analytics views.
 
+When the dashboard is hosted, the preferred control model is an authenticated VPS control API:
+
+```bash
+VPS_CONTROL_TOKEN=<secret>
+VPS_CONTROL_BIND_HOST=127.0.0.1
+VPS_CONTROL_PORT=4100
+VPS_CONTROL_AUDIT_PATH=/opt/alpaca-investing/logs/dashboard-control-audit.jsonl
+DASHBOARD_ADMIN_TOKEN=<secret>
+```
+
+Vercel-side dashboard routes call the VPS control API using `VPS_CONTROL_BASE_URL` and `VPS_CONTROL_TOKEN` with standard bearer auth.
+The control API exposes only allowlisted actions; no arbitrary command strings are accepted.
+The `research.run` control action intentionally uses a bounded research profile:
+`--barLookbackDays=120`, `ALPACA_REQUEST_TIMEOUT_MS=10000`, and `ALPACA_MAX_RETRIES=0`
+by default. This keeps the synchronous dashboard action inside the public route timeout while still
+allowing slow optional options ingestion to fail fast and continue with paper candidate generation.
+
+Current allowlist:
+
+- GET `/api/v1/health`, `/api/v1/account`, `/api/v1/positions`, `/api/v1/orders`
+- GET `/api/v1/research/latest`, `/api/v1/review/latest`, `/api/v1/plan/latest`
+- GET `/api/v1/executions`, `/api/v1/summary`
+- POST `/api/v1/research/run`, `/api/v1/review/run`, `/api/v1/plan/run`
+- GET `/api/v1/execute/dry-run/latest`
+- POST `/api/v1/execute/dry-run`, `/api/v1/execute/confirm`, `/api/v1/refresh`
+
 On the VPS, those historical views use local SQLite at `RESEARCH_DB_PATH` or `./data/research.db`. The VPS remains the owner of the scheduler, CLI runtime, research history, execution ledger, and local persistence.
 
 For Vercel, configure the project to build the dashboard app with `npm run dashboard:build` and provide paper-only guard variables:
@@ -90,6 +125,9 @@ ALPACA_LIVE_TRADE=false
 LIVE_TRADING_ENABLED=false
 PAPER_ORDER_EXECUTION_ENABLED=false
 PAPER_OPTIONS_EXECUTION_ENABLED=false
+VPS_CONTROL_BASE_URL=https://your-domain-or-ip:4100
+VPS_CONTROL_TOKEN=<secret>
+DASHBOARD_ADMIN_TOKEN=<secret>
 ```
 
 Optional live read-only paper account and position data can use the repo's paper credential names:
@@ -103,7 +141,62 @@ ALPACA_DATA_BASE_URL=https://data.alpaca.markets
 
 Vercel dashboard deployments are read-only by default. They do not create `apps/dashboard/data`, do not initialize SQLite under `/var/task`, and do not use local app-bundle persistence for historical ledger or research data. Historical Vercel routes return empty data with a warning until a future external store such as Vercel Postgres, Neon, Supabase, or Turso is implemented.
 
+## Run the dashboard control API on VPS
+
+On the VPS, install dependencies, keep secrets in `/opt/alpaca-investing/secrets/alpaca.env`, and start the control API service after cloning this repo:
+
+```bash
+cd /home/alpaca/Alpaca-Trading
+cp .env.example .env
+cp /opt/alpaca-investing/secrets/alpaca.env .env
+npm ci
+cp server/systemd/dashboard-control.service /opt/alpaca-investing/systemd/alpaca-dashboard-control.service
+cp /opt/alpaca-investing/systemd/alpaca-dashboard-control.service /etc/systemd/system/alpaca-dashboard-control.service
+systemctl daemon-reload
+systemctl enable --now alpaca-dashboard-control.service
+systemctl status alpaca-dashboard-control.service --no-pager
+```
+
+If you do not use systemd yet, run the control API directly for validation:
+
+```bash
+VPS_CONTROL_TOKEN=<secret> \
+VPS_CONTROL_BIND_HOST=127.0.0.1 \
+VPS_CONTROL_PORT=4100 \
+VPS_CONTROL_AUDIT_PATH=/opt/alpaca-investing/logs/dashboard-control-audit.jsonl \
+npm run dashboard:control
+```
+
+Then verify control API health from the VPS:
+
+```bash
+curl -sS -H "Authorization: Bearer $VPS_CONTROL_TOKEN" http://127.0.0.1:4100/api/v1/health
+```
+
 Do not expose `.env`, `.env.txt`, API keys, secrets, raw process environment, live endpoint URLs, or live-trading toggles through dashboard routes. Keep `PAPER_ORDER_EXECUTION_ENABLED=false` and `PAPER_OPTIONS_EXECUTION_ENABLED=false` on Vercel; order submission belongs on the explicitly gated VPS/local paper runtime, not the hosted dashboard.
+
+## Required production network validation
+
+Before marking the control bridge complete, verify the public control endpoint is reachable from this environment:
+
+```bash
+curl -m 8 -v "https://<host>:4100/api/v1/health"
+curl -m 8 -v "http://<host>:4100/api/v1/health"
+```
+
+Expected result for a healthy configuration is HTTP `200` with a JSON payload containing `"ok": true`.
+
+If port 4100 (or alternate port) is not reachable externally:
+
+- do not keep `VPS_CONTROL_BASE_URL` pointed at an unreachable host
+- expose the control API through an HTTPS reverse proxy, dedicated public domain, or tunnel
+- keep `VPS_CONTROL_TOKEN` on the server and add allowlist controls (`VPS_CONTROL_BASE_URL`, reverse-proxy IP ACL, and/or firewall rules)
+- confirm that `VPS_CONTROL_HOST`/`VPS_CONTROL_BIND_HOST` and upstream DNS remain consistent with the public entrypoint
+- rerun:
+  - `curl -sS -H "Authorization: Bearer $VPS_CONTROL_TOKEN" <VPS_CONTROL_BASE_URL>/api/v1/health`
+  - production dashboard read-only action endpoint: `https://www.jlsprojects.com/api/paper/summary`
+
+The dashboard intentionally requires this endpoint for authenticated control actions; if public reachability is not in place, those actions must remain unavailable even if code-level guards are correct.
 
 ## Run validation
 

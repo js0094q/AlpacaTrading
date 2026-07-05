@@ -72,6 +72,22 @@ type PaperExecutionSnapshot = {
   clientOrderId?: string;
 };
 
+type PaperOpenOrder = {
+  id?: string;
+  clientOrderId?: string;
+  symbol?: string;
+  side?: string;
+  status?: string;
+  qty?: string;
+  notional?: string;
+  submittedAt?: string;
+};
+
+type PaperOpenOrdersSnapshot = {
+  orders?: PaperOpenOrder[];
+  requestId?: string;
+};
+
 const Metric = ({ label, value }: { label: string; value: React.ReactNode }) => (
   <div className="metric">
     <span>{label}</span>
@@ -107,6 +123,10 @@ export default async function DashboardPage() {
   const executions = snapshot
     ? asResult<PaperExecutionSnapshot[]>(snapshot.executions as DashboardCaptureResult<PaperExecutionSnapshot[]> | DashboardCaptureError)
     : null;
+  const openOrders = snapshot
+    ? asResult<PaperOpenOrdersSnapshot>(snapshot.openOrders as DashboardCaptureResult<PaperOpenOrdersSnapshot> | DashboardCaptureError)
+    : null;
+  const openOrderRows = openOrders?.ok ? openOrders.data.orders || [] : [];
   const vercelReadOnly = snapshot?.mode === "vercel-read-only";
 
   return (
@@ -161,6 +181,25 @@ export default async function DashboardPage() {
             </>
           ) : (
             <p className="warning">{account?.error || "Unavailable"}</p>
+          )}
+        </div>
+
+        <div className="panel">
+          <h2>Open Orders</h2>
+          {openOrders?.ok ? (
+            <div className="list">
+              {openOrderRows.slice(0, 12).map((order) => (
+                <div className="row" key={order.id || order.clientOrderId}>
+                  <strong>{order.symbol || "-"}</strong>
+                  <span>{order.side || "-"}</span>
+                  <span>{order.status || "-"}</span>
+                  <span className="mono">{order.qty || order.notional || "-"}</span>
+                </div>
+              ))}
+              {!openOrderRows.length ? <p className="subtle">No open orders.</p> : null}
+            </div>
+          ) : (
+            <p className="warning">{openOrders?.error || "Unavailable"}</p>
           )}
         </div>
 

@@ -1,12 +1,13 @@
 import { getAlpacaAccountSnapshot } from "../../../src/services/alpacaAccountService";
 import { listAlpacaPositions } from "../../../src/services/alpacaPositionService";
+import { listAlpacaOpenOrders } from "../../../src/services/alpacaOrderReadService";
 import { assertPaperDashboardAccess } from "./guards";
 import {
   VERCEL_HISTORICAL_STORAGE_WARNING,
   VERCEL_HISTORICAL_UNAVAILABLE_MESSAGE,
   VERCEL_READ_ONLY_MODE,
-  DASHBOARD_PAPER_BRIDGE_TOKEN,
-  DASHBOARD_PAPER_BRIDGE_URL,
+  resolveVpsControlBaseUrl,
+  resolveDashboardControlToken,
   isPaperDashboardBridgeEnabled,
   hasDashboardDurableStorageConfig,
   shouldUseVercelReadOnlyFallback
@@ -54,10 +55,24 @@ type PaperBridgeSummary = {
   dryRun?: unknown;
   latestResearch?: unknown;
   latestPaperPlans?: unknown;
+  openOrders?: unknown;
   snapshots?: unknown;
   executions?: unknown;
   optionContracts?: unknown;
   requestIds?: unknown;
+};
+
+const normalizeOpenOrdersRows = (value: unknown): unknown[] => {
+  if (Array.isArray(value)) {
+    return value;
+  }
+  if (value && typeof value === "object" && "orders" in value) {
+    const orders = (value as { orders?: unknown }).orders;
+    if (Array.isArray(orders)) {
+      return orders;
+    }
+  }
+  return [];
 };
 
 type DashboardResultError = {
@@ -97,6 +112,7 @@ export interface DashboardSnapshot {
   dryRun: DashboardResult<{ summary: { wouldSubmitCount: number; payloadsBlocked: number }; assetClass: string }>;
   latestResearch: unknown[];
   latestPaperPlans: unknown[];
+  openOrders: DashboardResult<unknown>;
   snapshots: unknown[];
   executions: DashboardResult<unknown> | unknown[];
   optionContracts: unknown[];
@@ -117,9 +133,9 @@ const clampRows = <T>(rows: unknown, limit: number): T[] => {
 };
 
 const bridgeUrlForPath = (path: string) => {
-  const base = DASHBOARD_PAPER_BRIDGE_URL?.trim();
+  const base = (resolveVpsControlBaseUrl() || "").trim();
   if (!base) {
-    throw new Error("DASHBOARD_PAPER_BRIDGE_URL_NOT_CONFIGURED");
+    throw new Error("DASHBOARD_CONTROL_BASE_URL_NOT_CONFIGURED");
   }
   const normalizedBase = base.endsWith("/") ? base : `${base}/`;
   const normalizedPath = path.replace(/^\//, "");
@@ -131,9 +147,10 @@ const fetchPaperBridgePayload = async <T>(path: string): Promise<T> => {
     Accept: "application/json"
   };
 
-  if (DASHBOARD_PAPER_BRIDGE_TOKEN) {
-    headers.Authorization = `Bearer ${DASHBOARD_PAPER_BRIDGE_TOKEN}`;
-    headers["x-dashboard-bridge-token"] = DASHBOARD_PAPER_BRIDGE_TOKEN;
+  const token = (resolveDashboardControlToken() || "").trim();
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+    headers["x-dashboard-bridge-token"] = token;
   }
 
   const controller = new AbortController();
@@ -175,7 +192,8 @@ const fetchPaperBridgePayload = async <T>(path: string): Promise<T> => {
 
 const getPaperBridgeSummary = async () => {
   if (!bridgeSummaryPromise) {
-    bridgeSummaryPromise = fetchPaperBridgePayload<PaperBridgeSummary>("api/paper/summary");
+    const summaryPath = resolveVpsControlBaseUrl() ? "api/v1/summary" : "api/paper/summary";
+    bridgeSummaryPromise = fetchPaperBridgePayload<PaperBridgeSummary>(summaryPath);
   }
   return bridgeSummaryPromise;
 };
@@ -255,6 +273,15 @@ export const latestOptionContracts = async (limit = 10) =>
         `,
         [safeLimit(limit, 10, 50)]
       );
+
+export const latestOpenOrders = async (limit = 12) =>
+  shouldUseVercelReadOnlyFallback()
+    ? []
+    : isPaperDashboardBridgeEnabled()
+      ? getPaperBridgeSummary().then((summary) =>
+          clampRows(normalizeOpenOrdersRows(summary.openOrders), limit)
+        )
+    : listAlpacaOpenOrders().then((result) => clampRows(result.orders, limit));
 
 export const latestApiRequestIds = async (limit = 12) =>
   shouldUseVercelReadOnlyFallback()
@@ -336,9 +363,10 @@ export const buildDashboardSnapshot = async (): Promise<DashboardSnapshot> => {
   }
 
   if (shouldUseVercelReadOnlyFallback()) {
-    const [account, positions] = await Promise.all([
+    const [account, positions, openOrders] = await Promise.all([
       capture("account", () => getAlpacaAccountSnapshot()),
-      capture("positions", () => listAlpacaPositions())
+      capture("positions", () => listAlpacaPositions()),
+      capture("openOrders", () => listAlpacaOpenOrders())
     ]);
 
     return {
@@ -359,6 +387,7 @@ export const buildDashboardSnapshot = async (): Promise<DashboardSnapshot> => {
       dryRun: historicalUnavailable("dryRun"),
       latestResearch: [],
       latestPaperPlans: [],
+      openOrders,
       snapshots: [],
       executions: historicalUnavailable("executions"),
       optionContracts: [],
@@ -366,10 +395,11 @@ export const buildDashboardSnapshot = async (): Promise<DashboardSnapshot> => {
     };
   }
 
-  const [account, positions, runtime, plan, review, dryRun, executions] =
+  const [account, positions, openOrders, runtime, plan, review, dryRun, executions] =
     await Promise.all([
       capture("account", () => getAlpacaAccountSnapshot()),
       capture("positions", () => listAlpacaPositions()),
+      capture("openOrders", () => listAlpacaOpenOrders()),
       capture("runtime", async () => {
         const { buildPaperRuntimeReport } = await import(
           "../../../src/services/paperRuntimeService"
@@ -417,12 +447,14 @@ export const buildDashboardSnapshot = async (): Promise<DashboardSnapshot> => {
   const [
     latestResearch,
     latestPlans,
+    latestOpenOrderRows,
     snapshots,
     optionContracts,
     requestIds
   ] = await Promise.all([
     latestResearchRuns(5),
     latestPaperPlans(10),
+    latestOpenOrders(12),
     latestPaperRecommendationSnapshots(10),
     latestOptionContracts(10),
     latestApiRequestIds(12)
@@ -444,6 +476,7 @@ export const buildDashboardSnapshot = async (): Promise<DashboardSnapshot> => {
     plan,
     review,
     dryRun,
+    openOrders,
     latestResearch,
     latestPaperPlans: latestPlans,
     snapshots,
