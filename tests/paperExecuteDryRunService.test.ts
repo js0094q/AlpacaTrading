@@ -409,6 +409,7 @@ beforeEach(() => {
   delete process.env.ALLOW_OPTIONS_LAST_PRICE_FALLBACK;
   process.env.PAPER_OPTIONS_ALLOW_MARKET_ORDERS = "false";
   process.env.PAPER_OPTIONS_MAX_SPREAD_PCT = "50";
+  delete process.env.PAPER_OPTIONS_HARD_SPREAD_CAP_ENABLED;
   process.env.PAPER_OPTIONS_MAX_PORTFOLIO_RISK_PCT = "20";
   process.env.PAPER_OPTIONS_MAX_POSITION_RISK_PCT = "5";
   delete process.env.PAPER_RUNTIME_DUPLICATE_RECONCILIATION_ENABLED;
@@ -624,6 +625,68 @@ describe("paper execute dry-run payload construction", () => {
     assert.equal(report.blockedPayloads.length, 1);
     assert.equal(report.blockedPayloads[0]?.reasonCodes.includes("OPTION_LIMIT_PRICE_UNAVAILABLE"), true);
     assert.match(report.blockedPayloads[0]?.explanation || "", /quote_unavailable/);
+  });
+
+  test("constructs payloads for discovered 0DTE SPY call and put options", async () => {
+    const call = optionCandidate("long_call", {
+      symbol: "SPY0DTECALL",
+      optionSymbol: "SPY0DTECALL",
+      underlyingSymbol: "SPY",
+      strategyFamily: "zero_dte_spy",
+      sourceCandidateId: "discovery:zero_dte_spy:SPY0DTECALL",
+      bidAskSpreadPct: 75,
+      reasonCodes: ["OPTION_CONTRACT_FOUND", "OPTION_WIDE_SPREAD_WARNING"]
+    });
+    const put = optionCandidate("long_put", {
+      symbol: "SPY0DTEPUT",
+      optionSymbol: "SPY0DTEPUT",
+      underlyingSymbol: "SPY",
+      strategyFamily: "zero_dte_spy",
+      sourceCandidateId: "discovery:zero_dte_spy:SPY0DTEPUT",
+      bidAskSpreadPct: 75,
+      reasonCodes: ["OPTION_CONTRACT_FOUND", "OPTION_WIDE_SPREAD_WARNING"]
+    });
+
+    const report = await runWith(
+      { plan: [call, put] },
+      {},
+      { dryRun: true, assetClass: "option" }
+    );
+
+    assert.equal(report.status, "ready");
+    assert.deepEqual(report.wouldSubmit.map((payload) => payload.symbol).sort(), ["SPY0DTECALL", "SPY0DTEPUT"].sort());
+    assert.equal(report.wouldSubmit.every((payload) => payload.assetClass === "option"), true);
+    assert.equal(report.wouldSubmit.every((payload) => payload.position_intent === "buy_to_open"), true);
+    assert.equal(report.blockedPayloads.length, 0);
+  });
+
+  test("constructs payloads for discovered SPY and QQQ LEAPS calls", async () => {
+    const spy = optionCandidate("long_call", {
+      symbol: "SPYLEAPSCALL",
+      optionSymbol: "SPYLEAPSCALL",
+      underlyingSymbol: "SPY",
+      strategyFamily: "leaps",
+      sourceCandidateId: "discovery:leaps:SPYLEAPSCALL",
+      expirationDate: futureDate(365)
+    });
+    const qqq = optionCandidate("long_call", {
+      symbol: "QQQLEAPSCALL",
+      optionSymbol: "QQQLEAPSCALL",
+      underlyingSymbol: "QQQ",
+      strategyFamily: "leaps",
+      sourceCandidateId: "discovery:leaps:QQQLEAPSCALL",
+      expirationDate: futureDate(365)
+    });
+
+    const report = await runWith(
+      { plan: [spy, qqq] },
+      {},
+      { dryRun: true, assetClass: "option" }
+    );
+
+    assert.equal(report.status, "ready");
+    assert.deepEqual(report.wouldSubmit.map((payload) => payload.symbol).sort(), ["QQQLEAPSCALL", "SPYLEAPSCALL"].sort());
+    assert.equal(report.blockedPayloads.length, 0);
   });
 
   test("includes valid client order ids", async () => {
@@ -994,6 +1057,110 @@ describe("paper execute confirm-paper options", () => {
     });
     assert.equal(report.errors.length, 0);
     assert.equal(report.submitted.length, 1);
+  });
+
+  test("discovered 0DTE SPY option submits through confirm-paper path", async () => {
+    process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
+    process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
+    process.env.ALLOW_0DTE_OPTIONS = "true";
+    process.env.PAPER_OPTIONS_MAX_SPREAD_PCT = "10";
+    const today = new Date().toISOString().slice(0, 10);
+    const submittedPayloads: AlpacaPaperOrderRequest[] = [];
+    const report = await confirmWith(
+      {
+        plan: [
+          optionCandidate("long_call", {
+            symbol: "SPY0DTECALL",
+            optionSymbol: "SPY0DTECALL",
+            underlyingSymbol: "SPY",
+            strategyFamily: "zero_dte_spy",
+            sourceCandidateId: "discovery:zero_dte_spy:SPY0DTECALL",
+            expirationDate: today,
+            strike: 450,
+            bidAskSpreadPct: 80,
+            reasonCodes: ["OPTION_CONTRACT_FOUND", "OPTION_WIDE_SPREAD_WARNING"]
+          })
+        ]
+      },
+      {},
+      { confirmPaper: true, assetClass: "option" },
+      {
+        getOptionContract: async (symbolOrId: string) => ({
+          data: mockContract(symbolOrId, {
+            underlying_symbol: "SPY",
+            expiration_date: today,
+            strike_price: 450
+          }),
+          requestId: "contract-request-id",
+          status: 200,
+          url: `https://paper-api.alpaca.markets/v2/options/contracts/${symbolOrId}`
+        }),
+        submitPaperOrder: async (payload) => {
+          submittedPayloads.push(payload);
+          return mockSubmitSuccess(payload);
+        }
+      }
+    );
+
+    assert.equal(report.errors.length, 0);
+    assert.equal(report.blocked.length, 0);
+    assert.equal(report.submitted.length, 1);
+    assert.equal(submittedPayloads[0]?.symbol, "SPY0DTECALL");
+    assert.equal(submittedPayloads[0]?.position_intent, "buy_to_open");
+  });
+
+  test("discovered LEAPS option submits through confirm-paper path with LEAPS caps", async () => {
+    process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
+    process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
+    process.env.PAPER_LEAPS_ENABLED = "true";
+    process.env.PAPER_OPTIONS_MAX_DTE = "90";
+    process.env.PAPER_LEAPS_MIN_DTE = "180";
+    process.env.PAPER_LEAPS_MAX_DTE = "730";
+    process.env.PAPER_LEAPS_MAX_PREMIUM_PER_TRADE = "2500";
+    const expirationDate = futureDate(365);
+    const submittedPayloads: AlpacaPaperOrderRequest[] = [];
+    const report = await confirmWith(
+      {
+        plan: [
+          optionCandidate("long_call", {
+            symbol: "SPYLEAPSCALL",
+            optionSymbol: "SPYLEAPSCALL",
+            underlyingSymbol: "SPY",
+            strategyFamily: "leaps",
+            sourceCandidateId: "discovery:leaps:SPYLEAPSCALL",
+            expirationDate,
+            strike: 440,
+            estimatedPremium: 400,
+            maxRisk: 400,
+            estimatedNotional: 400
+          })
+        ]
+      },
+      {},
+      { confirmPaper: true, assetClass: "option" },
+      {
+        getOptionContract: async (symbolOrId: string) => ({
+          data: mockContract(symbolOrId, {
+            underlying_symbol: "SPY",
+            expiration_date: expirationDate,
+            strike_price: 440
+          }),
+          requestId: "contract-request-id",
+          status: 200,
+          url: `https://paper-api.alpaca.markets/v2/options/contracts/${symbolOrId}`
+        }),
+        submitPaperOrder: async (payload) => {
+          submittedPayloads.push(payload);
+          return mockSubmitSuccess(payload);
+        }
+      }
+    );
+
+    assert.equal(report.errors.length, 0);
+    assert.equal(report.blocked.length, 0);
+    assert.equal(report.submitted.length, 1);
+    assert.equal(submittedPayloads[0]?.symbol, "SPYLEAPSCALL");
+    assert.equal(submittedPayloads[0]?.position_intent, "buy_to_open");
   });
 
   test("renders confirm table output without throwing", async () => {

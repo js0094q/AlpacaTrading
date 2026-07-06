@@ -27,8 +27,9 @@
 - Paper option learning layer:
   - `PAPER_OPTION_LEARNING_LEDGER_ENABLED=true` records option candidate decisions into `paper_learning_records`.
   - `PAPER_0DTE_SPY_ENABLED=false` and `PAPER_LEAPS_ENABLED=false` remain safe defaults; enabling them is paper-only and does not enable live trading.
-  - 0DTE candidates are SPY-only, same-day, quote-quality gated, and capped by premium/contracts/daily-trade controls.
-  - LEAPS candidates are long-dated option records gated by `PAPER_LEAPS_MIN_DTE=180`, `PAPER_LEAPS_MAX_DTE=730`, premium/contracts/spread controls, and paper-only guards.
+  - 0DTE discovery is first-class when enabled, does not require SPY to appear in normal equity candidates, considers at most one same-day SPY call and one same-day SPY put, and is capped by premium/contracts/daily-trade controls.
+  - LEAPS discovery is first-class when enabled, does not require the underlying to appear in normal equity candidates, uses `PAPER_LEAPS_UNDERLYINGS=SPY,QQQ` by default, and selects at most one long-dated call per underlying inside `PAPER_LEAPS_MIN_DTE=180` to `PAPER_LEAPS_MAX_DTE=730`.
+  - Wide spreads are warnings unless `PAPER_OPTIONS_HARD_SPREAD_CAP_ENABLED=true` or the family-specific hard-spread flag is enabled.
   - `npm run paper:learn -- --format=json` evaluates pending learning rows when local option marks exist and reports promotion-readiness analytics using live-like fill profit factor.
 - Control bridge health:
   - `GET /api/v1/health` without token returns a healthy 200.

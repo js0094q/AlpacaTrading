@@ -73,6 +73,12 @@ export interface PaperPlanSummary {
   leapsCandidates?: number;
   leapsEligible?: number;
   leapsSkipped?: number;
+  zeroDteSpyDiscoveryCandidates?: number;
+  zeroDteSpyDiscoveryEligible?: number;
+  zeroDteSpyDiscoverySkipped?: number;
+  leapsDiscoveryCandidates?: number;
+  leapsDiscoveryEligible?: number;
+  leapsDiscoverySkipped?: number;
   learningRecordsWritten?: number;
   learningRecordsPending?: number;
 }
@@ -160,6 +166,19 @@ export interface PaperPlanDiagnostics {
   filtersMatchedSnapshots: boolean;
   runtimeCandidatesAvailable: boolean;
   emptyReason: PaperPlanEmptyReason | null;
+  discoveryTopBlockers?: string[];
+  zeroDteSpyDiscovery?: PaperPlanDiscoveryDiagnostics;
+  leapsDiscovery?: PaperPlanDiscoveryDiagnostics;
+}
+
+export interface PaperPlanDiscoveryDiagnostics {
+  enabled: boolean;
+  underlyings: string[];
+  contractsFound: number;
+  candidatesSelected: number;
+  selectedOptionSymbols: string[];
+  warnings: string[];
+  hardBlockers: string[];
 }
 
 export interface PaperPlanReport {
@@ -206,6 +225,7 @@ interface CandidateRow {
   option_symbol: string | null;
   strike: number | null;
   short_strike: number | null;
+  discovery_warnings?: string[];
 }
 
 interface OptionContractPlanRow {
@@ -216,6 +236,7 @@ interface OptionContractPlanRow {
   strike: number;
   multiplier: number;
   tradable: number;
+  delta?: number | null;
 }
 
 interface OptionSnapshotPlanRow {
@@ -230,6 +251,19 @@ interface OptionSnapshotPlanRow {
   executable_price_source: string | null;
   rejection_reason: string | null;
   quote_timestamp: string | null;
+}
+
+interface TargetSignalRow {
+  symbol: string;
+  as_of: string;
+  direction: "long" | "short" | "neutral";
+  confidence: number | null;
+  expected_return: number | null;
+}
+
+interface DiscoveryBuildResult {
+  candidates: CandidateRow[];
+  diagnostics: PaperPlanDiscoveryDiagnostics;
 }
 
 const DEFAULTS = {
@@ -540,6 +574,351 @@ const pickCandidates = (runId: string, maxCandidates: number): CandidateRow[] =>
     [runId, maxCandidates]
   );
 
+const latestTargetSignal = (symbol: string): TargetSignalRow | null =>
+  queryOne<TargetSignalRow>(
+    `
+    SELECT symbol, as_of, direction, confidence, expected_return
+    FROM target_snapshots
+    WHERE symbol = ?
+    ORDER BY as_of DESC
+    LIMIT 1
+    `,
+    [symbol]
+  );
+
+const optionContractsForUnderlyings = (underlyings: string[]): OptionContractPlanRow[] => {
+  if (!underlyings.length) {
+    return [];
+  }
+  return queryAll<OptionContractPlanRow>(
+    `
+    SELECT
+      option_symbol,
+      underlying_symbol,
+      type,
+      expiration_date,
+      strike,
+      multiplier,
+      tradable,
+      (
+        SELECT s.delta
+        FROM option_snapshots AS s
+        WHERE s.option_symbol = option_contracts.option_symbol
+        ORDER BY s.timestamp DESC
+        LIMIT 1
+      ) AS delta
+    FROM option_contracts
+    WHERE underlying_symbol IN (${underlyings.map(() => "?").join(",")})
+    ORDER BY underlying_symbol ASC, expiration_date ASC, type ASC, strike ASC
+    `,
+    underlyings
+  );
+};
+
+const discoverySourceFromCandidateId = (candidateId: string): string | null => {
+  if (candidateId.startsWith("discovery:zero_dte_spy:")) {
+    return "explicit_zero_dte_spy";
+  }
+  if (candidateId.startsWith("discovery:leaps:")) {
+    return "explicit_leaps";
+  }
+  return null;
+};
+
+const signalDirectionFor = (symbol: string): TargetSignalRow => {
+  const signal = latestTargetSignal(symbol);
+  return signal ?? {
+    symbol,
+    as_of: now(),
+    direction: "long",
+    confidence: null,
+    expected_return: null
+  };
+};
+
+const strategyForContract = (contract: OptionContractPlanRow): "long_call" | "long_put" =>
+  contract.type === "put" ? "long_put" : "long_call";
+
+const discoveryWarningsForSignal = (signal: TargetSignalRow): string[] => {
+  const warnings: string[] = [];
+  if (signal.confidence === null) {
+    warnings.push("missing_signal_confidence");
+  } else if (signal.confidence < 0.5) {
+    warnings.push("weak_signal_confidence");
+  }
+  if (signal.direction === "neutral") {
+    warnings.push("neutral_signal_direction");
+  }
+  return warnings;
+};
+
+const discoveryCandidate = (input: {
+  family: "zero_dte_spy" | "leaps";
+  contract: OptionContractPlanRow;
+  signal: TargetSignalRow;
+  rank: number;
+  warnings?: string[];
+}): CandidateRow => ({
+  id: `discovery:${input.family}:${input.contract.option_symbol}`,
+  symbol: input.contract.underlying_symbol,
+  rank: input.rank,
+  direction: input.contract.type === "put" ? "short" : "long",
+  preferred_expression: strategyForContract(input.contract),
+  as_of: input.signal.as_of,
+  estimated_max_loss: null,
+  estimated_max_profit: null,
+  option_symbol: input.contract.option_symbol,
+  strike: input.contract.strike,
+  short_strike: null,
+  discovery_warnings: input.warnings ?? []
+});
+
+const rankContractByMoneyness = (
+  left: OptionContractPlanRow,
+  right: OptionContractPlanRow,
+  referencePrice: number | null,
+  preferItm = false
+) => {
+  if (referencePrice !== null && referencePrice > 0) {
+    if (preferItm) {
+      const leftItmPenalty = left.type === "call"
+        ? left.strike <= referencePrice ? 0 : 1
+        : left.strike >= referencePrice ? 0 : 1;
+      const rightItmPenalty = right.type === "call"
+        ? right.strike <= referencePrice ? 0 : 1
+        : right.strike >= referencePrice ? 0 : 1;
+      if (leftItmPenalty !== rightItmPenalty) {
+        return leftItmPenalty - rightItmPenalty;
+      }
+    }
+    const leftDistance = Math.abs(left.strike - referencePrice);
+    const rightDistance = Math.abs(right.strike - referencePrice);
+    if (leftDistance !== rightDistance) {
+      return leftDistance - rightDistance;
+    }
+  }
+  if (left.expiration_date !== right.expiration_date) {
+    return left.expiration_date.localeCompare(right.expiration_date);
+  }
+  return left.strike - right.strike;
+};
+
+const selectContractForUnderlying = (input: {
+  contracts: OptionContractPlanRow[];
+  underlying: string;
+  type: "call" | "put";
+  referencePrice: number | null;
+  preferItm?: boolean;
+  preferDeltaRange?: {
+    min: number;
+    max: number;
+    target: number;
+  };
+}): OptionContractPlanRow | null => {
+  const candidates = input.contracts
+    .filter((contract) =>
+      contract.underlying_symbol === input.underlying &&
+      contract.type === input.type &&
+      contract.tradable === 1
+    )
+    .sort((left, right) => {
+      if (input.preferDeltaRange) {
+        const deltaRank = (contract: OptionContractPlanRow) => {
+          const delta = typeof contract.delta === "number" ? Math.abs(contract.delta) : null;
+          if (delta === null) {
+            return { band: 2, distance: Number.MAX_SAFE_INTEGER };
+          }
+          const inBand = delta >= input.preferDeltaRange!.min && delta <= input.preferDeltaRange!.max;
+          return {
+            band: inBand ? 0 : 1,
+            distance: Math.abs(delta - input.preferDeltaRange!.target)
+          };
+        };
+        const leftDelta = deltaRank(left);
+        const rightDelta = deltaRank(right);
+        if (leftDelta.band !== rightDelta.band) {
+          return leftDelta.band - rightDelta.band;
+        }
+        if (leftDelta.distance !== rightDelta.distance) {
+          return leftDelta.distance - rightDelta.distance;
+        }
+      }
+      return rankContractByMoneyness(left, right, input.referencePrice, input.preferItm ?? false);
+    });
+  return candidates[0] ?? null;
+};
+
+const emptyDiscoveryDiagnostics = (
+  enabled: boolean,
+  underlyings: string[]
+): PaperPlanDiscoveryDiagnostics => ({
+  enabled,
+  underlyings,
+  contractsFound: 0,
+  candidatesSelected: 0,
+  selectedOptionSymbols: [],
+  warnings: [],
+  hardBlockers: []
+});
+
+const buildZeroDteSpyDiscoveryCandidates = (
+  options: ReturnType<typeof paperOptionsConfig>,
+  startingRank: number,
+  optionsPlanningEnabled: boolean
+): DiscoveryBuildResult => {
+  const underlyings = Array.from(new Set(["SPY", ...options.zeroDteSpy.underlyings]))
+    .map((symbol) => normalizeSymbol(symbol))
+    .filter((symbol) => symbol === "SPY");
+  const diagnostics = emptyDiscoveryDiagnostics(
+    optionsPlanningEnabled && options.zeroDteSpy.enabled,
+    underlyings
+  );
+  if (!optionsPlanningEnabled) {
+    if (options.zeroDteSpy.enabled) {
+      diagnostics.hardBlockers.push("OPTIONS_PLANNING_NOT_IMPLEMENTED");
+    }
+    return { candidates: [], diagnostics };
+  }
+  if (!options.zeroDteSpy.enabled || !underlyings.length) {
+    return { candidates: [], diagnostics };
+  }
+
+  const today = new Date().toISOString().slice(0, 10);
+  const chain = optionContractsForUnderlyings(underlyings);
+  diagnostics.contractsFound = chain.length;
+  if (chain.length === 0) {
+    diagnostics.hardBlockers.push("OPTION_CONTRACT_NOT_FOUND");
+    return { candidates: [], diagnostics };
+  }
+
+  const sameDay = chain.filter((contract) =>
+    contract.underlying_symbol === "SPY" && contract.expiration_date === today
+  );
+  if (!sameDay.length) {
+    diagnostics.hardBlockers.push("OPTION_CONTRACT_NOT_FOUND");
+    return { candidates: [], diagnostics };
+  }
+
+  const signal = signalDirectionFor("SPY");
+  const warnings = discoveryWarningsForSignal(signal);
+  diagnostics.warnings.push(...warnings);
+  const referencePrice = findLatestPrice("SPY", signal.as_of);
+  const candidates: CandidateRow[] = [];
+
+  for (const type of ["call", "put"] as const) {
+    const strategyEnabled = type === "call" ? options.allowLongCalls : options.allowLongPuts;
+    if (!strategyEnabled) {
+      diagnostics.hardBlockers.push("UNSUPPORTED_OPTION_STRATEGY");
+      continue;
+    }
+
+    const selected = selectContractForUnderlying({
+      contracts: sameDay,
+      underlying: "SPY",
+      type,
+      referencePrice
+    });
+    if (!selected) {
+      diagnostics.hardBlockers.push("OPTION_CONTRACT_NOT_FOUND");
+      continue;
+    }
+
+    candidates.push(
+      discoveryCandidate({
+        family: "zero_dte_spy",
+        contract: selected,
+        signal,
+        rank: startingRank + candidates.length,
+        warnings
+      })
+    );
+  }
+
+  diagnostics.candidatesSelected = candidates.length;
+  diagnostics.selectedOptionSymbols = candidates
+    .map((candidate) => candidate.option_symbol)
+    .filter((symbol): symbol is string => Boolean(symbol));
+  return { candidates, diagnostics };
+};
+
+const buildLeapsDiscoveryCandidates = (
+  options: ReturnType<typeof paperOptionsConfig>,
+  startingRank: number,
+  optionsPlanningEnabled: boolean
+): DiscoveryBuildResult => {
+  const underlyings = options.leaps.underlyings;
+  const diagnostics = emptyDiscoveryDiagnostics(
+    optionsPlanningEnabled && options.leaps.enabled,
+    underlyings
+  );
+  if (!optionsPlanningEnabled) {
+    if (options.leaps.enabled) {
+      diagnostics.hardBlockers.push("OPTIONS_PLANNING_NOT_IMPLEMENTED");
+    }
+    return { candidates: [], diagnostics };
+  }
+  if (!options.leaps.enabled || !underlyings.length) {
+    return { candidates: [], diagnostics };
+  }
+
+  const chain = optionContractsForUnderlyings(underlyings);
+  diagnostics.contractsFound = chain.length;
+  if (chain.length === 0) {
+    diagnostics.hardBlockers.push("OPTION_CONTRACT_NOT_FOUND");
+    return { candidates: [], diagnostics };
+  }
+
+  const inRange = chain.filter((contract) => {
+    const dte = daysToExpiration(contract.expiration_date);
+    return dte !== null && dte >= options.leaps.minDte && dte <= options.leaps.maxDte;
+  });
+  if (!inRange.length) {
+    diagnostics.hardBlockers.push("OPTION_CONTRACT_NOT_FOUND");
+    return { candidates: [], diagnostics };
+  }
+
+  if (!options.allowLongCalls) {
+    diagnostics.hardBlockers.push("UNSUPPORTED_OPTION_STRATEGY");
+    return { candidates: [], diagnostics };
+  }
+
+  const candidates: CandidateRow[] = [];
+  for (const underlying of underlyings) {
+    const signal = signalDirectionFor(underlying);
+    const warnings = discoveryWarningsForSignal(signal);
+    diagnostics.warnings.push(...warnings.map((warning) => `${underlying}:${warning}`));
+    const selected = selectContractForUnderlying({
+      contracts: inRange,
+      underlying,
+      type: "call",
+      referencePrice: findLatestPrice(underlying, signal.as_of),
+      preferItm: true,
+      preferDeltaRange: { min: 0.6, max: 0.8, target: 0.7 }
+    });
+    if (!selected) {
+      continue;
+    }
+    candidates.push(
+      discoveryCandidate({
+        family: "leaps",
+        contract: selected,
+        signal,
+        rank: startingRank + candidates.length,
+        warnings
+      })
+    );
+  }
+
+  if (!candidates.length) {
+    diagnostics.hardBlockers.push("OPTION_CONTRACT_NOT_FOUND");
+  }
+  diagnostics.candidatesSelected = candidates.length;
+  diagnostics.selectedOptionSymbols = candidates
+    .map((candidate) => candidate.option_symbol)
+    .filter((symbol): symbol is string => Boolean(symbol));
+  return { candidates, diagnostics };
+};
+
 const latestTimestamp = (candidates: CandidateRow[]) => {
   let latest: string | null = null;
   for (const candidate of candidates) {
@@ -555,6 +934,8 @@ const buildPlanDiagnostics = (input: {
   latestRun: ResearchRunRow | null;
   candidates: CandidateRow[];
   plan: PaperPlanCandidate[];
+  zeroDteSpyDiscovery: PaperPlanDiscoveryDiagnostics;
+  leapsDiscovery: PaperPlanDiscoveryDiagnostics;
 }): PaperPlanDiagnostics => {
   let emptyReason: PaperPlanEmptyReason | null = null;
 
@@ -572,13 +953,21 @@ const buildPlanDiagnostics = (input: {
     emptyReason = "ALL_CANDIDATES_SKIPPED";
   }
 
+  const discoveryTopBlockers = [
+    ...input.zeroDteSpyDiscovery.hardBlockers,
+    ...input.leapsDiscovery.hardBlockers
+  ];
+
   return {
     latestSnapshotAvailable: Boolean(input.latestAnyRun),
     latestSnapshotRunId: input.latestAnyRun?.id ?? null,
     latestSnapshotTimestamp: input.latestAnyRun?.started_at ?? null,
     filtersMatchedSnapshots: Boolean(input.latestRun),
     runtimeCandidatesAvailable: input.candidates.length > 0,
-    emptyReason
+    emptyReason,
+    discoveryTopBlockers: [...new Set(discoveryTopBlockers)],
+    zeroDteSpyDiscovery: input.zeroDteSpyDiscovery,
+    leapsDiscovery: input.leapsDiscovery
   };
 };
 
@@ -657,8 +1046,22 @@ const parseIntegerEnv = (name: string, fallback: number): number => {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 };
 
+const parseSymbolListEnv = (name: string, fallback: string[]): string[] => {
+  const value = process.env[name];
+  const source = value === undefined || value.trim() === "" ? fallback.join(",") : value;
+  return Array.from(
+    new Set(
+      source
+        .split(",")
+        .map((entry) => normalizeSymbol(entry))
+        .filter(Boolean)
+    )
+  );
+};
+
 const paperOptionsConfig = () => {
   const quoteCfg = optionsQuoteConfig();
+  const hardSpreadCapEnabled = parseBooleanEnv("PAPER_OPTIONS_HARD_SPREAD_CAP_ENABLED", false);
   return {
     maxPremiumPerOrder: parseNumberEnv("PAPER_OPTIONS_MAX_PREMIUM_PER_ORDER", 1000),
     maxContracts: Math.max(1, parseIntegerEnv("PAPER_OPTIONS_MAX_CONTRACTS", 5)),
@@ -668,6 +1071,7 @@ const paperOptionsConfig = () => {
     allowMarketOrders: parseBooleanEnv("PAPER_OPTIONS_ALLOW_MARKET_ORDERS", false),
     limitPriceBasis: process.env.PAPER_OPTIONS_LIMIT_PRICE_BASIS || "mid",
     maxSpreadPct: parseNumberEnv("PAPER_OPTIONS_MAX_SPREAD_PCT", 50),
+    hardSpreadCapEnabled,
     maxPortfolioRiskPct: parseNumberEnv("PAPER_OPTIONS_MAX_PORTFOLIO_RISK_PCT", 20),
     maxPositionRiskPct: parseNumberEnv("PAPER_OPTIONS_MAX_POSITION_RISK_PCT", 5),
     allowLongCalls: parseBooleanEnv("PAPER_OPTIONS_ALLOW_LONG_CALLS", true),
@@ -680,19 +1084,29 @@ const paperOptionsConfig = () => {
     learningLedgerEnabled: parseBooleanEnv("PAPER_OPTION_LEARNING_LEDGER_ENABLED", true),
     zeroDteSpy: {
       enabled: parseBooleanEnv("PAPER_0DTE_SPY_ENABLED", false),
+      underlyings: parseSymbolListEnv("PAPER_0DTE_SPY_UNDERLYINGS", ["SPY"]),
       maxPremiumPerTrade: parseNumberEnv("PAPER_0DTE_SPY_MAX_PREMIUM_PER_TRADE", 500),
       maxContracts: Math.max(1, parseIntegerEnv("PAPER_0DTE_SPY_MAX_CONTRACTS", 5)),
       maxDailyTrades: Math.max(1, parseIntegerEnv("PAPER_0DTE_SPY_MAX_DAILY_TRADES", 3)),
       maxQuoteAgeSeconds: Math.max(1, parseIntegerEnv("PAPER_0DTE_SPY_MAX_QUOTE_AGE_SECONDS", 60)),
-      maxSpreadPct: parseNumberEnv("PAPER_0DTE_SPY_MAX_SPREAD_PCT", 20)
+      maxSpreadPct: parseNumberEnv("PAPER_0DTE_SPY_MAX_SPREAD_PCT", 20),
+      hardSpreadCapEnabled: parseBooleanEnv(
+        "PAPER_0DTE_SPY_HARD_SPREAD_CAP_ENABLED",
+        hardSpreadCapEnabled
+      )
     },
     leaps: {
       enabled: parseBooleanEnv("PAPER_LEAPS_ENABLED", false),
+      underlyings: parseSymbolListEnv("PAPER_LEAPS_UNDERLYINGS", ["SPY", "QQQ"]),
       maxPremiumPerTrade: parseNumberEnv("PAPER_LEAPS_MAX_PREMIUM_PER_TRADE", 2500),
       maxContracts: Math.max(1, parseIntegerEnv("PAPER_LEAPS_MAX_CONTRACTS", 2)),
       minDte: parseIntegerEnv("PAPER_LEAPS_MIN_DTE", 180),
       maxDte: Math.max(1, parseIntegerEnv("PAPER_LEAPS_MAX_DTE", 730)),
-      maxSpreadPct: parseNumberEnv("PAPER_LEAPS_MAX_SPREAD_PCT", 15)
+      maxSpreadPct: parseNumberEnv("PAPER_LEAPS_MAX_SPREAD_PCT", 15),
+      hardSpreadCapEnabled: parseBooleanEnv(
+        "PAPER_LEAPS_HARD_SPREAD_CAP_ENABLED",
+        hardSpreadCapEnabled
+      )
     }
   };
 };
@@ -1074,20 +1488,23 @@ const familyRiskCaps = (
     return {
       maxPremiumPerTrade: options.zeroDteSpy.maxPremiumPerTrade,
       maxContracts: options.zeroDteSpy.maxContracts,
-      maxSpreadPct: options.zeroDteSpy.maxSpreadPct
+      maxSpreadPct: options.zeroDteSpy.maxSpreadPct,
+      hardSpreadCapEnabled: options.zeroDteSpy.hardSpreadCapEnabled
     };
   }
   if (family === "leaps") {
     return {
       maxPremiumPerTrade: options.leaps.maxPremiumPerTrade,
       maxContracts: options.leaps.maxContracts,
-      maxSpreadPct: options.leaps.maxSpreadPct
+      maxSpreadPct: options.leaps.maxSpreadPct,
+      hardSpreadCapEnabled: options.leaps.hardSpreadCapEnabled
     };
   }
   return {
     maxPremiumPerTrade: options.maxPremiumPerOrder,
     maxContracts: options.maxContracts,
-    maxSpreadPct: options.maxSpreadPct
+    maxSpreadPct: options.maxSpreadPct,
+    hardSpreadCapEnabled: options.hardSpreadCapEnabled
   };
 };
 
@@ -1453,6 +1870,7 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
       multiplier: contract.multiplier || 100,
       tradable: contract.tradable === 1
     };
+    const discoverySource = discoverySourceFromCandidateId(candidate.id);
     const signalInputs = {
       rank: candidate.rank,
       direction: candidate.direction,
@@ -1460,7 +1878,15 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
       estimatedMaxLoss: candidate.estimated_max_loss,
       estimatedMaxProfit: candidate.estimated_max_profit,
       dte,
-      strategyFamily
+      strategyFamily,
+      ...(discoverySource
+        ? {
+            discoverySource,
+            discoveryGenerated: true,
+            discoveryUnderlying: contract.underlying_symbol,
+            warnings: candidate.discovery_warnings ?? []
+          }
+        : {})
     };
     const baseOptionFields = {
       sourceCandidateId: candidate.id,
@@ -1698,7 +2124,9 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
       };
     }
 
-    if (spreadPct !== null && spreadPct > familyCaps.maxSpreadPct) {
+    const spreadAboveConfiguredCap =
+      spreadPct !== null && spreadPct > familyCaps.maxSpreadPct;
+    if (spreadAboveConfiguredCap && familyCaps.hardSpreadCapEnabled) {
       return {
         ...base,
         decision: "watch",
@@ -1947,7 +2375,7 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         "OPTION_CONTRACT_FOUND",
         "OPTION_DTE_ALLOWED",
         ...(dte === 0 ? (["OPTION_0DTE_ALLOWED"] as PaperPlanReasonCode[]) : []),
-        ...(spreadPct !== null && spreadPct > 20
+        ...(spreadAboveConfiguredCap || (spreadPct !== null && spreadPct > 20)
           ? (["OPTION_WIDE_SPREAD_WARNING"] as PaperPlanReasonCode[])
           : []),
         ...(contractsByPremium > familyCaps.maxContracts ||
@@ -2150,10 +2578,26 @@ export const buildPaperPlanReport = async (
   const candidates = latestRun
     ? pickCandidates(latestRun.id, config.maxCandidates)
     : [];
+  const optionConfig = paperOptionsConfig();
+  const zeroDteSpyDiscovery = buildZeroDteSpyDiscoveryCandidates(
+    optionConfig,
+    candidates.length + 1,
+    config.optionsEnabled
+  );
+  const leapsDiscovery = buildLeapsDiscoveryCandidates(
+    optionConfig,
+    candidates.length + zeroDteSpyDiscovery.candidates.length + 1,
+    config.optionsEnabled
+  );
+  const allCandidates = [
+    ...candidates,
+    ...zeroDteSpyDiscovery.candidates,
+    ...leapsDiscovery.candidates
+  ];
 
   const source: PaperPlanSource = {
     snapshotRunId: latestRun?.id ?? null,
-    recommendationTimestamp: latestTimestamp(candidates),
+    recommendationTimestamp: latestTimestamp(allCandidates),
     runtimeTimestamp: generatedAt
   };
 
@@ -2163,7 +2607,7 @@ export const buildPaperPlanReport = async (
   let plannedNotional = 0;
   let plannedCount = 0;
 
-  for (const candidate of candidates) {
+  for (const candidate of allCandidates) {
     const symbol = normalizeSymbol(candidate.symbol);
     const candidateIdentity = getCandidateAssetIdentity({
       assetClass: candidate.preferred_expression === "shares" ? "equity" : "option",
@@ -2228,8 +2672,10 @@ export const buildPaperPlanReport = async (
   const diagnostics = buildPlanDiagnostics({
     latestAnyRun,
     latestRun,
-    candidates,
-    plan
+    candidates: allCandidates,
+    plan,
+    zeroDteSpyDiscovery: zeroDteSpyDiscovery.diagnostics,
+    leapsDiscovery: leapsDiscovery.diagnostics
   });
 
   return {
@@ -2274,6 +2720,32 @@ export const buildPaperPlanReport = async (
       leapsSkipped: plan.filter(
         (entry) => entry.strategyFamily === "leaps" && entry.decision !== "planned"
       ).length,
+      zeroDteSpyDiscoveryCandidates: plan.filter(
+        (entry) => entry.sourceCandidateId?.startsWith("discovery:zero_dte_spy:")
+      ).length,
+      zeroDteSpyDiscoveryEligible: plan.filter(
+        (entry) =>
+          entry.sourceCandidateId?.startsWith("discovery:zero_dte_spy:") &&
+          entry.decision === "planned"
+      ).length,
+      zeroDteSpyDiscoverySkipped: plan.filter(
+        (entry) =>
+          entry.sourceCandidateId?.startsWith("discovery:zero_dte_spy:") &&
+          entry.decision !== "planned"
+      ).length,
+      leapsDiscoveryCandidates: plan.filter(
+        (entry) => entry.sourceCandidateId?.startsWith("discovery:leaps:")
+      ).length,
+      leapsDiscoveryEligible: plan.filter(
+        (entry) =>
+          entry.sourceCandidateId?.startsWith("discovery:leaps:") &&
+          entry.decision === "planned"
+      ).length,
+      leapsDiscoverySkipped: plan.filter(
+        (entry) =>
+          entry.sourceCandidateId?.startsWith("discovery:leaps:") &&
+          entry.decision !== "planned"
+      ).length,
       learningRecordsWritten: plan.filter((entry) => entry.learningRecordWriteStatus === "written").length,
       learningRecordsPending: plan.filter((entry) =>
         entry.learningRecordWriteStatus === "written" &&
@@ -2302,6 +2774,10 @@ export const formatPaperPlanReportAsTable = (report: PaperPlanReport) => {
     lines.push("No candidates were evaluated.");
     if (report.diagnostics.emptyReason) {
       lines.push(`Empty reason: ${report.diagnostics.emptyReason}.`);
+    }
+    const discoveryTopBlockers = report.diagnostics.discoveryTopBlockers ?? [];
+    if (discoveryTopBlockers.length) {
+      lines.push(`Discovery blockers: ${discoveryTopBlockers.join(", ")}.`);
     }
     lines.push(
       `Latest snapshot: ${report.diagnostics.latestSnapshotRunId || "none"}; filters matched: ${stateText(report.diagnostics.filtersMatchedSnapshots)}.`
@@ -2340,6 +2816,11 @@ export const formatPaperPlanReportAsTable = (report: PaperPlanReport) => {
   );
   lines.push(
     `Strategy families: zeroDteSpy candidates=${report.summary.zeroDteSpyCandidates ?? 0}, eligible=${report.summary.zeroDteSpyEligible ?? 0}, skipped=${report.summary.zeroDteSpySkipped ?? 0}; leaps candidates=${report.summary.leapsCandidates ?? 0}, eligible=${report.summary.leapsEligible ?? 0}, skipped=${report.summary.leapsSkipped ?? 0}`
+  );
+  const zeroDiscovery = report.diagnostics.zeroDteSpyDiscovery;
+  const leapsDiscovery = report.diagnostics.leapsDiscovery;
+  lines.push(
+    `Discovery: zeroDteSpy ran=${stateText(Boolean(zeroDiscovery?.enabled))}, underlyings=${zeroDiscovery?.underlyings.join(",") || "none"}, contracts=${zeroDiscovery?.contractsFound ?? 0}, selected=${zeroDiscovery?.selectedOptionSymbols.join(",") || "none"}, warnings=${zeroDiscovery?.warnings.join(",") || "none"}, hardBlockers=${zeroDiscovery?.hardBlockers.join(",") || "none"}; leaps ran=${stateText(Boolean(leapsDiscovery?.enabled))}, underlyings=${leapsDiscovery?.underlyings.join(",") || "none"}, contracts=${leapsDiscovery?.contractsFound ?? 0}, selected=${leapsDiscovery?.selectedOptionSymbols.join(",") || "none"}, warnings=${leapsDiscovery?.warnings.join(",") || "none"}, hardBlockers=${leapsDiscovery?.hardBlockers.join(",") || "none"}`
   );
   lines.push(
     `Learning ledger: written=${report.summary.learningRecordsWritten ?? 0}, pending=${report.summary.learningRecordsPending ?? 0}`

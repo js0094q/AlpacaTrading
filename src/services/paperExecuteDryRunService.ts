@@ -882,6 +882,7 @@ const parseExecutionInteger = (name: string, fallback: number) => {
 
 const optionExecutionConfig = () => {
   const quoteCfg = optionsQuoteConfig();
+  const hardSpreadCapEnabled = parseExecutionBoolean("PAPER_OPTIONS_HARD_SPREAD_CAP_ENABLED");
   return {
     maxPremiumPerOrder: parseExecutionNumber("PAPER_OPTIONS_MAX_PREMIUM_PER_ORDER", 1000),
     maxContracts: Math.max(1, parseExecutionInteger("PAPER_OPTIONS_MAX_CONTRACTS", 5)),
@@ -891,8 +892,29 @@ const optionExecutionConfig = () => {
     allowMarketOrders: parseExecutionBoolean("PAPER_OPTIONS_ALLOW_MARKET_ORDERS"),
     limitPriceBasis: process.env.PAPER_OPTIONS_LIMIT_PRICE_BASIS || "mid",
     maxSpreadPct: parseExecutionNumber("PAPER_OPTIONS_MAX_SPREAD_PCT", 50),
+    hardSpreadCapEnabled,
     maxPortfolioRiskPct: parseExecutionNumber("PAPER_OPTIONS_MAX_PORTFOLIO_RISK_PCT", 20),
-    maxPositionRiskPct: parseExecutionNumber("PAPER_OPTIONS_MAX_POSITION_RISK_PCT", 5)
+    maxPositionRiskPct: parseExecutionNumber("PAPER_OPTIONS_MAX_POSITION_RISK_PCT", 5),
+    zeroDteSpy: {
+      enabled: parseExecutionBoolean("PAPER_0DTE_SPY_ENABLED"),
+      maxPremiumPerTrade: parseExecutionNumber("PAPER_0DTE_SPY_MAX_PREMIUM_PER_TRADE", 500),
+      maxContracts: Math.max(1, parseExecutionInteger("PAPER_0DTE_SPY_MAX_CONTRACTS", 5)),
+      maxSpreadPct: parseExecutionNumber("PAPER_0DTE_SPY_MAX_SPREAD_PCT", 20),
+      hardSpreadCapEnabled:
+        parseExecutionBoolean("PAPER_0DTE_SPY_HARD_SPREAD_CAP_ENABLED") ||
+        hardSpreadCapEnabled
+    },
+    leaps: {
+      enabled: parseExecutionBoolean("PAPER_LEAPS_ENABLED"),
+      maxPremiumPerTrade: parseExecutionNumber("PAPER_LEAPS_MAX_PREMIUM_PER_TRADE", 2500),
+      maxContracts: Math.max(1, parseExecutionInteger("PAPER_LEAPS_MAX_CONTRACTS", 2)),
+      minDte: parseExecutionInteger("PAPER_LEAPS_MIN_DTE", 180),
+      maxDte: Math.max(1, parseExecutionInteger("PAPER_LEAPS_MAX_DTE", 730)),
+      maxSpreadPct: parseExecutionNumber("PAPER_LEAPS_MAX_SPREAD_PCT", 15),
+      hardSpreadCapEnabled:
+        parseExecutionBoolean("PAPER_LEAPS_HARD_SPREAD_CAP_ENABLED") ||
+        hardSpreadCapEnabled
+    }
   };
 };
 
@@ -1038,12 +1060,42 @@ const validateOptionPayload = (input: {
   const status = String(contract.status || "active").toLowerCase();
   const tradable = contract.tradable ?? contract.tradeable ?? status === "active";
   const dte = optionDte(contract.expiration_date);
-  const dteAllowed =
+  const standardDteAllowed =
     dte !== null &&
     dte >= cfg.minDte &&
     dte <= cfg.maxDte &&
     (cfg.allow0Dte || dte > 0);
   const underlying = normalizeUpper(contract.underlying_symbol || contract.root_symbol);
+  const zeroDteSpyFamily =
+    dte === 0 &&
+    underlying === "SPY" &&
+    cfg.zeroDteSpy.enabled;
+  const leapsFamily =
+    dte !== null &&
+    cfg.leaps.enabled &&
+    dte >= cfg.leaps.minDte &&
+    dte <= cfg.leaps.maxDte;
+  const dteAllowed = standardDteAllowed || zeroDteSpyFamily || leapsFamily;
+  const familyCaps = zeroDteSpyFamily
+    ? {
+        maxPremiumPerOrder: cfg.zeroDteSpy.maxPremiumPerTrade,
+        maxContracts: cfg.zeroDteSpy.maxContracts,
+        maxSpreadPct: cfg.zeroDteSpy.maxSpreadPct,
+        hardSpreadCapEnabled: cfg.zeroDteSpy.hardSpreadCapEnabled
+      }
+    : leapsFamily
+      ? {
+          maxPremiumPerOrder: cfg.leaps.maxPremiumPerTrade,
+          maxContracts: cfg.leaps.maxContracts,
+          maxSpreadPct: cfg.leaps.maxSpreadPct,
+          hardSpreadCapEnabled: cfg.leaps.hardSpreadCapEnabled
+        }
+      : {
+          maxPremiumPerOrder: cfg.maxPremiumPerOrder,
+          maxContracts: cfg.maxContracts,
+          maxSpreadPct: cfg.maxSpreadPct,
+          hardSpreadCapEnabled: cfg.hardSpreadCapEnabled
+        };
   const hasLiquidityBasis = payload.bidAskSpreadPct !== null && payload.bidAskSpreadPct !== undefined;
   if (dte === 0 && !cfg.allow0Dte) {
     return "OPTION_0DTE_NOT_ENABLED";
@@ -1068,14 +1120,15 @@ const validateOptionPayload = (input: {
   }
 
   const qty = numericField(payload.qty) ?? 0;
-  if (qty <= 0 || qty > cfg.maxContracts) {
+  if (qty <= 0 || qty > familyCaps.maxContracts) {
     return "OPTION_RISK_LIMIT_EXCEEDED";
   }
 
   if (
     payload.bidAskSpreadPct !== null &&
     payload.bidAskSpreadPct !== undefined &&
-    payload.bidAskSpreadPct > cfg.maxSpreadPct
+    familyCaps.hardSpreadCapEnabled &&
+    payload.bidAskSpreadPct > familyCaps.maxSpreadPct
   ) {
     return "OPTION_SPREAD_TOO_WIDE";
   }
@@ -1089,7 +1142,7 @@ const validateOptionPayload = (input: {
   const estimatedPremium =
     numericField(payload.estimatedPremium) ??
     (limitPrice !== null ? limitPrice * multiplier * qty : maxRisk);
-  if (estimatedPremium > cfg.maxPremiumPerOrder) {
+  if (estimatedPremium > familyCaps.maxPremiumPerOrder) {
     return "OPTION_RISK_LIMIT_EXCEEDED";
   }
   const accountEquity =

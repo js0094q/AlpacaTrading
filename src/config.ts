@@ -14,6 +14,17 @@ const parseInteger = (value: string | undefined, fallback: number) => {
   const parsed = Number.parseInt(value || "", 10);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 };
+const parseSymbolList = (value: string | undefined, fallback: string[]) => {
+  const source = value === undefined || value.trim() === "" ? fallback.join(",") : value;
+  return Array.from(
+    new Set(
+      source
+        .split(",")
+        .map((entry) => entry.trim().toUpperCase())
+        .filter(Boolean)
+    )
+  );
+};
 
 const firstEnv = (...names: string[]) => {
   for (const name of names) {
@@ -69,6 +80,7 @@ export const config = {
     allowLastPriceFallback: parseBoolean(process.env.ALLOW_OPTIONS_LAST_PRICE_FALLBACK),
     limitPriceBasis: process.env.PAPER_OPTIONS_LIMIT_PRICE_BASIS || "mid",
     maxSpreadPct: parseNumber(process.env.PAPER_OPTIONS_MAX_SPREAD_PCT, 50),
+    hardSpreadCapEnabled: parseBoolean(process.env.PAPER_OPTIONS_HARD_SPREAD_CAP_ENABLED),
     maxPortfolioRiskPct: parseNumber(process.env.PAPER_OPTIONS_MAX_PORTFOLIO_RISK_PCT, 20),
     maxPositionRiskPct: parseNumber(process.env.PAPER_OPTIONS_MAX_POSITION_RISK_PCT, 5),
     allowLongCalls: parseBooleanDefault(process.env.PAPER_OPTIONS_ALLOW_LONG_CALLS, true),
@@ -83,19 +95,29 @@ export const config = {
   ),
   paperZeroDteSpy: {
     enabled: parseBoolean(process.env.PAPER_0DTE_SPY_ENABLED),
+    underlyings: parseSymbolList(process.env.PAPER_0DTE_SPY_UNDERLYINGS, ["SPY"]),
     maxPremiumPerTrade: parseNumber(process.env.PAPER_0DTE_SPY_MAX_PREMIUM_PER_TRADE, 500),
     maxContracts: Math.max(1, parseInteger(process.env.PAPER_0DTE_SPY_MAX_CONTRACTS, 5)),
     maxDailyTrades: Math.max(1, parseInteger(process.env.PAPER_0DTE_SPY_MAX_DAILY_TRADES, 3)),
     maxQuoteAgeSeconds: Math.max(1, parseInteger(process.env.PAPER_0DTE_SPY_MAX_QUOTE_AGE_SECONDS, 60)),
-    maxSpreadPct: parseNumber(process.env.PAPER_0DTE_SPY_MAX_SPREAD_PCT, 20)
+    maxSpreadPct: parseNumber(process.env.PAPER_0DTE_SPY_MAX_SPREAD_PCT, 20),
+    hardSpreadCapEnabled: parseBooleanDefault(
+      process.env.PAPER_0DTE_SPY_HARD_SPREAD_CAP_ENABLED,
+      parseBoolean(process.env.PAPER_OPTIONS_HARD_SPREAD_CAP_ENABLED)
+    )
   },
   paperLeaps: {
     enabled: parseBoolean(process.env.PAPER_LEAPS_ENABLED),
+    underlyings: parseSymbolList(process.env.PAPER_LEAPS_UNDERLYINGS, ["SPY", "QQQ"]),
     maxPremiumPerTrade: parseNumber(process.env.PAPER_LEAPS_MAX_PREMIUM_PER_TRADE, 2500),
     maxContracts: Math.max(1, parseInteger(process.env.PAPER_LEAPS_MAX_CONTRACTS, 2)),
     minDte: parseInteger(process.env.PAPER_LEAPS_MIN_DTE, 180),
     maxDte: Math.max(1, parseInteger(process.env.PAPER_LEAPS_MAX_DTE, 730)),
-    maxSpreadPct: parseNumber(process.env.PAPER_LEAPS_MAX_SPREAD_PCT, 15)
+    maxSpreadPct: parseNumber(process.env.PAPER_LEAPS_MAX_SPREAD_PCT, 15),
+    hardSpreadCapEnabled: parseBooleanDefault(
+      process.env.PAPER_LEAPS_HARD_SPREAD_CAP_ENABLED,
+      parseBoolean(process.env.PAPER_OPTIONS_HARD_SPREAD_CAP_ENABLED)
+    )
   },
   enableAggressivePaperStrategies:
     process.env.ENABLE_AGGRESSIVE_PAPER_STRATEGIES === "true",

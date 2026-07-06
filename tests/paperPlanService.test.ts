@@ -29,12 +29,13 @@ const resetDatabase = () => {
     DELETE FROM paper_trade_candidates;
     DELETE FROM paper_trade_plans;
     DELETE FROM paper_trade_evaluations;
-    DELETE FROM paper_learning_records;
-    DELETE FROM option_snapshots;
-    DELETE FROM option_contracts;
-    DELETE FROM market_bars;
-    DELETE FROM research_runs;
-  `);
+	    DELETE FROM paper_learning_records;
+	    DELETE FROM option_snapshots;
+	    DELETE FROM option_contracts;
+	    DELETE FROM target_snapshots;
+	    DELETE FROM market_bars;
+	    DELETE FROM research_runs;
+	  `);
 };
 
 const makeMockResponse = (payload: unknown, status = 200) => ({
@@ -69,11 +70,13 @@ const createMockFetcher = ({
   positions = [] as Array<{ symbol: string; qty: string; asset_class?: string }>,
   orders = [] as Array<{ symbol: string; id?: string; asset_class?: string }>,
   assets = {
-    AAPL: { class: "us_equity", status: "active", tradable: true, fractionable: true },
-    NVDA: { class: "us_equity", status: "active", tradable: true, fractionable: true },
-    MSFT: { class: "us_equity", status: "active", tradable: true, fractionable: true },
-    TSLA: { class: "us_equity", status: "active", tradable: true, fractionable: true },
-    GOOGL: { class: "us_equity", status: "active", tradable: true, fractionable: true }
+	    AAPL: { class: "us_equity", status: "active", tradable: true, fractionable: true },
+	    NVDA: { class: "us_equity", status: "active", tradable: true, fractionable: true },
+	    MSFT: { class: "us_equity", status: "active", tradable: true, fractionable: true },
+	    TSLA: { class: "us_equity", status: "active", tradable: true, fractionable: true },
+	    GOOGL: { class: "us_equity", status: "active", tradable: true, fractionable: true },
+	    SPY: { class: "us_equity", status: "active", tradable: true, fractionable: true },
+	    QQQ: { class: "us_equity", status: "active", tradable: true, fractionable: true }
   } as Record<string, AssetFixture>
 } = {}): FetcherFn => {
   return async (input, init) => {
@@ -256,9 +259,9 @@ const insertOptionContract = ({
   underlying = "AAPL",
   type = "call",
   expirationDate = futureDate(30),
-  strike = 100,
-  tradable = 1
-}: {
+	  strike = 100,
+	  tradable = 1
+	}: {
   optionSymbol: string;
   underlying?: string;
   type?: "call" | "put";
@@ -292,9 +295,10 @@ const insertOptionSnapshot = ({
   executable = 1,
   executablePrice = midpoint,
   executablePriceSource = "midpoint",
-  rejectionReason = null,
-  quoteTimestamp = timestamp
-}: {
+	  rejectionReason = null,
+	  quoteTimestamp = timestamp,
+	  delta = 0.5
+	}: {
   optionSymbol: string;
   underlying?: string;
   bid?: number | null;
@@ -305,10 +309,11 @@ const insertOptionSnapshot = ({
   quoteStatus?: string;
   executable?: number;
   executablePrice?: number | null;
-  executablePriceSource?: string | null;
-  rejectionReason?: string | null;
-  quoteTimestamp?: string | null;
-}) => {
+	  executablePriceSource?: string | null;
+	  rejectionReason?: string | null;
+	  quoteTimestamp?: string | null;
+	  delta?: number | null;
+	}) => {
   getDb().prepare(`
     INSERT INTO option_snapshots(
       option_symbol,
@@ -345,7 +350,7 @@ const insertOptionSnapshot = ({
     100,
     100,
     0.4,
-    0.5,
+	    delta,
     null,
     null,
     null,
@@ -357,6 +362,54 @@ const insertOptionSnapshot = ({
     executablePriceSource,
     rejectionReason,
     quoteTimestamp
+	  );
+	};
+
+const insertTargetSignal = ({
+  symbol,
+  direction = "long",
+  confidence = 0.8,
+  asOf = new Date().toISOString()
+}: {
+  symbol: string;
+  direction?: "long" | "short" | "neutral";
+  confidence?: number | null;
+  asOf?: string;
+}) => {
+  getDb().prepare(`
+    INSERT INTO target_snapshots(
+      symbol,
+      as_of,
+      direction,
+      horizon,
+      entry_reference,
+      upside_target,
+      downside_risk,
+      stop_loss,
+      take_profit,
+      confidence,
+      expected_return,
+      volatility_adjusted_score,
+      risk_profile,
+      preferred_expression,
+      rationale
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    symbol,
+    asOf,
+    direction,
+    "1d",
+    100,
+    105,
+    95,
+    94,
+    106,
+    confidence,
+    direction === "short" ? -0.01 : 0.01,
+    confidence ?? 0,
+    "moderate",
+    direction === "short" ? "long_put" : "long_call",
+    JSON.stringify(["test signal"])
   );
 };
 
@@ -407,21 +460,26 @@ beforeEach(() => {
   delete process.env.ALLOW_0DTE_OPTIONS;
   delete process.env.OPTIONS_QUOTE_MAX_AGE_MS;
   delete process.env.ALLOW_OPTIONS_LAST_PRICE_FALLBACK;
-  delete process.env.PAPER_OPTIONS_MAX_SPREAD_PCT;
-  delete process.env.PAPER_OPTIONS_MAX_CONTRACTS;
+	  delete process.env.PAPER_OPTIONS_MAX_SPREAD_PCT;
+	  delete process.env.PAPER_OPTIONS_HARD_SPREAD_CAP_ENABLED;
+	  delete process.env.PAPER_OPTIONS_MAX_CONTRACTS;
   delete process.env.PAPER_OPTIONS_MAX_PREMIUM_PER_ORDER;
-  delete process.env.PAPER_0DTE_SPY_ENABLED;
-  delete process.env.PAPER_0DTE_SPY_MAX_PREMIUM_PER_TRADE;
+	  delete process.env.PAPER_0DTE_SPY_ENABLED;
+	  delete process.env.PAPER_0DTE_SPY_UNDERLYINGS;
+	  delete process.env.PAPER_0DTE_SPY_MAX_PREMIUM_PER_TRADE;
   delete process.env.PAPER_0DTE_SPY_MAX_CONTRACTS;
   delete process.env.PAPER_0DTE_SPY_MAX_DAILY_TRADES;
-  delete process.env.PAPER_0DTE_SPY_MAX_QUOTE_AGE_SECONDS;
-  delete process.env.PAPER_0DTE_SPY_MAX_SPREAD_PCT;
-  delete process.env.PAPER_LEAPS_ENABLED;
+	  delete process.env.PAPER_0DTE_SPY_MAX_QUOTE_AGE_SECONDS;
+	  delete process.env.PAPER_0DTE_SPY_MAX_SPREAD_PCT;
+	  delete process.env.PAPER_0DTE_SPY_HARD_SPREAD_CAP_ENABLED;
+		  delete process.env.PAPER_LEAPS_ENABLED;
+		  delete process.env.PAPER_LEAPS_UNDERLYINGS;
   delete process.env.PAPER_LEAPS_MAX_PREMIUM_PER_TRADE;
   delete process.env.PAPER_LEAPS_MAX_CONTRACTS;
-  delete process.env.PAPER_LEAPS_MIN_DTE;
-  delete process.env.PAPER_LEAPS_MAX_DTE;
-  delete process.env.PAPER_LEAPS_MAX_SPREAD_PCT;
+	  delete process.env.PAPER_LEAPS_MIN_DTE;
+	  delete process.env.PAPER_LEAPS_MAX_DTE;
+	  delete process.env.PAPER_LEAPS_MAX_SPREAD_PCT;
+	  delete process.env.PAPER_LEAPS_HARD_SPREAD_CAP_ENABLED;
   delete process.env.PAPER_OPTION_LEARNING_LEDGER_ENABLED;
   setMockFetch(createMockFetcher());
 });
@@ -1110,6 +1168,256 @@ describe("paper plan service", () => {
     assert.equal(report.plan[0]?.reasonCodes.includes("DTE_OUT_OF_RANGE"), true);
   });
 
+  test("discovers executable 0DTE SPY call and put without normal equity candidates", async () => {
+    const asOf = new Date().toISOString();
+    const today = new Date().toISOString().slice(0, 10);
+    const callSymbol = "SPY0DTECALL";
+    const putSymbol = "SPY0DTEPUT";
+    process.env.PAPER_0DTE_SPY_ENABLED = "true";
+    process.env.ALLOW_0DTE_OPTIONS = "true";
+    insertResearchRun({ runId: "run-zero-dte-discovery", riskProfile: "moderate", optionsEnabled: true });
+    insertTargetSignal({ symbol: "SPY", asOf, direction: "neutral", confidence: 0.8 });
+    insertMarketBar({ symbol: "SPY", close: 450, timestamp: asOf });
+    insertOptionContract({ optionSymbol: callSymbol, underlying: "SPY", type: "call", expirationDate: today, strike: 450 });
+    insertOptionContract({ optionSymbol: putSymbol, underlying: "SPY", type: "put", expirationDate: today, strike: 450 });
+    insertOptionSnapshot({ optionSymbol: callSymbol, underlying: "SPY", bid: 1, ask: 1.1, midpoint: 1.05 });
+    insertOptionSnapshot({ optionSymbol: putSymbol, underlying: "SPY", bid: 1.2, ask: 1.3, midpoint: 1.25 });
+
+    const report = await planResultFor({ optionsEnabled: true });
+    const discovered = report.plan.filter((candidate) =>
+      candidate.sourceCandidateId?.startsWith("discovery:zero_dte_spy:")
+    );
+    assert.equal(discovered.length, 2);
+    assert.deepEqual(discovered.map((entry) => entry.optionSymbol).sort(), [callSymbol, putSymbol].sort());
+    assert.equal(discovered.every((entry) => entry.decision === "planned"), true);
+    assert.deepEqual(discovered.map((entry) => entry.strategy).sort(), ["long_call", "long_put"].sort());
+    assert.equal(report.summary.zeroDteSpyDiscoveryEligible, 2);
+    assert.deepEqual(report.diagnostics.zeroDteSpyDiscovery?.selectedOptionSymbols.sort(), [callSymbol, putSymbol].sort());
+
+    const records = getDb()
+      .prepare("SELECT strategy_family, decision, signal_inputs_json FROM paper_learning_records ORDER BY option_symbol ASC")
+      .all() as Array<{ strategy_family: string; decision: string; signal_inputs_json: string }>;
+    assert.equal(records.length, 2);
+    assert.equal(records.every((record) => record.strategy_family === "zero_dte_spy"), true);
+    assert.equal(records.every((record) => record.decision === "submitted"), true);
+    assert.equal(records.every((record) => JSON.parse(record.signal_inputs_json).discoverySource === "explicit_zero_dte_spy"), true);
+  });
+
+  test("does not run 0DTE SPY discovery when disabled", async () => {
+    const today = new Date().toISOString().slice(0, 10);
+    insertResearchRun({ runId: "run-zero-disabled", riskProfile: "moderate", optionsEnabled: true });
+    insertOptionContract({
+      optionSymbol: "SPY0DTEDISABLED",
+      underlying: "SPY",
+      type: "call",
+      expirationDate: today,
+      strike: 450
+    });
+
+    const report = await planResultFor({ optionsEnabled: true });
+    assert.equal(report.summary.zeroDteSpyDiscoveryCandidates, 0);
+    assert.equal(report.diagnostics.zeroDteSpyDiscovery?.enabled, false);
+  });
+
+  test("does not run option discovery when paper options planning is disabled", async () => {
+    const today = new Date().toISOString().slice(0, 10);
+    process.env.PAPER_0DTE_SPY_ENABLED = "true";
+    process.env.ALLOW_0DTE_OPTIONS = "true";
+    insertResearchRun({ runId: "run-zero-options-disabled", riskProfile: "moderate", optionsEnabled: false });
+    insertOptionContract({
+      optionSymbol: "SPY0DTEOPTIONSDISABLED",
+      underlying: "SPY",
+      type: "call",
+      expirationDate: today,
+      strike: 450
+    });
+    insertOptionSnapshot({ optionSymbol: "SPY0DTEOPTIONSDISABLED", underlying: "SPY" });
+
+    const report = await planResultFor({ optionsEnabled: false });
+    assert.equal(report.summary.zeroDteSpyDiscoveryCandidates, 0);
+    assert.equal(report.diagnostics.zeroDteSpyDiscovery?.enabled, false);
+    assert.equal(report.diagnostics.discoveryTopBlockers?.includes("OPTIONS_PLANNING_NOT_IMPLEMENTED"), true);
+  });
+
+  test("blocks discovery outside the paper environment", async () => {
+    const originalEnv = process.env.ALPACA_ENV;
+    try {
+      process.env.ALPACA_ENV = "live";
+      await assert.rejects(
+        () => planResultFor({ optionsEnabled: true }),
+        /paper:plan requires ALPACA_ENV=paper/
+      );
+    } finally {
+      process.env.ALPACA_ENV = originalEnv;
+    }
+  });
+
+  test("0DTE SPY discovery ignores underlying equity duplicates and blocks same option duplicates", async () => {
+    const today = new Date().toISOString().slice(0, 10);
+    const callSymbol = "SPY0DTEDUPECALL";
+    const putSymbol = "SPY0DTEDUPEPUT";
+    process.env.PAPER_0DTE_SPY_ENABLED = "true";
+    process.env.ALLOW_0DTE_OPTIONS = "true";
+    insertResearchRun({ runId: "run-zero-duplicates", riskProfile: "moderate", optionsEnabled: true });
+    insertOptionContract({ optionSymbol: callSymbol, underlying: "SPY", type: "call", expirationDate: today, strike: 450 });
+    insertOptionContract({ optionSymbol: putSymbol, underlying: "SPY", type: "put", expirationDate: today, strike: 450 });
+    insertOptionSnapshot({ optionSymbol: callSymbol, underlying: "SPY" });
+    insertOptionSnapshot({ optionSymbol: putSymbol, underlying: "SPY" });
+    insertMarketBar({ symbol: "SPY", close: 450, timestamp: new Date().toISOString() });
+    setMockFetch(createMockFetcher({
+      positions: [{ symbol: "SPY", qty: "10", asset_class: "us_equity" }],
+      orders: [{ symbol: "SPY", id: "ord-equity", asset_class: "us_equity" }]
+    }));
+
+    const underlyingDuplicate = await planResultFor({ optionsEnabled: true });
+    assert.equal(underlyingDuplicate.plan.every((entry) => entry.decision === "planned"), true);
+    assert.equal(underlyingDuplicate.plan.some((entry) => entry.reasonCodes.includes("ALREADY_HELD_EQUITY")), false);
+    assert.equal(underlyingDuplicate.plan.some((entry) => entry.reasonCodes.includes("DUPLICATE_OPEN_EQUITY_ORDER")), false);
+
+    resetDatabase();
+    setMockFetch(createMockFetcher({
+      positions: [{ symbol: callSymbol, qty: "1", asset_class: "option" }]
+    }));
+    process.env.PAPER_0DTE_SPY_ENABLED = "true";
+    process.env.ALLOW_0DTE_OPTIONS = "true";
+    insertResearchRun({ runId: "run-zero-held-contract", riskProfile: "moderate", optionsEnabled: true });
+    insertOptionContract({ optionSymbol: callSymbol, underlying: "SPY", type: "call", expirationDate: today, strike: 450 });
+    insertOptionContract({ optionSymbol: putSymbol, underlying: "SPY", type: "put", expirationDate: today, strike: 450 });
+    insertOptionSnapshot({ optionSymbol: callSymbol, underlying: "SPY" });
+    insertOptionSnapshot({ optionSymbol: putSymbol, underlying: "SPY" });
+
+    const heldContract = await planResultFor({ optionsEnabled: true });
+    const heldCall = heldContract.plan.find((entry) => entry.optionSymbol === callSymbol);
+    const unheldPut = heldContract.plan.find((entry) => entry.optionSymbol === putSymbol);
+    assert.equal(heldCall?.decision, "watch");
+    assert.equal(heldCall?.reasonCodes.includes("ALREADY_HELD_OPTION_CONTRACT"), true);
+    assert.equal(unheldPut?.decision, "planned");
+
+    resetDatabase();
+    setMockFetch(createMockFetcher({
+      orders: [{ symbol: callSymbol, id: "ord-option", asset_class: "option" }]
+    }));
+    process.env.PAPER_0DTE_SPY_ENABLED = "true";
+    process.env.ALLOW_0DTE_OPTIONS = "true";
+    insertResearchRun({ runId: "run-zero-open-contract", riskProfile: "moderate", optionsEnabled: true });
+    insertOptionContract({ optionSymbol: callSymbol, underlying: "SPY", type: "call", expirationDate: today, strike: 450 });
+    insertOptionContract({ optionSymbol: putSymbol, underlying: "SPY", type: "put", expirationDate: today, strike: 450 });
+    insertOptionSnapshot({ optionSymbol: callSymbol, underlying: "SPY" });
+    insertOptionSnapshot({ optionSymbol: putSymbol, underlying: "SPY" });
+
+    const openContract = await planResultFor({ optionsEnabled: true });
+    const openCall = openContract.plan.find((entry) => entry.optionSymbol === callSymbol);
+    assert.equal(openCall?.decision, "skip");
+    assert.equal(openCall?.reasonCodes.includes("DUPLICATE_OPEN_OPTION_ORDER"), true);
+  });
+
+  test("discovers executable SPY and QQQ LEAPS calls without normal equity candidates", async () => {
+    const spySymbol = "SPYLEAPSCALL";
+    const qqqSymbol = "QQQLEAPSCALL";
+    process.env.PAPER_LEAPS_ENABLED = "true";
+    process.env.PAPER_LEAPS_UNDERLYINGS = "SPY,QQQ";
+    insertResearchRun({ runId: "run-leaps-discovery", riskProfile: "moderate", optionsEnabled: true });
+    insertMarketBar({ symbol: "SPY", close: 450, timestamp: new Date().toISOString() });
+    insertMarketBar({ symbol: "QQQ", close: 380, timestamp: new Date().toISOString() });
+    insertOptionContract({ optionSymbol: spySymbol, underlying: "SPY", type: "call", expirationDate: futureDate(365), strike: 440 });
+    insertOptionContract({ optionSymbol: qqqSymbol, underlying: "QQQ", type: "call", expirationDate: futureDate(365), strike: 370 });
+    insertOptionSnapshot({ optionSymbol: spySymbol, underlying: "SPY", bid: 4, ask: 4.2, midpoint: 4.1, delta: 0.7 });
+    insertOptionSnapshot({ optionSymbol: qqqSymbol, underlying: "QQQ", bid: 3, ask: 3.2, midpoint: 3.1, delta: 0.65 });
+
+    const report = await planResultFor({ optionsEnabled: true });
+    const discovered = report.plan.filter((candidate) =>
+      candidate.sourceCandidateId?.startsWith("discovery:leaps:")
+    );
+    assert.equal(discovered.length, 2);
+    assert.deepEqual(discovered.map((entry) => entry.optionSymbol).sort(), [qqqSymbol, spySymbol].sort());
+    assert.equal(discovered.every((entry) => entry.decision === "planned"), true);
+    assert.equal(discovered.every((entry) => entry.strategy === "long_call"), true);
+    assert.equal(report.summary.leapsDiscoveryEligible, 2);
+
+    const records = getDb()
+      .prepare("SELECT strategy_family, decision, signal_inputs_json FROM paper_learning_records ORDER BY option_symbol ASC")
+      .all() as Array<{ strategy_family: string; decision: string; signal_inputs_json: string }>;
+    assert.equal(records.length, 2);
+    assert.equal(records.every((record) => record.strategy_family === "leaps"), true);
+    assert.equal(records.every((record) => record.decision === "submitted"), true);
+    assert.equal(records.every((record) => JSON.parse(record.signal_inputs_json).discoverySource === "explicit_leaps"), true);
+  });
+
+  test("LEAPS discovery ignores underlying equity duplicates and blocks same option duplicates", async () => {
+    const optionSymbol = "SPYLEAPSDUPE";
+    process.env.PAPER_LEAPS_ENABLED = "true";
+    process.env.PAPER_LEAPS_UNDERLYINGS = "SPY";
+    insertResearchRun({ runId: "run-leaps-duplicates", riskProfile: "moderate", optionsEnabled: true });
+    insertOptionContract({ optionSymbol, underlying: "SPY", type: "call", expirationDate: futureDate(365), strike: 440 });
+    insertOptionSnapshot({ optionSymbol, underlying: "SPY", delta: 0.7 });
+    setMockFetch(createMockFetcher({
+      positions: [{ symbol: "SPY", qty: "10", asset_class: "us_equity" }],
+      orders: [{ symbol: "SPY", id: "ord-equity", asset_class: "us_equity" }]
+    }));
+
+    const underlyingDuplicate = await planResultFor({ optionsEnabled: true });
+    assert.equal(underlyingDuplicate.plan[0]?.decision, "planned");
+    assert.equal(underlyingDuplicate.plan[0]?.reasonCodes.includes("ALREADY_HELD_EQUITY"), false);
+    assert.equal(underlyingDuplicate.plan[0]?.reasonCodes.includes("DUPLICATE_OPEN_EQUITY_ORDER"), false);
+
+    resetDatabase();
+    setMockFetch(createMockFetcher({
+      positions: [{ symbol: optionSymbol, qty: "1", asset_class: "option" }]
+    }));
+    process.env.PAPER_LEAPS_ENABLED = "true";
+    process.env.PAPER_LEAPS_UNDERLYINGS = "SPY";
+    insertResearchRun({ runId: "run-leaps-held-contract", riskProfile: "moderate", optionsEnabled: true });
+    insertOptionContract({ optionSymbol, underlying: "SPY", type: "call", expirationDate: futureDate(365), strike: 440 });
+    insertOptionSnapshot({ optionSymbol, underlying: "SPY", delta: 0.7 });
+
+    const heldContract = await planResultFor({ optionsEnabled: true });
+    assert.equal(heldContract.plan[0]?.decision, "watch");
+    assert.equal(heldContract.plan[0]?.reasonCodes.includes("ALREADY_HELD_OPTION_CONTRACT"), true);
+
+    resetDatabase();
+    setMockFetch(createMockFetcher({
+      orders: [{ symbol: optionSymbol, id: "ord-option", asset_class: "option" }]
+    }));
+    process.env.PAPER_LEAPS_ENABLED = "true";
+    process.env.PAPER_LEAPS_UNDERLYINGS = "SPY";
+    insertResearchRun({ runId: "run-leaps-open-contract", riskProfile: "moderate", optionsEnabled: true });
+    insertOptionContract({ optionSymbol, underlying: "SPY", type: "call", expirationDate: futureDate(365), strike: 440 });
+    insertOptionSnapshot({ optionSymbol, underlying: "SPY", delta: 0.7 });
+
+    const openContract = await planResultFor({ optionsEnabled: true });
+    assert.equal(openContract.plan[0]?.decision, "skip");
+    assert.equal(openContract.plan[0]?.reasonCodes.includes("DUPLICATE_OPEN_OPTION_ORDER"), true);
+  });
+
+  test("wide spread and weak signal are warnings, not discovery buy blockers", async () => {
+    const asOf = new Date().toISOString();
+    const today = new Date().toISOString().slice(0, 10);
+    const callSymbol = "SPY0DTEWIDECALL";
+    const putSymbol = "SPY0DTEWIDEPUT";
+    process.env.PAPER_0DTE_SPY_ENABLED = "true";
+    process.env.ALLOW_0DTE_OPTIONS = "true";
+    process.env.PAPER_0DTE_SPY_MAX_SPREAD_PCT = "10";
+    insertResearchRun({ runId: "run-zero-warnings", riskProfile: "moderate", optionsEnabled: true });
+    insertTargetSignal({ symbol: "SPY", asOf, direction: "neutral", confidence: 0.2 });
+    insertMarketBar({ symbol: "SPY", close: 450, timestamp: asOf });
+    insertOptionContract({ optionSymbol: callSymbol, underlying: "SPY", type: "call", expirationDate: today, strike: 450 });
+    insertOptionContract({ optionSymbol: putSymbol, underlying: "SPY", type: "put", expirationDate: today, strike: 450 });
+    insertOptionSnapshot({ optionSymbol: callSymbol, underlying: "SPY", bid: 0.5, ask: 1, midpoint: 0.75 });
+    insertOptionSnapshot({ optionSymbol: putSymbol, underlying: "SPY", bid: 0.5, ask: 1, midpoint: 0.75 });
+
+    const report = await planResultFor({ optionsEnabled: true });
+    assert.equal(report.plan.every((entry) => entry.decision === "planned"), true);
+    assert.equal(report.plan.every((entry) => entry.reasonCodes.includes("OPTION_WIDE_SPREAD_WARNING")), true);
+    assert.equal(report.diagnostics.zeroDteSpyDiscovery?.warnings.includes("weak_signal_confidence"), true);
+    assert.equal(report.diagnostics.zeroDteSpyDiscovery?.warnings.includes("neutral_signal_direction"), true);
+
+    const record = getDb()
+      .prepare("SELECT signal_inputs_json FROM paper_learning_records LIMIT 1")
+      .get() as { signal_inputs_json: string };
+    const signalInputs = JSON.parse(record.signal_inputs_json) as { warnings?: string[] };
+    assert.equal(signalInputs.warnings?.includes("weak_signal_confidence"), true);
+  });
+
   test("writes learning records for submitted and rejected option candidates", async () => {
     const submittedSymbol = "AAPL270115C00100000";
     const rejectedSymbol = "SPY260703C00100000";
@@ -1174,7 +1482,7 @@ describe("paper plan service", () => {
     assert.match(records[1]?.hypothesis || "", /SPY intraday/);
   });
 
-  test("wide option spread is a warning below hard max and blocker above hard max", async () => {
+  test("wide option spread is a warning unless hard spread cap is enabled", async () => {
     const optionSymbol = "AAPL260814C00100000";
     insertResearchRun({ runId: "run-wide-spread", riskProfile: "moderate", optionsEnabled: true });
     insertCandidate({
@@ -1194,6 +1502,7 @@ describe("paper plan service", () => {
     assert.equal(warning.plan[0]?.reasonCodes.includes("OPTION_WIDE_SPREAD_WARNING"), true);
 
     process.env.PAPER_OPTIONS_MAX_SPREAD_PCT = "20";
+    process.env.PAPER_OPTIONS_HARD_SPREAD_CAP_ENABLED = "true";
     const blocked = await planResultFor({ optionsEnabled: true });
     assert.equal(blocked.plan[0]?.decision, "watch");
     assert.equal(blocked.plan[0]?.reasonCodes.includes("OPTION_SPREAD_TOO_WIDE"), true);

@@ -88,6 +88,7 @@ PAPER_OPTIONS_LIMIT_PRICE_BASIS=mid
 OPTIONS_QUOTE_MAX_AGE_MS=900000
 ALLOW_OPTIONS_LAST_PRICE_FALLBACK=false
 PAPER_OPTIONS_MAX_SPREAD_PCT=50
+PAPER_OPTIONS_HARD_SPREAD_CAP_ENABLED=false
 PAPER_OPTIONS_MAX_PORTFOLIO_RISK_PCT=20
 PAPER_OPTIONS_MAX_POSITION_RISK_PCT=5
 PAPER_OPTIONS_ALLOW_LONG_CALLS=true
@@ -97,17 +98,21 @@ PAPER_OPTIONS_ALLOW_COVERED_CALLS=true
 PAPER_OPTIONS_ALLOW_NAKED_OPTIONS=false
 PAPER_OPTION_LEARNING_LEDGER_ENABLED=true
 PAPER_0DTE_SPY_ENABLED=false
+PAPER_0DTE_SPY_UNDERLYINGS=SPY
 PAPER_0DTE_SPY_MAX_PREMIUM_PER_TRADE=500
 PAPER_0DTE_SPY_MAX_CONTRACTS=5
 PAPER_0DTE_SPY_MAX_DAILY_TRADES=3
 PAPER_0DTE_SPY_MAX_QUOTE_AGE_SECONDS=60
 PAPER_0DTE_SPY_MAX_SPREAD_PCT=20
+PAPER_0DTE_SPY_HARD_SPREAD_CAP_ENABLED=false
 PAPER_LEAPS_ENABLED=false
+PAPER_LEAPS_UNDERLYINGS=SPY,QQQ
 PAPER_LEAPS_MAX_PREMIUM_PER_TRADE=2500
 PAPER_LEAPS_MAX_CONTRACTS=2
 PAPER_LEAPS_MIN_DTE=180
 PAPER_LEAPS_MAX_DTE=730
 PAPER_LEAPS_MAX_SPREAD_PCT=15
+PAPER_LEAPS_HARD_SPREAD_CAP_ENABLED=false
 PAPER_RUNTIME_DUPLICATE_RECONCILIATION_ENABLED=false
 ENABLE_OPTIONS_RESEARCH=true
 ENABLE_AGGRESSIVE_PAPER_STRATEGIES=true
@@ -239,7 +244,7 @@ npm run paper:learn -- --format=json
 Each option decision is classified as `zero_dte_spy`, `leaps`, or `standard_option`, with a hypothesis, signal inputs, quote snapshot, paper fill model, live-like fill model, and risk model.
 
 `PAPER_0DTE_SPY_ENABLED=false` and `PAPER_LEAPS_ENABLED=false` are safe defaults.
-Enabling either flag only allows paper candidate planning under the paper-only guards.
+Enabling either flag allows first-class paper discovery under the paper-only guards; 0DTE discovery considers same-day SPY calls and puts from `PAPER_0DTE_SPY_UNDERLYINGS=SPY`, and LEAPS discovery considers one long-dated call per symbol from `PAPER_LEAPS_UNDERLYINGS=SPY,QQQ`.
 It does not enable live trading or automatic live promotion.
 
 Use `npm run paper:learn -- --format=json` to evaluate pending learning rows when local option mark data exists.
@@ -373,12 +378,13 @@ Paper options remain disabled by default with `PAPER_OPTIONS_EXECUTION_ENABLED=f
 - `OPTIONS_QUOTE_MAX_AGE_MS=900000`
 - `ALLOW_OPTIONS_LAST_PRICE_FALLBACK=false`
 - `PAPER_OPTIONS_MAX_SPREAD_PCT=50`
+- `PAPER_OPTIONS_HARD_SPREAD_CAP_ENABLED=false`
 - `PAPER_OPTIONS_MAX_PORTFOLIO_RISK_PCT=20`
 - `PAPER_OPTIONS_MAX_POSITION_RISK_PCT=5`
 - long calls, long puts, cash-secured puts, and covered calls enabled by default
 - naked options disabled by default
 
-Wide spreads and speculative long calls/puts are warnings in paper mode unless they exceed configured hard limits. `OPTION_LIMIT_PRICE_UNAVAILABLE` remains a hard blocker when no usable fresh bid/ask quote can produce an executable price. Last-price fallback is disabled unless `ALLOW_OPTIONS_LAST_PRICE_FALLBACK=true`; same-day expiration is disabled unless `ALLOW_0DTE_OPTIONS=true`.
+Wide spreads and speculative long calls/puts are warnings in paper mode by default. Spread caps become hard blockers only when `PAPER_OPTIONS_HARD_SPREAD_CAP_ENABLED=true` or a family-specific hard-spread flag is enabled. `OPTION_LIMIT_PRICE_UNAVAILABLE` remains a hard blocker when no usable fresh bid/ask quote can produce an executable price. Last-price fallback is disabled unless `ALLOW_OPTIONS_LAST_PRICE_FALLBACK=true`; same-day expiration is disabled unless `ALLOW_0DTE_OPTIONS=true`.
 
 Multi-leg options remain intentionally out of scope. Do not model spreads as unrelated single-leg submissions until the system can represent every leg, net debit/credit, max risk/reward, strike ordering, expiration alignment, combined payload behavior, and partial-failure handling.
 

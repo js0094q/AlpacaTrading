@@ -70,6 +70,12 @@ export interface PaperReviewPlanSummary {
   leapsCandidates?: number;
   leapsEligible?: number;
   leapsSkipped?: number;
+  zeroDteSpyDiscoveryCandidates?: number;
+  zeroDteSpyDiscoveryEligible?: number;
+  zeroDteSpyDiscoverySkipped?: number;
+  leapsDiscoveryCandidates?: number;
+  leapsDiscoveryEligible?: number;
+  leapsDiscoverySkipped?: number;
   learningRecordsWritten?: number;
   learningRecordsPending?: number;
   learningRecordsEvaluated?: number;
@@ -135,6 +141,12 @@ export interface PaperReviewReport {
     leapsCandidates?: number;
     leapsEligible?: number;
     leapsSkipped?: number;
+    zeroDteSpyDiscoveryCandidates?: number;
+    zeroDteSpyDiscoveryEligible?: number;
+    zeroDteSpyDiscoverySkipped?: number;
+    leapsDiscoveryCandidates?: number;
+    leapsDiscoveryEligible?: number;
+    leapsDiscoverySkipped?: number;
     learningRecordsWritten?: number;
     learningRecordsPending?: number;
   };
@@ -451,13 +463,14 @@ const buildReviewFlags = (
     "LEAPS_DISABLED",
     "NOT_ZERO_DTE",
     "DTE_OUT_OF_RANGE",
-    "QUOTE_NULL",
-    "QUOTE_STALE",
-    "QUOTE_CROSSED",
-    "SPREAD_TOO_WIDE",
-    "PREMIUM_ABOVE_LIMIT",
-    "MAX_DAILY_ZERO_DTE_TRADES_REACHED",
-    "LEARNING_LEDGER_WRITE_FAILED",
+	    "QUOTE_NULL",
+	    "QUOTE_STALE",
+	    "QUOTE_CROSSED",
+	    "SPREAD_TOO_WIDE",
+	    "PREMIUM_ABOVE_LIMIT",
+	    "MAX_DAILY_ZERO_DTE_TRADES_REACHED",
+	    "PAPER_ONLY_GUARD_FAILED",
+	    "LEARNING_LEDGER_WRITE_FAILED",
     "UNSUPPORTED_OPTION_STRATEGY",
     "OPTION_COLLATERAL_INSUFFICIENT"
   ]) {
@@ -495,8 +508,15 @@ const buildExecutionReadiness = (plan: PaperPlanCandidate[]) => {
             code === "ALREADY_HELD_OPTION_CONTRACT" ||
             code === "DUPLICATE_OPEN_OPTION_ORDER" ||
             code === "UNSUPPORTED_OPTION_STRATEGY" ||
-            code === "OPTIONS_PLANNING_NOT_IMPLEMENTED"
-          ) {
+            code === "OPTIONS_PLANNING_NOT_IMPLEMENTED" ||
+            code === "QUOTE_NULL" ||
+	            code === "QUOTE_STALE" ||
+	            code === "QUOTE_CROSSED" ||
+	            code === "SPREAD_TOO_WIDE" ||
+	            code === "PREMIUM_ABOVE_LIMIT" ||
+	            code === "MAX_DAILY_ZERO_DTE_TRADES_REACHED" ||
+	            code === "PAPER_ONLY_GUARD_FAILED"
+	          ) {
             optionBlockers.push(code);
           }
         }
@@ -534,6 +554,12 @@ const emptyCandidateCounts = () => ({
   leapsCandidates: 0,
   leapsEligible: 0,
   leapsSkipped: 0,
+  zeroDteSpyDiscoveryCandidates: 0,
+  zeroDteSpyDiscoveryEligible: 0,
+  zeroDteSpyDiscoverySkipped: 0,
+  leapsDiscoveryCandidates: 0,
+  leapsDiscoveryEligible: 0,
+  leapsDiscoverySkipped: 0,
   learningRecordsWritten: 0,
   learningRecordsPending: 0
 });
@@ -601,6 +627,28 @@ const buildCandidateCounts = (
   ).length,
   leapsSkipped: plan.filter(
     (candidate) => candidate.strategyFamily === "leaps" && candidate.decision !== "planned"
+  ).length,
+  zeroDteSpyDiscoveryCandidates: plan.filter((candidate) =>
+    candidate.sourceCandidateId?.startsWith("discovery:zero_dte_spy:")
+  ).length,
+  zeroDteSpyDiscoveryEligible: plan.filter((candidate) =>
+    candidate.sourceCandidateId?.startsWith("discovery:zero_dte_spy:") &&
+    candidate.decision === "planned"
+  ).length,
+  zeroDteSpyDiscoverySkipped: plan.filter((candidate) =>
+    candidate.sourceCandidateId?.startsWith("discovery:zero_dte_spy:") &&
+    candidate.decision !== "planned"
+  ).length,
+  leapsDiscoveryCandidates: plan.filter((candidate) =>
+    candidate.sourceCandidateId?.startsWith("discovery:leaps:")
+  ).length,
+  leapsDiscoveryEligible: plan.filter((candidate) =>
+    candidate.sourceCandidateId?.startsWith("discovery:leaps:") &&
+    candidate.decision === "planned"
+  ).length,
+  leapsDiscoverySkipped: plan.filter((candidate) =>
+    candidate.sourceCandidateId?.startsWith("discovery:leaps:") &&
+    candidate.decision !== "planned"
   ).length,
   learningRecordsWritten: plan.filter((candidate) => candidate.learningRecordWriteStatus === "written").length,
   learningRecordsPending: plan.filter((candidate) => candidate.learningRecordWriteStatus === "written").length
@@ -740,8 +788,27 @@ const emptyDiagnostics = (emptyReason: PaperPlanEmptyReason | null = null): Pape
   latestSnapshotTimestamp: null,
   filtersMatchedSnapshots: false,
   runtimeCandidatesAvailable: false,
-  emptyReason
-});
+  emptyReason,
+  discoveryTopBlockers: [],
+	  zeroDteSpyDiscovery: {
+	    enabled: false,
+	    underlyings: [],
+	    contractsFound: 0,
+	    candidatesSelected: 0,
+	    selectedOptionSymbols: [],
+	    warnings: [],
+	    hardBlockers: []
+	  },
+	  leapsDiscovery: {
+	    enabled: false,
+	    underlyings: [],
+	    contractsFound: 0,
+	    candidatesSelected: 0,
+	    selectedOptionSymbols: [],
+	    warnings: [],
+	    hardBlockers: []
+	  }
+	});
 
 const blockerForEmptyReason = (
   emptyReason: PaperPlanEmptyReason | null | undefined
@@ -852,6 +919,12 @@ export const buildPaperReviewReport = async (
         leapsCandidates: 0,
         leapsEligible: 0,
         leapsSkipped: 0,
+        zeroDteSpyDiscoveryCandidates: 0,
+        zeroDteSpyDiscoveryEligible: 0,
+        zeroDteSpyDiscoverySkipped: 0,
+        leapsDiscoveryCandidates: 0,
+        leapsDiscoveryEligible: 0,
+        leapsDiscoverySkipped: 0,
         learningRecordsWritten: 0,
         learningRecordsPending: paperLearningSummary().pending,
         learningRecordsEvaluated: paperLearningSummary().evaluated
@@ -943,6 +1016,12 @@ export const buildPaperReviewReport = async (
     leapsCandidates: planReport.summary?.leapsCandidates ?? 0,
     leapsEligible: planReport.summary?.leapsEligible ?? 0,
     leapsSkipped: planReport.summary?.leapsSkipped ?? 0,
+    zeroDteSpyDiscoveryCandidates: planReport.summary?.zeroDteSpyDiscoveryCandidates ?? 0,
+    zeroDteSpyDiscoveryEligible: planReport.summary?.zeroDteSpyDiscoveryEligible ?? 0,
+    zeroDteSpyDiscoverySkipped: planReport.summary?.zeroDteSpyDiscoverySkipped ?? 0,
+    leapsDiscoveryCandidates: planReport.summary?.leapsDiscoveryCandidates ?? 0,
+    leapsDiscoveryEligible: planReport.summary?.leapsDiscoveryEligible ?? 0,
+    leapsDiscoverySkipped: planReport.summary?.leapsDiscoverySkipped ?? 0,
     learningRecordsWritten: planReport.summary?.learningRecordsWritten ?? 0,
     learningRecordsPending: paperLearningSummary().pending,
     learningRecordsEvaluated: paperLearningSummary().evaluated
@@ -1066,7 +1145,12 @@ export const buildPaperReviewReport = async (
   const orderedWarnings = sortUniqueCodes(warnings, REVIEWER_WARNINGS);
   const executionReadiness = buildExecutionReadiness(planReport.plan);
   const candidateCounts = buildCandidateCounts(planReport.plan, summary, executionReadiness);
-  const topSkipReasons = buildTopSkipReasons(planReport.plan);
+  const topSkipReasons = [
+    ...new Set([
+      ...buildTopSkipReasons(planReport.plan),
+      ...(planReport.diagnostics?.discoveryTopBlockers ?? [])
+    ])
+  ];
   const blockReason = reviewBlockReason(orderedBlockers);
   const promotionReadiness = buildPromotionReadinessAnalytics();
 
@@ -1210,6 +1294,11 @@ export const formatPaperReviewReportAsTable = (report: PaperReviewReport) => {
   );
   lines.push(
     `Strategy families: zeroDteSpy candidates=${report.candidateCounts.zeroDteSpyCandidates ?? 0}, eligible=${report.candidateCounts.zeroDteSpyEligible ?? 0}, skipped=${report.candidateCounts.zeroDteSpySkipped ?? 0}; leaps candidates=${report.candidateCounts.leapsCandidates ?? 0}, eligible=${report.candidateCounts.leapsEligible ?? 0}, skipped=${report.candidateCounts.leapsSkipped ?? 0}`
+  );
+  const zeroDiscovery = report.diagnostics.zeroDteSpyDiscovery;
+  const leapsDiscovery = report.diagnostics.leapsDiscovery;
+  lines.push(
+    `Discovery: zeroDteSpy ran=${stateText(Boolean(zeroDiscovery?.enabled))}, underlyings=${zeroDiscovery?.underlyings.join(",") || "none"}, contracts=${zeroDiscovery?.contractsFound ?? 0}, selected=${zeroDiscovery?.selectedOptionSymbols.join(",") || "none"}, warnings=${zeroDiscovery?.warnings.join(",") || "none"}, hardBlockers=${zeroDiscovery?.hardBlockers.join(",") || "none"}; leaps ran=${stateText(Boolean(leapsDiscovery?.enabled))}, underlyings=${leapsDiscovery?.underlyings.join(",") || "none"}, contracts=${leapsDiscovery?.contractsFound ?? 0}, selected=${leapsDiscovery?.selectedOptionSymbols.join(",") || "none"}, warnings=${leapsDiscovery?.warnings.join(",") || "none"}, hardBlockers=${leapsDiscovery?.hardBlockers.join(",") || "none"}`
   );
   lines.push(
     `Learning ledger: written=${report.candidateCounts.learningRecordsWritten ?? 0}, pending=${report.planSummary.learningRecordsPending ?? 0}, evaluated=${report.planSummary.learningRecordsEvaluated ?? 0}`

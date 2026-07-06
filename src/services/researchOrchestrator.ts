@@ -15,7 +15,7 @@ import { ingestOptionContracts, ingestOptionSnapshots } from "./optionsService.j
 import { buildFeatures } from "./featureService.js";
 import { runLearning } from "./learningService.js";
 import { generateTargets } from "./targetService.js";
-import { nowIso, normalizeSymbol } from "../lib/utils.js";
+import { dedupeSymbols, nowIso, normalizeSymbol } from "../lib/utils.js";
 import { getDb } from "../lib/db.js";
 import { rankResearchCandidates, persistRankedCandidates } from "./candidateRankingService.js";
 import { buildPaperTradePlans } from "./paperTradeService.js";
@@ -246,6 +246,17 @@ const buildAlpacaFilteredTargets = async (
   };
 };
 
+const discoveryOptionUnderlyings = () => {
+  const symbols: string[] = [];
+  if (config.paperZeroDteSpy.enabled) {
+    symbols.push(...config.paperZeroDteSpy.underlyings);
+  }
+  if (config.paperLeaps.enabled) {
+    symbols.push(...config.paperLeaps.underlyings);
+  }
+  return dedupeSymbols(symbols);
+};
+
 export const runResearchDaily = async (
   input: ResearchDailyInput = {}
 ): Promise<RunSummary> => {
@@ -305,8 +316,12 @@ export const runResearchDaily = async (
     await ingestBars({ symbols, timeframe: "1Day", start: barLookbackStart });
     if (optionsEnabled) {
       try {
-        await ingestOptionContracts({ underlyingSymbols: symbols });
-        await ingestOptionSnapshots({ underlyingSymbols: symbols });
+        const optionUnderlyings = dedupeSymbols([
+          ...symbols,
+          ...discoveryOptionUnderlyings()
+        ]);
+        await ingestOptionContracts({ underlyingSymbols: optionUnderlyings });
+        await ingestOptionSnapshots({ underlyingSymbols: optionUnderlyings });
       } catch (error) {
         warnings.push(
           `Options data ingestion skipped; continuing equity candidate generation: ${safeWarningMessage(error)}`
