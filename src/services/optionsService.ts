@@ -174,23 +174,31 @@ export const ingestOptionContracts = async (params?: {
       minDaysToExpiration: params?.minDaysToExpiration,
       maxDaysToExpiration: params?.maxDaysToExpiration
     });
-    for (const raw of contracts) {
-      const row = toContractRow(raw);
-      if (!row.underlyingSymbol || !row.optionSymbol || !row.expirationDate || row.strike === null) {
-        continue;
+    const db = getDb();
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const raw of contracts) {
+        const row = toContractRow(raw);
+        if (!row.underlyingSymbol || !row.optionSymbol || !row.expirationDate || row.strike === null) {
+          continue;
+        }
+        const result = insert.run(
+          row.underlyingSymbol,
+          row.optionSymbol,
+          row.type,
+          row.expirationDate,
+          row.strike,
+          row.multiplier,
+          row.tradable
+        );
+        if (result.changes === 1) {
+          inserted += 1;
+        }
       }
-      const result = insert.run(
-        row.underlyingSymbol,
-        row.optionSymbol,
-        row.type,
-        row.expirationDate,
-        row.strike,
-        row.multiplier,
-        row.tradable
-      );
-      if (result.changes === 1) {
-        inserted += 1;
-      }
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
     }
     finishRun(runId, inserted, "completed");
     return { runId, rowsIngested: inserted };
@@ -230,46 +238,54 @@ const insertOptionSnapshotRows = async (
     fetchOptionQuotes(optionSymbols)
   ]);
   const quotesBySymbol = new Map(quotes.map((row) => [row.symbol, row.raw]));
-  for (const { symbol, raw } of snapshots) {
-    if (params?.minDelta !== undefined && params.minDelta !== null) {
-      const delta = raw.Greeks?.delta;
-      if (typeof delta !== "number" || delta < params.minDelta) {
-        continue;
+  const db = getDb();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    for (const { symbol, raw } of snapshots) {
+      if (params?.minDelta !== undefined && params.minDelta !== null) {
+        const delta = raw.Greeks?.delta;
+        if (typeof delta !== "number" || delta < params.minDelta) {
+          continue;
+        }
+      }
+      if (params?.maxDelta !== undefined && params.maxDelta !== null) {
+        const delta = raw.Greeks?.delta;
+        if (typeof delta !== "number" || delta > params.maxDelta) {
+          continue;
+        }
+      }
+      const row = toSnapshotRow(symbol, raw, quotesBySymbol.get(symbol));
+      const result = insert.run(
+        row.optionSymbol,
+        row.underlyingSymbol,
+        row.timestamp,
+        row.bid,
+        row.ask,
+        row.midpoint,
+        row.last,
+        row.quoteStatus,
+        row.executable,
+        row.executablePrice,
+        row.executablePriceSource,
+        row.rejectionReason,
+        row.quoteTimestamp,
+        row.volume,
+        row.openInterest,
+        row.impliedVolatility,
+        row.delta,
+        row.gamma,
+        row.theta,
+        row.vega,
+        row.rho
+      );
+      if (result.changes === 1) {
+        inserted += 1;
       }
     }
-    if (params?.maxDelta !== undefined && params.maxDelta !== null) {
-      const delta = raw.Greeks?.delta;
-      if (typeof delta !== "number" || delta > params.maxDelta) {
-        continue;
-      }
-    }
-    const row = toSnapshotRow(symbol, raw, quotesBySymbol.get(symbol));
-    const result = insert.run(
-      row.optionSymbol,
-      row.underlyingSymbol,
-      row.timestamp,
-      row.bid,
-      row.ask,
-      row.midpoint,
-      row.last,
-      row.quoteStatus,
-      row.executable,
-      row.executablePrice,
-      row.executablePriceSource,
-      row.rejectionReason,
-      row.quoteTimestamp,
-      row.volume,
-      row.openInterest,
-      row.impliedVolatility,
-      row.delta,
-      row.gamma,
-      row.theta,
-      row.vega,
-      row.rho
-    );
-    if (result.changes === 1) {
-      inserted += 1;
-    }
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
   }
   return inserted;
 };
