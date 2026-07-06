@@ -456,8 +456,10 @@ const buildPayloadForCandidate = (
       typeof candidate.executablePrice === "number" && candidate.executablePrice > 0
         ? roundOptionLimitPrice(candidate.executablePrice)
         : null;
+    const quoteStatusExecutable =
+      candidate.quoteStatus === "valid" || candidate.quoteStatus === "stale";
     if (
-      candidate.quoteStatus !== "valid" ||
+      !quoteStatusExecutable ||
       candidate.executable !== true ||
       executablePrice === null
     ) {

@@ -943,7 +943,7 @@ describe("paper plan service", () => {
     assert.equal(entry?.reasonCodes.includes("DUPLICATE_OPEN_OPTION_ORDER"), true);
   });
 
-  test("rejects stale option quotes before planning", async () => {
+  test("plans complete stale option quotes with a warning", async () => {
     const optionSymbol = "AAPL260814C00100000";
     const staleTimestamp = new Date(Date.now() - 60 * 60 * 1000).toISOString();
     insertResearchRun({ runId: "run-stale-option", riskProfile: "moderate", optionsEnabled: true });
@@ -970,11 +970,13 @@ describe("paper plan service", () => {
 
     const report = await planResultFor({ optionsEnabled: true });
     const entry = report.plan[0];
-    assert.equal(entry?.decision, "watch");
+    assert.equal(entry?.decision, "planned");
     assert.equal(entry?.quoteStatus, "stale");
-    assert.equal(entry?.executable, false);
+    assert.equal(entry?.executable, true);
+    assert.equal(entry?.limitPrice, 0.75);
     assert.equal(entry?.rejectionReason, "quote_stale");
-    assert.equal(entry?.reasonCodes.includes("OPTION_LIMIT_PRICE_UNAVAILABLE"), true);
+    assert.equal(entry?.reasonCodes.includes("QUOTE_STALE"), true);
+    assert.equal(entry?.reasonCodes.includes("OPTION_LIMIT_PRICE_UNAVAILABLE"), false);
   });
 
   test("rejects crossed option quotes before planning", async () => {

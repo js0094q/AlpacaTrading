@@ -627,6 +627,25 @@ describe("paper execute dry-run payload construction", () => {
     assert.match(report.blockedPayloads[0]?.explanation || "", /quote_unavailable/);
   });
 
+  test("constructs option payloads when quote status is stale but executable", async () => {
+    const report = await runWith({
+      plan: [
+        optionCandidate("long_call", {
+          quoteStatus: "stale",
+          executable: true,
+          executablePrice: 0.75,
+          executablePriceSource: "midpoint",
+          rejectionReason: "quote_stale",
+          reasonCodes: ["OPTION_CONTRACT_FOUND", "QUOTE_STALE"]
+        })
+      ]
+    });
+
+    assert.equal(report.wouldSubmit.length, 1);
+    assert.equal(report.blockedPayloads.length, 0);
+    assert.equal(report.wouldSubmit[0]?.symbol, "AAPL260814C00100000");
+  });
+
   test("constructs payloads for discovered 0DTE SPY call and put options", async () => {
     const call = optionCandidate("long_call", {
       symbol: "SPY0DTECALL",

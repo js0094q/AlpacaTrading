@@ -2004,11 +2004,36 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         : options
     );
     const spreadPct = spreadPctFor(quote.bid, quote.ask);
-    const limitPrice =
-      quote.executable && quote.executablePrice !== null
-        ? roundOptionLimitPrice(quote.executablePrice)
+    const staleQuoteUsable =
+      quote.quoteStatus === "stale" &&
+      quote.bid !== null &&
+      quote.ask !== null &&
+      quote.ask >= quote.bid;
+    const staleExecutablePrice =
+      staleQuoteUsable
+        ? quote.midpoint !== null && quote.midpoint > 0
+          ? quote.midpoint
+          : quote.ask
         : null;
-    if (quote.quoteStatus !== "valid" || !quote.executable || limitPrice === null) {
+    const quoteForPlanning: NormalizedOptionQuote = staleQuoteUsable
+      ? {
+          ...quote,
+          executable: true,
+          executablePrice: staleExecutablePrice,
+          executablePriceSource:
+            quote.midpoint !== null && quote.midpoint > 0 ? "midpoint" : "ask",
+          rejectionReason: quote.rejectionReason ?? "quote_stale"
+        }
+      : quote;
+    const limitPrice =
+      quoteForPlanning.executable && quoteForPlanning.executablePrice !== null
+        ? roundOptionLimitPrice(quoteForPlanning.executablePrice)
+        : null;
+    if (
+      (quote.quoteStatus !== "valid" && !staleQuoteUsable) ||
+      !quoteForPlanning.executable ||
+      limitPrice === null
+    ) {
       const qualityReason = quoteQualityReason(quote);
       return {
         ...base,
@@ -2101,9 +2126,9 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         shortStrike: candidate.short_strike,
         contracts,
         bidAskSpreadPct: spreadPct,
-        quoteSnapshot: quoteSnapshotModel(quote, spreadPct),
-        paperFillModel: paperFillModelFor(quote, limitPrice),
-        liveLikeFillModel: liveLikeFillModelFor(quote, limitPrice, spreadPct),
+        quoteSnapshot: quoteSnapshotModel(quoteForPlanning, spreadPct),
+        paperFillModel: paperFillModelFor(quoteForPlanning, limitPrice),
+        liveLikeFillModel: liveLikeFillModelFor(quoteForPlanning, limitPrice, spreadPct),
         riskModel: {
           maxPremium: familyCaps.maxPremiumPerTrade,
           contracts,
@@ -2111,7 +2136,7 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
           maxLoss: configuredRisk,
           expectedHoldPeriod: expectedHoldPeriodForFamily(strategyFamily)
         },
-        ...optionQuoteFields(quote),
+        ...optionQuoteFields(quoteForPlanning),
         estimatedNotional: configuredRisk,
         reasonCodes: buildReasonList([
           ...(base.reasonCodes),
@@ -2145,9 +2170,9 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         shortStrike: candidate.short_strike,
         contracts,
         bidAskSpreadPct: spreadPct,
-        quoteSnapshot: quoteSnapshotModel(quote, spreadPct),
-        paperFillModel: paperFillModelFor(quote, limitPrice),
-        liveLikeFillModel: liveLikeFillModelFor(quote, limitPrice, spreadPct),
+        quoteSnapshot: quoteSnapshotModel(quoteForPlanning, spreadPct),
+        paperFillModel: paperFillModelFor(quoteForPlanning, limitPrice),
+        liveLikeFillModel: liveLikeFillModelFor(quoteForPlanning, limitPrice, spreadPct),
         riskModel: {
           maxPremium: familyCaps.maxPremiumPerTrade,
           contracts,
@@ -2155,7 +2180,7 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
           maxLoss: configuredRisk,
           expectedHoldPeriod: expectedHoldPeriodForFamily(strategyFamily)
         },
-        ...optionQuoteFields(quote),
+        ...optionQuoteFields(quoteForPlanning),
         estimatedNotional: configuredRisk,
         reasonCodes: buildReasonList([
           ...(base.reasonCodes),
@@ -2187,9 +2212,9 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         shortStrike: candidate.short_strike,
         contracts,
         bidAskSpreadPct: spreadPct,
-        quoteSnapshot: quoteSnapshotModel(quote, spreadPct),
-        paperFillModel: paperFillModelFor(quote, limitPrice),
-        liveLikeFillModel: liveLikeFillModelFor(quote, limitPrice, spreadPct),
+        quoteSnapshot: quoteSnapshotModel(quoteForPlanning, spreadPct),
+        paperFillModel: paperFillModelFor(quoteForPlanning, limitPrice),
+        liveLikeFillModel: liveLikeFillModelFor(quoteForPlanning, limitPrice, spreadPct),
         riskModel: {
           maxPremium: familyCaps.maxPremiumPerTrade,
           contracts,
@@ -2197,7 +2222,7 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
           maxLoss: configuredRisk,
           expectedHoldPeriod: expectedHoldPeriodForFamily(strategyFamily)
         },
-        ...optionQuoteFields(quote),
+        ...optionQuoteFields(quoteForPlanning),
         reasonCodes: buildReasonList([
           ...(base.reasonCodes),
           "OPTION_CONTRACT_FOUND",
@@ -2230,9 +2255,9 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         shortStrike: candidate.short_strike,
         contracts,
         bidAskSpreadPct: spreadPct,
-        quoteSnapshot: quoteSnapshotModel(quote, spreadPct),
-        paperFillModel: paperFillModelFor(quote, limitPrice),
-        liveLikeFillModel: liveLikeFillModelFor(quote, limitPrice, spreadPct),
+        quoteSnapshot: quoteSnapshotModel(quoteForPlanning, spreadPct),
+        paperFillModel: paperFillModelFor(quoteForPlanning, limitPrice),
+        liveLikeFillModel: liveLikeFillModelFor(quoteForPlanning, limitPrice, spreadPct),
         riskModel: {
           maxPremium: familyCaps.maxPremiumPerTrade,
           contracts,
@@ -2240,7 +2265,7 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
           maxLoss: configuredRisk,
           expectedHoldPeriod: expectedHoldPeriodForFamily(strategyFamily)
         },
-        ...optionQuoteFields(quote),
+        ...optionQuoteFields(quoteForPlanning),
         estimatedNotional: configuredRisk,
         reasonCodes: buildReasonList([
           ...(base.reasonCodes),
@@ -2270,9 +2295,9 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         shortStrike: candidate.short_strike,
         contracts,
         bidAskSpreadPct: spreadPct,
-        quoteSnapshot: quoteSnapshotModel(quote, spreadPct),
-        paperFillModel: paperFillModelFor(quote, limitPrice),
-        liveLikeFillModel: liveLikeFillModelFor(quote, limitPrice, spreadPct),
+        quoteSnapshot: quoteSnapshotModel(quoteForPlanning, spreadPct),
+        paperFillModel: paperFillModelFor(quoteForPlanning, limitPrice),
+        liveLikeFillModel: liveLikeFillModelFor(quoteForPlanning, limitPrice, spreadPct),
         riskModel: {
           maxPremium: familyCaps.maxPremiumPerTrade,
           contracts,
@@ -2280,7 +2305,7 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
           maxLoss: configuredRisk,
           expectedHoldPeriod: expectedHoldPeriodForFamily(strategyFamily)
         },
-        ...optionQuoteFields(quote),
+        ...optionQuoteFields(quoteForPlanning),
         estimatedPrice: limitPrice,
         estimatedQty: contracts,
         estimatedNotional: configuredRisk,
@@ -2313,9 +2338,9 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         shortStrike: candidate.short_strike,
         contracts,
         bidAskSpreadPct: spreadPct,
-        quoteSnapshot: quoteSnapshotModel(quote, spreadPct),
-        paperFillModel: paperFillModelFor(quote, limitPrice),
-        liveLikeFillModel: liveLikeFillModelFor(quote, limitPrice, spreadPct),
+        quoteSnapshot: quoteSnapshotModel(quoteForPlanning, spreadPct),
+        paperFillModel: paperFillModelFor(quoteForPlanning, limitPrice),
+        liveLikeFillModel: liveLikeFillModelFor(quoteForPlanning, limitPrice, spreadPct),
         riskModel: {
           maxPremium: familyCaps.maxPremiumPerTrade,
           contracts,
@@ -2323,7 +2348,7 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
           maxLoss: configuredRisk,
           expectedHoldPeriod: expectedHoldPeriodForFamily(strategyFamily)
         },
-        ...optionQuoteFields(quote),
+        ...optionQuoteFields(quoteForPlanning),
         estimatedPrice: limitPrice,
         estimatedQty: contracts,
         estimatedNotional: configuredRisk,
@@ -2355,9 +2380,9 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
       shortStrike: candidate.short_strike,
       contracts,
       bidAskSpreadPct: spreadPct,
-      quoteSnapshot: quoteSnapshotModel(quote, spreadPct),
-      paperFillModel: paperFillModelFor(quote, limitPrice),
-      liveLikeFillModel: liveLikeFillModelFor(quote, limitPrice, spreadPct),
+      quoteSnapshot: quoteSnapshotModel(quoteForPlanning, spreadPct),
+      paperFillModel: paperFillModelFor(quoteForPlanning, limitPrice),
+      liveLikeFillModel: liveLikeFillModelFor(quoteForPlanning, limitPrice, spreadPct),
       riskModel: {
         maxPremium: familyCaps.maxPremiumPerTrade,
         contracts,
@@ -2365,7 +2390,7 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         maxLoss: configuredRisk,
         expectedHoldPeriod: expectedHoldPeriodForFamily(strategyFamily)
       },
-      ...optionQuoteFields(quote),
+      ...optionQuoteFields(quoteForPlanning),
       estimatedPrice: limitPrice,
       estimatedQty: contracts,
       estimatedNotional: configuredRisk,
@@ -2374,6 +2399,7 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         ...base.reasonCodes,
         "OPTION_CONTRACT_FOUND",
         "OPTION_DTE_ALLOWED",
+        ...(staleQuoteUsable ? (["QUOTE_STALE"] as PaperPlanReasonCode[]) : []),
         ...(dte === 0 ? (["OPTION_0DTE_ALLOWED"] as PaperPlanReasonCode[]) : []),
         ...(spreadAboveConfiguredCap || (spreadPct !== null && spreadPct > 20)
           ? (["OPTION_WIDE_SPREAD_WARNING"] as PaperPlanReasonCode[])
