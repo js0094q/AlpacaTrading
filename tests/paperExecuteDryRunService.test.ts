@@ -300,7 +300,43 @@ const baseReview = (
     plannedOrders: plan.summary.plannedOrders,
     eligiblePayloads: plan.plan.filter((candidate) => candidate.decision === "planned").length,
     skippedAlreadyHeld: plan.plan.filter((candidate) =>
-      candidate.decision !== "planned" && candidate.reasonCodes.includes("ALREADY_HELD")
+      candidate.decision !== "planned" &&
+      (
+        candidate.reasonCodes.includes("ALREADY_HELD") ||
+        candidate.reasonCodes.includes("ALREADY_HELD_EQUITY") ||
+        candidate.reasonCodes.includes("ALREADY_HELD_OPTION_CONTRACT")
+      )
+    ).length,
+    skippedAlreadyHeldEquity: plan.plan.filter((candidate) =>
+      candidate.decision !== "planned" &&
+      candidate.assetClass === "us_equity" &&
+      (
+        candidate.reasonCodes.includes("ALREADY_HELD") ||
+        candidate.reasonCodes.includes("ALREADY_HELD_EQUITY")
+      )
+    ).length,
+    skippedAlreadyHeldOptionContract: plan.plan.filter((candidate) =>
+      candidate.decision !== "planned" &&
+      candidate.assetClass === "option" &&
+      candidate.reasonCodes.includes("ALREADY_HELD_OPTION_CONTRACT")
+    ).length,
+    skippedUnderlyingEquityHeldForOption: plan.plan.filter((candidate) =>
+      candidate.decision !== "planned" &&
+      candidate.assetClass === "option" &&
+      candidate.reasonCodes.includes("ALREADY_HELD_EQUITY")
+    ).length,
+    skippedDuplicateOpenEquityOrder: plan.plan.filter((candidate) =>
+      candidate.decision !== "planned" &&
+      candidate.assetClass === "us_equity" &&
+      (
+        candidate.reasonCodes.includes("OPEN_ORDER_EXISTS") ||
+        candidate.reasonCodes.includes("DUPLICATE_OPEN_EQUITY_ORDER")
+      )
+    ).length,
+    skippedDuplicateOpenOptionOrder: plan.plan.filter((candidate) =>
+      candidate.decision !== "planned" &&
+      candidate.assetClass === "option" &&
+      candidate.reasonCodes.includes("DUPLICATE_OPEN_OPTION_ORDER")
     ).length,
     skippedQuoteUnavailable: plan.plan.filter((candidate) =>
       candidate.decision !== "planned" && candidate.rejectionReason === "quote_unavailable"
@@ -311,9 +347,13 @@ const baseReview = (
       plan.plan
         .filter((candidate) => candidate.decision !== "planned")
         .map((candidate) =>
-          candidate.reasonCodes.includes("ALREADY_HELD")
-            ? "ALREADY_HELD"
-            : candidate.rejectionReason || candidate.reasonCodes[0] || candidate.decision
+          candidate.reasonCodes.includes("ALREADY_HELD_EQUITY")
+            ? "ALREADY_HELD_EQUITY"
+            : candidate.reasonCodes.includes("ALREADY_HELD_OPTION_CONTRACT")
+              ? "ALREADY_HELD_OPTION_CONTRACT"
+              : candidate.reasonCodes.includes("ALREADY_HELD")
+                ? "ALREADY_HELD"
+                : candidate.rejectionReason || candidate.reasonCodes[0] || candidate.decision
         )
     )
   ],
@@ -416,7 +456,7 @@ describe("paper execute dry-run service guardrails", () => {
           decision: "watch",
           estimatedNotional: null,
           estimatedQty: null,
-          reasonCodes: ["ALREADY_HELD"],
+          reasonCodes: ["ALREADY_HELD_EQUITY"],
           explanation: "Watch"
         })
       ]
@@ -425,7 +465,8 @@ describe("paper execute dry-run service guardrails", () => {
     assert.equal(report.reason, "NO_ELIGIBLE_PAPER_PAYLOADS");
     assert.equal(report.blockers.length, 0);
     assert.equal(report.candidateCounts?.skippedAlreadyHeld, 1);
-    assert.deepEqual(report.topSkipReasons, ["ALREADY_HELD"]);
+    assert.equal(report.candidateCounts?.skippedAlreadyHeldEquity, 1);
+    assert.deepEqual(report.topSkipReasons, ["ALREADY_HELD_EQUITY"]);
     assert.equal(report.wouldSubmit.length, 0);
   });
 

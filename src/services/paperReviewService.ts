@@ -108,6 +108,11 @@ export interface PaperReviewReport {
     plannedOrders: number;
     eligiblePayloads: number;
     skippedAlreadyHeld: number;
+    skippedAlreadyHeldEquity: number;
+    skippedAlreadyHeldOptionContract: number;
+    skippedUnderlyingEquityHeldForOption: number;
+    skippedDuplicateOpenEquityOrder: number;
+    skippedDuplicateOpenOptionOrder: number;
     skippedQuoteUnavailable: number;
   };
   topSkipReasons: string[];
@@ -452,6 +457,8 @@ const buildExecutionReadiness = (plan: PaperPlanCandidate[]) => {
         for (const code of candidate.reasonCodes) {
           if (
             code.startsWith("OPTION_") ||
+            code === "ALREADY_HELD_OPTION_CONTRACT" ||
+            code === "DUPLICATE_OPEN_OPTION_ORDER" ||
             code === "UNSUPPORTED_OPTION_STRATEGY" ||
             code === "OPTIONS_PLANNING_NOT_IMPLEMENTED"
           ) {
@@ -480,6 +487,11 @@ const emptyCandidateCounts = () => ({
   plannedOrders: 0,
   eligiblePayloads: 0,
   skippedAlreadyHeld: 0,
+  skippedAlreadyHeldEquity: 0,
+  skippedAlreadyHeldOptionContract: 0,
+  skippedUnderlyingEquityHeldForOption: 0,
+  skippedDuplicateOpenEquityOrder: 0,
+  skippedDuplicateOpenOptionOrder: 0,
   skippedQuoteUnavailable: 0
 });
 
@@ -492,7 +504,43 @@ const buildCandidateCounts = (
   plannedOrders: summary.plannedOrders,
   eligiblePayloads: readiness.equity.eligible + readiness.options.eligible,
   skippedAlreadyHeld: plan.filter((candidate) =>
-    candidate.decision !== "planned" && candidate.reasonCodes.includes("ALREADY_HELD")
+    candidate.decision !== "planned" &&
+    (
+      candidate.reasonCodes.includes("ALREADY_HELD") ||
+      candidate.reasonCodes.includes("ALREADY_HELD_EQUITY") ||
+      candidate.reasonCodes.includes("ALREADY_HELD_OPTION_CONTRACT")
+    )
+  ).length,
+  skippedAlreadyHeldEquity: plan.filter((candidate) =>
+    candidate.decision !== "planned" &&
+    candidate.assetClass === "us_equity" &&
+    (
+      candidate.reasonCodes.includes("ALREADY_HELD") ||
+      candidate.reasonCodes.includes("ALREADY_HELD_EQUITY")
+    )
+  ).length,
+  skippedAlreadyHeldOptionContract: plan.filter((candidate) =>
+    candidate.decision !== "planned" &&
+    candidate.assetClass === "option" &&
+    candidate.reasonCodes.includes("ALREADY_HELD_OPTION_CONTRACT")
+  ).length,
+  skippedUnderlyingEquityHeldForOption: plan.filter((candidate) =>
+    candidate.decision !== "planned" &&
+    candidate.assetClass === "option" &&
+    candidate.reasonCodes.includes("ALREADY_HELD_EQUITY")
+  ).length,
+  skippedDuplicateOpenEquityOrder: plan.filter((candidate) =>
+    candidate.decision !== "planned" &&
+    candidate.assetClass === "us_equity" &&
+    (
+      candidate.reasonCodes.includes("OPEN_ORDER_EXISTS") ||
+      candidate.reasonCodes.includes("DUPLICATE_OPEN_EQUITY_ORDER")
+    )
+  ).length,
+  skippedDuplicateOpenOptionOrder: plan.filter((candidate) =>
+    candidate.decision !== "planned" &&
+    candidate.assetClass === "option" &&
+    candidate.reasonCodes.includes("DUPLICATE_OPEN_OPTION_ORDER")
   ).length,
   skippedQuoteUnavailable: plan.filter((candidate) =>
     candidate.decision !== "planned" && candidate.rejectionReason === "quote_unavailable"
@@ -502,6 +550,18 @@ const buildCandidateCounts = (
 const primarySkipReason = (candidate: PaperPlanCandidate): string | null => {
   if (candidate.decision === "planned") {
     return null;
+  }
+  if (candidate.reasonCodes.includes("ALREADY_HELD_EQUITY")) {
+    return "ALREADY_HELD_EQUITY";
+  }
+  if (candidate.reasonCodes.includes("ALREADY_HELD_OPTION_CONTRACT")) {
+    return "ALREADY_HELD_OPTION_CONTRACT";
+  }
+  if (candidate.reasonCodes.includes("DUPLICATE_OPEN_EQUITY_ORDER")) {
+    return "DUPLICATE_OPEN_EQUITY_ORDER";
+  }
+  if (candidate.reasonCodes.includes("DUPLICATE_OPEN_OPTION_ORDER")) {
+    return "DUPLICATE_OPEN_OPTION_ORDER";
   }
   if (candidate.reasonCodes.includes("ALREADY_HELD")) {
     return "ALREADY_HELD";
@@ -1065,7 +1125,7 @@ export const formatPaperReviewReportAsTable = (report: PaperReviewReport) => {
   lines.push(`Buying power use: ${formatPercent(report.planSummary.buyingPowerUsePct)}`);
   lines.push(`Block reason: ${report.review.blockReason || "none"}`);
   lines.push(
-    `Candidate counts: input=${report.candidateCounts.inputCandidates}, planned=${report.candidateCounts.plannedOrders}, eligiblePayloads=${report.candidateCounts.eligiblePayloads}, alreadyHeld=${report.candidateCounts.skippedAlreadyHeld}, quoteUnavailable=${report.candidateCounts.skippedQuoteUnavailable}`
+    `Candidate counts: input=${report.candidateCounts.inputCandidates}, planned=${report.candidateCounts.plannedOrders}, eligiblePayloads=${report.candidateCounts.eligiblePayloads}, alreadyHeld=${report.candidateCounts.skippedAlreadyHeld}, alreadyHeldEquity=${report.candidateCounts.skippedAlreadyHeldEquity}, alreadyHeldOptionContract=${report.candidateCounts.skippedAlreadyHeldOptionContract}, underlyingEquityHeldForOption=${report.candidateCounts.skippedUnderlyingEquityHeldForOption}, duplicateOpenEquityOrder=${report.candidateCounts.skippedDuplicateOpenEquityOrder}, duplicateOpenOptionOrder=${report.candidateCounts.skippedDuplicateOpenOptionOrder}, quoteUnavailable=${report.candidateCounts.skippedQuoteUnavailable}`
   );
   lines.push(`Top skip reasons: ${report.topSkipReasons.length ? report.topSkipReasons.join(", ") : "none"}`);
   if (report.executionReadiness) {

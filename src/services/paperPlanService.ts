@@ -16,6 +16,11 @@ import {
   type OptionQuoteStatus
 } from "./optionQuoteNormalizer.js";
 import { normalizeSymbol } from "../lib/utils.js";
+import {
+  getCandidateAssetIdentity,
+  getOrderAssetIdentity,
+  getPositionAssetIdentity
+} from "./assetIdentity.js";
 import type { PreferredExpression, RiskProfile } from "../types.js";
 
 export type PaperPlanDecision = "planned" | "watch" | "skip";
@@ -217,7 +222,11 @@ type PaperPlanReasonCode =
   | "TRADABLE"
   | "NOT_TRADABLE"
   | "ALREADY_HELD"
+  | "ALREADY_HELD_EQUITY"
+  | "ALREADY_HELD_OPTION_CONTRACT"
   | "OPEN_ORDER_EXISTS"
+  | "DUPLICATE_OPEN_EQUITY_ORDER"
+  | "DUPLICATE_OPEN_OPTION_ORDER"
   | "BUYING_POWER_OK"
   | "BUYING_POWER_INSUFFICIENT"
   | "BUYING_POWER_UNKNOWN"
@@ -256,7 +265,11 @@ const REASON_ORDER = [
   "TRADABLE",
   "NOT_TRADABLE",
   "ALREADY_HELD",
+  "ALREADY_HELD_EQUITY",
+  "ALREADY_HELD_OPTION_CONTRACT",
   "OPEN_ORDER_EXISTS",
+  "DUPLICATE_OPEN_EQUITY_ORDER",
+  "DUPLICATE_OPEN_OPTION_ORDER",
   "BUYING_POWER_OK",
   "BUYING_POWER_INSUFFICIENT",
   "BUYING_POWER_UNKNOWN",
@@ -875,9 +888,11 @@ interface CandidateEvaluationContext {
   candidate: CandidateRow;
   tradability: AlpacaAssetTradabilityResult;
   estimatedPrice: number | null;
-  isHeld: boolean;
+  heldEquity: boolean;
+  heldOptionContract: boolean;
   heldQty: number;
-  openOrderExists: boolean;
+  openEquityOrderExists: boolean;
+  openOptionOrderExists: boolean;
   duplicateExposure: boolean;
   config: Required<PaperPlanConfig>;
   deployableBuyingPower: number | null;
@@ -971,9 +986,11 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
     candidate,
     tradability,
     estimatedPrice,
-  isHeld,
-  heldQty,
-    openOrderExists,
+    heldEquity,
+    heldOptionContract,
+    heldQty,
+    openEquityOrderExists,
+    openOptionOrderExists,
     duplicateExposure,
     config,
     deployableBuyingPower,
@@ -1335,6 +1352,70 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
       };
     }
 
+    if (heldOptionContract) {
+      return {
+        ...base,
+        side,
+        assetClass: "option",
+        orderType: "limit",
+        underlyingSymbol: contract.underlying_symbol,
+        optionSymbol: contract.option_symbol,
+        strategy,
+        limitPrice,
+        estimatedPremium: premiumRisk,
+        maxRisk: configuredRisk,
+        expirationDate: contract.expiration_date,
+        strike: contract.strike,
+        shortStrike: candidate.short_strike,
+        contracts,
+        bidAskSpreadPct: spreadPct,
+        ...optionQuoteFields(quote),
+        estimatedPrice: limitPrice,
+        estimatedQty: contracts,
+        estimatedNotional: configuredRisk,
+        decision: "watch",
+        reasonCodes: buildReasonList([
+          ...(base.reasonCodes),
+          "OPTION_CONTRACT_FOUND",
+          "OPTION_DTE_ALLOWED",
+          "ALREADY_HELD_OPTION_CONTRACT"
+        ]),
+        explanation: explanationFor("watch", ["ALREADY_HELD_OPTION_CONTRACT"])
+      };
+    }
+
+    if (openOptionOrderExists) {
+      return {
+        ...base,
+        side,
+        assetClass: "option",
+        orderType: "limit",
+        underlyingSymbol: contract.underlying_symbol,
+        optionSymbol: contract.option_symbol,
+        strategy,
+        limitPrice,
+        estimatedPremium: premiumRisk,
+        maxRisk: configuredRisk,
+        expirationDate: contract.expiration_date,
+        strike: contract.strike,
+        shortStrike: candidate.short_strike,
+        contracts,
+        bidAskSpreadPct: spreadPct,
+        ...optionQuoteFields(quote),
+        estimatedPrice: limitPrice,
+        estimatedQty: contracts,
+        estimatedNotional: configuredRisk,
+        decision: "skip",
+        reasonCodes: buildReasonList([
+          ...(base.reasonCodes),
+          "OPTION_CONTRACT_FOUND",
+          "OPTION_DTE_ALLOWED",
+          "DUPLICATE_OPEN_OPTION_ORDER"
+        ]),
+        explanation: explanationFor("skip", ["DUPLICATE_OPEN_OPTION_ORDER"])
+      };
+    }
+
     return {
       ...base,
       side,
@@ -1383,21 +1464,21 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
     };
   }
 
-  if (isHeld) {
+  if (heldEquity) {
     return {
       ...base,
       decision: "watch",
-      reasonCodes: buildReasonList([...(base.reasonCodes), "ALREADY_HELD"]),
-      explanation: explanationFor("watch", ["ALREADY_HELD"])
+      reasonCodes: buildReasonList([...(base.reasonCodes), "ALREADY_HELD_EQUITY"]),
+      explanation: explanationFor("watch", ["ALREADY_HELD_EQUITY"])
     };
   }
 
-  if (openOrderExists) {
+  if (openEquityOrderExists) {
     return {
       ...base,
       decision: "skip",
-      reasonCodes: buildReasonList([...(base.reasonCodes), "OPEN_ORDER_EXISTS"]),
-      explanation: explanationFor("skip", ["OPEN_ORDER_EXISTS"])
+      reasonCodes: buildReasonList([...(base.reasonCodes), "DUPLICATE_OPEN_EQUITY_ORDER"]),
+      explanation: explanationFor("skip", ["DUPLICATE_OPEN_EQUITY_ORDER"])
     };
   }
 
@@ -1514,28 +1595,44 @@ export const buildPaperPlanReport = async (
     listAlpacaPositions()
   ]);
 
-  const heldSymbols = new Set<string>();
-  const heldQuantities = new Map<string, number>();
+  const heldEquitySymbols = new Set<string>();
+  const heldOptionSymbols = new Set<string>();
+  const heldEquityQuantities = new Map<string, number>();
   let currentDeployedNotional = 0;
   for (const row of positionsResult.positions || []) {
-    const symbol = normalizeSymbol(row.symbol);
+    const identity = getPositionAssetIdentity(row);
     const qty = toNullableNumber(row.qty);
     const marketValue = toNullableNumber(row.marketValue);
     const size = qty ?? 0;
-    if (symbol && size !== 0) {
-      heldSymbols.add(symbol);
-      heldQuantities.set(symbol, (heldQuantities.get(symbol) ?? 0) + size);
+    if (identity && size !== 0) {
+      if (identity.assetClass === "option") {
+        heldOptionSymbols.add(identity.optionSymbol);
+      } else {
+        heldEquitySymbols.add(identity.symbol);
+        heldEquityQuantities.set(
+          identity.symbol,
+          (heldEquityQuantities.get(identity.symbol) ?? 0) + size
+        );
+      }
     }
     if (marketValue !== null) {
       currentDeployedNotional += Math.abs(marketValue);
     }
   }
 
-  const openOrderSymbols = new Set<string>(
-    (ordersResult.orders || [])
-      .map((row) => normalizeSymbol(row.symbol))
-      .filter(Boolean)
-  );
+  const openEquityOrderSymbols = new Set<string>();
+  const openOptionOrderSymbols = new Set<string>();
+  for (const row of ordersResult.orders || []) {
+    const identity = getOrderAssetIdentity(row);
+    if (!identity) {
+      continue;
+    }
+    if (identity.assetClass === "option") {
+      openOptionOrderSymbols.add(identity.optionSymbol);
+    } else {
+      openEquityOrderSymbols.add(identity.symbol);
+    }
+  }
 
   const latestAnyRun = pickLatestCompletedResearchRun();
   const latestRun = pickLatestResearchRun(config.riskProfile, config.optionsEnabled);
@@ -1557,6 +1654,11 @@ export const buildPaperPlanReport = async (
 
   for (const candidate of candidates) {
     const symbol = normalizeSymbol(candidate.symbol);
+    const candidateIdentity = getCandidateAssetIdentity({
+      assetClass: candidate.preferred_expression === "shares" ? "equity" : "option",
+      symbol,
+      optionSymbol: candidate.option_symbol
+    });
     let tradabilityPromise = tradabilityCache.get(symbol);
     if (!tradabilityPromise) {
       tradabilityPromise = checkAlpacaSymbolTradability(symbol);
@@ -1567,9 +1669,19 @@ export const buildPaperPlanReport = async (
       candidate,
       tradability: await tradabilityPromise,
       estimatedPrice: findLatestPrice(symbol, candidate.as_of || undefined),
-      isHeld: heldSymbols.has(symbol),
-      heldQty: heldQuantities.get(symbol) ?? 0,
-      openOrderExists: openOrderSymbols.has(symbol),
+      heldEquity:
+        candidateIdentity?.assetClass === "equity" &&
+        heldEquitySymbols.has(candidateIdentity.symbol),
+      heldOptionContract:
+        candidateIdentity?.assetClass === "option" &&
+        heldOptionSymbols.has(candidateIdentity.optionSymbol),
+      heldQty: heldEquityQuantities.get(symbol) ?? 0,
+      openEquityOrderExists:
+        candidateIdentity?.assetClass === "equity" &&
+        openEquityOrderSymbols.has(candidateIdentity.symbol),
+      openOptionOrderExists:
+        candidateIdentity?.assetClass === "option" &&
+        openOptionOrderSymbols.has(candidateIdentity.optionSymbol),
       duplicateExposure: seenSymbols.has(symbol),
       config,
       deployableBuyingPower: account.deployableBuyingPower,

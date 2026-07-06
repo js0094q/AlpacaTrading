@@ -265,6 +265,7 @@ npm run paper:plan -- --format=json
 
 - reads latest recommendation/runtime context and current paper account/positions/open orders
 - enforces buying-power reserve and notional/rank exposure caps
+- checks duplicate held positions and open orders by asset identity: held/open `XLF` equity blocks duplicate `XLF` equity candidates, but does not by itself block `XLF` option contracts; same option contracts are blocked by option symbol
 - reports empty-plan diagnostics such as `NO_RESEARCH_SNAPSHOTS`, `NO_MATCHING_SNAPSHOTS_FOR_FILTERS`, `NO_RUNTIME_CANDIDATES`, and `ALL_CANDIDATES_SKIPPED`
 - outputs `dryRun: true` and `nonMutating: true`
 - never submits, replaces, cancels, or closes any orders
@@ -283,6 +284,7 @@ npm run paper:review -- --format=json
 - concentration and duplicate exposure warnings
 - option planning limitations and environment/guardrail blockers
 - candidate-generation blockers from the plan diagnostics
+- structured candidate counts separating held-equity skips from held-option-contract skips
 - `reviewOnly: true` and `nonMutating: true` invariants
 
 `paper:review` does not submit, replace, cancel, or modify Alpaca orders.

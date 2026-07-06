@@ -41,6 +41,10 @@
   - latest `paper:runtime` sees 3 equity candidates, each already held in current paper positions.
   - latest `paper:plan` finds the current research run but produces zero planned orders because those candidate symbols are already held.
   - `paper:execute` now reports this zero-payload state as `status: "no_op"` with `reason: "NO_ELIGIBLE_PAPER_PAYLOADS"` instead of a safety-review failure.
+- Current duplicate-classification behavior:
+  - held/open equity positions or orders block duplicate equity candidates on the same symbol.
+  - held/open equity positions or orders do not by themselves block option contracts on the same underlying.
+  - held/open option contracts are compared by option contract symbol and reported with option-specific duplicate reasons.
 
 ## Token/env coordination
 

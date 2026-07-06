@@ -1581,7 +1581,7 @@ export const formatPaperExecuteDryRunReportAsTable = (report: PaperExecuteDryRun
   lines.push(`Payloads blocked: ${report.summary.payloadsBlocked}`);
   if (report.candidateCounts) {
     lines.push(
-      `Candidate counts: input=${report.candidateCounts.inputCandidates}, planned=${report.candidateCounts.plannedOrders}, eligiblePayloads=${report.candidateCounts.eligiblePayloads}, alreadyHeld=${report.candidateCounts.skippedAlreadyHeld}, quoteUnavailable=${report.candidateCounts.skippedQuoteUnavailable}`
+      `Candidate counts: input=${report.candidateCounts.inputCandidates}, planned=${report.candidateCounts.plannedOrders}, eligiblePayloads=${report.candidateCounts.eligiblePayloads}, alreadyHeld=${report.candidateCounts.skippedAlreadyHeld}, alreadyHeldEquity=${report.candidateCounts.skippedAlreadyHeldEquity}, alreadyHeldOptionContract=${report.candidateCounts.skippedAlreadyHeldOptionContract}, underlyingEquityHeldForOption=${report.candidateCounts.skippedUnderlyingEquityHeldForOption}, duplicateOpenEquityOrder=${report.candidateCounts.skippedDuplicateOpenEquityOrder}, duplicateOpenOptionOrder=${report.candidateCounts.skippedDuplicateOpenOptionOrder}, quoteUnavailable=${report.candidateCounts.skippedQuoteUnavailable}`
     );
   }
   if (report.topSkipReasons?.length) {
@@ -1656,7 +1656,7 @@ export const formatPaperExecuteConfirmReportAsTable = (
   lines.push(`Errors: ${report.summary.errors}`);
   if (report.candidateCounts) {
     lines.push(
-      `Candidate counts: input=${report.candidateCounts.inputCandidates}, planned=${report.candidateCounts.plannedOrders}, eligiblePayloads=${report.candidateCounts.eligiblePayloads}, alreadyHeld=${report.candidateCounts.skippedAlreadyHeld}, quoteUnavailable=${report.candidateCounts.skippedQuoteUnavailable}`
+      `Candidate counts: input=${report.candidateCounts.inputCandidates}, planned=${report.candidateCounts.plannedOrders}, eligiblePayloads=${report.candidateCounts.eligiblePayloads}, alreadyHeld=${report.candidateCounts.skippedAlreadyHeld}, alreadyHeldEquity=${report.candidateCounts.skippedAlreadyHeldEquity}, alreadyHeldOptionContract=${report.candidateCounts.skippedAlreadyHeldOptionContract}, underlyingEquityHeldForOption=${report.candidateCounts.skippedUnderlyingEquityHeldForOption}, duplicateOpenEquityOrder=${report.candidateCounts.skippedDuplicateOpenEquityOrder}, duplicateOpenOptionOrder=${report.candidateCounts.skippedDuplicateOpenOptionOrder}, quoteUnavailable=${report.candidateCounts.skippedQuoteUnavailable}`
     );
   }
   if (report.topSkipReasons?.length) {

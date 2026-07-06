@@ -551,7 +551,7 @@ describe("paper review service", () => {
     assert.equal(report.review.blockers.includes("ALL_CANDIDATES_SKIPPED"), true);
   });
 
-  test("includes structured no-op counts for already-held candidates", async () => {
+  test("includes structured no-op counts for already-held equity and option contract candidates", async () => {
     const report = await reviewWithPlan({
       summary: {
         candidatesEvaluated: 2,
@@ -574,22 +574,24 @@ describe("paper review service", () => {
           estimatedQty: null,
           estimatedNotional: null,
           decision: "watch",
-          reasonCodes: ["ALREADY_HELD"],
+          reasonCodes: ["ALREADY_HELD_EQUITY"],
           explanation: "Watch"
         },
         {
-          symbol: "MSFT",
+          symbol: "MSFT260814C00100000",
           side: "buy",
-          assetClass: "us_equity",
-          orderType: "market",
+          assetClass: "option",
+          orderType: "limit",
           timeInForce: "day",
+          underlyingSymbol: "MSFT",
+          optionSymbol: "MSFT260814C00100000",
           latestRank: 2,
-          recommendation: "long shares",
+          recommendation: "long long_call",
           estimatedPrice: null,
           estimatedQty: null,
           estimatedNotional: null,
           decision: "watch",
-          reasonCodes: ["ALREADY_HELD"],
+          reasonCodes: ["ALREADY_HELD_OPTION_CONTRACT"],
           explanation: "Watch"
         }
       ]
@@ -601,7 +603,13 @@ describe("paper review service", () => {
     assert.equal(report.candidateCounts.plannedOrders, 0);
     assert.equal(report.candidateCounts.eligiblePayloads, 0);
     assert.equal(report.candidateCounts.skippedAlreadyHeld, 2);
-    assert.deepEqual(report.topSkipReasons, ["ALREADY_HELD"]);
+    assert.equal(report.candidateCounts.skippedAlreadyHeldEquity, 1);
+    assert.equal(report.candidateCounts.skippedAlreadyHeldOptionContract, 1);
+    assert.equal(report.candidateCounts.skippedUnderlyingEquityHeldForOption, 0);
+    assert.deepEqual(report.topSkipReasons, [
+      "ALREADY_HELD_EQUITY",
+      "ALREADY_HELD_OPTION_CONTRACT"
+    ]);
   });
 
   test("counts quote-unavailable option candidates as rejected payload candidates", async () => {

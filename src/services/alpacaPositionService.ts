@@ -3,6 +3,7 @@ import { getAlpacaPaperEndpoint, type AlpacaApiResponse } from "./alpacaClient.j
 export interface AlpacaPositionSnapshot {
   symbol: string;
   assetId?: string;
+  assetClass?: string;
   qty?: string;
   marketValue?: string;
   costBasis?: string;
@@ -15,6 +16,7 @@ export interface AlpacaPositionSnapshot {
 type ApiPositionPayload = {
   symbol?: string;
   asset_id?: string;
+  asset_class?: string;
   qty?: string;
   market_value?: string;
   cost_basis?: string;
@@ -27,6 +29,7 @@ type ApiPositionPayload = {
 const mapPosition = (row: ApiPositionPayload): AlpacaPositionSnapshot => ({
   symbol: String(row.symbol || ""),
   assetId: row.asset_id,
+  assetClass: row.asset_class,
   qty: row.qty,
   marketValue: row.market_value,
   costBasis: row.cost_basis,

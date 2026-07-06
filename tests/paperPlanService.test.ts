@@ -65,8 +65,8 @@ type FetcherFn = (input: string, init?: RequestInit) => Promise<Response>;
 
 const createMockFetcher = ({
   account = { status: "ACTIVE", equity: "100000", cash: "100000", buying_power: "80000" },
-  positions = [] as Array<{ symbol: string; qty: string }>,
-  orders = [] as Array<{ symbol: string; id?: string }>,
+  positions = [] as Array<{ symbol: string; qty: string; asset_class?: string }>,
+  orders = [] as Array<{ symbol: string; id?: string; asset_class?: string }>,
   assets = {
     AAPL: { class: "us_equity", status: "active", tradable: true, fractionable: true },
     NVDA: { class: "us_equity", status: "active", tradable: true, fractionable: true },
@@ -495,7 +495,7 @@ describe("paper plan service", () => {
     assert.equal(report.plan[0]?.sizingBasis?.usedFallback, true);
   });
 
-  test("marks candidates as watch when symbol already held", async () => {
+  test("marks equity candidates as watch when the same equity is already held", async () => {
     insertResearchRun({ runId: "run-held", riskProfile: "moderate", optionsEnabled: false });
     insertCandidate({
       runId: "run-held",
@@ -511,7 +511,7 @@ describe("paper plan service", () => {
     const report = await planResultFor({});
     const entry = report.plan[0];
     assert.equal(entry?.decision, "watch");
-    assert.equal(entry?.reasonCodes.includes("ALREADY_HELD"), true);
+    assert.equal(entry?.reasonCodes.includes("ALREADY_HELD_EQUITY"), true);
   });
 
   test("skips candidates when open order already exists", async () => {
@@ -529,7 +529,7 @@ describe("paper plan service", () => {
 
     const report = await planResultFor({});
     assert.equal(report.plan[0]?.decision, "skip");
-    assert.equal(report.plan[0]?.reasonCodes.includes("OPEN_ORDER_EXISTS"), true);
+    assert.equal(report.plan[0]?.reasonCodes.includes("DUPLICATE_OPEN_EQUITY_ORDER"), true);
   });
 
   test("skips candidates when symbol is not tradable", async () => {
@@ -770,6 +770,104 @@ describe("paper plan service", () => {
     assert.equal(entry?.executablePriceSource, "midpoint");
     assert.equal(entry?.rejectionReason, null);
     assert.equal(entry?.reasonCodes.includes("SPECULATIVE_OPTION_PAPER_WARNING"), true);
+  });
+
+  test("does not block an option contract solely because the underlying equity is held", async () => {
+    const optionSymbol = "AAPL260814C00100000";
+    insertResearchRun({ runId: "run-option-held-underlying", riskProfile: "moderate", optionsEnabled: true });
+    insertCandidate({
+      runId: "run-option-held-underlying",
+      symbol: "AAPL",
+      rank: 1,
+      preferredExpression: "long_call",
+      optionSymbol,
+      strike: 100,
+      estimatedMaxLoss: 75
+    });
+    insertOptionContract({ optionSymbol, type: "call" });
+    insertOptionSnapshot({ optionSymbol });
+    setMockFetch(createMockFetcher({
+      positions: [{ symbol: "AAPL", qty: "10", asset_class: "us_equity" }]
+    }));
+
+    const report = await planResultFor({ optionsEnabled: true });
+    const entry = report.plan[0];
+    assert.equal(entry?.decision, "planned");
+    assert.equal(entry?.reasonCodes.includes("ALREADY_HELD_EQUITY"), false);
+    assert.equal(entry?.reasonCodes.includes("ALREADY_HELD_OPTION_CONTRACT"), false);
+  });
+
+  test("blocks an option contract when the same option contract is already held", async () => {
+    const optionSymbol = "AAPL260814C00100000";
+    insertResearchRun({ runId: "run-held-option-contract", riskProfile: "moderate", optionsEnabled: true });
+    insertCandidate({
+      runId: "run-held-option-contract",
+      symbol: "AAPL",
+      rank: 1,
+      preferredExpression: "long_call",
+      optionSymbol,
+      strike: 100,
+      estimatedMaxLoss: 75
+    });
+    insertOptionContract({ optionSymbol, type: "call" });
+    insertOptionSnapshot({ optionSymbol });
+    setMockFetch(createMockFetcher({
+      positions: [{ symbol: optionSymbol, qty: "1", asset_class: "option" }]
+    }));
+
+    const report = await planResultFor({ optionsEnabled: true });
+    const entry = report.plan[0];
+    assert.equal(entry?.decision, "watch");
+    assert.equal(entry?.reasonCodes.includes("ALREADY_HELD_OPTION_CONTRACT"), true);
+  });
+
+  test("does not block an option contract because an equity order exists for the underlying", async () => {
+    const optionSymbol = "AAPL260814C00100000";
+    insertResearchRun({ runId: "run-option-open-equity-order", riskProfile: "moderate", optionsEnabled: true });
+    insertCandidate({
+      runId: "run-option-open-equity-order",
+      symbol: "AAPL",
+      rank: 1,
+      preferredExpression: "long_call",
+      optionSymbol,
+      strike: 100,
+      estimatedMaxLoss: 75
+    });
+    insertOptionContract({ optionSymbol, type: "call" });
+    insertOptionSnapshot({ optionSymbol });
+    setMockFetch(createMockFetcher({
+      orders: [{ symbol: "AAPL", id: "ord-equity-1", asset_class: "us_equity" }]
+    }));
+
+    const report = await planResultFor({ optionsEnabled: true });
+    const entry = report.plan[0];
+    assert.equal(entry?.decision, "planned");
+    assert.equal(entry?.reasonCodes.includes("DUPLICATE_OPEN_EQUITY_ORDER"), false);
+    assert.equal(entry?.reasonCodes.includes("DUPLICATE_OPEN_OPTION_ORDER"), false);
+  });
+
+  test("blocks an option contract when the same option contract has an open order", async () => {
+    const optionSymbol = "AAPL260814C00100000";
+    insertResearchRun({ runId: "run-option-open-option-order", riskProfile: "moderate", optionsEnabled: true });
+    insertCandidate({
+      runId: "run-option-open-option-order",
+      symbol: "AAPL",
+      rank: 1,
+      preferredExpression: "long_call",
+      optionSymbol,
+      strike: 100,
+      estimatedMaxLoss: 75
+    });
+    insertOptionContract({ optionSymbol, type: "call" });
+    insertOptionSnapshot({ optionSymbol });
+    setMockFetch(createMockFetcher({
+      orders: [{ symbol: optionSymbol, id: "ord-option-1", asset_class: "option" }]
+    }));
+
+    const report = await planResultFor({ optionsEnabled: true });
+    const entry = report.plan[0];
+    assert.equal(entry?.decision, "skip");
+    assert.equal(entry?.reasonCodes.includes("DUPLICATE_OPEN_OPTION_ORDER"), true);
   });
 
   test("rejects stale option quotes before planning", async () => {
