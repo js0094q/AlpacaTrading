@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { resetSqliteTestDb } from "./helpers/sqliteTestDb.js";
 
 process.env.RESEARCH_DB_PATH = join(
   mkdtempSync(join(tmpdir(), "alpaca-paper-intel-test-")),
@@ -16,7 +17,7 @@ process.env.ENABLE_AGGRESSIVE_PAPER_STRATEGIES = "true";
 process.env.ALPACA_PAPER_API_KEY = "paper-key";
 process.env.ALPACA_PAPER_SECRET_KEY = "paper-secret";
 
-import { getDb } from "../src/lib/db.js";
+import { closeDbForTests, getDb } from "../src/lib/db.js";
 import {
   buildPaperRecommendationTrends,
   queryPaperRecommendationTrends
@@ -28,8 +29,7 @@ import {
 import { buildPaperIntelligenceReport } from "../src/services/paperIntelService.js";
 
 const resetDatabase = () => {
-  const db = getDb();
-  db.exec(`
+  resetSqliteTestDb(getDb(), `
     DELETE FROM paper_recommendation_snapshots;
     DELETE FROM paper_trade_candidates;
     DELETE FROM research_runs;
@@ -336,6 +336,7 @@ beforeEach(() => {
 
 after(() => {
   const path = process.env.RESEARCH_DB_PATH!;
+  closeDbForTests();
   rmSync(path.substring(0, path.lastIndexOf("/")), { recursive: true, force: true });
 });
 

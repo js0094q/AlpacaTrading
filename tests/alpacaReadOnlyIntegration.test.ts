@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { resetSqliteTestDb } from "./helpers/sqliteTestDb.js";
 
 process.env.RESEARCH_DB_PATH = join(mkdtempSync(join(tmpdir(), "alpaca-readonly-test-")), "research.db");
 process.env.TRADING_MODE = "paper";
@@ -35,7 +36,7 @@ const [
   import("../src/services/researchOrchestrator.js")
 ]);
 
-const { getDb } = libDb;
+const { closeDbForTests, getDb } = libDb;
 const {
   assertLiveTradingDisabled,
   assertNoTradingMutationsAllowed,
@@ -73,8 +74,7 @@ const makeMockResponse = (payload: unknown, status = 200) => ({
 }) as unknown as Response;
 
 const resetDatabase = () => {
-  const db = getDb();
-  db.exec(`
+  resetSqliteTestDb(getDb(), `
     DELETE FROM paper_trade_evaluations;
     DELETE FROM paper_trade_plans;
     DELETE FROM paper_trade_candidates;
@@ -101,6 +101,7 @@ beforeEach(() => {
 
 after(() => {
   const path = process.env.RESEARCH_DB_PATH!;
+  closeDbForTests();
   rmSync(path.substring(0, path.lastIndexOf("/")), { recursive: true, force: true });
 });
 

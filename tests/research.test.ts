@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
+import { resetSqliteTestDb } from "./helpers/sqliteTestDb.js";
 
 process.env.RESEARCH_DB_PATH = join(mkdtempSync(join(tmpdir(), "alpaca-research-test-")), "research.db");
 process.env.TRADING_MODE = "paper";
@@ -63,8 +64,7 @@ const { fetchAllBars } = providerAlpaca;
 const { config: runtimeConfig } = appConfig;
 
 const resetDatabase = () => {
-  const db = getDb();
-  db.exec(`
+  resetSqliteTestDb(getDb(), `
     DELETE FROM paper_trade_evaluations;
     DELETE FROM paper_trade_plans;
     DELETE FROM paper_trade_candidates;

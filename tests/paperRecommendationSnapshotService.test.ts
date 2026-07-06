@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { resetSqliteTestDb } from "./helpers/sqliteTestDb.js";
 
 process.env.RESEARCH_DB_PATH = join(
   mkdtempSync(join(tmpdir(), "alpaca-snapshots-test-")),
@@ -14,7 +15,7 @@ process.env.LIVE_TRADING_ENABLED = "false";
 process.env.ALPACA_ENV = "paper";
 process.env.ENABLE_AGGRESSIVE_PAPER_STRATEGIES = "true";
 
-import { getDb } from "../src/lib/db.js";
+import { closeDbForTests, getDb } from "../src/lib/db.js";
 import {
   listPaperRecommendationSnapshots,
   formatPaperRecommendationSnapshotsAsTable
@@ -22,7 +23,7 @@ import {
 import { getTradingSafetyState } from "../src/services/tradingSafetyService.js";
 
 const resetDatabase = () => {
-  getDb().exec("DELETE FROM paper_recommendation_snapshots;");
+  resetSqliteTestDb(getDb(), "DELETE FROM paper_recommendation_snapshots;");
 };
 
 beforeEach(() => {
@@ -31,6 +32,7 @@ beforeEach(() => {
 
 after(() => {
   const path = process.env.RESEARCH_DB_PATH!;
+  closeDbForTests();
   rmSync(path.substring(0, path.lastIndexOf("/")), { recursive: true, force: true });
 });
 

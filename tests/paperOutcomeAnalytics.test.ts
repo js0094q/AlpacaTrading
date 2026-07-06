@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { resetSqliteTestDb } from "./helpers/sqliteTestDb.js";
 import * as dbModule from "../src/lib/db.js";
 import * as analyticsService from "../src/services/paperOutcomeAnalyticsService.js";
 
@@ -30,14 +31,13 @@ const {
   DEFAULT_ANALYTICS_THRESHOLDS,
   persistRecommendationSnapshots
 } = analyticsService;
-const { getDb } = dbModule;
+const { closeDbForTests, getDb } = dbModule;
 
 const ts = (offset = 0) =>
   new Date(Date.UTC(2026, 0, 1 + offset, 9, 30, 0)).toISOString();
 
 const resetDatabase = () => {
-  const db = getDb();
-  db.exec(`
+  resetSqliteTestDb(getDb(), `
     DELETE FROM paper_trade_evaluations;
     DELETE FROM paper_trade_plans;
     DELETE FROM paper_trade_candidates;
@@ -265,6 +265,7 @@ beforeEach(() => {
 
 after(() => {
   const path = process.env.RESEARCH_DB_PATH!;
+  closeDbForTests();
   rmSync(path.substring(0, path.lastIndexOf("/")), { recursive: true, force: true });
 });
 

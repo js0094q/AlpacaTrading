@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { resetSqliteTestDb } from "./helpers/sqliteTestDb.js";
 
 const tempDir = mkdtempSync(join(tmpdir(), "alpaca-paper-execute-test-"));
 
@@ -27,11 +28,12 @@ import {
   formatPaperExecuteConfirmReportAsTable,
   formatPaperExecuteDryRunReportAsTable
 } from "../src/services/paperExecuteDryRunService.js";
-import { getDb } from "../src/lib/db.js";
+import { closeDbForTests, getDb } from "../src/lib/db.js";
 import type { PaperPlanCandidate, PaperPlanReport } from "../src/services/paperPlanService.js";
 import type { PaperReviewReport } from "../src/services/paperReviewService.js";
 
 after(() => {
+  closeDbForTests();
   rmSync(tempDir, { recursive: true, force: true });
 });
 
@@ -410,7 +412,7 @@ beforeEach(() => {
   process.env.PAPER_OPTIONS_MAX_PORTFOLIO_RISK_PCT = "20";
   process.env.PAPER_OPTIONS_MAX_POSITION_RISK_PCT = "5";
   delete process.env.PAPER_RUNTIME_DUPLICATE_RECONCILIATION_ENABLED;
-  getDb().exec("DELETE FROM paper_execution_ledger;");
+  resetSqliteTestDb(getDb(), "DELETE FROM paper_execution_ledger;");
 });
 
 describe("paper execute dry-run service guardrails", () => {

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { resetSqliteTestDb } from "./helpers/sqliteTestDb.js";
 
 process.env.RESEARCH_DB_PATH = join(
   mkdtempSync(join(tmpdir(), "alpaca-paper-plan-test-")),
@@ -17,15 +18,14 @@ process.env.ALPACA_PAPER_API_KEY = "paper-key";
 process.env.ALPACA_PAPER_SECRET_KEY = "paper-secret";
 process.env.ALPACA_PAPER_BASE_URL = "https://paper-api.alpaca.markets";
 
-import { getDb } from "../src/lib/db.js";
+import { closeDbForTests, getDb } from "../src/lib/db.js";
 import {
   buildPaperPlanReport,
   formatPaperPlanReportAsTable
 } from "../src/services/paperPlanService.js";
 
 const resetDatabase = () => {
-  const db = getDb();
-  db.exec(`
+  resetSqliteTestDb(getDb(), `
     DELETE FROM paper_trade_candidates;
     DELETE FROM paper_trade_plans;
     DELETE FROM paper_trade_evaluations;
@@ -413,6 +413,7 @@ beforeEach(() => {
 });
 
 after(() => {
+  closeDbForTests();
   rmSync(process.env.RESEARCH_DB_PATH!.substring(0, process.env.RESEARCH_DB_PATH!.lastIndexOf("/")), {
     recursive: true,
     force: true
