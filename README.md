@@ -231,6 +231,7 @@ npm run paper:snapshots -- --format=json --limit=5
 npm run paper:trends -- --format=json
 npm run paper:runtime -- --format=json
 npm run paper:intel -- --format=json
+npm run options:diagnose -- --underlyings=SPY,QQQ
 npm run paper:plan -- --riskProfile=aggressive --optionsEnabled=true --format=json
 npm run paper:review -- --riskProfile=aggressive --optionsEnabled=true --format=json
 npm run paper:execute -- --dryRun --riskProfile=aggressive --optionsEnabled=true --format=json
@@ -245,7 +246,11 @@ Each option decision is classified as `zero_dte_spy`, `leaps`, or `standard_opti
 
 `PAPER_0DTE_SPY_ENABLED=false` and `PAPER_LEAPS_ENABLED=false` are safe defaults.
 Enabling either flag allows first-class paper discovery under the paper-only guards; 0DTE discovery considers same-day SPY calls and puts from `PAPER_0DTE_SPY_UNDERLYINGS=SPY`, and LEAPS discovery considers one long-dated call per symbol from `PAPER_LEAPS_UNDERLYINGS=SPY,QQQ`.
+When `paper:plan` or `paper:review` runs with options enabled and an explicit discovery family enabled, the planner refreshes empty or stale matching option-contract cache windows from Alpaca and refreshes quotes only for selected discovery contracts.
 It does not enable live trading or automatic live promotion.
+
+Use `npm run options:diagnose -- --underlyings=SPY,QQQ` for a read-only provider/cache check.
+It reports the Alpaca contract endpoints used, local `option_contracts` cache counts, SPY same-day contracts, configured LEAPS counts by underlying, sample contract symbols, quote availability for sample contracts, and the exact zero-contract reason when filters or provider responses return no contracts.
 
 Use `npm run paper:learn -- --format=json` to evaluate pending learning rows when local option mark data exists.
 The command also reports promotion-readiness analytics using live-like profit factor, trade count, observed days, drawdown, and spread gates.
@@ -498,6 +503,12 @@ npm run data:ingest -- --symbols=SPY,QQQ --timeframe=1Day --start=2026-01-01 --e
 
 ```bash
 npm run options:ingest -- --underlyingSymbols=SPY,QQQ --minDaysToExpiration=1 --maxDaysToExpiration=60
+```
+
+- Diagnose option contract availability without writing to the local cache:
+
+```bash
+npm run options:diagnose -- --underlyings=SPY,QQQ
 ```
 
 - Build features:

@@ -22,6 +22,10 @@ import {
   getPositionAssetIdentity
 } from "./assetIdentity.js";
 import {
+  ingestOptionContracts,
+  ingestOptionSnapshotsForSymbols
+} from "./optionsService.js";
+import {
   insertPaperLearningRecord,
   type LiveLikeFillModel,
   type PaperFillModel,
@@ -179,6 +183,16 @@ export interface PaperPlanDiscoveryDiagnostics {
   selectedOptionSymbols: string[];
   warnings: string[];
   hardBlockers: string[];
+  cacheRefresh?: PaperPlanDiscoveryCacheRefresh;
+}
+
+export interface PaperPlanDiscoveryCacheRefresh {
+  providerUsed: boolean;
+  refreshed: boolean;
+  reason: string;
+  localContractsBefore: number;
+  rowsIngested?: number;
+  error?: string | null;
 }
 
 export interface PaperPlanReport {
@@ -264,6 +278,20 @@ interface TargetSignalRow {
 interface DiscoveryBuildResult {
   candidates: CandidateRow[];
   diagnostics: PaperPlanDiscoveryDiagnostics;
+}
+
+interface DiscoveryRefreshResult {
+  providerUsed: boolean;
+  refreshed: boolean;
+  reason: string;
+  localContractsBefore: number;
+  rowsIngested?: number;
+  error?: string | null;
+}
+
+interface DiscoveryRefreshState {
+  zeroDteSpy?: DiscoveryRefreshResult;
+  leaps?: DiscoveryRefreshResult;
 }
 
 const DEFAULTS = {
@@ -761,10 +789,196 @@ const emptyDiscoveryDiagnostics = (
   hardBlockers: []
 });
 
+const dateOnlyFromDays = (days: number) => {
+  const date = new Date();
+  date.setUTCDate(date.getUTCDate() + Math.floor(days));
+  return date.toISOString().slice(0, 10);
+};
+
+const latestCompletedOptionContractRun = (): { completed_at: string | null } | null =>
+  queryOne<{ completed_at: string | null }>(
+    `
+    SELECT completed_at
+    FROM ingestion_runs
+    WHERE run_type = 'options_contracts'
+      AND status = 'completed'
+      AND completed_at IS NOT NULL
+    ORDER BY completed_at DESC
+    LIMIT 1
+    `
+  );
+
+const optionContractCacheMaxAgeMs = () =>
+  Math.max(60_000, parseIntegerEnv("OPTION_CONTRACT_CACHE_MAX_AGE_MS", 6 * 60 * 60 * 1000));
+
+const optionContractCacheIsStale = (contractCount: number) => {
+  if (contractCount === 0) {
+    return true;
+  }
+  const latest = latestCompletedOptionContractRun();
+  if (!latest?.completed_at) {
+    return false;
+  }
+  const completedAt = Date.parse(latest.completed_at);
+  if (!Number.isFinite(completedAt)) {
+    return true;
+  }
+  return Date.now() - completedAt > optionContractCacheMaxAgeMs();
+};
+
+const optionContractCacheCount = (input: {
+  underlyings: string[];
+  expirationDate?: string;
+  expirationDateGte?: string;
+  expirationDateLte?: string;
+}) => {
+  if (!input.underlyings.length) {
+    return 0;
+  }
+  const clauses = [
+    `underlying_symbol IN (${input.underlyings.map(() => "?").join(",")})`
+  ];
+  const params: Array<string | number> = [...input.underlyings];
+  if (input.expirationDate) {
+    clauses.push("expiration_date = ?");
+    params.push(input.expirationDate);
+  }
+  if (input.expirationDateGte) {
+    clauses.push("expiration_date >= ?");
+    params.push(input.expirationDateGte);
+  }
+  if (input.expirationDateLte) {
+    clauses.push("expiration_date <= ?");
+    params.push(input.expirationDateLte);
+  }
+
+  const row = queryOne<{ contracts: number }>(
+    `
+    SELECT COUNT(*) AS contracts
+    FROM option_contracts
+    WHERE ${clauses.join(" AND ")}
+    `,
+    params
+  );
+  return row?.contracts ?? 0;
+};
+
+const safeDiscoveryError = (error: unknown) => {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.length > 180 ? `${message.slice(0, 180)}...` : message;
+};
+
+const refreshDiscoveryContractCache = async (input: {
+  enabled: boolean;
+  underlyings: string[];
+  minDaysToExpiration?: number;
+  maxDaysToExpiration?: number;
+  expirationDate?: string;
+  expirationDateGte?: string;
+  expirationDateLte?: string;
+}): Promise<DiscoveryRefreshResult | undefined> => {
+  if (!input.enabled || !input.underlyings.length) {
+    return undefined;
+  }
+  const localContractsBefore = optionContractCacheCount({
+    underlyings: input.underlyings,
+    expirationDate: input.expirationDate,
+    expirationDateGte: input.expirationDateGte,
+    expirationDateLte: input.expirationDateLte
+  });
+  if (!optionContractCacheIsStale(localContractsBefore)) {
+    return {
+      providerUsed: false,
+      refreshed: false,
+      reason: "local_cache_has_matching_contracts",
+      localContractsBefore
+    };
+  }
+
+  try {
+    const result = await ingestOptionContracts({
+      underlyingSymbols: input.underlyings,
+      minDaysToExpiration: input.minDaysToExpiration,
+      maxDaysToExpiration: input.maxDaysToExpiration
+    });
+    return {
+      providerUsed: true,
+      refreshed: true,
+      reason: localContractsBefore === 0 ? "local_cache_empty" : "local_cache_stale",
+      localContractsBefore,
+      rowsIngested: result.rowsIngested
+    };
+  } catch (error) {
+    return {
+      providerUsed: true,
+      refreshed: false,
+      reason: localContractsBefore === 0 ? "local_cache_empty" : "local_cache_stale",
+      localContractsBefore,
+      error: safeDiscoveryError(error)
+    };
+  }
+};
+
+const refreshOptionDiscoveryCache = async (
+  options: ReturnType<typeof paperOptionsConfig>,
+  optionsPlanningEnabled: boolean
+): Promise<DiscoveryRefreshState> => {
+  if (!optionsPlanningEnabled) {
+    return {};
+  }
+  const zeroUnderlyings = Array.from(new Set(["SPY", ...options.zeroDteSpy.underlyings]))
+    .map((symbol) => normalizeSymbol(symbol))
+    .filter((symbol) => symbol === "SPY");
+  const today = new Date().toISOString().slice(0, 10);
+  const leapsMinDate = dateOnlyFromDays(options.leaps.minDte);
+  const leapsMaxDate = dateOnlyFromDays(options.leaps.maxDte);
+
+  const [zeroDteSpy, leaps] = await Promise.all([
+    refreshDiscoveryContractCache({
+      enabled: options.zeroDteSpy.enabled,
+      underlyings: zeroUnderlyings,
+      minDaysToExpiration: 0,
+      maxDaysToExpiration: 0,
+      expirationDate: today
+    }),
+    refreshDiscoveryContractCache({
+      enabled: options.leaps.enabled,
+      underlyings: options.leaps.underlyings,
+      minDaysToExpiration: options.leaps.minDte,
+      maxDaysToExpiration: options.leaps.maxDte,
+      expirationDateGte: leapsMinDate,
+      expirationDateLte: leapsMaxDate
+    })
+  ]);
+
+  return { zeroDteSpy, leaps };
+};
+
+const refreshSelectedOptionSnapshots = async (
+  optionSymbols: string[],
+  diagnostics: PaperPlanDiscoveryDiagnostics[]
+) => {
+  const symbols = Array.from(new Set(optionSymbols.filter(Boolean)));
+  if (!symbols.length) {
+    return;
+  }
+  try {
+    await ingestOptionSnapshotsForSymbols(symbols);
+  } catch (error) {
+    const message = `quote_refresh_failed:${safeDiscoveryError(error)}`;
+    diagnostics.forEach((diagnostic) => {
+      if (diagnostic.enabled) {
+        diagnostic.warnings.push(message);
+      }
+    });
+  }
+};
+
 const buildZeroDteSpyDiscoveryCandidates = (
   options: ReturnType<typeof paperOptionsConfig>,
   startingRank: number,
-  optionsPlanningEnabled: boolean
+  optionsPlanningEnabled: boolean,
+  refresh?: DiscoveryRefreshResult
 ): DiscoveryBuildResult => {
   const underlyings = Array.from(new Set(["SPY", ...options.zeroDteSpy.underlyings]))
     .map((symbol) => normalizeSymbol(symbol))
@@ -773,6 +987,12 @@ const buildZeroDteSpyDiscoveryCandidates = (
     optionsPlanningEnabled && options.zeroDteSpy.enabled,
     underlyings
   );
+  if (refresh) {
+    diagnostics.cacheRefresh = refresh;
+    if (refresh.error) {
+      diagnostics.warnings.push(`contract_refresh_failed:${refresh.error}`);
+    }
+  }
   if (!optionsPlanningEnabled) {
     if (options.zeroDteSpy.enabled) {
       diagnostics.hardBlockers.push("OPTIONS_PLANNING_NOT_IMPLEMENTED");
@@ -844,13 +1064,20 @@ const buildZeroDteSpyDiscoveryCandidates = (
 const buildLeapsDiscoveryCandidates = (
   options: ReturnType<typeof paperOptionsConfig>,
   startingRank: number,
-  optionsPlanningEnabled: boolean
+  optionsPlanningEnabled: boolean,
+  refresh?: DiscoveryRefreshResult
 ): DiscoveryBuildResult => {
   const underlyings = options.leaps.underlyings;
   const diagnostics = emptyDiscoveryDiagnostics(
     optionsPlanningEnabled && options.leaps.enabled,
     underlyings
   );
+  if (refresh) {
+    diagnostics.cacheRefresh = refresh;
+    if (refresh.error) {
+      diagnostics.warnings.push(`contract_refresh_failed:${refresh.error}`);
+    }
+  }
   if (!optionsPlanningEnabled) {
     if (options.leaps.enabled) {
       diagnostics.hardBlockers.push("OPTIONS_PLANNING_NOT_IMPLEMENTED");
@@ -2605,15 +2832,28 @@ export const buildPaperPlanReport = async (
     ? pickCandidates(latestRun.id, config.maxCandidates)
     : [];
   const optionConfig = paperOptionsConfig();
+  const discoveryRefresh = await refreshOptionDiscoveryCache(
+    optionConfig,
+    config.optionsEnabled
+  );
   const zeroDteSpyDiscovery = buildZeroDteSpyDiscoveryCandidates(
     optionConfig,
     candidates.length + 1,
-    config.optionsEnabled
+    config.optionsEnabled,
+    discoveryRefresh.zeroDteSpy
   );
   const leapsDiscovery = buildLeapsDiscoveryCandidates(
     optionConfig,
     candidates.length + zeroDteSpyDiscovery.candidates.length + 1,
-    config.optionsEnabled
+    config.optionsEnabled,
+    discoveryRefresh.leaps
+  );
+  await refreshSelectedOptionSnapshots(
+    [
+      ...zeroDteSpyDiscovery.diagnostics.selectedOptionSymbols,
+      ...leapsDiscovery.diagnostics.selectedOptionSymbols
+    ],
+    [zeroDteSpyDiscovery.diagnostics, leapsDiscovery.diagnostics]
   );
   const allCandidates = [
     ...candidates,

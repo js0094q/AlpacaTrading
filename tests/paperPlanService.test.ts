@@ -117,6 +117,116 @@ const setMockFetch = (fetcher: FetcherFn) => {
   globalThis.fetch = (input, init) => fetcher(String(input), init as RequestInit | undefined);
 };
 
+type MockOptionContract = {
+  symbol: string;
+  underlying_symbol: string;
+  type: "call" | "put";
+  expiration_date: string;
+  strike_price: number | string;
+  multiplier?: number | string;
+  tradable?: boolean;
+  status?: string;
+};
+
+const createOptionDiscoveryFetcher = ({
+  contracts,
+  calls
+}: {
+  contracts: MockOptionContract[];
+  calls?: string[];
+}): FetcherFn => {
+  const base = createMockFetcher();
+  return async (input, init) => {
+    const target = String(input);
+    calls?.push(target);
+    if (target.includes("/v2/options/contracts")) {
+      const url = new URL(target);
+      const underlyings = (url.searchParams.get("underlying_symbols") || "")
+        .split(",")
+        .map((entry) => entry.trim().toUpperCase())
+        .filter(Boolean);
+      const expirationDate = url.searchParams.get("expiration_date");
+      const expirationGte = url.searchParams.get("expiration_date_gte");
+      const expirationLte = url.searchParams.get("expiration_date_lte");
+      const filtered = contracts.filter((contract) => {
+        if (underlyings.length && !underlyings.includes(contract.underlying_symbol.toUpperCase())) {
+          return false;
+        }
+        if (expirationDate && contract.expiration_date !== expirationDate) {
+          return false;
+        }
+        if (expirationGte && contract.expiration_date < expirationGte) {
+          return false;
+        }
+        if (expirationLte && contract.expiration_date > expirationLte) {
+          return false;
+        }
+        return true;
+      });
+      return makeMockResponse({ option_contracts: filtered });
+    }
+    if (target.includes("/v1beta1/options/snapshots")) {
+      const url = new URL(target);
+      const symbols = (url.searchParams.get("symbols") || "")
+        .split(",")
+        .map((entry) => entry.trim().toUpperCase())
+        .filter(Boolean);
+      return makeMockResponse({
+        snapshots: Object.fromEntries(
+          symbols.map((symbol) => {
+            const contract = contracts.find((row) => row.symbol.toUpperCase() === symbol);
+            return [
+              symbol,
+              {
+                symbol,
+                underlying_symbol: contract?.underlying_symbol || symbol.slice(0, 3),
+                Greeks: {
+                  delta: contract?.type === "put" ? -0.55 : 0.7
+                },
+                latest_quote: {
+                  t: new Date().toISOString(),
+                  bp: contract?.type === "put" ? 1.2 : 1,
+                  ap: contract?.type === "put" ? 1.3 : 1.1
+                },
+                latest_trade: {
+                  t: new Date().toISOString(),
+                  p: contract?.type === "put" ? 1.25 : 1.05
+                },
+                implied_volatility: 0.3,
+                volume: 100,
+                open_interest: 1000
+              }
+            ];
+          })
+        )
+      });
+    }
+    if (target.includes("/v1beta1/options/quotes/latest")) {
+      const url = new URL(target);
+      const symbols = (url.searchParams.get("symbols") || "")
+        .split(",")
+        .map((entry) => entry.trim().toUpperCase())
+        .filter(Boolean);
+      return makeMockResponse({
+        quotes: Object.fromEntries(
+          symbols.map((symbol) => {
+            const contract = contracts.find((row) => row.symbol.toUpperCase() === symbol);
+            return [
+              symbol,
+              {
+                t: new Date().toISOString(),
+                bp: contract?.type === "put" ? 1.2 : 1,
+                ap: contract?.type === "put" ? 1.3 : 1.1
+              }
+            ];
+          })
+        )
+      });
+    }
+    return base(input, init);
+  };
+};
+
 const insertResearchRun = ({
   runId,
   riskProfile = "moderate",
@@ -1168,6 +1278,135 @@ describe("paper plan service", () => {
     assert.equal(report.plan[0]?.decision, "watch");
     assert.equal(report.plan[0]?.strategyFamily, "leaps");
     assert.equal(report.plan[0]?.reasonCodes.includes("DTE_OUT_OF_RANGE"), true);
+  });
+
+  test("empty local cache triggers provider fetch and discovers same-day SPY contracts", async () => {
+    const today = new Date().toISOString().slice(0, 10);
+    const occDate = today.slice(2).replace(/-/g, "");
+    const callSymbol = `SPY${occDate}C00450000`;
+    const putSymbol = `SPY${occDate}P00450000`;
+    const calls: string[] = [];
+    process.env.PAPER_0DTE_SPY_ENABLED = "true";
+    process.env.ALLOW_0DTE_OPTIONS = "true";
+    insertResearchRun({ runId: "run-zero-provider", riskProfile: "moderate", optionsEnabled: true });
+    insertMarketBar({ symbol: "SPY", close: 450, timestamp: new Date().toISOString() });
+    setMockFetch(createOptionDiscoveryFetcher({
+      calls,
+      contracts: [
+        {
+          symbol: callSymbol.toLowerCase(),
+          underlying_symbol: "SPY",
+          type: "call",
+          expiration_date: today,
+          strike_price: "450",
+          multiplier: "100",
+          tradable: true,
+          status: "active"
+        },
+        {
+          symbol: putSymbol,
+          underlying_symbol: "SPY",
+          type: "put",
+          expiration_date: today,
+          strike_price: 450,
+          multiplier: 100,
+          tradable: true,
+          status: "active"
+        }
+      ]
+    }));
+
+    const report = await planResultFor({ optionsEnabled: true });
+    const discovered = report.plan.filter((entry) =>
+      entry.sourceCandidateId?.startsWith("discovery:zero_dte_spy:")
+    );
+    assert.equal(report.diagnostics.zeroDteSpyDiscovery?.cacheRefresh?.providerUsed, true);
+    assert.equal(report.diagnostics.zeroDteSpyDiscovery?.cacheRefresh?.reason, "local_cache_empty");
+    assert.equal(calls.some((target) => {
+      if (!target.includes("/v2/options/contracts")) {
+        return false;
+      }
+      const params = new URL(target).searchParams;
+      return (
+        params.get("expiration_date") === today ||
+        (
+          params.get("expiration_date_gte") === today &&
+          params.get("expiration_date_lte") === today
+        )
+      );
+    }), true);
+    assert.equal(calls.some((target) => target.includes("/v1beta1/options/snapshots")), true);
+    assert.equal(discovered.length, 2);
+    assert.deepEqual(discovered.map((entry) => entry.optionSymbol).sort(), [callSymbol, putSymbol]);
+    assert.equal(discovered.every((entry) => entry.decision === "planned"), true);
+    assert.equal(discovered.every((entry) => entry.assetClass === "option"), true);
+    assert.equal(discovered.every((entry) => entry.reasonCodes.includes("OPTION_CONTRACT_FOUND")), true);
+  });
+
+  test("empty local cache triggers provider fetch and discovers SPY and QQQ LEAPS", async () => {
+    const calls: string[] = [];
+    process.env.PAPER_LEAPS_ENABLED = "true";
+    process.env.PAPER_LEAPS_UNDERLYINGS = "SPY,QQQ";
+    insertResearchRun({ runId: "run-leaps-provider", riskProfile: "moderate", optionsEnabled: true });
+    insertMarketBar({ symbol: "SPY", close: 450, timestamp: new Date().toISOString() });
+    insertMarketBar({ symbol: "QQQ", close: 380, timestamp: new Date().toISOString() });
+    setMockFetch(createOptionDiscoveryFetcher({
+      calls,
+      contracts: [
+        {
+          symbol: "SPY270115C00440000",
+          underlying_symbol: "SPY",
+          type: "call",
+          expiration_date: futureDate(365),
+          strike_price: "440",
+          multiplier: "100",
+          tradable: true,
+          status: "active"
+        },
+        {
+          symbol: "QQQ270115C00370000",
+          underlying_symbol: "QQQ",
+          type: "call",
+          expiration_date: futureDate(365),
+          strike_price: "370",
+          multiplier: "100",
+          tradable: true,
+          status: "active"
+        }
+      ]
+    }));
+
+    const report = await planResultFor({ optionsEnabled: true });
+    const discovered = report.plan.filter((entry) =>
+      entry.sourceCandidateId?.startsWith("discovery:leaps:")
+    );
+    assert.equal(report.diagnostics.leapsDiscovery?.cacheRefresh?.providerUsed, true);
+    assert.equal(calls.some((target) =>
+      target.includes("/v2/options/contracts") &&
+      target.includes("expiration_date_gte=") &&
+      target.includes("expiration_date_lte=")
+    ), true);
+    assert.equal(discovered.length, 2);
+    assert.deepEqual(discovered.map((entry) => entry.optionSymbol).sort(), [
+      "QQQ270115C00370000",
+      "SPY270115C00440000"
+    ]);
+    assert.equal(discovered.every((entry) => entry.decision === "planned"), true);
+    assert.equal(discovered.every((entry) => entry.strategyFamily === "leaps"), true);
+  });
+
+  test("missing provider contract response keeps OPTION_CONTRACT_NOT_FOUND blocker", async () => {
+    process.env.PAPER_0DTE_SPY_ENABLED = "true";
+    process.env.ALLOW_0DTE_OPTIONS = "true";
+    insertResearchRun({ runId: "run-zero-provider-empty", riskProfile: "moderate", optionsEnabled: true });
+    setMockFetch(createOptionDiscoveryFetcher({ contracts: [] }));
+
+    const report = await planResultFor({ optionsEnabled: true });
+    assert.equal(report.plan.length, 0);
+    assert.equal(report.diagnostics.zeroDteSpyDiscovery?.contractsFound, 0);
+    assert.equal(report.diagnostics.zeroDteSpyDiscovery?.cacheRefresh?.providerUsed, true);
+    assert.equal(report.diagnostics.zeroDteSpyDiscovery?.hardBlockers.includes("OPTION_CONTRACT_NOT_FOUND"), true);
+    assert.equal(report.diagnostics.discoveryTopBlockers?.includes("OPTION_CONTRACT_NOT_FOUND"), true);
   });
 
   test("discovers executable 0DTE SPY call and put without normal equity candidates", async () => {

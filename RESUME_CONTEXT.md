@@ -29,6 +29,8 @@
   - `PAPER_0DTE_SPY_ENABLED=false` and `PAPER_LEAPS_ENABLED=false` remain safe defaults; enabling them is paper-only and does not enable live trading.
   - 0DTE discovery is first-class when enabled, does not require SPY to appear in normal equity candidates, considers at most one same-day SPY call and one same-day SPY put, and is capped by premium/contracts/daily-trade controls.
   - LEAPS discovery is first-class when enabled, does not require the underlying to appear in normal equity candidates, uses `PAPER_LEAPS_UNDERLYINGS=SPY,QQQ` by default, and selects at most one long-dated call per underlying inside `PAPER_LEAPS_MIN_DTE=180` to `PAPER_LEAPS_MAX_DTE=730`.
+  - `paper:plan` and `paper:review` refresh empty or stale explicit discovery contract windows from Alpaca, then refresh quotes only for selected discovery contracts before deciding whether payloads are executable.
+  - `npm run options:diagnose -- --underlyings=SPY,QQQ` is the read-only diagnostic for local cache counts, Alpaca contract endpoint availability, SPY same-day contracts, LEAPS counts, sample symbols, quote availability, and zero-contract reasons.
   - Wide spreads are warnings unless `PAPER_OPTIONS_HARD_SPREAD_CAP_ENABLED=true` or the family-specific hard-spread flag is enabled.
   - `npm run paper:learn -- --format=json` evaluates pending learning rows when local option marks exist and reports promotion-readiness analytics using live-like fill profit factor.
 - Control bridge health:
@@ -72,6 +74,7 @@
 4. Verify output and re-run readiness chain:
    - `npm run paper:snapshots -- --format=json --limit=5`
    - `npm run paper:runtime -- --format=json`
+   - `npm run options:diagnose -- --underlyings=SPY,QQQ`
    - `npm run paper:review -- --riskProfile=aggressive --optionsEnabled=true --format=json`
    - `npm run paper:plan -- --riskProfile=aggressive --optionsEnabled=true --maxCandidates=10 --format=json`.
 5. Once snapshots flow, re-check control bridge actions:

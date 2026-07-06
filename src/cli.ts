@@ -55,6 +55,7 @@ import {
   buildPaperRuntimeReport,
   formatPaperRuntimeReportAsTable
 } from "./services/paperRuntimeService.js";
+import { buildOptionsDiagnosticReport } from "./services/optionsDiagnosticService.js";
 import {
   buildPromotionReadinessAnalytics,
   evaluatePaperLearningRecords,
@@ -284,6 +285,18 @@ const run = async () => {
       maxDelta: args.maxDelta ? Number(args.maxDelta) : undefined
     });
     print({ contracts: optionsRun, snapshots: snapshotRun });
+    return;
+  }
+
+  if (command === "options:diagnose") {
+    const result = await buildOptionsDiagnosticReport({
+      underlyings: parseList(args.underlyings),
+      asOfDate: args.asOfDate,
+      leapsMinDte: args.leapsMinDte ? Number(args.leapsMinDte) : undefined,
+      leapsMaxDte: args.leapsMaxDte ? Number(args.leapsMaxDte) : undefined,
+      sampleSize: args.sampleSize ? Number(args.sampleSize) : undefined
+    });
+    print(result);
     return;
   }
 

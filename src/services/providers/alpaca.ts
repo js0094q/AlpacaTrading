@@ -28,6 +28,9 @@ const getAuthHeaders = (): Record<string, string> => {
 };
 
 const MAX_MARKET_DATA_PAGES = 100;
+const MAX_OPTION_CONTRACT_PAGES = 50;
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 const executeWithTimeout = async <T>(
   timeoutMs: number,
@@ -164,18 +167,27 @@ export interface OptionChainFilters {
   underlyingSymbols?: string[];
   minDaysToExpiration?: number | null;
   maxDaysToExpiration?: number | null;
+  expirationDate?: string | null;
+  expirationDateGte?: string | null;
+  expirationDateLte?: string | null;
   minDelta?: number | null;
   maxDelta?: number | null;
+  status?: "active" | "inactive" | null;
+  limit?: number | null;
 }
 
 export interface OptionContractRaw {
-  symbol: string;
-  underlying_symbol: string;
-  type: "call" | "put";
-  expiration_date: string;
-  strike_price: number;
-  multiplier?: number;
-  tradable: boolean;
+  symbol?: string;
+  underlying_symbol?: string;
+  root_symbol?: string;
+  type?: "call" | "put" | string;
+  expiration_date?: string;
+  strike_price?: number | string;
+  multiplier?: number | string;
+  size?: number | string;
+  tradable?: boolean;
+  tradeable?: boolean;
+  status?: string;
 }
 
 export interface OptionSnapshotRaw {
@@ -274,6 +286,88 @@ const parseOptionQuotePayload = (
   return result;
 };
 
+const dateOnly = (value: Date = new Date()) => value.toISOString().slice(0, 10);
+
+const dateOnlyFromDays = (days: number) => {
+  const date = new Date();
+  date.setUTCDate(date.getUTCDate() + Math.floor(days));
+  return dateOnly(date);
+};
+
+const assertDateOnly = (value: string, label: string) => {
+  if (!ISO_DATE_RE.test(value)) {
+    throw new Error(`Invalid option contract date filter: ${label}=${value}; expected YYYY-MM-DD.`);
+  }
+  const [year, month, day] = value.split("-").map(Number);
+  const utc = Date.UTC(year!, month! - 1, day!);
+  if (Number.isNaN(utc) || new Date(utc).toISOString().slice(0, 10) !== value) {
+    throw new Error(`Invalid option contract date filter: ${label}=${value}; expected a real calendar date.`);
+  }
+};
+
+const utcDayNumber = (value: string) => {
+  assertDateOnly(value, "expiration_date");
+  const [year, month, day] = value.split("-").map(Number);
+  return Math.floor(Date.UTC(year!, month! - 1, day!) / MS_PER_DAY);
+};
+
+const daysToExpirationDateOnly = (expirationDate: string) =>
+  utcDayNumber(expirationDate) - utcDayNumber(dateOnly());
+
+const normalizeOptionContractLimit = (limit?: number | null) => {
+  if (!Number.isFinite(limit || NaN) || !limit) {
+    return 1000;
+  }
+  return Math.max(1, Math.min(1000, Math.floor(limit)));
+};
+
+const optionContractParams = (
+  filters: OptionChainFilters,
+  pageToken?: string | null
+) => {
+  const expirationDate = filters.expirationDate || undefined;
+  const expirationDateGte =
+    filters.expirationDateGte ||
+    (filters.minDaysToExpiration !== null && filters.minDaysToExpiration !== undefined
+      ? dateOnlyFromDays(filters.minDaysToExpiration)
+      : undefined);
+  const expirationDateLte =
+    filters.expirationDateLte ||
+    (filters.maxDaysToExpiration !== null && filters.maxDaysToExpiration !== undefined
+      ? dateOnlyFromDays(filters.maxDaysToExpiration)
+      : undefined);
+
+  if (expirationDate) {
+    assertDateOnly(expirationDate, "expiration_date");
+  }
+  if (expirationDateGte) {
+    assertDateOnly(expirationDateGte, "expiration_date_gte");
+  }
+  if (expirationDateLte) {
+    assertDateOnly(expirationDateLte, "expiration_date_lte");
+  }
+  if (expirationDateGte && expirationDateLte && utcDayNumber(expirationDateGte) > utcDayNumber(expirationDateLte)) {
+    throw new Error(
+      `Invalid option contract date filter: expiration_date_gte=${expirationDateGte} is after expiration_date_lte=${expirationDateLte}.`
+    );
+  }
+
+  return {
+    underlying_symbols: filters.underlyingSymbols?.join(","),
+    status: filters.status ?? "active",
+    expiration_date: expirationDate,
+    expiration_date_gte: expirationDate ? undefined : expirationDateGte,
+    expiration_date_lte: expirationDate ? undefined : expirationDateLte,
+    page_token: pageToken ?? undefined,
+    limit: normalizeOptionContractLimit(filters.limit)
+  };
+};
+
+export const buildOptionContractsEndpoint = (
+  filters: OptionChainFilters,
+  pageToken?: string | null
+) => `/v2/options/contracts?${toSearchParams(optionContractParams(filters, pageToken))}`;
+
 export const fetchBars = async (options: ProviderOptions): Promise<{ symbol: string; bars: RawBar[]; requestId: string | null }[]> => {
   const timeframe = options.timeframe || "1Day";
   const params = toSearchParams({
@@ -364,22 +458,53 @@ export const fetchAllBars = async (
 export const fetchOptionContracts = async (
   filters: OptionChainFilters
 ): Promise<OptionContractRaw[]> => {
-  const endpoint = `/v2/options/contracts?${toSearchParams({
-    underlying_symbols: filters.underlyingSymbols?.join(","),
-    limit: 500
-  })}`;
-  const response = await requestJson<unknown>(endpoint, { method: "GET" }, "trade");
-  const contracts = parseOptionContractPayload(response.data);
+  const contracts: OptionContractRaw[] = [];
+  let pageToken: string | null = null;
+  const seenTokens = new Set<string>();
+  let pageCount = 0;
+
+  while (true) {
+    pageCount += 1;
+    if (pageCount > MAX_OPTION_CONTRACT_PAGES) {
+      throw new Error(
+        `Alpaca option contract pagination exceeded safety cap (${MAX_OPTION_CONTRACT_PAGES} pages).`
+      );
+    }
+
+    const endpoint = buildOptionContractsEndpoint(filters, pageToken);
+    const response = await requestJson<{
+      option_contracts?: OptionContractRaw[];
+      contracts?: OptionContractRaw[];
+      next_page_token?: string | null;
+      page_token?: string | null;
+    }>(endpoint, { method: "GET" }, "trade");
+    contracts.push(...parseOptionContractPayload(response.data));
+
+    const next = response.data.next_page_token || response.data.page_token || null;
+    if (!next) {
+      break;
+    }
+    if (seenTokens.has(next)) {
+      throw new Error(`Alpaca option contract pagination repeated token: ${next}`);
+    }
+    seenTokens.add(next);
+    pageToken = next;
+  }
+
   return contracts.filter((contract) => {
     const expiration = contract.expiration_date;
     if (!expiration) {
       return false;
     }
-    const expires = new Date(expiration);
-    const now = new Date();
-    const days = Math.round(
-      (expires.getTime() - now.getTime()) / (24 * 60 * 60 * 1000)
-    );
+    if (filters.expirationDate && expiration !== filters.expirationDate) {
+      return false;
+    }
+    let days: number;
+    try {
+      days = daysToExpirationDateOnly(expiration);
+    } catch {
+      return false;
+    }
     if (filters.minDaysToExpiration !== null && filters.minDaysToExpiration !== undefined) {
       if (days < filters.minDaysToExpiration) {
         return false;

@@ -12,6 +12,7 @@
     "universe:remove": "tsx src/cli.ts universe remove",
     "data:ingest": "tsx src/cli.ts data ingest",
     "options:ingest": "tsx src/cli.ts options ingest",
+    "options:diagnose": "tsx src/cli.ts options:diagnose",
     "features:build": "tsx src/cli.ts features build",
     "targets:generate": "tsx src/cli.ts targets generate",
     "backtest": "tsx src/cli.ts backtest run",
@@ -41,7 +42,7 @@
     "dashboard:start": "next start apps/dashboard",
     "lint": "npm run typecheck",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test tests/optionQuoteNormalizer.test.ts && tsx --test tests/research.test.ts && tsx --test tests/paperOutcomeAnalytics.test.ts && tsx --test tests/paperRecommendationSnapshotService.test.ts && tsx --test tests/paperIntelligence.test.ts && tsx --test tests/paperPlanService.test.ts && tsx --test tests/paperReviewService.test.ts && tsx --test tests/paperLearningLedgerService.test.ts && tsx --test tests/paperExecuteDryRunService.test.ts && tsx --test tests/dashboardGuard.test.ts && tsx --test tests/dashboardVercelFallback.test.ts && tsx --test tests/alpacaConfigDiagnostic.test.ts && tsx --test tests/alpacaReadOnlyIntegration.test.ts && tsx --test tests/dashboardControlServer.test.ts && tsx --test tests/dashboardVercelBridge.test.ts",
+    "test": "tsx --test tests/optionQuoteNormalizer.test.ts && tsx --test tests/research.test.ts && tsx --test tests/optionsDiagnosticService.test.ts && tsx --test tests/paperOutcomeAnalytics.test.ts && tsx --test tests/paperRecommendationSnapshotService.test.ts && tsx --test tests/paperIntelligence.test.ts && tsx --test tests/paperPlanService.test.ts && tsx --test tests/paperReviewService.test.ts && tsx --test tests/paperLearningLedgerService.test.ts && tsx --test tests/paperExecuteDryRunService.test.ts && tsx --test tests/dashboardGuard.test.ts && tsx --test tests/dashboardVercelFallback.test.ts && tsx --test tests/alpacaConfigDiagnostic.test.ts && tsx --test tests/alpacaReadOnlyIntegration.test.ts && tsx --test tests/dashboardControlServer.test.ts && tsx --test tests/dashboardVercelBridge.test.ts",
     "build": "tsc"
   },
   "devDependencies": {

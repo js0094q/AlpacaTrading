@@ -54,13 +54,29 @@ const finishRun = (runId: number, rowsIngested: number, status: "completed" | "f
 
 export const toContractRow = (contract: OptionContractRaw) => ({
   underlyingSymbol: normalizeSymbol(contract.underlying_symbol || ""),
-  optionSymbol: contract.symbol,
-  type: contract.type,
+  optionSymbol: normalizeSymbol(contract.symbol || ""),
+  type: contract.type === "put" ? "put" : "call",
   expirationDate: contract.expiration_date,
-  strike: contract.strike_price,
-  multiplier: contract.multiplier ?? 100,
-  tradable: contract.tradable ? 1 : 0
+  strike: toNullableNumber(contract.strike_price),
+  multiplier: toNullableNumber(contract.multiplier ?? contract.size) ?? 100,
+  tradable:
+    contract.tradable === true ||
+    contract.tradeable === true ||
+    contract.status === "active"
+      ? 1
+      : 0
 });
+
+const toNullableNumber = (value: unknown): number | null => {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number.parseFloat(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+};
 
 const quoteBid = (quote: OptionQuoteRaw | null | undefined, snapshot: OptionSnapshotRaw) =>
   quote?.bp ?? quote?.b ?? snapshot.latest_quote?.bp ?? snapshot.latest_quote?.b ?? null;
@@ -142,9 +158,13 @@ export const ingestOptionContracts = async (params?: {
       underlying_symbol, option_symbol, type, expiration_date, strike, multiplier, tradable, source
     ) VALUES (?, ?, ?, ?, ?, ?, ?, 'alpaca')
     ON CONFLICT(option_symbol) DO UPDATE SET
+      underlying_symbol = excluded.underlying_symbol,
+      type = excluded.type,
       tradable = excluded.tradable,
       expiration_date = excluded.expiration_date,
-      strike = excluded.strike
+      strike = excluded.strike,
+      multiplier = excluded.multiplier,
+      source = 'alpaca'
   `);
 
   let inserted = 0;
@@ -156,7 +176,7 @@ export const ingestOptionContracts = async (params?: {
     });
     for (const raw of contracts) {
       const row = toContractRow(raw);
-      if (!row.underlyingSymbol) {
+      if (!row.underlyingSymbol || !row.optionSymbol || !row.expirationDate || row.strike === null) {
         continue;
       }
       const result = insert.run(
@@ -185,6 +205,75 @@ export const ingestOptionContracts = async (params?: {
   }
 };
 
+const insertOptionSnapshotRows = async (
+  optionSymbols: string[],
+  params?: {
+    minDelta?: number;
+    maxDelta?: number;
+  }
+) => {
+  if (!optionSymbols.length) {
+    return 0;
+  }
+  const insert = getDb().prepare(`
+    INSERT INTO option_snapshots(
+      option_symbol, underlying_symbol, timestamp, bid, ask, midpoint, last,
+      quote_status, executable, executable_price, executable_price_source, rejection_reason, quote_timestamp,
+      volume, open_interest, implied_volatility, delta, gamma, theta, vega, rho, source
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'alpaca')
+    ON CONFLICT(option_symbol, timestamp) DO NOTHING
+  `);
+
+  let inserted = 0;
+  const [snapshots, quotes] = await Promise.all([
+    fetchOptionSnapshots(optionSymbols),
+    fetchOptionQuotes(optionSymbols)
+  ]);
+  const quotesBySymbol = new Map(quotes.map((row) => [row.symbol, row.raw]));
+  for (const { symbol, raw } of snapshots) {
+    if (params?.minDelta !== undefined && params.minDelta !== null) {
+      const delta = raw.Greeks?.delta;
+      if (typeof delta !== "number" || delta < params.minDelta) {
+        continue;
+      }
+    }
+    if (params?.maxDelta !== undefined && params.maxDelta !== null) {
+      const delta = raw.Greeks?.delta;
+      if (typeof delta !== "number" || delta > params.maxDelta) {
+        continue;
+      }
+    }
+    const row = toSnapshotRow(symbol, raw, quotesBySymbol.get(symbol));
+    const result = insert.run(
+      row.optionSymbol,
+      row.underlyingSymbol,
+      row.timestamp,
+      row.bid,
+      row.ask,
+      row.midpoint,
+      row.last,
+      row.quoteStatus,
+      row.executable,
+      row.executablePrice,
+      row.executablePriceSource,
+      row.rejectionReason,
+      row.quoteTimestamp,
+      row.volume,
+      row.openInterest,
+      row.impliedVolatility,
+      row.delta,
+      row.gamma,
+      row.theta,
+      row.vega,
+      row.rho
+    );
+    if (result.changes === 1) {
+      inserted += 1;
+    }
+  }
+  return inserted;
+};
+
 export const ingestOptionSnapshots = async (params?: {
   underlyingSymbols?: string[];
   minDaysToExpiration?: number;
@@ -204,14 +293,6 @@ export const ingestOptionSnapshots = async (params?: {
     symbols,
     status: "running"
   });
-  const insert = getDb().prepare(`
-    INSERT INTO option_snapshots(
-      option_symbol, underlying_symbol, timestamp, bid, ask, midpoint, last,
-      quote_status, executable, executable_price, executable_price_source, rejection_reason, quote_timestamp,
-      volume, open_interest, implied_volatility, delta, gamma, theta, vega, rho, source
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'alpaca')
-    ON CONFLICT(option_symbol, timestamp) DO NOTHING
-  `);
 
   let inserted = 0;
   try {
@@ -224,52 +305,35 @@ export const ingestOptionSnapshots = async (params?: {
       )
       .all(...symbols) as Array<{ option_symbol: string }>;
     const optionSymbols = options.map((row) => row.option_symbol);
-    const [snapshots, quotes] = await Promise.all([
-      fetchOptionSnapshots(optionSymbols),
-      fetchOptionQuotes(optionSymbols)
-    ]);
-    const quotesBySymbol = new Map(quotes.map((row) => [row.symbol, row.raw]));
-    for (const { symbol, raw } of snapshots) {
-      if (params?.minDelta !== undefined && params.minDelta !== null) {
-        const delta = raw.Greeks?.delta;
-        if (typeof delta !== "number" || delta < params.minDelta) {
-          continue;
-        }
-      }
-      if (params?.maxDelta !== undefined && params.maxDelta !== null) {
-        const delta = raw.Greeks?.delta;
-        if (typeof delta !== "number" || delta > params.maxDelta) {
-          continue;
-        }
-      }
-      const row = toSnapshotRow(symbol, raw, quotesBySymbol.get(symbol));
-      const result = insert.run(
-        row.optionSymbol,
-        row.underlyingSymbol,
-        row.timestamp,
-        row.bid,
-        row.ask,
-        row.midpoint,
-        row.last,
-        row.quoteStatus,
-        row.executable,
-        row.executablePrice,
-        row.executablePriceSource,
-        row.rejectionReason,
-        row.quoteTimestamp,
-        row.volume,
-        row.openInterest,
-        row.impliedVolatility,
-        row.delta,
-        row.gamma,
-        row.theta,
-        row.vega,
-        row.rho
-      );
-      if (result.changes === 1) {
-        inserted += 1;
-      }
-    }
+    inserted = await insertOptionSnapshotRows(optionSymbols, params);
+    finishRun(runId, inserted, "completed");
+    return { runId, rowsIngested: inserted };
+  } catch (error) {
+    finishRun(
+      runId,
+      inserted,
+      "failed",
+      error instanceof Error ? error.message : "unknown"
+    );
+    throw error;
+  }
+};
+
+export const ingestOptionSnapshotsForSymbols = async (optionSymbols: string[]) => {
+  const symbols = dedupeSymbols(optionSymbols);
+  if (!symbols.length) {
+    return { runId: null, rowsIngested: 0 };
+  }
+
+  const runId = ensureRunRow({
+    runType: "options_snapshots",
+    symbols,
+    status: "running"
+  });
+
+  let inserted = 0;
+  try {
+    inserted = await insertOptionSnapshotRows(symbols);
     finishRun(runId, inserted, "completed");
     return { runId, rowsIngested: inserted };
   } catch (error) {
