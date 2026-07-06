@@ -517,7 +517,7 @@ const buildPayloadForCandidate = (
             : undefined,
         maxRisk: moneyString(candidate.maxRisk),
         bidAskSpreadPct: candidate.bidAskSpreadPct ?? null,
-        sourceCandidateId: source.snapshotRunId || undefined,
+        sourceCandidateId: candidate.sourceCandidateId || source.snapshotRunId || undefined,
         dedupeKey: buildDedupeKey({
           runId: source.snapshotRunId,
           assetClass: "option",
@@ -574,6 +574,7 @@ const buildPayloadForCandidate = (
         time_in_force: candidate.timeInForce,
         notional: moneyString(candidate.estimatedNotional),
         client_order_id: clientOrderId,
+        sourceCandidateId: candidate.sourceCandidateId || source.snapshotRunId || undefined,
         dedupeKey: buildDedupeKey({
           runId: source.snapshotRunId,
           assetClass: "equity",
@@ -594,6 +595,7 @@ const buildPayloadForCandidate = (
         time_in_force: candidate.timeInForce,
         qty: qtyString(candidate.estimatedQty),
         client_order_id: clientOrderId,
+        sourceCandidateId: candidate.sourceCandidateId || source.snapshotRunId || undefined,
         dedupeKey: buildDedupeKey({
           runId: source.snapshotRunId,
           assetClass: "equity",

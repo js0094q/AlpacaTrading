@@ -90,6 +90,22 @@ type PaperOpenOrdersSnapshot = {
 
 type OptionContractRow = DashboardSnapshot["optionContracts"][number];
 
+type PaperLearningSummary = {
+  pending?: number;
+  evaluated?: number;
+  promoted?: number;
+  rejected?: number;
+};
+
+type PromotionReadinessRow = {
+  strategyFamily?: string;
+  totalTrades?: number;
+  evaluatedTrades?: number;
+  profitFactorLiveLike?: number;
+  eligibleForLiveReview?: boolean;
+  blockReasons?: string[];
+};
+
 const dashboardLoadError = (message: string) => {
   const lower = message.toLowerCase();
   if (lower.includes("abort") || lower.includes("timed out") || lower.includes("timeout")) {
@@ -152,8 +168,14 @@ export default async function DashboardPage() {
   const openOrders = snapshot
     ? asResult<PaperOpenOrdersSnapshot>(snapshot.openOrders as DashboardCaptureResult<PaperOpenOrdersSnapshot> | DashboardCaptureError)
     : null;
+  const learningSummary = snapshot
+    ? asResult<PaperLearningSummary>(snapshot.learningSummary as DashboardCaptureResult<PaperLearningSummary> | DashboardCaptureError)
+    : null;
   const openOrderRows = openOrders?.ok ? openOrders.data.orders || [] : [];
   const optionRows = snapshot?.optionContracts || [];
+  const promotionReadiness = (Array.isArray(snapshot?.promotionReadiness)
+    ? snapshot?.promotionReadiness
+    : []) as PromotionReadinessRow[];
   const vercelReadOnly = snapshot?.mode === "vercel-read-only";
 
   return (
@@ -241,6 +263,36 @@ export default async function DashboardPage() {
             </>
           ) : (
             <p className="warning">{review?.error || "Unavailable"}</p>
+          )}
+        </div>
+
+        <div className="panel wide">
+          <h2>Learning Ledger</h2>
+          {learningSummary?.ok ? (
+            <>
+              <div className="option-counts">
+                <Metric label="Pending" value={learningSummary.data.pending ?? 0} />
+                <Metric label="Evaluated" value={learningSummary.data.evaluated ?? 0} />
+                <Metric label="Promoted" value={learningSummary.data.promoted ?? 0} />
+                <Metric label="Rejected" value={learningSummary.data.rejected ?? 0} />
+              </div>
+              <div className="list">
+                {promotionReadiness.map((entry) => (
+                  <div className="row" key={entry.strategyFamily}>
+                    <strong>{entry.strategyFamily || "-"}</strong>
+                    <span>{String(Boolean(entry.eligibleForLiveReview))}</span>
+                    <span className="mono">
+                      {entry.evaluatedTrades ?? 0}/{entry.totalTrades ?? 0}
+                    </span>
+                    <span className="mono">PF {entry.profitFactorLiveLike ?? 0}</span>
+                    <span>{entry.blockReasons?.join(", ") || "none"}</span>
+                  </div>
+                ))}
+                {!promotionReadiness.length ? <p className="subtle">No promotion analytics yet.</p> : null}
+              </div>
+            </>
+          ) : (
+            <p className="warning">{learningSummary?.error || "Unavailable"}</p>
           )}
         </div>
 

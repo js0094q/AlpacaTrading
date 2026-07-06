@@ -55,6 +55,11 @@ import {
   buildPaperRuntimeReport,
   formatPaperRuntimeReportAsTable
 } from "./services/paperRuntimeService.js";
+import {
+  buildPromotionReadinessAnalytics,
+  evaluatePaperLearningRecords,
+  paperLearningSummary
+} from "./services/paperLearningLedgerService.js";
 import { config } from "./config.js";
 import { normalizeSymbol } from "./lib/utils.js";
 import { AlpacaApiError } from "./services/alpacaClient.js";
@@ -742,6 +747,50 @@ const run = async () => {
     return;
   }
 
+  if (command === "paper:learn" || (command === "paper" && (action === "learn" || action === "learning"))) {
+    const format = args.format;
+    const evaluation = evaluatePaperLearningRecords({
+      limit: toInt(args.limit, 100),
+      asOf: args.asOf
+    });
+    const promotionReadiness = buildPromotionReadinessAnalytics();
+    const summary = paperLearningSummary();
+
+    if (format === "json") {
+      print({
+        paperOnly: true,
+        environment: getTradingSafetyState().alpacaEnv,
+        evaluation,
+        learningSummary: summary,
+        promotionReadiness
+      });
+      return;
+    }
+
+    const lines = [
+      "Paper Learning Ledger",
+      `Environment: ${getTradingSafetyState().alpacaEnv}`,
+      `Evaluated this run: ${evaluation.evaluated}`,
+      `Still pending this run: ${evaluation.stillPending}`,
+      `Ledger pending: ${summary.pending}`,
+      `Ledger evaluated: ${summary.evaluated}`,
+      "Promotion readiness:"
+    ];
+    promotionReadiness.forEach((entry) => {
+      lines.push(
+        `- ${entry.strategyFamily}: eligible=${buildSafeBoolean(entry.eligibleForLiveReview)}, trades=${entry.totalTrades}, evaluated=${entry.evaluatedTrades}, liveLikePF=${entry.profitFactorLiveLike}, blockers=${entry.blockReasons.join(", ") || "none"}`
+      );
+    });
+    if (evaluation.pendingReasons.length) {
+      lines.push("Pending reasons:");
+      evaluation.pendingReasons.slice(0, 10).forEach((entry) => {
+        lines.push(`- ${entry.id}: ${entry.reason}`);
+      });
+    }
+    print(lines.join("\n"));
+    return;
+  }
+
   if (command === "paper" && action === "snapshots") {
     const format = args.format;
     const result = listPaperRecommendationSnapshots({
@@ -1003,7 +1052,7 @@ const run = async () => {
 
   print({
     error:
-      "Unknown command. See README for available commands including universe/data/options/features/targets/backtest/learn/research/alpaca:config/paper (including paper:analytics, paper:execute, paper:review, paper:plan, paper:snapshots, paper:trends, paper:runtime, paper:intel).",
+      "Unknown command. See README for available commands including universe/data/options/features/targets/backtest/learn/research/alpaca:config/paper (including paper:analytics, paper:learn, paper:execute, paper:review, paper:plan, paper:snapshots, paper:trends, paper:runtime, paper:intel).",
     command,
     action,
     config

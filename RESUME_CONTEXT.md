@@ -24,6 +24,12 @@
   - `ALLOW_OPTIONS_LAST_PRICE_FALLBACK=false` by default.
   - `ALLOW_0DTE_OPTIONS=true` for the current paper runtime target.
   - Option contracts may be discovered with null quotes, but they must carry `quoteStatus`, `executable=false`, and `rejectionReason` before they can appear in dashboard/runtime outputs.
+- Paper option learning layer:
+  - `PAPER_OPTION_LEARNING_LEDGER_ENABLED=true` records option candidate decisions into `paper_learning_records`.
+  - `PAPER_0DTE_SPY_ENABLED=false` and `PAPER_LEAPS_ENABLED=false` remain safe defaults; enabling them is paper-only and does not enable live trading.
+  - 0DTE candidates are SPY-only, same-day, quote-quality gated, and capped by premium/contracts/daily-trade controls.
+  - LEAPS candidates are long-dated option records gated by `PAPER_LEAPS_MIN_DTE=180`, `PAPER_LEAPS_MAX_DTE=730`, premium/contracts/spread controls, and paper-only guards.
+  - `npm run paper:learn -- --format=json` evaluates pending learning rows when local option marks exist and reports promotion-readiness analytics using live-like fill profit factor.
 - Control bridge health:
   - `GET /api/v1/health` without token returns a healthy 200.
   - `POST /api/v1/refresh` without or with a bad token returns `401`.

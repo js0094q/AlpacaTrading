@@ -29,6 +29,7 @@ const resetDatabase = () => {
     DELETE FROM paper_trade_candidates;
     DELETE FROM paper_trade_plans;
     DELETE FROM paper_trade_evaluations;
+    DELETE FROM paper_learning_records;
     DELETE FROM option_snapshots;
     DELETE FROM option_contracts;
     DELETE FROM market_bars;
@@ -409,6 +410,19 @@ beforeEach(() => {
   delete process.env.PAPER_OPTIONS_MAX_SPREAD_PCT;
   delete process.env.PAPER_OPTIONS_MAX_CONTRACTS;
   delete process.env.PAPER_OPTIONS_MAX_PREMIUM_PER_ORDER;
+  delete process.env.PAPER_0DTE_SPY_ENABLED;
+  delete process.env.PAPER_0DTE_SPY_MAX_PREMIUM_PER_TRADE;
+  delete process.env.PAPER_0DTE_SPY_MAX_CONTRACTS;
+  delete process.env.PAPER_0DTE_SPY_MAX_DAILY_TRADES;
+  delete process.env.PAPER_0DTE_SPY_MAX_QUOTE_AGE_SECONDS;
+  delete process.env.PAPER_0DTE_SPY_MAX_SPREAD_PCT;
+  delete process.env.PAPER_LEAPS_ENABLED;
+  delete process.env.PAPER_LEAPS_MAX_PREMIUM_PER_TRADE;
+  delete process.env.PAPER_LEAPS_MAX_CONTRACTS;
+  delete process.env.PAPER_LEAPS_MIN_DTE;
+  delete process.env.PAPER_LEAPS_MAX_DTE;
+  delete process.env.PAPER_LEAPS_MAX_SPREAD_PCT;
+  delete process.env.PAPER_OPTION_LEARNING_LEDGER_ENABLED;
   setMockFetch(createMockFetcher());
 });
 
@@ -975,11 +989,75 @@ describe("paper plan service", () => {
     assert.equal(entry?.reasonCodes.includes("OPTION_LIMIT_PRICE_UNAVAILABLE"), true);
   });
 
-  test("blocks 0DTE option planning by default and allows it only when enabled", async () => {
-    const optionSymbol = "AAPL260703C00100000";
+  test("blocks 0DTE SPY option planning by default and allows it only when enabled", async () => {
+    const optionSymbol = "SPY260703C00100000";
     insertResearchRun({ runId: "run-0dte", riskProfile: "moderate", optionsEnabled: true });
     insertCandidate({
       runId: "run-0dte",
+      symbol: "SPY",
+      rank: 1,
+      preferredExpression: "long_call",
+      optionSymbol,
+      strike: 100,
+      estimatedMaxLoss: 75
+    });
+    insertOptionContract({
+      optionSymbol,
+      underlying: "SPY",
+      type: "call",
+      expirationDate: new Date().toISOString().slice(0, 10)
+    });
+    insertOptionSnapshot({ optionSymbol });
+    setMockFetch(createMockFetcher({
+      assets: {
+        SPY: { class: "us_equity", status: "active", tradable: true, fractionable: true }
+      }
+    }));
+
+    const blocked = await planResultFor({ optionsEnabled: true });
+    assert.equal(blocked.plan[0]?.decision, "watch");
+    assert.equal(blocked.plan[0]?.reasonCodes.includes("ZERO_DTE_SPY_DISABLED"), true);
+    assert.equal(blocked.plan[0]?.strategyFamily, "zero_dte_spy");
+
+    process.env.PAPER_0DTE_SPY_ENABLED = "true";
+    const allowed = await planResultFor({ optionsEnabled: true });
+    assert.equal(allowed.plan[0]?.decision, "planned");
+    assert.equal(allowed.plan[0]?.reasonCodes.includes("OPTION_0DTE_ALLOWED"), true);
+    assert.equal(allowed.plan[0]?.strategyFamily, "zero_dte_spy");
+  });
+
+  test("rejects non-SPY same-day options under the 0DTE SPY family", async () => {
+    const optionSymbol = "AAPL260703C00100000";
+    process.env.PAPER_0DTE_SPY_ENABLED = "true";
+    insertResearchRun({ runId: "run-non-spy-0dte", riskProfile: "moderate", optionsEnabled: true });
+    insertCandidate({
+      runId: "run-non-spy-0dte",
+      symbol: "AAPL",
+      rank: 1,
+      preferredExpression: "long_call",
+      optionSymbol,
+      strike: 100,
+      estimatedMaxLoss: 75
+    });
+    insertOptionContract({
+      optionSymbol,
+      underlying: "AAPL",
+      type: "call",
+      expirationDate: new Date().toISOString().slice(0, 10)
+    });
+    insertOptionSnapshot({ optionSymbol });
+
+    const report = await planResultFor({ optionsEnabled: true });
+    assert.equal(report.plan[0]?.decision, "watch");
+    assert.equal(report.plan[0]?.strategyFamily, "zero_dte_spy");
+    assert.equal(report.plan[0]?.reasonCodes.includes("NOT_ZERO_DTE"), true);
+  });
+
+  test("blocks LEAPS by default and plans eligible long-dated calls when enabled", async () => {
+    const optionSymbol = "AAPL270115C00100000";
+    insertResearchRun({ runId: "run-leaps", riskProfile: "moderate", optionsEnabled: true });
+    insertCandidate({
+      runId: "run-leaps",
       symbol: "AAPL",
       rank: 1,
       preferredExpression: "long_call",
@@ -990,18 +1068,110 @@ describe("paper plan service", () => {
     insertOptionContract({
       optionSymbol,
       type: "call",
-      expirationDate: new Date().toISOString().slice(0, 10)
+      expirationDate: futureDate(365)
     });
     insertOptionSnapshot({ optionSymbol });
 
     const blocked = await planResultFor({ optionsEnabled: true });
     assert.equal(blocked.plan[0]?.decision, "watch");
-    assert.equal(blocked.plan[0]?.reasonCodes.includes("OPTION_0DTE_NOT_ENABLED"), true);
+    assert.equal(blocked.plan[0]?.strategyFamily, "leaps");
+    assert.equal(blocked.plan[0]?.reasonCodes.includes("LEAPS_DISABLED"), true);
 
-    process.env.ALLOW_0DTE_OPTIONS = "true";
+    process.env.PAPER_LEAPS_ENABLED = "true";
     const allowed = await planResultFor({ optionsEnabled: true });
     assert.equal(allowed.plan[0]?.decision, "planned");
-    assert.equal(allowed.plan[0]?.reasonCodes.includes("OPTION_0DTE_ALLOWED"), true);
+    assert.equal(allowed.plan[0]?.strategyFamily, "leaps");
+    assert.equal(allowed.plan[0]?.riskModel?.expectedHoldPeriod, "long_horizon");
+  });
+
+  test("rejects LEAPS candidates below the configured DTE window", async () => {
+    const optionSymbol = "AAPL260501C00100000";
+    process.env.PAPER_LEAPS_ENABLED = "true";
+    insertResearchRun({ runId: "run-leaps-dte-low", riskProfile: "moderate", optionsEnabled: true });
+    insertCandidate({
+      runId: "run-leaps-dte-low",
+      symbol: "AAPL",
+      rank: 1,
+      preferredExpression: "long_call",
+      optionSymbol,
+      strike: 100,
+      estimatedMaxLoss: 75
+    });
+    insertOptionContract({
+      optionSymbol,
+      type: "call",
+      expirationDate: futureDate(120)
+    });
+    insertOptionSnapshot({ optionSymbol });
+
+    const report = await planResultFor({ optionsEnabled: true });
+    assert.equal(report.plan[0]?.decision, "watch");
+    assert.equal(report.plan[0]?.strategyFamily, "leaps");
+    assert.equal(report.plan[0]?.reasonCodes.includes("DTE_OUT_OF_RANGE"), true);
+  });
+
+  test("writes learning records for submitted and rejected option candidates", async () => {
+    const submittedSymbol = "AAPL270115C00100000";
+    const rejectedSymbol = "SPY260703C00100000";
+    process.env.PAPER_LEAPS_ENABLED = "true";
+    insertResearchRun({ runId: "run-learning-ledger", riskProfile: "moderate", optionsEnabled: true });
+    insertCandidate({
+      runId: "run-learning-ledger",
+      symbol: "AAPL",
+      rank: 1,
+      preferredExpression: "long_call",
+      optionSymbol: submittedSymbol,
+      strike: 100,
+      estimatedMaxLoss: 75
+    });
+    insertCandidate({
+      runId: "run-learning-ledger",
+      symbol: "SPY",
+      rank: 2,
+      preferredExpression: "long_call",
+      optionSymbol: rejectedSymbol,
+      strike: 100,
+      estimatedMaxLoss: 75
+    });
+    insertOptionContract({
+      optionSymbol: submittedSymbol,
+      type: "call",
+      expirationDate: futureDate(365)
+    });
+    insertOptionSnapshot({ optionSymbol: submittedSymbol });
+    insertOptionContract({
+      optionSymbol: rejectedSymbol,
+      underlying: "SPY",
+      type: "call",
+      expirationDate: new Date().toISOString().slice(0, 10)
+    });
+    insertOptionSnapshot({ optionSymbol: rejectedSymbol, underlying: "SPY" });
+    setMockFetch(createMockFetcher({
+      assets: {
+        AAPL: { class: "us_equity", status: "active", tradable: true, fractionable: true },
+        SPY: { class: "us_equity", status: "active", tradable: true, fractionable: true }
+      }
+    }));
+
+    const report = await planResultFor({ optionsEnabled: true, maxCandidates: 2 });
+    assert.equal(report.summary.learningRecordsWritten, 2);
+    const records = getDb()
+      .prepare("SELECT strategy_family, decision, hypothesis, paper_fill_model_json, live_like_fill_model_json FROM paper_learning_records ORDER BY source_candidate_id ASC")
+      .all() as Array<{
+        strategy_family: string;
+        decision: string;
+        hypothesis: string;
+        paper_fill_model_json: string | null;
+        live_like_fill_model_json: string | null;
+      }>;
+    assert.equal(records.length, 2);
+    assert.equal(records[0]?.strategy_family, "leaps");
+    assert.equal(records[0]?.decision, "submitted");
+    assert.equal(Boolean(records[0]?.paper_fill_model_json), true);
+    assert.equal(Boolean(records[0]?.live_like_fill_model_json), true);
+    assert.equal(records[1]?.strategy_family, "zero_dte_spy");
+    assert.equal(records[1]?.decision, "skipped");
+    assert.match(records[1]?.hypothesis || "", /SPY intraday/);
   });
 
   test("wide option spread is a warning below hard max and blocker above hard max", async () => {

@@ -6,6 +6,11 @@ import {
   type PaperPlanReport
 } from "./paperPlanService.js";
 import { getTradingSafetyState } from "./tradingSafetyService.js";
+import {
+  buildPromotionReadinessAnalytics,
+  paperLearningSummary,
+  type PromotionReadiness
+} from "./paperLearningLedgerService.js";
 import type { RiskProfile } from "../types.js";
 
 export type PaperReviewStatus = "ready_for_dry_run_execution" | "warning" | "blocked";
@@ -59,6 +64,15 @@ export interface PaperReviewPlanSummary {
   estimatedTotalNotional: number;
   buyingPowerUsePct: number | null;
   remainingDeployableBuyingPower: number | null;
+  zeroDteSpyCandidates?: number;
+  zeroDteSpyEligible?: number;
+  zeroDteSpySkipped?: number;
+  leapsCandidates?: number;
+  leapsEligible?: number;
+  leapsSkipped?: number;
+  learningRecordsWritten?: number;
+  learningRecordsPending?: number;
+  learningRecordsEvaluated?: number;
 }
 
 export interface PaperReviewCandidate {
@@ -68,6 +82,7 @@ export interface PaperReviewCandidate {
   estimatedQty: number | null;
   reasonCodes: string[];
   reviewFlags: string[];
+  strategyFamily?: string | null;
 }
 
 export interface PaperReviewReport {
@@ -114,7 +129,16 @@ export interface PaperReviewReport {
     skippedDuplicateOpenEquityOrder: number;
     skippedDuplicateOpenOptionOrder: number;
     skippedQuoteUnavailable: number;
+    zeroDteSpyCandidates?: number;
+    zeroDteSpyEligible?: number;
+    zeroDteSpySkipped?: number;
+    leapsCandidates?: number;
+    leapsEligible?: number;
+    leapsSkipped?: number;
+    learningRecordsWritten?: number;
+    learningRecordsPending?: number;
   };
+  promotionReadiness?: PromotionReadiness[];
   topSkipReasons: string[];
   executionReadiness?: {
     equity: {
@@ -423,6 +447,17 @@ const buildReviewFlags = (
     "OPTION_RISK_LIMIT_EXCEEDED",
     "OPTION_CONTRACT_NOT_FOUND",
     "OPTION_CONTRACT_NOT_TRADABLE",
+    "ZERO_DTE_SPY_DISABLED",
+    "LEAPS_DISABLED",
+    "NOT_ZERO_DTE",
+    "DTE_OUT_OF_RANGE",
+    "QUOTE_NULL",
+    "QUOTE_STALE",
+    "QUOTE_CROSSED",
+    "SPREAD_TOO_WIDE",
+    "PREMIUM_ABOVE_LIMIT",
+    "MAX_DAILY_ZERO_DTE_TRADES_REACHED",
+    "LEARNING_LEDGER_WRITE_FAILED",
     "UNSUPPORTED_OPTION_STRATEGY",
     "OPTION_COLLATERAL_INSUFFICIENT"
   ]) {
@@ -492,7 +527,15 @@ const emptyCandidateCounts = () => ({
   skippedUnderlyingEquityHeldForOption: 0,
   skippedDuplicateOpenEquityOrder: 0,
   skippedDuplicateOpenOptionOrder: 0,
-  skippedQuoteUnavailable: 0
+  skippedQuoteUnavailable: 0,
+  zeroDteSpyCandidates: 0,
+  zeroDteSpyEligible: 0,
+  zeroDteSpySkipped: 0,
+  leapsCandidates: 0,
+  leapsEligible: 0,
+  leapsSkipped: 0,
+  learningRecordsWritten: 0,
+  learningRecordsPending: 0
 });
 
 const buildCandidateCounts = (
@@ -544,7 +587,23 @@ const buildCandidateCounts = (
   ).length,
   skippedQuoteUnavailable: plan.filter((candidate) =>
     candidate.decision !== "planned" && candidate.rejectionReason === "quote_unavailable"
-  ).length
+  ).length,
+  zeroDteSpyCandidates: plan.filter((candidate) => candidate.strategyFamily === "zero_dte_spy").length,
+  zeroDteSpyEligible: plan.filter(
+    (candidate) => candidate.strategyFamily === "zero_dte_spy" && candidate.decision === "planned"
+  ).length,
+  zeroDteSpySkipped: plan.filter(
+    (candidate) => candidate.strategyFamily === "zero_dte_spy" && candidate.decision !== "planned"
+  ).length,
+  leapsCandidates: plan.filter((candidate) => candidate.strategyFamily === "leaps").length,
+  leapsEligible: plan.filter(
+    (candidate) => candidate.strategyFamily === "leaps" && candidate.decision === "planned"
+  ).length,
+  leapsSkipped: plan.filter(
+    (candidate) => candidate.strategyFamily === "leaps" && candidate.decision !== "planned"
+  ).length,
+  learningRecordsWritten: plan.filter((candidate) => candidate.learningRecordWriteStatus === "written").length,
+  learningRecordsPending: plan.filter((candidate) => candidate.learningRecordWriteStatus === "written").length
 });
 
 const primarySkipReason = (candidate: PaperPlanCandidate): string | null => {
@@ -786,7 +845,16 @@ export const buildPaperReviewReport = async (
         skipped: 0,
         estimatedTotalNotional: 0,
         buyingPowerUsePct: null,
-        remainingDeployableBuyingPower: null
+        remainingDeployableBuyingPower: null,
+        zeroDteSpyCandidates: 0,
+        zeroDteSpyEligible: 0,
+        zeroDteSpySkipped: 0,
+        leapsCandidates: 0,
+        leapsEligible: 0,
+        leapsSkipped: 0,
+        learningRecordsWritten: 0,
+        learningRecordsPending: paperLearningSummary().pending,
+        learningRecordsEvaluated: paperLearningSummary().evaluated
       },
       review,
       risk: {
@@ -817,6 +885,7 @@ export const buildPaperReviewReport = async (
         buyingPowerWarnings: []
       },
       candidateCounts: emptyCandidateCounts(),
+      promotionReadiness: buildPromotionReadinessAnalytics(),
       topSkipReasons: [],
       executionReadiness: {
         equity: {
@@ -867,7 +936,16 @@ export const buildPaperReviewReport = async (
     skipped: planReport.summary?.skipped ?? 0,
     estimatedTotalNotional: planReport.summary?.estimatedTotalNotional ?? 0,
     buyingPowerUsePct: null,
-    remainingDeployableBuyingPower: planReport.account?.deployableBuyingPower ?? null
+    remainingDeployableBuyingPower: planReport.account?.deployableBuyingPower ?? null,
+    zeroDteSpyCandidates: planReport.summary?.zeroDteSpyCandidates ?? 0,
+    zeroDteSpyEligible: planReport.summary?.zeroDteSpyEligible ?? 0,
+    zeroDteSpySkipped: planReport.summary?.zeroDteSpySkipped ?? 0,
+    leapsCandidates: planReport.summary?.leapsCandidates ?? 0,
+    leapsEligible: planReport.summary?.leapsEligible ?? 0,
+    leapsSkipped: planReport.summary?.leapsSkipped ?? 0,
+    learningRecordsWritten: planReport.summary?.learningRecordsWritten ?? 0,
+    learningRecordsPending: paperLearningSummary().pending,
+    learningRecordsEvaluated: paperLearningSummary().evaluated
   };
 
   const buyingPower = planReport.account?.buyingPower;
@@ -990,6 +1068,7 @@ export const buildPaperReviewReport = async (
   const candidateCounts = buildCandidateCounts(planReport.plan, summary, executionReadiness);
   const topSkipReasons = buildTopSkipReasons(planReport.plan);
   const blockReason = reviewBlockReason(orderedBlockers);
+  const promotionReadiness = buildPromotionReadinessAnalytics();
 
   const review = {
     status,
@@ -1014,7 +1093,8 @@ export const buildPaperReviewReport = async (
     estimatedNotional: candidate.estimatedNotional,
     estimatedQty: candidate.estimatedQty,
     reasonCodes: [...new Set(candidate.reasonCodes)].sort(),
-    reviewFlags: buildReviewFlags(candidate, concentratedSymbols)
+    reviewFlags: buildReviewFlags(candidate, concentratedSymbols),
+    strategyFamily: candidate.strategyFamily ?? null
   }));
 
   const riskFlags = {
@@ -1099,6 +1179,7 @@ export const buildPaperReviewReport = async (
     review,
     risk: riskFlags,
     candidateCounts,
+    promotionReadiness,
     topSkipReasons,
     executionReadiness,
     plan: reviewPlan,
@@ -1127,6 +1208,21 @@ export const formatPaperReviewReportAsTable = (report: PaperReviewReport) => {
   lines.push(
     `Candidate counts: input=${report.candidateCounts.inputCandidates}, planned=${report.candidateCounts.plannedOrders}, eligiblePayloads=${report.candidateCounts.eligiblePayloads}, alreadyHeld=${report.candidateCounts.skippedAlreadyHeld}, alreadyHeldEquity=${report.candidateCounts.skippedAlreadyHeldEquity}, alreadyHeldOptionContract=${report.candidateCounts.skippedAlreadyHeldOptionContract}, underlyingEquityHeldForOption=${report.candidateCounts.skippedUnderlyingEquityHeldForOption}, duplicateOpenEquityOrder=${report.candidateCounts.skippedDuplicateOpenEquityOrder}, duplicateOpenOptionOrder=${report.candidateCounts.skippedDuplicateOpenOptionOrder}, quoteUnavailable=${report.candidateCounts.skippedQuoteUnavailable}`
   );
+  lines.push(
+    `Strategy families: zeroDteSpy candidates=${report.candidateCounts.zeroDteSpyCandidates ?? 0}, eligible=${report.candidateCounts.zeroDteSpyEligible ?? 0}, skipped=${report.candidateCounts.zeroDteSpySkipped ?? 0}; leaps candidates=${report.candidateCounts.leapsCandidates ?? 0}, eligible=${report.candidateCounts.leapsEligible ?? 0}, skipped=${report.candidateCounts.leapsSkipped ?? 0}`
+  );
+  lines.push(
+    `Learning ledger: written=${report.candidateCounts.learningRecordsWritten ?? 0}, pending=${report.planSummary.learningRecordsPending ?? 0}, evaluated=${report.planSummary.learningRecordsEvaluated ?? 0}`
+  );
+  const promotionReadiness = report.promotionReadiness ?? [];
+  if (promotionReadiness.length) {
+    lines.push("Promotion readiness:");
+    for (const entry of promotionReadiness) {
+      lines.push(
+        `- ${entry.strategyFamily}: eligible=${stateText(entry.eligibleForLiveReview)}, trades=${entry.totalTrades}, evaluated=${entry.evaluatedTrades}, liveLikePF=${entry.profitFactorLiveLike}, blockers=${entry.blockReasons.join(", ") || "none"}`
+      );
+    }
+  }
   lines.push(`Top skip reasons: ${report.topSkipReasons.length ? report.topSkipReasons.join(", ") : "none"}`);
   if (report.executionReadiness) {
     lines.push(

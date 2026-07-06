@@ -21,6 +21,14 @@ import {
   getOrderAssetIdentity,
   getPositionAssetIdentity
 } from "./assetIdentity.js";
+import {
+  insertPaperLearningRecord,
+  type LiveLikeFillModel,
+  type PaperFillModel,
+  type PaperStrategyFamily,
+  type QuoteSnapshotModel,
+  type RiskModel
+} from "./paperLearningLedgerService.js";
 import type { PreferredExpression, RiskProfile } from "../types.js";
 
 export type PaperPlanDecision = "planned" | "watch" | "skip";
@@ -59,6 +67,14 @@ export interface PaperPlanSummary {
   skipped: number;
   estimatedTotalNotional: number;
   remainingDeployableBuyingPower: number | null;
+  zeroDteSpyCandidates?: number;
+  zeroDteSpyEligible?: number;
+  zeroDteSpySkipped?: number;
+  leapsCandidates?: number;
+  leapsEligible?: number;
+  leapsSkipped?: number;
+  learningRecordsWritten?: number;
+  learningRecordsPending?: number;
 }
 
 export interface PaperPlanSizingBasis {
@@ -85,7 +101,20 @@ export interface PaperPlanCandidate {
   timeInForce: "day";
   underlyingSymbol?: string | null;
   optionSymbol?: string | null;
+  sourceCandidateId?: string | null;
+  sourceResearchRunId?: string | null;
+  strategyFamily?: PaperStrategyFamily | null;
   strategy?: PreferredExpression | null;
+  hypothesis?: string | null;
+  signalInputs?: Record<string, unknown> | null;
+  optionMetadata?: Record<string, unknown> | null;
+  quoteSnapshot?: QuoteSnapshotModel | null;
+  paperFillModel?: PaperFillModel | null;
+  liveLikeFillModel?: LiveLikeFillModel | null;
+  riskModel?: RiskModel | null;
+  learningRecordId?: string | null;
+  learningRecordWriteStatus?: "written" | "disabled" | "failed" | null;
+  learningRecordError?: string | null;
   limitPrice?: number | null;
   estimatedPremium?: number | null;
   maxRisk?: number | null;
@@ -252,6 +281,19 @@ type PaperPlanReasonCode =
   | "OPTION_SPREAD_TOO_WIDE"
   | "OPTION_WIDE_SPREAD_WARNING"
   | "OPTION_0DTE_NOT_ENABLED"
+  | "ZERO_DTE_SPY_DISABLED"
+  | "LEAPS_DISABLED"
+  | "NOT_ZERO_DTE"
+  | "DTE_OUT_OF_RANGE"
+  | "QUOTE_NULL"
+  | "QUOTE_STALE"
+  | "QUOTE_CROSSED"
+  | "SPREAD_TOO_WIDE"
+  | "PREMIUM_ABOVE_LIMIT"
+  | "MAX_CONTRACTS_EXCEEDED"
+  | "MAX_DAILY_ZERO_DTE_TRADES_REACHED"
+  | "PAPER_ONLY_GUARD_FAILED"
+  | "LEARNING_LEDGER_WRITE_FAILED"
   | "SPECULATIVE_OPTION_PAPER_WARNING"
   | "OPTION_0DTE_ALLOWED"
   | "OPTION_DTE_ALLOWED"
@@ -295,6 +337,19 @@ const REASON_ORDER = [
   "OPTION_SPREAD_TOO_WIDE",
   "OPTION_WIDE_SPREAD_WARNING",
   "OPTION_0DTE_NOT_ENABLED",
+  "ZERO_DTE_SPY_DISABLED",
+  "LEAPS_DISABLED",
+  "NOT_ZERO_DTE",
+  "DTE_OUT_OF_RANGE",
+  "QUOTE_NULL",
+  "QUOTE_STALE",
+  "QUOTE_CROSSED",
+  "SPREAD_TOO_WIDE",
+  "PREMIUM_ABOVE_LIMIT",
+  "MAX_CONTRACTS_EXCEEDED",
+  "MAX_DAILY_ZERO_DTE_TRADES_REACHED",
+  "PAPER_ONLY_GUARD_FAILED",
+  "LEARNING_LEDGER_WRITE_FAILED",
   "SPECULATIVE_OPTION_PAPER_WARNING",
   "OPTION_0DTE_ALLOWED",
   "OPTION_DTE_ALLOWED",
@@ -621,7 +676,24 @@ const paperOptionsConfig = () => {
     allowCoveredCalls: parseBooleanEnv("PAPER_OPTIONS_ALLOW_COVERED_CALLS", true),
     allowNakedOptions: parseBooleanEnv("PAPER_OPTIONS_ALLOW_NAKED_OPTIONS", false),
     quoteMaxAgeMs: quoteCfg.maxAgeMs,
-    allowLastPriceFallback: quoteCfg.allowLastPriceFallback
+    allowLastPriceFallback: quoteCfg.allowLastPriceFallback,
+    learningLedgerEnabled: parseBooleanEnv("PAPER_OPTION_LEARNING_LEDGER_ENABLED", true),
+    zeroDteSpy: {
+      enabled: parseBooleanEnv("PAPER_0DTE_SPY_ENABLED", false),
+      maxPremiumPerTrade: parseNumberEnv("PAPER_0DTE_SPY_MAX_PREMIUM_PER_TRADE", 500),
+      maxContracts: Math.max(1, parseIntegerEnv("PAPER_0DTE_SPY_MAX_CONTRACTS", 5)),
+      maxDailyTrades: Math.max(1, parseIntegerEnv("PAPER_0DTE_SPY_MAX_DAILY_TRADES", 3)),
+      maxQuoteAgeSeconds: Math.max(1, parseIntegerEnv("PAPER_0DTE_SPY_MAX_QUOTE_AGE_SECONDS", 60)),
+      maxSpreadPct: parseNumberEnv("PAPER_0DTE_SPY_MAX_SPREAD_PCT", 20)
+    },
+    leaps: {
+      enabled: parseBooleanEnv("PAPER_LEAPS_ENABLED", false),
+      maxPremiumPerTrade: parseNumberEnv("PAPER_LEAPS_MAX_PREMIUM_PER_TRADE", 2500),
+      maxContracts: Math.max(1, parseIntegerEnv("PAPER_LEAPS_MAX_CONTRACTS", 2)),
+      minDte: parseIntegerEnv("PAPER_LEAPS_MIN_DTE", 180),
+      maxDte: Math.max(1, parseIntegerEnv("PAPER_LEAPS_MAX_DTE", 730)),
+      maxSpreadPct: parseNumberEnv("PAPER_LEAPS_MAX_SPREAD_PCT", 15)
+    }
   };
 };
 
@@ -741,6 +813,112 @@ const optionQuoteFields = (quote: NormalizedOptionQuote) => ({
   quoteTimestamp: quote.quoteTimestamp
 });
 
+const quoteAgeSeconds = (quoteTimestamp: string | null): number | null => {
+  if (!quoteTimestamp) {
+    return null;
+  }
+  const parsed = Date.parse(quoteTimestamp);
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+  return Math.max(0, Math.round((Date.now() - parsed) / 1000));
+};
+
+const quoteQualityReason = (quote: NormalizedOptionQuote): PaperPlanReasonCode => {
+  if (quote.rejectionReason === "crossed_quote") {
+    return "QUOTE_CROSSED";
+  }
+  if (quote.quoteStatus === "stale") {
+    return "QUOTE_STALE";
+  }
+  if (quote.bid === null || quote.ask === null) {
+    return "QUOTE_NULL";
+  }
+  return "OPTION_LIMIT_PRICE_UNAVAILABLE";
+};
+
+const quoteSnapshotModel = (
+  quote: NormalizedOptionQuote,
+  spreadPct: number | null
+): QuoteSnapshotModel => ({
+  bid: quote.bid,
+  ask: quote.ask,
+  midpoint: quote.midpoint,
+  spreadPct,
+  quoteAgeSeconds: quoteAgeSeconds(quote.quoteTimestamp)
+});
+
+const paperFillModelFor = (
+  quote: NormalizedOptionQuote,
+  limitPrice: number | null
+): PaperFillModel | null => {
+  if (limitPrice === null) {
+    return null;
+  }
+  const source =
+    quote.executablePriceSource === "midpoint"
+      ? "midpoint"
+      : quote.executablePriceSource === "ask"
+        ? "ask"
+        : "paper_order";
+  return {
+    submittedLimitPrice: limitPrice,
+    assumedFillPrice: limitPrice,
+    source
+  };
+};
+
+const liveLikeFillModelFor = (
+  quote: NormalizedOptionQuote,
+  limitPrice: number | null,
+  spreadPct: number | null
+): LiveLikeFillModel | null => {
+  if (quote.ask !== null && quote.ask > 0) {
+    const paperPrice = limitPrice ?? quote.midpoint ?? quote.ask;
+    const slippageBps = paperPrice > 0 ? ((quote.ask - paperPrice) / paperPrice) * 10000 : 0;
+    return {
+      assumedEntryPrice: roundMoney(quote.ask),
+      method: "ask",
+      slippageBps: Number(Math.max(0, slippageBps).toFixed(2)),
+      spreadPenaltyPct: spreadPct ?? undefined
+    };
+  }
+  if (quote.midpoint !== null && quote.midpoint > 0 && spreadPct !== null) {
+    const penalty = spreadPct / 2;
+    return {
+      assumedEntryPrice: roundMoney(quote.midpoint * (1 + penalty / 100)),
+      method: "midpoint_plus_spread_fraction",
+      spreadPenaltyPct: penalty
+    };
+  }
+  return null;
+};
+
+const hypothesisForFamily = (family: PaperStrategyFamily) => {
+  if (family === "zero_dte_spy") {
+    return "SPY intraday momentum/mean-reversion signal is strong enough to overcome same-day theta decay, spread cost, and conservative live-like fill assumptions.";
+  }
+  if (family === "leaps") {
+    return "Long-horizon directional signal is strong enough to justify long-dated premium exposure after spread, liquidity, and drawdown controls.";
+  }
+  if (family === "standard_option") {
+    return "Defined paper option exposure can express the directional signal after quote, spread, liquidity, and risk controls.";
+  }
+  return "Equity paper exposure can validate the directional signal while preserving paper-only execution controls.";
+};
+
+const expectedHoldPeriodForFamily = (
+  family: PaperStrategyFamily
+): RiskModel["expectedHoldPeriod"] => {
+  if (family === "zero_dte_spy") {
+    return "intraday";
+  }
+  if (family === "leaps") {
+    return "long_horizon";
+  }
+  return "swing";
+};
+
 const missingOptionQuoteFields = (optionSymbol: string): NormalizedOptionQuote => ({
   optionSymbol,
   bid: null,
@@ -858,6 +1036,161 @@ const accountRelativeCap = (
   accountEquity !== null && accountEquity > 0
     ? roundMoney((accountEquity * pct) / 100)
     : null;
+
+const classifyOptionFamily = (input: {
+  dte: number | null;
+  genericMaxDte: number;
+  leapsMinDte: number;
+}): PaperStrategyFamily => {
+  if (input.dte === 0) {
+    return "zero_dte_spy";
+  }
+  if (input.dte !== null && (input.dte >= input.leapsMinDte || input.dte > input.genericMaxDte)) {
+    return "leaps";
+  }
+  return "standard_option";
+};
+
+const zeroDteSubmittedToday = (): number => {
+  const today = new Date().toISOString().slice(0, 10);
+  const row = queryOne<{ count: number }>(
+    `
+    SELECT COUNT(DISTINCT COALESCE(source_candidate_id, id)) AS count
+    FROM paper_learning_records
+    WHERE strategy_family = 'zero_dte_spy'
+      AND decision = 'submitted'
+      AND substr(created_at, 1, 10) = ?
+    `,
+    [today]
+  );
+  return Number(row?.count ?? 0);
+};
+
+const familyRiskCaps = (
+  family: PaperStrategyFamily,
+  options: ReturnType<typeof paperOptionsConfig>
+) => {
+  if (family === "zero_dte_spy") {
+    return {
+      maxPremiumPerTrade: options.zeroDteSpy.maxPremiumPerTrade,
+      maxContracts: options.zeroDteSpy.maxContracts,
+      maxSpreadPct: options.zeroDteSpy.maxSpreadPct
+    };
+  }
+  if (family === "leaps") {
+    return {
+      maxPremiumPerTrade: options.leaps.maxPremiumPerTrade,
+      maxContracts: options.leaps.maxContracts,
+      maxSpreadPct: options.leaps.maxSpreadPct
+    };
+  }
+  return {
+    maxPremiumPerTrade: options.maxPremiumPerOrder,
+    maxContracts: options.maxContracts,
+    maxSpreadPct: options.maxSpreadPct
+  };
+};
+
+const learningDecisionFor = (candidate: PaperPlanCandidate) => {
+  if (candidate.decision === "planned") {
+    return "submitted" as const;
+  }
+  if (candidate.reasonCodes.some((code) =>
+    code.startsWith("QUOTE_") ||
+    code === "OPTION_LIMIT_PRICE_UNAVAILABLE" ||
+    code === "OPTION_SPREAD_TOO_WIDE" ||
+    code === "SPREAD_TOO_WIDE" ||
+    code === "PREMIUM_ABOVE_LIMIT" ||
+    code === "DTE_OUT_OF_RANGE" ||
+    code === "NOT_ZERO_DTE"
+  )) {
+    return "rejected" as const;
+  }
+  return "skipped" as const;
+};
+
+const learningBlockReasonFor = (candidate: PaperPlanCandidate): string | null => {
+  const blocking = candidate.reasonCodes.find((code) =>
+    ![
+      "PAPER_ENV_CONFIRMED",
+      "LIVE_TRADING_DISABLED",
+      "PLAN_ONLY_NO_MUTATION",
+      "RISK_PROFILE_ALLOWED",
+      "OPTION_CONTRACT_FOUND",
+      "OPTION_DTE_ALLOWED",
+      "OPTION_0DTE_ALLOWED",
+      "TRADABLE",
+      "BUYING_POWER_OK",
+      "WITHIN_POSITION_CAP",
+      "QTY_ESTIMATED",
+      "SPECULATIVE_OPTION_PAPER_WARNING",
+      "OPTION_WIDE_SPREAD_WARNING"
+    ].includes(code)
+  );
+  return candidate.rejectionReason || blocking || null;
+};
+
+const attachLearningRecord = (input: {
+  candidate: CandidateRow;
+  plan: PaperPlanCandidate;
+  researchRunId: string | null;
+  generatedAt: string;
+}): PaperPlanCandidate => {
+  const family = input.plan.strategyFamily ?? (
+    input.plan.assetClass === "option" ? "standard_option" : "equity"
+  );
+  if (!parseBooleanEnv("PAPER_OPTION_LEARNING_LEDGER_ENABLED", true)) {
+    return {
+      ...input.plan,
+      learningRecordWriteStatus: "disabled"
+    };
+  }
+
+  const decision = learningDecisionFor(input.plan);
+  const blockReason = learningBlockReasonFor(input.plan);
+  const signalInputs = input.plan.signalInputs ?? {
+    rank: input.candidate.rank,
+    direction: input.candidate.direction,
+    preferredExpression: input.candidate.preferred_expression,
+    estimatedMaxLoss: input.candidate.estimated_max_loss,
+    estimatedMaxProfit: input.candidate.estimated_max_profit
+  };
+
+  try {
+    const record = insertPaperLearningRecord({
+      createdAt: input.generatedAt,
+      strategyFamily: family,
+      symbol: input.plan.symbol,
+      underlyingSymbol: input.plan.underlyingSymbol ?? input.plan.symbol,
+      optionSymbol: input.plan.optionSymbol ?? null,
+      decision,
+      skipReason: decision === "submitted" ? null : blockReason,
+      blockReason,
+      hypothesis: input.plan.hypothesis || hypothesisForFamily(family),
+      signalInputs,
+      optionMetadata: input.plan.optionMetadata ?? null,
+      quoteSnapshot: input.plan.quoteSnapshot ?? null,
+      paperFillModel: input.plan.paperFillModel ?? null,
+      liveLikeFillModel: input.plan.liveLikeFillModel ?? null,
+      riskModel: input.plan.riskModel ?? null,
+      sourceResearchRunId: input.researchRunId,
+      sourceCandidateId: input.candidate.id,
+      sourcePlanTimestamp: input.generatedAt
+    });
+    return {
+      ...input.plan,
+      learningRecordId: record.id,
+      learningRecordWriteStatus: "written"
+    };
+  } catch (error) {
+    return {
+      ...input.plan,
+      reasonCodes: buildReasonList([...input.plan.reasonCodes, "LEARNING_LEDGER_WRITE_FAILED"]),
+      learningRecordWriteStatus: "failed",
+      learningRecordError: error instanceof Error ? error.message : "unknown"
+    };
+  }
+};
 
 const positiveFloor = (value: number) =>
   Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
@@ -1087,6 +1420,16 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         ...base,
         decision: "watch",
         assetClass: "option",
+        sourceCandidateId: candidate.id,
+        strategyFamily: "standard_option",
+        hypothesis: hypothesisForFamily("standard_option"),
+        signalInputs: {
+          rank: candidate.rank,
+          direction: candidate.direction,
+          preferredExpression: candidate.preferred_expression,
+          estimatedMaxLoss: candidate.estimated_max_loss,
+          estimatedMaxProfit: candidate.estimated_max_profit
+        },
         strategy,
         reasonCodes: buildReasonList([...(base.reasonCodes), "OPTION_CONTRACT_NOT_FOUND"]),
         explanation: explanationFor("watch", ["OPTION_CONTRACT_NOT_FOUND"])
@@ -1096,18 +1439,83 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
     const expectedType =
       strategy === "long_call" || strategy === "covered_call" ? "call" : "put";
     const dte = daysToExpiration(contract.expiration_date);
-    const dteAllowed =
+    const strategyFamily = classifyOptionFamily({
+      dte,
+      genericMaxDte: options.maxDte,
+      leapsMinDte: options.leaps.minDte
+    });
+    const optionMetadata = {
+      type: contract.type,
+      expectedType,
+      expirationDate: contract.expiration_date,
+      dte,
+      strike: contract.strike,
+      multiplier: contract.multiplier || 100,
+      tradable: contract.tradable === 1
+    };
+    const signalInputs = {
+      rank: candidate.rank,
+      direction: candidate.direction,
+      preferredExpression: candidate.preferred_expression,
+      estimatedMaxLoss: candidate.estimated_max_loss,
+      estimatedMaxProfit: candidate.estimated_max_profit,
+      dte,
+      strategyFamily
+    };
+    const baseOptionFields = {
+      sourceCandidateId: candidate.id,
+      strategyFamily,
+      hypothesis: hypothesisForFamily(strategyFamily),
+      signalInputs,
+      optionMetadata
+    };
+    const genericDteAllowed =
       dte !== null &&
       dte >= options.minDte &&
       dte <= options.maxDte &&
       (options.allow0Dte || dte > 0);
-    const dteBlockReason: PaperPlanReasonCode =
-      dte === 0 && !options.allow0Dte ? "OPTION_0DTE_NOT_ENABLED" : "OPTION_CONTRACT_NOT_TRADABLE";
-    if (!contract.tradable || contract.type !== expectedType || !dteAllowed) {
+    let dteBlockReason: PaperPlanReasonCode | null = null;
+    let familyRejectionReason: string | null = null;
+
+    if (!contract.tradable || contract.type !== expectedType) {
+      dteBlockReason = "OPTION_CONTRACT_NOT_TRADABLE";
+    } else if (strategyFamily === "zero_dte_spy") {
+      if (contract.underlying_symbol !== "SPY") {
+        dteBlockReason = "NOT_ZERO_DTE";
+        familyRejectionReason = "zero_dte_spy_requires_spy_underlying";
+      } else if (!options.zeroDteSpy.enabled) {
+        dteBlockReason = "ZERO_DTE_SPY_DISABLED";
+        familyRejectionReason = "zero_dte_spy_disabled";
+      } else if (zeroDteSubmittedToday() >= options.zeroDteSpy.maxDailyTrades) {
+        dteBlockReason = "MAX_DAILY_ZERO_DTE_TRADES_REACHED";
+        familyRejectionReason = "max_daily_zero_dte_trades_reached";
+      }
+    } else if (strategyFamily === "leaps") {
+      if (!options.leaps.enabled) {
+        dteBlockReason = "LEAPS_DISABLED";
+        familyRejectionReason = "leaps_disabled";
+      } else if (dte === null || dte < options.leaps.minDte || dte > options.leaps.maxDte) {
+        dteBlockReason = "DTE_OUT_OF_RANGE";
+        familyRejectionReason = "leaps_dte_out_of_range";
+      } else if (contract.type === "put" && candidate.direction !== "short") {
+        dteBlockReason = "UNSUPPORTED_OPTION_STRATEGY";
+        familyRejectionReason = "leaps_put_requires_bearish_signal";
+      }
+    } else if (!genericDteAllowed) {
+      dteBlockReason =
+        dte === 0 && !options.allow0Dte ? "OPTION_0DTE_NOT_ENABLED" : "DTE_OUT_OF_RANGE";
+      familyRejectionReason =
+        dte === 0 && !options.allow0Dte
+          ? "same_day_expiration_not_enabled"
+          : "standard_option_dte_out_of_range";
+    }
+
+    if (dteBlockReason) {
       return {
         ...base,
         decision: "watch",
         assetClass: "option",
+        ...baseOptionFields,
         underlyingSymbol: contract.underlying_symbol,
         optionSymbol: contract.option_symbol,
         strategy,
@@ -1117,9 +1525,7 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         executable: false,
         executablePrice: null,
         executablePriceSource: null,
-        rejectionReason: dteBlockReason === "OPTION_0DTE_NOT_ENABLED"
-          ? "same_day_expiration_not_enabled"
-          : null,
+        rejectionReason: familyRejectionReason,
         reasonCodes: buildReasonList([
           ...(base.reasonCodes),
           "OPTION_CONTRACT_FOUND",
@@ -1142,35 +1548,49 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         side,
         assetClass: "option",
         orderType: "limit",
+        ...baseOptionFields,
         underlyingSymbol: contract.underlying_symbol,
         optionSymbol: contract.option_symbol,
         strategy,
         expirationDate: contract.expiration_date,
         strike: contract.strike,
         shortStrike: candidate.short_strike,
+        quoteSnapshot: quoteSnapshotModel(missingQuote, null),
         ...optionQuoteFields(missingQuote),
         reasonCodes: buildReasonList([
           ...(base.reasonCodes),
           "OPTION_CONTRACT_FOUND",
-          "OPTION_LIMIT_PRICE_UNAVAILABLE"
+          "OPTION_LIMIT_PRICE_UNAVAILABLE",
+          "QUOTE_NULL"
         ]),
         explanation: explanationFor("watch", ["OPTION_LIMIT_PRICE_UNAVAILABLE"])
       };
     }
 
-    const quote = normalizedSnapshotQuote(contract.option_symbol, snapshot, options);
+    const quote = normalizedSnapshotQuote(
+      contract.option_symbol,
+      snapshot,
+      strategyFamily === "zero_dte_spy"
+        ? {
+            ...options,
+            quoteMaxAgeMs: options.zeroDteSpy.maxQuoteAgeSeconds * 1000
+          }
+        : options
+    );
     const spreadPct = spreadPctFor(quote.bid, quote.ask);
     const limitPrice =
       quote.executable && quote.executablePrice !== null
         ? roundOptionLimitPrice(quote.executablePrice)
         : null;
     if (quote.quoteStatus !== "valid" || !quote.executable || limitPrice === null) {
+      const qualityReason = quoteQualityReason(quote);
       return {
         ...base,
         decision: "watch",
         side,
         assetClass: "option",
         orderType: "limit",
+        ...baseOptionFields,
         underlyingSymbol: contract.underlying_symbol,
         optionSymbol: contract.option_symbol,
         strategy,
@@ -1178,12 +1598,17 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         strike: contract.strike,
         shortStrike: candidate.short_strike,
         bidAskSpreadPct: spreadPct,
+        quoteSnapshot: quoteSnapshotModel(quote, spreadPct),
         ...optionQuoteFields(quote),
-        reasonCodes: optionPriceUnavailableReasons(base.reasonCodes),
+        reasonCodes: buildReasonList([
+          ...optionPriceUnavailableReasons(base.reasonCodes),
+          qualityReason
+        ]),
         explanation: explanationFor("watch", ["OPTION_LIMIT_PRICE_UNAVAILABLE"])
       };
     }
 
+    const familyCaps = familyRiskCaps(strategyFamily, options);
     const multiplier = contract.multiplier || 100;
     const perContractPremium = roundMoney(limitPrice * multiplier);
     const perContractMaxRisk =
@@ -1194,21 +1619,21 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
     const maxPortfolioRisk = accountRelativeCap(accountEquity, options.maxPortfolioRiskPct);
     const remainingPortfolioRisk =
       maxPortfolioRisk === null ? null : roundMoney(Math.max(0, maxPortfolioRisk - plannedNotional));
-    const contractsByPremium = positiveFloor(options.maxPremiumPerOrder / perContractPremium);
+    const contractsByPremium = positiveFloor(familyCaps.maxPremiumPerTrade / perContractPremium);
     const contractsByPositionRisk =
       maxPositionRisk === null
-        ? options.maxContracts
+        ? familyCaps.maxContracts
         : positiveFloor(maxPositionRisk / perContractMaxRisk);
     const contractsByPortfolioRisk =
       remainingPortfolioRisk === null
-        ? options.maxContracts
+        ? familyCaps.maxContracts
         : positiveFloor(remainingPortfolioRisk / perContractMaxRisk);
     const contractsByBuyingPower =
       deployableBuyingPower === null
-        ? options.maxContracts
+        ? familyCaps.maxContracts
         : positiveFloor(deployableBuyingPower / perContractMaxRisk);
     const contracts = Math.min(
-      options.maxContracts,
+      familyCaps.maxContracts,
       contractsByPremium,
       contractsByPositionRisk,
       contractsByPortfolioRisk,
@@ -1230,13 +1655,15 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
       (maxPositionRisk !== null && configuredRisk > maxPositionRisk) ||
       (remainingPortfolioRisk !== null && configuredRisk > remainingPortfolioRisk);
 
-    if (contracts <= 0 || premiumRisk > options.maxPremiumPerOrder || accountRiskExceeded) {
+    const premiumAboveLimit = contractsByPremium <= 0 || premiumRisk > familyCaps.maxPremiumPerTrade;
+    if (contracts <= 0 || premiumAboveLimit || accountRiskExceeded) {
       return {
         ...base,
         decision: "watch",
         side,
         assetClass: "option",
         orderType: "limit",
+        ...baseOptionFields,
         underlyingSymbol: contract.underlying_symbol,
         optionSymbol: contract.option_symbol,
         strategy,
@@ -1248,25 +1675,37 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         shortStrike: candidate.short_strike,
         contracts,
         bidAskSpreadPct: spreadPct,
+        quoteSnapshot: quoteSnapshotModel(quote, spreadPct),
+        paperFillModel: paperFillModelFor(quote, limitPrice),
+        liveLikeFillModel: liveLikeFillModelFor(quote, limitPrice, spreadPct),
+        riskModel: {
+          maxPremium: familyCaps.maxPremiumPerTrade,
+          contracts,
+          notionalPremium: premiumRisk,
+          maxLoss: configuredRisk,
+          expectedHoldPeriod: expectedHoldPeriodForFamily(strategyFamily)
+        },
         ...optionQuoteFields(quote),
         estimatedNotional: configuredRisk,
         reasonCodes: buildReasonList([
           ...(base.reasonCodes),
           "OPTION_CONTRACT_FOUND",
           "OPTION_DTE_ALLOWED",
-          "OPTION_RISK_LIMIT_EXCEEDED"
+          "OPTION_RISK_LIMIT_EXCEEDED",
+          ...(premiumAboveLimit ? (["PREMIUM_ABOVE_LIMIT"] as PaperPlanReasonCode[]) : [])
         ]),
         explanation: explanationFor("watch", ["OPTION_RISK_LIMIT_EXCEEDED"])
       };
     }
 
-    if (spreadPct !== null && spreadPct > options.maxSpreadPct) {
+    if (spreadPct !== null && spreadPct > familyCaps.maxSpreadPct) {
       return {
         ...base,
         decision: "watch",
         side,
         assetClass: "option",
         orderType: "limit",
+        ...baseOptionFields,
         underlyingSymbol: contract.underlying_symbol,
         optionSymbol: contract.option_symbol,
         strategy,
@@ -1278,13 +1717,24 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         shortStrike: candidate.short_strike,
         contracts,
         bidAskSpreadPct: spreadPct,
+        quoteSnapshot: quoteSnapshotModel(quote, spreadPct),
+        paperFillModel: paperFillModelFor(quote, limitPrice),
+        liveLikeFillModel: liveLikeFillModelFor(quote, limitPrice, spreadPct),
+        riskModel: {
+          maxPremium: familyCaps.maxPremiumPerTrade,
+          contracts,
+          notionalPremium: premiumRisk,
+          maxLoss: configuredRisk,
+          expectedHoldPeriod: expectedHoldPeriodForFamily(strategyFamily)
+        },
         ...optionQuoteFields(quote),
         estimatedNotional: configuredRisk,
         reasonCodes: buildReasonList([
           ...(base.reasonCodes),
           "OPTION_CONTRACT_FOUND",
           "OPTION_DTE_ALLOWED",
-          "OPTION_SPREAD_TOO_WIDE"
+          "OPTION_SPREAD_TOO_WIDE",
+          "SPREAD_TOO_WIDE"
         ]),
         explanation: explanationFor("watch", ["OPTION_SPREAD_TOO_WIDE"])
       };
@@ -1297,6 +1747,7 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         side,
         assetClass: "option",
         orderType: "limit",
+        ...baseOptionFields,
         underlyingSymbol: contract.underlying_symbol,
         optionSymbol: contract.option_symbol,
         strategy,
@@ -1308,6 +1759,16 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         shortStrike: candidate.short_strike,
         contracts,
         bidAskSpreadPct: spreadPct,
+        quoteSnapshot: quoteSnapshotModel(quote, spreadPct),
+        paperFillModel: paperFillModelFor(quote, limitPrice),
+        liveLikeFillModel: liveLikeFillModelFor(quote, limitPrice, spreadPct),
+        riskModel: {
+          maxPremium: familyCaps.maxPremiumPerTrade,
+          contracts,
+          notionalPremium: premiumRisk,
+          maxLoss: configuredRisk,
+          expectedHoldPeriod: expectedHoldPeriodForFamily(strategyFamily)
+        },
         ...optionQuoteFields(quote),
         reasonCodes: buildReasonList([
           ...(base.reasonCodes),
@@ -1329,6 +1790,7 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         side,
         assetClass: "option",
         orderType: "limit",
+        ...baseOptionFields,
         underlyingSymbol: contract.underlying_symbol,
         optionSymbol: contract.option_symbol,
         strategy,
@@ -1340,6 +1802,16 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         shortStrike: candidate.short_strike,
         contracts,
         bidAskSpreadPct: spreadPct,
+        quoteSnapshot: quoteSnapshotModel(quote, spreadPct),
+        paperFillModel: paperFillModelFor(quote, limitPrice),
+        liveLikeFillModel: liveLikeFillModelFor(quote, limitPrice, spreadPct),
+        riskModel: {
+          maxPremium: familyCaps.maxPremiumPerTrade,
+          contracts,
+          notionalPremium: premiumRisk,
+          maxLoss: configuredRisk,
+          expectedHoldPeriod: expectedHoldPeriodForFamily(strategyFamily)
+        },
         ...optionQuoteFields(quote),
         estimatedNotional: configuredRisk,
         reasonCodes: buildReasonList([
@@ -1358,6 +1830,7 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         side,
         assetClass: "option",
         orderType: "limit",
+        ...baseOptionFields,
         underlyingSymbol: contract.underlying_symbol,
         optionSymbol: contract.option_symbol,
         strategy,
@@ -1369,6 +1842,16 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         shortStrike: candidate.short_strike,
         contracts,
         bidAskSpreadPct: spreadPct,
+        quoteSnapshot: quoteSnapshotModel(quote, spreadPct),
+        paperFillModel: paperFillModelFor(quote, limitPrice),
+        liveLikeFillModel: liveLikeFillModelFor(quote, limitPrice, spreadPct),
+        riskModel: {
+          maxPremium: familyCaps.maxPremiumPerTrade,
+          contracts,
+          notionalPremium: premiumRisk,
+          maxLoss: configuredRisk,
+          expectedHoldPeriod: expectedHoldPeriodForFamily(strategyFamily)
+        },
         ...optionQuoteFields(quote),
         estimatedPrice: limitPrice,
         estimatedQty: contracts,
@@ -1390,6 +1873,7 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         side,
         assetClass: "option",
         orderType: "limit",
+        ...baseOptionFields,
         underlyingSymbol: contract.underlying_symbol,
         optionSymbol: contract.option_symbol,
         strategy,
@@ -1401,6 +1885,16 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         shortStrike: candidate.short_strike,
         contracts,
         bidAskSpreadPct: spreadPct,
+        quoteSnapshot: quoteSnapshotModel(quote, spreadPct),
+        paperFillModel: paperFillModelFor(quote, limitPrice),
+        liveLikeFillModel: liveLikeFillModelFor(quote, limitPrice, spreadPct),
+        riskModel: {
+          maxPremium: familyCaps.maxPremiumPerTrade,
+          contracts,
+          notionalPremium: premiumRisk,
+          maxLoss: configuredRisk,
+          expectedHoldPeriod: expectedHoldPeriodForFamily(strategyFamily)
+        },
         ...optionQuoteFields(quote),
         estimatedPrice: limitPrice,
         estimatedQty: contracts,
@@ -1421,6 +1915,7 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
       side,
       assetClass: "option",
       orderType: "limit",
+      ...baseOptionFields,
       underlyingSymbol: contract.underlying_symbol,
       optionSymbol: contract.option_symbol,
       strategy,
@@ -1432,6 +1927,16 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
       shortStrike: candidate.short_strike,
       contracts,
       bidAskSpreadPct: spreadPct,
+      quoteSnapshot: quoteSnapshotModel(quote, spreadPct),
+      paperFillModel: paperFillModelFor(quote, limitPrice),
+      liveLikeFillModel: liveLikeFillModelFor(quote, limitPrice, spreadPct),
+      riskModel: {
+        maxPremium: familyCaps.maxPremiumPerTrade,
+        contracts,
+        notionalPremium: premiumRisk,
+        maxLoss: configuredRisk,
+        expectedHoldPeriod: expectedHoldPeriodForFamily(strategyFamily)
+      },
       ...optionQuoteFields(quote),
       estimatedPrice: limitPrice,
       estimatedQty: contracts,
@@ -1444,6 +1949,12 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         ...(dte === 0 ? (["OPTION_0DTE_ALLOWED"] as PaperPlanReasonCode[]) : []),
         ...(spreadPct !== null && spreadPct > 20
           ? (["OPTION_WIDE_SPREAD_WARNING"] as PaperPlanReasonCode[])
+          : []),
+        ...(contractsByPremium > familyCaps.maxContracts ||
+        contractsByPositionRisk > familyCaps.maxContracts ||
+        contractsByPortfolioRisk > familyCaps.maxContracts ||
+        contractsByBuyingPower > familyCaps.maxContracts
+          ? (["MAX_CONTRACTS_EXCEEDED"] as PaperPlanReasonCode[])
           : []),
         ...(strategy === "long_call" || strategy === "long_put"
           ? (["SPECULATIVE_OPTION_PAPER_WARNING"] as PaperPlanReasonCode[])
@@ -1665,7 +2176,7 @@ export const buildPaperPlanReport = async (
       tradabilityCache.set(symbol, tradabilityPromise);
     }
 
-    const candidatePlan = evaluateCandidate({
+    const evaluatedPlan = evaluateCandidate({
       candidate,
       tradability: await tradabilityPromise,
       estimatedPrice: findLatestPrice(symbol, candidate.as_of || undefined),
@@ -1690,6 +2201,16 @@ export const buildPaperPlanReport = async (
       currentDeployedNotional,
       plannedCount,
       plannedNotional
+    });
+    const candidatePlan = attachLearningRecord({
+      candidate,
+      plan: {
+        ...evaluatedPlan,
+        sourceResearchRunId: latestRun?.id ?? null,
+        sourceCandidateId: candidate.id
+      },
+      researchRunId: latestRun?.id ?? null,
+      generatedAt
     });
 
     plan.push(candidatePlan);
@@ -1738,7 +2259,26 @@ export const buildPaperPlanReport = async (
       watched: plan.filter((entry) => entry.decision === "watch").length,
       skipped: plan.filter((entry) => entry.decision === "skip").length,
       estimatedTotalNotional: Number(plannedNotional.toFixed(2)),
-      remainingDeployableBuyingPower
+      remainingDeployableBuyingPower,
+      zeroDteSpyCandidates: plan.filter((entry) => entry.strategyFamily === "zero_dte_spy").length,
+      zeroDteSpyEligible: plan.filter(
+        (entry) => entry.strategyFamily === "zero_dte_spy" && entry.decision === "planned"
+      ).length,
+      zeroDteSpySkipped: plan.filter(
+        (entry) => entry.strategyFamily === "zero_dte_spy" && entry.decision !== "planned"
+      ).length,
+      leapsCandidates: plan.filter((entry) => entry.strategyFamily === "leaps").length,
+      leapsEligible: plan.filter(
+        (entry) => entry.strategyFamily === "leaps" && entry.decision === "planned"
+      ).length,
+      leapsSkipped: plan.filter(
+        (entry) => entry.strategyFamily === "leaps" && entry.decision !== "planned"
+      ).length,
+      learningRecordsWritten: plan.filter((entry) => entry.learningRecordWriteStatus === "written").length,
+      learningRecordsPending: plan.filter((entry) =>
+        entry.learningRecordWriteStatus === "written" &&
+        (entry.decision === "planned" || entry.decision === "watch" || entry.decision === "skip")
+      ).length
     },
     plan,
     source,
@@ -1797,6 +2337,12 @@ export const formatPaperPlanReportAsTable = (report: PaperPlanReport) => {
   lines.push("");
   lines.push(
     `Summary: candidates=${report.summary.candidatesEvaluated}, planned=${report.summary.plannedOrders}, watch=${report.summary.watched}, skip=${report.summary.skipped}, estimatedNotional=${formatNotional(report.summary.estimatedTotalNotional)}`
+  );
+  lines.push(
+    `Strategy families: zeroDteSpy candidates=${report.summary.zeroDteSpyCandidates ?? 0}, eligible=${report.summary.zeroDteSpyEligible ?? 0}, skipped=${report.summary.zeroDteSpySkipped ?? 0}; leaps candidates=${report.summary.leapsCandidates ?? 0}, eligible=${report.summary.leapsEligible ?? 0}, skipped=${report.summary.leapsSkipped ?? 0}`
+  );
+  lines.push(
+    `Learning ledger: written=${report.summary.learningRecordsWritten ?? 0}, pending=${report.summary.learningRecordsPending ?? 0}`
   );
   if (report.diagnostics.emptyReason) {
     lines.push(`Plan diagnostic: ${report.diagnostics.emptyReason}.`);

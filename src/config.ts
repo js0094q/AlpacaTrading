@@ -77,6 +77,26 @@ export const config = {
     allowCoveredCalls: parseBooleanDefault(process.env.PAPER_OPTIONS_ALLOW_COVERED_CALLS, true),
     allowNakedOptions: parseBoolean(process.env.PAPER_OPTIONS_ALLOW_NAKED_OPTIONS)
   },
+  paperOptionLearningLedgerEnabled: parseBooleanDefault(
+    process.env.PAPER_OPTION_LEARNING_LEDGER_ENABLED,
+    true
+  ),
+  paperZeroDteSpy: {
+    enabled: parseBoolean(process.env.PAPER_0DTE_SPY_ENABLED),
+    maxPremiumPerTrade: parseNumber(process.env.PAPER_0DTE_SPY_MAX_PREMIUM_PER_TRADE, 500),
+    maxContracts: Math.max(1, parseInteger(process.env.PAPER_0DTE_SPY_MAX_CONTRACTS, 5)),
+    maxDailyTrades: Math.max(1, parseInteger(process.env.PAPER_0DTE_SPY_MAX_DAILY_TRADES, 3)),
+    maxQuoteAgeSeconds: Math.max(1, parseInteger(process.env.PAPER_0DTE_SPY_MAX_QUOTE_AGE_SECONDS, 60)),
+    maxSpreadPct: parseNumber(process.env.PAPER_0DTE_SPY_MAX_SPREAD_PCT, 20)
+  },
+  paperLeaps: {
+    enabled: parseBoolean(process.env.PAPER_LEAPS_ENABLED),
+    maxPremiumPerTrade: parseNumber(process.env.PAPER_LEAPS_MAX_PREMIUM_PER_TRADE, 2500),
+    maxContracts: Math.max(1, parseInteger(process.env.PAPER_LEAPS_MAX_CONTRACTS, 2)),
+    minDte: parseInteger(process.env.PAPER_LEAPS_MIN_DTE, 180),
+    maxDte: Math.max(1, parseInteger(process.env.PAPER_LEAPS_MAX_DTE, 730)),
+    maxSpreadPct: parseNumber(process.env.PAPER_LEAPS_MAX_SPREAD_PCT, 15)
+  },
   enableAggressivePaperStrategies:
     process.env.ENABLE_AGGRESSIVE_PAPER_STRATEGIES === "true",
   enableShortResearch: process.env.ENABLE_SHORT_RESEARCH !== "false",

@@ -30,6 +30,7 @@ const resetDatabase = () => {
     DELETE FROM paper_trade_candidates;
     DELETE FROM paper_trade_plans;
     DELETE FROM paper_trade_evaluations;
+    DELETE FROM paper_learning_records;
     DELETE FROM market_bars;
     DELETE FROM research_runs;
   `);

@@ -378,6 +378,43 @@ CREATE INDEX IF NOT EXISTS idx_paper_execution_ledger_symbol
 
 CREATE INDEX IF NOT EXISTS idx_paper_execution_ledger_dedupe_key
   ON paper_execution_ledger(dedupe_key);
+
+CREATE TABLE IF NOT EXISTS paper_learning_records (
+  id TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  strategy_family TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  underlying_symbol TEXT,
+  option_symbol TEXT,
+  decision TEXT NOT NULL,
+  skip_reason TEXT,
+  block_reason TEXT,
+  hypothesis TEXT NOT NULL,
+  signal_inputs_json TEXT NOT NULL,
+  option_metadata_json TEXT,
+  quote_snapshot_json TEXT,
+  paper_fill_model_json TEXT,
+  live_like_fill_model_json TEXT,
+  risk_model_json TEXT,
+  outcome_json TEXT,
+  evaluation_reason TEXT,
+  learning_status TEXT NOT NULL,
+  promotion_eligible INTEGER NOT NULL DEFAULT 0,
+  promotion_block_reason TEXT,
+  source_research_run_id TEXT,
+  source_candidate_id TEXT,
+  source_plan_timestamp TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_learning_records_created_at
+  ON paper_learning_records(created_at);
+
+CREATE INDEX IF NOT EXISTS idx_paper_learning_records_strategy_status
+  ON paper_learning_records(strategy_family, learning_status);
+
+CREATE INDEX IF NOT EXISTS idx_paper_learning_records_option_symbol
+  ON paper_learning_records(option_symbol);
 `;
 
 let database: DbHandle | null = null;
@@ -414,6 +451,12 @@ const runMigrations = (db: DbHandle) => {
   addColumnIfMissing(db, "paper_execution_ledger", "error_message", "error_message TEXT");
   addColumnIfMissing(db, "paper_execution_ledger", "raw_payload_json", "raw_payload_json TEXT");
   addColumnIfMissing(db, "paper_execution_ledger", "raw_response_json", "raw_response_json TEXT");
+  addColumnIfMissing(db, "paper_learning_records", "updated_at", "updated_at TEXT");
+  addColumnIfMissing(db, "paper_learning_records", "outcome_json", "outcome_json TEXT");
+  addColumnIfMissing(db, "paper_learning_records", "evaluation_reason", "evaluation_reason TEXT");
+  addColumnIfMissing(db, "paper_learning_records", "source_research_run_id", "source_research_run_id TEXT");
+  addColumnIfMissing(db, "paper_learning_records", "source_candidate_id", "source_candidate_id TEXT");
+  addColumnIfMissing(db, "paper_learning_records", "source_plan_timestamp", "source_plan_timestamp TEXT");
 };
 
 const initialize = (): DbHandle => {

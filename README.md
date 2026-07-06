@@ -95,6 +95,19 @@ PAPER_OPTIONS_ALLOW_LONG_PUTS=true
 PAPER_OPTIONS_ALLOW_CASH_SECURED_PUTS=true
 PAPER_OPTIONS_ALLOW_COVERED_CALLS=true
 PAPER_OPTIONS_ALLOW_NAKED_OPTIONS=false
+PAPER_OPTION_LEARNING_LEDGER_ENABLED=true
+PAPER_0DTE_SPY_ENABLED=false
+PAPER_0DTE_SPY_MAX_PREMIUM_PER_TRADE=500
+PAPER_0DTE_SPY_MAX_CONTRACTS=5
+PAPER_0DTE_SPY_MAX_DAILY_TRADES=3
+PAPER_0DTE_SPY_MAX_QUOTE_AGE_SECONDS=60
+PAPER_0DTE_SPY_MAX_SPREAD_PCT=20
+PAPER_LEAPS_ENABLED=false
+PAPER_LEAPS_MAX_PREMIUM_PER_TRADE=2500
+PAPER_LEAPS_MAX_CONTRACTS=2
+PAPER_LEAPS_MIN_DTE=180
+PAPER_LEAPS_MAX_DTE=730
+PAPER_LEAPS_MAX_SPREAD_PCT=15
 PAPER_RUNTIME_DUPLICATE_RECONCILIATION_ENABLED=false
 ENABLE_OPTIONS_RESEARCH=true
 ENABLE_AGGRESSIVE_PAPER_STRATEGIES=true
@@ -217,7 +230,20 @@ npm run paper:plan -- --riskProfile=aggressive --optionsEnabled=true --format=js
 npm run paper:review -- --riskProfile=aggressive --optionsEnabled=true --format=json
 npm run paper:execute -- --dryRun --riskProfile=aggressive --optionsEnabled=true --format=json
 npm run paper:execute -- --confirmPaper --riskProfile=aggressive --optionsEnabled=true --assetClass=all --format=json
+npm run paper:learn -- --format=json
 ```
+
+### Paper option learning ledger
+
+`paper:plan` records paper learning rows when `PAPER_OPTION_LEARNING_LEDGER_ENABLED=true`.
+Each option decision is classified as `zero_dte_spy`, `leaps`, or `standard_option`, with a hypothesis, signal inputs, quote snapshot, paper fill model, live-like fill model, and risk model.
+
+`PAPER_0DTE_SPY_ENABLED=false` and `PAPER_LEAPS_ENABLED=false` are safe defaults.
+Enabling either flag only allows paper candidate planning under the paper-only guards.
+It does not enable live trading or automatic live promotion.
+
+Use `npm run paper:learn -- --format=json` to evaluate pending learning rows when local option mark data exists.
+The command also reports promotion-readiness analytics using live-like profit factor, trade count, observed days, drawdown, and spread gates.
 
 Expected safety properties:
 

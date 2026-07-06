@@ -59,6 +59,8 @@ type PaperBridgeSummary = {
   openOrders?: unknown;
   snapshots?: unknown;
   executions?: unknown;
+  learningSummary?: unknown;
+  promotionReadiness?: unknown;
   optionContracts?: unknown;
   requestIds?: unknown;
 };
@@ -116,6 +118,8 @@ export interface DashboardSnapshot {
   openOrders: DashboardResult<unknown>;
   snapshots: unknown[];
   executions: DashboardResult<unknown> | unknown[];
+  learningSummary: DashboardResult<unknown>;
+  promotionReadiness: unknown[];
   optionContracts: OptionContractDashboardRow[];
   requestIds: unknown[];
 }
@@ -537,12 +541,14 @@ export const buildDashboardSnapshot = async (): Promise<DashboardSnapshot> => {
       openOrders,
       snapshots: [],
       executions: historicalUnavailable("executions"),
+      learningSummary: historicalUnavailable("learningSummary"),
+      promotionReadiness: [],
       optionContracts: [],
       requestIds: []
     };
   }
 
-  const [account, positions, openOrders, runtime, plan, review, dryRun, executions] =
+  const [account, positions, openOrders, runtime, plan, review, dryRun, executions, learningSummary] =
     await Promise.all([
       capture("account", () => getAlpacaAccountSnapshot()),
       capture("positions", () => listAlpacaPositions()),
@@ -589,13 +595,20 @@ export const buildDashboardSnapshot = async (): Promise<DashboardSnapshot> => {
           assetClass: "all"
         });
       }),
-      capture("executions", () => latestPaperExecutions(25))
+      capture("executions", () => latestPaperExecutions(25)),
+      capture("learningSummary", async () => {
+        const { paperLearningSummary } = await import(
+          "../../../src/services/paperLearningLedgerService"
+        );
+        return paperLearningSummary();
+      })
     ]);
   const [
     latestResearch,
     latestPlans,
     latestOpenOrderRows,
     snapshots,
+    promotionReadiness,
     optionContracts,
     requestIds
   ] = await Promise.all([
@@ -603,6 +616,9 @@ export const buildDashboardSnapshot = async (): Promise<DashboardSnapshot> => {
     latestPaperPlans(10),
     latestOpenOrders(12),
     latestPaperRecommendationSnapshots(10),
+    import("../../../src/services/paperLearningLedgerService").then((service) =>
+      service.buildPromotionReadinessAnalytics()
+    ),
     latestOptionContracts(10),
     latestApiRequestIds(12)
   ]);
@@ -628,6 +644,8 @@ export const buildDashboardSnapshot = async (): Promise<DashboardSnapshot> => {
     latestPaperPlans: latestPlans,
     snapshots,
     executions,
+    learningSummary,
+    promotionReadiness,
     optionContracts,
     requestIds
   } as DashboardSnapshot;
