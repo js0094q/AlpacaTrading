@@ -92,6 +92,12 @@ const optionCandidate = (
     strike: 100,
     contracts: 1,
     bidAskSpreadPct: 10,
+    quoteStatus: "valid",
+    executable: true,
+    executablePrice: 0.75,
+    executablePriceSource: "midpoint",
+    rejectionReason: null,
+    quoteTimestamp: now,
     recommendation: `long ${strategy}`,
     estimatedPrice: 0.75,
     estimatedQty: 1,
@@ -333,7 +339,10 @@ beforeEach(() => {
   process.env.PAPER_OPTIONS_MAX_CONTRACTS = "5";
   process.env.PAPER_OPTIONS_MIN_DTE = "0";
   process.env.PAPER_OPTIONS_MAX_DTE = "90";
-  process.env.PAPER_OPTIONS_ALLOW_0DTE = "true";
+  delete process.env.PAPER_OPTIONS_ALLOW_0DTE;
+  delete process.env.ALLOW_0DTE_OPTIONS;
+  delete process.env.OPTIONS_QUOTE_MAX_AGE_MS;
+  delete process.env.ALLOW_OPTIONS_LAST_PRICE_FALLBACK;
   process.env.PAPER_OPTIONS_ALLOW_MARKET_ORDERS = "false";
   process.env.PAPER_OPTIONS_MAX_SPREAD_PCT = "50";
   process.env.PAPER_OPTIONS_MAX_PORTFOLIO_RISK_PCT = "20";
@@ -494,6 +503,26 @@ describe("paper execute dry-run payload construction", () => {
     assert.equal(report.blockers.includes("OPTION_LIMIT_PRICE_REQUIRED"), true);
   });
 
+  test("blocks option candidate payloads when quote status is not executable", async () => {
+    const report = await runWith({
+      plan: [
+        optionCandidate("long_call", {
+          limitPrice: 0.75,
+          quoteStatus: "missing",
+          executable: false,
+          executablePrice: null,
+          executablePriceSource: null,
+          rejectionReason: "quote_unavailable"
+        })
+      ]
+    });
+
+    assert.equal(report.wouldSubmit.length, 0);
+    assert.equal(report.blockedPayloads.length, 1);
+    assert.equal(report.blockedPayloads[0]?.reasonCodes.includes("OPTION_LIMIT_PRICE_UNAVAILABLE"), true);
+    assert.match(report.blockedPayloads[0]?.explanation || "", /quote_unavailable/);
+  });
+
   test("includes valid client order ids", async () => {
     const report = await runWith();
     const id = report.wouldSubmit[0]?.client_order_id || "";
@@ -640,12 +669,30 @@ describe("paper execute confirm-paper options", () => {
   test("long call paper payload submits when all gates pass", async () => {
     process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
     process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
-    const report = await confirmWith({ plan: [optionCandidate("long_call")] });
+    const submittedPayloads: AlpacaPaperOrderRequest[] = [];
+    const report = await confirmWith({ plan: [optionCandidate("long_call", {
+      limitPrice: 1.25,
+      executablePrice: 1.25,
+      executablePriceSource: "midpoint",
+      estimatedPremium: 125,
+      maxRisk: 125,
+      estimatedNotional: 125
+    })] }, {}, { confirmPaper: true }, {
+      submitPaperOrder: async (payload) => {
+        submittedPayloads.push(payload);
+        return mockSubmitSuccess(payload);
+      }
+    });
     assert.equal(report.errors.length, 0);
     assert.equal(report.submitted.length, 1);
     assert.equal(report.submitted[0]?.assetClass, "option");
     assert.equal(report.submitted[0]?.strategy, "long_call");
-    assert.equal(report.submitted[0]?.limitPrice, "0.75");
+    assert.equal(report.submitted[0]?.limitPrice, "1.25");
+    const submittedPayload = submittedPayloads[0];
+    assert.equal(submittedPayload?.symbol, "AAPL260814C00100000");
+    assert.equal(submittedPayload?.type, "limit");
+    assert.equal(submittedPayload?.limit_price, "1.25");
+    assert.equal(submittedPayload?.position_intent, "buy_to_open");
   });
 
   test("long put paper payload submits when all gates pass", async () => {
@@ -662,6 +709,31 @@ describe("paper execute confirm-paper options", () => {
     const report = await confirmWith({ plan: [optionCandidate("long_call")] });
     assert.equal(report.blocked[0]?.reason, "PAPER_OPTIONS_EXECUTION_DISABLED");
     assert.equal(report.submitted.length, 0);
+  });
+
+  test("confirm-paper does not submit option payloads with rejected quote status", async () => {
+    process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
+    process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
+    let submitCalls = 0;
+    const report = await confirmWith({ plan: [
+      optionCandidate("long_call", {
+        limitPrice: 0.75,
+        quoteStatus: "missing",
+        executable: false,
+        executablePrice: null,
+        executablePriceSource: null,
+        rejectionReason: "quote_unavailable"
+      })
+    ] }, {}, { confirmPaper: true }, {
+      submitPaperOrder: async (payload) => {
+        submitCalls += 1;
+        return mockSubmitSuccess(payload);
+      }
+    });
+
+    assert.equal(submitCalls, 0);
+    assert.equal(report.submitted.length, 0);
+    assert.equal(report.blocked.some((entry) => entry.reason === "OPTION_LIMIT_PRICE_UNAVAILABLE"), true);
   });
 
   test("option without limit price is blocked", async () => {
@@ -788,9 +860,25 @@ describe("paper execute confirm-paper options", () => {
     assert.equal(report.submitted[0]?.limitPrice, undefined);
   });
 
-  test("0DTE option is allowed by default for paper options", async () => {
+  test("0DTE option is blocked by default for paper options", async () => {
     process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
     process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
+    const report = await confirmWith({ plan: [optionCandidate("long_call")] }, {}, { confirmPaper: true }, {
+      getOptionContract: async (symbolOrId: string) => ({
+        data: mockContract(symbolOrId, { expiration_date: new Date().toISOString().slice(0, 10) }),
+        requestId: "contract-request-id",
+        status: 200,
+        url: `https://paper-api.alpaca.markets/v2/options/contracts/${symbolOrId}`
+      })
+    });
+    assert.equal(report.blocked[0]?.reason, "OPTION_0DTE_NOT_ENABLED");
+    assert.equal(report.submitted.length, 0);
+  });
+
+  test("0DTE option is allowed only when explicitly enabled", async () => {
+    process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
+    process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
+    process.env.ALLOW_0DTE_OPTIONS = "true";
     const report = await confirmWith({ plan: [optionCandidate("long_call")] }, {}, { confirmPaper: true }, {
       getOptionContract: async (symbolOrId: string) => ({
         data: mockContract(symbolOrId, { expiration_date: new Date().toISOString().slice(0, 10) }),
@@ -801,22 +889,6 @@ describe("paper execute confirm-paper options", () => {
     });
     assert.equal(report.errors.length, 0);
     assert.equal(report.submitted.length, 1);
-  });
-
-  test("0DTE option is blocked when disabled", async () => {
-    process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
-    process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
-    process.env.PAPER_OPTIONS_ALLOW_0DTE = "false";
-    const report = await confirmWith({ plan: [optionCandidate("long_call")] }, {}, { confirmPaper: true }, {
-      getOptionContract: async (symbolOrId: string) => ({
-        data: mockContract(symbolOrId, { expiration_date: new Date().toISOString().slice(0, 10) }),
-        requestId: "contract-request-id",
-        status: 200,
-        url: `https://paper-api.alpaca.markets/v2/options/contracts/${symbolOrId}`
-      })
-    });
-    assert.equal(report.blocked[0]?.reason, "OPTION_CONTRACT_NOT_TRADABLE");
-    assert.equal(report.submitted.length, 0);
   });
 
   test("renders confirm table output without throwing", async () => {

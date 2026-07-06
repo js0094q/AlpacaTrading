@@ -286,7 +286,13 @@ const insertOptionSnapshot = ({
   ask = 0.8,
   midpoint = 0.75,
   last = 0.75,
-  timestamp = "2026-01-01T12:00:00.000Z"
+  timestamp = new Date().toISOString(),
+  quoteStatus = "valid",
+  executable = 1,
+  executablePrice = midpoint,
+  executablePriceSource = "midpoint",
+  rejectionReason = null,
+  quoteTimestamp = timestamp
 }: {
   optionSymbol: string;
   underlying?: string;
@@ -295,6 +301,12 @@ const insertOptionSnapshot = ({
   midpoint?: number | null;
   last?: number | null;
   timestamp?: string;
+  quoteStatus?: string;
+  executable?: number;
+  executablePrice?: number | null;
+  executablePriceSource?: string | null;
+  rejectionReason?: string | null;
+  quoteTimestamp?: string | null;
 }) => {
   getDb().prepare(`
     INSERT INTO option_snapshots(
@@ -313,8 +325,14 @@ const insertOptionSnapshot = ({
       theta,
       vega,
       rho,
-      source
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      source,
+      quote_status,
+      executable,
+      executable_price,
+      executable_price_source,
+      rejection_reason,
+      quote_timestamp
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     optionSymbol,
     underlying,
@@ -331,7 +349,13 @@ const insertOptionSnapshot = ({
     null,
     null,
     null,
-    "alpaca"
+    "alpaca",
+    quoteStatus,
+    executable,
+    executablePrice,
+    executablePriceSource,
+    rejectionReason,
+    quoteTimestamp
   );
 };
 
@@ -379,6 +403,9 @@ beforeEach(() => {
   delete process.env.PAPER_PLAN_MAX_POSITION_NOTIONAL;
   delete process.env.PAPER_PLAN_MAX_TOTAL_PLAN_NOTIONAL;
   delete process.env.PAPER_OPTIONS_ALLOW_0DTE;
+  delete process.env.ALLOW_0DTE_OPTIONS;
+  delete process.env.OPTIONS_QUOTE_MAX_AGE_MS;
+  delete process.env.ALLOW_OPTIONS_LAST_PRICE_FALLBACK;
   delete process.env.PAPER_OPTIONS_MAX_SPREAD_PCT;
   delete process.env.PAPER_OPTIONS_MAX_CONTRACTS;
   delete process.env.PAPER_OPTIONS_MAX_PREMIUM_PER_ORDER;
@@ -737,10 +764,83 @@ describe("paper plan service", () => {
     assert.equal(entry?.strategy, "long_call");
     assert.equal(entry?.contracts, 5);
     assert.equal(entry?.estimatedPremium, 375);
+    assert.equal(entry?.quoteStatus, "valid");
+    assert.equal(entry?.executable, true);
+    assert.equal(entry?.executablePrice, 0.75);
+    assert.equal(entry?.executablePriceSource, "midpoint");
+    assert.equal(entry?.rejectionReason, null);
     assert.equal(entry?.reasonCodes.includes("SPECULATIVE_OPTION_PAPER_WARNING"), true);
   });
 
-  test("allows 0DTE option planning by default and blocks when disabled", async () => {
+  test("rejects stale option quotes before planning", async () => {
+    const optionSymbol = "AAPL260814C00100000";
+    const staleTimestamp = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    insertResearchRun({ runId: "run-stale-option", riskProfile: "moderate", optionsEnabled: true });
+    insertCandidate({
+      runId: "run-stale-option",
+      symbol: "AAPL",
+      rank: 1,
+      preferredExpression: "long_call",
+      optionSymbol,
+      strike: 100,
+      estimatedMaxLoss: 75
+    });
+    insertOptionContract({ optionSymbol, type: "call" });
+    insertOptionSnapshot({
+      optionSymbol,
+      timestamp: staleTimestamp,
+      quoteTimestamp: staleTimestamp,
+      quoteStatus: "stale",
+      executable: 0,
+      executablePrice: null,
+      executablePriceSource: null,
+      rejectionReason: "quote_stale"
+    });
+
+    const report = await planResultFor({ optionsEnabled: true });
+    const entry = report.plan[0];
+    assert.equal(entry?.decision, "watch");
+    assert.equal(entry?.quoteStatus, "stale");
+    assert.equal(entry?.executable, false);
+    assert.equal(entry?.rejectionReason, "quote_stale");
+    assert.equal(entry?.reasonCodes.includes("OPTION_LIMIT_PRICE_UNAVAILABLE"), true);
+  });
+
+  test("rejects crossed option quotes before planning", async () => {
+    const optionSymbol = "AAPL260814C00100000";
+    insertResearchRun({ runId: "run-crossed-option", riskProfile: "moderate", optionsEnabled: true });
+    insertCandidate({
+      runId: "run-crossed-option",
+      symbol: "AAPL",
+      rank: 1,
+      preferredExpression: "long_call",
+      optionSymbol,
+      strike: 100,
+      estimatedMaxLoss: 75
+    });
+    insertOptionContract({ optionSymbol, type: "call" });
+    insertOptionSnapshot({
+      optionSymbol,
+      bid: 2,
+      ask: 1.5,
+      midpoint: null,
+      quoteStatus: "invalid",
+      executable: 0,
+      executablePrice: null,
+      executablePriceSource: null,
+      rejectionReason: "crossed_quote"
+    });
+
+    const report = await planResultFor({ optionsEnabled: true });
+    const entry = report.plan[0];
+    assert.equal(entry?.decision, "watch");
+    assert.equal(entry?.quoteStatus, "invalid");
+    assert.equal(entry?.executable, false);
+    assert.equal(entry?.rejectionReason, "crossed_quote");
+    assert.equal(entry?.reasonCodes.includes("OPTION_LIMIT_PRICE_UNAVAILABLE"), true);
+  });
+
+  test("blocks 0DTE option planning by default and allows it only when enabled", async () => {
     const optionSymbol = "AAPL260703C00100000";
     insertResearchRun({ runId: "run-0dte", riskProfile: "moderate", optionsEnabled: true });
     insertCandidate({
@@ -759,14 +859,14 @@ describe("paper plan service", () => {
     });
     insertOptionSnapshot({ optionSymbol });
 
+    const blocked = await planResultFor({ optionsEnabled: true });
+    assert.equal(blocked.plan[0]?.decision, "watch");
+    assert.equal(blocked.plan[0]?.reasonCodes.includes("OPTION_0DTE_NOT_ENABLED"), true);
+
+    process.env.ALLOW_0DTE_OPTIONS = "true";
     const allowed = await planResultFor({ optionsEnabled: true });
     assert.equal(allowed.plan[0]?.decision, "planned");
     assert.equal(allowed.plan[0]?.reasonCodes.includes("OPTION_0DTE_ALLOWED"), true);
-
-    process.env.PAPER_OPTIONS_ALLOW_0DTE = "false";
-    const blocked = await planResultFor({ optionsEnabled: true });
-    assert.equal(blocked.plan[0]?.decision, "watch");
-    assert.equal(blocked.plan[0]?.reasonCodes.includes("OPTION_CONTRACT_NOT_TRADABLE"), true);
   });
 
   test("wide option spread is a warning below hard max and blocker above hard max", async () => {

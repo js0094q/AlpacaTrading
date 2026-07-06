@@ -12,6 +12,7 @@ import {
   hasDashboardDurableStorageConfig,
   shouldUseVercelReadOnlyFallback
 } from "./runtime";
+import { optionsQuoteConfig } from "../../../src/services/optionQuoteNormalizer";
 
 export type RiskProfileInput = "moderate" | "aggressive" | "conservative";
 
@@ -115,8 +116,31 @@ export interface DashboardSnapshot {
   openOrders: DashboardResult<unknown>;
   snapshots: unknown[];
   executions: DashboardResult<unknown> | unknown[];
-  optionContracts: unknown[];
+  optionContracts: OptionContractDashboardRow[];
   requestIds: unknown[];
+}
+
+export type OptionContractDisplayCategory = "Discovered" | "Quoted" | "Executable" | "Rejected";
+
+export interface OptionContractDashboardRow {
+  underlying_symbol: string;
+  option_symbol: string;
+  type: string;
+  expiration_date: string;
+  strike: number | null;
+  tradable: boolean;
+  bid: number | null;
+  ask: number | null;
+  midpoint: number | null;
+  last: number | null;
+  quoteStatus: "valid" | "missing" | "invalid" | "stale";
+  executable: boolean;
+  executablePrice: number | null;
+  executablePriceSource: string | null;
+  rejectionReason: string | null;
+  quoteTimestamp: string | null;
+  timestamp: string | null;
+  displayCategory: OptionContractDisplayCategory;
 }
 
 type BridgeEnvelope<T> = { ok: true; data: T } | { ok: false; error?: unknown };
@@ -257,22 +281,145 @@ export const latestPaperPlans = async (limit = 10) =>
         [safeLimit(limit, 10, 50)]
       );
 
+const quoteStatusForDashboard = (
+  value: string | null
+): OptionContractDashboardRow["quoteStatus"] =>
+  value === "valid" || value === "invalid" || value === "stale" || value === "missing"
+    ? value
+    : "missing";
+
+const optionDisplayCategory = (input: {
+  hasSnapshot: boolean;
+  quoteStatus: OptionContractDashboardRow["quoteStatus"];
+  executable: boolean;
+  rejectionReason: string | null;
+}): OptionContractDisplayCategory => {
+  if (input.executable) {
+    return "Executable";
+  }
+  if (input.rejectionReason || (input.hasSnapshot && input.quoteStatus !== "valid")) {
+    return "Rejected";
+  }
+  if (input.quoteStatus === "valid") {
+    return "Quoted";
+  }
+  return "Discovered";
+};
+
+const normalizeOptionContractDashboardRow = (row: {
+  underlying_symbol: string;
+  option_symbol: string;
+  type: string;
+  expiration_date: string;
+  strike: number | null;
+  tradable: number;
+  bid: number | null;
+  ask: number | null;
+  midpoint: number | null;
+  last: number | null;
+  quote_status: string | null;
+  executable: number | null;
+  executable_price: number | null;
+  executable_price_source: string | null;
+  rejection_reason: string | null;
+  quote_timestamp: string | null;
+  timestamp: string | null;
+}): OptionContractDashboardRow => {
+  const quoteStatus = quoteStatusForDashboard(row.quote_status);
+  const allow0Dte = optionsQuoteConfig().allow0DteOptions;
+  const sameDayExpiration =
+    row.expiration_date === new Date().toISOString().slice(0, 10);
+  const expirationRejection =
+    sameDayExpiration && !allow0Dte ? "same_day_expiration_not_enabled" : null;
+  const executable = row.executable === 1 && !expirationRejection;
+  const rejectionReason =
+    expirationRejection ||
+    row.rejection_reason ||
+    (row.timestamp && quoteStatus === "missing" ? "quote_unavailable" : null);
+
+  return {
+    underlying_symbol: row.underlying_symbol,
+    option_symbol: row.option_symbol,
+    type: row.type,
+    expiration_date: row.expiration_date,
+    strike: row.strike,
+    tradable: row.tradable === 1,
+    bid: row.bid,
+    ask: row.ask,
+    midpoint: row.midpoint,
+    last: row.last,
+    quoteStatus,
+    executable,
+    executablePrice: executable ? row.executable_price : null,
+    executablePriceSource: executable ? row.executable_price_source : null,
+    rejectionReason,
+    quoteTimestamp: row.quote_timestamp,
+    timestamp: row.timestamp,
+    displayCategory: optionDisplayCategory({
+      hasSnapshot: Boolean(row.timestamp),
+      quoteStatus,
+      executable,
+      rejectionReason
+    })
+  };
+};
+
 export const latestOptionContracts = async (limit = 10) =>
   shouldUseVercelReadOnlyFallback()
     ? []
     : isPaperDashboardBridgeEnabled()
       ? getPaperBridgeSummary().then((summary) => clampRows(summary.optionContracts, limit))
-    : queryAllRows(
+    : queryAllRows<{
+        underlying_symbol: string;
+        option_symbol: string;
+        type: string;
+        expiration_date: string;
+        strike: number | null;
+        tradable: number;
+        bid: number | null;
+        ask: number | null;
+        midpoint: number | null;
+        last: number | null;
+        quote_status: string | null;
+        executable: number | null;
+        executable_price: number | null;
+        executable_price_source: string | null;
+        rejection_reason: string | null;
+        quote_timestamp: string | null;
+        timestamp: string | null;
+      }>(
         `
-        SELECT c.underlying_symbol, c.option_symbol, c.type, c.expiration_date, c.strike, c.tradable,
-          s.bid, s.ask, s.midpoint, s.last, s.timestamp
+        SELECT
+          c.underlying_symbol,
+          c.option_symbol,
+          c.type,
+          c.expiration_date,
+          c.strike,
+          c.tradable,
+          s.bid,
+          s.ask,
+          s.midpoint,
+          s.last,
+          s.quote_status,
+          s.executable,
+          s.executable_price,
+          s.executable_price_source,
+          s.rejection_reason,
+          s.quote_timestamp,
+          s.timestamp
         FROM option_contracts c
-        LEFT JOIN option_snapshots s ON s.option_symbol = c.option_symbol
+        LEFT JOIN option_snapshots s
+          ON s.option_symbol = c.option_symbol
+          AND s.timestamp = (
+            SELECT MAX(timestamp)
+            FROM option_snapshots
+            WHERE option_symbol = c.option_symbol
+          )
         ORDER BY COALESCE(s.timestamp, c.expiration_date) DESC
         LIMIT ?
         `,
         [safeLimit(limit, 10, 50)]
-      );
+      ).then((rows) => rows.map(normalizeOptionContractDashboardRow));
 
 export const latestOpenOrders = async (limit = 12) =>
   shouldUseVercelReadOnlyFallback()

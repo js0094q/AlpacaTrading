@@ -134,6 +134,39 @@ button {
   padding-top: 0;
 }
 
+.option-counts {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.option-table {
+  display: grid;
+  gap: 0;
+  overflow-x: auto;
+}
+
+.option-row {
+  display: grid;
+  grid-template-columns: 96px minmax(190px, 1.2fr) 104px 88px minmax(180px, 1fr) 120px 96px;
+  gap: 10px;
+  align-items: center;
+  min-width: 900px;
+  min-height: 34px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  padding: 8px 0 0;
+  font-size: 12px;
+}
+
+.option-row.option-head {
+  min-height: 28px;
+  border-top: 0;
+  padding-top: 0;
+  color: var(--muted);
+  font-weight: 700;
+}
+
 .actions {
   display: flex;
   flex-wrap: wrap;
@@ -201,6 +234,10 @@ pre {
   }
 
   .row {
+    grid-template-columns: 1fr;
+  }
+
+  .option-counts {
     grid-template-columns: 1fr;
   }
 }

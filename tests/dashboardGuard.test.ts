@@ -86,6 +86,9 @@ describe("dashboard paper guards", () => {
     const actions = readFileSync("apps/dashboard/app/components/ActionPanel.tsx", "utf8");
 
     assert.match(page, /PAPER ONLY/);
+    assert.match(page, /Quote Status/);
+    assert.match(page, /Executable Price/);
+    assert.match(page, /Reject Reason/);
     assert.match(actions, /Submit to Alpaca Paper Account/);
     assert.doesNotMatch(actions, /Execute Live|Live Trading/);
   });

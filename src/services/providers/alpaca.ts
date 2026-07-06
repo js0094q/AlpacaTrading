@@ -189,13 +189,28 @@ export interface OptionSnapshotRaw {
     rho?: number;
   };
   latest_quote?: {
+    t?: string | null;
+    bp?: number | null;
+    ap?: number | null;
     b?: number | null;
     a?: number | null;
+    p?: number | null;
+  };
+  latest_trade?: {
+    t?: string | null;
     p?: number | null;
   };
   implied_volatility?: number | null;
   volume?: number | null;
   open_interest?: number | null;
+}
+
+export interface OptionQuoteRaw {
+  t?: string | null;
+  bp?: number | null;
+  ap?: number | null;
+  b?: number | null;
+  a?: number | null;
 }
 
 const parseOptionContractPayload = (payload: unknown): OptionContractRaw[] => {
@@ -225,6 +240,32 @@ const parseOptionSnapshotPayload = (
     options?: Record<string, OptionSnapshotRaw>;
   };
   const map = value.snapshots || value.data || value.options || {};
+  for (const [symbol, data] of Object.entries(map)) {
+    if (symbol && data) {
+      result.push({ symbol, data });
+    }
+  }
+  return result;
+};
+
+const parseOptionQuotePayload = (
+  payload: unknown
+): { symbol: string; data: OptionQuoteRaw }[] => {
+  const result: { symbol: string; data: OptionQuoteRaw }[] = [];
+  if (!payload || typeof payload !== "object") {
+    return result;
+  }
+  const value = payload as {
+    quotes?: Record<string, OptionQuoteRaw>;
+    data?: Record<string, OptionQuoteRaw>;
+    quote?: OptionQuoteRaw;
+    symbol?: string;
+  };
+  if (value.quote && value.symbol) {
+    result.push({ symbol: value.symbol, data: value.quote });
+    return result;
+  }
+  const map = value.quotes || value.data || {};
   for (const [symbol, data] of Object.entries(map)) {
     if (symbol && data) {
       result.push({ symbol, data });
@@ -367,6 +408,28 @@ export const fetchOptionSnapshots = async (
     const response = await requestJson<unknown>(endpoint);
     results.push(
       ...parseOptionSnapshotPayload(response.data).map((row) => ({
+        symbol: row.symbol,
+        raw: row.data
+      }))
+    );
+  }
+  return results;
+};
+
+export const fetchOptionQuotes = async (
+  optionSymbols: string[]
+): Promise<{ symbol: string; raw: OptionQuoteRaw }[]> => {
+  if (!optionSymbols.length) {
+    return [];
+  }
+  const results: { symbol: string; raw: OptionQuoteRaw }[] = [];
+  const chunkSize = 100;
+  for (let index = 0; index < optionSymbols.length; index += chunkSize) {
+    const chunk = optionSymbols.slice(index, index + chunkSize);
+    const endpoint = `/v1beta1/options/quotes/latest?${toSearchParams({ symbols: chunk.join(",") })}`;
+    const response = await requestJson<unknown>(endpoint);
+    results.push(
+      ...parseOptionQuotePayload(response.data).map((row) => ({
         symbol: row.symbol,
         raw: row.data
       }))

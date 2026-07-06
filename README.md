@@ -81,9 +81,11 @@ PAPER_OPTIONS_MAX_PREMIUM_PER_ORDER=1000
 PAPER_OPTIONS_MAX_CONTRACTS=5
 PAPER_OPTIONS_MIN_DTE=0
 PAPER_OPTIONS_MAX_DTE=90
-PAPER_OPTIONS_ALLOW_0DTE=true
+ALLOW_0DTE_OPTIONS=false
 PAPER_OPTIONS_ALLOW_MARKET_ORDERS=false
 PAPER_OPTIONS_LIMIT_PRICE_BASIS=mid
+OPTIONS_QUOTE_MAX_AGE_MS=900000
+ALLOW_OPTIONS_LAST_PRICE_FALLBACK=false
 PAPER_OPTIONS_MAX_SPREAD_PCT=50
 PAPER_OPTIONS_MAX_PORTFOLIO_RISK_PCT=20
 PAPER_OPTIONS_MAX_POSITION_RISK_PCT=5
@@ -336,15 +338,17 @@ Paper options remain disabled by default with `PAPER_OPTIONS_EXECUTION_ENABLED=f
 - `PAPER_OPTIONS_MAX_CONTRACTS=5`
 - `PAPER_OPTIONS_MIN_DTE=0`
 - `PAPER_OPTIONS_MAX_DTE=90`
-- `PAPER_OPTIONS_ALLOW_0DTE=true`
+- `ALLOW_0DTE_OPTIONS=false`
 - `PAPER_OPTIONS_ALLOW_MARKET_ORDERS=false`
+- `OPTIONS_QUOTE_MAX_AGE_MS=900000`
+- `ALLOW_OPTIONS_LAST_PRICE_FALLBACK=false`
 - `PAPER_OPTIONS_MAX_SPREAD_PCT=50`
 - `PAPER_OPTIONS_MAX_PORTFOLIO_RISK_PCT=20`
 - `PAPER_OPTIONS_MAX_POSITION_RISK_PCT=5`
 - long calls, long puts, cash-secured puts, and covered calls enabled by default
 - naked options disabled by default
 
-Wide spreads and speculative long calls/puts are warnings in paper mode unless they exceed configured hard limits. `OPTION_LIMIT_PRICE_UNAVAILABLE` remains a hard blocker when no usable bid/ask/mark/last-derived limit price can be built.
+Wide spreads and speculative long calls/puts are warnings in paper mode unless they exceed configured hard limits. `OPTION_LIMIT_PRICE_UNAVAILABLE` remains a hard blocker when no usable fresh bid/ask quote can produce an executable price. Last-price fallback is disabled unless `ALLOW_OPTIONS_LAST_PRICE_FALLBACK=true`; same-day expiration is disabled unless `ALLOW_0DTE_OPTIONS=true`.
 
 Multi-leg options remain intentionally out of scope. Do not model spreads as unrelated single-leg submissions until the system can represent every leg, net debit/credit, max risk/reward, strike ordering, expiration alignment, combined payload behavior, and partial-failure handling.
 

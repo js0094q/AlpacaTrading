@@ -27,6 +27,7 @@ import {
   insertPaperExecutionLedgerEntry,
   updatePaperExecutionLedgerEntry
 } from "./paperExecutionLedgerService.js";
+import { optionsQuoteConfig, roundOptionLimitPrice } from "./optionQuoteNormalizer.js";
 import type { RiskProfile } from "../types.js";
 
 type PaperExecuteFormat = "table" | "json";
@@ -55,6 +56,7 @@ export type PaperExecuteBlockerCode =
   | "OPTION_LIMIT_PRICE_REQUIRED"
   | "OPTION_LIMIT_PRICE_UNAVAILABLE"
   | "OPTION_SPREAD_TOO_WIDE"
+  | "OPTION_0DTE_NOT_ENABLED"
   | "UNSUPPORTED_OPTION_STRATEGY"
   | "OPTION_RISK_LIMIT_EXCEEDED"
   | "ALPACA_PAPER_ORDER_SUBMISSION_FAILED"
@@ -195,6 +197,7 @@ const BLOCKER_ORDER: PaperExecuteBlockerCode[] = [
   "OPTION_LIMIT_PRICE_REQUIRED",
   "OPTION_LIMIT_PRICE_UNAVAILABLE",
   "OPTION_SPREAD_TOO_WIDE",
+  "OPTION_0DTE_NOT_ENABLED",
   "UNSUPPORTED_OPTION_STRATEGY",
   "OPTION_RISK_LIMIT_EXCEEDED",
   "ALPACA_PAPER_ORDER_SUBMISSION_FAILED",
@@ -416,13 +419,42 @@ const buildPayloadForCandidate = (
       };
     }
 
-    if (candidate.orderType === "limit" && typeof candidate.limitPrice !== "number") {
+    if (
+      candidate.orderType === "limit" &&
+      (typeof candidate.limitPrice !== "number" || candidate.limitPrice <= 0)
+    ) {
       return {
         payload: null,
         blocked: blockPayload(
           optionSymbol,
           ["OPTION_LIMIT_PRICE_UNAVAILABLE"],
           "Options paper execution requires a usable option limit price.",
+          {
+            assetClass: "option",
+            underlyingSymbol: candidate.underlyingSymbol || candidate.symbol,
+            strategy
+          }
+        )
+      };
+    }
+
+    const executablePrice =
+      typeof candidate.executablePrice === "number" && candidate.executablePrice > 0
+        ? roundOptionLimitPrice(candidate.executablePrice)
+        : null;
+    if (
+      candidate.quoteStatus !== "valid" ||
+      candidate.executable !== true ||
+      executablePrice === null
+    ) {
+      return {
+        payload: null,
+        blocked: blockPayload(
+          optionSymbol,
+          ["OPTION_LIMIT_PRICE_UNAVAILABLE"],
+          `Options paper execution requires a valid executable quote${
+            candidate.rejectionReason ? ` (${candidate.rejectionReason})` : ""
+          }.`,
           {
             assetClass: "option",
             underlyingSymbol: candidate.underlyingSymbol || candidate.symbol,
@@ -460,8 +492,8 @@ const buildPayloadForCandidate = (
         time_in_force: candidate.timeInForce,
         qty: qtyString(qty),
         limit_price:
-          candidate.orderType === "limit" && typeof candidate.limitPrice === "number"
-            ? moneyString(candidate.limitPrice)
+          candidate.orderType === "limit"
+            ? moneyString(executablePrice)
             : undefined,
         position_intent: candidate.side === "buy" ? "buy_to_open" : "sell_to_open",
         client_order_id: clientOrderId,
@@ -801,20 +833,21 @@ const parseExecutionInteger = (name: string, fallback: number) => {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 };
 
-const optionExecutionConfig = () => ({
-  maxPremiumPerOrder: parseExecutionNumber("PAPER_OPTIONS_MAX_PREMIUM_PER_ORDER", 1000),
-  maxContracts: Math.max(1, parseExecutionInteger("PAPER_OPTIONS_MAX_CONTRACTS", 5)),
-  minDte: parseExecutionInteger("PAPER_OPTIONS_MIN_DTE", 0),
-  maxDte: Math.max(1, parseExecutionInteger("PAPER_OPTIONS_MAX_DTE", 90)),
-  allow0Dte: process.env.PAPER_OPTIONS_ALLOW_0DTE === undefined
-    ? true
-    : parseExecutionBoolean("PAPER_OPTIONS_ALLOW_0DTE"),
-  allowMarketOrders: parseExecutionBoolean("PAPER_OPTIONS_ALLOW_MARKET_ORDERS"),
-  limitPriceBasis: process.env.PAPER_OPTIONS_LIMIT_PRICE_BASIS || "mid",
-  maxSpreadPct: parseExecutionNumber("PAPER_OPTIONS_MAX_SPREAD_PCT", 50),
-  maxPortfolioRiskPct: parseExecutionNumber("PAPER_OPTIONS_MAX_PORTFOLIO_RISK_PCT", 20),
-  maxPositionRiskPct: parseExecutionNumber("PAPER_OPTIONS_MAX_POSITION_RISK_PCT", 5)
-});
+const optionExecutionConfig = () => {
+  const quoteCfg = optionsQuoteConfig();
+  return {
+    maxPremiumPerOrder: parseExecutionNumber("PAPER_OPTIONS_MAX_PREMIUM_PER_ORDER", 1000),
+    maxContracts: Math.max(1, parseExecutionInteger("PAPER_OPTIONS_MAX_CONTRACTS", 5)),
+    minDte: parseExecutionInteger("PAPER_OPTIONS_MIN_DTE", 0),
+    maxDte: Math.max(1, parseExecutionInteger("PAPER_OPTIONS_MAX_DTE", 90)),
+    allow0Dte: quoteCfg.allow0DteOptions,
+    allowMarketOrders: parseExecutionBoolean("PAPER_OPTIONS_ALLOW_MARKET_ORDERS"),
+    limitPriceBasis: process.env.PAPER_OPTIONS_LIMIT_PRICE_BASIS || "mid",
+    maxSpreadPct: parseExecutionNumber("PAPER_OPTIONS_MAX_SPREAD_PCT", 50),
+    maxPortfolioRiskPct: parseExecutionNumber("PAPER_OPTIONS_MAX_PORTFOLIO_RISK_PCT", 20),
+    maxPositionRiskPct: parseExecutionNumber("PAPER_OPTIONS_MAX_POSITION_RISK_PCT", 5)
+  };
+};
 
 const OPTION_GATE_BLOCKERS = new Set<PaperExecuteBlockerCode>([
   "OPTION_LIMIT_PRICE_REQUIRED",
@@ -823,6 +856,7 @@ const OPTION_GATE_BLOCKERS = new Set<PaperExecuteBlockerCode>([
   "OPTION_SPREAD_TOO_WIDE",
   "OPTION_CONTRACT_NOT_FOUND",
   "OPTION_CONTRACT_NOT_TRADABLE",
+  "OPTION_0DTE_NOT_ENABLED",
   "UNSUPPORTED_OPTION_STRATEGY",
   "OPTIONS_APPROVAL_LEVEL_INSUFFICIENT"
 ]);
@@ -942,6 +976,9 @@ const validateOptionPayload = (input: {
     (cfg.allow0Dte || dte > 0);
   const underlying = normalizeUpper(contract.underlying_symbol || contract.root_symbol);
   const hasLiquidityBasis = payload.bidAskSpreadPct !== null && payload.bidAskSpreadPct !== undefined;
+  if (dte === 0 && !cfg.allow0Dte) {
+    return "OPTION_0DTE_NOT_ENABLED";
+  }
   if (
     !tradable ||
     status !== "active" ||

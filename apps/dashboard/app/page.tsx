@@ -88,12 +88,22 @@ type PaperOpenOrdersSnapshot = {
   requestId?: string;
 };
 
+type OptionContractRow = DashboardSnapshot["optionContracts"][number];
+
 const Metric = ({ label, value }: { label: string; value: React.ReactNode }) => (
   <div className="metric">
     <span>{label}</span>
     <strong>{value}</strong>
   </div>
 );
+
+const optionPrice = (value: number | null | undefined) =>
+  typeof value === "number" ? value.toFixed(2) : "-";
+
+const optionCategoryCount = (
+  rows: OptionContractRow[],
+  category: OptionContractRow["displayCategory"]
+) => rows.filter((row) => row.displayCategory === category).length;
 
 export default async function DashboardPage() {
   let snapshot: DashboardSnapshot | null = null;
@@ -127,6 +137,7 @@ export default async function DashboardPage() {
     ? asResult<PaperOpenOrdersSnapshot>(snapshot.openOrders as DashboardCaptureResult<PaperOpenOrdersSnapshot> | DashboardCaptureError)
     : null;
   const openOrderRows = openOrders?.ok ? openOrders.data.orders || [] : [];
+  const optionRows = snapshot?.optionContracts || [];
   const vercelReadOnly = snapshot?.mode === "vercel-read-only";
 
   return (
@@ -299,7 +310,35 @@ export default async function DashboardPage() {
 
         <div className="panel wide">
           <h2>Option Contracts</h2>
-          <pre>{JSON.stringify(snapshot?.optionContracts || [], null, 2)}</pre>
+          <div className="option-counts">
+            <Metric label="Discovered" value={optionCategoryCount(optionRows, "Discovered")} />
+            <Metric label="Quoted" value={optionCategoryCount(optionRows, "Quoted")} />
+            <Metric label="Executable" value={optionCategoryCount(optionRows, "Executable")} />
+            <Metric label="Rejected" value={optionCategoryCount(optionRows, "Rejected")} />
+          </div>
+          <div className="option-table">
+            <div className="option-row option-head">
+              <span>Category</span>
+              <span>Contract</span>
+              <span>Quote Status</span>
+              <span>Executable</span>
+              <span>Reject Reason</span>
+              <span>Executable Price</span>
+              <span>Price Source</span>
+            </div>
+            {optionRows.slice(0, 10).map((entry) => (
+              <div className="option-row" key={entry.option_symbol}>
+                <span>{entry.displayCategory}</span>
+                <strong>{entry.option_symbol}</strong>
+                <span>{entry.quoteStatus}</span>
+                <span>{String(entry.executable)}</span>
+                <span>{entry.rejectionReason || "-"}</span>
+                <span className="mono">{optionPrice(entry.executablePrice)}</span>
+                <span>{entry.executablePriceSource || "-"}</span>
+              </div>
+            ))}
+            {!optionRows.length ? <p className="subtle">No option contracts discovered.</p> : null}
+          </div>
         </div>
 
         <div className="panel">

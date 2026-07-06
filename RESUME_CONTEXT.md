@@ -19,6 +19,11 @@
   - `LIVE_TRADING_ENABLED=false`
   - `PAPER_ORDER_EXECUTION_ENABLED=false`
   - `PAPER_OPTIONS_EXECUTION_ENABLED=false`
+- Options quote/execution controls after the quote-status fix:
+  - `OPTIONS_QUOTE_MAX_AGE_MS=900000` by default.
+  - `ALLOW_OPTIONS_LAST_PRICE_FALLBACK=false` by default.
+  - `ALLOW_0DTE_OPTIONS=false` by default.
+  - Option contracts may be discovered with null quotes, but they must carry `quoteStatus`, `executable=false`, and `rejectionReason` before they can appear in dashboard/runtime outputs.
 - Control bridge health:
   - `GET /api/v1/health` without token returns a healthy 200.
   - `POST /api/v1/refresh` without or with a bad token returns `401`.

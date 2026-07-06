@@ -7,6 +7,14 @@ import {
   type AlpacaAssetTradabilityResult
 } from "./alpacaAssetService.js";
 import { getTradingSafetyState, type TradingSafetyState } from "./tradingSafetyService.js";
+import {
+  normalizeOptionQuote,
+  optionsQuoteConfig,
+  roundOptionLimitPrice,
+  type NormalizedOptionQuote,
+  type OptionExecutablePriceSource,
+  type OptionQuoteStatus
+} from "./optionQuoteNormalizer.js";
 import { normalizeSymbol } from "../lib/utils.js";
 import type { PreferredExpression, RiskProfile } from "../types.js";
 
@@ -81,6 +89,12 @@ export interface PaperPlanCandidate {
   shortStrike?: number | null;
   contracts?: number | null;
   bidAskSpreadPct?: number | null;
+  quoteStatus?: OptionQuoteStatus | null;
+  executable?: boolean;
+  executablePrice?: number | null;
+  executablePriceSource?: OptionExecutablePriceSource | null;
+  rejectionReason?: string | null;
+  quoteTimestamp?: string | null;
   latestRank: number | null;
   recommendation: string | null;
   estimatedPrice: number | null;
@@ -176,6 +190,12 @@ interface OptionSnapshotPlanRow {
   midpoint: number | null;
   last: number | null;
   timestamp: string;
+  quote_status: string | null;
+  executable: number | null;
+  executable_price: number | null;
+  executable_price_source: string | null;
+  rejection_reason: string | null;
+  quote_timestamp: string | null;
 }
 
 const DEFAULTS = {
@@ -222,6 +242,7 @@ type PaperPlanReasonCode =
   | "OPTION_LIMIT_PRICE_UNAVAILABLE"
   | "OPTION_SPREAD_TOO_WIDE"
   | "OPTION_WIDE_SPREAD_WARNING"
+  | "OPTION_0DTE_NOT_ENABLED"
   | "SPECULATIVE_OPTION_PAPER_WARNING"
   | "OPTION_0DTE_ALLOWED"
   | "OPTION_DTE_ALLOWED"
@@ -260,6 +281,7 @@ const REASON_ORDER = [
   "OPTION_LIMIT_PRICE_UNAVAILABLE",
   "OPTION_SPREAD_TOO_WIDE",
   "OPTION_WIDE_SPREAD_WARNING",
+  "OPTION_0DTE_NOT_ENABLED",
   "SPECULATIVE_OPTION_PAPER_WARNING",
   "OPTION_0DTE_ALLOWED",
   "OPTION_DTE_ALLOWED",
@@ -567,23 +589,28 @@ const parseIntegerEnv = (name: string, fallback: number): number => {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 };
 
-const paperOptionsConfig = () => ({
-  maxPremiumPerOrder: parseNumberEnv("PAPER_OPTIONS_MAX_PREMIUM_PER_ORDER", 1000),
-  maxContracts: Math.max(1, parseIntegerEnv("PAPER_OPTIONS_MAX_CONTRACTS", 5)),
-  minDte: parseIntegerEnv("PAPER_OPTIONS_MIN_DTE", 0),
-  maxDte: Math.max(1, parseIntegerEnv("PAPER_OPTIONS_MAX_DTE", 90)),
-  allow0Dte: parseBooleanEnv("PAPER_OPTIONS_ALLOW_0DTE", true),
-  allowMarketOrders: parseBooleanEnv("PAPER_OPTIONS_ALLOW_MARKET_ORDERS", false),
-  limitPriceBasis: process.env.PAPER_OPTIONS_LIMIT_PRICE_BASIS || "mid",
-  maxSpreadPct: parseNumberEnv("PAPER_OPTIONS_MAX_SPREAD_PCT", 50),
-  maxPortfolioRiskPct: parseNumberEnv("PAPER_OPTIONS_MAX_PORTFOLIO_RISK_PCT", 20),
-  maxPositionRiskPct: parseNumberEnv("PAPER_OPTIONS_MAX_POSITION_RISK_PCT", 5),
-  allowLongCalls: parseBooleanEnv("PAPER_OPTIONS_ALLOW_LONG_CALLS", true),
-  allowLongPuts: parseBooleanEnv("PAPER_OPTIONS_ALLOW_LONG_PUTS", true),
-  allowCashSecuredPuts: parseBooleanEnv("PAPER_OPTIONS_ALLOW_CASH_SECURED_PUTS", true),
-  allowCoveredCalls: parseBooleanEnv("PAPER_OPTIONS_ALLOW_COVERED_CALLS", true),
-  allowNakedOptions: parseBooleanEnv("PAPER_OPTIONS_ALLOW_NAKED_OPTIONS", false)
-});
+const paperOptionsConfig = () => {
+  const quoteCfg = optionsQuoteConfig();
+  return {
+    maxPremiumPerOrder: parseNumberEnv("PAPER_OPTIONS_MAX_PREMIUM_PER_ORDER", 1000),
+    maxContracts: Math.max(1, parseIntegerEnv("PAPER_OPTIONS_MAX_CONTRACTS", 5)),
+    minDte: parseIntegerEnv("PAPER_OPTIONS_MIN_DTE", 0),
+    maxDte: Math.max(1, parseIntegerEnv("PAPER_OPTIONS_MAX_DTE", 90)),
+    allow0Dte: quoteCfg.allow0DteOptions,
+    allowMarketOrders: parseBooleanEnv("PAPER_OPTIONS_ALLOW_MARKET_ORDERS", false),
+    limitPriceBasis: process.env.PAPER_OPTIONS_LIMIT_PRICE_BASIS || "mid",
+    maxSpreadPct: parseNumberEnv("PAPER_OPTIONS_MAX_SPREAD_PCT", 50),
+    maxPortfolioRiskPct: parseNumberEnv("PAPER_OPTIONS_MAX_PORTFOLIO_RISK_PCT", 20),
+    maxPositionRiskPct: parseNumberEnv("PAPER_OPTIONS_MAX_POSITION_RISK_PCT", 5),
+    allowLongCalls: parseBooleanEnv("PAPER_OPTIONS_ALLOW_LONG_CALLS", true),
+    allowLongPuts: parseBooleanEnv("PAPER_OPTIONS_ALLOW_LONG_PUTS", true),
+    allowCashSecuredPuts: parseBooleanEnv("PAPER_OPTIONS_ALLOW_CASH_SECURED_PUTS", true),
+    allowCoveredCalls: parseBooleanEnv("PAPER_OPTIONS_ALLOW_COVERED_CALLS", true),
+    allowNakedOptions: parseBooleanEnv("PAPER_OPTIONS_ALLOW_NAKED_OPTIONS", false),
+    quoteMaxAgeMs: quoteCfg.maxAgeMs,
+    allowLastPriceFallback: quoteCfg.allowLastPriceFallback
+  };
+};
 
 const findOptionContract = (optionSymbol: string | null | undefined): OptionContractPlanRow | null => {
   if (!optionSymbol) {
@@ -608,19 +635,28 @@ const findOptionContract = (optionSymbol: string | null | undefined): OptionCont
 };
 
 const findLatestOptionSnapshot = (
-  optionSymbol: string,
-  asOf?: string
+  optionSymbol: string
 ): OptionSnapshotPlanRow | null =>
   queryOne<OptionSnapshotPlanRow>(
     `
-    SELECT bid, ask, midpoint, last, timestamp
+    SELECT
+      bid,
+      ask,
+      midpoint,
+      last,
+      timestamp,
+      quote_status,
+      executable,
+      executable_price,
+      executable_price_source,
+      rejection_reason,
+      quote_timestamp
     FROM option_snapshots
     WHERE option_symbol = ?
-      AND (? IS NULL OR timestamp <= ?)
     ORDER BY timestamp DESC
     LIMIT 1
     `,
-    [optionSymbol, asOf || null, asOf || null]
+    [optionSymbol]
   );
 
 const daysToExpiration = (expirationDate: string): number | null => {
@@ -673,6 +709,103 @@ const pickLimitPrice = (
     return roundMoney(bid);
   }
   return last !== null && last > 0 ? roundMoney(last) : null;
+};
+
+const asQuoteStatus = (value: string | null): OptionQuoteStatus | null =>
+  value === "valid" || value === "missing" || value === "invalid" || value === "stale"
+    ? value
+    : null;
+
+const asExecutablePriceSource = (value: string | null): OptionExecutablePriceSource | null =>
+  value === "midpoint" || value === "ask" || value === "last" ? value : null;
+
+const optionQuoteFields = (quote: NormalizedOptionQuote) => ({
+  quoteStatus: quote.quoteStatus,
+  executable: quote.executable,
+  executablePrice: quote.executablePrice,
+  executablePriceSource: quote.executablePriceSource,
+  rejectionReason: quote.rejectionReason,
+  quoteTimestamp: quote.quoteTimestamp
+});
+
+const missingOptionQuoteFields = (optionSymbol: string): NormalizedOptionQuote => ({
+  optionSymbol,
+  bid: null,
+  ask: null,
+  midpoint: null,
+  last: null,
+  quoteTimestamp: null,
+  quoteStatus: "missing",
+  executable: false,
+  executablePrice: null,
+  executablePriceSource: null,
+  rejectionReason: "quote_unavailable"
+});
+
+const normalizedSnapshotQuote = (
+  optionSymbol: string,
+  snapshot: OptionSnapshotPlanRow,
+  options: ReturnType<typeof paperOptionsConfig>
+): NormalizedOptionQuote => {
+  const persistedStatus = asQuoteStatus(snapshot.quote_status);
+  const persistedSource = asExecutablePriceSource(snapshot.executable_price_source);
+  const normalized = normalizeOptionQuote(
+    {
+      optionSymbol,
+      bid: snapshot.bid,
+      ask: snapshot.ask,
+      midpoint: snapshot.midpoint,
+      last: snapshot.last,
+      timestamp: snapshot.quote_timestamp || snapshot.timestamp
+    },
+    new Date(),
+    options.quoteMaxAgeMs,
+    {
+      allowLastPriceFallback: options.allowLastPriceFallback
+    }
+  );
+
+  if (persistedStatus === null) {
+    return normalized;
+  }
+
+  if (persistedStatus !== "valid") {
+    return {
+      ...normalized,
+      quoteStatus: normalized.quoteStatus === "stale" ? "stale" : persistedStatus,
+      executable: false,
+      executablePrice: null,
+      executablePriceSource: null,
+      rejectionReason:
+        normalized.quoteStatus === "stale"
+          ? normalized.rejectionReason
+          : snapshot.rejection_reason || normalized.rejectionReason,
+      quoteTimestamp: snapshot.quote_timestamp || normalized.quoteTimestamp
+    };
+  }
+
+  const persistedExecutable = snapshot.executable === 1;
+  return {
+    ...normalized,
+    quoteStatus: normalized.quoteStatus === "valid" ? "valid" : normalized.quoteStatus,
+    executable:
+      normalized.quoteStatus === "valid"
+        ? persistedExecutable
+        : normalized.executable,
+    executablePrice:
+      normalized.quoteStatus === "valid" && persistedExecutable
+        ? toNullableNumber(snapshot.executable_price) ?? normalized.executablePrice
+        : null,
+    executablePriceSource:
+      normalized.quoteStatus === "valid" && persistedExecutable
+        ? persistedSource ?? normalized.executablePriceSource
+        : null,
+    rejectionReason:
+      normalized.quoteStatus === "valid"
+        ? snapshot.rejection_reason
+        : normalized.rejectionReason,
+    quoteTimestamp: snapshot.quote_timestamp || normalized.quoteTimestamp
+  };
 };
 
 const isSupportedSingleLegOptionStrategy = (
@@ -951,6 +1084,8 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
       dte >= options.minDte &&
       dte <= options.maxDte &&
       (options.allow0Dte || dte > 0);
+    const dteBlockReason: PaperPlanReasonCode =
+      dte === 0 && !options.allow0Dte ? "OPTION_0DTE_NOT_ENABLED" : "OPTION_CONTRACT_NOT_TRADABLE";
     if (!contract.tradable || contract.type !== expectedType || !dteAllowed) {
       return {
         ...base,
@@ -962,12 +1097,18 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         expirationDate: contract.expiration_date,
         strike: contract.strike,
         shortStrike: candidate.short_strike,
+        executable: false,
+        executablePrice: null,
+        executablePriceSource: null,
+        rejectionReason: dteBlockReason === "OPTION_0DTE_NOT_ENABLED"
+          ? "same_day_expiration_not_enabled"
+          : null,
         reasonCodes: buildReasonList([
           ...(base.reasonCodes),
           "OPTION_CONTRACT_FOUND",
-          "OPTION_CONTRACT_NOT_TRADABLE"
+          dteBlockReason
         ]),
-        explanation: explanationFor("watch", ["OPTION_CONTRACT_NOT_TRADABLE"])
+        explanation: explanationFor("watch", [dteBlockReason])
       };
     }
 
@@ -975,8 +1116,9 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
     if (!options.allowMarketOrders) {
       base.orderType = "limit";
     }
-    const snapshot = findLatestOptionSnapshot(contract.option_symbol, candidate.as_of || undefined);
+    const snapshot = findLatestOptionSnapshot(contract.option_symbol);
     if (!snapshot) {
+      const missingQuote = missingOptionQuoteFields(contract.option_symbol);
       return {
         ...base,
         decision: "watch",
@@ -989,6 +1131,7 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         expirationDate: contract.expiration_date,
         strike: contract.strike,
         shortStrike: candidate.short_strike,
+        ...optionQuoteFields(missingQuote),
         reasonCodes: buildReasonList([
           ...(base.reasonCodes),
           "OPTION_CONTRACT_FOUND",
@@ -998,9 +1141,13 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
       };
     }
 
-    const spreadPct = spreadPctFor(snapshot.bid, snapshot.ask);
-    const limitPrice = pickLimitPrice(snapshot, side, options.limitPriceBasis);
-    if (limitPrice === null) {
+    const quote = normalizedSnapshotQuote(contract.option_symbol, snapshot, options);
+    const spreadPct = spreadPctFor(quote.bid, quote.ask);
+    const limitPrice =
+      quote.executable && quote.executablePrice !== null
+        ? roundOptionLimitPrice(quote.executablePrice)
+        : null;
+    if (quote.quoteStatus !== "valid" || !quote.executable || limitPrice === null) {
       return {
         ...base,
         decision: "watch",
@@ -1014,6 +1161,7 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         strike: contract.strike,
         shortStrike: candidate.short_strike,
         bidAskSpreadPct: spreadPct,
+        ...optionQuoteFields(quote),
         reasonCodes: optionPriceUnavailableReasons(base.reasonCodes),
         explanation: explanationFor("watch", ["OPTION_LIMIT_PRICE_UNAVAILABLE"])
       };
@@ -1083,6 +1231,7 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         shortStrike: candidate.short_strike,
         contracts,
         bidAskSpreadPct: spreadPct,
+        ...optionQuoteFields(quote),
         estimatedNotional: configuredRisk,
         reasonCodes: buildReasonList([
           ...(base.reasonCodes),
@@ -1112,6 +1261,7 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         shortStrike: candidate.short_strike,
         contracts,
         bidAskSpreadPct: spreadPct,
+        ...optionQuoteFields(quote),
         estimatedNotional: configuredRisk,
         reasonCodes: buildReasonList([
           ...(base.reasonCodes),
@@ -1141,6 +1291,7 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         shortStrike: candidate.short_strike,
         contracts,
         bidAskSpreadPct: spreadPct,
+        ...optionQuoteFields(quote),
         reasonCodes: buildReasonList([
           ...(base.reasonCodes),
           "OPTION_CONTRACT_FOUND",
@@ -1172,6 +1323,7 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         shortStrike: candidate.short_strike,
         contracts,
         bidAskSpreadPct: spreadPct,
+        ...optionQuoteFields(quote),
         estimatedNotional: configuredRisk,
         reasonCodes: buildReasonList([
           ...(base.reasonCodes),
@@ -1199,6 +1351,7 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
       shortStrike: candidate.short_strike,
       contracts,
       bidAskSpreadPct: spreadPct,
+      ...optionQuoteFields(quote),
       estimatedPrice: limitPrice,
       estimatedQty: contracts,
       estimatedNotional: configuredRisk,

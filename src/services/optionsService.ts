@@ -3,10 +3,16 @@ import { nowIso, dedupeSymbols, normalizeSymbol } from "../lib/utils.js";
 import { getActiveSymbols, seedInitialUniverse } from "./universeService.js";
 import {
   fetchOptionContracts,
+  fetchOptionQuotes,
   fetchOptionSnapshots,
   type OptionContractRaw,
+  type OptionQuoteRaw,
   type OptionSnapshotRaw
 } from "./providers/alpaca.js";
+import {
+  normalizeOptionQuote,
+  optionsQuoteConfig
+} from "./optionQuoteNormalizer.js";
 
 const ensureRunRow = (input: {
   runType: "options_contracts" | "options_snapshots";
@@ -56,28 +62,66 @@ export const toContractRow = (contract: OptionContractRaw) => ({
   tradable: contract.tradable ? 1 : 0
 });
 
-export const toSnapshotRow = (optionSymbol: string, symbolData: OptionSnapshotRaw) => ({
-  optionSymbol,
-  underlyingSymbol: normalizeSymbol(symbolData.underlying_symbol || optionSymbol),
-  timestamp: nowIso(),
-  bid: symbolData.latest_quote?.b ?? null,
-  ask: symbolData.latest_quote?.a ?? null,
-  midpoint:
-    symbolData.latest_quote?.b != null && symbolData.latest_quote?.a != null
-      ? (symbolData.latest_quote.b + symbolData.latest_quote.a) / 2
-      : null,
-  last: symbolData.latest_quote?.p ?? null,
-  volume:
-    typeof symbolData.volume === "number" ? Math.round(symbolData.volume) : null,
-  openInterest:
-    typeof symbolData.open_interest === "number" ? Math.round(symbolData.open_interest) : null,
-  impliedVolatility: symbolData.implied_volatility ?? null,
-  delta: symbolData.Greeks?.delta ?? null,
-  gamma: symbolData.Greeks?.gamma ?? null,
-  theta: symbolData.Greeks?.theta ?? null,
-  vega: symbolData.Greeks?.vega ?? null,
-  rho: symbolData.Greeks?.rho ?? null
-});
+const quoteBid = (quote: OptionQuoteRaw | null | undefined, snapshot: OptionSnapshotRaw) =>
+  quote?.bp ?? quote?.b ?? snapshot.latest_quote?.bp ?? snapshot.latest_quote?.b ?? null;
+
+const quoteAsk = (quote: OptionQuoteRaw | null | undefined, snapshot: OptionSnapshotRaw) =>
+  quote?.ap ?? quote?.a ?? snapshot.latest_quote?.ap ?? snapshot.latest_quote?.a ?? null;
+
+const quoteTimestamp = (quote: OptionQuoteRaw | null | undefined, snapshot: OptionSnapshotRaw) =>
+  quote?.t ?? snapshot.latest_quote?.t ?? snapshot.latest_trade?.t ?? null;
+
+const quoteLast = (snapshot: OptionSnapshotRaw) =>
+  snapshot.latest_trade?.p ?? snapshot.latest_quote?.p ?? null;
+
+export const toSnapshotRow = (
+  optionSymbol: string,
+  symbolData: OptionSnapshotRaw,
+  quoteData?: OptionQuoteRaw | null
+) => {
+  const timestamp = nowIso();
+  const quoteCfg = optionsQuoteConfig();
+  const normalizedQuote = normalizeOptionQuote(
+    {
+      optionSymbol,
+      bid: quoteBid(quoteData, symbolData),
+      ask: quoteAsk(quoteData, symbolData),
+      last: quoteLast(symbolData),
+      timestamp: quoteTimestamp(quoteData, symbolData)
+    },
+    new Date(timestamp),
+    quoteCfg.maxAgeMs,
+    {
+      allowLastPriceFallback: quoteCfg.allowLastPriceFallback
+    }
+  );
+
+  return {
+    optionSymbol,
+    underlyingSymbol: normalizeSymbol(symbolData.underlying_symbol || optionSymbol),
+    timestamp,
+    bid: normalizedQuote.bid,
+    ask: normalizedQuote.ask,
+    midpoint: normalizedQuote.midpoint,
+    last: normalizedQuote.last,
+    quoteStatus: normalizedQuote.quoteStatus,
+    executable: normalizedQuote.executable ? 1 : 0,
+    executablePrice: normalizedQuote.executablePrice,
+    executablePriceSource: normalizedQuote.executablePriceSource,
+    rejectionReason: normalizedQuote.rejectionReason,
+    quoteTimestamp: normalizedQuote.quoteTimestamp,
+    volume:
+      typeof symbolData.volume === "number" ? Math.round(symbolData.volume) : null,
+    openInterest:
+      typeof symbolData.open_interest === "number" ? Math.round(symbolData.open_interest) : null,
+    impliedVolatility: symbolData.implied_volatility ?? null,
+    delta: symbolData.Greeks?.delta ?? null,
+    gamma: symbolData.Greeks?.gamma ?? null,
+    theta: symbolData.Greeks?.theta ?? null,
+    vega: symbolData.Greeks?.vega ?? null,
+    rho: symbolData.Greeks?.rho ?? null
+  };
+};
 
 export const ingestOptionContracts = async (params?: {
   underlyingSymbols?: string[];
@@ -163,8 +207,9 @@ export const ingestOptionSnapshots = async (params?: {
   const insert = getDb().prepare(`
     INSERT INTO option_snapshots(
       option_symbol, underlying_symbol, timestamp, bid, ask, midpoint, last,
+      quote_status, executable, executable_price, executable_price_source, rejection_reason, quote_timestamp,
       volume, open_interest, implied_volatility, delta, gamma, theta, vega, rho, source
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'alpaca')
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'alpaca')
     ON CONFLICT(option_symbol, timestamp) DO NOTHING
   `);
 
@@ -179,7 +224,11 @@ export const ingestOptionSnapshots = async (params?: {
       )
       .all(...symbols) as Array<{ option_symbol: string }>;
     const optionSymbols = options.map((row) => row.option_symbol);
-    const snapshots = await fetchOptionSnapshots(optionSymbols);
+    const [snapshots, quotes] = await Promise.all([
+      fetchOptionSnapshots(optionSymbols),
+      fetchOptionQuotes(optionSymbols)
+    ]);
+    const quotesBySymbol = new Map(quotes.map((row) => [row.symbol, row.raw]));
     for (const { symbol, raw } of snapshots) {
       if (params?.minDelta !== undefined && params.minDelta !== null) {
         const delta = raw.Greeks?.delta;
@@ -193,7 +242,7 @@ export const ingestOptionSnapshots = async (params?: {
           continue;
         }
       }
-      const row = toSnapshotRow(symbol, raw);
+      const row = toSnapshotRow(symbol, raw, quotesBySymbol.get(symbol));
       const result = insert.run(
         row.optionSymbol,
         row.underlyingSymbol,
@@ -202,6 +251,12 @@ export const ingestOptionSnapshots = async (params?: {
         row.ask,
         row.midpoint,
         row.last,
+        row.quoteStatus,
+        row.executable,
+        row.executablePrice,
+        row.executablePriceSource,
+        row.rejectionReason,
+        row.quoteTimestamp,
         row.volume,
         row.openInterest,
         row.impliedVolatility,

@@ -47,3 +47,4 @@
 - Preserve paper-only guardrails (`ALPACA_ENV=paper`, `LIVE_TRADING_ENABLED=false`) on all runs.
 - Do not add direct shell command execution in dashboard actions; keep allowlisted control endpoints only.
 - Do not configure direct client-side Alpaca credentials or local SQLite writes on Vercel.
+- Preserve option quote execution gates: stale/missing/crossed quotes and same-day expirations are non-executable unless explicitly enabled by runtime env.

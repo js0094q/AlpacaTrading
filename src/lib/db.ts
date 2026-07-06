@@ -74,6 +74,12 @@ CREATE TABLE IF NOT EXISTS option_snapshots (
   ask REAL,
   midpoint REAL,
   last REAL,
+  quote_status TEXT,
+  executable INTEGER NOT NULL DEFAULT 0,
+  executable_price REAL,
+  executable_price_source TEXT,
+  rejection_reason TEXT,
+  quote_timestamp TEXT,
   volume INTEGER,
   open_interest INTEGER,
   implied_volatility REAL,
@@ -387,6 +393,12 @@ const addColumnIfMissing = (db: DbHandle, table: string, column: string, ddl: st
 };
 
 const runMigrations = (db: DbHandle) => {
+  addColumnIfMissing(db, "option_snapshots", "quote_status", "quote_status TEXT");
+  addColumnIfMissing(db, "option_snapshots", "executable", "executable INTEGER NOT NULL DEFAULT 0");
+  addColumnIfMissing(db, "option_snapshots", "executable_price", "executable_price REAL");
+  addColumnIfMissing(db, "option_snapshots", "executable_price_source", "executable_price_source TEXT");
+  addColumnIfMissing(db, "option_snapshots", "rejection_reason", "rejection_reason TEXT");
+  addColumnIfMissing(db, "option_snapshots", "quote_timestamp", "quote_timestamp TEXT");
   addColumnIfMissing(db, "paper_execution_ledger", "side", "side TEXT");
   addColumnIfMissing(db, "paper_execution_ledger", "order_type", "order_type TEXT");
   addColumnIfMissing(db, "paper_execution_ledger", "time_in_force", "time_in_force TEXT");

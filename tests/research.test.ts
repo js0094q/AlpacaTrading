@@ -52,7 +52,7 @@ const [
 const { closeDbForTests, getDb } = libDb;
 const { seedInitialUniverse, addTicker, getAllUniverse } = universeService;
 const { buildFeatures } = featureService;
-const { toContractRow } = optionService;
+const { ingestOptionContracts, ingestOptionSnapshots, toContractRow } = optionService;
 const { selectExpression } = strategySelector;
 const { runBacktest } = backtestService;
 const { generateTargets } = targetService;
@@ -162,8 +162,12 @@ const buildOptionSnapshotsPayload = (symbols: string[]) => ({
             rho: isCall ? 0.02 : -0.02
           },
           latest_quote: {
-            b: 0.92,
-            a: 1.0,
+            t: ts(1),
+            bp: 0.92,
+            ap: 1.0
+          },
+          latest_trade: {
+            t: ts(1),
             p: 0.95
           },
           implied_volatility: 0.35,
@@ -216,12 +220,31 @@ const setMockFetchForSuccess = (
       return makeMockResponse(buildOptionsContractsPayload(symbols));
     }
 
-    if (includeOptions && target.includes("/v2/options/snapshots")) {
+    if (includeOptions && target.includes("/v1beta1/options/snapshots")) {
       const endpoint = new URL(target);
       const symbols = (endpoint.searchParams.get("symbols") || "")
         .split(",")
         .filter(Boolean);
       return makeMockResponse(buildOptionSnapshotsPayload(symbols));
+    }
+
+    if (includeOptions && target.includes("/v1beta1/options/quotes/latest")) {
+      const endpoint = new URL(target);
+      const symbols = (endpoint.searchParams.get("symbols") || "")
+        .split(",")
+        .filter(Boolean);
+      return makeMockResponse({
+        quotes: Object.fromEntries(
+          symbols.map((symbol) => [
+            symbol,
+            {
+              t: new Date().toISOString(),
+              bp: 0.92,
+              ap: 1.0
+            }
+          ])
+        )
+      });
     }
 
     return makeMockResponse({});
@@ -364,6 +387,89 @@ describe("Feature generation", () => {
     assert.equal(row.underlyingSymbol, "SPY");
     assert.equal(row.optionSymbol, "SPY240315C00220000");
     assert.equal(row.tradable, 1);
+  });
+
+  test("ingests option quotes from Alpaca latest options quote endpoint", async () => {
+    const optionSymbol = "SPY260814C00100000";
+    const calls: string[] = [];
+    globalThis.fetch = async (input: string | Request | URL) => {
+      const target = String(input);
+      calls.push(target);
+      if (target.includes("/v2/options/contracts")) {
+        return makeMockResponse({
+          option_contracts: [{
+            symbol: optionSymbol,
+            underlying_symbol: "SPY",
+            type: "call",
+            expiration_date: "2026-08-14",
+            strike_price: 100,
+            multiplier: 100,
+            tradable: true
+          }]
+        });
+      }
+      if (target.includes("/v1beta1/options/snapshots")) {
+        return makeMockResponse({
+          snapshots: {
+            [optionSymbol]: {
+              symbol: optionSymbol,
+              underlying_symbol: "SPY",
+              Greeks: { delta: 0.5 },
+              latest_trade: { t: new Date().toISOString(), p: 1.21 },
+              implied_volatility: 0.31,
+              volume: 100,
+              open_interest: 200
+            }
+          }
+        });
+      }
+      if (target.includes("/v1beta1/options/quotes/latest")) {
+        return makeMockResponse({
+          quotes: {
+            [optionSymbol]: {
+              t: new Date().toISOString(),
+              bp: 1.2,
+              ap: 1.4
+            }
+          }
+        });
+      }
+      return makeMockResponse({});
+    };
+
+    await ingestOptionContracts({ underlyingSymbols: ["SPY"] });
+    await ingestOptionSnapshots({ underlyingSymbols: ["SPY"] });
+
+    const row = getDb()
+      .prepare(`
+        SELECT bid, ask, midpoint, last, quote_status, executable, executable_price, executable_price_source, rejection_reason
+        FROM option_snapshots
+        WHERE option_symbol = ?
+        ORDER BY timestamp DESC
+        LIMIT 1
+      `)
+      .get(optionSymbol) as {
+        bid: number | null;
+        ask: number | null;
+        midpoint: number | null;
+        last: number | null;
+        quote_status: string;
+        executable: number;
+        executable_price: number | null;
+        executable_price_source: string | null;
+        rejection_reason: string | null;
+      };
+
+    assert.equal(calls.some((target) => target.includes("/v1beta1/options/quotes/latest")), true);
+    assert.equal(row.bid, 1.2);
+    assert.equal(row.ask, 1.4);
+    assert.equal(row.midpoint, 1.3);
+    assert.equal(row.last, 1.21);
+    assert.equal(row.quote_status, "valid");
+    assert.equal(row.executable, 1);
+    assert.equal(row.executable_price, 1.3);
+    assert.equal(row.executable_price_source, "midpoint");
+    assert.equal(row.rejection_reason, null);
   });
 });
 

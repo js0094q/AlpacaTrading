@@ -60,8 +60,13 @@ export const config = {
     maxContracts: Math.max(1, parseInteger(process.env.PAPER_OPTIONS_MAX_CONTRACTS, 5)),
     minDte: parseInteger(process.env.PAPER_OPTIONS_MIN_DTE, 0),
     maxDte: Math.max(1, parseInteger(process.env.PAPER_OPTIONS_MAX_DTE, 90)),
-    allow0Dte: parseBooleanDefault(process.env.PAPER_OPTIONS_ALLOW_0DTE, true),
+    allow0Dte: parseBooleanDefault(
+      process.env.ALLOW_0DTE_OPTIONS ?? process.env.PAPER_OPTIONS_ALLOW_0DTE,
+      false
+    ),
     allowMarketOrders: parseBoolean(process.env.PAPER_OPTIONS_ALLOW_MARKET_ORDERS),
+    quoteMaxAgeMs: parseInteger(process.env.OPTIONS_QUOTE_MAX_AGE_MS, 15 * 60 * 1000),
+    allowLastPriceFallback: parseBoolean(process.env.ALLOW_OPTIONS_LAST_PRICE_FALLBACK),
     limitPriceBasis: process.env.PAPER_OPTIONS_LIMIT_PRICE_BASIS || "mid",
     maxSpreadPct: parseNumber(process.env.PAPER_OPTIONS_MAX_SPREAD_PCT, 50),
     maxPortfolioRiskPct: parseNumber(process.env.PAPER_OPTIONS_MAX_PORTFOLIO_RISK_PCT, 20),
