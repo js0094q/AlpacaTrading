@@ -295,6 +295,28 @@ const baseReview = (
     optionsWarnings: [],
     buyingPowerWarnings: []
   },
+  candidateCounts: {
+    inputCandidates: plan.summary.candidatesEvaluated,
+    plannedOrders: plan.summary.plannedOrders,
+    eligiblePayloads: plan.plan.filter((candidate) => candidate.decision === "planned").length,
+    skippedAlreadyHeld: plan.plan.filter((candidate) =>
+      candidate.decision !== "planned" && candidate.reasonCodes.includes("ALREADY_HELD")
+    ).length,
+    skippedQuoteUnavailable: plan.plan.filter((candidate) =>
+      candidate.decision !== "planned" && candidate.rejectionReason === "quote_unavailable"
+    ).length
+  },
+  topSkipReasons: [
+    ...new Set(
+      plan.plan
+        .filter((candidate) => candidate.decision !== "planned")
+        .map((candidate) =>
+          candidate.reasonCodes.includes("ALREADY_HELD")
+            ? "ALREADY_HELD"
+            : candidate.rejectionReason || candidate.reasonCodes[0] || candidate.decision
+        )
+    )
+  ],
   plan: plan.plan.map((candidate) => ({
     symbol: candidate.symbol,
     decision: candidate.decision,
@@ -386,7 +408,7 @@ describe("paper execute dry-run service guardrails", () => {
     assert.equal(report.wouldSubmit.length, 0);
   });
 
-  test("fails if plan has no planned orders", async () => {
+  test("returns no-op if plan has no planned orders", async () => {
     const report = await runWith({
       plan: [
         plannedCandidate({
@@ -394,13 +416,51 @@ describe("paper execute dry-run service guardrails", () => {
           decision: "watch",
           estimatedNotional: null,
           estimatedQty: null,
-          reasonCodes: ["PRICE_UNKNOWN"],
+          reasonCodes: ["ALREADY_HELD"],
           explanation: "Watch"
         })
       ]
     });
-    assert.equal(report.blockers.includes("NO_PLANNED_ORDERS"), true);
+    assert.equal(report.status, "no_op");
+    assert.equal(report.reason, "NO_ELIGIBLE_PAPER_PAYLOADS");
+    assert.equal(report.blockers.length, 0);
+    assert.equal(report.candidateCounts?.skippedAlreadyHeld, 1);
+    assert.deepEqual(report.topSkipReasons, ["ALREADY_HELD"]);
     assert.equal(report.wouldSubmit.length, 0);
+  });
+
+  test("empty plan produces clean no-op instead of ambiguous failure", async () => {
+    const report = await runWith({
+      plan: [],
+      summary: {
+        candidatesEvaluated: 0,
+        plannedOrders: 0,
+        watched: 0,
+        skipped: 0,
+        estimatedTotalNotional: 0,
+        remainingDeployableBuyingPower: 800
+      },
+      diagnostics: {
+        latestSnapshotAvailable: true,
+        latestSnapshotRunId: "run-empty",
+        latestSnapshotTimestamp: now,
+        filtersMatchedSnapshots: true,
+        runtimeCandidatesAvailable: false,
+        emptyReason: "NO_RUNTIME_CANDIDATES"
+      }
+    }, {
+      review: {
+        status: "blocked",
+        blockers: ["NO_RUNTIME_CANDIDATES"],
+        warnings: [],
+        confirmationsRequired: ["No runtime candidates."]
+      }
+    });
+
+    assert.equal(report.status, "no_op");
+    assert.equal(report.reason, "NO_ELIGIBLE_PAPER_PAYLOADS");
+    assert.equal(report.summary.wouldSubmitCount, 0);
+    assert.equal(report.blockers.length, 0);
   });
 
   test("fails if plan is not dry-run", async () => {
@@ -608,7 +668,7 @@ describe("paper execute confirm-paper guardrails", () => {
     assert.equal(report.submitted.length, 0);
   });
 
-  test("empty payload set returns NO_ELIGIBLE_PAPER_PAYLOADS", async () => {
+  test("empty payload set returns no-op without confirm-paper errors", async () => {
     process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
     const report = await confirmWith({
       plan: [
@@ -621,7 +681,9 @@ describe("paper execute confirm-paper guardrails", () => {
         })
       ]
     });
-    assert.equal(report.errors.some((error) => error.reason === "NO_ELIGIBLE_PAPER_PAYLOADS"), true);
+    assert.equal(report.status, "no_op");
+    assert.equal(report.reason, "NO_ELIGIBLE_PAPER_PAYLOADS");
+    assert.equal(report.errors.length, 0);
     assert.equal(report.submitted.length, 0);
   });
 

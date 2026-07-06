@@ -38,9 +38,9 @@
 - Runtime check results captured prior to pause:
   - `alpaca:health` returned `paperOnly: true`.
   - `paper:runtime -- --format=json` returned runtime state.
-  - latest `paper:runtime` sees 3 candidates.
-  - latest `paper:plan` finds the current research run but skips all candidates due to `OPEN_ORDER_EXISTS`.
-  - latest `paper:review` is blocked by `ALL_CANDIDATES_SKIPPED` and `NO_PLANNED_ORDERS`.
+  - latest `paper:runtime` sees 3 equity candidates, each already held in current paper positions.
+  - latest `paper:plan` finds the current research run but produces zero planned orders because those candidate symbols are already held.
+  - `paper:execute` now reports this zero-payload state as `status: "no_op"` with `reason: "NO_ELIGIBLE_PAPER_PAYLOADS"` instead of a safety-review failure.
 
 ## Token/env coordination
 

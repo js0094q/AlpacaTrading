@@ -20,7 +20,7 @@
   - Public summary and refresh routes reach the VPS control service and return paper-only state.
   - Dashboard page summary loads use the VPS summary bridge with a 30 second timeout; slow summary reads should not be labeled as environment-guard failures.
   - Public `POST /api/paper/research/run` completes with valid admin auth using bounded control-service research defaults.
-  - Latest review is blocked because all current candidates already have open paper orders, so no execution path is ready.
+  - Latest review is a clean no-op because all current equity candidates are already held in paper positions, so no eligible payloads exist.
 - Fast resume command sequence:
   - `ssh njalla-vps`
   - load Node 22 and secrets from `/opt/alpaca-investing/secrets/alpaca.env`
@@ -297,6 +297,7 @@ npm run paper:execute -- --dryRun --riskProfile=aggressive --optionsEnabled=true
 
 `paper:execute --dryRun` only constructs the Alpaca order payloads that would be submitted later. It requires an explicit dry-run flag and returns `DRY_RUN_OR_CONFIRM_PAPER_REQUIRED` if omitted. It does not submit, replace, cancel, or modify Alpaca orders.
 `paper:execute --dryRun` returns `DRY_RUN_OR_CONFIRM_PAPER_REQUIRED` when neither dry-run nor confirm flags are present.
+If the plan has no eligible payloads after candidate filtering, `paper:execute --dryRun` and `paper:execute --confirmPaper` return `status: "no_op"` with `reason: "NO_ELIGIBLE_PAPER_PAYLOADS"` and submit zero orders.
 `paper:execute --confirmPaper` submits eligible equity and options payloads to Alpaca paper.
 
 Required command forms:

@@ -840,6 +840,42 @@ describe("paper plan service", () => {
     assert.equal(entry?.reasonCodes.includes("OPTION_LIMIT_PRICE_UNAVAILABLE"), true);
   });
 
+  test("rejects null option quotes before planning", async () => {
+    const optionSymbol = "AAPL260814C00100000";
+    insertResearchRun({ runId: "run-null-option", riskProfile: "moderate", optionsEnabled: true });
+    insertCandidate({
+      runId: "run-null-option",
+      symbol: "AAPL",
+      rank: 1,
+      preferredExpression: "long_call",
+      optionSymbol,
+      strike: 100,
+      estimatedMaxLoss: 75
+    });
+    insertOptionContract({ optionSymbol, type: "call" });
+    insertOptionSnapshot({
+      optionSymbol,
+      bid: null,
+      ask: null,
+      midpoint: null,
+      last: null,
+      quoteStatus: "missing",
+      executable: 0,
+      executablePrice: null,
+      executablePriceSource: null,
+      rejectionReason: "quote_unavailable"
+    });
+
+    const report = await planResultFor({ optionsEnabled: true });
+    const entry = report.plan[0];
+    assert.equal(entry?.decision, "watch");
+    assert.equal(entry?.quoteStatus, "missing");
+    assert.equal(entry?.executable, false);
+    assert.equal(entry?.executablePrice, null);
+    assert.equal(entry?.rejectionReason, "quote_unavailable");
+    assert.equal(entry?.reasonCodes.includes("OPTION_LIMIT_PRICE_UNAVAILABLE"), true);
+  });
+
   test("blocks 0DTE option planning by default and allows it only when enabled", async () => {
     const optionSymbol = "AAPL260703C00100000";
     insertResearchRun({ runId: "run-0dte", riskProfile: "moderate", optionsEnabled: true });

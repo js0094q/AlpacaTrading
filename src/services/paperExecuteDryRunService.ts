@@ -32,6 +32,8 @@ import type { RiskProfile } from "../types.js";
 
 type PaperExecuteFormat = "table" | "json";
 type PaperExecuteAssetClassFilter = "all" | "equity" | "option";
+type PaperExecuteDryRunStatus = "ready" | "blocked" | "no_op";
+type PaperExecuteConfirmStatus = "submitted" | "partial" | "blocked" | "no_op";
 
 export type PaperExecuteBlockerCode =
   | "DRY_RUN_OR_CONFIRM_PAPER_REQUIRED"
@@ -138,6 +140,8 @@ export interface PaperExecuteDryRunReport {
   nonMutating: true;
   executionMode: "dryRun";
   assetClass: PaperExecuteAssetClassFilter;
+  status: PaperExecuteDryRunStatus;
+  reason: PaperExecuteBlockerCode | null;
   reviewStatus: PaperReviewStatus | "blocked";
   blockers: PaperExecuteBlockerCode[];
   warnings: string[];
@@ -149,6 +153,8 @@ export interface PaperExecuteDryRunReport {
     estimatedTotalNotional: number;
     wouldSubmitCount: number;
   };
+  candidateCounts?: PaperReviewReport["candidateCounts"];
+  topSkipReasons?: string[];
   wouldSubmit: AlpacaOrderPayloadDryRun[];
   blockedPayloads: BlockedPayload[];
   source: {
@@ -306,12 +312,16 @@ const emptyReport = (input: {
   dryRun: boolean;
   environment: "paper" | "live";
   assetClass?: PaperExecuteAssetClassFilter;
+  status?: PaperExecuteDryRunStatus;
+  reason?: PaperExecuteBlockerCode | null;
   reviewStatus?: PaperReviewStatus | "blocked";
   blockers?: PaperExecuteBlockerCode[];
   warnings?: string[];
   confirmations?: PaperExecuteInfoCode[];
   plannedOrdersFromPlan?: number;
   estimatedTotalNotional?: number;
+  candidateCounts?: PaperReviewReport["candidateCounts"];
+  topSkipReasons?: string[];
   source?: PaperExecuteDryRunReport["source"];
 }): PaperExecuteDryRunReport => ({
   paperOnly: true,
@@ -321,6 +331,8 @@ const emptyReport = (input: {
   nonMutating: true,
   executionMode: "dryRun",
   assetClass: input.assetClass || "all",
+  status: input.status || ((input.blockers?.length || 0) > 0 ? "blocked" : "ready"),
+  reason: input.reason ?? null,
   reviewStatus: input.reviewStatus || "blocked",
   blockers: sortUnique(input.blockers || [], BLOCKER_ORDER),
   warnings: [...new Set(input.warnings || [])],
@@ -332,6 +344,8 @@ const emptyReport = (input: {
     estimatedTotalNotional: input.estimatedTotalNotional || 0,
     wouldSubmitCount: 0
   },
+  candidateCounts: input.candidateCounts,
+  topSkipReasons: input.topSkipReasons,
   wouldSubmit: [],
   blockedPayloads: [],
   source: input.source || {}
@@ -696,7 +710,8 @@ export const buildPaperExecuteDryRunReport = async (
     blockers.push("REVIEW_NOT_NON_MUTATING");
   }
 
-  if (reviewReport.review.status === "blocked") {
+  const reviewNoOp = isReviewNoOp(reviewReport) && planReport.summary.plannedOrders === 0;
+  if (reviewReport.review.status === "blocked" && !reviewNoOp) {
     blockers.push("REVIEW_BLOCKED");
   }
 
@@ -704,11 +719,12 @@ export const buildPaperExecuteDryRunReport = async (
   const filteredPlannedCandidates = plannedCandidates.filter((candidate) =>
     candidateMatchesAssetFilter(candidate, assetClass)
   );
+  let noOpReason: PaperExecuteBlockerCode | null = null;
   if (!plannedCandidates.length) {
-    blockers.push("NO_PLANNED_ORDERS");
+    noOpReason = "NO_ELIGIBLE_PAPER_PAYLOADS";
   }
   if (plannedCandidates.length > 0 && !filteredPlannedCandidates.length) {
-    blockers.push("NO_ELIGIBLE_PAPER_PAYLOADS");
+    noOpReason = "NO_ELIGIBLE_PAPER_PAYLOADS";
   }
 
   if (blockers.length > 0) {
@@ -723,6 +739,27 @@ export const buildPaperExecuteDryRunReport = async (
       confirmations,
       plannedOrdersFromPlan: filteredPlannedCandidates.length,
       estimatedTotalNotional: planReport.summary.estimatedTotalNotional,
+      candidateCounts: reviewReport.candidateCounts,
+      topSkipReasons: reviewReport.topSkipReasons,
+      source
+    });
+  }
+
+  if (noOpReason) {
+    return emptyReport({
+      generatedAt,
+      dryRun,
+      environment: state.alpacaEnv,
+      assetClass,
+      status: "no_op",
+      reason: noOpReason,
+      reviewStatus: reviewReport.review.status,
+      warnings,
+      confirmations,
+      plannedOrdersFromPlan: filteredPlannedCandidates.length,
+      estimatedTotalNotional: planReport.summary.estimatedTotalNotional,
+      candidateCounts: reviewReport.candidateCounts,
+      topSkipReasons: reviewReport.topSkipReasons,
       source
     });
   }
@@ -754,6 +791,8 @@ export const buildPaperExecuteDryRunReport = async (
     nonMutating: true,
     executionMode: "dryRun",
     assetClass,
+    status: payloadBlockers.length ? "blocked" : "ready",
+    reason: payloadBlockers.length ? payloadBlockers[0] ?? "ORDER_PAYLOAD_INVALID" : null,
     reviewStatus: payloadBlockers.length ? "blocked" : reviewReport.review.status,
     blockers: sortUnique(payloadBlockers, BLOCKER_ORDER),
     warnings,
@@ -765,6 +804,8 @@ export const buildPaperExecuteDryRunReport = async (
       estimatedTotalNotional: planReport.summary.estimatedTotalNotional,
       wouldSubmitCount: wouldSubmit.length
     },
+    candidateCounts: reviewReport.candidateCounts,
+    topSkipReasons: reviewReport.topSkipReasons,
     wouldSubmit,
     blockedPayloads,
     source
@@ -803,6 +844,8 @@ export interface PaperExecuteConfirmReport {
   generatedAt: string;
   mode: "confirmPaper";
   assetClass: PaperExecuteAssetClassFilter;
+  status: PaperExecuteConfirmStatus;
+  reason: PaperExecuteBlockerCode | null;
   submitted: PaperExecuteSubmittedOrder[];
   blocked: PaperExecuteConfirmBlocked[];
   errors: Array<{
@@ -817,6 +860,8 @@ export interface PaperExecuteConfirmReport {
     blocked: number;
     errors: number;
   };
+  candidateCounts?: PaperReviewReport["candidateCounts"];
+  topSkipReasons?: string[];
   source: PaperExecuteDryRunReport["source"];
 }
 
@@ -861,6 +906,15 @@ const OPTION_GATE_BLOCKERS = new Set<PaperExecuteBlockerCode>([
   "OPTIONS_APPROVAL_LEVEL_INSUFFICIENT"
 ]);
 
+const NO_OP_REVIEW_BLOCKERS = new Set<string>([
+  "NO_RESEARCH_SNAPSHOTS",
+  "NO_MATCHING_SNAPSHOTS_FOR_FILTERS",
+  "NO_RUNTIME_CANDIDATES",
+  "ALL_CANDIDATES_SKIPPED",
+  "NO_CANDIDATES_EVALUATED",
+  "NO_PLANNED_ORDERS"
+]);
+
 const OPTION_EXECUTION_STRATEGIES = new Set<string>([
   "long_call",
   "long_put",
@@ -873,12 +927,21 @@ const isSupportedOptionStrategy = (
 ): value is "long_call" | "long_put" | "cash_secured_put" | "covered_call" =>
   OPTION_EXECUTION_STRATEGIES.has(value || "");
 
+const isReviewNoOp = (review: PaperReviewReport): boolean =>
+  review.review.status === "blocked" &&
+  review.review.blockers.length > 0 &&
+  review.review.blockers.every((blocker) => NO_OP_REVIEW_BLOCKERS.has(blocker));
+
 const emptyConfirmReport = (input: {
   generatedAt: string;
   environment: "paper" | "live";
   assetClass: PaperExecuteAssetClassFilter;
+  status?: PaperExecuteConfirmStatus;
+  reason?: PaperExecuteBlockerCode | null;
   blocked?: PaperExecuteConfirmBlocked[];
   errors?: PaperExecuteConfirmReport["errors"];
+  candidateCounts?: PaperReviewReport["candidateCounts"];
+  topSkipReasons?: string[];
   source?: PaperExecuteDryRunReport["source"];
 }): PaperExecuteConfirmReport => ({
   paperOnly: true,
@@ -886,6 +949,8 @@ const emptyConfirmReport = (input: {
   generatedAt: input.generatedAt,
   mode: "confirmPaper",
   assetClass: input.assetClass,
+  status: input.status || ((input.errors?.length || 0) > 0 ? "blocked" : "no_op"),
+  reason: input.reason ?? null,
   submitted: [],
   blocked: input.blocked || [],
   errors: input.errors || [],
@@ -895,6 +960,8 @@ const emptyConfirmReport = (input: {
     blocked: input.blocked?.length || 0,
     errors: input.errors?.length || 0
   },
+  candidateCounts: input.candidateCounts,
+  topSkipReasons: input.topSkipReasons,
   source: input.source || {}
 });
 
@@ -1192,6 +1259,20 @@ export const buildPaperExecuteConfirmPaperReport = async (
     explanation: blocked.explanation
   })) satisfies PaperExecuteConfirmBlocked[];
 
+  if (dryRunReport.status === "no_op") {
+    return emptyConfirmReport({
+      generatedAt,
+      environment: state.alpacaEnv,
+      assetClass,
+      status: "no_op",
+      reason: dryRunReport.reason || "NO_ELIGIBLE_PAPER_PAYLOADS",
+      blocked: preflightBlocked,
+      candidateCounts: dryRunReport.candidateCounts,
+      topSkipReasons: dryRunReport.topSkipReasons,
+      source: dryRunReport.source
+    });
+  }
+
   if (dryRunReport.blockers.includes("REVIEW_BLOCKED")) {
     pushConfirmError(errors, "PAPER_REVIEW_BLOCKED");
   }
@@ -1231,23 +1312,17 @@ export const buildPaperExecuteConfirmPaperReport = async (
   }
 
   if (!dryRunReport.wouldSubmit.length) {
-    pushConfirmError(errors, "NO_ELIGIBLE_PAPER_PAYLOADS");
-    return {
-      ...emptyConfirmReport({
-        generatedAt,
-        environment: state.alpacaEnv,
-        assetClass,
-        blocked: preflightBlocked,
-        errors,
-        source: dryRunReport.source
-      }),
-      summary: {
-        eligiblePayloads: 0,
-        submitted: 0,
-        blocked: preflightBlocked.length,
-        errors: errors.length
-      }
-    };
+    return emptyConfirmReport({
+      generatedAt,
+      environment: state.alpacaEnv,
+      assetClass,
+      status: "no_op",
+      reason: "NO_ELIGIBLE_PAPER_PAYLOADS",
+      blocked: preflightBlocked,
+      candidateCounts: dryRunReport.candidateCounts,
+      topSkipReasons: dryRunReport.topSkipReasons,
+      source: dryRunReport.source
+    });
   }
 
   const getAccountFn = deps.getAccount ?? getAccount;
@@ -1441,7 +1516,16 @@ export const buildPaperExecuteConfirmPaperReport = async (
   }
 
   if (!submitted.length && !blocked.length && !errors.length) {
-    errors.push({ reason: "NO_ELIGIBLE_PAPER_PAYLOADS" });
+    return emptyConfirmReport({
+      generatedAt,
+      environment: state.alpacaEnv,
+      assetClass,
+      status: "no_op",
+      reason: "NO_ELIGIBLE_PAPER_PAYLOADS",
+      candidateCounts: dryRunReport.candidateCounts,
+      topSkipReasons: dryRunReport.topSkipReasons,
+      source: dryRunReport.source
+    });
   }
 
   return {
@@ -1450,6 +1534,12 @@ export const buildPaperExecuteConfirmPaperReport = async (
     generatedAt,
     mode: "confirmPaper",
     assetClass,
+    status: submitted.length > 0
+      ? blocked.length > 0 || errors.length > 0
+        ? "partial"
+        : "submitted"
+      : "blocked",
+    reason: errors[0]?.reason ?? blocked[0]?.reason ?? null,
     submitted,
     blocked,
     errors,
@@ -1459,6 +1549,8 @@ export const buildPaperExecuteConfirmPaperReport = async (
       blocked: blocked.length,
       errors: errors.length
     },
+    candidateCounts: dryRunReport.candidateCounts,
+    topSkipReasons: dryRunReport.topSkipReasons,
     source: dryRunReport.source
   };
 };
@@ -1472,9 +1564,10 @@ export const formatPaperExecuteDryRunReportAsTable = (report: PaperExecuteDryRun
   const lines: string[] = [];
   lines.push("Paper Execute, dry-run only");
   lines.push(`Asset filter: ${report.assetClass}`);
+  lines.push(`Status: ${report.status}`);
+  lines.push(`Reason: ${report.reason || "none"}`);
 
   if (report.blockers.length > 0) {
-    lines.push("Status: blocked");
     lines.push("Blockers:");
     for (const blocker of report.blockers) {
       lines.push(`- ${blocker}`);
@@ -1486,6 +1579,14 @@ export const formatPaperExecuteDryRunReportAsTable = (report: PaperExecuteDryRun
   lines.push(`Review status: ${report.reviewStatus}`);
   lines.push(`Payloads constructed: ${report.summary.payloadsConstructed}`);
   lines.push(`Payloads blocked: ${report.summary.payloadsBlocked}`);
+  if (report.candidateCounts) {
+    lines.push(
+      `Candidate counts: input=${report.candidateCounts.inputCandidates}, planned=${report.candidateCounts.plannedOrders}, eligiblePayloads=${report.candidateCounts.eligiblePayloads}, alreadyHeld=${report.candidateCounts.skippedAlreadyHeld}, quoteUnavailable=${report.candidateCounts.skippedQuoteUnavailable}`
+    );
+  }
+  if (report.topSkipReasons?.length) {
+    lines.push(`Top skip reasons: ${report.topSkipReasons.join(", ")}`);
+  }
   lines.push(
     [
       pad("Asset Class", 12),
@@ -1548,9 +1649,19 @@ export const formatPaperExecuteConfirmReportAsTable = (
   const lines: string[] = [];
   lines.push("Paper Execute, confirm-paper");
   lines.push(`Asset filter: ${report.assetClass}`);
+  lines.push(`Status: ${report.status}`);
+  lines.push(`Reason: ${report.reason || "none"}`);
   lines.push(`Submitted: ${report.summary.submitted}`);
   lines.push(`Blocked: ${report.summary.blocked}`);
   lines.push(`Errors: ${report.summary.errors}`);
+  if (report.candidateCounts) {
+    lines.push(
+      `Candidate counts: input=${report.candidateCounts.inputCandidates}, planned=${report.candidateCounts.plannedOrders}, eligiblePayloads=${report.candidateCounts.eligiblePayloads}, alreadyHeld=${report.candidateCounts.skippedAlreadyHeld}, quoteUnavailable=${report.candidateCounts.skippedQuoteUnavailable}`
+    );
+  }
+  if (report.topSkipReasons?.length) {
+    lines.push(`Top skip reasons: ${report.topSkipReasons.join(", ")}`);
+  }
   lines.push(
     [
       pad("Asset Class", 12),

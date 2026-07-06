@@ -551,6 +551,106 @@ describe("paper review service", () => {
     assert.equal(report.review.blockers.includes("ALL_CANDIDATES_SKIPPED"), true);
   });
 
+  test("includes structured no-op counts for already-held candidates", async () => {
+    const report = await reviewWithPlan({
+      summary: {
+        candidatesEvaluated: 2,
+        plannedOrders: 0,
+        watched: 2,
+        skipped: 0,
+        estimatedTotalNotional: 0,
+        remainingDeployableBuyingPower: 800
+      },
+      plan: [
+        {
+          symbol: "AAPL",
+          side: "buy",
+          assetClass: "us_equity",
+          orderType: "market",
+          timeInForce: "day",
+          latestRank: 1,
+          recommendation: "long shares",
+          estimatedPrice: null,
+          estimatedQty: null,
+          estimatedNotional: null,
+          decision: "watch",
+          reasonCodes: ["ALREADY_HELD"],
+          explanation: "Watch"
+        },
+        {
+          symbol: "MSFT",
+          side: "buy",
+          assetClass: "us_equity",
+          orderType: "market",
+          timeInForce: "day",
+          latestRank: 2,
+          recommendation: "long shares",
+          estimatedPrice: null,
+          estimatedQty: null,
+          estimatedNotional: null,
+          decision: "watch",
+          reasonCodes: ["ALREADY_HELD"],
+          explanation: "Watch"
+        }
+      ]
+    });
+
+    assert.equal(report.review.status, "blocked");
+    assert.equal(report.review.blockReason, "NO_ELIGIBLE_PAPER_PAYLOADS");
+    assert.equal(report.candidateCounts.inputCandidates, 2);
+    assert.equal(report.candidateCounts.plannedOrders, 0);
+    assert.equal(report.candidateCounts.eligiblePayloads, 0);
+    assert.equal(report.candidateCounts.skippedAlreadyHeld, 2);
+    assert.deepEqual(report.topSkipReasons, ["ALREADY_HELD"]);
+  });
+
+  test("counts quote-unavailable option candidates as rejected payload candidates", async () => {
+    const report = await reviewWithPlan({
+      summary: {
+        candidatesEvaluated: 1,
+        plannedOrders: 0,
+        watched: 1,
+        skipped: 0,
+        estimatedTotalNotional: 0,
+        remainingDeployableBuyingPower: 800
+      },
+      plan: [
+        {
+          symbol: "AAPL260814C00100000",
+          side: "buy",
+          assetClass: "option",
+          orderType: "limit",
+          timeInForce: "day",
+          underlyingSymbol: "AAPL",
+          optionSymbol: "AAPL260814C00100000",
+          strategy: "long_call",
+          limitPrice: null,
+          estimatedPremium: null,
+          maxRisk: null,
+          latestRank: 1,
+          recommendation: "long long_call",
+          estimatedPrice: null,
+          estimatedQty: null,
+          estimatedNotional: null,
+          quoteStatus: "missing",
+          executable: false,
+          executablePrice: null,
+          executablePriceSource: null,
+          rejectionReason: "quote_unavailable",
+          decision: "watch",
+          reasonCodes: ["OPTION_LIMIT_PRICE_UNAVAILABLE"],
+          explanation: "Watch"
+        }
+      ]
+    });
+
+    assert.equal(report.review.status, "blocked");
+    assert.equal(report.candidateCounts.skippedQuoteUnavailable, 1);
+    assert.equal(report.executionReadiness?.options.eligible, 0);
+    assert.equal(report.executionReadiness?.options.blocked, 1);
+    assert.deepEqual(report.topSkipReasons, ["quote_unavailable"]);
+  });
+
   test("blocked for stale plan", async () => {
     const report = await reviewWithPlan({
       generatedAt: oldIso(60)

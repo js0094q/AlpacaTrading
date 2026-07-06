@@ -9,6 +9,7 @@ import { getTradingSafetyState } from "./tradingSafetyService.js";
 import type { RiskProfile } from "../types.js";
 
 export type PaperReviewStatus = "ready_for_dry_run_execution" | "warning" | "blocked";
+export type PaperReviewBlockReason = ReviewBlockerCode | "NO_ELIGIBLE_PAPER_PAYLOADS";
 
 type PaperReviewFormat = "table" | "json";
 
@@ -89,6 +90,7 @@ export interface PaperReviewReport {
   planSummary: PaperReviewPlanSummary;
   review: {
     status: PaperReviewStatus;
+    blockReason?: PaperReviewBlockReason | null;
     blockers: string[];
     warnings: string[];
     confirmationsRequired: string[];
@@ -101,6 +103,14 @@ export interface PaperReviewReport {
     optionsWarnings: string[];
     buyingPowerWarnings: string[];
   };
+  candidateCounts: {
+    inputCandidates: number;
+    plannedOrders: number;
+    eligiblePayloads: number;
+    skippedAlreadyHeld: number;
+    skippedQuoteUnavailable: number;
+  };
+  topSkipReasons: string[];
   executionReadiness?: {
     equity: {
       eligible: number;
@@ -195,6 +205,33 @@ const REVIEWER_WARNINGS: ReviewWarningCode[] = [
   "SOURCE_MARKET_DATA_LOOKBACK",
   "STALE_RECOMMENDATION_SOURCE"
 ] as const;
+
+const NO_OP_REVIEW_BLOCKERS = new Set<ReviewBlockerCode>([
+  "NO_RESEARCH_SNAPSHOTS",
+  "NO_MATCHING_SNAPSHOTS_FOR_FILTERS",
+  "NO_RUNTIME_CANDIDATES",
+  "ALL_CANDIDATES_SKIPPED",
+  "NO_CANDIDATES_EVALUATED",
+  "NO_PLANNED_ORDERS"
+]);
+
+const NON_SKIP_REASON_CODES = new Set<string>([
+  "TRADABLE",
+  "BUYING_POWER_OK",
+  "WITHIN_POSITION_CAP",
+  "QTY_ESTIMATED",
+  "RISK_PROFILE_ALLOWED",
+  "PAPER_ENV_CONFIRMED",
+  "LIVE_TRADING_DISABLED",
+  "PLAN_ONLY_NO_MUTATION",
+  "OPTION_CONTRACT_FOUND",
+  "OPTION_DTE_ALLOWED",
+  "OPTION_0DTE_ALLOWED",
+  "OPTION_RISK_LIMIT_OK",
+  "OPTION_COLLATERAL_CONFIRMED",
+  "OPTION_WIDE_SPREAD_WARNING",
+  "SPECULATIVE_OPTION_PAPER_WARNING"
+]);
 
 interface PaperReviewDeps {
   buildPlan?: (input: {
@@ -438,6 +475,69 @@ const buildExecutionReadiness = (plan: PaperPlanCandidate[]) => {
   return readiness;
 };
 
+const emptyCandidateCounts = () => ({
+  inputCandidates: 0,
+  plannedOrders: 0,
+  eligiblePayloads: 0,
+  skippedAlreadyHeld: 0,
+  skippedQuoteUnavailable: 0
+});
+
+const buildCandidateCounts = (
+  plan: PaperPlanCandidate[],
+  summary: Pick<PaperReviewPlanSummary, "candidatesEvaluated" | "plannedOrders">,
+  readiness: ReturnType<typeof buildExecutionReadiness>
+) => ({
+  inputCandidates: summary.candidatesEvaluated,
+  plannedOrders: summary.plannedOrders,
+  eligiblePayloads: readiness.equity.eligible + readiness.options.eligible,
+  skippedAlreadyHeld: plan.filter((candidate) =>
+    candidate.decision !== "planned" && candidate.reasonCodes.includes("ALREADY_HELD")
+  ).length,
+  skippedQuoteUnavailable: plan.filter((candidate) =>
+    candidate.decision !== "planned" && candidate.rejectionReason === "quote_unavailable"
+  ).length
+});
+
+const primarySkipReason = (candidate: PaperPlanCandidate): string | null => {
+  if (candidate.decision === "planned") {
+    return null;
+  }
+  if (candidate.reasonCodes.includes("ALREADY_HELD")) {
+    return "ALREADY_HELD";
+  }
+  if (candidate.rejectionReason) {
+    return candidate.rejectionReason;
+  }
+  return candidate.reasonCodes.find((code) => !NON_SKIP_REASON_CODES.has(code)) ?? candidate.decision;
+};
+
+const buildTopSkipReasons = (plan: PaperPlanCandidate[]) => {
+  const counts = new Map<string, number>();
+  for (const candidate of plan) {
+    const reason = primarySkipReason(candidate);
+    if (!reason) {
+      continue;
+    }
+    counts.set(reason, (counts.get(reason) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .map(([reason]) => reason);
+};
+
+const reviewBlockReason = (
+  blockers: ReviewBlockerCode[]
+): PaperReviewBlockReason | null => {
+  if (!blockers.length) {
+    return null;
+  }
+  if (blockers.every((blocker) => NO_OP_REVIEW_BLOCKERS.has(blocker))) {
+    return "NO_ELIGIBLE_PAPER_PAYLOADS";
+  }
+  return blockers[0] ?? null;
+};
+
 const concentrationAnalysis = (
   plan: PaperPlanCandidate[],
   maxSingleSymbolPlanPct: number
@@ -594,6 +694,7 @@ export const buildPaperReviewReport = async (
 
     const review = {
       status: parseReviewStatus(blockers, warnings),
+      blockReason: reviewBlockReason(sortUniqueCodes(blockers, REVIEWER_BLOCKERS)),
       blockers: sortUniqueCodes(blockers, [...REVIEWER_BLOCKERS, ...REVIEWER_WARNINGS]),
       warnings: sortUniqueCodes(warnings, REVIEWER_WARNINGS),
       confirmationsRequired: blockers.length
@@ -655,6 +756,8 @@ export const buildPaperReviewReport = async (
         ),
         buyingPowerWarnings: []
       },
+      candidateCounts: emptyCandidateCounts(),
+      topSkipReasons: [],
       executionReadiness: {
         equity: {
           eligible: 0,
@@ -823,9 +926,14 @@ export const buildPaperReviewReport = async (
 
   const orderedBlockers = sortUniqueCodes(blockers, REVIEWER_BLOCKERS);
   const orderedWarnings = sortUniqueCodes(warnings, REVIEWER_WARNINGS);
+  const executionReadiness = buildExecutionReadiness(planReport.plan);
+  const candidateCounts = buildCandidateCounts(planReport.plan, summary, executionReadiness);
+  const topSkipReasons = buildTopSkipReasons(planReport.plan);
+  const blockReason = reviewBlockReason(orderedBlockers);
 
   const review = {
     status,
+    blockReason,
     blockers: orderedBlockers,
     warnings: orderedWarnings,
     confirmationsRequired:
@@ -833,7 +941,9 @@ export const buildPaperReviewReport = async (
         ? []
         : [
             status === "blocked"
-              ? "Resolve blockers before running paper:review with a fresh execution plan."
+              ? blockReason === "NO_ELIGIBLE_PAPER_PAYLOADS"
+                ? "No eligible paper payloads after candidate filtering; no orders should be submitted."
+                : "Resolve blockers before running paper:review with a fresh execution plan."
               : "Review this plan and manually confirm elevated risk signals before dry-run execution review."
           ]
   };
@@ -928,7 +1038,9 @@ export const buildPaperReviewReport = async (
     planSummary: summary,
     review,
     risk: riskFlags,
-    executionReadiness: buildExecutionReadiness(planReport.plan),
+    candidateCounts,
+    topSkipReasons,
+    executionReadiness,
     plan: reviewPlan,
     source: {
       snapshotRunId: planReport.source?.snapshotRunId ?? null,
@@ -951,6 +1063,11 @@ export const formatPaperReviewReportAsTable = (report: PaperReviewReport) => {
   lines.push(`Planned orders: ${report.planSummary.plannedOrders}`);
   lines.push(`Estimated notional: ${formatMoney(report.planSummary.estimatedTotalNotional)}`);
   lines.push(`Buying power use: ${formatPercent(report.planSummary.buyingPowerUsePct)}`);
+  lines.push(`Block reason: ${report.review.blockReason || "none"}`);
+  lines.push(
+    `Candidate counts: input=${report.candidateCounts.inputCandidates}, planned=${report.candidateCounts.plannedOrders}, eligiblePayloads=${report.candidateCounts.eligiblePayloads}, alreadyHeld=${report.candidateCounts.skippedAlreadyHeld}, quoteUnavailable=${report.candidateCounts.skippedQuoteUnavailable}`
+  );
+  lines.push(`Top skip reasons: ${report.topSkipReasons.length ? report.topSkipReasons.join(", ") : "none"}`);
   if (report.executionReadiness) {
     lines.push(
       `Execution readiness: equity eligible=${report.executionReadiness.equity.eligible}, equity blocked=${report.executionReadiness.equity.blocked}, options eligible=${report.executionReadiness.options.eligible}, options blocked=${report.executionReadiness.options.blocked}`
