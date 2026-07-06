@@ -213,6 +213,7 @@ type ReviewWarningCode =
   | "WIDE_SPREAD"
   | "WEAK_SIGNAL"
   | "FALLBACK_LIMIT_PRICE_USED"
+  | "PAPER_OPTION_PLAN_NOTIONAL_ABOVE_REVIEW_LIMIT"
   | "OPTION_0DTE_PAPER_WARNING"
   | "ELEVATED_BUYING_POWER_USE"
   | "CONCENTRATION_WARNING"
@@ -254,6 +255,7 @@ const REVIEWER_WARNINGS: ReviewWarningCode[] = [
   "WIDE_SPREAD",
   "WEAK_SIGNAL",
   "FALLBACK_LIMIT_PRICE_USED",
+  "PAPER_OPTION_PLAN_NOTIONAL_ABOVE_REVIEW_LIMIT",
   "OPTION_0DTE_PAPER_WARNING",
   "ELEVATED_BUYING_POWER_USE",
   "CONCENTRATION_WARNING",
@@ -1091,8 +1093,19 @@ export const buildPaperReviewReport = async (
     blockers.push("NO_PLANNED_ORDERS");
   }
 
+  const plannedEntries = planReport.plan.filter((candidate) => candidate.decision === "planned");
+  const optionsOnlyPlannedEntries =
+    config.optionsEnabled &&
+    plannedEntries.length > 0 &&
+    plannedEntries.every((candidate) => candidate.assetClass === "option") &&
+    plannedEntries.every((candidate) => candidate.reasonCodes.includes("OPTION_RISK_LIMIT_OK"));
+
   if (summary.estimatedTotalNotional > planReport.config.maxTotalPlanNotional) {
-    blockers.push("MAX_TOTAL_PLAN_NOTIONAL_EXCEEDED");
+    if (optionsOnlyPlannedEntries) {
+      warnings.push("PAPER_OPTION_PLAN_NOTIONAL_ABOVE_REVIEW_LIMIT");
+    } else {
+      blockers.push("MAX_TOTAL_PLAN_NOTIONAL_EXCEEDED");
+    }
   }
 
   if (accountAvailable) {
@@ -1308,6 +1321,7 @@ export const buildPaperReviewReport = async (
         orderedWarnings.includes("WIDE_SPREAD") ||
         orderedWarnings.includes("WEAK_SIGNAL") ||
         orderedWarnings.includes("FALLBACK_LIMIT_PRICE_USED") ||
+        orderedWarnings.includes("PAPER_OPTION_PLAN_NOTIONAL_ABOVE_REVIEW_LIMIT") ||
         orderedWarnings.includes("OPTION_0DTE_PAPER_WARNING")
         ? [
             ...(orderedWarnings.includes("OPTIONS_ENABLED") ? ["OPTIONS_ENABLED"] : []),
@@ -1325,6 +1339,9 @@ export const buildPaperReviewReport = async (
             ...(orderedWarnings.includes("WEAK_SIGNAL") ? ["WEAK_SIGNAL"] : []),
             ...(orderedWarnings.includes("FALLBACK_LIMIT_PRICE_USED")
               ? ["FALLBACK_LIMIT_PRICE_USED"]
+              : []),
+            ...(orderedWarnings.includes("PAPER_OPTION_PLAN_NOTIONAL_ABOVE_REVIEW_LIMIT")
+              ? ["PAPER_OPTION_PLAN_NOTIONAL_ABOVE_REVIEW_LIMIT"]
               : []),
             ...(orderedWarnings.includes("OPTION_0DTE_PAPER_WARNING")
               ? ["OPTION_0DTE_PAPER_WARNING"]

@@ -23,7 +23,7 @@ import {
   buildPaperReviewReport,
   formatPaperReviewReportAsTable
 } from "../src/services/paperReviewService.js";
-import type { PaperPlanReport } from "../src/services/paperPlanService.js";
+import type { PaperPlanCandidate, PaperPlanReport } from "../src/services/paperPlanService.js";
 
 const resetDatabase = () => {
   resetSqliteTestDb(getDb(), `
@@ -967,6 +967,157 @@ describe("paper review service", () => {
     assert.equal(report.review.warnings.includes("SPECULATIVE_OPTION_PAPER_WARNING"), true);
     assert.equal(report.review.warnings.includes("OPTION_WIDE_SPREAD_WARNING"), true);
     assert.equal(report.executionReadiness?.options.eligible, 1);
+  });
+
+  test("options-only aggregate notional above review cap warns without blocking eligible payloads", async () => {
+    const plannedOption = (symbol: string, notional: number): PaperPlanCandidate => ({
+      symbol,
+      side: "buy",
+      assetClass: "option",
+      orderType: "limit",
+      timeInForce: "day",
+      underlyingSymbol: symbol.slice(0, 3),
+      optionSymbol: symbol,
+      strategyFamily: "leaps",
+      strategy: "long_call",
+      limitPrice: notional / 100,
+      estimatedPremium: notional,
+      maxRisk: notional,
+      latestRank: 1,
+      recommendation: "long long_call",
+      estimatedPrice: notional / 100,
+      estimatedQty: 1,
+      estimatedNotional: notional,
+      decision: "planned",
+      reasonCodes: [
+        "TRADABLE",
+        "BUYING_POWER_OK",
+        "WITHIN_POSITION_CAP",
+        "OPTION_CONTRACT_FOUND",
+        "OPTION_DTE_ALLOWED",
+        "OPTION_RISK_LIMIT_OK",
+        "QTY_ESTIMATED"
+      ],
+      explanation: "Planned"
+    });
+    const report = await reviewWithPlan({
+      config: {
+        riskProfile: "moderate",
+        optionsEnabled: true,
+        maxCandidates: 5,
+        maxNewPositions: 3,
+        maxPositionNotional: 100,
+        maxTotalPlanNotional: 300,
+        minBuyingPowerReservePct: 20,
+        equityNotionalPerOrder: 1000,
+        equityMaxNotionalPerOrder: 5000,
+        equityMaxPortfolioDeployPct: 50,
+        equityMaxPositionPct: 10,
+        equityMinCashReservePct: 20
+      },
+      account: {
+        status: "ACTIVE",
+        equity: 10000,
+        cash: 10000,
+        buyingPower: 10000,
+        reservedBuyingPower: 0,
+        deployableBuyingPower: 10000
+      },
+      summary: {
+        candidatesEvaluated: 2,
+        plannedOrders: 2,
+        watched: 0,
+        skipped: 0,
+        estimatedTotalNotional: 400,
+        remainingDeployableBuyingPower: 9600
+      },
+      plan: [plannedOption("SPY270115C00810000", 200), plannedOption("QQQ270115C00845000", 200)]
+    });
+
+    assert.equal(report.review.status, "warning");
+    assert.equal(report.review.blockers.includes("MAX_TOTAL_PLAN_NOTIONAL_EXCEEDED"), false);
+    assert.equal(
+      report.review.warnings.includes("PAPER_OPTION_PLAN_NOTIONAL_ABOVE_REVIEW_LIMIT"),
+      true
+    );
+    assert.equal(report.executionReadiness?.options.eligible, 2);
+  });
+
+  test("mixed or equity plans above aggregate notional cap still block", async () => {
+    const report = await reviewWithPlan({
+      config: {
+        riskProfile: "moderate",
+        optionsEnabled: true,
+        maxCandidates: 5,
+        maxNewPositions: 3,
+        maxPositionNotional: 100,
+        maxTotalPlanNotional: 300,
+        minBuyingPowerReservePct: 20,
+        equityNotionalPerOrder: 1000,
+        equityMaxNotionalPerOrder: 5000,
+        equityMaxPortfolioDeployPct: 50,
+        equityMaxPositionPct: 10,
+        equityMinCashReservePct: 20
+      },
+      account: {
+        status: "ACTIVE",
+        equity: 10000,
+        cash: 10000,
+        buyingPower: 10000,
+        reservedBuyingPower: 0,
+        deployableBuyingPower: 10000
+      },
+      summary: {
+        candidatesEvaluated: 2,
+        plannedOrders: 2,
+        watched: 0,
+        skipped: 0,
+        estimatedTotalNotional: 400,
+        remainingDeployableBuyingPower: 9600
+      },
+      plan: [
+        {
+          symbol: "AAPL",
+          side: "buy",
+          assetClass: "us_equity",
+          orderType: "market",
+          timeInForce: "day",
+          latestRank: 1,
+          recommendation: "long",
+          estimatedPrice: 200,
+          estimatedQty: 1,
+          estimatedNotional: 200,
+          decision: "planned",
+          reasonCodes: ["TRADABLE", "BUYING_POWER_OK", "QTY_ESTIMATED", "WITHIN_POSITION_CAP"],
+          explanation: "Planned"
+        },
+        {
+          symbol: "SPY270115C00810000",
+          side: "buy",
+          assetClass: "option",
+          orderType: "limit",
+          timeInForce: "day",
+          underlyingSymbol: "SPY",
+          optionSymbol: "SPY270115C00810000",
+          strategyFamily: "leaps",
+          strategy: "long_call",
+          limitPrice: 2,
+          estimatedPremium: 200,
+          maxRisk: 200,
+          latestRank: 2,
+          recommendation: "long long_call",
+          estimatedPrice: 2,
+          estimatedQty: 1,
+          estimatedNotional: 200,
+          decision: "planned",
+          reasonCodes: ["OPTION_RISK_LIMIT_OK", "TRADABLE", "BUYING_POWER_OK", "QTY_ESTIMATED"],
+          explanation: "Planned"
+        }
+      ]
+    });
+
+    assert.equal(report.review.status, "blocked");
+    assert.equal(report.review.blockers.includes("MAX_TOTAL_PLAN_NOTIONAL_EXCEEDED"), true);
   });
 
   test("warning when watched candidates exist", async () => {
