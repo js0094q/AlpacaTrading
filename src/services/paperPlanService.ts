@@ -191,6 +191,7 @@ export interface PaperPlanDiscoveryCacheRefresh {
   refreshed: boolean;
   reason: string;
   localContractsBefore: number;
+  missingUnderlyings?: string[];
   rowsIngested?: number;
   error?: string | null;
 }
@@ -285,6 +286,7 @@ interface DiscoveryRefreshResult {
   refreshed: boolean;
   reason: string;
   localContractsBefore: number;
+  missingUnderlyings?: string[];
   rowsIngested?: number;
   error?: string | null;
 }
@@ -863,6 +865,46 @@ const optionContractCacheCount = (input: {
   return row?.contracts ?? 0;
 };
 
+const optionContractCacheCountsByUnderlying = (input: {
+  underlyings: string[];
+  expirationDate?: string;
+  expirationDateGte?: string;
+  expirationDateLte?: string;
+}) => {
+  if (!input.underlyings.length) {
+    return new Map<string, number>();
+  }
+  const clauses = [
+    `underlying_symbol IN (${input.underlyings.map(() => "?").join(",")})`
+  ];
+  const params: Array<string | number> = [...input.underlyings];
+  if (input.expirationDate) {
+    clauses.push("expiration_date = ?");
+    params.push(input.expirationDate);
+  }
+  if (input.expirationDateGte) {
+    clauses.push("expiration_date >= ?");
+    params.push(input.expirationDateGte);
+  }
+  if (input.expirationDateLte) {
+    clauses.push("expiration_date <= ?");
+    params.push(input.expirationDateLte);
+  }
+
+  const rows = queryAll<{ underlying_symbol: string; contracts: number }>(
+    `
+    SELECT underlying_symbol, COUNT(*) AS contracts
+    FROM option_contracts
+    WHERE ${clauses.join(" AND ")}
+    GROUP BY underlying_symbol
+    `,
+    params
+  );
+  return new Map(
+    rows.map((row) => [normalizeSymbol(row.underlying_symbol), row.contracts ?? 0])
+  );
+};
+
 const safeDiscoveryError = (error: unknown) => {
   const message = error instanceof Error ? error.message : String(error);
   return message.length > 180 ? `${message.slice(0, 180)}...` : message;
@@ -886,7 +928,16 @@ const refreshDiscoveryContractCache = async (input: {
     expirationDateGte: input.expirationDateGte,
     expirationDateLte: input.expirationDateLte
   });
-  if (!optionContractCacheIsStale(localContractsBefore)) {
+  const localCountsByUnderlying = optionContractCacheCountsByUnderlying({
+    underlyings: input.underlyings,
+    expirationDate: input.expirationDate,
+    expirationDateGte: input.expirationDateGte,
+    expirationDateLte: input.expirationDateLte
+  });
+  const missingUnderlyings = input.underlyings.filter(
+    (symbol) => (localCountsByUnderlying.get(normalizeSymbol(symbol)) ?? 0) === 0
+  );
+  if (missingUnderlyings.length === 0 && !optionContractCacheIsStale(localContractsBefore)) {
     return {
       providerUsed: false,
       refreshed: false,
@@ -904,16 +955,26 @@ const refreshDiscoveryContractCache = async (input: {
     return {
       providerUsed: true,
       refreshed: true,
-      reason: localContractsBefore === 0 ? "local_cache_empty" : "local_cache_stale",
+      reason: localContractsBefore === 0
+        ? "local_cache_empty"
+        : missingUnderlyings.length
+          ? "local_cache_partial"
+          : "local_cache_stale",
       localContractsBefore,
+      missingUnderlyings: missingUnderlyings.length ? missingUnderlyings : undefined,
       rowsIngested: result.rowsIngested
     };
   } catch (error) {
     return {
       providerUsed: true,
       refreshed: false,
-      reason: localContractsBefore === 0 ? "local_cache_empty" : "local_cache_stale",
+      reason: localContractsBefore === 0
+        ? "local_cache_empty"
+        : missingUnderlyings.length
+          ? "local_cache_partial"
+          : "local_cache_stale",
       localContractsBefore,
+      missingUnderlyings: missingUnderlyings.length ? missingUnderlyings : undefined,
       error: safeDiscoveryError(error)
     };
   }

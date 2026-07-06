@@ -1395,6 +1395,62 @@ describe("paper plan service", () => {
     assert.equal(discovered.every((entry) => entry.strategyFamily === "leaps"), true);
   });
 
+  test("partial LEAPS cache triggers provider fetch for missing underlyings", async () => {
+    const calls: string[] = [];
+    const expirationDate = futureDate(365);
+    process.env.PAPER_LEAPS_ENABLED = "true";
+    process.env.PAPER_LEAPS_UNDERLYINGS = "SPY,QQQ";
+    insertResearchRun({ runId: "run-leaps-provider-partial", riskProfile: "moderate", optionsEnabled: true });
+    insertMarketBar({ symbol: "SPY", close: 450, timestamp: new Date().toISOString() });
+    insertMarketBar({ symbol: "QQQ", close: 380, timestamp: new Date().toISOString() });
+    insertOptionContract({
+      optionSymbol: "QQQ270115C00370000",
+      underlying: "QQQ",
+      type: "call",
+      expirationDate,
+      strike: 370
+    });
+    setMockFetch(createOptionDiscoveryFetcher({
+      calls,
+      contracts: [
+        {
+          symbol: "SPY270115C00440000",
+          underlying_symbol: "SPY",
+          type: "call",
+          expiration_date: expirationDate,
+          strike_price: "440",
+          multiplier: "100",
+          tradable: true,
+          status: "active"
+        },
+        {
+          symbol: "QQQ270115C00370000",
+          underlying_symbol: "QQQ",
+          type: "call",
+          expiration_date: expirationDate,
+          strike_price: "370",
+          multiplier: "100",
+          tradable: true,
+          status: "active"
+        }
+      ]
+    }));
+
+    const report = await planResultFor({ optionsEnabled: true });
+    const discovered = report.plan.filter((entry) =>
+      entry.sourceCandidateId?.startsWith("discovery:leaps:")
+    );
+
+    assert.equal(report.diagnostics.leapsDiscovery?.cacheRefresh?.providerUsed, true);
+    assert.equal(report.diagnostics.leapsDiscovery?.cacheRefresh?.reason, "local_cache_partial");
+    assert.deepEqual(report.diagnostics.leapsDiscovery?.cacheRefresh?.missingUnderlyings, ["SPY"]);
+    assert.equal(calls.some((target) => target.includes("/v2/options/contracts")), true);
+    assert.deepEqual(discovered.map((entry) => entry.optionSymbol).sort(), [
+      "QQQ270115C00370000",
+      "SPY270115C00440000"
+    ]);
+  });
+
   test("missing provider contract response keeps OPTION_CONTRACT_NOT_FOUND blocker", async () => {
     process.env.PAPER_0DTE_SPY_ENABLED = "true";
     process.env.ALLOW_0DTE_OPTIONS = "true";
