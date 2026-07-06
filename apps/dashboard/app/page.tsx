@@ -90,6 +90,21 @@ type PaperOpenOrdersSnapshot = {
 
 type OptionContractRow = DashboardSnapshot["optionContracts"][number];
 
+const dashboardLoadError = (message: string) => {
+  const lower = message.toLowerCase();
+  if (lower.includes("abort") || lower.includes("timed out") || lower.includes("timeout")) {
+    return {
+      title: "Dashboard Data",
+      message: "VPS summary timed out while loading dashboard state."
+    };
+  }
+
+  return {
+    title: "Environment Guard",
+    message
+  };
+};
+
 const Metric = ({ label, value }: { label: string; value: React.ReactNode }) => (
   <div className="metric">
     <span>{label}</span>
@@ -114,6 +129,7 @@ export default async function DashboardPage() {
   } catch (error) {
     guardError = error instanceof Error ? error.message : "Dashboard guard failed.";
   }
+  const loadError = guardError ? dashboardLoadError(guardError) : null;
 
   const account = snapshot
     ? asResult<PaperAccountSnapshot>(snapshot.account as DashboardCaptureResult<PaperAccountSnapshot> | DashboardCaptureError)
@@ -152,11 +168,11 @@ export default async function DashboardPage() {
         <span className="badge">PAPER ONLY</span>
       </header>
 
-      {guardError ? (
+      {loadError ? (
         <section className="grid">
           <div className="panel full">
-            <h2>Environment Guard</h2>
-            <p className="danger">{guardError}</p>
+            <h2>{loadError.title}</h2>
+            <p className="danger">{loadError.message}</p>
           </div>
         </section>
       ) : null}

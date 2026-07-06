@@ -8,7 +8,7 @@
   - Repo path on VPS: `/home/alpaca/Alpaca-Trading`
   - Runtime repo service: `alpaca-dashboard-control` (systemd) is active and bound to `127.0.0.1:4100`.
   - Health endpoint is reachable locally at `/api/v1/health` (paper-only checks enabled).
-  - `POST /api/v1/refresh` requires auth token and correctly returns paper-only guard results at present.
+  - `POST /api/v1/refresh` requires auth token, runs the read-only `paper:runtime` command, and does not run order execution or mutating safety prechecks.
 - Current hardening posture after rebuild:
   - SSH is key-only (`PasswordAuthentication no`, `KbdInteractiveAuthentication no`).
   - Root key recovery remains intentionally preserved (`PermitRootLogin without-password`) until explicitly disabled.
@@ -18,6 +18,7 @@
   - `DASHBOARD_ADMIN_TOKEN` should be confirmed in Vercel production for dashboard admin/mutating routes.
 - Verified dashboard bridge state:
   - Public summary and refresh routes reach the VPS control service and return paper-only state.
+  - Dashboard page summary loads use the VPS summary bridge with a 30 second timeout; slow summary reads should not be labeled as environment-guard failures.
   - Public `POST /api/paper/research/run` completes with valid admin auth using bounded control-service research defaults.
   - Latest review is blocked because all current candidates already have open paper orders, so no execution path is ready.
 - Fast resume command sequence:
@@ -81,7 +82,7 @@ PAPER_OPTIONS_MAX_PREMIUM_PER_ORDER=1000
 PAPER_OPTIONS_MAX_CONTRACTS=5
 PAPER_OPTIONS_MIN_DTE=0
 PAPER_OPTIONS_MAX_DTE=90
-ALLOW_0DTE_OPTIONS=false
+ALLOW_0DTE_OPTIONS=true
 PAPER_OPTIONS_ALLOW_MARKET_ORDERS=false
 PAPER_OPTIONS_LIMIT_PRICE_BASIS=mid
 OPTIONS_QUOTE_MAX_AGE_MS=900000
@@ -338,7 +339,7 @@ Paper options remain disabled by default with `PAPER_OPTIONS_EXECUTION_ENABLED=f
 - `PAPER_OPTIONS_MAX_CONTRACTS=5`
 - `PAPER_OPTIONS_MIN_DTE=0`
 - `PAPER_OPTIONS_MAX_DTE=90`
-- `ALLOW_0DTE_OPTIONS=false`
+- `ALLOW_0DTE_OPTIONS=true`
 - `PAPER_OPTIONS_ALLOW_MARKET_ORDERS=false`
 - `OPTIONS_QUOTE_MAX_AGE_MS=900000`
 - `ALLOW_OPTIONS_LAST_PRICE_FALLBACK=false`

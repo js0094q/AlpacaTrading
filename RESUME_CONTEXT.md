@@ -22,13 +22,14 @@
 - Options quote/execution controls after the quote-status fix:
   - `OPTIONS_QUOTE_MAX_AGE_MS=900000` by default.
   - `ALLOW_OPTIONS_LAST_PRICE_FALLBACK=false` by default.
-  - `ALLOW_0DTE_OPTIONS=false` by default.
+  - `ALLOW_0DTE_OPTIONS=true` for the current paper runtime target.
   - Option contracts may be discovered with null quotes, but they must carry `quoteStatus`, `executable=false`, and `rejectionReason` before they can appear in dashboard/runtime outputs.
 - Control bridge health:
   - `GET /api/v1/health` without token returns a healthy 200.
   - `POST /api/v1/refresh` without or with a bad token returns `401`.
-  - `POST /api/v1/refresh` with the control token returns 200 and remains non-mutating.
+  - `POST /api/v1/refresh` with the control token returns 200, remains non-mutating, and runs only the read-only `paper:runtime` command.
   - Public `https://www.jlsprojects.com/api/paper/summary` returns paper-only state through the Vercel-to-VPS bridge.
+  - Dashboard page summary loads use a 30 second VPS bridge timeout so slow summary reads are reported as dashboard data timeouts instead of environment-guard aborts.
   - Public `POST https://www.jlsprojects.com/api/paper/research/run` succeeds with valid admin auth after the control action was bounded to `--barLookbackDays=120`, `ALPACA_REQUEST_TIMEOUT_MS=10000`, and `ALPACA_MAX_RETRIES=0`.
 - SSH hardening:
   - key-based auth is active and password auth is disabled.

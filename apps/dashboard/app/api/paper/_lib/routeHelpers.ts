@@ -67,6 +67,17 @@ const parseVpsError = (payload: unknown) => {
   return null;
 };
 
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  Boolean(value && typeof value === "object");
+
+const noStoreVpsControlJson = (payload: unknown) => {
+  if (isRecord(payload) && typeof payload._status === "number") {
+    const { _status, ...body } = payload;
+    return noStoreJson(body, { status: _status });
+  }
+  return noStoreJson(payload);
+};
+
 const callVpsControl = async (
   path: string,
   method: "GET" | "POST",
@@ -119,6 +130,14 @@ const callVpsControl = async (
       payload = raw ? JSON.parse(raw) : null;
     } catch {
       payload = { ok: false, error: raw || "VPS control response was not JSON" };
+    }
+
+    if (!response.ok && isRecord(payload)) {
+      return {
+        ...payload,
+        _status: response.status,
+        headers: Object.fromEntries(response.headers.entries())
+      };
     }
 
     if (!response.ok) {
@@ -183,7 +202,7 @@ export const guardedGet = async (
       const response = await guardForVpsBridge(normalizedRequest, "GET", options.vpsPath, {
         timeoutMs: options.timeoutMs
       });
-      return noStoreJson(response);
+      return noStoreVpsControlJson(response);
     }
 
     return noStoreJson({ ok: true, data: await handler() });
@@ -205,7 +224,7 @@ export const guardedHistoricalGet = async (
       const response = await guardForVpsBridge(normalizedRequest, "GET", options.vpsPath, {
         timeoutMs: options.timeoutMs
       });
-      return noStoreJson(response);
+      return noStoreVpsControlJson(response);
     }
     if (shouldUseVercelReadOnlyFallback()) {
       return noStoreJson(buildVercelHistoricalFallback([]));
@@ -255,7 +274,7 @@ export const guardedPost = async (
         timeoutMs: options.timeoutMs,
         input
       });
-      return noStoreJson(response);
+      return noStoreVpsControlJson(response);
     }
 
     return noStoreJson({ ok: true, data: await handler(input) });
@@ -307,7 +326,7 @@ export const guardedHistoricalPost = async (
         timeoutMs: options.timeoutMs,
         input
       });
-      return noStoreJson(response);
+      return noStoreVpsControlJson(response);
     }
 
     return noStoreJson({ ok: true, data: await handler(input) });

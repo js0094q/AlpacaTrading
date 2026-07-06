@@ -41,6 +41,7 @@
 5. Confirm runtime auth gates:
    - `curl -sS -H "Authorization: Bearer $VPS_CONTROL_TOKEN" http://127.0.0.1:4100/api/v1/health`
    - `curl -sS -H "Authorization: Bearer $VPS_CONTROL_TOKEN" -X POST http://127.0.0.1:4100/api/v1/refresh`
+   - `refresh` is a read-only runtime refresh and should run `paper:runtime` without order execution or mutating precheck.
 
 ## Do-not-break requirements
 

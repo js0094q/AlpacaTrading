@@ -21,7 +21,9 @@ Run target:
 - `POST /api/v1/execute/confirm`
 - `POST /api/v1/refresh`
 
-All mutating actions require `Authorization: Bearer <VPS_CONTROL_TOKEN>` and fixed allowlist scripts.
+Admin POST actions require `Authorization: Bearer <VPS_CONTROL_TOKEN>` and fixed allowlist scripts.
+`POST /api/v1/refresh` is a read-only runtime refresh that runs `paper:runtime`.
+Guarded submit actions return structured safety-guard details when execution flags are disabled.
 
 Run locally (paper-mode checks still apply):
 

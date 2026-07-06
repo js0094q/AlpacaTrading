@@ -73,6 +73,7 @@ const configureDefaultRuntime = () => {
   process.env.VPS_CONTROL_BIND_HOST = "127.0.0.1";
   process.env.VPS_CONTROL_PORT = "0";
   process.env.ENABLE_AGGRESSIVE_PAPER_STRATEGIES = "true";
+  process.env.PAPER_ORDER_EXECUTION_ENABLED = "false";
   process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
   process.env.ALPACA_ENV = "paper";
   process.env.TRADING_MODE = "paper";
@@ -268,6 +269,7 @@ describe("VPS dashboard control API", () => {
   });
 
   test("execute.confirm uses fixed confirm-paper command and prefetches open orders", async () => {
+    process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
     let confirmActionArgs: string[] | null = null;
     setMockCommandRunner({
       onCommand: (_script, args) => {
@@ -327,6 +329,22 @@ describe("VPS dashboard control API", () => {
       }
     });
 
+    const response = await callControl("/api/v1/research/run", "POST", {
+      riskProfile: "aggressive",
+      optionsEnabled: true,
+      maxCandidates: 10,
+      assetClass: "all"
+    });
+
+    assert.equal(response.status, 403);
+    assert.equal(response.payload.ok, false);
+    assert.equal(response.payload.error?.code, "LIVE_TRADING_MUST_BE_DISABLED");
+    assert.match(response.payload.error?.message || "", /live trading is enabled/);
+    assert.equal(commandCalls.length, 1);
+    assert.equal(commandCalls[0].script, "alpaca:health");
+  });
+
+  test("refresh is read-only and does not run mutation precheck", async () => {
     const response = await callControl("/api/v1/refresh", "POST", {
       riskProfile: "aggressive",
       optionsEnabled: true,
@@ -334,11 +352,38 @@ describe("VPS dashboard control API", () => {
       assetClass: "all"
     });
 
-    assert.equal(response.status, 500);
-    assert.equal(response.payload.ok, false);
-    assert.match(response.payload.error?.message || "", /live trading is enabled/);
+    assert.equal(response.status, 200);
+    assert.equal(response.payload.ok, true);
     assert.equal(commandCalls.length, 1);
-    assert.equal(commandCalls[0].script, "alpaca:health");
+    assert.equal(commandCalls[0].script, "paper:runtime");
+  });
+
+  test("execute.confirm returns structured paper order guard when disabled", async () => {
+    const response = await callControl("/api/v1/execute/confirm", "POST", {
+      ...defaultRequest.body,
+      riskProfile: "aggressive",
+      optionsEnabled: true,
+      assetClass: "all"
+    });
+    const payload = response.payload as ControlResponse & {
+      guard?: {
+        paperOnly?: boolean;
+        liveTradingEnabled?: boolean;
+        mutationAllowed?: boolean;
+        paperOrderExecutionEnabled?: boolean;
+      };
+    };
+
+    assert.equal(response.status, 403);
+    assert.equal(payload.ok, false);
+    assert.equal(payload.error?.code, "PAPER_ORDER_EXECUTION_DISABLED");
+    assert.equal(payload.error?.message, "Blocked by safety guard: paper order execution is disabled.");
+    assert.equal(payload.correlationId, "request-correlation-1");
+    assert.equal(payload.guard?.paperOnly, true);
+    assert.equal(payload.guard?.liveTradingEnabled, false);
+    assert.equal(payload.guard?.mutationAllowed, false);
+    assert.equal(payload.guard?.paperOrderExecutionEnabled, false);
+    assert.equal(commandCalls.length, 0);
   });
 
   test("mutating command endpoints map to allowlisted scripts", async () => {

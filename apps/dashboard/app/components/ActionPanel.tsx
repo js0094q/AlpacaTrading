@@ -33,6 +33,13 @@ type DashboardControlPayload = {
   error?: {
     code?: string;
     message?: string;
+  } | string;
+  guard?: {
+    paperOnly?: boolean;
+    liveTradingEnabled?: boolean;
+    mutationAllowed?: boolean;
+    paperOrderExecutionEnabled?: boolean;
+    paperOptionsExecutionEnabled?: boolean;
   };
 };
 
@@ -58,6 +65,42 @@ type ActionResultData = {
     symbol?: string;
     reason?: string;
   }>;
+};
+
+const flagLine = (label: string, value: boolean | undefined) =>
+  typeof value === "boolean" ? `${label}=${String(value)}` : null;
+
+const collectGuardLines = (payload: DashboardControlPayload): string[] => {
+  if (!payload.guard) {
+    return [];
+  }
+
+  return [
+    flagLine("paperOnly", payload.guard.paperOnly),
+    flagLine("liveTradingEnabled", payload.guard.liveTradingEnabled),
+    flagLine("mutationAllowed", payload.guard.mutationAllowed),
+    flagLine("PAPER_ORDER_EXECUTION_ENABLED", payload.guard.paperOrderExecutionEnabled),
+    flagLine("PAPER_OPTIONS_EXECUTION_ENABLED", payload.guard.paperOptionsExecutionEnabled)
+  ].filter((line): line is string => Boolean(line));
+};
+
+export const describeActionFailure = (
+  parsed: DashboardControlPayload,
+  responseStatus: number,
+  actionLabel: string
+) => {
+  const message =
+    parsed?.error && typeof parsed.error === "object"
+      ? parsed.error.message || parsed.error.code || "Action failed."
+      : parsed?.error
+        ? String(parsed.error)
+        : `${actionLabel} failed`;
+
+  return {
+    message,
+    summary: `${responseStatus}: ${message}`,
+    details: collectGuardLines(parsed)
+  };
 };
 
 const collectResultLines = (data: unknown, actionLabel: string): string[] => {
@@ -179,12 +222,8 @@ export function ActionPanel({ readOnly = false }: { readOnly?: boolean }) {
       }
 
       if (!response.ok || parsed?.ok === false) {
-        const message =
-          parsed?.error && typeof parsed.error === "object"
-            ? parsed.error.message || parsed.error.code || "Action failed."
-            : parsed?.error
-              ? String(parsed.error)
-              : `${action.label} failed`;
+        const failure = describeActionFailure(parsed, response.status, action.label);
+        const message = failure.message;
         result = message;
         setStatus(message);
         setLastAction({
@@ -192,8 +231,8 @@ export function ActionPanel({ readOnly = false }: { readOnly?: boolean }) {
           correlationId: parsed.correlationId || correlationId,
           requestId: parsed.requestId || null,
           status: "failed",
-          summary: `${response.status}: ${message}`,
-          details: []
+          summary: failure.summary,
+          details: failure.details
         });
         return;
       }

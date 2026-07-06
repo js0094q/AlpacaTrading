@@ -191,4 +191,104 @@ describe("Vercel dashboard VPS bridge mode", () => {
     assert.equal(headerValue(calls[0].init.headers, "x-request-id"), null);
     assert.equal(calls[0].init.method, "POST");
   });
+
+  test("bridge preserves structured VPS safety guard responses", async () => {
+    setMockFetchResponse({
+      ok: false,
+      action: "execute.confirm",
+      requestId: "vps-request-id-guard",
+      correlationId: "client-correlation-id-guard",
+      error: {
+        code: "PAPER_ORDER_EXECUTION_DISABLED",
+        message: "Blocked by safety guard: paper order execution is disabled."
+      },
+      guard: {
+        paperOnly: true,
+        liveTradingEnabled: false,
+        mutationAllowed: false,
+        paperOrderExecutionEnabled: false,
+        paperOptionsExecutionEnabled: true
+      }
+    }, 403);
+
+    const { POST } = await importRoute<{
+      POST: (request: Request) => Promise<Response> | Response;
+    }>("apps/dashboard/app/api/paper/execute/confirm/route.ts");
+
+    const response = await POST(new Request("http://localhost/api/paper/execute/confirm", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer dashboard-admin-secret",
+        "x-correlation-id": "client-correlation-id-guard"
+      },
+      body: JSON.stringify({
+        riskProfile: "aggressive",
+        optionsEnabled: true,
+        maxCandidates: 10,
+        assetClass: "all"
+      })
+    }));
+    const payload = (await response.json()) as {
+      ok: false;
+      requestId: string;
+      correlationId: string;
+      error: { code: string; message: string };
+      guard: { paperOrderExecutionEnabled: boolean; mutationAllowed: boolean };
+    };
+
+    assert.equal(response.status, 403);
+    assert.equal(payload.ok, false);
+    assert.equal(payload.requestId, "vps-request-id-guard");
+    assert.equal(payload.correlationId, "client-correlation-id-guard");
+    assert.equal(payload.error.code, "PAPER_ORDER_EXECUTION_DISABLED");
+    assert.equal(payload.error.message, "Blocked by safety guard: paper order execution is disabled.");
+    assert.equal(payload.guard.paperOrderExecutionEnabled, false);
+    assert.equal(payload.guard.mutationAllowed, false);
+  });
+
+  test("action panel formats safety guard reason and flags", async () => {
+    const { describeActionFailure } = await importRoute<{
+      describeActionFailure: (
+        payload: {
+          ok: false;
+          error: { code: string; message: string };
+          guard: {
+            paperOnly: boolean;
+            liveTradingEnabled: boolean;
+            mutationAllowed: boolean;
+            paperOrderExecutionEnabled: boolean;
+            paperOptionsExecutionEnabled: boolean;
+          };
+        },
+        responseStatus: number,
+        actionLabel: string
+      ) => { message: string; summary: string; details: string[] };
+    }>("apps/dashboard/app/components/ActionPanel.tsx");
+
+    const failure = describeActionFailure({
+      ok: false,
+      error: {
+        code: "PAPER_ORDER_EXECUTION_DISABLED",
+        message: "Blocked by safety guard: paper order execution is disabled."
+      },
+      guard: {
+        paperOnly: true,
+        liveTradingEnabled: false,
+        mutationAllowed: false,
+        paperOrderExecutionEnabled: false,
+        paperOptionsExecutionEnabled: true
+      }
+    }, 403, "Submit to Alpaca Paper Account");
+
+    assert.equal(failure.message, "Blocked by safety guard: paper order execution is disabled.");
+    assert.equal(failure.summary, "403: Blocked by safety guard: paper order execution is disabled.");
+    assert.deepEqual(failure.details, [
+      "paperOnly=true",
+      "liveTradingEnabled=false",
+      "mutationAllowed=false",
+      "PAPER_ORDER_EXECUTION_ENABLED=false",
+      "PAPER_OPTIONS_EXECUTION_ENABLED=true"
+    ]);
+  });
 });

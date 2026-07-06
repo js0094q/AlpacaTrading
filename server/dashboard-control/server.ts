@@ -38,10 +38,12 @@ type ErrorEnvelope = {
   ok: false;
   action: string;
   requestId: string;
+  correlationId?: string;
   error: {
     code: string;
     message: string;
   };
+  guard?: EnvironmentGuardState;
 };
 
 type AuditEntry = {
@@ -80,6 +82,14 @@ type CommandRunner = (
 ) => Promise<unknown>;
 
 type OpenOrdersFetcher = () => Promise<unknown>;
+
+type EnvironmentGuardState = {
+  paperOnly: boolean;
+  liveTradingEnabled: boolean;
+  mutationAllowed: boolean;
+  paperOrderExecutionEnabled: boolean;
+  paperOptionsExecutionEnabled: boolean;
+};
 
 const getControlToken = () => process.env.VPS_CONTROL_TOKEN?.trim() || "";
 const CONTROL_HOST =
@@ -236,6 +246,42 @@ const normalizeBoolean = (value: unknown, fallback = false) => {
   return typeof value === "boolean" ? value : fallback;
 };
 
+const parseEnvBoolean = (name: string) =>
+  process.env[name] === "true" || process.env[name] === "1";
+
+const buildEnvironmentGuardState = (payload?: Record<string, unknown>): EnvironmentGuardState => {
+  const liveTradingEnabled =
+    payload?.liveTradingEnabled === true ||
+    parseEnvBoolean("LIVE_TRADING_ENABLED") ||
+    parseEnvBoolean("ALPACA_LIVE_TRADE");
+  const alpacaEnv = String(process.env.ALPACA_ENV || "paper").toLowerCase();
+
+  return {
+    paperOnly:
+      payload && "paperOnly" in payload
+        ? payload.paperOnly === true
+        : alpacaEnv === "paper" && !liveTradingEnabled,
+    liveTradingEnabled,
+    mutationAllowed: payload?.mutationAllowed === true,
+    paperOrderExecutionEnabled: parseEnvBoolean("PAPER_ORDER_EXECUTION_ENABLED"),
+    paperOptionsExecutionEnabled: parseEnvBoolean("PAPER_OPTIONS_EXECUTION_ENABLED")
+  };
+};
+
+class EnvironmentGuardError extends Error {
+  code: string;
+  status: number;
+  guard: EnvironmentGuardState;
+
+  constructor(code: string, message: string, guard: EnvironmentGuardState, status = 403) {
+    super(message);
+    this.name = "EnvironmentGuardError";
+    this.code = code;
+    this.status = status;
+    this.guard = guard;
+  }
+}
+
 const parseAssetClass = (value: unknown): AssetClass => {
   return value === "equity" || value === "option" ? value : "all";
 };
@@ -352,6 +398,25 @@ const wrapError = (action: string, requestId: string, code: string, message: str
   }
 });
 
+const wrapRouteError = (
+  action: string,
+  requestId: string,
+  correlationId: string,
+  code: string,
+  message: string,
+  guard?: EnvironmentGuardState
+): ErrorEnvelope => ({
+  ok: false,
+  action,
+  requestId,
+  correlationId,
+  error: {
+    code,
+    message
+  },
+  ...(guard ? { guard } : {})
+});
+
 type MutabilityRequirement = {
   requireAggressiveMode?: boolean;
   requireOptionsExecution?: boolean;
@@ -370,27 +435,50 @@ const verifyPaperMutability = async (requirements: MutabilityRequirement = {}) =
   }
 
   const payload = health as Record<string, unknown>;
+  const guard = buildEnvironmentGuardState(payload);
   if (payload.paperOnly !== true) {
-    throw new Error("Paper-only mode is required.");
+    throw new EnvironmentGuardError(
+      "PAPER_ENV_REQUIRED",
+      "Blocked by safety guard: paper-only mode is required.",
+      guard
+    );
   }
   if (payload.liveTradingEnabled) {
-    throw new Error("Mutations are blocked while live trading is enabled.");
+    throw new EnvironmentGuardError(
+      "LIVE_TRADING_MUST_BE_DISABLED",
+      "Blocked by safety guard: live trading is enabled in the current environment.",
+      guard
+    );
   }
   if (payload.mutationAllowed !== false) {
-    throw new Error("Mutation guardrail is not currently disabled.");
+    throw new EnvironmentGuardError(
+      "MUTATION_GUARD_STATE_INVALID",
+      "Blocked by safety guard: mutation guard state is invalid for paper-only operation.",
+      guard
+    );
   }
   if (payload.accountStatus !== "ACTIVE") {
-    throw new Error(
-      `Account status ${String(payload.accountStatus || "unknown")} blocks mutation.`
+    throw new EnvironmentGuardError(
+      "PAPER_ACCOUNT_NOT_ACTIVE",
+      `Blocked by safety guard: paper account status ${String(payload.accountStatus || "unknown")} blocks operation.`,
+      guard
     );
   }
 
   if (requirements.requireAggressiveMode && process.env.ENABLE_AGGRESSIVE_PAPER_STRATEGIES !== "true") {
-    throw new Error("Aggressive paper mode is not enabled in runtime configuration.");
+    throw new EnvironmentGuardError(
+      "AGGRESSIVE_PAPER_MODE_DISABLED",
+      "Blocked by safety guard: aggressive paper mode is disabled.",
+      guard
+    );
   }
 
   if (requirements.requireOptionsExecution && process.env.PAPER_OPTIONS_EXECUTION_ENABLED !== "true") {
-    throw new Error("Option paper execution is disabled in runtime configuration.");
+    throw new EnvironmentGuardError(
+      "PAPER_OPTIONS_EXECUTION_DISABLED",
+      "Blocked by safety guard: paper options execution is disabled.",
+      guard
+    );
   }
 };
 
@@ -405,6 +493,14 @@ const executeConfirmHandler = async (_input: ControlInput, requestId: string) =>
 
   if (_input.assetClass !== "all") {
     throw new Error("execute.confirm supports assetClass=all only.");
+  }
+
+  if (process.env.PAPER_ORDER_EXECUTION_ENABLED !== "true") {
+    throw new EnvironmentGuardError(
+      "PAPER_ORDER_EXECUTION_DISABLED",
+      "Blocked by safety guard: paper order execution is disabled.",
+      buildEnvironmentGuardState()
+    );
   }
 
   await verifyPaperMutability({
@@ -618,7 +714,7 @@ const actionHandlers: Record<string, ActionConfig> = {
     method: "POST",
     timeoutMs: 60_000,
     requireAdminToken: true,
-    requireMutationPrecheck: true,
+    requireMutationPrecheck: false,
     action: "refresh",
     handler: async (input, requestId) =>
       command(
@@ -649,6 +745,16 @@ const classifyErrorCode = (message: string) =>
       : message.includes("not parse")
         ? "CONTROL_INPUT_INVALID"
         : "CONTROL_ACTION_ERROR";
+
+const routeErrorCode = (error: unknown, message: string) =>
+  error instanceof EnvironmentGuardError ? error.code : classifyErrorCode(message);
+
+const routeErrorStatus = (error: unknown, code: string) =>
+  error instanceof EnvironmentGuardError
+    ? error.status
+    : code === "CONTROL_TOKEN_INVALID"
+      ? 401
+      : 500;
 
 const routeHandler = async (request: IncomingMessage, response: any, config: ActionConfig) => {
   const startMs = Date.now();
@@ -699,9 +805,16 @@ const routeHandler = async (request: IncomingMessage, response: any, config: Act
     response.end(JSON.stringify(payload));
   } catch (error) {
     const message = parseError(error);
-    const code = classifyErrorCode(message);
-    const status = code === "CONTROL_TOKEN_INVALID" ? 401 : 500;
-    const payload = wrapError(config.action, requestId, code, message);
+    const code = routeErrorCode(error, message);
+    const status = routeErrorStatus(error, code);
+    const payload = wrapRouteError(
+      config.action,
+      requestId,
+      correlationId,
+      code,
+      message,
+      error instanceof EnvironmentGuardError ? error.guard : undefined
+    );
     const durationMs = Date.now() - startMs;
 
     logEntry({

@@ -145,7 +145,7 @@ export interface OptionContractDashboardRow {
 
 type BridgeEnvelope<T> = { ok: true; data: T } | { ok: false; error?: unknown };
 
-const MAX_BRIDGE_TIMEOUT_MS = 8000;
+const MAX_BRIDGE_TIMEOUT_MS = 30_000;
 
 let bridgeSummaryPromise: Promise<PaperBridgeSummary> | null = null;
 
