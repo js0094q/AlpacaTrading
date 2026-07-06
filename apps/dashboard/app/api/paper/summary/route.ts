@@ -6,5 +6,6 @@ export const dynamic = "force-dynamic";
 
 export const GET = (request: Request) =>
   guardedGet(request, () => buildDashboardSnapshot(), {
-    vpsPath: "/api/v1/summary"
+    vpsPath: "/api/v1/summary",
+    timeoutMs: 30_000
   });
