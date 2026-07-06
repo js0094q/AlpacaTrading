@@ -882,12 +882,62 @@ const parseExecutionInteger = (name: string, fallback: number) => {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 };
 
+const firstExecutionEnv = (...names: string[]) => {
+  for (const name of names) {
+    const value = process.env[name];
+    if (value !== undefined && value.trim() !== "") {
+      return value;
+    }
+  }
+  return undefined;
+};
+
+const parseExecutionNumberAny = (names: string[], fallback: number) => {
+  const parsed = Number.parseFloat(firstExecutionEnv(...names) || "");
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+};
+
+const parseExecutionIntegerAny = (names: string[], fallback: number) => {
+  const parsed = Number.parseInt(firstExecutionEnv(...names) || "", 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+};
+
 const optionExecutionConfig = () => {
   const quoteCfg = optionsQuoteConfig();
   const hardSpreadCapEnabled = parseExecutionBoolean("PAPER_OPTIONS_HARD_SPREAD_CAP_ENABLED");
+  const maxPremiumPerContract = parseExecutionNumberAny(
+    ["PAPER_OPTION_MAX_PREMIUM_PER_CONTRACT", "PAPER_OPTIONS_MAX_PREMIUM_PER_ORDER"],
+    1500
+  );
+  const maxOrderNotional = parseExecutionNumberAny(
+    ["PAPER_OPTION_MAX_ORDER_NOTIONAL", "PAPER_OPTIONS_MAX_PREMIUM_PER_ORDER"],
+    1500
+  );
+  const maxContracts = Math.max(
+    1,
+    parseExecutionIntegerAny(["PAPER_OPTION_MAX_CONTRACTS", "PAPER_OPTIONS_MAX_CONTRACTS"], 1)
+  );
+  const zeroDteMaxPremiumPerContract = parseExecutionNumberAny(
+    ["PAPER_0DTE_SPY_MAX_PREMIUM_PER_CONTRACT", "PAPER_0DTE_SPY_MAX_PREMIUM_PER_TRADE"],
+    250
+  );
+  const zeroDteMaxOrderNotional = parseExecutionNumberAny(
+    ["PAPER_0DTE_SPY_MAX_ORDER_NOTIONAL", "PAPER_0DTE_SPY_MAX_PREMIUM_PER_TRADE"],
+    250
+  );
+  const leapsMaxPremiumPerContract = parseExecutionNumberAny(
+    ["PAPER_LEAPS_MAX_PREMIUM_PER_CONTRACT", "PAPER_LEAPS_MAX_PREMIUM_PER_TRADE"],
+    1500
+  );
+  const leapsMaxOrderNotional = parseExecutionNumberAny(
+    ["PAPER_LEAPS_MAX_ORDER_NOTIONAL", "PAPER_LEAPS_MAX_PREMIUM_PER_TRADE"],
+    1500
+  );
   return {
-    maxPremiumPerOrder: parseExecutionNumber("PAPER_OPTIONS_MAX_PREMIUM_PER_ORDER", 1000),
-    maxContracts: Math.max(1, parseExecutionInteger("PAPER_OPTIONS_MAX_CONTRACTS", 5)),
+    maxPremiumPerOrder: maxOrderNotional,
+    maxPremiumPerContract,
+    maxOrderNotional,
+    maxContracts,
     minDte: parseExecutionInteger("PAPER_OPTIONS_MIN_DTE", 0),
     maxDte: Math.max(1, parseExecutionInteger("PAPER_OPTIONS_MAX_DTE", 90)),
     allow0Dte: quoteCfg.allow0DteOptions,
@@ -899,8 +949,13 @@ const optionExecutionConfig = () => {
     maxPositionRiskPct: parseExecutionNumber("PAPER_OPTIONS_MAX_POSITION_RISK_PCT", 5),
     zeroDteSpy: {
       enabled: parseExecutionBoolean("PAPER_0DTE_SPY_ENABLED"),
-      maxPremiumPerTrade: parseExecutionNumber("PAPER_0DTE_SPY_MAX_PREMIUM_PER_TRADE", 500),
-      maxContracts: Math.max(1, parseExecutionInteger("PAPER_0DTE_SPY_MAX_CONTRACTS", 5)),
+      maxPremiumPerTrade: Math.min(maxOrderNotional, zeroDteMaxOrderNotional),
+      maxPremiumPerContract: Math.min(maxPremiumPerContract, zeroDteMaxPremiumPerContract),
+      maxOrderNotional: Math.min(maxOrderNotional, zeroDteMaxOrderNotional),
+      maxContracts: Math.min(
+        maxContracts,
+        Math.max(1, parseExecutionInteger("PAPER_0DTE_SPY_MAX_CONTRACTS", maxContracts))
+      ),
       maxSpreadPct: parseExecutionNumber("PAPER_0DTE_SPY_MAX_SPREAD_PCT", 20),
       hardSpreadCapEnabled:
         parseExecutionBoolean("PAPER_0DTE_SPY_HARD_SPREAD_CAP_ENABLED") ||
@@ -908,8 +963,13 @@ const optionExecutionConfig = () => {
     },
     leaps: {
       enabled: parseExecutionBoolean("PAPER_LEAPS_ENABLED"),
-      maxPremiumPerTrade: parseExecutionNumber("PAPER_LEAPS_MAX_PREMIUM_PER_TRADE", 2500),
-      maxContracts: Math.max(1, parseExecutionInteger("PAPER_LEAPS_MAX_CONTRACTS", 2)),
+      maxPremiumPerTrade: Math.min(maxOrderNotional, leapsMaxOrderNotional),
+      maxPremiumPerContract: Math.min(maxPremiumPerContract, leapsMaxPremiumPerContract),
+      maxOrderNotional: Math.min(maxOrderNotional, leapsMaxOrderNotional),
+      maxContracts: Math.min(
+        maxContracts,
+        Math.max(1, parseExecutionInteger("PAPER_LEAPS_MAX_CONTRACTS", maxContracts))
+      ),
       minDte: parseExecutionInteger("PAPER_LEAPS_MIN_DTE", 180),
       maxDte: Math.max(1, parseExecutionInteger("PAPER_LEAPS_MAX_DTE", 730)),
       maxSpreadPct: parseExecutionNumber("PAPER_LEAPS_MAX_SPREAD_PCT", 15),
@@ -1081,6 +1141,8 @@ const validateOptionPayload = (input: {
   const familyCaps = zeroDteSpyFamily
     ? {
         maxPremiumPerOrder: cfg.zeroDteSpy.maxPremiumPerTrade,
+        maxPremiumPerContract: cfg.zeroDteSpy.maxPremiumPerContract,
+        maxOrderNotional: cfg.zeroDteSpy.maxOrderNotional,
         maxContracts: cfg.zeroDteSpy.maxContracts,
         maxSpreadPct: cfg.zeroDteSpy.maxSpreadPct,
         hardSpreadCapEnabled: cfg.zeroDteSpy.hardSpreadCapEnabled
@@ -1088,12 +1150,16 @@ const validateOptionPayload = (input: {
     : leapsFamily
       ? {
           maxPremiumPerOrder: cfg.leaps.maxPremiumPerTrade,
+          maxPremiumPerContract: cfg.leaps.maxPremiumPerContract,
+          maxOrderNotional: cfg.leaps.maxOrderNotional,
           maxContracts: cfg.leaps.maxContracts,
           maxSpreadPct: cfg.leaps.maxSpreadPct,
           hardSpreadCapEnabled: cfg.leaps.hardSpreadCapEnabled
         }
       : {
           maxPremiumPerOrder: cfg.maxPremiumPerOrder,
+          maxPremiumPerContract: cfg.maxPremiumPerContract,
+          maxOrderNotional: cfg.maxOrderNotional,
           maxContracts: cfg.maxContracts,
           maxSpreadPct: cfg.maxSpreadPct,
           hardSpreadCapEnabled: cfg.hardSpreadCapEnabled
@@ -1144,7 +1210,12 @@ const validateOptionPayload = (input: {
   const estimatedPremium =
     numericField(payload.estimatedPremium) ??
     (limitPrice !== null ? limitPrice * multiplier * qty : maxRisk);
-  if (estimatedPremium > familyCaps.maxPremiumPerOrder) {
+  const perContractPremium =
+    limitPrice !== null ? limitPrice * multiplier : qty > 0 ? estimatedPremium / qty : estimatedPremium;
+  if (
+    perContractPremium > familyCaps.maxPremiumPerContract ||
+    estimatedPremium > familyCaps.maxOrderNotional
+  ) {
     return "OPTION_RISK_LIMIT_EXCEEDED";
   }
   const accountEquity =
@@ -1156,12 +1227,12 @@ const validateOptionPayload = (input: {
     accountEquity > 0 ? (accountEquity * cfg.maxPositionRiskPct) / 100 : cfg.maxPremiumPerOrder;
   const maxPortfolioRisk =
     accountEquity > 0 ? (accountEquity * cfg.maxPortfolioRiskPct) / 100 : cfg.maxPremiumPerOrder;
-  if (maxRisk > maxPositionRisk || maxRisk > maxPortfolioRisk) {
-    return "OPTION_RISK_LIMIT_EXCEEDED";
-  }
   const effectiveRisk =
     strategy === "cash_secured_put" ? Math.max(maxRisk, strike * multiplier * qty) : maxRisk;
-  if (effectiveRisk > maxPositionRisk || effectiveRisk > maxPortfolioRisk) {
+  if (
+    strategy === "cash_secured_put" &&
+    (effectiveRisk > maxPositionRisk || effectiveRisk > maxPortfolioRisk)
+  ) {
     return "OPTION_RISK_LIMIT_EXCEEDED";
   }
 

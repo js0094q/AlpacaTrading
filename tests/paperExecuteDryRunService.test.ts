@@ -401,6 +401,9 @@ beforeEach(() => {
   process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "false";
   process.env.PAPER_OPTIONS_MAX_PREMIUM_PER_ORDER = "1000";
   process.env.PAPER_OPTIONS_MAX_CONTRACTS = "5";
+  delete process.env.PAPER_OPTION_MAX_PREMIUM_PER_CONTRACT;
+  delete process.env.PAPER_OPTION_MAX_ORDER_NOTIONAL;
+  delete process.env.PAPER_OPTION_MAX_CONTRACTS;
   process.env.PAPER_OPTIONS_MIN_DTE = "0";
   process.env.PAPER_OPTIONS_MAX_DTE = "90";
   delete process.env.PAPER_OPTIONS_ALLOW_0DTE;
@@ -412,6 +415,10 @@ beforeEach(() => {
   delete process.env.PAPER_OPTIONS_HARD_SPREAD_CAP_ENABLED;
   process.env.PAPER_OPTIONS_MAX_PORTFOLIO_RISK_PCT = "20";
   process.env.PAPER_OPTIONS_MAX_POSITION_RISK_PCT = "5";
+  delete process.env.PAPER_0DTE_SPY_MAX_PREMIUM_PER_CONTRACT;
+  delete process.env.PAPER_0DTE_SPY_MAX_ORDER_NOTIONAL;
+  delete process.env.PAPER_LEAPS_MAX_PREMIUM_PER_CONTRACT;
+  delete process.env.PAPER_LEAPS_MAX_ORDER_NOTIONAL;
   delete process.env.PAPER_RUNTIME_DUPLICATE_RECONCILIATION_ENABLED;
   resetSqliteTestDb(getDb(), "DELETE FROM paper_execution_ledger;");
 });
@@ -963,14 +970,41 @@ describe("paper execute confirm-paper options", () => {
     assert.equal(report.submitted.length, 0);
   });
 
-  test("option risk above cap is blocked", async () => {
+  test("option order notional above absolute cap is blocked", async () => {
     process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
     process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
+    process.env.PAPER_OPTION_MAX_ORDER_NOTIONAL = "150";
+    process.env.PAPER_OPTION_MAX_PREMIUM_PER_CONTRACT = "150";
     const report = await confirmWith({
-      plan: [optionCandidate("long_call", { maxRisk: 6000 })]
+      plan: [optionCandidate("long_call", {
+        limitPrice: 2,
+        executablePrice: 2,
+        estimatedPremium: 200,
+        maxRisk: 200,
+        estimatedNotional: 200
+      })]
     });
     assert.equal(report.blocked[0]?.reason, "OPTION_RISK_LIMIT_EXCEEDED");
     assert.equal(report.submitted.length, 0);
+  });
+
+  test("legacy maxRisk does not block a long option when option notional is within cap", async () => {
+    process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
+    process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
+    process.env.PAPER_OPTION_MAX_ORDER_NOTIONAL = "1500";
+    process.env.PAPER_OPTION_MAX_PREMIUM_PER_CONTRACT = "1500";
+    const report = await confirmWith({
+      plan: [optionCandidate("long_call", {
+        limitPrice: 1.25,
+        executablePrice: 1.25,
+        estimatedPremium: 125,
+        maxRisk: 6000,
+        estimatedNotional: 125
+      })]
+    });
+    assert.equal(report.errors.length, 0);
+    assert.equal(report.blocked.length, 0);
+    assert.equal(report.submitted.length, 1);
   });
 
   test("max option contracts respects env cap", async () => {

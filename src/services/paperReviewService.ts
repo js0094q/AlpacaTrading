@@ -89,6 +89,16 @@ export interface PaperReviewCandidate {
   reasonCodes: string[];
   reviewFlags: string[];
   strategyFamily?: string | null;
+  underlyingSymbol?: string | null;
+  optionSymbol?: string | null;
+  strategy?: string | null;
+  limitPrice?: number | null;
+  priceSource?: string | null;
+  estimatedPremium?: number | null;
+  maxRisk?: number | null;
+  capUsed?: number | null;
+  hardBlockers?: string[];
+  warnings?: string[];
 }
 
 export interface PaperReviewReport {
@@ -199,6 +209,10 @@ type ReviewWarningCode =
   | "OPTIONS_PLANNING_NOT_IMPLEMENTED"
   | "SPECULATIVE_OPTION_PAPER_WARNING"
   | "OPTION_WIDE_SPREAD_WARNING"
+  | "QUOTE_STALE"
+  | "WIDE_SPREAD"
+  | "WEAK_SIGNAL"
+  | "FALLBACK_LIMIT_PRICE_USED"
   | "OPTION_0DTE_PAPER_WARNING"
   | "ELEVATED_BUYING_POWER_USE"
   | "CONCENTRATION_WARNING"
@@ -236,6 +250,10 @@ const REVIEWER_WARNINGS: ReviewWarningCode[] = [
   "OPTIONS_PLANNING_NOT_IMPLEMENTED",
   "SPECULATIVE_OPTION_PAPER_WARNING",
   "OPTION_WIDE_SPREAD_WARNING",
+  "QUOTE_STALE",
+  "WIDE_SPREAD",
+  "WEAK_SIGNAL",
+  "FALLBACK_LIMIT_PRICE_USED",
   "OPTION_0DTE_PAPER_WARNING",
   "ELEVATED_BUYING_POWER_USE",
   "CONCENTRATION_WARNING",
@@ -271,7 +289,10 @@ const NON_SKIP_REASON_CODES = new Set<string>([
   "OPTION_RISK_LIMIT_OK",
   "OPTION_COLLATERAL_CONFIRMED",
   "OPTION_WIDE_SPREAD_WARNING",
-  "SPECULATIVE_OPTION_PAPER_WARNING"
+  "SPECULATIVE_OPTION_PAPER_WARNING",
+  "QUOTE_STALE",
+  "WEAK_SIGNAL",
+  "FALLBACK_LIMIT_PRICE_USED"
 ]);
 
 interface PaperReviewDeps {
@@ -448,6 +469,19 @@ const buildReviewFlags = (
 
   if (candidate.reasonCodes.includes("OPTION_WIDE_SPREAD_WARNING")) {
     flags.push("OPTION_WIDE_SPREAD_WARNING");
+    flags.push("WIDE_SPREAD");
+  }
+
+  if (candidate.reasonCodes.includes("QUOTE_STALE")) {
+    flags.push("QUOTE_STALE");
+  }
+
+  if (candidate.reasonCodes.includes("WEAK_SIGNAL")) {
+    flags.push("WEAK_SIGNAL");
+  }
+
+  if (candidate.reasonCodes.includes("FALLBACK_LIMIT_PRICE_USED")) {
+    flags.push("FALLBACK_LIMIT_PRICE_USED");
   }
 
   if (candidate.reasonCodes.includes("OPTION_0DTE_ALLOWED")) {
@@ -464,7 +498,6 @@ const buildReviewFlags = (
     "NOT_ZERO_DTE",
     "DTE_OUT_OF_RANGE",
 	    "QUOTE_NULL",
-	    "QUOTE_STALE",
 	    "QUOTE_CROSSED",
 	    "SPREAD_TOO_WIDE",
 	    "PREMIUM_ABOVE_LIMIT",
@@ -510,7 +543,6 @@ const buildExecutionReadiness = (plan: PaperPlanCandidate[]) => {
             code === "UNSUPPORTED_OPTION_STRATEGY" ||
             code === "OPTIONS_PLANNING_NOT_IMPLEMENTED" ||
             code === "QUOTE_NULL" ||
-	            code === "QUOTE_STALE" ||
 	            code === "QUOTE_CROSSED" ||
 	            code === "SPREAD_TOO_WIDE" ||
 	            code === "PREMIUM_ABOVE_LIMIT" ||
@@ -945,6 +977,10 @@ export const buildPaperReviewReport = async (
               warning === "OPTIONS_PLANNING_NOT_IMPLEMENTED" ||
               warning === "SPECULATIVE_OPTION_PAPER_WARNING" ||
               warning === "OPTION_WIDE_SPREAD_WARNING" ||
+              warning === "QUOTE_STALE" ||
+              warning === "WIDE_SPREAD" ||
+              warning === "WEAK_SIGNAL" ||
+              warning === "FALLBACK_LIMIT_PRICE_USED" ||
               warning === "OPTION_0DTE_PAPER_WARNING"
           ),
           [
@@ -952,6 +988,10 @@ export const buildPaperReviewReport = async (
             "OPTIONS_PLANNING_NOT_IMPLEMENTED",
             "SPECULATIVE_OPTION_PAPER_WARNING",
             "OPTION_WIDE_SPREAD_WARNING",
+            "QUOTE_STALE",
+            "WIDE_SPREAD",
+            "WEAK_SIGNAL",
+            "FALLBACK_LIMIT_PRICE_USED",
             "OPTION_0DTE_PAPER_WARNING"
           ]
         ),
@@ -1112,6 +1152,31 @@ export const buildPaperReviewReport = async (
     )
   ) {
     warnings.push("OPTION_WIDE_SPREAD_WARNING");
+    warnings.push("WIDE_SPREAD");
+  }
+
+  if (
+    planReport.plan.some((candidate) =>
+      candidate.reasonCodes.includes("QUOTE_STALE")
+    )
+  ) {
+    warnings.push("QUOTE_STALE");
+  }
+
+  if (
+    planReport.plan.some((candidate) =>
+      candidate.reasonCodes.includes("WEAK_SIGNAL")
+    )
+  ) {
+    warnings.push("WEAK_SIGNAL");
+  }
+
+  if (
+    planReport.plan.some((candidate) =>
+      candidate.reasonCodes.includes("FALLBACK_LIMIT_PRICE_USED")
+    )
+  ) {
+    warnings.push("FALLBACK_LIMIT_PRICE_USED");
   }
 
   if (
@@ -1171,15 +1236,37 @@ export const buildPaperReviewReport = async (
           ]
   };
 
-  const reviewPlan: PaperReviewCandidate[] = planReport.plan.map((candidate) => ({
-    symbol: candidate.symbol,
-    decision: candidate.decision,
-    estimatedNotional: candidate.estimatedNotional,
-    estimatedQty: candidate.estimatedQty,
-    reasonCodes: [...new Set(candidate.reasonCodes)].sort(),
-    reviewFlags: buildReviewFlags(candidate, concentratedSymbols),
-    strategyFamily: candidate.strategyFamily ?? null
-  }));
+  const reviewPlan: PaperReviewCandidate[] = planReport.plan.map((candidate) => {
+    const reviewFlags = buildReviewFlags(candidate, concentratedSymbols);
+    const warningSet = new Set<string>(reviewFlags);
+    return {
+      symbol: candidate.symbol,
+      decision: candidate.decision,
+      estimatedNotional: candidate.estimatedNotional,
+      estimatedQty: candidate.estimatedQty,
+      reasonCodes: [...new Set(candidate.reasonCodes)].sort(),
+      reviewFlags,
+      strategyFamily: candidate.strategyFamily ?? null,
+      underlyingSymbol: candidate.underlyingSymbol ?? null,
+      optionSymbol: candidate.optionSymbol ?? null,
+      strategy: candidate.strategy ?? null,
+      limitPrice: candidate.limitPrice ?? null,
+      priceSource: candidate.riskModel?.priceSource ?? candidate.executablePriceSource ?? null,
+      estimatedPremium: candidate.estimatedPremium ?? null,
+      maxRisk: candidate.maxRisk ?? null,
+      capUsed: candidate.riskModel?.capUsed ?? candidate.riskModel?.maxPremium ?? null,
+      hardBlockers: candidate.decision === "planned"
+        ? []
+        : candidate.reasonCodes.filter((code) =>
+            !NON_SKIP_REASON_CODES.has(code) &&
+            !warningSet.has(code) &&
+            code !== "ALTERNATE_CONTRACT_NOT_SELECTED"
+          ),
+      warnings: reviewFlags.filter((flag) =>
+        (REVIEWER_WARNINGS as readonly string[]).includes(flag)
+      )
+    };
+  });
 
   const riskFlags = {
     concentrationWarnings: sortUniqueCodes(
@@ -1217,6 +1304,10 @@ export const buildPaperReviewReport = async (
         orderedWarnings.includes("OPTIONS_PLANNING_NOT_IMPLEMENTED") ||
         orderedWarnings.includes("SPECULATIVE_OPTION_PAPER_WARNING") ||
         orderedWarnings.includes("OPTION_WIDE_SPREAD_WARNING") ||
+        orderedWarnings.includes("QUOTE_STALE") ||
+        orderedWarnings.includes("WIDE_SPREAD") ||
+        orderedWarnings.includes("WEAK_SIGNAL") ||
+        orderedWarnings.includes("FALLBACK_LIMIT_PRICE_USED") ||
         orderedWarnings.includes("OPTION_0DTE_PAPER_WARNING")
         ? [
             ...(orderedWarnings.includes("OPTIONS_ENABLED") ? ["OPTIONS_ENABLED"] : []),
@@ -1228,6 +1319,12 @@ export const buildPaperReviewReport = async (
               : []),
             ...(orderedWarnings.includes("OPTION_WIDE_SPREAD_WARNING")
               ? ["OPTION_WIDE_SPREAD_WARNING"]
+              : []),
+            ...(orderedWarnings.includes("QUOTE_STALE") ? ["QUOTE_STALE"] : []),
+            ...(orderedWarnings.includes("WIDE_SPREAD") ? ["WIDE_SPREAD"] : []),
+            ...(orderedWarnings.includes("WEAK_SIGNAL") ? ["WEAK_SIGNAL"] : []),
+            ...(orderedWarnings.includes("FALLBACK_LIMIT_PRICE_USED")
+              ? ["FALLBACK_LIMIT_PRICE_USED"]
               : []),
             ...(orderedWarnings.includes("OPTION_0DTE_PAPER_WARNING")
               ? ["OPTION_0DTE_PAPER_WARNING"]
@@ -1368,6 +1465,16 @@ export const formatPaperReviewReportAsTable = (report: PaperReviewReport) => {
         ].join(" ")
       );
     });
+
+    const optionEntries = report.plan.filter((entry) => entry.optionSymbol);
+    if (optionEntries.length) {
+      lines.push("Option details:");
+      for (const entry of optionEntries) {
+        lines.push(
+          `- ${entry.optionSymbol}: decision=${entry.decision}, underlying=${entry.underlyingSymbol || entry.symbol}, limit=${formatMoney(entry.limitPrice ?? null)}, source=${entry.priceSource || "unavailable"}, notional=${formatMoney(entry.estimatedNotional)}, cap=${formatMoney(entry.capUsed ?? null)}, hardBlockers=${entry.hardBlockers?.join(", ") || "none"}, warnings=${entry.warnings?.join(", ") || "none"}`
+        );
+      }
+    }
   }
 
   lines.push("Review only. No orders were submitted.");

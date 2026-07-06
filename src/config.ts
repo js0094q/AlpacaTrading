@@ -46,6 +46,35 @@ const defaultSafeMode = () => {
   return tradingMode !== "live" && parseAlpacaEnv() === "paper";
 };
 
+const paperOptionMaxPremiumPerContract = parseNumber(
+  firstEnv("PAPER_OPTION_MAX_PREMIUM_PER_CONTRACT", "PAPER_OPTIONS_MAX_PREMIUM_PER_ORDER"),
+  1500
+);
+const paperOptionMaxOrderNotional = parseNumber(
+  firstEnv("PAPER_OPTION_MAX_ORDER_NOTIONAL", "PAPER_OPTIONS_MAX_PREMIUM_PER_ORDER"),
+  1500
+);
+const paperOptionMaxContracts = Math.max(
+  1,
+  parseInteger(firstEnv("PAPER_OPTION_MAX_CONTRACTS", "PAPER_OPTIONS_MAX_CONTRACTS"), 1)
+);
+const paperZeroDteSpyMaxPremiumPerContract = parseNumber(
+  firstEnv("PAPER_0DTE_SPY_MAX_PREMIUM_PER_CONTRACT", "PAPER_0DTE_SPY_MAX_PREMIUM_PER_TRADE"),
+  250
+);
+const paperZeroDteSpyMaxOrderNotional = parseNumber(
+  firstEnv("PAPER_0DTE_SPY_MAX_ORDER_NOTIONAL", "PAPER_0DTE_SPY_MAX_PREMIUM_PER_TRADE"),
+  250
+);
+const paperLeapsMaxPremiumPerContract = parseNumber(
+  firstEnv("PAPER_LEAPS_MAX_PREMIUM_PER_CONTRACT", "PAPER_LEAPS_MAX_PREMIUM_PER_TRADE"),
+  1500
+);
+const paperLeapsMaxOrderNotional = parseNumber(
+  firstEnv("PAPER_LEAPS_MAX_ORDER_NOTIONAL", "PAPER_LEAPS_MAX_PREMIUM_PER_TRADE"),
+  1500
+);
+
 export const config = {
   alpacaEnv: parseAlpacaEnv(),
   paperByDefault:
@@ -67,8 +96,10 @@ export const config = {
     minCashReservePct: parseNumber(process.env.PAPER_EQUITY_MIN_CASH_RESERVE_PCT, 20)
   },
   paperOptions: {
-    maxPremiumPerOrder: parseNumber(process.env.PAPER_OPTIONS_MAX_PREMIUM_PER_ORDER, 1000),
-    maxContracts: Math.max(1, parseInteger(process.env.PAPER_OPTIONS_MAX_CONTRACTS, 5)),
+    maxPremiumPerOrder: paperOptionMaxOrderNotional,
+    maxPremiumPerContract: paperOptionMaxPremiumPerContract,
+    maxOrderNotional: paperOptionMaxOrderNotional,
+    maxContracts: paperOptionMaxContracts,
     minDte: parseInteger(process.env.PAPER_OPTIONS_MIN_DTE, 0),
     maxDte: Math.max(1, parseInteger(process.env.PAPER_OPTIONS_MAX_DTE, 90)),
     allow0Dte: parseBooleanDefault(
@@ -96,8 +127,16 @@ export const config = {
   paperZeroDteSpy: {
     enabled: parseBoolean(process.env.PAPER_0DTE_SPY_ENABLED),
     underlyings: parseSymbolList(process.env.PAPER_0DTE_SPY_UNDERLYINGS, ["SPY"]),
-    maxPremiumPerTrade: parseNumber(process.env.PAPER_0DTE_SPY_MAX_PREMIUM_PER_TRADE, 500),
-    maxContracts: Math.max(1, parseInteger(process.env.PAPER_0DTE_SPY_MAX_CONTRACTS, 5)),
+    maxPremiumPerTrade: paperZeroDteSpyMaxOrderNotional,
+    maxPremiumPerContract: Math.min(
+      paperOptionMaxPremiumPerContract,
+      paperZeroDteSpyMaxPremiumPerContract
+    ),
+    maxOrderNotional: Math.min(paperOptionMaxOrderNotional, paperZeroDteSpyMaxOrderNotional),
+    maxContracts: Math.min(
+      paperOptionMaxContracts,
+      Math.max(1, parseInteger(process.env.PAPER_0DTE_SPY_MAX_CONTRACTS, paperOptionMaxContracts))
+    ),
     maxDailyTrades: Math.max(1, parseInteger(process.env.PAPER_0DTE_SPY_MAX_DAILY_TRADES, 3)),
     maxQuoteAgeSeconds: Math.max(1, parseInteger(process.env.PAPER_0DTE_SPY_MAX_QUOTE_AGE_SECONDS, 60)),
     maxSpreadPct: parseNumber(process.env.PAPER_0DTE_SPY_MAX_SPREAD_PCT, 20),
@@ -109,8 +148,16 @@ export const config = {
   paperLeaps: {
     enabled: parseBoolean(process.env.PAPER_LEAPS_ENABLED),
     underlyings: parseSymbolList(process.env.PAPER_LEAPS_UNDERLYINGS, ["SPY", "QQQ"]),
-    maxPremiumPerTrade: parseNumber(process.env.PAPER_LEAPS_MAX_PREMIUM_PER_TRADE, 2500),
-    maxContracts: Math.max(1, parseInteger(process.env.PAPER_LEAPS_MAX_CONTRACTS, 2)),
+    maxPremiumPerTrade: paperLeapsMaxOrderNotional,
+    maxPremiumPerContract: Math.min(
+      paperOptionMaxPremiumPerContract,
+      paperLeapsMaxPremiumPerContract
+    ),
+    maxOrderNotional: Math.min(paperOptionMaxOrderNotional, paperLeapsMaxOrderNotional),
+    maxContracts: Math.min(
+      paperOptionMaxContracts,
+      Math.max(1, parseInteger(process.env.PAPER_LEAPS_MAX_CONTRACTS, paperOptionMaxContracts))
+    ),
     minDte: parseInteger(process.env.PAPER_LEAPS_MIN_DTE, 180),
     maxDte: Math.max(1, parseInteger(process.env.PAPER_LEAPS_MAX_DTE, 730)),
     maxSpreadPct: parseNumber(process.env.PAPER_LEAPS_MAX_SPREAD_PCT, 15),

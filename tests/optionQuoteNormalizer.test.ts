@@ -42,7 +42,7 @@ describe("option quote normalizer", () => {
     assert.equal(quote.executablePriceSource, "midpoint");
   });
 
-  test("uses ask when only ask is valid", () => {
+  test("uses ask fallback when only ask is valid", () => {
     const quote = normalizeOptionQuote({
       optionSymbol: "IWM260706C00269000",
       bid: null,
@@ -54,7 +54,7 @@ describe("option quote normalizer", () => {
     assert.equal(quote.quoteStatus, "valid");
     assert.equal(quote.executable, true);
     assert.equal(quote.executablePrice, 1.5);
-    assert.equal(quote.executablePriceSource, "ask");
+    assert.equal(quote.executablePriceSource, "askFallback");
   });
 
   test("rejects stale quotes", () => {

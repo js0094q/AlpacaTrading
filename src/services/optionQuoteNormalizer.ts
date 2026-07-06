@@ -1,6 +1,6 @@
 export type OptionQuoteStatus = "valid" | "missing" | "invalid" | "stale";
 
-export type OptionExecutablePriceSource = "midpoint" | "ask" | "last";
+export type OptionExecutablePriceSource = "midpoint" | "ask" | "askFallback" | "last";
 
 export interface RawOptionQuoteInput {
   optionSymbol: string;
@@ -142,7 +142,7 @@ export const normalizeOptionQuote = (
   }
 
   if (ask !== null) {
-    return validQuote(base, ask, "ask");
+    return validQuote(base, ask, "askFallback");
   }
 
   if (last !== null && options.allowLastPriceFallback === true) {

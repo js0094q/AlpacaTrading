@@ -661,6 +661,95 @@ describe("paper review service", () => {
     assert.deepEqual(report.topSkipReasons, ["quote_unavailable"]);
   });
 
+  test("surfaces relaxed option guard warnings on eligible payloads", async () => {
+    const report = await reviewWithPlan({
+      config: {
+        riskProfile: "moderate",
+        optionsEnabled: true,
+        maxCandidates: 5,
+        maxNewPositions: 3,
+        maxPositionNotional: 100,
+        maxTotalPlanNotional: 300,
+        minBuyingPowerReservePct: 20,
+        equityNotionalPerOrder: 1000,
+        equityMaxNotionalPerOrder: 5000,
+        equityMaxPortfolioDeployPct: 50,
+        equityMaxPositionPct: 10,
+        equityMinCashReservePct: 20
+      },
+      plan: [
+        {
+          symbol: "AAPL260814C00100000",
+          side: "buy",
+          assetClass: "option",
+          orderType: "limit",
+          timeInForce: "day",
+          underlyingSymbol: "AAPL",
+          optionSymbol: "AAPL260814C00100000",
+          strategyFamily: "standard_option",
+          strategy: "long_call",
+          limitPrice: 1.4,
+          estimatedPremium: 140,
+          maxRisk: 140,
+          latestRank: 1,
+          recommendation: "long long_call",
+          estimatedPrice: 1.4,
+          estimatedQty: 1,
+          estimatedNotional: 140,
+          quoteStatus: "stale",
+          executable: true,
+          executablePrice: 1.4,
+          executablePriceSource: "askFallback",
+          rejectionReason: "quote_stale",
+          riskModel: {
+            maxPremium: 1500,
+            maxPremiumPerContract: 1500,
+            maxOrderNotional: 1500,
+            capUsed: 1500,
+            contracts: 1,
+            notionalPremium: 140,
+            maxLoss: 140,
+            priceSource: "askFallback",
+            expectedHoldPeriod: "swing"
+          },
+          decision: "planned",
+          reasonCodes: [
+            "OPTION_CONTRACT_FOUND",
+            "OPTION_DTE_ALLOWED",
+            "QUOTE_STALE",
+            "OPTION_WIDE_SPREAD_WARNING",
+            "WEAK_SIGNAL",
+            "FALLBACK_LIMIT_PRICE_USED",
+            "OPTION_RISK_LIMIT_OK",
+            "TRADABLE",
+            "BUYING_POWER_OK",
+            "WITHIN_POSITION_CAP",
+            "QTY_ESTIMATED"
+          ],
+          explanation: "Planned"
+        }
+      ],
+      summary: {
+        candidatesEvaluated: 1,
+        plannedOrders: 1,
+        watched: 0,
+        skipped: 0,
+        estimatedTotalNotional: 140,
+        remainingDeployableBuyingPower: 800
+      }
+    });
+
+    assert.equal(report.review.status, "warning");
+    assert.equal(report.executionReadiness?.options.eligible, 1);
+    assert.equal(report.review.blockers.length, 0);
+    assert.equal(report.review.warnings.includes("QUOTE_STALE"), true);
+    assert.equal(report.review.warnings.includes("WIDE_SPREAD"), true);
+    assert.equal(report.review.warnings.includes("WEAK_SIGNAL"), true);
+    assert.equal(report.review.warnings.includes("FALLBACK_LIMIT_PRICE_USED"), true);
+    assert.equal(report.plan[0]?.priceSource, "askFallback");
+    assert.deepEqual(report.plan[0]?.hardBlockers, []);
+  });
+
   test("blocked for stale plan", async () => {
     const report = await reviewWithPlan({
       generatedAt: oldIso(60)

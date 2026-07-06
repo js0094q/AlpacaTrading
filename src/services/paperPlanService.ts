@@ -241,6 +241,9 @@ interface CandidateRow {
   strike: number | null;
   short_strike: number | null;
   discovery_warnings?: string[];
+  discovery_selection_rank?: number | null;
+  discovery_selection_reason?: string | null;
+  discovery_selection_group?: string | null;
 }
 
 interface OptionContractPlanRow {
@@ -359,6 +362,9 @@ type PaperPlanReasonCode =
   | "PAPER_ONLY_GUARD_FAILED"
   | "LEARNING_LEDGER_WRITE_FAILED"
   | "SPECULATIVE_OPTION_PAPER_WARNING"
+  | "WEAK_SIGNAL"
+  | "FALLBACK_LIMIT_PRICE_USED"
+  | "ALTERNATE_CONTRACT_NOT_SELECTED"
   | "OPTION_0DTE_ALLOWED"
   | "OPTION_DTE_ALLOWED"
   | "OPTION_MARKET_ORDER_BLOCKED"
@@ -415,6 +421,9 @@ const REASON_ORDER = [
   "PAPER_ONLY_GUARD_FAILED",
   "LEARNING_LEDGER_WRITE_FAILED",
   "SPECULATIVE_OPTION_PAPER_WARNING",
+  "WEAK_SIGNAL",
+  "FALLBACK_LIMIT_PRICE_USED",
+  "ALTERNATE_CONTRACT_NOT_SELECTED",
   "OPTION_0DTE_ALLOWED",
   "OPTION_DTE_ALLOWED",
   "OPTION_MARKET_ORDER_BLOCKED",
@@ -687,6 +696,9 @@ const discoveryCandidate = (input: {
   contract: OptionContractPlanRow;
   signal: TargetSignalRow;
   rank: number;
+  selectionRank: number;
+  selectionReason: string;
+  selectionGroup: string;
   warnings?: string[];
 }): CandidateRow => ({
   id: `discovery:${input.family}:${input.contract.option_symbol}`,
@@ -700,7 +712,10 @@ const discoveryCandidate = (input: {
   option_symbol: input.contract.option_symbol,
   strike: input.contract.strike,
   short_strike: null,
-  discovery_warnings: input.warnings ?? []
+  discovery_warnings: input.warnings ?? [],
+  discovery_selection_rank: input.selectionRank,
+  discovery_selection_reason: input.selectionReason,
+  discovery_selection_group: input.selectionGroup
 });
 
 const rankContractByMoneyness = (
@@ -733,7 +748,24 @@ const rankContractByMoneyness = (
   return left.strike - right.strike;
 };
 
-const selectContractForUnderlying = (input: {
+const ZERO_DTE_DISCOVERY_ALTERNATIVES_PER_SIDE = 40;
+const LEAPS_DISCOVERY_DELTA_ALTERNATIVES_PER_UNDERLYING = 12;
+const LEAPS_DISCOVERY_CHEAPER_ALTERNATIVES_PER_UNDERLYING = 28;
+
+const uniqueContractsBySymbol = (contracts: OptionContractPlanRow[]): OptionContractPlanRow[] => {
+  const seen = new Set<string>();
+  const unique: OptionContractPlanRow[] = [];
+  for (const contract of contracts) {
+    if (seen.has(contract.option_symbol)) {
+      continue;
+    }
+    seen.add(contract.option_symbol);
+    unique.push(contract);
+  }
+  return unique;
+};
+
+const rankContractsForUnderlying = (input: {
   contracts: OptionContractPlanRow[];
   underlying: string;
   type: "call" | "put";
@@ -744,8 +776,8 @@ const selectContractForUnderlying = (input: {
     max: number;
     target: number;
   };
-}): OptionContractPlanRow | null => {
-  const candidates = input.contracts
+}): OptionContractPlanRow[] => {
+  return input.contracts
     .filter((contract) =>
       contract.underlying_symbol === input.underlying &&
       contract.type === input.type &&
@@ -775,7 +807,63 @@ const selectContractForUnderlying = (input: {
       }
       return rankContractByMoneyness(left, right, input.referencePrice, input.preferItm ?? false);
     });
+};
+
+const selectContractForUnderlying = (
+  input: Parameters<typeof rankContractsForUnderlying>[0]
+): OptionContractPlanRow | null => {
+  const candidates = rankContractsForUnderlying(input);
   return candidates[0] ?? null;
+};
+
+const zeroDteAlternativesForUnderlying = (
+  input: Parameters<typeof rankContractsForUnderlying>[0]
+): OptionContractPlanRow[] => {
+  const ranked = rankContractsForUnderlying(input);
+  if (input.referencePrice === null || input.referencePrice <= 0) {
+    return ranked.slice(0, ZERO_DTE_DISCOVERY_ALTERNATIVES_PER_SIDE);
+  }
+  const otmRanked = [...ranked].sort((left, right) => {
+    const leftOtm = input.type === "call"
+      ? left.strike >= input.referencePrice!
+      : left.strike <= input.referencePrice!;
+    const rightOtm = input.type === "call"
+      ? right.strike >= input.referencePrice!
+      : right.strike <= input.referencePrice!;
+    if (leftOtm !== rightOtm) {
+      return leftOtm ? -1 : 1;
+    }
+    const leftDistance = Math.abs(left.strike - input.referencePrice!);
+    const rightDistance = Math.abs(right.strike - input.referencePrice!);
+    return leftDistance - rightDistance || rankContractByMoneyness(left, right, input.referencePrice, false);
+  });
+  return uniqueContractsBySymbol([...ranked.slice(0, 8), ...otmRanked]).slice(
+    0,
+    ZERO_DTE_DISCOVERY_ALTERNATIVES_PER_SIDE
+  );
+};
+
+const leapsAlternativesForUnderlying = (
+  input: Parameters<typeof rankContractsForUnderlying>[0]
+): OptionContractPlanRow[] => {
+  const ranked = rankContractsForUnderlying(input);
+  const cheaperRanked = [...ranked].sort((left, right) => {
+    if (input.referencePrice !== null && input.referencePrice > 0) {
+      const leftOtm = left.strike >= input.referencePrice;
+      const rightOtm = right.strike >= input.referencePrice;
+      if (leftOtm !== rightOtm) {
+        return leftOtm ? -1 : 1;
+      }
+      if (leftOtm && rightOtm && left.strike !== right.strike) {
+        return left.strike - right.strike;
+      }
+    }
+    return rankContractByMoneyness(left, right, input.referencePrice, false);
+  });
+  return uniqueContractsBySymbol([
+    ...ranked.slice(0, LEAPS_DISCOVERY_DELTA_ALTERNATIVES_PER_UNDERLYING),
+    ...cheaperRanked.slice(0, LEAPS_DISCOVERY_CHEAPER_ALTERNATIVES_PER_UNDERLYING)
+  ]);
 };
 
 const emptyDiscoveryDiagnostics = (
@@ -1093,26 +1181,31 @@ const buildZeroDteSpyDiscoveryCandidates = (
       continue;
     }
 
-    const selected = selectContractForUnderlying({
+    const alternatives = zeroDteAlternativesForUnderlying({
       contracts: sameDay,
       underlying: "SPY",
       type,
       referencePrice
     });
-    if (!selected) {
+    if (!alternatives.length) {
       diagnostics.hardBlockers.push("OPTION_CONTRACT_NOT_FOUND");
       continue;
     }
 
-    candidates.push(
-      discoveryCandidate({
-        family: "zero_dte_spy",
-        contract: selected,
-        signal,
-        rank: startingRank + candidates.length,
-        warnings
-      })
-    );
+    alternatives.forEach((contract, index) => {
+      candidates.push(
+        discoveryCandidate({
+          family: "zero_dte_spy",
+          contract,
+          signal,
+          rank: startingRank + candidates.length,
+          selectionRank: index + 1,
+          selectionReason: index === 0 ? "nearest_reference_contract" : "cheaper_otm_alternative",
+          selectionGroup: `zero_dte_spy:SPY:${strategyForContract(contract)}`,
+          warnings
+        })
+      );
+    });
   }
 
   diagnostics.candidatesSelected = candidates.length;
@@ -1175,7 +1268,7 @@ const buildLeapsDiscoveryCandidates = (
     const signal = signalDirectionFor(underlying);
     const warnings = discoveryWarningsForSignal(signal);
     diagnostics.warnings.push(...warnings.map((warning) => `${underlying}:${warning}`));
-    const selected = selectContractForUnderlying({
+    const alternatives = leapsAlternativesForUnderlying({
       contracts: inRange,
       underlying,
       type: "call",
@@ -1183,18 +1276,23 @@ const buildLeapsDiscoveryCandidates = (
       preferItm: true,
       preferDeltaRange: { min: 0.6, max: 0.8, target: 0.7 }
     });
-    if (!selected) {
+    if (!alternatives.length) {
       continue;
     }
-    candidates.push(
-      discoveryCandidate({
-        family: "leaps",
-        contract: selected,
-        signal,
-        rank: startingRank + candidates.length,
-        warnings
-      })
-    );
+    alternatives.forEach((contract, index) => {
+      candidates.push(
+        discoveryCandidate({
+          family: "leaps",
+          contract,
+          signal,
+          rank: startingRank + candidates.length,
+          selectionRank: index + 1,
+          selectionReason: index === 0 ? "delta_preferred_contract" : "cheaper_leaps_alternative",
+          selectionGroup: `leaps:${underlying}:${strategyForContract(contract)}`,
+          warnings
+        })
+      );
+    });
   }
 
   if (!candidates.length) {
@@ -1334,6 +1432,26 @@ const parseIntegerEnv = (name: string, fallback: number): number => {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 };
 
+const firstEnvValue = (...names: string[]): string | undefined => {
+  for (const name of names) {
+    const value = process.env[name];
+    if (value !== undefined && value.trim() !== "") {
+      return value;
+    }
+  }
+  return undefined;
+};
+
+const parseNumberEnvAny = (names: string[], fallback: number): number => {
+  const parsed = Number.parseFloat(firstEnvValue(...names) || "");
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+};
+
+const parseIntegerEnvAny = (names: string[], fallback: number): number => {
+  const parsed = Number.parseInt(firstEnvValue(...names) || "", 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+};
+
 const parseSymbolListEnv = (name: string, fallback: string[]): string[] => {
   const value = process.env[name];
   const source = value === undefined || value.trim() === "" ? fallback.join(",") : value;
@@ -1350,9 +1468,39 @@ const parseSymbolListEnv = (name: string, fallback: string[]): string[] => {
 const paperOptionsConfig = () => {
   const quoteCfg = optionsQuoteConfig();
   const hardSpreadCapEnabled = parseBooleanEnv("PAPER_OPTIONS_HARD_SPREAD_CAP_ENABLED", false);
+  const maxPremiumPerContract = parseNumberEnvAny(
+    ["PAPER_OPTION_MAX_PREMIUM_PER_CONTRACT", "PAPER_OPTIONS_MAX_PREMIUM_PER_ORDER"],
+    1500
+  );
+  const maxOrderNotional = parseNumberEnvAny(
+    ["PAPER_OPTION_MAX_ORDER_NOTIONAL", "PAPER_OPTIONS_MAX_PREMIUM_PER_ORDER"],
+    1500
+  );
+  const maxContracts = Math.max(
+    1,
+    parseIntegerEnvAny(["PAPER_OPTION_MAX_CONTRACTS", "PAPER_OPTIONS_MAX_CONTRACTS"], 1)
+  );
+  const zeroDteMaxPremiumPerContract = parseNumberEnvAny(
+    ["PAPER_0DTE_SPY_MAX_PREMIUM_PER_CONTRACT", "PAPER_0DTE_SPY_MAX_PREMIUM_PER_TRADE"],
+    250
+  );
+  const zeroDteMaxOrderNotional = parseNumberEnvAny(
+    ["PAPER_0DTE_SPY_MAX_ORDER_NOTIONAL", "PAPER_0DTE_SPY_MAX_PREMIUM_PER_TRADE"],
+    250
+  );
+  const leapsMaxPremiumPerContract = parseNumberEnvAny(
+    ["PAPER_LEAPS_MAX_PREMIUM_PER_CONTRACT", "PAPER_LEAPS_MAX_PREMIUM_PER_TRADE"],
+    1500
+  );
+  const leapsMaxOrderNotional = parseNumberEnvAny(
+    ["PAPER_LEAPS_MAX_ORDER_NOTIONAL", "PAPER_LEAPS_MAX_PREMIUM_PER_TRADE"],
+    1500
+  );
   return {
-    maxPremiumPerOrder: parseNumberEnv("PAPER_OPTIONS_MAX_PREMIUM_PER_ORDER", 1000),
-    maxContracts: Math.max(1, parseIntegerEnv("PAPER_OPTIONS_MAX_CONTRACTS", 5)),
+    maxPremiumPerOrder: maxOrderNotional,
+    maxPremiumPerContract,
+    maxOrderNotional,
+    maxContracts,
     minDte: parseIntegerEnv("PAPER_OPTIONS_MIN_DTE", 0),
     maxDte: Math.max(1, parseIntegerEnv("PAPER_OPTIONS_MAX_DTE", 90)),
     allow0Dte: quoteCfg.allow0DteOptions,
@@ -1373,8 +1521,13 @@ const paperOptionsConfig = () => {
     zeroDteSpy: {
       enabled: parseBooleanEnv("PAPER_0DTE_SPY_ENABLED", false),
       underlyings: parseSymbolListEnv("PAPER_0DTE_SPY_UNDERLYINGS", ["SPY"]),
-      maxPremiumPerTrade: parseNumberEnv("PAPER_0DTE_SPY_MAX_PREMIUM_PER_TRADE", 500),
-      maxContracts: Math.max(1, parseIntegerEnv("PAPER_0DTE_SPY_MAX_CONTRACTS", 5)),
+      maxPremiumPerTrade: Math.min(maxOrderNotional, zeroDteMaxOrderNotional),
+      maxPremiumPerContract: Math.min(maxPremiumPerContract, zeroDteMaxPremiumPerContract),
+      maxOrderNotional: Math.min(maxOrderNotional, zeroDteMaxOrderNotional),
+      maxContracts: Math.min(
+        maxContracts,
+        Math.max(1, parseIntegerEnv("PAPER_0DTE_SPY_MAX_CONTRACTS", maxContracts))
+      ),
       maxDailyTrades: Math.max(1, parseIntegerEnv("PAPER_0DTE_SPY_MAX_DAILY_TRADES", 3)),
       maxQuoteAgeSeconds: Math.max(1, parseIntegerEnv("PAPER_0DTE_SPY_MAX_QUOTE_AGE_SECONDS", 60)),
       maxSpreadPct: parseNumberEnv("PAPER_0DTE_SPY_MAX_SPREAD_PCT", 20),
@@ -1386,8 +1539,13 @@ const paperOptionsConfig = () => {
     leaps: {
       enabled: parseBooleanEnv("PAPER_LEAPS_ENABLED", false),
       underlyings: parseSymbolListEnv("PAPER_LEAPS_UNDERLYINGS", ["SPY", "QQQ"]),
-      maxPremiumPerTrade: parseNumberEnv("PAPER_LEAPS_MAX_PREMIUM_PER_TRADE", 2500),
-      maxContracts: Math.max(1, parseIntegerEnv("PAPER_LEAPS_MAX_CONTRACTS", 2)),
+      maxPremiumPerTrade: Math.min(maxOrderNotional, leapsMaxOrderNotional),
+      maxPremiumPerContract: Math.min(maxPremiumPerContract, leapsMaxPremiumPerContract),
+      maxOrderNotional: Math.min(maxOrderNotional, leapsMaxOrderNotional),
+      maxContracts: Math.min(
+        maxContracts,
+        Math.max(1, parseIntegerEnv("PAPER_LEAPS_MAX_CONTRACTS", maxContracts))
+      ),
       minDte: parseIntegerEnv("PAPER_LEAPS_MIN_DTE", 180),
       maxDte: Math.max(1, parseIntegerEnv("PAPER_LEAPS_MAX_DTE", 730)),
       maxSpreadPct: parseNumberEnv("PAPER_LEAPS_MAX_SPREAD_PCT", 15),
@@ -1504,7 +1662,9 @@ const asQuoteStatus = (value: string | null): OptionQuoteStatus | null =>
     : null;
 
 const asExecutablePriceSource = (value: string | null): OptionExecutablePriceSource | null =>
-  value === "midpoint" || value === "ask" || value === "last" ? value : null;
+  value === "midpoint" || value === "ask" || value === "askFallback" || value === "last"
+    ? value
+    : null;
 
 const optionQuoteFields = (quote: NormalizedOptionQuote) => ({
   quoteStatus: quote.quoteStatus,
@@ -1539,6 +1699,45 @@ const quoteQualityReason = (quote: NormalizedOptionQuote): PaperPlanReasonCode =
   return "OPTION_LIMIT_PRICE_UNAVAILABLE";
 };
 
+type DerivedOptionLimitPrice = {
+  limitPrice: number | null;
+  source: "midpoint" | "askFallback" | "unavailable";
+};
+
+const derivePaperOptionLimitPrice = (
+  quote: NormalizedOptionQuote,
+  side: "buy" | "sell",
+  basis: string
+): DerivedOptionLimitPrice => {
+  if (quote.bid === null || quote.ask === null || quote.bid <= 0 || quote.ask <= 0) {
+    return { limitPrice: null, source: "unavailable" };
+  }
+  if (quote.ask < quote.bid) {
+    return { limitPrice: null, source: "unavailable" };
+  }
+
+  if (basis === "ask" && side === "buy") {
+    return {
+      limitPrice: roundOptionLimitPrice(quote.ask),
+      source: "askFallback"
+    };
+  }
+
+  const midpoint = roundOptionLimitPrice((quote.bid + quote.ask) / 2);
+  if (midpoint > 0) {
+    return { limitPrice: midpoint, source: "midpoint" };
+  }
+
+  if (side === "buy" && quote.ask > 0) {
+    return {
+      limitPrice: roundOptionLimitPrice(quote.ask),
+      source: "askFallback"
+    };
+  }
+
+  return { limitPrice: null, source: "unavailable" };
+};
+
 const quoteSnapshotModel = (
   quote: NormalizedOptionQuote,
   spreadPct: number | null
@@ -1560,9 +1759,11 @@ const paperFillModelFor = (
   const source =
     quote.executablePriceSource === "midpoint"
       ? "midpoint"
-      : quote.executablePriceSource === "ask"
-        ? "ask"
-        : "paper_order";
+      : quote.executablePriceSource === "askFallback"
+        ? "askFallback"
+        : quote.executablePriceSource === "ask"
+          ? "ask"
+          : "paper_order";
   return {
     submittedLimitPrice: limitPrice,
     assumedFillPrice: limitPrice,
@@ -1775,6 +1976,8 @@ const familyRiskCaps = (
   if (family === "zero_dte_spy") {
     return {
       maxPremiumPerTrade: options.zeroDteSpy.maxPremiumPerTrade,
+      maxPremiumPerContract: options.zeroDteSpy.maxPremiumPerContract,
+      maxOrderNotional: options.zeroDteSpy.maxOrderNotional,
       maxContracts: options.zeroDteSpy.maxContracts,
       maxSpreadPct: options.zeroDteSpy.maxSpreadPct,
       hardSpreadCapEnabled: options.zeroDteSpy.hardSpreadCapEnabled
@@ -1783,6 +1986,8 @@ const familyRiskCaps = (
   if (family === "leaps") {
     return {
       maxPremiumPerTrade: options.leaps.maxPremiumPerTrade,
+      maxPremiumPerContract: options.leaps.maxPremiumPerContract,
+      maxOrderNotional: options.leaps.maxOrderNotional,
       maxContracts: options.leaps.maxContracts,
       maxSpreadPct: options.leaps.maxSpreadPct,
       hardSpreadCapEnabled: options.leaps.hardSpreadCapEnabled
@@ -1790,6 +1995,8 @@ const familyRiskCaps = (
   }
   return {
     maxPremiumPerTrade: options.maxPremiumPerOrder,
+    maxPremiumPerContract: options.maxPremiumPerContract,
+    maxOrderNotional: options.maxOrderNotional,
     maxContracts: options.maxContracts,
     maxSpreadPct: options.maxSpreadPct,
     hardSpreadCapEnabled: options.hardSpreadCapEnabled
@@ -1829,7 +2036,10 @@ const learningBlockReasonFor = (candidate: PaperPlanCandidate): string | null =>
       "WITHIN_POSITION_CAP",
       "QTY_ESTIMATED",
       "SPECULATIVE_OPTION_PAPER_WARNING",
-      "OPTION_WIDE_SPREAD_WARNING"
+      "OPTION_WIDE_SPREAD_WARNING",
+      "QUOTE_STALE",
+      "WEAK_SIGNAL",
+      "FALLBACK_LIMIT_PRICE_USED"
     ].includes(code)
   );
   return candidate.rejectionReason || blocking || null;
@@ -1870,7 +2080,7 @@ const attachLearningRecord = (input: {
       optionSymbol: input.plan.optionSymbol ?? null,
       decision,
       skipReason: decision === "submitted" ? null : blockReason,
-      blockReason,
+      blockReason: decision === "submitted" ? null : blockReason,
       hypothesis: input.plan.hypothesis || hypothesisForFamily(family),
       signalInputs,
       optionMetadata: input.plan.optionMetadata ?? null,
@@ -1915,6 +2125,25 @@ const assertPlanGuards = (riskProfile: RiskProfile): void => {
     throw new Error("AGGRESSIVE mode requires ENABLE_AGGRESSIVE_PAPER_STRATEGIES=true.");
   }
 };
+
+const discoverySelectionGroupForPlan = (candidate: PaperPlanCandidate): string | null => {
+  const selectionGroup = candidate.optionMetadata?.selectionGroup;
+  return typeof selectionGroup === "string" && selectionGroup.trim() !== ""
+    ? selectionGroup
+    : null;
+};
+
+const skipUnselectedDiscoveryAlternative = (
+  candidate: PaperPlanCandidate
+): PaperPlanCandidate => ({
+  ...candidate,
+  decision: "skip",
+  reasonCodes: buildReasonList([
+    ...candidate.reasonCodes,
+    "ALTERNATE_CONTRACT_NOT_SELECTED"
+  ]),
+  explanation: explanationFor("skip", ["ALTERNATE_CONTRACT_NOT_SELECTED"])
+});
 
 const formatQty = (value: number | null): string =>
   value === null ? "-" : value.toFixed(4);
@@ -2156,7 +2385,10 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
       dte,
       strike: contract.strike,
       multiplier: contract.multiplier || 100,
-      tradable: contract.tradable === 1
+      tradable: contract.tradable === 1,
+      selectionRank: candidate.discovery_selection_rank ?? null,
+      selectionReason: candidate.discovery_selection_reason ?? null,
+      selectionGroup: candidate.discovery_selection_group ?? null
     };
     const discoverySource = discoverySourceFromCandidateId(candidate.id);
     const signalInputs = {
@@ -2172,6 +2404,9 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
             discoverySource,
             discoveryGenerated: true,
             discoveryUnderlying: contract.underlying_symbol,
+            selectionRank: candidate.discovery_selection_rank ?? null,
+            selectionReason: candidate.discovery_selection_reason ?? null,
+            selectionGroup: candidate.discovery_selection_group ?? null,
             warnings: candidate.discovery_warnings ?? []
           }
         : {})
@@ -2292,35 +2527,39 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         : options
     );
     const spreadPct = spreadPctFor(quote.bid, quote.ask);
-    const staleQuoteUsable =
-      quote.quoteStatus === "stale" &&
+    const quoteBidAskUsable =
       quote.bid !== null &&
       quote.ask !== null &&
+      quote.bid > 0 &&
+      quote.ask > 0 &&
       quote.ask >= quote.bid;
-    const staleExecutablePrice =
-      staleQuoteUsable
-        ? quote.midpoint !== null && quote.midpoint > 0
-          ? quote.midpoint
-          : quote.ask
-        : null;
-    const quoteForPlanning: NormalizedOptionQuote = staleQuoteUsable
+    const staleQuoteUsable =
+      quote.quoteStatus === "stale" &&
+      quoteBidAskUsable;
+    const quoteUsableForPaper =
+      quote.quoteStatus === "valid" || staleQuoteUsable;
+    const derivedLimit = quoteUsableForPaper
+      ? derivePaperOptionLimitPrice(quote, side, options.limitPriceBasis)
+      : { limitPrice: null, source: "unavailable" as const };
+    const quoteForPlanning: NormalizedOptionQuote =
+      quoteUsableForPaper && derivedLimit.limitPrice !== null
       ? {
           ...quote,
           executable: true,
-          executablePrice: staleExecutablePrice,
+          executablePrice: derivedLimit.limitPrice,
           executablePriceSource:
-            quote.midpoint !== null && quote.midpoint > 0 ? "midpoint" : "ask",
-          rejectionReason: quote.rejectionReason ?? "quote_stale"
+            derivedLimit.source === "midpoint" ? "midpoint" : "askFallback",
+          rejectionReason:
+            quote.quoteStatus === "stale"
+              ? quote.rejectionReason ?? "quote_stale"
+              : quote.rejectionReason
         }
       : quote;
-    const limitPrice =
-      quoteForPlanning.executable && quoteForPlanning.executablePrice !== null
-        ? roundOptionLimitPrice(quoteForPlanning.executablePrice)
-        : null;
+    const limitPrice = derivedLimit.limitPrice;
     if (
-      (quote.quoteStatus !== "valid" && !staleQuoteUsable) ||
-      !quoteForPlanning.executable ||
-      limitPrice === null
+      !quoteUsableForPaper ||
+      limitPrice === null ||
+      limitPrice <= 0
     ) {
       const qualityReason = quoteQualityReason(quote);
       return {
@@ -2354,19 +2593,13 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
       strategy === "cash_secured_put"
         ? roundMoney(contract.strike * multiplier)
         : perContractPremium;
-    const maxPositionRisk = accountRelativeCap(accountEquity, options.maxPositionRiskPct);
-    const maxPortfolioRisk = accountRelativeCap(accountEquity, options.maxPortfolioRiskPct);
-    const remainingPortfolioRisk =
-      maxPortfolioRisk === null ? null : roundMoney(Math.max(0, maxPortfolioRisk - plannedNotional));
-    const contractsByPremium = positiveFloor(familyCaps.maxPremiumPerTrade / perContractPremium);
-    const contractsByPositionRisk =
-      maxPositionRisk === null
+    const contractsByPremium =
+      perContractPremium <= familyCaps.maxPremiumPerContract
         ? familyCaps.maxContracts
-        : positiveFloor(maxPositionRisk / perContractMaxRisk);
-    const contractsByPortfolioRisk =
-      remainingPortfolioRisk === null
-        ? familyCaps.maxContracts
-        : positiveFloor(remainingPortfolioRisk / perContractMaxRisk);
+        : 0;
+    const contractsByOrderNotional = positiveFloor(
+      familyCaps.maxOrderNotional / perContractPremium
+    );
     const contractsByBuyingPower =
       deployableBuyingPower === null
         ? familyCaps.maxContracts
@@ -2374,8 +2607,7 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
     const contracts = Math.min(
       familyCaps.maxContracts,
       contractsByPremium,
-      contractsByPositionRisk,
-      contractsByPortfolioRisk,
+      contractsByOrderNotional,
       contractsByBuyingPower
     );
     const premiumRisk = roundMoney(limitPrice * multiplier * contracts);
@@ -2384,17 +2616,43 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         ? roundMoney(contract.strike * multiplier * contracts)
         : 0;
     const maxRisk = strategy === "cash_secured_put" ? collateralRisk : premiumRisk;
-    const candidateMaxLoss = toNullableNumber(candidate.estimated_max_loss);
-    const configuredRisk =
-      candidateMaxLoss !== null && candidateMaxLoss > 0 && strategy !== "covered_call"
-        ? Math.max(maxRisk, candidateMaxLoss)
-        : maxRisk;
-
+    const configuredRisk = maxRisk;
+    const maxPositionRisk = accountRelativeCap(accountEquity, options.maxPositionRiskPct);
+    const maxPortfolioRisk = accountRelativeCap(accountEquity, options.maxPortfolioRiskPct);
+    const remainingPortfolioRisk =
+      maxPortfolioRisk === null ? null : roundMoney(Math.max(0, maxPortfolioRisk - plannedNotional));
     const accountRiskExceeded =
-      (maxPositionRisk !== null && configuredRisk > maxPositionRisk) ||
-      (remainingPortfolioRisk !== null && configuredRisk > remainingPortfolioRisk);
+      strategy === "cash_secured_put" &&
+      (
+        (maxPositionRisk !== null && configuredRisk > maxPositionRisk) ||
+        (remainingPortfolioRisk !== null && configuredRisk > remainingPortfolioRisk)
+      );
 
-    const premiumAboveLimit = contractsByPremium <= 0 || premiumRisk > familyCaps.maxPremiumPerTrade;
+    const premiumAboveLimit =
+      contractsByPremium <= 0 ||
+      contractsByOrderNotional <= 0 ||
+      premiumRisk > familyCaps.maxOrderNotional ||
+      perContractPremium > familyCaps.maxPremiumPerContract;
+    const weakSignalWarning = (candidate.discovery_warnings ?? []).length > 0;
+    const fallbackLimitPriceUsed = derivedLimit.source === "askFallback";
+    const commonOptionWarnings: PaperPlanReasonCode[] = [
+      ...(staleQuoteUsable ? (["QUOTE_STALE"] as PaperPlanReasonCode[]) : []),
+      ...(fallbackLimitPriceUsed ? (["FALLBACK_LIMIT_PRICE_USED"] as PaperPlanReasonCode[]) : []),
+      ...(weakSignalWarning ? (["WEAK_SIGNAL"] as PaperPlanReasonCode[]) : [])
+    ];
+    const optionRiskModel: RiskModel = {
+      maxPremium: familyCaps.maxOrderNotional,
+      maxPremiumPerContract: familyCaps.maxPremiumPerContract,
+      maxOrderNotional: familyCaps.maxOrderNotional,
+      capUsed: familyCaps.maxOrderNotional,
+      contracts,
+      notionalPremium: premiumRisk,
+      maxLoss: configuredRisk,
+      priceSource: derivedLimit.source,
+      selectionRank: candidate.discovery_selection_rank ?? null,
+      selectionReason: candidate.discovery_selection_reason ?? null,
+      expectedHoldPeriod: expectedHoldPeriodForFamily(strategyFamily)
+    };
     if (contracts <= 0 || premiumAboveLimit || accountRiskExceeded) {
       return {
         ...base,
@@ -2417,19 +2675,14 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         quoteSnapshot: quoteSnapshotModel(quoteForPlanning, spreadPct),
         paperFillModel: paperFillModelFor(quoteForPlanning, limitPrice),
         liveLikeFillModel: liveLikeFillModelFor(quoteForPlanning, limitPrice, spreadPct),
-        riskModel: {
-          maxPremium: familyCaps.maxPremiumPerTrade,
-          contracts,
-          notionalPremium: premiumRisk,
-          maxLoss: configuredRisk,
-          expectedHoldPeriod: expectedHoldPeriodForFamily(strategyFamily)
-        },
+        riskModel: optionRiskModel,
         ...optionQuoteFields(quoteForPlanning),
         estimatedNotional: configuredRisk,
         reasonCodes: buildReasonList([
           ...(base.reasonCodes),
           "OPTION_CONTRACT_FOUND",
           "OPTION_DTE_ALLOWED",
+          ...commonOptionWarnings,
           "OPTION_RISK_LIMIT_EXCEEDED",
           ...(premiumAboveLimit ? (["PREMIUM_ABOVE_LIMIT"] as PaperPlanReasonCode[]) : [])
         ]),
@@ -2461,19 +2714,14 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         quoteSnapshot: quoteSnapshotModel(quoteForPlanning, spreadPct),
         paperFillModel: paperFillModelFor(quoteForPlanning, limitPrice),
         liveLikeFillModel: liveLikeFillModelFor(quoteForPlanning, limitPrice, spreadPct),
-        riskModel: {
-          maxPremium: familyCaps.maxPremiumPerTrade,
-          contracts,
-          notionalPremium: premiumRisk,
-          maxLoss: configuredRisk,
-          expectedHoldPeriod: expectedHoldPeriodForFamily(strategyFamily)
-        },
+        riskModel: optionRiskModel,
         ...optionQuoteFields(quoteForPlanning),
         estimatedNotional: configuredRisk,
         reasonCodes: buildReasonList([
           ...(base.reasonCodes),
           "OPTION_CONTRACT_FOUND",
           "OPTION_DTE_ALLOWED",
+          ...commonOptionWarnings,
           "OPTION_SPREAD_TOO_WIDE",
           "SPREAD_TOO_WIDE"
         ]),
@@ -2503,17 +2751,12 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         quoteSnapshot: quoteSnapshotModel(quoteForPlanning, spreadPct),
         paperFillModel: paperFillModelFor(quoteForPlanning, limitPrice),
         liveLikeFillModel: liveLikeFillModelFor(quoteForPlanning, limitPrice, spreadPct),
-        riskModel: {
-          maxPremium: familyCaps.maxPremiumPerTrade,
-          contracts,
-          notionalPremium: premiumRisk,
-          maxLoss: configuredRisk,
-          expectedHoldPeriod: expectedHoldPeriodForFamily(strategyFamily)
-        },
+        riskModel: optionRiskModel,
         ...optionQuoteFields(quoteForPlanning),
         reasonCodes: buildReasonList([
           ...(base.reasonCodes),
           "OPTION_CONTRACT_FOUND",
+          ...commonOptionWarnings,
           "OPTION_COLLATERAL_INSUFFICIENT",
           "UNSUPPORTED_OPTION_STRATEGY"
         ]),
@@ -2546,18 +2789,13 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         quoteSnapshot: quoteSnapshotModel(quoteForPlanning, spreadPct),
         paperFillModel: paperFillModelFor(quoteForPlanning, limitPrice),
         liveLikeFillModel: liveLikeFillModelFor(quoteForPlanning, limitPrice, spreadPct),
-        riskModel: {
-          maxPremium: familyCaps.maxPremiumPerTrade,
-          contracts,
-          notionalPremium: premiumRisk,
-          maxLoss: configuredRisk,
-          expectedHoldPeriod: expectedHoldPeriodForFamily(strategyFamily)
-        },
+        riskModel: optionRiskModel,
         ...optionQuoteFields(quoteForPlanning),
         estimatedNotional: configuredRisk,
         reasonCodes: buildReasonList([
           ...(base.reasonCodes),
           "OPTION_CONTRACT_FOUND",
+          ...commonOptionWarnings,
           "OPTION_COLLATERAL_INSUFFICIENT",
           "OPTION_RISK_LIMIT_EXCEEDED"
         ]),
@@ -2586,13 +2824,7 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         quoteSnapshot: quoteSnapshotModel(quoteForPlanning, spreadPct),
         paperFillModel: paperFillModelFor(quoteForPlanning, limitPrice),
         liveLikeFillModel: liveLikeFillModelFor(quoteForPlanning, limitPrice, spreadPct),
-        riskModel: {
-          maxPremium: familyCaps.maxPremiumPerTrade,
-          contracts,
-          notionalPremium: premiumRisk,
-          maxLoss: configuredRisk,
-          expectedHoldPeriod: expectedHoldPeriodForFamily(strategyFamily)
-        },
+        riskModel: optionRiskModel,
         ...optionQuoteFields(quoteForPlanning),
         estimatedPrice: limitPrice,
         estimatedQty: contracts,
@@ -2602,6 +2834,7 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
           ...(base.reasonCodes),
           "OPTION_CONTRACT_FOUND",
           "OPTION_DTE_ALLOWED",
+          ...commonOptionWarnings,
           "ALREADY_HELD_OPTION_CONTRACT"
         ]),
         explanation: explanationFor("watch", ["ALREADY_HELD_OPTION_CONTRACT"])
@@ -2629,13 +2862,7 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         quoteSnapshot: quoteSnapshotModel(quoteForPlanning, spreadPct),
         paperFillModel: paperFillModelFor(quoteForPlanning, limitPrice),
         liveLikeFillModel: liveLikeFillModelFor(quoteForPlanning, limitPrice, spreadPct),
-        riskModel: {
-          maxPremium: familyCaps.maxPremiumPerTrade,
-          contracts,
-          notionalPremium: premiumRisk,
-          maxLoss: configuredRisk,
-          expectedHoldPeriod: expectedHoldPeriodForFamily(strategyFamily)
-        },
+        riskModel: optionRiskModel,
         ...optionQuoteFields(quoteForPlanning),
         estimatedPrice: limitPrice,
         estimatedQty: contracts,
@@ -2645,6 +2872,7 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
           ...(base.reasonCodes),
           "OPTION_CONTRACT_FOUND",
           "OPTION_DTE_ALLOWED",
+          ...commonOptionWarnings,
           "DUPLICATE_OPEN_OPTION_ORDER"
         ]),
         explanation: explanationFor("skip", ["DUPLICATE_OPEN_OPTION_ORDER"])
@@ -2671,13 +2899,7 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
       quoteSnapshot: quoteSnapshotModel(quoteForPlanning, spreadPct),
       paperFillModel: paperFillModelFor(quoteForPlanning, limitPrice),
       liveLikeFillModel: liveLikeFillModelFor(quoteForPlanning, limitPrice, spreadPct),
-      riskModel: {
-        maxPremium: familyCaps.maxPremiumPerTrade,
-        contracts,
-        notionalPremium: premiumRisk,
-        maxLoss: configuredRisk,
-        expectedHoldPeriod: expectedHoldPeriodForFamily(strategyFamily)
-      },
+      riskModel: optionRiskModel,
       ...optionQuoteFields(quoteForPlanning),
       estimatedPrice: limitPrice,
       estimatedQty: contracts,
@@ -2687,14 +2909,13 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
         ...base.reasonCodes,
         "OPTION_CONTRACT_FOUND",
         "OPTION_DTE_ALLOWED",
-        ...(staleQuoteUsable ? (["QUOTE_STALE"] as PaperPlanReasonCode[]) : []),
+        ...commonOptionWarnings,
         ...(dte === 0 ? (["OPTION_0DTE_ALLOWED"] as PaperPlanReasonCode[]) : []),
         ...(spreadAboveConfiguredCap || (spreadPct !== null && spreadPct > 20)
           ? (["OPTION_WIDE_SPREAD_WARNING"] as PaperPlanReasonCode[])
           : []),
         ...(contractsByPremium > familyCaps.maxContracts ||
-        contractsByPositionRisk > familyCaps.maxContracts ||
-        contractsByPortfolioRisk > familyCaps.maxContracts ||
+        contractsByOrderNotional > familyCaps.maxContracts ||
         contractsByBuyingPower > familyCaps.maxContracts
           ? (["MAX_CONTRACTS_EXCEEDED"] as PaperPlanReasonCode[])
           : []),
@@ -2931,6 +3152,7 @@ export const buildPaperPlanReport = async (
   const tradabilityCache = new Map<string, Promise<AlpacaAssetTradabilityResult>>();
   const plan: PaperPlanCandidate[] = [];
   const seenSymbols = new Set<string>();
+  const selectedDiscoveryGroups = new Set<string>();
   let plannedNotional = 0;
   let plannedCount = 0;
 
@@ -2947,7 +3169,7 @@ export const buildPaperPlanReport = async (
       tradabilityCache.set(symbol, tradabilityPromise);
     }
 
-    const evaluatedPlan = evaluateCandidate({
+    let evaluatedPlan = evaluateCandidate({
       candidate,
       tradability: await tradabilityPromise,
       estimatedPrice: findLatestPrice(symbol, candidate.as_of || undefined),
@@ -2973,6 +3195,17 @@ export const buildPaperPlanReport = async (
       plannedCount,
       plannedNotional
     });
+    const discoverySelectionGroup = discoverySelectionGroupForPlan(evaluatedPlan);
+    if (
+      discoverySelectionGroup &&
+      selectedDiscoveryGroups.has(discoverySelectionGroup) &&
+      evaluatedPlan.decision === "planned"
+    ) {
+      evaluatedPlan = skipUnselectedDiscoveryAlternative(evaluatedPlan);
+    }
+    if (discoverySelectionGroup && evaluatedPlan.decision === "planned") {
+      selectedDiscoveryGroups.add(discoverySelectionGroup);
+    }
     const candidatePlan = attachLearningRecord({
       candidate,
       plan: {

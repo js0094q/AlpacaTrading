@@ -16,7 +16,7 @@ export interface QuoteSnapshotModel {
 export interface PaperFillModel {
   submittedLimitPrice?: number;
   assumedFillPrice?: number;
-  source: "paper_order" | "midpoint" | "ask" | "model";
+  source: "paper_order" | "midpoint" | "ask" | "askFallback" | "model";
 }
 
 export interface LiveLikeFillModel {
@@ -28,9 +28,15 @@ export interface LiveLikeFillModel {
 
 export interface RiskModel {
   maxPremium: number;
+  maxPremiumPerContract?: number;
+  maxOrderNotional?: number;
+  capUsed?: number;
   contracts: number;
   notionalPremium: number;
   maxLoss: number;
+  priceSource?: "midpoint" | "askFallback" | "unavailable";
+  selectionRank?: number | null;
+  selectionReason?: string | null;
   expectedHoldPeriod: "intraday" | "swing" | "long_horizon";
 }
 

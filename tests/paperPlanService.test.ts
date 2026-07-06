@@ -130,10 +130,12 @@ type MockOptionContract = {
 
 const createOptionDiscoveryFetcher = ({
   contracts,
-  calls
+  calls,
+  quotes = {}
 }: {
   contracts: MockOptionContract[];
   calls?: string[];
+  quotes?: Record<string, { bid: number; ask: number; last?: number; delta?: number }>;
 }): FetcherFn => {
   const base = createMockFetcher();
   return async (input, init) => {
@@ -175,22 +177,25 @@ const createOptionDiscoveryFetcher = ({
         snapshots: Object.fromEntries(
           symbols.map((symbol) => {
             const contract = contracts.find((row) => row.symbol.toUpperCase() === symbol);
+            const quote = quotes[symbol] ?? quotes[symbol.toUpperCase()];
+            const bid = quote?.bid ?? (contract?.type === "put" ? 1.2 : 1);
+            const ask = quote?.ask ?? (contract?.type === "put" ? 1.3 : 1.1);
             return [
               symbol,
               {
                 symbol,
                 underlying_symbol: contract?.underlying_symbol || symbol.slice(0, 3),
                 Greeks: {
-                  delta: contract?.type === "put" ? -0.55 : 0.7
+                  delta: quote?.delta ?? (contract?.type === "put" ? -0.55 : 0.7)
                 },
                 latest_quote: {
                   t: new Date().toISOString(),
-                  bp: contract?.type === "put" ? 1.2 : 1,
-                  ap: contract?.type === "put" ? 1.3 : 1.1
+                  bp: bid,
+                  ap: ask
                 },
                 latest_trade: {
                   t: new Date().toISOString(),
-                  p: contract?.type === "put" ? 1.25 : 1.05
+                  p: quote?.last ?? (bid + ask) / 2
                 },
                 implied_volatility: 0.3,
                 volume: 100,
@@ -211,12 +216,13 @@ const createOptionDiscoveryFetcher = ({
         quotes: Object.fromEntries(
           symbols.map((symbol) => {
             const contract = contracts.find((row) => row.symbol.toUpperCase() === symbol);
+            const quote = quotes[symbol] ?? quotes[symbol.toUpperCase()];
             return [
               symbol,
               {
                 t: new Date().toISOString(),
-                bp: contract?.type === "put" ? 1.2 : 1,
-                ap: contract?.type === "put" ? 1.3 : 1.1
+                bp: quote?.bid ?? (contract?.type === "put" ? 1.2 : 1),
+                ap: quote?.ask ?? (contract?.type === "put" ? 1.3 : 1.1)
               }
             ];
           })
@@ -570,21 +576,29 @@ beforeEach(() => {
   delete process.env.ALLOW_0DTE_OPTIONS;
   delete process.env.OPTIONS_QUOTE_MAX_AGE_MS;
   delete process.env.ALLOW_OPTIONS_LAST_PRICE_FALLBACK;
-	  delete process.env.PAPER_OPTIONS_MAX_SPREAD_PCT;
-	  delete process.env.PAPER_OPTIONS_HARD_SPREAD_CAP_ENABLED;
-	  delete process.env.PAPER_OPTIONS_MAX_CONTRACTS;
+  delete process.env.PAPER_OPTIONS_LIMIT_PRICE_BASIS;
+  delete process.env.PAPER_OPTIONS_MAX_SPREAD_PCT;
+  delete process.env.PAPER_OPTIONS_HARD_SPREAD_CAP_ENABLED;
+  delete process.env.PAPER_OPTIONS_MAX_CONTRACTS;
   delete process.env.PAPER_OPTIONS_MAX_PREMIUM_PER_ORDER;
+  delete process.env.PAPER_OPTION_MAX_PREMIUM_PER_CONTRACT;
+  delete process.env.PAPER_OPTION_MAX_ORDER_NOTIONAL;
+  delete process.env.PAPER_OPTION_MAX_CONTRACTS;
 	  delete process.env.PAPER_0DTE_SPY_ENABLED;
 	  delete process.env.PAPER_0DTE_SPY_UNDERLYINGS;
 	  delete process.env.PAPER_0DTE_SPY_MAX_PREMIUM_PER_TRADE;
+  delete process.env.PAPER_0DTE_SPY_MAX_PREMIUM_PER_CONTRACT;
+  delete process.env.PAPER_0DTE_SPY_MAX_ORDER_NOTIONAL;
   delete process.env.PAPER_0DTE_SPY_MAX_CONTRACTS;
   delete process.env.PAPER_0DTE_SPY_MAX_DAILY_TRADES;
 	  delete process.env.PAPER_0DTE_SPY_MAX_QUOTE_AGE_SECONDS;
 	  delete process.env.PAPER_0DTE_SPY_MAX_SPREAD_PCT;
 	  delete process.env.PAPER_0DTE_SPY_HARD_SPREAD_CAP_ENABLED;
 		  delete process.env.PAPER_LEAPS_ENABLED;
-		  delete process.env.PAPER_LEAPS_UNDERLYINGS;
+  delete process.env.PAPER_LEAPS_UNDERLYINGS;
   delete process.env.PAPER_LEAPS_MAX_PREMIUM_PER_TRADE;
+  delete process.env.PAPER_LEAPS_MAX_PREMIUM_PER_CONTRACT;
+  delete process.env.PAPER_LEAPS_MAX_ORDER_NOTIONAL;
   delete process.env.PAPER_LEAPS_MAX_CONTRACTS;
 	  delete process.env.PAPER_LEAPS_MIN_DTE;
 	  delete process.env.PAPER_LEAPS_MAX_DTE;
@@ -945,8 +959,8 @@ describe("paper plan service", () => {
     assert.equal(entry?.decision, "planned");
     assert.equal(entry?.assetClass, "option");
     assert.equal(entry?.strategy, "long_call");
-    assert.equal(entry?.contracts, 5);
-    assert.equal(entry?.estimatedPremium, 375);
+    assert.equal(entry?.contracts, 1);
+    assert.equal(entry?.estimatedPremium, 75);
     assert.equal(entry?.quoteStatus, "valid");
     assert.equal(entry?.executable, true);
     assert.equal(entry?.executablePrice, 0.75);
@@ -1159,6 +1173,113 @@ describe("paper plan service", () => {
     assert.equal(entry?.reasonCodes.includes("OPTION_LIMIT_PRICE_UNAVAILABLE"), true);
   });
 
+  test("blocks option planning when bid is missing", async () => {
+    const optionSymbol = "AAPL260814C00100000";
+    insertResearchRun({ runId: "run-missing-bid-option", riskProfile: "moderate", optionsEnabled: true });
+    insertCandidate({
+      runId: "run-missing-bid-option",
+      symbol: "AAPL",
+      rank: 1,
+      preferredExpression: "long_call",
+      optionSymbol,
+      strike: 100,
+      estimatedMaxLoss: 75
+    });
+    insertOptionContract({ optionSymbol, type: "call" });
+    insertOptionSnapshot({
+      optionSymbol,
+      bid: null,
+      ask: 1.5,
+      midpoint: null,
+      executablePrice: 1.5,
+      executablePriceSource: "askFallback"
+    });
+
+    const report = await planResultFor({ optionsEnabled: true });
+    const entry = report.plan[0];
+    assert.equal(entry?.decision, "watch");
+    assert.equal(entry?.reasonCodes.includes("OPTION_LIMIT_PRICE_UNAVAILABLE"), true);
+    assert.equal(entry?.reasonCodes.includes("QUOTE_NULL"), true);
+  });
+
+  test("blocks option planning when ask is missing", async () => {
+    const optionSymbol = "AAPL260814C00100000";
+    insertResearchRun({ runId: "run-missing-ask-option", riskProfile: "moderate", optionsEnabled: true });
+    insertCandidate({
+      runId: "run-missing-ask-option",
+      symbol: "AAPL",
+      rank: 1,
+      preferredExpression: "long_call",
+      optionSymbol,
+      strike: 100,
+      estimatedMaxLoss: 75
+    });
+    insertOptionContract({ optionSymbol, type: "call" });
+    insertOptionSnapshot({
+      optionSymbol,
+      bid: 1.2,
+      ask: null,
+      midpoint: null,
+      executable: 0,
+      executablePrice: null,
+      executablePriceSource: null
+    });
+
+    const report = await planResultFor({ optionsEnabled: true });
+    const entry = report.plan[0];
+    assert.equal(entry?.decision, "watch");
+    assert.equal(entry?.reasonCodes.includes("OPTION_LIMIT_PRICE_UNAVAILABLE"), true);
+    assert.equal(entry?.reasonCodes.includes("QUOTE_NULL"), true);
+  });
+
+  test("derives midpoint limit price from valid bid and ask", async () => {
+    const optionSymbol = "AAPL260814C00100000";
+    insertResearchRun({ runId: "run-midpoint-derived-option", riskProfile: "moderate", optionsEnabled: true });
+    insertCandidate({
+      runId: "run-midpoint-derived-option",
+      symbol: "AAPL",
+      rank: 1,
+      preferredExpression: "long_call",
+      optionSymbol,
+      strike: 100,
+      estimatedMaxLoss: 5000
+    });
+    insertOptionContract({ optionSymbol, type: "call" });
+    insertOptionSnapshot({ optionSymbol, bid: 1, ask: 1.4, midpoint: null, executable: 0 });
+
+    const report = await planResultFor({ optionsEnabled: true });
+    const entry = report.plan[0];
+    assert.equal(entry?.decision, "planned");
+    assert.equal(entry?.limitPrice, 1.2);
+    assert.equal(entry?.executablePriceSource, "midpoint");
+    assert.equal(entry?.estimatedPremium, 120);
+    assert.equal(entry?.reasonCodes.includes("OPTION_RISK_LIMIT_EXCEEDED"), false);
+  });
+
+  test("uses ask fallback when configured limit basis requires ask", async () => {
+    process.env.PAPER_OPTIONS_LIMIT_PRICE_BASIS = "ask";
+    const optionSymbol = "AAPL260814C00100000";
+    insertResearchRun({ runId: "run-ask-fallback-option", riskProfile: "moderate", optionsEnabled: true });
+    insertCandidate({
+      runId: "run-ask-fallback-option",
+      symbol: "AAPL",
+      rank: 1,
+      preferredExpression: "long_call",
+      optionSymbol,
+      strike: 100,
+      estimatedMaxLoss: 75
+    });
+    insertOptionContract({ optionSymbol, type: "call" });
+    insertOptionSnapshot({ optionSymbol, bid: 1, ask: 1.4, midpoint: 1.2 });
+
+    const report = await planResultFor({ optionsEnabled: true });
+    const entry = report.plan[0];
+    assert.equal(entry?.decision, "planned");
+    assert.equal(entry?.limitPrice, 1.4);
+    assert.equal(entry?.executablePriceSource, "askFallback");
+    assert.equal(entry?.reasonCodes.includes("FALLBACK_LIMIT_PRICE_USED"), true);
+  });
+
   test("blocks 0DTE SPY option planning by default and allows it only when enabled", async () => {
     const optionSymbol = "SPY260703C00100000";
     insertResearchRun({ runId: "run-0dte", riskProfile: "moderate", optionsEnabled: true });
@@ -1341,6 +1462,61 @@ describe("paper plan service", () => {
     assert.equal(discovered.every((entry) => entry.decision === "planned"), true);
     assert.equal(discovered.every((entry) => entry.assetClass === "option"), true);
     assert.equal(discovered.every((entry) => entry.reasonCodes.includes("OPTION_CONTRACT_FOUND")), true);
+  });
+
+  test("premium above 0DTE cap selects a cheaper alternative before blocking", async () => {
+    const today = new Date().toISOString().slice(0, 10);
+    const occDate = today.slice(2).replace(/-/g, "");
+    const expensiveCall = `SPY${occDate}C00450000`;
+    const cheapCall = `SPY${occDate}C00451000`;
+    process.env.PAPER_0DTE_SPY_ENABLED = "true";
+    process.env.ALLOW_0DTE_OPTIONS = "true";
+    process.env.PAPER_0DTE_SPY_MAX_PREMIUM_PER_CONTRACT = "250";
+    process.env.PAPER_0DTE_SPY_MAX_ORDER_NOTIONAL = "250";
+    insertResearchRun({ runId: "run-zero-premium-fallback", riskProfile: "moderate", optionsEnabled: true });
+    insertMarketBar({ symbol: "SPY", close: 450, timestamp: new Date().toISOString() });
+    setMockFetch(createOptionDiscoveryFetcher({
+      contracts: [
+        {
+          symbol: expensiveCall,
+          underlying_symbol: "SPY",
+          type: "call",
+          expiration_date: today,
+          strike_price: 450,
+          multiplier: 100,
+          tradable: true,
+          status: "active"
+        },
+        {
+          symbol: cheapCall,
+          underlying_symbol: "SPY",
+          type: "call",
+          expiration_date: today,
+          strike_price: 451,
+          multiplier: 100,
+          tradable: true,
+          status: "active"
+        }
+      ],
+      quotes: {
+        [expensiveCall]: { bid: 3, ask: 3.2 },
+        [cheapCall]: { bid: 2, ask: 2.2 }
+      }
+    }));
+
+    const report = await planResultFor({ optionsEnabled: true });
+    const discoveredCalls = report.plan.filter((entry) =>
+      entry.sourceCandidateId?.startsWith("discovery:zero_dte_spy:") &&
+      entry.strategy === "long_call"
+    );
+    const expensive = discoveredCalls.find((entry) => entry.optionSymbol === expensiveCall);
+    const cheap = discoveredCalls.find((entry) => entry.optionSymbol === cheapCall);
+    assert.equal(expensive?.decision, "watch");
+    assert.equal(expensive?.reasonCodes.includes("PREMIUM_ABOVE_LIMIT"), true);
+    assert.equal(cheap?.decision, "planned");
+    assert.equal(cheap?.limitPrice, 2.1);
+    assert.equal(cheap?.estimatedPremium, 210);
+    assert.equal(report.summary.zeroDteSpyDiscoveryEligible, 1);
   });
 
   test("empty local cache triggers provider fetch and discovers SPY and QQQ LEAPS", async () => {
@@ -1705,6 +1881,7 @@ describe("paper plan service", () => {
     const report = await planResultFor({ optionsEnabled: true });
     assert.equal(report.plan.every((entry) => entry.decision === "planned"), true);
     assert.equal(report.plan.every((entry) => entry.reasonCodes.includes("OPTION_WIDE_SPREAD_WARNING")), true);
+    assert.equal(report.plan.every((entry) => entry.reasonCodes.includes("WEAK_SIGNAL")), true);
     assert.equal(report.diagnostics.zeroDteSpyDiscovery?.warnings.includes("weak_signal_confidence"), true);
     assert.equal(report.diagnostics.zeroDteSpyDiscovery?.warnings.includes("neutral_signal_direction"), true);
 

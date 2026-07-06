@@ -78,8 +78,9 @@ PAPER_EQUITY_MAX_NOTIONAL_PER_ORDER=5000
 PAPER_EQUITY_MAX_PORTFOLIO_DEPLOY_PCT=50
 PAPER_EQUITY_MAX_POSITION_PCT=10
 PAPER_EQUITY_MIN_CASH_RESERVE_PCT=20
-PAPER_OPTIONS_MAX_PREMIUM_PER_ORDER=1000
-PAPER_OPTIONS_MAX_CONTRACTS=5
+PAPER_OPTION_MAX_PREMIUM_PER_CONTRACT=1500
+PAPER_OPTION_MAX_ORDER_NOTIONAL=1500
+PAPER_OPTION_MAX_CONTRACTS=1
 PAPER_OPTIONS_MIN_DTE=0
 PAPER_OPTIONS_MAX_DTE=90
 ALLOW_0DTE_OPTIONS=true
@@ -99,16 +100,18 @@ PAPER_OPTIONS_ALLOW_NAKED_OPTIONS=false
 PAPER_OPTION_LEARNING_LEDGER_ENABLED=true
 PAPER_0DTE_SPY_ENABLED=false
 PAPER_0DTE_SPY_UNDERLYINGS=SPY
-PAPER_0DTE_SPY_MAX_PREMIUM_PER_TRADE=500
-PAPER_0DTE_SPY_MAX_CONTRACTS=5
+PAPER_0DTE_SPY_MAX_PREMIUM_PER_CONTRACT=250
+PAPER_0DTE_SPY_MAX_ORDER_NOTIONAL=250
+PAPER_0DTE_SPY_MAX_CONTRACTS=1
 PAPER_0DTE_SPY_MAX_DAILY_TRADES=3
 PAPER_0DTE_SPY_MAX_QUOTE_AGE_SECONDS=60
 PAPER_0DTE_SPY_MAX_SPREAD_PCT=20
 PAPER_0DTE_SPY_HARD_SPREAD_CAP_ENABLED=false
 PAPER_LEAPS_ENABLED=false
 PAPER_LEAPS_UNDERLYINGS=SPY,QQQ
-PAPER_LEAPS_MAX_PREMIUM_PER_TRADE=2500
-PAPER_LEAPS_MAX_CONTRACTS=2
+PAPER_LEAPS_MAX_PREMIUM_PER_CONTRACT=1500
+PAPER_LEAPS_MAX_ORDER_NOTIONAL=1500
+PAPER_LEAPS_MAX_CONTRACTS=1
 PAPER_LEAPS_MIN_DTE=180
 PAPER_LEAPS_MAX_DTE=730
 PAPER_LEAPS_MAX_SPREAD_PCT=15
@@ -374,8 +377,13 @@ When account values are available, equity plans size from paper account equity, 
 
 Paper options remain disabled by default with `PAPER_OPTIONS_EXECUTION_ENABLED=false`. Setting it to `true` allows eligible paper option payloads after contract, price, strategy, DTE, duplicate, and risk checks pass. Current practical paper defaults:
 
-- `PAPER_OPTIONS_MAX_PREMIUM_PER_ORDER=1000`
-- `PAPER_OPTIONS_MAX_CONTRACTS=5`
+- `PAPER_OPTION_MAX_PREMIUM_PER_CONTRACT=1500`
+- `PAPER_OPTION_MAX_ORDER_NOTIONAL=1500`
+- `PAPER_OPTION_MAX_CONTRACTS=1`
+- `PAPER_0DTE_SPY_MAX_PREMIUM_PER_CONTRACT=250`
+- `PAPER_0DTE_SPY_MAX_ORDER_NOTIONAL=250`
+- `PAPER_LEAPS_MAX_PREMIUM_PER_CONTRACT=1500`
+- `PAPER_LEAPS_MAX_ORDER_NOTIONAL=1500`
 - `PAPER_OPTIONS_MIN_DTE=0`
 - `PAPER_OPTIONS_MAX_DTE=90`
 - `ALLOW_0DTE_OPTIONS=true`
@@ -389,7 +397,7 @@ Paper options remain disabled by default with `PAPER_OPTIONS_EXECUTION_ENABLED=f
 - long calls, long puts, cash-secured puts, and covered calls enabled by default
 - naked options disabled by default
 
-Wide spreads and speculative long calls/puts are warnings in paper mode by default. Spread caps become hard blockers only when `PAPER_OPTIONS_HARD_SPREAD_CAP_ENABLED=true` or a family-specific hard-spread flag is enabled. `OPTION_LIMIT_PRICE_UNAVAILABLE` remains a hard blocker when no usable fresh bid/ask quote can produce an executable price. Last-price fallback is disabled unless `ALLOW_OPTIONS_LAST_PRICE_FALLBACK=true`; same-day expiration is disabled unless `ALLOW_0DTE_OPTIONS=true`.
+Wide spreads, stale quotes with complete non-crossed bid/ask, weak discovery signals, and ask-fallback limit prices are warnings in paper mode by default. Spread caps become hard blockers only when `PAPER_OPTIONS_HARD_SPREAD_CAP_ENABLED=true` or a family-specific hard-spread flag is enabled. `OPTION_LIMIT_PRICE_UNAVAILABLE` remains a hard blocker when no usable bid/ask quote can produce a positive limit price. Last-price fallback is disabled unless `ALLOW_OPTIONS_LAST_PRICE_FALLBACK=true`; same-day expiration is disabled unless `ALLOW_0DTE_OPTIONS=true`. Legacy `PAPER_OPTIONS_MAX_PREMIUM_PER_ORDER`, `PAPER_OPTIONS_MAX_CONTRACTS`, `PAPER_0DTE_SPY_MAX_PREMIUM_PER_TRADE`, and `PAPER_LEAPS_MAX_PREMIUM_PER_TRADE` names remain accepted as aliases when the preferred paper-option cap names are unset.
 
 Multi-leg options remain intentionally out of scope. Do not model spreads as unrelated single-leg submissions until the system can represent every leg, net debit/credit, max risk/reward, strike ordering, expiration alignment, combined payload behavior, and partial-failure handling.
 
