@@ -750,7 +750,7 @@ const rankContractByMoneyness = (
 
 const ZERO_DTE_DISCOVERY_ALTERNATIVES_PER_SIDE = 40;
 const LEAPS_DISCOVERY_DELTA_ALTERNATIVES_PER_UNDERLYING = 12;
-const LEAPS_DISCOVERY_CHEAPER_ALTERNATIVES_PER_UNDERLYING = 28;
+const LEAPS_DISCOVERY_CHEAPER_STRIKES_PER_UNDERLYING = 60;
 
 const uniqueContractsBySymbol = (contracts: OptionContractPlanRow[]): OptionContractPlanRow[] => {
   const seen = new Set<string>();
@@ -847,22 +847,38 @@ const leapsAlternativesForUnderlying = (
   input: Parameters<typeof rankContractsForUnderlying>[0]
 ): OptionContractPlanRow[] => {
   const ranked = rankContractsForUnderlying(input);
-  const cheaperRanked = [...ranked].sort((left, right) => {
+  const cheaperStrikeLadder = [...ranked].sort((left, right) => {
     if (input.referencePrice !== null && input.referencePrice > 0) {
       const leftOtm = left.strike >= input.referencePrice;
       const rightOtm = right.strike >= input.referencePrice;
       if (leftOtm !== rightOtm) {
         return leftOtm ? -1 : 1;
       }
-      if (leftOtm && rightOtm && left.strike !== right.strike) {
-        return left.strike - right.strike;
+      if (leftOtm && rightOtm) {
+        const leftDistance = Math.abs(left.strike - input.referencePrice);
+        const rightDistance = Math.abs(right.strike - input.referencePrice);
+        if (leftDistance !== rightDistance) {
+          return leftDistance - rightDistance;
+        }
+        if (left.strike !== right.strike) {
+          return left.strike - right.strike;
+        }
       }
     }
     return rankContractByMoneyness(left, right, input.referencePrice, false);
   });
+  const cheaperByStrike: OptionContractPlanRow[] = [];
+  const seenStrikes = new Set<number>();
+  for (const contract of cheaperStrikeLadder) {
+    if (seenStrikes.has(contract.strike)) {
+      continue;
+    }
+    seenStrikes.add(contract.strike);
+    cheaperByStrike.push(contract);
+  }
   return uniqueContractsBySymbol([
     ...ranked.slice(0, LEAPS_DISCOVERY_DELTA_ALTERNATIVES_PER_UNDERLYING),
-    ...cheaperRanked.slice(0, LEAPS_DISCOVERY_CHEAPER_ALTERNATIVES_PER_UNDERLYING)
+    ...cheaperByStrike.slice(0, LEAPS_DISCOVERY_CHEAPER_STRIKES_PER_UNDERLYING)
   ]);
 };
 

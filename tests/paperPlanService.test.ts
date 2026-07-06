@@ -1816,6 +1816,65 @@ describe("paper plan service", () => {
     assert.equal(records.every((record) => JSON.parse(record.signal_inputs_json).discoverySource === "explicit_leaps"), true);
   });
 
+  test("LEAPS premium above cap walks the strike ladder to a cheaper alternative", async () => {
+    const expirationBase = 365;
+    const cheapSymbol = "SPYLEAPSCHEAP";
+    process.env.PAPER_LEAPS_ENABLED = "true";
+    process.env.PAPER_LEAPS_UNDERLYINGS = "SPY";
+    process.env.PAPER_LEAPS_MAX_PREMIUM_PER_CONTRACT = "1500";
+    process.env.PAPER_LEAPS_MAX_ORDER_NOTIONAL = "1500";
+    insertResearchRun({ runId: "run-leaps-premium-fallback", riskProfile: "moderate", optionsEnabled: true });
+    insertMarketBar({ symbol: "SPY", close: 450, timestamp: new Date().toISOString() });
+
+    for (let index = 0; index < 30; index += 1) {
+      const symbol = `SPYLEAPSEXP${String(index).padStart(2, "0")}`;
+      insertOptionContract({
+        optionSymbol: symbol,
+        underlying: "SPY",
+        type: "call",
+        expirationDate: futureDate(expirationBase + index),
+        strike: 455
+      });
+      insertOptionSnapshot({
+        optionSymbol: symbol,
+        underlying: "SPY",
+        bid: 30,
+        ask: 31,
+        midpoint: 30.5,
+        delta: 0.7
+      });
+    }
+    insertOptionContract({
+      optionSymbol: cheapSymbol,
+      underlying: "SPY",
+      type: "call",
+      expirationDate: futureDate(expirationBase),
+      strike: 700
+    });
+    insertOptionSnapshot({
+      optionSymbol: cheapSymbol,
+      underlying: "SPY",
+      bid: 14,
+      ask: 15,
+      midpoint: 14.5,
+      delta: 0.2
+    });
+
+    const report = await planResultFor({ optionsEnabled: true });
+    const discovered = report.plan.filter((candidate) =>
+      candidate.sourceCandidateId?.startsWith("discovery:leaps:")
+    );
+    const selected = discovered.find((entry) => entry.optionSymbol === cheapSymbol);
+    const expensive = discovered.find((entry) => entry.optionSymbol?.startsWith("SPYLEAPSEXP"));
+    assert.equal(expensive?.decision, "watch");
+    assert.equal(expensive?.reasonCodes.includes("PREMIUM_ABOVE_LIMIT"), true);
+    assert.equal(selected?.decision, "planned");
+    assert.equal(selected?.limitPrice, 14.5);
+    assert.equal(selected?.estimatedPremium, 1450);
+    assert.equal(selected?.reasonCodes.includes("OPTION_RISK_LIMIT_EXCEEDED"), false);
+    assert.equal(report.summary.leapsDiscoveryEligible, 1);
+  });
+
   test("LEAPS discovery ignores underlying equity duplicates and blocks same option duplicates", async () => {
     const optionSymbol = "SPYLEAPSDUPE";
     process.env.PAPER_LEAPS_ENABLED = "true";
