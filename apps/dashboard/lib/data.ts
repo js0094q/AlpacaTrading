@@ -532,6 +532,14 @@ const captureWithTimeout = async <T>(
   }
 };
 
+const rowsOrEmpty = async <T>(fn: () => Promise<T[]> | T[]): Promise<T[]> => {
+  try {
+    return await fn();
+  } catch {
+    return [];
+  }
+};
+
 const cachedPlanResult = (latestPlans: unknown[]): DashboardSnapshot["plan"] => ({
   ok: true,
   label: "plan",
@@ -655,11 +663,11 @@ export const buildCachedDashboardSnapshot = async (): Promise<DashboardSnapshot>
       captureWithTimeout("account", () => getAlpacaAccountSnapshot()),
       captureWithTimeout("positions", () => listAlpacaPositions()),
       captureWithTimeout("openOrders", () => listAlpacaOpenOrders()),
-      latestResearchRuns(5),
-      latestPaperPlans(10),
+      rowsOrEmpty(() => latestResearchRuns(5)),
+      rowsOrEmpty(() => latestPaperPlans(10)),
       captureWithTimeout("executions", () => latestPaperExecutions(25)),
-      latestPaperRecommendationSnapshots(10),
-      latestApiRequestIds(12)
+      rowsOrEmpty(() => latestPaperRecommendationSnapshots(10)),
+      rowsOrEmpty(() => latestApiRequestIds(12))
     ]);
 
   const [reviewDryRun, learningSummary, promotionReadiness] = await Promise.all([
