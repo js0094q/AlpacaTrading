@@ -18,7 +18,7 @@
   - `DASHBOARD_ADMIN_TOKEN` should be confirmed in Vercel production for dashboard admin/mutating routes.
 - Verified dashboard bridge state:
   - Public summary and refresh routes reach the VPS control service and return paper-only state.
-  - Dashboard page summary loads use the VPS summary bridge with a 30 second timeout; slow summary reads should not be labeled as environment-guard failures.
+  - Dashboard page summary loads use the VPS cached summary bridge with a 30 second timeout; fresh plan/review/dry-run generation remains on explicit protected action routes.
   - Public `POST /api/paper/research/run` completes with valid admin auth using bounded control-service research defaults.
   - Latest review is a clean no-op because all current equity candidates are already held in paper positions, so no eligible payloads exist.
 - Paper trading operations layer:

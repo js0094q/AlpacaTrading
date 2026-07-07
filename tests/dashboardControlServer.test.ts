@@ -365,6 +365,29 @@ describe("VPS dashboard control API", () => {
     assert.equal(commandCalls[0].script, "paper:runtime");
   });
 
+  test("summary returns cached dashboard state without dispatching commands", async () => {
+    const response = await callControl("/api/v1/summary", "GET");
+    const data = response.payload.data as {
+      paperOnly?: boolean;
+      mode?: string;
+      liveTradingEnabled?: boolean;
+      plan?: { ok?: boolean };
+      review?: { ok?: boolean };
+      dryRun?: { ok?: boolean };
+    };
+
+    assert.equal(response.status, 200, `unexpected response status ${response.status}: ${response.text}`);
+    assert.equal(response.payload.ok, true);
+    assert.equal(response.payload.action, "summary");
+    assert.equal(data.paperOnly, true);
+    assert.equal(data.liveTradingEnabled, false);
+    assert.equal(data.mode, "vps-cached-summary");
+    assert.equal(typeof data.plan?.ok, "boolean");
+    assert.equal(typeof data.review?.ok, "boolean");
+    assert.equal(typeof data.dryRun?.ok, "boolean");
+    assert.equal(commandCalls.length, 0);
+  });
+
   test("execute.confirm returns structured paper order guard when disabled", async () => {
     const response = await callControl("/api/v1/execute/confirm", "POST", {
       ...defaultRequest.body,

@@ -42,7 +42,7 @@
   - `POST /api/v1/refresh` without or with a bad token returns `401`.
   - `POST /api/v1/refresh` with the control token returns 200, remains non-mutating, and runs only the read-only `paper:runtime` command.
   - Public `https://www.jlsprojects.com/api/paper/summary` returns paper-only state through the Vercel-to-VPS bridge.
-  - Dashboard page summary loads use a 30 second VPS bridge timeout so slow summary reads are reported as dashboard data timeouts instead of environment-guard aborts.
+  - Dashboard page summary loads use a cached VPS summary bridge with a 30 second timeout; expensive fresh plan/review/dry-run work stays on explicit protected action routes.
   - Public `POST https://www.jlsprojects.com/api/paper/research/run` succeeds with valid admin auth after the control action was bounded to `--barLookbackDays=120`, `ALPACA_REQUEST_TIMEOUT_MS=10000`, and `ALPACA_MAX_RETRIES=0`.
 - SSH hardening:
   - key-based auth is active and password auth is disabled.

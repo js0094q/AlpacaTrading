@@ -5,7 +5,7 @@ import { createServer, IncomingMessage } from "node:http";
 import { spawn } from "node:child_process";
 
 import {
-  buildDashboardSnapshot,
+  buildCachedDashboardSnapshot,
   latestPaperExecutions,
   latestPaperPlans,
   latestResearchRuns,
@@ -933,7 +933,7 @@ const actionHandlers: Record<string, ActionConfig> = {
     requireAdminToken: false,
     requireMutationPrecheck: false,
     action: "summary",
-    handler: async () => buildDashboardSnapshot()
+    handler: async () => buildCachedDashboardSnapshot()
   },
   "/api/v1/refresh": {
     method: "POST",
