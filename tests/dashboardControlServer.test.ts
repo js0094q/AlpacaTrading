@@ -59,6 +59,7 @@ const getServerModule = async (): Promise<ServerModule> => {
 
 const safeHealthPayload = {
   paperOnly: true,
+  environment: "paper",
   liveTradingEnabled: false,
   mutationAllowed: false,
   accountStatus: "ACTIVE"
@@ -75,9 +76,12 @@ const configureDefaultRuntime = () => {
   process.env.ENABLE_AGGRESSIVE_PAPER_STRATEGIES = "true";
   process.env.PAPER_ORDER_EXECUTION_ENABLED = "false";
   process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
+  process.env.AUTOMATED_PAPER_EXECUTION_ENABLED = "false";
   process.env.ALPACA_ENV = "paper";
   process.env.TRADING_MODE = "paper";
   process.env.LIVE_TRADING_ENABLED = "false";
+  process.env.ALPACA_LIVE_TRADE = "false";
+  process.env.ALPACA_PAPER_BASE_URL = "https://paper-api.alpaca.markets";
 };
 
 const defaultRequest = {
@@ -246,6 +250,16 @@ describe("VPS dashboard control API", () => {
     assert.equal(response.payload.error?.code, "CONTROL_TOKEN_INVALID");
   });
 
+  test("mutating endpoint rejects empty configured control token without throwing", async () => {
+    process.env.VPS_CONTROL_TOKEN = "";
+    const response = await callControl("/api/v1/research/run", "POST", defaultRequest.body, "x");
+
+    assert.equal(response.status, 401);
+    assert.equal(response.payload.ok, false);
+    assert.equal(response.payload.error?.code, "CONTROL_TOKEN_INVALID");
+    assert.equal(commandCalls.length, 0);
+  });
+
   test("unknown action returns 404", async () => {
     const response = await callControl("/api/v1/does-not-exist", "GET");
     const payload = response.payload;
@@ -256,6 +270,7 @@ describe("VPS dashboard control API", () => {
   });
 
   test("execute.confirm enforces aggressive + options-enabled guardrails", async () => {
+    process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
     const responseModerate = await callControl("/api/v1/execute/confirm", "POST", {
       ...defaultRequest.body,
       riskProfile: "moderate"
@@ -345,13 +360,14 @@ describe("VPS dashboard control API", () => {
 
     assert.equal(response.status, 403);
     assert.equal(response.payload.ok, false);
-    assert.equal(response.payload.error?.code, "LIVE_TRADING_MUST_BE_DISABLED");
-    assert.match(response.payload.error?.message || "", /live trading is enabled/);
+    assert.equal(response.payload.error?.code, "RUNTIME_PREFLIGHT_FAILED");
+    assert.equal(response.payload.error?.message, "Runtime state does not permit this action.");
+    assert.deepEqual((response.payload as { failedChecks?: string[] }).failedChecks, ["paperOnly", "liveTradingEnabled"]);
     assert.equal(commandCalls.length, 1);
     assert.equal(commandCalls[0].script, "alpaca:health");
   });
 
-  test("refresh is read-only and does not run mutation precheck", async () => {
+  test("refresh requires paper preflight but not paper execution enablement", async () => {
     const response = await callControl("/api/v1/refresh", "POST", {
       riskProfile: "aggressive",
       optionsEnabled: true,
@@ -361,8 +377,7 @@ describe("VPS dashboard control API", () => {
 
     assert.equal(response.status, 200);
     assert.equal(response.payload.ok, true);
-    assert.equal(commandCalls.length, 1);
-    assert.equal(commandCalls[0].script, "paper:runtime");
+    assert.deepEqual(commandCalls.map((entry) => entry.script), ["alpaca:health", "paper:runtime"]);
   });
 
   test("summary returns cached dashboard state without dispatching commands", async () => {
@@ -406,26 +421,33 @@ describe("VPS dashboard control API", () => {
 
     assert.equal(response.status, 403);
     assert.equal(payload.ok, false);
-    assert.equal(payload.error?.code, "PAPER_ORDER_EXECUTION_DISABLED");
-    assert.equal(payload.error?.message, "Blocked by safety guard: paper order execution is disabled.");
+    assert.equal(payload.error?.code, "RUNTIME_PREFLIGHT_FAILED");
+    assert.equal(payload.error?.message, "Runtime state does not permit this action.");
     assert.equal(payload.correlationId, "request-correlation-1");
     assert.equal(payload.guard?.paperOnly, true);
     assert.equal(payload.guard?.liveTradingEnabled, false);
     assert.equal(payload.guard?.mutationAllowed, false);
     assert.equal(payload.guard?.paperOrderExecutionEnabled, false);
-    assert.equal(commandCalls.length, 0);
+    assert.deepEqual((payload as { failedChecks?: string[] }).failedChecks, ["paperExecutionEnabled"]);
+    assert.equal(commandCalls.length, 1);
+    assert.equal(commandCalls[0].script, "alpaca:health");
   });
 
   test("reviewed execute action requires explicit confirmPaper flag before command dispatch", async () => {
+    process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
+    process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
     const response = await callControl("/api/v1/actions/execute", "POST", {
       ...defaultRequest.body,
       confirmPaper: false
     });
 
-    assert.equal(response.status, 200);
-    assert.equal(response.payload.ok, true);
-    assert.equal((response.payload.data as { status?: string }).status, "blocked");
-    assert.equal(commandCalls.length, 0);
+    assert.equal(response.status, 403);
+    assert.equal(response.payload.ok, false);
+    assert.equal(response.payload.error?.code, "RUNTIME_PREFLIGHT_FAILED");
+    assert.deepEqual((response.payload as { failedChecks?: string[] }).failedChecks, ["confirmPaper"]);
+    assert.equal(commandCalls.length, 1);
+    assert.equal(commandCalls[0].script, "alpaca:health");
+    assert.equal(openOrderCalls, 0);
   });
 
   test("mutating command endpoints map to allowlisted scripts", async () => {
@@ -506,6 +528,41 @@ describe("VPS dashboard control API", () => {
     assert.equal(last.method, "GET");
     assert.equal(last.params && typeof last.params === "object" ? true : false, true);
     assert.equal(raw.includes(DASHBOARD_TOKEN), false);
+  });
+
+  test("control errors redact secret-like command output in responses and audit logs", async () => {
+    const auditPath = join(mkdtempSync(join(tmpdir(), "alpaca-dashboard-audit-")), "audit-redact.log");
+    process.env.VPS_CONTROL_AUDIT_PATH = auditPath;
+    process.env.DASHBOARD_ADMIN_TOKEN = "dashboard-admin-secret-for-redaction";
+    const secretText =
+      "Bearer bridge-secret-12345 sk-proj-abcdefghijklmnopqrstuvwxyz123456 APCA_API_SECRET_KEY=super-secret-value -----BEGIN PRIVATE KEY-----\\nabc\\n-----END PRIVATE KEY-----";
+
+    setMockCommandRunner({
+      onCommand: (script) => {
+        if (script === "alpaca:health") {
+          return safeHealthPayload;
+        }
+        if (script === "research:daily") {
+          throw new Error(`command leaked ${secretText}`);
+        }
+      }
+    });
+
+    const response = await callControl("/api/v1/research/run", "POST", defaultRequest.body);
+
+    assert.equal(response.status, 500);
+    assert.equal(response.payload.ok, false);
+    assert.equal(response.payload.error?.code, "CONTROL_ACTION_ERROR");
+    assert.equal(response.text.includes("bridge-secret-12345"), false);
+    assert.equal(response.text.includes("sk-proj-abcdefghijklmnopqrstuvwxyz123456"), false);
+    assert.equal(response.text.includes("super-secret-value"), false);
+    assert.equal(response.text.includes("BEGIN PRIVATE KEY"), false);
+
+    const raw = readFileSync(auditPath, "utf8");
+    assert.equal(raw.includes("bridge-secret-12345"), false);
+    assert.equal(raw.includes("sk-proj-abcdefghijklmnopqrstuvwxyz123456"), false);
+    assert.equal(raw.includes("super-secret-value"), false);
+    assert.equal(raw.includes("BEGIN PRIVATE KEY"), false);
   });
 
   test("mutating audit logs include request and method context", async () => {

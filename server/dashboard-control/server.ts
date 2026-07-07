@@ -16,6 +16,15 @@ import { listAlpacaOpenOrders } from "../../src/services/alpacaOrderReadService.
 import { listAlpacaPositions } from "../../src/services/alpacaPositionService.js";
 import { listPaperOperations } from "../../src/services/paperOperationLogService.js";
 import { latestReviewArtifactReadiness } from "../../src/services/paperOpsWorkflowService.js";
+import { safeTokenEquals } from "../../src/lib/safeToken.js";
+import { redactSensitiveData, redactSensitiveText } from "../../src/lib/securityRedaction.js";
+import {
+  RuntimePreflightError,
+  assertRuntimeMutationPreflight,
+  buildRuntimePreflightChecks,
+  type RuntimeMutationActionType,
+  type RuntimePreflightChecks
+} from "../../src/services/runtimeMutationPreflight.js";
 
 type RiskProfile = "moderate" | "aggressive" | "conservative";
 type AssetClass = "all" | "equity" | "option";
@@ -58,6 +67,8 @@ type ErrorEnvelope = {
     message: string;
   };
   guard?: EnvironmentGuardState;
+  checks?: RuntimePreflightChecks;
+  failedChecks?: string[];
 };
 
 type AuditEntry = {
@@ -75,11 +86,19 @@ type AuditEntry = {
 
 type ActionHandler = (input: ControlInput, requestId: string) => Promise<unknown>;
 
+type ControlRuntimePreflight = {
+  actionType: RuntimeMutationActionType;
+  confirmPaper?: boolean;
+  confirmPaperFromInput?: boolean;
+  requireOptionsExecution?: boolean;
+};
+
 type ActionConfig = {
   method: "GET" | "POST";
   timeoutMs: number;
   requireAdminToken: boolean;
   requireMutationPrecheck: boolean;
+  runtimePreflight?: ControlRuntimePreflight;
   action: string;
   handler: ActionHandler;
 };
@@ -99,10 +118,16 @@ type OpenOrdersFetcher = () => Promise<unknown>;
 
 type EnvironmentGuardState = {
   paperOnly: boolean;
+  environment: string;
+  tradingMode: string;
   liveTradingEnabled: boolean;
   mutationAllowed: boolean;
+  paperExecutionEnabled: boolean;
   paperOrderExecutionEnabled: boolean;
   paperOptionsExecutionEnabled: boolean;
+  automatedPaperExecutionEnabled: boolean;
+  liveApiBaseUrlReachableOrConfigured: boolean;
+  paperApiBaseUrlConfigured: boolean;
 };
 
 const getControlToken = () => process.env.VPS_CONTROL_TOKEN?.trim() || "";
@@ -183,7 +208,7 @@ const runCommandViaSpawn = (
       }
 
       if (code !== 0) {
-        const err = (errored || output || "Command execution failed").trim();
+        const err = redactSensitiveText((errored || output || "Command execution failed").trim());
         reject(new Error(`${action} command failed (exit ${code}): ${err}`));
         return;
       }
@@ -260,25 +285,12 @@ const normalizeBoolean = (value: unknown, fallback = false) => {
   return typeof value === "boolean" ? value : fallback;
 };
 
-const parseEnvBoolean = (name: string) =>
-  process.env[name] === "true" || process.env[name] === "1";
-
 const buildEnvironmentGuardState = (payload?: Record<string, unknown>): EnvironmentGuardState => {
-  const liveTradingEnabled =
-    payload?.liveTradingEnabled === true ||
-    parseEnvBoolean("LIVE_TRADING_ENABLED") ||
-    parseEnvBoolean("ALPACA_LIVE_TRADE");
-  const alpacaEnv = String(process.env.ALPACA_ENV || "paper").toLowerCase();
+  const checks = buildRuntimePreflightChecks(payload || {});
 
   return {
-    paperOnly:
-      payload && "paperOnly" in payload
-        ? payload.paperOnly === true
-        : alpacaEnv === "paper" && !liveTradingEnabled,
-    liveTradingEnabled,
-    mutationAllowed: payload?.mutationAllowed === true,
-    paperOrderExecutionEnabled: parseEnvBoolean("PAPER_ORDER_EXECUTION_ENABLED"),
-    paperOptionsExecutionEnabled: parseEnvBoolean("PAPER_OPTIONS_EXECUTION_ENABLED")
+    ...checks,
+    paperOrderExecutionEnabled: checks.paperExecutionEnabled
   };
 };
 
@@ -286,13 +298,23 @@ class EnvironmentGuardError extends Error {
   code: string;
   status: number;
   guard: EnvironmentGuardState;
+  checks: RuntimePreflightChecks;
+  failedChecks: string[];
 
-  constructor(code: string, message: string, guard: EnvironmentGuardState, status = 403) {
+  constructor(
+    code: string,
+    message: string,
+    guard: EnvironmentGuardState,
+    status = 403,
+    failedChecks: string[] = []
+  ) {
     super(message);
     this.name = "EnvironmentGuardError";
     this.code = code;
     this.status = status;
     this.guard = guard;
+    this.checks = guard;
+    this.failedChecks = failedChecks;
   }
 }
 
@@ -377,7 +399,7 @@ const authorize = (request: IncomingMessage) => {
   }
   const presented = token.slice(7).trim();
   const configured = getControlToken();
-  return Boolean(configured && presented && presented === configured);
+  return safeTokenEquals(presented, configured);
 };
 
 const requestIdFromRequest = (request: IncomingMessage) =>
@@ -391,7 +413,7 @@ const logEntry = (entry: AuditEntry) => {
   try {
     const logPath = getLogPath();
     mkdirSync(dirname(logPath), { recursive: true });
-    appendFileSync(logPath, `${JSON.stringify(entry)}\n`);
+    appendFileSync(logPath, `${JSON.stringify(redactSensitiveData(entry))}\n`);
   } catch {
     // Logging is best-effort only.
   }
@@ -452,7 +474,8 @@ const wrapRouteError = (
   correlationId: string,
   code: string,
   message: string,
-  guard?: EnvironmentGuardState
+  guard?: EnvironmentGuardState,
+  failedChecks: string[] = []
 ): ErrorEnvelope => ({
   ok: false,
   action,
@@ -460,14 +483,16 @@ const wrapRouteError = (
   correlationId,
   error: {
     code,
-    message
+    message: redactSensitiveText(message)
   },
-  ...(guard ? { guard } : {})
+  ...(guard ? { guard, checks: guard, failedChecks } : {})
 });
 
 type MutabilityRequirement = {
   requireAggressiveMode?: boolean;
   requireOptionsExecution?: boolean;
+  actionType?: RuntimeMutationActionType;
+  confirmPaper?: boolean;
 };
 
 const verifyPaperMutability = async (requirements: MutabilityRequirement = {}) => {
@@ -484,27 +509,28 @@ const verifyPaperMutability = async (requirements: MutabilityRequirement = {}) =
 
   const payload = health as Record<string, unknown>;
   const guard = buildEnvironmentGuardState(payload);
-  if (payload.paperOnly !== true) {
-    throw new EnvironmentGuardError(
-      "PAPER_ENV_REQUIRED",
-      "Blocked by safety guard: paper-only mode is required.",
-      guard
+  try {
+    assertRuntimeMutationPreflight(
+      {
+        actionType: requirements.actionType || "research",
+        confirmPaper: requirements.confirmPaper,
+        requireOptionsExecution: requirements.requireOptionsExecution
+      },
+      payload
     );
+  } catch (error) {
+    if (error instanceof RuntimePreflightError) {
+      throw new EnvironmentGuardError(
+        error.code,
+        error.message,
+        buildEnvironmentGuardState(error.checks),
+        error.status,
+        error.failedChecks
+      );
+    }
+    throw error;
   }
-  if (payload.liveTradingEnabled) {
-    throw new EnvironmentGuardError(
-      "LIVE_TRADING_MUST_BE_DISABLED",
-      "Blocked by safety guard: live trading is enabled in the current environment.",
-      guard
-    );
-  }
-  if (payload.mutationAllowed !== false) {
-    throw new EnvironmentGuardError(
-      "MUTATION_GUARD_STATE_INVALID",
-      "Blocked by safety guard: mutation guard state is invalid for paper-only operation.",
-      guard
-    );
-  }
+
   if (payload.accountStatus !== "ACTIVE") {
     throw new EnvironmentGuardError(
       "PAPER_ACCOUNT_NOT_ACTIVE",
@@ -521,13 +547,6 @@ const verifyPaperMutability = async (requirements: MutabilityRequirement = {}) =
     );
   }
 
-  if (requirements.requireOptionsExecution && process.env.PAPER_OPTIONS_EXECUTION_ENABLED !== "true") {
-    throw new EnvironmentGuardError(
-      "PAPER_OPTIONS_EXECUTION_DISABLED",
-      "Blocked by safety guard: paper options execution is disabled.",
-      guard
-    );
-  }
 };
 
 const executeConfirmHandler = async (_input: ControlInput, requestId: string) => {
@@ -542,19 +561,6 @@ const executeConfirmHandler = async (_input: ControlInput, requestId: string) =>
   if (_input.assetClass !== "all") {
     throw new Error("execute.confirm supports assetClass=all only.");
   }
-
-  if (process.env.PAPER_ORDER_EXECUTION_ENABLED !== "true") {
-    throw new EnvironmentGuardError(
-      "PAPER_ORDER_EXECUTION_DISABLED",
-      "Blocked by safety guard: paper order execution is disabled.",
-      buildEnvironmentGuardState()
-    );
-  }
-
-  await verifyPaperMutability({
-    requireAggressiveMode: true,
-    requireOptionsExecution: true
-  });
 
   await openOrdersFetcher();
   return command(
@@ -664,11 +670,6 @@ const executeReviewedHandler = async (input: ControlInput, requestId: string) =>
     };
   }
 
-  await verifyPaperMutability({
-    requireAggressiveMode: true,
-    requireOptionsExecution: true
-  });
-
   await openOrdersFetcher();
   return command(
     "paper:execute:reviewed",
@@ -760,6 +761,7 @@ const actionHandlers: Record<string, ActionConfig> = {
     timeoutMs: 420_000,
     requireAdminToken: true,
     requireMutationPrecheck: true,
+    runtimePreflight: { actionType: "research" },
     action: "research.run",
     handler: async (input, requestId) =>
       command(
@@ -785,6 +787,7 @@ const actionHandlers: Record<string, ActionConfig> = {
     timeoutMs: 420_000,
     requireAdminToken: true,
     requireMutationPrecheck: true,
+    runtimePreflight: { actionType: "research" },
     action: "paper.actions.research.run",
     handler: async (input, requestId) =>
       command(
@@ -810,6 +813,7 @@ const actionHandlers: Record<string, ActionConfig> = {
     timeoutMs: 120_000,
     requireAdminToken: true,
     requireMutationPrecheck: true,
+    runtimePreflight: { actionType: "learning" },
     action: "paper.actions.learn.run",
     handler: learnRunHandler
   },
@@ -818,6 +822,7 @@ const actionHandlers: Record<string, ActionConfig> = {
     timeoutMs: 60_000,
     requireAdminToken: true,
     requireMutationPrecheck: true,
+    runtimePreflight: { actionType: "portfolio-review" },
     action: "paper.actions.portfolio.review",
     handler: portfolioReviewHandler
   },
@@ -826,6 +831,7 @@ const actionHandlers: Record<string, ActionConfig> = {
     timeoutMs: 60_000,
     requireAdminToken: true,
     requireMutationPrecheck: true,
+    runtimePreflight: { actionType: "options-discovery" },
     action: "paper.actions.options.discover",
     handler: optionsDiscoverHandler
   },
@@ -834,6 +840,7 @@ const actionHandlers: Record<string, ActionConfig> = {
     timeoutMs: 120_000,
     requireAdminToken: true,
     requireMutationPrecheck: true,
+    runtimePreflight: { actionType: "review" },
     action: "paper.actions.review",
     handler: opsReviewHandler
   },
@@ -842,6 +849,11 @@ const actionHandlers: Record<string, ActionConfig> = {
     timeoutMs: 120_000,
     requireAdminToken: true,
     requireMutationPrecheck: false,
+    runtimePreflight: {
+      actionType: "confirmed-paper-execution",
+      confirmPaperFromInput: true,
+      requireOptionsExecution: true
+    },
     action: "paper.actions.execute",
     handler: executeReviewedHandler
   },
@@ -868,6 +880,7 @@ const actionHandlers: Record<string, ActionConfig> = {
     timeoutMs: 60_000,
     requireAdminToken: true,
     requireMutationPrecheck: true,
+    runtimePreflight: { actionType: "review" },
     action: "review.run",
     handler: async (input, requestId) =>
       command(
@@ -888,6 +901,7 @@ const actionHandlers: Record<string, ActionConfig> = {
     timeoutMs: 60_000,
     requireAdminToken: true,
     requireMutationPrecheck: true,
+    runtimePreflight: { actionType: "review" },
     action: "plan.run",
     handler: async (input, requestId) =>
       command(
@@ -908,6 +922,7 @@ const actionHandlers: Record<string, ActionConfig> = {
     timeoutMs: 120_000,
     requireAdminToken: true,
     requireMutationPrecheck: false,
+    runtimePreflight: { actionType: "dry-run-execution" },
     action: "execute.dry-run",
     handler: executeDryRunHandler
   },
@@ -924,6 +939,11 @@ const actionHandlers: Record<string, ActionConfig> = {
     timeoutMs: 120_000,
     requireAdminToken: true,
     requireMutationPrecheck: false,
+    runtimePreflight: {
+      actionType: "confirmed-paper-execution",
+      confirmPaper: true,
+      requireOptionsExecution: true
+    },
     action: "execute.confirm",
     handler: executeConfirmHandler
   },
@@ -940,6 +960,7 @@ const actionHandlers: Record<string, ActionConfig> = {
     timeoutMs: 60_000,
     requireAdminToken: true,
     requireMutationPrecheck: false,
+    runtimePreflight: { actionType: "review" },
     action: "refresh",
     handler: async (input, requestId) =>
       command(
@@ -960,7 +981,7 @@ const actionHandlers: Record<string, ActionConfig> = {
 export const ACTION_HANDLERS = actionHandlers;
 
 const parseError = (error: unknown) =>
-  error instanceof Error ? error.message : String(error || "Control request failed.");
+  redactSensitiveText(error instanceof Error ? error.message : String(error || "Control request failed."));
 
 const classifyErrorCode = (message: string) =>
   message.includes("token")
@@ -981,6 +1002,27 @@ const routeErrorStatus = (error: unknown, code: string) =>
       ? 401
       : 500;
 
+const runtimePreflightForConfig = (
+  config: ActionConfig,
+  input: ControlInput
+): MutabilityRequirement | null => {
+  if (config.runtimePreflight) {
+    return {
+      actionType: config.runtimePreflight.actionType,
+      confirmPaper: config.runtimePreflight.confirmPaperFromInput
+        ? input.confirmPaper === true
+        : config.runtimePreflight.confirmPaper,
+      requireOptionsExecution: config.runtimePreflight.requireOptionsExecution
+    };
+  }
+
+  if (config.requireMutationPrecheck) {
+    return { actionType: "research" };
+  }
+
+  return null;
+};
+
 const routeHandler = async (request: IncomingMessage, response: any, config: ActionConfig) => {
   const startMs = Date.now();
   const startedAt = new Date(startMs).toISOString();
@@ -992,12 +1034,13 @@ const routeHandler = async (request: IncomingMessage, response: any, config: Act
       throw new Error("Missing or invalid control token.");
     }
 
-    if (config.requireMutationPrecheck) {
-      await verifyPaperMutability();
-    }
-
     const body = request.method === "POST" ? await readBody(request) : {};
     const input = parseInput(body);
+    const preflight = runtimePreflightForConfig(config, input);
+    if (preflight) {
+      await verifyPaperMutability(preflight);
+    }
+
     const data = await config.handler(input, requestId);
     const durationMs = Date.now() - startMs;
     const finishedAt = new Date(startMs + durationMs).toISOString();
@@ -1048,7 +1091,8 @@ const routeHandler = async (request: IncomingMessage, response: any, config: Act
       correlationId,
       code,
       message,
-      error instanceof EnvironmentGuardError ? error.guard : undefined
+      error instanceof EnvironmentGuardError ? error.guard : undefined,
+      error instanceof EnvironmentGuardError ? error.failedChecks : []
     );
     const durationMs = Date.now() - startMs;
 
@@ -1065,7 +1109,7 @@ const routeHandler = async (request: IncomingMessage, response: any, config: Act
       status: "error",
       durationMs,
       resultSummary: "error",
-      error: message
+      error: redactSensitiveText(message)
     });
 
     response.statusCode = status;
@@ -1119,7 +1163,7 @@ const requestListener = async (request: IncomingMessage, response: any) => {
           "unknown",
           randomUUID(),
           "CONTROL_ROUTE_HANDLER_ERROR",
-          error instanceof Error ? error.message : "Request handler failed."
+          redactSensitiveText(error instanceof Error ? error.message : "Request handler failed.")
         )
       )
     );

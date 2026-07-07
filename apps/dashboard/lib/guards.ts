@@ -1,15 +1,35 @@
 import { getTradingSafetyState } from "../../../src/services/tradingSafetyService";
+import { safeTokenEquals } from "../../../src/lib/safeToken";
+import { redactSensitiveText } from "../../../src/lib/securityRedaction";
+import {
+  RuntimePreflightError,
+  assertRuntimeMutationPreflight,
+  type RuntimePreflightChecks,
+  type RuntimePreflightPolicy
+} from "../../../src/services/runtimeMutationPreflight";
 import { isVercelRuntime } from "./runtime";
 
 export class DashboardGuardError extends Error {
   status: number;
   code: string;
+  checks?: RuntimePreflightChecks;
+  failedChecks?: string[];
 
-  constructor(code: string, message: string, status = 403) {
+  constructor(
+    code: string,
+    message: string,
+    status = 403,
+    details: {
+      checks?: RuntimePreflightChecks;
+      failedChecks?: string[];
+    } = {}
+  ) {
     super(message);
     this.name = "DashboardGuardError";
     this.status = status;
     this.code = code;
+    this.checks = details.checks;
+    this.failedChecks = details.failedChecks;
   }
 }
 
@@ -78,7 +98,7 @@ export const assertDashboardAdminToken = (token: string | null) => {
     );
   }
 
-  if (!token || token !== expected) {
+  if (!safeTokenEquals(token, expected)) {
     throw new DashboardGuardError(
       "DASHBOARD_ADMIN_TOKEN_INVALID",
       "Invalid dashboard admin token."
@@ -86,7 +106,31 @@ export const assertDashboardAdminToken = (token: string | null) => {
   }
 };
 
+export const assertDashboardRuntimePreflight = (policy: RuntimePreflightPolicy) =>
+  assertRuntimeMutationPreflight(policy);
+
+const guardFromChecks = (checks: RuntimePreflightChecks) => ({
+  ...checks,
+  paperOrderExecutionEnabled: checks.paperExecutionEnabled
+});
+
 export const sanitizeDashboardError = (error: unknown) => {
+  if (error instanceof RuntimePreflightError) {
+    return {
+      status: error.status,
+      body: {
+        ok: false,
+        error: {
+          code: error.code,
+          message: redactSensitiveText(error.message)
+        },
+        checks: error.checks,
+        guard: guardFromChecks(error.checks),
+        failedChecks: error.failedChecks
+      }
+    };
+  }
+
   if (error instanceof DashboardGuardError) {
     return {
       status: error.status,
@@ -94,8 +138,11 @@ export const sanitizeDashboardError = (error: unknown) => {
         ok: false,
         error: {
           code: error.code,
-          message: error.message
-        }
+          message: redactSensitiveText(error.message)
+        },
+        ...(error.checks ? { checks: error.checks } : {}),
+        ...(error.checks ? { guard: guardFromChecks(error.checks) } : {}),
+        ...(error.failedChecks ? { failedChecks: error.failedChecks } : {})
       }
     };
   }
