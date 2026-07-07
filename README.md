@@ -344,10 +344,10 @@ If the plan has no eligible payloads after candidate filtering, `paper:execute -
 Required command forms:
 
 ```bash
-npm run paper:execute -- --confirmPaper
-npm run paper:execute -- --confirmPaper --format=json
-npm run paper:execute -- --confirmPaper --assetClass=option
-npm run paper:execute -- --confirmPaper --assetClass=all
+npm run paper:execute -- --confirmPaper --assetClass=equity
+npm run paper:execute -- --confirmPaper --assetClass=equity --format=json
+npm run paper:execute -- --confirmPaper --riskProfile=aggressive --optionsEnabled=true --assetClass=option
+npm run paper:execute -- --confirmPaper --riskProfile=aggressive --optionsEnabled=true --assetClass=all
 ```
 
 `--confirmPaper` hard gates:
@@ -356,10 +356,13 @@ npm run paper:execute -- --confirmPaper --assetClass=all
 - `LIVE_TRADING_MUST_BE_DISABLED`: `LIVE_TRADING_ENABLED=false`
 - `PAPER_ORDER_EXECUTION_DISABLED`: `PAPER_ORDER_EXECUTION_ENABLED=true`
 - `PAPER_OPTIONS_EXECUTION_DISABLED`: `PAPER_OPTIONS_EXECUTION_ENABLED=true` for option payloads
+- `OPTIONS_EXECUTION_REQUIRES_EXPLICIT_OPTIONS_ENABLED`: `--optionsEnabled=true` on the execution command for option payloads
+- `OPTIONS_EXECUTION_REQUIRES_EXPLICIT_RISK_PROFILE`: explicit `--riskProfile=<profile>` on the execution command for option payloads
 
 Paper endpoint-only safety note:
 
 `paper:execute --confirmPaper` submits to Alpaca paper endpoints only and includes request IDs where available.
+When option payloads are present, execution rebuilds plan/review with the supplied `--riskProfile` and `--optionsEnabled=true` flags before submission; default moderate/options-disabled execution cannot submit option payloads.
 
 ## Paper Risk Posture
 
@@ -695,7 +698,7 @@ npm run typecheck
 npm run build
 npm run dashboard:build
 npm run paper:execute -- --dryRun --format=json
-npm run paper:execute -- --confirmPaper --format=json
+npm run paper:execute -- --confirmPaper --assetClass=equity --format=json
 ```
 
 - Option ingestion supports optional filters:

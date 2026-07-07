@@ -47,6 +47,8 @@ export type PaperExecuteBlockerCode =
   | "LIVE_TRADING_MUST_BE_DISABLED"
   | "PAPER_ORDER_EXECUTION_DISABLED"
   | "PAPER_OPTIONS_EXECUTION_DISABLED"
+  | "OPTIONS_EXECUTION_REQUIRES_EXPLICIT_OPTIONS_ENABLED"
+  | "OPTIONS_EXECUTION_REQUIRES_EXPLICIT_RISK_PROFILE"
   | "PLAN_NOT_DRY_RUN"
   | "PLAN_NOT_NON_MUTATING"
   | "REVIEW_NOT_REVIEW_ONLY"
@@ -192,6 +194,8 @@ const BLOCKER_ORDER: PaperExecuteBlockerCode[] = [
   "LIVE_TRADING_MUST_BE_DISABLED",
   "PAPER_ORDER_EXECUTION_DISABLED",
   "PAPER_OPTIONS_EXECUTION_DISABLED",
+  "OPTIONS_EXECUTION_REQUIRES_EXPLICIT_OPTIONS_ENABLED",
+  "OPTIONS_EXECUTION_REQUIRES_EXPLICIT_RISK_PROFILE",
   "PLAN_NOT_DRY_RUN",
   "PLAN_NOT_NON_MUTATING",
   "REVIEW_NOT_REVIEW_ONLY",
@@ -1336,6 +1340,22 @@ const runtimeDuplicateReconciliationEnabled = () =>
   process.env.PAPER_RUNTIME_DUPLICATE_RECONCILIATION_ENABLED === "true" ||
   process.env.PAPER_RUNTIME_DUPLICATE_RECONCILIATION_ENABLED === "1";
 
+const optionExecutionContextBlocker = (
+  payload: AlpacaOrderPayloadDryRun,
+  input: PaperExecuteInput
+): PaperExecuteBlockerCode | null => {
+  if (payload.assetClass !== "option") {
+    return null;
+  }
+  if (input.optionsEnabled !== true) {
+    return "OPTIONS_EXECUTION_REQUIRES_EXPLICIT_OPTIONS_ENABLED";
+  }
+  if (!input.riskProfile) {
+    return "OPTIONS_EXECUTION_REQUIRES_EXPLICIT_RISK_PROFILE";
+  }
+  return null;
+};
+
 export const buildPaperExecuteConfirmPaperReport = async (
   input: PaperExecuteInput = {},
   deps: PaperConfirmDeps = {}
@@ -1471,6 +1491,22 @@ export const buildPaperExecuteConfirmPaperReport = async (
         payload,
         "PAPER_OPTIONS_EXECUTION_DISABLED",
         "Options paper execution requires PAPER_OPTIONS_EXECUTION_ENABLED=true."
+      );
+      blocked.push(entry);
+      insertPaperExecutionLedgerEntry(
+        ledgerInputForPayload(payload, dryRunReport.source, "blocked", entry.reason)
+      );
+      continue;
+    }
+
+    const contextBlocker = optionExecutionContextBlocker(payload, input);
+    if (contextBlocker) {
+      const entry = blockConfirmPayload(
+        payload,
+        contextBlocker,
+        contextBlocker === "OPTIONS_EXECUTION_REQUIRES_EXPLICIT_OPTIONS_ENABLED"
+          ? "Options paper execution requires --optionsEnabled=true on the execution command."
+          : "Options paper execution requires an explicit --riskProfile on the execution command."
       );
       blocked.push(entry);
       insertPaperExecutionLedgerEntry(

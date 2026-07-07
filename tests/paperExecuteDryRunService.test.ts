@@ -196,6 +196,15 @@ const confirmWith = async (
   });
 };
 
+const explicitOptionsConfirmInput = (
+  values: Parameters<typeof buildPaperExecuteConfirmPaperReport>[0] = {}
+) => ({
+  confirmPaper: true,
+  riskProfile: "aggressive" as const,
+  optionsEnabled: true,
+  ...values
+});
+
 const basePlan = (values: Partial<PaperPlanReport> = {}): PaperPlanReport => {
   const plan = values.plan || [plannedCandidate()];
   return {
@@ -860,6 +869,30 @@ describe("paper execute confirm-paper guardrails", () => {
 });
 
 describe("paper execute confirm-paper options", () => {
+  test("options require explicit optionsEnabled execution flag even when env gate is enabled", async () => {
+    process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
+    process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
+    const report = await confirmWith(
+      { plan: [optionCandidate("long_call")] },
+      {},
+      { confirmPaper: true, riskProfile: "aggressive" }
+    );
+    assert.equal(report.blocked[0]?.reason, "OPTIONS_EXECUTION_REQUIRES_EXPLICIT_OPTIONS_ENABLED");
+    assert.equal(report.submitted.length, 0);
+  });
+
+  test("options require explicit riskProfile when options execution is requested", async () => {
+    process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
+    process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
+    const report = await confirmWith(
+      { plan: [optionCandidate("long_call")] },
+      {},
+      { confirmPaper: true, optionsEnabled: true }
+    );
+    assert.equal(report.blocked[0]?.reason, "OPTIONS_EXECUTION_REQUIRES_EXPLICIT_RISK_PROFILE");
+    assert.equal(report.submitted.length, 0);
+  });
+
   test("long call paper payload submits when all gates pass", async () => {
     process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
     process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
@@ -871,7 +904,7 @@ describe("paper execute confirm-paper options", () => {
       estimatedPremium: 125,
       maxRisk: 125,
       estimatedNotional: 125
-    })] }, {}, { confirmPaper: true }, {
+    })] }, {}, explicitOptionsConfirmInput(), {
       submitPaperOrder: async (payload) => {
         submittedPayloads.push(payload);
         return mockSubmitSuccess(payload);
@@ -892,7 +925,7 @@ describe("paper execute confirm-paper options", () => {
   test("long put paper payload submits when all gates pass", async () => {
     process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
     process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
-    const report = await confirmWith({ plan: [optionCandidate("long_put")] });
+    const report = await confirmWith({ plan: [optionCandidate("long_put")] }, {}, explicitOptionsConfirmInput());
     assert.equal(report.errors.length, 0);
     assert.equal(report.submitted.length, 1);
     assert.equal(report.submitted[0]?.strategy, "long_put");
@@ -900,9 +933,72 @@ describe("paper execute confirm-paper options", () => {
 
   test("options require PAPER_OPTIONS_EXECUTION_ENABLED=true", async () => {
     process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
-    const report = await confirmWith({ plan: [optionCandidate("long_call")] });
+    const report = await confirmWith({ plan: [optionCandidate("long_call")] }, {}, explicitOptionsConfirmInput());
     assert.equal(report.blocked[0]?.reason, "PAPER_OPTIONS_EXECUTION_DISABLED");
     assert.equal(report.submitted.length, 0);
+  });
+
+  test("confirm-paper rebuilds review with supplied option execution flags before submission", async () => {
+    process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
+    process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
+    let planInput: { riskProfile?: string; optionsEnabled?: boolean } | undefined;
+    let reviewInput: { riskProfile?: string; optionsEnabled?: boolean } | undefined;
+    const report = await buildPaperExecuteConfirmPaperReport(
+      explicitOptionsConfirmInput({ assetClass: "option" }),
+      {
+        now: () => now,
+        buildPlan: async (input) => {
+          planInput = input;
+          const plan = basePlan({ plan: [optionCandidate("long_call")] });
+          return {
+            ...plan,
+            config: {
+              ...plan.config,
+              riskProfile: input.riskProfile || plan.config.riskProfile,
+              optionsEnabled: input.optionsEnabled ?? plan.config.optionsEnabled
+            }
+          };
+        },
+        buildReview: async (input, reviewDeps) => {
+          reviewInput = {
+            riskProfile: input?.riskProfile,
+            optionsEnabled: input?.optionsEnabled
+          };
+          const plan = reviewDeps?.buildPlan
+            ? await reviewDeps.buildPlan({} as any)
+            : basePlan({ plan: [optionCandidate("long_call")] });
+          return baseReview(plan);
+        },
+        getAccount: async () => ({
+          data: mockAccount(),
+          requestId: "account-request-id",
+          status: 200,
+          url: "https://paper-api.alpaca.markets/v2/account"
+        }),
+        getOptionContract: async (symbolOrId: string) => ({
+          data: mockContract(symbolOrId),
+          requestId: "contract-request-id",
+          status: 200,
+          url: `https://paper-api.alpaca.markets/v2/options/contracts/${symbolOrId}`
+        }),
+        listPaperPositions: async () => ({
+          data: [mockPosition()],
+          requestId: "positions-request-id",
+          status: 200,
+          url: "https://paper-api.alpaca.markets/v2/positions"
+        }),
+        submitPaperOrder: mockSubmitSuccess
+      }
+    );
+
+    assert.ok(planInput);
+    assert.ok(reviewInput);
+    assert.equal(planInput.riskProfile, "aggressive");
+    assert.equal(planInput.optionsEnabled, true);
+    assert.equal(reviewInput.riskProfile, "aggressive");
+    assert.equal(reviewInput.optionsEnabled, true);
+    assert.equal(report.errors.length, 0);
+    assert.equal(report.submitted.length, 1);
   });
 
   test("confirm-paper does not submit option payloads with rejected quote status", async () => {
@@ -918,7 +1014,7 @@ describe("paper execute confirm-paper options", () => {
         executablePriceSource: null,
         rejectionReason: "quote_unavailable"
       })
-    ] }, {}, { confirmPaper: true }, {
+    ] }, {}, explicitOptionsConfirmInput(), {
       submitPaperOrder: async (payload) => {
         submitCalls += 1;
         return mockSubmitSuccess(payload);
@@ -935,7 +1031,7 @@ describe("paper execute confirm-paper options", () => {
     process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
     const report = await confirmWith({
       plan: [optionCandidate("long_call", { limitPrice: null, orderType: "market" })]
-    });
+    }, {}, explicitOptionsConfirmInput());
     assert.equal(report.blocked[0]?.reason, "OPTION_LIMIT_PRICE_REQUIRED");
     assert.equal(report.submitted.length, 0);
   });
@@ -943,7 +1039,7 @@ describe("paper execute confirm-paper options", () => {
   test("inactive or expired option contract is blocked", async () => {
     process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
     process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
-    const report = await confirmWith({ plan: [optionCandidate("long_call")] }, {}, { confirmPaper: true }, {
+    const report = await confirmWith({ plan: [optionCandidate("long_call")] }, {}, explicitOptionsConfirmInput(), {
       getOptionContract: async (symbolOrId: string) => ({
         data: mockContract(symbolOrId, { status: "inactive", tradable: false }),
         requestId: "contract-request-id",
@@ -958,7 +1054,7 @@ describe("paper execute confirm-paper options", () => {
   test("insufficient options approval is blocked", async () => {
     process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
     process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
-    const report = await confirmWith({ plan: [optionCandidate("long_call")] }, {}, { confirmPaper: true }, {
+    const report = await confirmWith({ plan: [optionCandidate("long_call")] }, {}, explicitOptionsConfirmInput(), {
       getAccount: async () => ({
         data: mockAccount({ options_approved_level: 1, options_trading_level: 1 }),
         requestId: "account-request-id",
@@ -983,7 +1079,7 @@ describe("paper execute confirm-paper options", () => {
         maxRisk: 200,
         estimatedNotional: 200
       })]
-    });
+    }, {}, explicitOptionsConfirmInput());
     assert.equal(report.blocked[0]?.reason, "OPTION_RISK_LIMIT_EXCEEDED");
     assert.equal(report.submitted.length, 0);
   });
@@ -1001,7 +1097,7 @@ describe("paper execute confirm-paper options", () => {
         maxRisk: 6000,
         estimatedNotional: 125
       })]
-    });
+    }, {}, explicitOptionsConfirmInput());
     assert.equal(report.errors.length, 0);
     assert.equal(report.blocked.length, 0);
     assert.equal(report.submitted.length, 1);
@@ -1013,7 +1109,7 @@ describe("paper execute confirm-paper options", () => {
     process.env.PAPER_OPTIONS_MAX_CONTRACTS = "2";
     const report = await confirmWith({
       plan: [optionCandidate("long_call", { contracts: 3, estimatedQty: 3, maxRisk: 225 })]
-    });
+    }, {}, explicitOptionsConfirmInput());
     assert.equal(report.blocked[0]?.reason, "OPTION_RISK_LIMIT_EXCEEDED");
     assert.equal(report.submitted.length, 0);
   });
@@ -1021,7 +1117,7 @@ describe("paper execute confirm-paper options", () => {
   test("naked short call is blocked by covered-call share requirement", async () => {
     process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
     process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
-    const report = await confirmWith({ plan: [optionCandidate("covered_call", { maxRisk: 0 })] }, {}, { confirmPaper: true }, {
+    const report = await confirmWith({ plan: [optionCandidate("covered_call", { maxRisk: 0 })] }, {}, explicitOptionsConfirmInput(), {
       listPaperPositions: async () => ({
         data: [],
         requestId: "positions-request-id",
@@ -1036,7 +1132,7 @@ describe("paper execute confirm-paper options", () => {
   test("covered call submits only when sufficient shares exist", async () => {
     process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
     process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
-    const report = await confirmWith({ plan: [optionCandidate("covered_call", { maxRisk: 0 })] });
+    const report = await confirmWith({ plan: [optionCandidate("covered_call", { maxRisk: 0 })] }, {}, explicitOptionsConfirmInput());
     assert.equal(report.errors.length, 0);
     assert.equal(report.submitted.length, 1);
     assert.equal(report.submitted[0]?.strategy, "covered_call");
@@ -1046,7 +1142,7 @@ describe("paper execute confirm-paper options", () => {
     process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
     process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
     process.env.PAPER_OPTIONS_MAX_PREMIUM_PER_ORDER = "20000";
-    const report = await confirmWith({ plan: [optionCandidate("cash_secured_put")] }, {}, { confirmPaper: true }, {
+    const report = await confirmWith({ plan: [optionCandidate("cash_secured_put")] }, {}, explicitOptionsConfirmInput(), {
       getAccount: async () => ({
         data: mockAccount({ options_buying_power: "100" }),
         requestId: "account-request-id",
@@ -1063,7 +1159,7 @@ describe("paper execute confirm-paper options", () => {
     process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
     const report = await confirmWith({
       plan: [optionCandidate("long_call", { orderType: "market" })]
-    });
+    }, {}, explicitOptionsConfirmInput());
     assert.equal(report.blocked[0]?.reason, "OPTION_LIMIT_PRICE_REQUIRED");
     assert.equal(report.submitted.length, 0);
   });
@@ -1074,7 +1170,7 @@ describe("paper execute confirm-paper options", () => {
     process.env.PAPER_OPTIONS_ALLOW_MARKET_ORDERS = "true";
     const report = await confirmWith({
       plan: [optionCandidate("long_call", { orderType: "market", limitPrice: null })]
-    });
+    }, {}, explicitOptionsConfirmInput());
     assert.equal(report.errors.length, 0);
     assert.equal(report.submitted.length, 1);
     assert.equal(report.submitted[0]?.type, "market");
@@ -1084,7 +1180,7 @@ describe("paper execute confirm-paper options", () => {
   test("0DTE option is blocked by default for paper options", async () => {
     process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
     process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
-    const report = await confirmWith({ plan: [optionCandidate("long_call")] }, {}, { confirmPaper: true }, {
+    const report = await confirmWith({ plan: [optionCandidate("long_call")] }, {}, explicitOptionsConfirmInput(), {
       getOptionContract: async (symbolOrId: string) => ({
         data: mockContract(symbolOrId, { expiration_date: new Date().toISOString().slice(0, 10) }),
         requestId: "contract-request-id",
@@ -1100,7 +1196,7 @@ describe("paper execute confirm-paper options", () => {
     process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
     process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
     process.env.ALLOW_0DTE_OPTIONS = "true";
-    const report = await confirmWith({ plan: [optionCandidate("long_call")] }, {}, { confirmPaper: true }, {
+    const report = await confirmWith({ plan: [optionCandidate("long_call")] }, {}, explicitOptionsConfirmInput(), {
       getOptionContract: async (symbolOrId: string) => ({
         data: mockContract(symbolOrId, { expiration_date: new Date().toISOString().slice(0, 10) }),
         requestId: "contract-request-id",
@@ -1136,7 +1232,7 @@ describe("paper execute confirm-paper options", () => {
         ]
       },
       {},
-      { confirmPaper: true, assetClass: "option" },
+      explicitOptionsConfirmInput({ assetClass: "option" }),
       {
         getOptionContract: async (symbolOrId: string) => ({
           data: mockContract(symbolOrId, {
@@ -1190,7 +1286,7 @@ describe("paper execute confirm-paper options", () => {
         ]
       },
       {},
-      { confirmPaper: true, assetClass: "option" },
+      explicitOptionsConfirmInput({ assetClass: "option" }),
       {
         getOptionContract: async (symbolOrId: string) => ({
           data: mockContract(symbolOrId, {
