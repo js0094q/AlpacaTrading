@@ -1535,7 +1535,9 @@ const paperOptionsConfig = () => {
     allowLastPriceFallback: quoteCfg.allowLastPriceFallback,
     learningLedgerEnabled: parseBooleanEnv("PAPER_OPTION_LEARNING_LEDGER_ENABLED", true),
     zeroDteSpy: {
-      enabled: parseBooleanEnv("PAPER_0DTE_SPY_ENABLED", false),
+      enabled:
+        parseBooleanEnv("PAPER_0DTE_SPY_ENABLED", false) ||
+        parseBooleanEnv("PAPER_0DTE_DISCOVERY_ENABLED", false),
       underlyings: parseSymbolListEnv("PAPER_0DTE_SPY_UNDERLYINGS", ["SPY"]),
       maxPremiumPerTrade: Math.min(maxOrderNotional, zeroDteMaxOrderNotional),
       maxPremiumPerContract: Math.min(maxPremiumPerContract, zeroDteMaxPremiumPerContract),

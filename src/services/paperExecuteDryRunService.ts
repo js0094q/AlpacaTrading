@@ -952,7 +952,9 @@ const optionExecutionConfig = () => {
     maxPortfolioRiskPct: parseExecutionNumber("PAPER_OPTIONS_MAX_PORTFOLIO_RISK_PCT", 20),
     maxPositionRiskPct: parseExecutionNumber("PAPER_OPTIONS_MAX_POSITION_RISK_PCT", 5),
     zeroDteSpy: {
-      enabled: parseExecutionBoolean("PAPER_0DTE_SPY_ENABLED"),
+      enabled:
+        parseExecutionBoolean("PAPER_0DTE_SPY_ENABLED") ||
+        parseExecutionBoolean("PAPER_0DTE_DISCOVERY_ENABLED"),
       maxPremiumPerTrade: Math.min(maxOrderNotional, zeroDteMaxOrderNotional),
       maxPremiumPerContract: Math.min(maxPremiumPerContract, zeroDteMaxPremiumPerContract),
       maxOrderNotional: Math.min(maxOrderNotional, zeroDteMaxOrderNotional),

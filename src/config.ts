@@ -125,7 +125,9 @@ export const config = {
     true
   ),
   paperZeroDteSpy: {
-    enabled: parseBoolean(process.env.PAPER_0DTE_SPY_ENABLED),
+    enabled:
+      parseBoolean(process.env.PAPER_0DTE_SPY_ENABLED) ||
+      parseBoolean(process.env.PAPER_0DTE_DISCOVERY_ENABLED),
     underlyings: parseSymbolList(process.env.PAPER_0DTE_SPY_UNDERLYINGS, ["SPY"]),
     maxPremiumPerTrade: paperZeroDteSpyMaxOrderNotional,
     maxPremiumPerContract: Math.min(

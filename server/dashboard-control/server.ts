@@ -14,6 +14,8 @@ import {
 import { getAlpacaAccountSnapshot } from "../../src/services/alpacaAccountService.js";
 import { listAlpacaOpenOrders } from "../../src/services/alpacaOrderReadService.js";
 import { listAlpacaPositions } from "../../src/services/alpacaPositionService.js";
+import { listPaperOperations } from "../../src/services/paperOperationLogService.js";
+import { latestReviewArtifactReadiness } from "../../src/services/paperOpsWorkflowService.js";
 
 type RiskProfile = "moderate" | "aggressive" | "conservative";
 type AssetClass = "all" | "equity" | "option";
@@ -23,12 +25,24 @@ type ControlInput = {
   optionsEnabled: boolean;
   maxCandidates: number;
   assetClass: AssetClass;
+  confirmPaper: boolean;
+  expectedPayloadSignature?: string;
+  underlying: string;
+  dte: number;
 };
 
 type Envelope = {
   ok: true;
+  status: string;
   action: string;
   requestId: string;
+  startedAt: string;
+  finishedAt: string;
+  durationMs: number;
+  summary?: unknown;
+  details?: unknown;
+  blockers?: unknown;
+  warnings?: unknown;
   data: unknown;
   params?: Record<string, unknown>;
   correlationId?: string;
@@ -296,7 +310,17 @@ const parseInput = (raw: unknown): ControlInput => {
     riskProfile: normalizeRiskProfile(body.riskProfile),
     optionsEnabled: normalizeBoolean(body.optionsEnabled, true),
     maxCandidates: safeInteger(body.maxCandidates, 10),
-    assetClass: parseAssetClass(body.assetClass)
+    assetClass: parseAssetClass(body.assetClass),
+    confirmPaper: normalizeBoolean(body.confirmPaper, false),
+    expectedPayloadSignature:
+      typeof body.expectedPayloadSignature === "string"
+        ? body.expectedPayloadSignature
+        : undefined,
+    underlying:
+      typeof body.underlying === "string" && body.underlying.trim()
+        ? body.underlying.trim().toUpperCase()
+        : "SPY",
+    dte: safeInteger(body.dte, 0, 0, 30)
   };
 };
 
@@ -378,12 +402,36 @@ const wrapSuccess = (
   requestId: string,
   correlationId: string,
   data: unknown,
-  params: Record<string, unknown>
+  params: Record<string, unknown>,
+  timing: {
+    startedAt: string;
+    finishedAt: string;
+    durationMs: number;
+  }
 ): Envelope => ({
   ok: true,
+  status:
+    data && typeof data === "object" && "status" in data
+      ? String((data as { status?: unknown }).status || "success")
+      : "success",
   action,
   requestId,
   correlationId,
+  startedAt: timing.startedAt,
+  finishedAt: timing.finishedAt,
+  durationMs: timing.durationMs,
+  ...(data && typeof data === "object" && "summary" in data
+    ? { summary: (data as { summary?: unknown }).summary }
+    : {}),
+  ...(data && typeof data === "object" && "details" in data
+    ? { details: (data as { details?: unknown }).details }
+    : {}),
+  ...(data && typeof data === "object" && "blockers" in data
+    ? { blockers: (data as { blockers?: unknown }).blockers }
+    : {}),
+  ...(data && typeof data === "object" && "warnings" in data
+    ? { warnings: (data as { warnings?: unknown }).warnings }
+    : {}),
   data,
   params
 });
@@ -541,6 +589,100 @@ const executeDryRunHandler = (input: ControlInput, requestId: string) =>
     "execute.dry-run"
   );
 
+const learnRunHandler = (_input: ControlInput, requestId: string) =>
+  command(
+    "paper:learn",
+    ["--format=json"],
+    120_000,
+    requestId,
+    "learn.run"
+  );
+
+const portfolioReviewHandler = (_input: ControlInput, requestId: string) =>
+  command(
+    "paper:portfolio:review",
+    ["--format=json"],
+    60_000,
+    requestId,
+    "portfolio.review"
+  );
+
+const optionsDiscoverHandler = (input: ControlInput, requestId: string) =>
+  command(
+    "paper:options:discover",
+    [
+      `--underlying=${input.underlying}`,
+      `--dte=${input.dte}`,
+      "--format=json"
+    ],
+    60_000,
+    requestId,
+    "options.discover"
+  );
+
+const opsReviewHandler = (_input: ControlInput, requestId: string) =>
+  command(
+    "paper:ops:review",
+    ["--format=json"],
+    120_000,
+    requestId,
+    "paper.ops.review"
+  );
+
+const executeReviewedHandler = async (input: ControlInput, requestId: string) => {
+  if (input.confirmPaper !== true) {
+    return {
+      paperOnly: true,
+      status: "blocked",
+      reason: "CONFIRM_PAPER_REQUIRED",
+      summary: {
+        eligiblePayloads: 0,
+        submitted: 0,
+        blocked: 1,
+        errors: 0
+      },
+      blockers: ["CONFIRM_PAPER_REQUIRED"],
+      warnings: []
+    };
+  }
+
+  const readiness = latestReviewArtifactReadiness();
+  if (!readiness.ready) {
+    return {
+      paperOnly: true,
+      status: readiness.status,
+      reason: readiness.reason,
+      summary: {
+        eligiblePayloads: readiness.artifact?.payloadCount ?? 0,
+        submitted: 0,
+        blocked: readiness.status === "blocked" ? 1 : 0,
+        errors: 0
+      },
+      blockers: readiness.status === "blocked" ? [readiness.reason] : [],
+      warnings: readiness.status === "warning" ? [readiness.reason] : [],
+      artifact: readiness.artifact ?? null
+    };
+  }
+
+  await verifyPaperMutability({
+    requireAggressiveMode: true,
+    requireOptionsExecution: true
+  });
+
+  await openOrdersFetcher();
+  return command(
+    "paper:execute:reviewed",
+    [
+      "--confirmPaper",
+      `--expectedPayloadSignature=${readiness.artifact.payloadSignature}`,
+      "--format=json"
+    ],
+    120_000,
+    requestId,
+    "execute.reviewed"
+  );
+};
+
 const actionHandlers: Record<string, ActionConfig> = {
   "/api/v1/health": {
     method: "GET",
@@ -637,6 +779,89 @@ const actionHandlers: Record<string, ActionConfig> = {
           env: researchRunEnv()
         }
       )
+  },
+  "/api/v1/actions/research/run": {
+    method: "POST",
+    timeoutMs: 420_000,
+    requireAdminToken: true,
+    requireMutationPrecheck: true,
+    action: "paper.actions.research.run",
+    handler: async (input, requestId) =>
+      command(
+        "paper:research",
+        [
+          `--riskProfile=${input.riskProfile}`,
+          `--optionsEnabled=${String(input.optionsEnabled)}`,
+          `--maxCandidates=${input.maxCandidates}`,
+          "--useAlpacaAssets=true",
+          "--barLookbackDays=120",
+          "--format=json"
+        ],
+        420_000,
+        requestId,
+        "paper.actions.research.run",
+        {
+          env: researchRunEnv()
+        }
+      )
+  },
+  "/api/v1/actions/learn/run": {
+    method: "POST",
+    timeoutMs: 120_000,
+    requireAdminToken: true,
+    requireMutationPrecheck: true,
+    action: "paper.actions.learn.run",
+    handler: learnRunHandler
+  },
+  "/api/v1/actions/portfolio/review": {
+    method: "POST",
+    timeoutMs: 60_000,
+    requireAdminToken: true,
+    requireMutationPrecheck: true,
+    action: "paper.actions.portfolio.review",
+    handler: portfolioReviewHandler
+  },
+  "/api/v1/actions/options/discover": {
+    method: "POST",
+    timeoutMs: 60_000,
+    requireAdminToken: true,
+    requireMutationPrecheck: true,
+    action: "paper.actions.options.discover",
+    handler: optionsDiscoverHandler
+  },
+  "/api/v1/actions/review": {
+    method: "POST",
+    timeoutMs: 120_000,
+    requireAdminToken: true,
+    requireMutationPrecheck: true,
+    action: "paper.actions.review",
+    handler: opsReviewHandler
+  },
+  "/api/v1/actions/execute": {
+    method: "POST",
+    timeoutMs: 120_000,
+    requireAdminToken: true,
+    requireMutationPrecheck: false,
+    action: "paper.actions.execute",
+    handler: executeReviewedHandler
+  },
+  "/api/v1/actions/history": {
+    method: "GET",
+    timeoutMs: 30_000,
+    requireAdminToken: false,
+    requireMutationPrecheck: false,
+    action: "paper.actions.history",
+    handler: async () => ({
+      status: "success",
+      summary: {
+        operations: listPaperOperations(25).length,
+        reviewReady: latestReviewArtifactReadiness().ready
+      },
+      operations: listPaperOperations(25),
+      reviewReadiness: latestReviewArtifactReadiness(),
+      blockers: [],
+      warnings: []
+    })
   },
   "/api/v1/review/run": {
     method: "POST",
@@ -758,6 +983,7 @@ const routeErrorStatus = (error: unknown, code: string) =>
 
 const routeHandler = async (request: IncomingMessage, response: any, config: ActionConfig) => {
   const startMs = Date.now();
+  const startedAt = new Date(startMs).toISOString();
   const correlationId = requestIdFromRequest(request);
   const requestId = randomUUID();
 
@@ -773,6 +999,8 @@ const routeHandler = async (request: IncomingMessage, response: any, config: Act
     const body = request.method === "POST" ? await readBody(request) : {};
     const input = parseInput(body);
     const data = await config.handler(input, requestId);
+    const durationMs = Date.now() - startMs;
+    const finishedAt = new Date(startMs + durationMs).toISOString();
     const payload = wrapSuccess(
       config.action,
       requestId,
@@ -782,11 +1010,18 @@ const routeHandler = async (request: IncomingMessage, response: any, config: Act
         riskProfile: input.riskProfile,
         optionsEnabled: input.optionsEnabled,
         maxCandidates: input.maxCandidates,
-        assetClass: input.assetClass
+        assetClass: input.assetClass,
+        confirmPaper: input.confirmPaper,
+        underlying: input.underlying,
+        dte: input.dte
+      },
+      {
+        startedAt,
+        finishedAt,
+        durationMs
       }
     );
 
-    const durationMs = Date.now() - startMs;
     logEntry({
       timestamp: new Date().toISOString(),
       action: config.action,

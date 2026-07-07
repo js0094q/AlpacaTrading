@@ -192,6 +192,44 @@ describe("Vercel dashboard VPS bridge mode", () => {
     assert.equal(calls[0].init.method, "POST");
   });
 
+  test("new paper actions route proxies to fixed VPS action path", async () => {
+    setMockFetchResponse({
+      ok: true,
+      status: "success",
+      action: "paper.actions.options.discover",
+      requestId: "vps-options-action",
+      correlationId: "client-options-action",
+      summary: { selected: 1 },
+      data: { status: "success", summary: { selected: 1 } }
+    });
+
+    const { POST } = await importRoute<{
+      POST: (request: Request) => Promise<Response> | Response;
+    }>("apps/dashboard/app/api/paper/actions/options/discover/route.ts");
+
+    const response = await POST(new Request("http://localhost/api/paper/actions/options/discover", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer dashboard-admin-secret",
+        "x-correlation-id": "client-options-action"
+      },
+      body: JSON.stringify({
+        underlying: "SPY",
+        dte: 0
+      })
+    }));
+    const payload = (await response.json()) as { ok: true; requestId: string };
+
+    assert.equal(response.status, 200);
+    assert.equal(payload.ok, true);
+    assert.equal(payload.requestId, "vps-options-action");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, "https://vps.internal:4100/api/v1/actions/options/discover");
+    assert.equal(headerValue(calls[0].init.headers, "authorization"), "Bearer bridge-secret");
+    assert.equal(headerValue(calls[0].init.headers, "x-correlation-id"), "client-options-action");
+  });
+
   test("bridge preserves structured VPS safety guard responses", async () => {
     setMockFetchResponse({
       ok: false,

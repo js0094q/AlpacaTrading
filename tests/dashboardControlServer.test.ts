@@ -203,6 +203,13 @@ describe("VPS dashboard control API", () => {
     const paths = Object.keys(module.ACTION_HANDLERS).sort();
     const expected = [
       "/api/v1/account",
+      "/api/v1/actions/execute",
+      "/api/v1/actions/history",
+      "/api/v1/actions/learn/run",
+      "/api/v1/actions/options/discover",
+      "/api/v1/actions/portfolio/review",
+      "/api/v1/actions/research/run",
+      "/api/v1/actions/review",
       "/api/v1/execute/confirm",
       "/api/v1/execute/dry-run",
       "/api/v1/execute/dry-run/latest",
@@ -386,8 +393,25 @@ describe("VPS dashboard control API", () => {
     assert.equal(commandCalls.length, 0);
   });
 
+  test("reviewed execute action requires explicit confirmPaper flag before command dispatch", async () => {
+    const response = await callControl("/api/v1/actions/execute", "POST", {
+      ...defaultRequest.body,
+      confirmPaper: false
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.payload.ok, true);
+    assert.equal((response.payload.data as { status?: string }).status, "blocked");
+    assert.equal(commandCalls.length, 0);
+  });
+
   test("mutating command endpoints map to allowlisted scripts", async () => {
     const cases: Array<{ path: string; script: string }> = [
+      { path: "/api/v1/actions/research/run", script: "paper:research" },
+      { path: "/api/v1/actions/learn/run", script: "paper:learn" },
+      { path: "/api/v1/actions/portfolio/review", script: "paper:portfolio:review" },
+      { path: "/api/v1/actions/options/discover", script: "paper:options:discover" },
+      { path: "/api/v1/actions/review", script: "paper:ops:review" },
       { path: "/api/v1/research/run", script: "research:daily" },
       { path: "/api/v1/review/run", script: "paper:review" },
       { path: "/api/v1/plan/run", script: "paper:plan" },

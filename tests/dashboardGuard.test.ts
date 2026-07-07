@@ -89,7 +89,9 @@ describe("dashboard paper guards", () => {
     assert.match(page, /Quote Status/);
     assert.match(page, /Executable Price/);
     assert.match(page, /Reject Reason/);
-    assert.match(actions, /Submit to Alpaca Paper Account/);
+    assert.match(actions, /Paper Trading Controls/);
+    assert.match(actions, /Execute Reviewed Paper Payloads/);
+    assert.match(actions, /Requires confirmPaper/);
     assert.doesNotMatch(actions, /Execute Live|Live Trading/);
   });
 });

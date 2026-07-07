@@ -21,6 +21,12 @@
   - Dashboard page summary loads use the VPS summary bridge with a 30 second timeout; slow summary reads should not be labeled as environment-guard failures.
   - Public `POST /api/paper/research/run` completes with valid admin auth using bounded control-service research defaults.
   - Latest review is a clean no-op because all current equity candidates are already held in paper positions, so no eligible payloads exist.
+- Paper trading operations layer:
+  - Dashboard section: `Paper Trading Controls`.
+  - Vercel action routes proxy to allowlisted VPS routes under `/api/v1/actions/*`.
+  - `paper:ops:review` persists the latest reviewed payload artifact with separated sections for equity buys, equity adds, equity sells, option buys, and option sell-to-close exits.
+  - `paper:execute:reviewed -- --confirmPaper` executes only the latest fresh reviewed payload artifact and refuses stale or signature-mismatched payloads.
+  - Scheduled ops are systemd timers on the VPS; default automation stops at review payload generation.
 - Fast resume command sequence:
   - `ssh njalla-vps`
   - load Node 22 and secrets from `/opt/alpaca-investing/secrets/alpaca.env`
@@ -125,6 +131,12 @@ ALPACA_REQUEST_TIMEOUT_MS=15000
 ALPACA_MAX_RETRIES=2
 VPS_RESEARCH_REQUEST_TIMEOUT_MS=10000
 VPS_RESEARCH_MAX_RETRIES=0
+VPS_CONTROL_TOKEN=
+DASHBOARD_ADMIN_TOKEN=
+AUTOMATED_PAPER_EXECUTION_ENABLED=false
+PAPER_0DTE_DISCOVERY_ENABLED=true
+PAPER_OPTION_EXIT_REVIEW_ENABLED=true
+PAPER_EQUITY_SCALE_IN_ENABLED=false
 ```
 
 The CLI loads `.env` first, then `.env.txt` as fallback when keys are missing. If both files exist, `.env` values take precedence over `.env.txt`.
@@ -257,6 +269,42 @@ It reports the Alpaca contract endpoints used, local `option_contracts` cache co
 
 Use `npm run paper:learn -- --format=json` to evaluate pending learning rows when local option mark data exists.
 The command also reports promotion-readiness analytics using live-like profit factor, trade count, observed days, drawdown, and spread gates.
+
+## Paper Trading Controls and Ops
+
+Dashboard controls live in `apps/dashboard/app/components/ActionPanel.tsx` and call only fixed dashboard API routes:
+
+```bash
+POST /api/paper/actions/research/run
+POST /api/paper/actions/learn/run
+POST /api/paper/actions/portfolio/review
+POST /api/paper/actions/options/discover
+POST /api/paper/actions/review
+POST /api/paper/actions/execute
+GET  /api/paper/actions/history
+```
+
+The VPS control server maps those routes to hardcoded commands only. No raw command string is accepted from the dashboard.
+
+```bash
+npm run paper:ops:morning -- --format=json
+npm run paper:ops:midday -- --format=json
+npm run paper:ops:late-day -- --format=json
+npm run paper:portfolio:review -- --format=json
+npm run paper:exit:review -- --format=json
+npm run paper:options:discover -- --underlying=SPY --dte=0 --format=json
+npm run paper:ops:review -- --format=json
+```
+
+`npm run paper:execute:reviewed -- --confirmPaper --format=json` is paper-only and requires `PAPER_ORDER_EXECUTION_ENABLED=true`. Option payloads also require `PAPER_OPTIONS_EXECUTION_ENABLED=true`. Do not use execution commands during implementation or review unless the user explicitly requests paper execution.
+
+Systemd timers in `server/systemd/` implement the VPS automation schedule:
+
+- `paper-ops-morning.timer`: weekdays around 8:30 AM ET.
+- `paper-ops-midday.timer`: weekdays around 12:00 PM ET.
+- `paper-ops-late-day.timer`: weekdays around 3:15 PM ET.
+
+Set the VPS timezone to `America/New_York` or adjust the timer calendar before enabling timers.
 
 Expected safety properties:
 

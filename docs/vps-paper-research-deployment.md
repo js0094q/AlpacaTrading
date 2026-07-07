@@ -58,6 +58,10 @@ PAPER_OPTIONS_ALLOW_COVERED_CALLS=true
 PAPER_OPTIONS_ALLOW_NAKED_OPTIONS=false
 PAPER_RUNTIME_DUPLICATE_RECONCILIATION_ENABLED=false
 ENABLE_AGGRESSIVE_PAPER_STRATEGIES=true
+AUTOMATED_PAPER_EXECUTION_ENABLED=false
+PAPER_0DTE_DISCOVERY_ENABLED=true
+PAPER_OPTION_EXIT_REVIEW_ENABLED=true
+PAPER_EQUITY_SCALE_IN_ENABLED=false
 ALPACA_REQUEST_TIMEOUT_MS=15000
 ALPACA_MAX_RETRIES=2
 VPS_RESEARCH_REQUEST_TIMEOUT_MS=10000
@@ -116,8 +120,32 @@ Current allowlist:
 - POST `/api/v1/research/run`, `/api/v1/review/run`, `/api/v1/plan/run`
 - GET `/api/v1/execute/dry-run/latest`
 - POST `/api/v1/execute/dry-run`, `/api/v1/execute/confirm`, `/api/v1/refresh`
+- POST `/api/v1/actions/research/run`
+- POST `/api/v1/actions/learn/run`
+- POST `/api/v1/actions/portfolio/review`
+- POST `/api/v1/actions/options/discover`
+- POST `/api/v1/actions/review`
+- POST `/api/v1/actions/execute`
+- GET `/api/v1/actions/history`
+
+The `/api/v1/actions/*` routes are fixed command mappings. The dashboard never sends arbitrary shell commands to the VPS. `actions.execute` requires `confirmPaper: true`, loads the latest reviewed payload artifact, verifies it is fresh, verifies the payload signature, and refuses to run when the artifact is stale, empty, missing, or changed.
 
 On the VPS, those historical views use local SQLite at `RESEARCH_DB_PATH` or `./data/research.db`. The VPS remains the owner of the scheduler, CLI runtime, research history, execution ledger, and local persistence.
+
+## Paper Trading Controls
+
+The dashboard section is named `Paper Trading Controls` and exposes:
+
+- Run Automated Paper Research.
+- Commit Learning.
+- Run Portfolio Review.
+- Run 0DTE Options Discovery.
+- Review Paper Order Payloads.
+- Execute Reviewed Paper Payloads.
+
+Each action shows status, last run time, request/correlation IDs, a summary, and raw JSON details. Execution is labeled as paper-only and requires an additional confirmation step in the UI.
+
+Review payload artifacts are stored in SQLite table `paper_review_artifacts`. Operation history is stored in `paper_operation_log` and exposed through `GET /api/v1/actions/history` and `GET /api/paper/actions/history`.
 
 For Vercel, configure the project to build the dashboard app with `npm run dashboard:build` and provide paper-only guard variables:
 
@@ -224,6 +252,10 @@ npm run paper:runtime -- --format=json
 npm run paper:intel -- --format=json
 npm run paper:plan -- --riskProfile=aggressive --optionsEnabled=true --format=json
 npm run paper:review -- --riskProfile=aggressive --optionsEnabled=true --format=json
+npm run paper:portfolio:review -- --format=json
+npm run paper:exit:review -- --format=json
+npm run paper:options:discover -- --underlying=SPY --dte=0 --format=json
+npm run paper:ops:review -- --format=json
 npm run paper:execute -- --dryRun --riskProfile=aggressive --optionsEnabled=true --format=json
 npm run paper:execute -- --confirmPaper --assetClass=all --riskProfile=aggressive --optionsEnabled=true --format=json
 npm run dashboard:build
@@ -253,6 +285,10 @@ npm run paper:runtime -- --format=json
 npm run paper:intel -- --format=json
 npm run paper:plan -- --riskProfile=aggressive --optionsEnabled=true --format=json
 npm run paper:review -- --riskProfile=aggressive --optionsEnabled=true --format=json
+npm run paper:portfolio:review -- --format=json
+npm run paper:exit:review -- --format=json
+npm run paper:options:discover -- --underlying=SPY --dte=0 --format=json
+npm run paper:ops:review -- --format=json
 npm run paper:execute -- --dryRun --riskProfile=aggressive --optionsEnabled=true --format=json
 npm run paper:execute -- --confirmPaper --assetClass=all --riskProfile=aggressive --optionsEnabled=true --format=json
 ```
@@ -339,9 +375,69 @@ npm run paper:execute -- --confirmPaper --assetClass=option --format=json
 - `PAPER_ORDER_EXECUTION_ENABLED=true`
 - `PAPER_OPTIONS_EXECUTION_ENABLED=true` for option payloads
 
-## Schedule paper research and reporting
+## Scheduled Paper Ops Automation
 
-Suggested cron entries:
+Use systemd timers for VPS automation. Before enabling timers, set the VPS timezone to New York market time or adjust the `OnCalendar` entries:
+
+```bash
+timedatectl status
+sudo timedatectl set-timezone America/New_York
+```
+
+Install the timer units:
+
+```bash
+sudo cp server/systemd/paper-ops-morning.service /etc/systemd/system/paper-ops-morning.service
+sudo cp server/systemd/paper-ops-morning.timer /etc/systemd/system/paper-ops-morning.timer
+sudo cp server/systemd/paper-ops-midday.service /etc/systemd/system/paper-ops-midday.service
+sudo cp server/systemd/paper-ops-midday.timer /etc/systemd/system/paper-ops-midday.timer
+sudo cp server/systemd/paper-ops-late-day.service /etc/systemd/system/paper-ops-late-day.service
+sudo cp server/systemd/paper-ops-late-day.timer /etc/systemd/system/paper-ops-late-day.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now paper-ops-morning.timer paper-ops-midday.timer paper-ops-late-day.timer
+systemctl list-timers 'paper-ops-*' --no-pager
+```
+
+Schedules:
+
+- Morning: weekdays at 8:30 AM ET; runs research, learning commit/evaluation, 0DTE discovery, and review payload generation.
+- Midday: weekdays at 12:00 PM ET; runs portfolio add/new-buy/sell and option exit review.
+- Late day: weekdays at 3:15 PM ET; runs portfolio sell and 0DTE forced-exit review.
+
+Default automation mode is review-only:
+
+```bash
+AUTOMATED_PAPER_EXECUTION_ENABLED=false
+```
+
+When false, timers do not submit orders. Future automated paper execution still requires paper-only runtime guards and explicit paper execution flags.
+
+Manual review-only commands:
+
+```bash
+npm run paper:ops:morning -- --format=json
+npm run paper:ops:midday -- --format=json
+npm run paper:ops:late-day -- --format=json
+npm run paper:portfolio:review -- --format=json
+npm run paper:exit:review -- --format=json
+npm run paper:options:discover -- --underlying=SPY --dte=0 --format=json
+npm run paper:ops:review -- --format=json
+```
+
+Confirm no live trading path is configured:
+
+```bash
+npm run alpaca:health -- --format=json
+rg -n "LIVE_TRADING_ENABLED=true|ALPACA_LIVE_TRADE=true|api.alpaca.markets|live" apps/dashboard server src
+```
+
+Expected dashboard/control state is paper-only: `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, and `LIVE_TRADING_ENABLED=false`.
+
+## Legacy cron fallback
+
+Systemd timers are the preferred scheduler for the paper ops layer because they are easier to inspect with `systemctl list-timers` and keep logs under `/opt/alpaca-investing/logs`. If systemd timers are unavailable, use cron only as a fallback.
+
+Suggested fallback cron entries:
 
 ```bash
 # Paper-only daily research loop, weekdays before market open
@@ -370,4 +466,4 @@ crontab -e
 
 ## Scheduling note
 
-Systemd timers may be preferable for stricter reliability and observability, but cron is acceptable for the first VPS paper-only deployment.
+Use systemd timers for the current VPS paper operations loop unless the host cannot run them.

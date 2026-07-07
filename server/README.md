@@ -172,12 +172,14 @@ Before using Caddy:
 
 No public UI is deployed by these server bootstrap scripts. The optional paper-only dashboard lives in `apps/dashboard/` and must be deployed separately behind its documented paper guards.
 
-## Stop Future App Services
+## Stop App Services
 
-No app services exist yet. When services are added later, stop them with:
+The VPS may run the paper-only dashboard control API and scheduled paper ops timers. Stop them before
+changing deployment artifacts, secrets, or security-relevant environment values:
 
 ```bash
-sudo systemctl stop <service-name>
+sudo systemctl stop alpaca-dashboard-control.service
+sudo systemctl stop paper-ops-morning.timer paper-ops-midday.timer paper-ops-late-day.timer
 docker compose -f /opt/alpaca-investing/app/docker-compose.yml down
 ```
 

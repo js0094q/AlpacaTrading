@@ -21,6 +21,10 @@ export interface PaperActionInput {
   optionsEnabled?: boolean;
   maxCandidates?: number;
   assetClass?: "all" | "equity" | "option";
+  confirmPaper?: boolean;
+  expectedPayloadSignature?: string;
+  underlying?: string;
+  dte?: number;
 }
 
 const numberOrNull = (value: unknown): number | null => {
@@ -251,7 +255,17 @@ export const parsePaperActionInput = (value: unknown): PaperActionInput => {
     optionsEnabled:
       typeof record.optionsEnabled === "boolean" ? record.optionsEnabled : true,
     maxCandidates: safeLimit(record.maxCandidates, 10, 50),
-    assetClass: normalizeAssetClass(record.assetClass)
+    assetClass: normalizeAssetClass(record.assetClass),
+    confirmPaper: record.confirmPaper === true,
+    expectedPayloadSignature:
+      typeof record.expectedPayloadSignature === "string"
+        ? record.expectedPayloadSignature
+        : undefined,
+    underlying:
+      typeof record.underlying === "string" && record.underlying.trim()
+        ? record.underlying.trim().toUpperCase()
+        : "SPY",
+    dte: safeLimit(record.dte, 0, 30)
   };
 };
 
@@ -702,6 +716,64 @@ export const runPaperConfirm = async (input: PaperActionInput) => {
     optionsEnabled: input.optionsEnabled,
     maxCandidates: input.maxCandidates,
     assetClass: input.assetClass
+  });
+};
+
+export const runPaperLearningCommit = async () => {
+  const service = await import("../../../src/services/paperLearningLedgerService");
+  const evaluation = service.evaluatePaperLearningRecords({ limit: 100 });
+  return {
+    paperOnly: true,
+    status: "success",
+    summary: {
+      evaluatedRows: evaluation.evaluated,
+      submittedRows: 0,
+      pendingRows: evaluation.stillPending,
+      promotedSignals: service.paperLearningSummary().promoted,
+      demotedSignals: service.paperLearningSummary().rejected,
+      skippedReasons: evaluation.pendingReasons.slice(0, 20)
+    },
+    evaluation,
+    learningSummary: service.paperLearningSummary(),
+    promotionReadiness: service.buildPromotionReadinessAnalytics(),
+    blockers: [],
+    warnings: []
+  };
+};
+
+export const runPaperPortfolioReview = async (input: PaperActionInput) => {
+  const { buildPaperPortfolioReviewReport } = await import(
+    "../../../src/services/paperPortfolioReviewService"
+  );
+  return buildPaperPortfolioReviewReport({
+    moment: "manual"
+  });
+};
+
+export const runPaperOptionsDiscovery = async (input: PaperActionInput) => {
+  const { buildPaperOptionsDiscoveryReport } = await import(
+    "../../../src/services/paperOptionsDiscoveryService"
+  );
+  return buildPaperOptionsDiscoveryReport({
+    underlying: input.underlying,
+    dte: input.dte
+  });
+};
+
+export const runPaperOpsReviewAction = async () => {
+  const { runPaperOpsReview } = await import(
+    "../../../src/services/paperOpsWorkflowService"
+  );
+  return runPaperOpsReview({ triggerSource: "dashboard" });
+};
+
+export const runPaperReviewedExecution = async (input: PaperActionInput) => {
+  const { buildPaperReviewedPayloadExecutionReport } = await import(
+    "../../../src/services/paperReviewedPayloadExecutionService"
+  );
+  return buildPaperReviewedPayloadExecutionReport({
+    confirmPaper: input.confirmPaper,
+    expectedPayloadSignature: input.expectedPayloadSignature
   });
 };
 

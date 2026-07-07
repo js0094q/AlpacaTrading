@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Alpaca Paper Ops Morning Workflow at 8:30 AM ET on weekdays
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 08:30:00
+Persistent=false
+Unit=paper-ops-morning.service
+
+[Install]
+WantedBy=timers.target

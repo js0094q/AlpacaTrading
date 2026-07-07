@@ -59,6 +59,15 @@
   - held/open equity positions or orders block duplicate equity candidates on the same symbol.
   - held/open equity positions or orders do not by themselves block option contracts on the same underlying.
   - held/open option contracts are compared by option contract symbol and reported with option-specific duplicate reasons.
+- Paper operations layer added after this checkpoint:
+  - Dashboard cards live under `Paper Trading Controls`.
+  - New dashboard routes live under `apps/dashboard/app/api/paper/actions/*`.
+  - New VPS allowlisted control routes live under `/api/v1/actions/*`.
+  - `paper:portfolio:review` is review-only and emits `BUY_NEW_EQUITY`, `ADD_TO_EQUITY`, `SELL_EQUITY`, `HOLD_EQUITY`, `BUY_OPTION`, `SELL_TO_CLOSE_OPTION`, and `HOLD_OPTION` recommendations.
+  - `paper:options:discover` is review-only and labels current-session 0DTE versus `nextSessionPreparation: true`.
+  - `paper:ops:review` persists the latest reviewed payload artifact and operation log rows.
+  - `paper:execute:reviewed -- --confirmPaper` refuses missing, stale, empty, or payload-signature-mismatched review artifacts before paper submission.
+  - `AUTOMATED_PAPER_EXECUTION_ENABLED=false` remains the default; systemd ops timers generate reviews only.
 
 ## Token/env coordination
 
@@ -82,6 +91,10 @@
    - `npm run options:diagnose -- --underlyings=SPY,QQQ`
    - `npm run paper:review -- --riskProfile=aggressive --optionsEnabled=true --format=json`
    - `npm run paper:plan -- --riskProfile=aggressive --optionsEnabled=true --maxCandidates=10 --format=json`.
+   - `npm run paper:portfolio:review -- --format=json`
+   - `npm run paper:exit:review -- --format=json`
+   - `npm run paper:options:discover -- --underlying=SPY --dte=0 --format=json`
+   - `npm run paper:ops:review -- --format=json`
 5. Once snapshots flow, re-check control bridge actions:
    - `curl -sS -H "Authorization: Bearer $VPS_CONTROL_TOKEN" http://127.0.0.1:4100/api/v1/review/latest`
    - `curl -sS -H "Authorization: Bearer $VPS_CONTROL_TOKEN" http://127.0.0.1:4100/api/v1/plan/latest`
@@ -92,3 +105,5 @@
 - Do not enable any live or direct Alpaca execution on Vercel.
 - Keep dashboard actions behind explicit admin controls and VPS allowlisted commands.
 - Do not relax paper-only gates without an explicit request.
+- Do not run `npm run paper:execute:reviewed -- --confirmPaper` or `npm run paper:execute -- --confirmPaper` unless the user explicitly requests paper execution.
+- No live execution route exists in the dashboard operations layer.
