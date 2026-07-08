@@ -17,8 +17,8 @@
   - `ALPACA_ENV=paper`
   - `ALPACA_LIVE_TRADE=false`
   - `LIVE_TRADING_ENABLED=false`
-  - `PAPER_ORDER_EXECUTION_ENABLED=false`
-  - `PAPER_OPTIONS_EXECUTION_ENABLED=false`
+  - `PAPER_ORDER_EXECUTION_ENABLED=true`
+  - `PAPER_OPTIONS_EXECUTION_ENABLED=true`
 - Options quote/execution controls after the quote-status fix:
   - `OPTIONS_QUOTE_MAX_AGE_MS=900000` by default.
   - `ALLOW_OPTIONS_LAST_PRICE_FALLBACK=false` by default.
@@ -74,6 +74,7 @@
 - `VPS_CONTROL_TOKEN` is configured in `/opt/alpaca-investing/secrets/alpaca.env`; Vercel must use the same value in `VPS_CONTROL_TOKEN`.
 - `DASHBOARD_ADMIN_TOKEN` belongs in Vercel production environment for dashboard mutating/admin routes.
 - Secrets must not be copied into repo files, client code, or Vercel frontend bundles.
+- Use `npm run vercel:env:parity -- --check-vercel-presence --pull-vercel` for redacted Vercel production env checks. The utility reports presence and sha256 fingerprint match booleans only.
 
 ## Current continuation objective
 

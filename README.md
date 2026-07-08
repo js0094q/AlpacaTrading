@@ -77,8 +77,8 @@ MARKET_DATA_PROVIDER=alpaca
 TRADING_MODE=paper
 ALPACA_LIVE_TRADE=false
 LIVE_TRADING_ENABLED=false
-PAPER_ORDER_EXECUTION_ENABLED=false
-PAPER_OPTIONS_EXECUTION_ENABLED=false
+PAPER_ORDER_EXECUTION_ENABLED=true
+PAPER_OPTIONS_EXECUTION_ENABLED=true
 PAPER_EQUITY_NOTIONAL_PER_ORDER=1000
 PAPER_EQUITY_MAX_NOTIONAL_PER_ORDER=5000
 PAPER_EQUITY_MAX_PORTFOLIO_DEPLOY_PCT=50
@@ -426,7 +426,7 @@ Equity sizing defaults are calibrated for an approximately `$100,000` paper acco
 
 When account values are available, equity plans size from paper account equity, buying power, existing exposure, and cash reserve. If account-based sizing cannot be computed, the plan falls back to the configured notional while still respecting the configured max.
 
-Paper options remain disabled by default with `PAPER_OPTIONS_EXECUTION_ENABLED=false`. Setting it to `true` allows eligible paper option payloads after contract, price, strategy, DTE, duplicate, and risk checks pass. Current practical paper defaults:
+Paper options are operationally enabled for the current paper runtime with `PAPER_OPTIONS_EXECUTION_ENABLED=true`. This enables eligible paper option payloads only after contract, price, strategy, DTE, duplicate, explicit command, and risk checks pass. Current practical paper defaults:
 
 - `PAPER_OPTION_MAX_PREMIUM_PER_CONTRACT=1500`
 - `PAPER_OPTION_MAX_ORDER_NOTIONAL=1500`
@@ -497,8 +497,8 @@ ALPACA_ENV=paper
 TRADING_MODE=paper
 ALPACA_LIVE_TRADE=false
 LIVE_TRADING_ENABLED=false
-PAPER_ORDER_EXECUTION_ENABLED=false
-PAPER_OPTIONS_EXECUTION_ENABLED=false
+PAPER_ORDER_EXECUTION_ENABLED=true
+PAPER_OPTIONS_EXECUTION_ENABLED=true
 ```
 
 Optional read-only Alpaca account and position data uses the paper credential names from `src/config.ts`:
@@ -510,7 +510,15 @@ ALPACA_PAPER_BASE_URL=https://paper-api.alpaca.markets
 ALPACA_DATA_BASE_URL=https://data.alpaca.markets
 ```
 
-Keep `PAPER_ORDER_EXECUTION_ENABLED=false` and `PAPER_OPTIONS_EXECUTION_ENABLED=false` on Vercel. The hosted dashboard is read-only even if those variables are accidentally set to `true`; paper submission remains a local/VPS runtime concern.
+The hosted dashboard cannot submit orders from Vercel directly: `assertPaperOrderSubmissionEnabled` fails closed on Vercel before checking paper execution flags. When the VPS bridge is configured, paper submission remains a VPS runtime concern and still requires a valid dashboard admin token, matching `VPS_CONTROL_TOKEN`, `ALPACA_ENV=paper`, `LIVE_TRADING_ENABLED=false`, `PAPER_ORDER_EXECUTION_ENABLED=true`, `PAPER_OPTIONS_EXECUTION_ENABLED=true` for option payloads, and the CLI `--confirmPaper` boundary.
+
+Safe Vercel environment parity check:
+
+```bash
+npm run vercel:env:parity -- --check-vercel-presence --pull-vercel
+```
+
+The parity check prints only presence booleans and sha256 fingerprint comparison results. It must not print raw token, URL, or credential values.
 
 The Vercel serverless runtime must not rely on writable SQLite persistence under `/var/task`. Without future durable dashboard storage, historical API routes return:
 
