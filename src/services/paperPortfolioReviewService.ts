@@ -4,6 +4,10 @@ import {
   listAlpacaPositions,
   type AlpacaPositionSnapshot
 } from "./alpacaPositionService.js";
+import {
+  evaluateLeapsExit,
+  type LeapsExitEvaluation
+} from "./leapsExitReviewService.js";
 import { getTradingSafetyState } from "./tradingSafetyService.js";
 
 export type PaperPortfolioRecommendationType =
@@ -31,6 +35,8 @@ export interface PaperPortfolioReviewPayload {
   position_intent?: "buy_to_open" | "sell_to_close";
   client_order_id: string;
   reason: string;
+  reasonCodes?: string[];
+  leapsExitEvaluation?: LeapsExitEvaluation;
   sourceReviewId: string;
 }
 
@@ -44,9 +50,11 @@ export interface PaperPortfolioRecommendation {
   unrealizedPlPercent: number | null;
   signalRank: number | null;
   reason: string;
+  reasonCodes?: string[];
   confidence: number | null;
   eligiblePayload: PaperPortfolioReviewPayload | null;
   skippedReason: string | null;
+  leapsExitEvaluation?: LeapsExitEvaluation;
 }
 
 export interface PaperPortfolioReviewReport {
@@ -67,6 +75,7 @@ export interface PaperPortfolioReviewReport {
   };
   config: ReturnType<typeof paperPortfolioReviewConfig>;
   recommendations: PaperPortfolioRecommendation[];
+  leapsExitEvaluations: LeapsExitEvaluation[];
   warnings: string[];
   blockers: string[];
 }
@@ -85,6 +94,7 @@ interface PaperPortfolioReviewDeps {
   listPositions?: typeof listAlpacaPositions;
   getAccount?: typeof getAlpacaAccountSnapshot;
   getCandidates?: () => Promise<CandidateRow[]> | CandidateRow[];
+  evaluateLeapsExit?: typeof evaluateLeapsExit;
   now?: () => string;
 }
 
@@ -280,6 +290,8 @@ const optionExitPayload = (input: {
   qty: number;
   limitPrice: number | null;
   reason: string;
+  reasonCodes?: string[];
+  leapsExitEvaluation?: LeapsExitEvaluation;
   reviewId: string;
 }): PaperPortfolioReviewPayload => ({
   orderAction: "SELL_TO_CLOSE",
@@ -298,8 +310,28 @@ const optionExitPayload = (input: {
     symbol: input.symbol
   }),
   reason: input.reason,
+  ...(input.reasonCodes?.length ? { reasonCodes: input.reasonCodes } : {}),
+  ...(input.leapsExitEvaluation ? { leapsExitEvaluation: input.leapsExitEvaluation } : {}),
   sourceReviewId: input.reviewId
 });
+
+const primaryLeapsReason = (evaluation: LeapsExitEvaluation): string =>
+  evaluation.reasons.find((reason) =>
+    [
+      "LEAPS_HARD_STOP_LOSS",
+      "LEAPS_FULL_PROFIT_TAKE",
+      "LEAPS_DTE_EXIT_WINDOW",
+      "LEAPS_SEVERE_TREND_BREAK"
+    ].includes(reason)
+  ) ??
+  evaluation.reasons.find((reason) => reason !== "LEAPS_CLASSIFICATION_INFERRED") ??
+  "LEAPS_HOLD_REVIEW";
+
+const firstLeapsSkipReason = (evaluation: LeapsExitEvaluation): string =>
+  evaluation.reasons.find((reason) =>
+    ["LIMIT_EXIT_REQUIRED", "LEAPS_QUOTE_UNAVAILABLE"].includes(reason)
+  ) ??
+  (evaluation.hardExit ? "LEAPS_EXIT_NOT_EXECUTABLE" : "LEAPS_REVIEW_ONLY");
 
 export const buildPaperPortfolioReviewReport = async (
   input: {
@@ -331,6 +363,7 @@ export const buildPaperPortfolioReviewReport = async (
   const buyingPower = numeric(account.buyingPower) ?? numeric(account.cash) ?? 0;
   const accountEquity = numeric(account.equity) ?? numeric(account.buyingPower) ?? 0;
   const recommendations: PaperPortfolioRecommendation[] = [];
+  const leapsExitEvaluations: LeapsExitEvaluation[] = [];
 
   for (const position of positions) {
     const symbol = position.symbol.toUpperCase();
@@ -340,6 +373,45 @@ export const buildPaperPortfolioReviewReport = async (
     const unrealizedPlPercent = pctFromPosition(position.unrealizedPlpc);
 
     if (isOptionPosition(position)) {
+      const leapsEvaluation = (deps.evaluateLeapsExit ?? evaluateLeapsExit)(position, {
+        now: () => generatedAt
+      });
+      if (leapsEvaluation?.classification === "LEAPS") {
+        leapsExitEvaluations.push(leapsEvaluation);
+        if (leapsEvaluation.reviewOnly || (leapsEvaluation.hardExit && !leapsEvaluation.executable)) {
+          warnings.push(...leapsEvaluation.reasons);
+        }
+        const reason = primaryLeapsReason(leapsEvaluation);
+        const reasonCodes = leapsEvaluation.reasons;
+        addRecommendation(recommendations, {
+          recommendation: leapsEvaluation.hardExit ? "SELL_TO_CLOSE_OPTION" : "HOLD_OPTION",
+          symbol,
+          assetClass: "option",
+          currentQuantity: qty,
+          currentMarketValue: marketValue,
+          unrealizedPl,
+          unrealizedPlPercent,
+          signalRank: null,
+          reason,
+          reasonCodes,
+          confidence: null,
+          eligiblePayload: leapsEvaluation.executable
+            ? optionExitPayload({
+                symbol,
+                qty: leapsEvaluation.exitQuantity ?? qty,
+                limitPrice: leapsEvaluation.limitPrice,
+                reason,
+                reasonCodes,
+                leapsExitEvaluation: leapsEvaluation,
+                reviewId
+              })
+            : null,
+          skippedReason: leapsEvaluation.executable ? null : firstLeapsSkipReason(leapsEvaluation),
+          leapsExitEvaluation: leapsEvaluation
+        });
+        continue;
+      }
+
       const metadata = optionSymbolMetadata(symbol);
       const isZeroDte = metadata?.expirationDate === todayEt(generatedAt);
       const lateDayForced =
@@ -528,7 +600,8 @@ export const buildPaperPortfolioReviewReport = async (
     },
     config: cfg,
     recommendations,
-    warnings,
+    leapsExitEvaluations,
+    warnings: [...new Set(warnings)],
     blockers
   };
 };

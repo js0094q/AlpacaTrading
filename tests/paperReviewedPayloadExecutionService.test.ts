@@ -13,6 +13,7 @@ process.env.ALPACA_LIVE_TRADE = "false";
 process.env.LIVE_TRADING_ENABLED = "false";
 process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
 process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
+process.env.AUTOMATED_PAPER_EXECUTION_ENABLED = "true";
 
 import { closeDbForTests, getDb } from "../src/lib/db.js";
 import { createPaperReviewArtifact } from "../src/services/paperReviewArtifactService.js";
@@ -32,6 +33,7 @@ beforeEach(() => {
   process.env.LIVE_TRADING_ENABLED = "false";
   process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
   process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
+  process.env.AUTOMATED_PAPER_EXECUTION_ENABLED = "true";
   resetDatabase();
 });
 
@@ -41,6 +43,43 @@ after(() => {
 });
 
 describe("reviewed payload execution", () => {
+  const createLeapsExitArtifact = () =>
+    createPaperReviewArtifact({
+      id: "review-leaps-exit",
+      sourceAction: "paper.ops.review",
+      status: "success",
+      createdAt: "2026-07-08T14:00:00.000Z",
+      maxAgeMinutes: 60,
+      payloadSections: {
+        equityBuys: [],
+        equityAdds: [],
+        equitySells: [],
+        optionBuys: [],
+        optionSellToCloseExits: [
+          {
+            assetClass: "option",
+            symbol: "SPY270115C00600000",
+            side: "sell",
+            type: "limit",
+            time_in_force: "day",
+            qty: "1",
+            limit_price: "8.40",
+            position_intent: "sell_to_close",
+            client_order_id: "leaps-exit-spy",
+            dedupeKey: "leaps-exit-spy",
+            reason: "LEAPS_DTE_EXIT_WINDOW",
+            reasonCodes: ["LEAPS_DTE_EXIT_WINDOW"],
+            leapsExitEvaluation: {
+              classification: "LEAPS",
+              hardExit: true,
+              executable: true
+            }
+          }
+        ]
+      },
+      summary: {}
+    });
+
   test("executes only requested reviewed payload sections", async () => {
     createPaperReviewArtifact({
       id: "review-filter-test",
@@ -112,5 +151,76 @@ describe("reviewed payload execution", () => {
     assert.equal(report.summary.reviewedPayloads, 1);
     assert.deepEqual(submittedSymbols, ["MSFT"]);
     assert.equal(report.submitted[0]?.section, "equitySells");
+  });
+
+  test("live trading enabled blocks reviewed LEAPS execution", async () => {
+    createLeapsExitArtifact();
+    process.env.LIVE_TRADING_ENABLED = "true";
+
+    const report = await buildPaperReviewedPayloadExecutionReport({
+      confirmPaper: true,
+      sections: ["optionSellToCloseExits"]
+    }, {
+      now: () => "2026-07-08T14:05:00.000Z"
+    });
+
+    assert.equal(report.status, "blocked");
+    assert.equal(report.reason, "LIVE_TRADING_DISABLED_REQUIRED");
+  });
+
+  test("non-paper runtime blocks reviewed LEAPS execution", async () => {
+    createLeapsExitArtifact();
+    process.env.ALPACA_ENV = "live";
+
+    const report = await buildPaperReviewedPayloadExecutionReport({
+      confirmPaper: true,
+      sections: ["optionSellToCloseExits"]
+    }, {
+      now: () => "2026-07-08T14:05:00.000Z"
+    });
+
+    assert.equal(report.status, "blocked");
+    assert.equal(report.reason, "PAPER_RUNTIME_REQUIRED");
+  });
+
+  test("missing --confirmPaper blocks reviewed LEAPS execution", async () => {
+    createLeapsExitArtifact();
+
+    const report = await buildPaperReviewedPayloadExecutionReport({
+      sections: ["optionSellToCloseExits"]
+    });
+
+    assert.equal(report.status, "blocked");
+    assert.equal(report.reason, "PAPER_CONFIRMATION_REQUIRED");
+  });
+
+  test("missing paper options flag blocks reviewed LEAPS execution", async () => {
+    createLeapsExitArtifact();
+    process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "false";
+
+    const report = await buildPaperReviewedPayloadExecutionReport({
+      confirmPaper: true,
+      sections: ["optionSellToCloseExits"]
+    }, {
+      now: () => "2026-07-08T14:05:00.000Z"
+    });
+
+    assert.equal(report.status, "blocked");
+    assert.equal(report.reason, "PAPER_OPTIONS_EXECUTION_FLAG_REQUIRED");
+  });
+
+  test("missing automated paper execution flag blocks reviewed LEAPS execution", async () => {
+    createLeapsExitArtifact();
+    process.env.AUTOMATED_PAPER_EXECUTION_ENABLED = "false";
+
+    const report = await buildPaperReviewedPayloadExecutionReport({
+      confirmPaper: true,
+      sections: ["optionSellToCloseExits"]
+    }, {
+      now: () => "2026-07-08T14:05:00.000Z"
+    });
+
+    assert.equal(report.status, "blocked");
+    assert.equal(report.reason, "AUTOMATED_PAPER_EXECUTION_FLAG_REQUIRED");
   });
 });

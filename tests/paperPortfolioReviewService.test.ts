@@ -7,6 +7,7 @@ process.env.LIVE_TRADING_ENABLED = "false";
 process.env.ALPACA_ENV = "paper";
 
 import { buildPaperPortfolioReviewReport } from "../src/services/paperPortfolioReviewService.js";
+import type { LeapsExitEvaluation } from "../src/services/leapsExitReviewService.js";
 
 const account = {
   status: "ACTIVE",
@@ -155,5 +156,105 @@ describe("paper portfolio review", () => {
 
     assert.equal(report.recommendations[0]?.recommendation, "SELL_TO_CLOSE_OPTION");
     assert.equal(report.recommendations[0]?.reason, "OPTION_0DTE_LATE_DAY_FORCED_EXIT_REVIEW");
+  });
+
+  test("creates reviewed option sell-to-close payload for executable LEAPS hard exit", async () => {
+    const leapsEvaluation: LeapsExitEvaluation = {
+      symbol: "SPY",
+      contractSymbol: "SPY270115C00600000",
+      classification: "LEAPS",
+      classificationInferred: false,
+      entryDte: 540,
+      currentDte: 175,
+      unrealizedPlPct: 82.4,
+      delta: 0.61,
+      bidAskSpreadPct: 8.7,
+      hardExit: true,
+      reviewOnly: false,
+      executable: true,
+      section: "optionSellToCloseExits",
+      reasons: ["LEAPS_DTE_EXIT_WINDOW"],
+      underlyingClose: 500,
+      trendReviewSma: 490,
+      severeTrendExitSma: 480,
+      limitPrice: 8.4,
+      exitQuantity: 1,
+      partialExitCandidate: null,
+      lastReviewAt: "2026-07-01T14:00:00.000Z"
+    };
+    const report = await buildPaperPortfolioReviewReport({}, {
+      listPositions: async () => ({
+        positions: [
+          {
+            symbol: "SPY270115C00600000",
+            assetClass: "us_option",
+            qty: "1",
+            marketValue: "840",
+            unrealizedPl: "400",
+            unrealizedPlpc: "0.82",
+            currentPrice: "8.4"
+          }
+        ]
+      }),
+      getAccount: async () => account,
+      getCandidates: () => [],
+      evaluateLeapsExit: () => leapsEvaluation,
+      now: () => "2026-07-08T14:00:00.000Z"
+    });
+
+    assert.equal(report.leapsExitEvaluations.length, 1);
+    assert.equal(report.recommendations[0]?.recommendation, "SELL_TO_CLOSE_OPTION");
+    assert.equal(report.recommendations[0]?.eligiblePayload?.position_intent, "sell_to_close");
+    assert.equal(report.recommendations[0]?.eligiblePayload?.limit_price, "8.40");
+    assert.deepEqual(report.recommendations[0]?.eligiblePayload?.reasonCodes, ["LEAPS_DTE_EXIT_WINDOW"]);
+  });
+
+  test("keeps liquidity-blocked LEAPS hard exit non-executable", async () => {
+    const leapsEvaluation: LeapsExitEvaluation = {
+      symbol: "SPY",
+      contractSymbol: "SPY270115C00600000",
+      classification: "LEAPS",
+      classificationInferred: false,
+      entryDte: 540,
+      currentDte: 190,
+      unrealizedPlPct: 130,
+      delta: 0.61,
+      bidAskSpreadPct: 33.3,
+      hardExit: true,
+      reviewOnly: false,
+      executable: false,
+      reasons: ["LEAPS_FULL_PROFIT_TAKE", "LIMIT_EXIT_REQUIRED"],
+      underlyingClose: 500,
+      trendReviewSma: 490,
+      severeTrendExitSma: 480,
+      limitPrice: null,
+      exitQuantity: null,
+      partialExitCandidate: null,
+      lastReviewAt: "2026-07-01T14:00:00.000Z"
+    };
+    const report = await buildPaperPortfolioReviewReport({}, {
+      listPositions: async () => ({
+        positions: [
+          {
+            symbol: "SPY270115C00600000",
+            assetClass: "us_option",
+            qty: "1",
+            marketValue: "1300",
+            unrealizedPl: "500",
+            unrealizedPlpc: "1.3",
+            currentPrice: "13"
+          }
+        ]
+      }),
+      getAccount: async () => account,
+      getCandidates: () => [],
+      evaluateLeapsExit: () => leapsEvaluation,
+      now: () => "2026-07-08T14:00:00.000Z"
+    });
+
+    assert.equal(report.recommendations[0]?.recommendation, "SELL_TO_CLOSE_OPTION");
+    assert.equal(report.recommendations[0]?.eligiblePayload, null);
+    assert.equal(report.recommendations[0]?.skippedReason, "LIMIT_EXIT_REQUIRED");
+    assert.equal(report.warnings.includes("LIMIT_EXIT_REQUIRED"), true);
   });
 });

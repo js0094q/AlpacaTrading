@@ -106,6 +106,9 @@ interface PaperReviewedExecutionDeps {
 const parseBoolean = (name: string) =>
   process.env[name] === "true" || process.env[name] === "1";
 
+const parseFalse = (name: string) =>
+  process.env[name] === "false" || process.env[name] === "0";
+
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   Boolean(value && typeof value === "object");
 
@@ -193,6 +196,28 @@ const requestedSections = (sections: ReviewedPayloadSectionName[] | undefined) =
   return normalized.length ? new Set(normalized) : null;
 };
 
+const isLeapsSellToCloseExit = (payload: NormalizedReviewedPayload) => {
+  if (
+    payload.section !== "optionSellToCloseExits" ||
+    payload.assetClass !== "option" ||
+    payload.positionIntent !== "sell_to_close"
+  ) {
+    return false;
+  }
+  const raw = payload.raw;
+  const reason = stringField(raw.reason);
+  const reasonCodes = Array.isArray(raw.reasonCodes)
+    ? raw.reasonCodes
+    : Array.isArray(raw.reasons)
+      ? raw.reasons
+      : [];
+  return Boolean(
+    isRecord(raw.leapsExitEvaluation) ||
+    reason?.startsWith("LEAPS_") ||
+    reasonCodes.some((entry) => typeof entry === "string" && entry.startsWith("LEAPS_"))
+  );
+};
+
 const toAlpacaPayload = (payload: NormalizedReviewedPayload): AlpacaPaperOrderRequest => ({
   symbol: payload.symbol,
   qty: payload.qty,
@@ -248,19 +273,33 @@ export const buildPaperReviewedPayloadExecutionReport = async (
       generatedAt,
       environment: state.alpacaEnv,
       status: "blocked",
-      reason: "CONFIRM_PAPER_REQUIRED",
+      reason: "PAPER_CONFIRMATION_REQUIRED",
       artifact,
-      blocked: [{ reason: "CONFIRM_PAPER_REQUIRED" }]
+      blocked: [{ reason: "PAPER_CONFIRMATION_REQUIRED" }]
     });
   }
-  if (!state.paperOnly) {
+  if (state.alpacaEnv !== "paper" || process.env.TRADING_MODE !== "paper") {
     return emptyReport({
       generatedAt,
       environment: state.alpacaEnv,
       status: "blocked",
-      reason: "PAPER_ENV_REQUIRED",
+      reason: "PAPER_RUNTIME_REQUIRED",
       artifact,
-      blocked: [{ reason: "PAPER_ENV_REQUIRED" }]
+      blocked: [{ reason: "PAPER_RUNTIME_REQUIRED" }]
+    });
+  }
+  if (
+    state.liveTradingEnabled ||
+    !parseFalse("ALPACA_LIVE_TRADE") ||
+    !parseFalse("LIVE_TRADING_ENABLED")
+  ) {
+    return emptyReport({
+      generatedAt,
+      environment: state.alpacaEnv,
+      status: "blocked",
+      reason: "LIVE_TRADING_DISABLED_REQUIRED",
+      artifact,
+      blocked: [{ reason: "LIVE_TRADING_DISABLED_REQUIRED" }]
     });
   }
   if (!parseBoolean("PAPER_ORDER_EXECUTION_ENABLED")) {
@@ -268,9 +307,9 @@ export const buildPaperReviewedPayloadExecutionReport = async (
       generatedAt,
       environment: state.alpacaEnv,
       status: "blocked",
-      reason: "PAPER_ORDER_EXECUTION_DISABLED",
+      reason: "PAPER_EXECUTION_FLAG_REQUIRED",
       artifact,
-      blocked: [{ reason: "PAPER_ORDER_EXECUTION_DISABLED" }]
+      blocked: [{ reason: "PAPER_EXECUTION_FLAG_REQUIRED" }]
     });
   }
   if (!artifact) {
@@ -330,7 +369,7 @@ export const buildPaperReviewedPayloadExecutionReport = async (
         section: result.section,
         symbol: result.symbol,
         clientOrderId: result.clientOrderId,
-        reason: "PAPER_OPTIONS_EXECUTION_DISABLED",
+        reason: "PAPER_OPTIONS_EXECUTION_FLAG_REQUIRED",
         explanation: "Option paper execution requires PAPER_OPTIONS_EXECUTION_ENABLED=true."
       });
       continue;
@@ -346,6 +385,16 @@ export const buildPaperReviewedPayloadExecutionReport = async (
         clientOrderId: result.clientOrderId,
         reason: "OPTION_POSITION_INTENT_INVALID",
         explanation: "Reviewed option payload must be buy_to_open or sell_to_close."
+      });
+      continue;
+    }
+    if (isLeapsSellToCloseExit(result) && !parseBoolean("AUTOMATED_PAPER_EXECUTION_ENABLED")) {
+      blocked.push({
+        section: result.section,
+        symbol: result.symbol,
+        clientOrderId: result.clientOrderId,
+        reason: "AUTOMATED_PAPER_EXECUTION_FLAG_REQUIRED",
+        explanation: "LEAPS sell-to-close execution requires AUTOMATED_PAPER_EXECUTION_ENABLED=true."
       });
       continue;
     }

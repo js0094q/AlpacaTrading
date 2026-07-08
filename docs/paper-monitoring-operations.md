@@ -27,7 +27,7 @@ Do not print `/opt/alpaca-investing/secrets/alpaca.env`.
 
 - `alpaca-paper-review.timer`: wakes every 30 minutes on weekdays during regular market-hour windows. Runs `npm run paper:monitor -- --task=review`, which executes `paper:ops:morning` after market-hours gating.
 - `alpaca-paper-execute.timer`: wakes five minutes after review windows. Runs reviewed entry execution only for `equityBuys`, `equityAdds`, and `optionBuys`.
-- `alpaca-paper-exit-review.timer`: wakes every 15 minutes during regular windows and every 5 minutes in the final hour. In the final hour it uses `paper:ops:late-day` so 0DTE late-day exit review is active.
+- `alpaca-paper-exit-review.timer`: wakes every 15 minutes during regular windows and every 5 minutes in the final hour. It evaluates equity exits, generic option exits, LEAPS sell discipline, and in the final hour uses `paper:ops:late-day` so 0DTE late-day exit review is active.
 - `alpaca-paper-exit-execute.timer`: wakes after exit review windows. Runs reviewed exit execution only for `equitySells` and `optionSellToCloseExits`.
 
 All monitor tasks no-op with `MARKET_CLOSED` outside regular market hours, weekends, and configured US market holidays.
@@ -47,6 +47,8 @@ AUTOMATED_PAPER_EXECUTION_ENABLED=true
 ```
 
 Execution commands always include `--confirmPaper` and use `paper:execute:reviewed`, which refuses missing, stale, empty, duplicate, or payload-signature-mismatched reviewed artifacts before paper submission.
+
+LEAPS sell-to-close payloads use the same `optionSellToCloseExits` section. The reviewed executor also blocks LEAPS exits unless `AUTOMATED_PAPER_EXECUTION_ENABLED=true`; review-only LEAPS warnings and liquidity-blocked LEAPS hard exits do not create executable payloads.
 
 The runner uses separate lock files under `/tmp` for review, entry execution, exit review, and exit execution. If a prior run is still active, the next wakeup no-ops with `LOCK_BUSY`.
 
@@ -76,4 +78,3 @@ npm run paper:review -- --riskProfile=aggressive --optionsEnabled=true --format=
 ```
 
 Do not manually run `paper:execute:reviewed -- --confirmPaper` or `paper:execute -- --confirmPaper` unless paper execution is explicitly approved.
-

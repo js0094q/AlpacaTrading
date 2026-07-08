@@ -16,8 +16,9 @@ The repository now includes a paper control service template for the VPS dashboa
   every 30 minutes during weekday market-hour windows.
 - `alpaca-paper-execute.service` / `.timer` — runs reviewed entry execution through
   `npm run paper:monitor -- --task=execute`.
-- `alpaca-paper-exit-review.service` / `.timer` — runs reviewed exit checks every 15 minutes
-  and every 5 minutes during the final hour.
+- `alpaca-paper-exit-review.service` / `.timer` — runs reviewed exit checks for equities,
+  generic options, LEAPS, and final-hour 0DTE exits every 15 minutes and every 5 minutes
+  during the final hour.
 - `alpaca-paper-exit-execute.service` / `.timer` — runs reviewed exit execution through
   `npm run paper:monitor -- --task=exit-execute`.
 

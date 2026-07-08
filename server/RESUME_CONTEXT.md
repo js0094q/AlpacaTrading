@@ -20,6 +20,9 @@
   - `research.run` is intentionally bounded by the control server to `--barLookbackDays=120`, `ALPACA_REQUEST_TIMEOUT_MS=10000`, and `ALPACA_MAX_RETRIES=0` so optional slow Alpaca options calls do not exceed Vercel's synchronous timeout.
   - `GET /api/v1/summary` returns cached/read-only dashboard state and does not dispatch fresh plan, review, or dry-run commands.
   - Public `POST /api/paper/research/run` was verified through `https://www.jlsprojects.com` with valid admin auth.
+- Paper monitor behavior:
+  - Exit review now evaluates LEAPS positions through the existing `optionSellToCloseExits` reviewed section; no separate LEAPS timer or execution command is required.
+  - Reviewed LEAPS sell-to-close execution fails closed unless paper runtime, live-off, paper execution, paper options execution, automated execution, and `--confirmPaper` gates are all satisfied.
 - Security/hardening posture:
   - SSH key-only hardening is in place; password auth is disabled.
   - Root key recovery remains intentionally preserved until explicitly disabled.

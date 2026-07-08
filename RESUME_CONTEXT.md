@@ -33,6 +33,11 @@
   - `PAPER_0DTE_SPY_ENABLED=false` and `PAPER_LEAPS_ENABLED=false` remain safe defaults; enabling them is paper-only and does not enable live trading.
   - 0DTE discovery is first-class when enabled, does not require SPY to appear in normal equity candidates, considers ranked same-day SPY call/put alternatives, selects at most one executable call and one executable put, and walks OTM when the nearest contract exceeds caps.
   - LEAPS discovery is first-class when enabled, does not require the underlying to appear in normal equity candidates, uses `PAPER_LEAPS_UNDERLYINGS=SPY,QQQ` by default, considers ranked delta/moneyness alternatives, and selects at most one executable long-dated call per underlying inside `PAPER_LEAPS_MIN_DTE=180` to `PAPER_LEAPS_MAX_DTE=730`.
+  - LEAPS exit review is now explicit and does not depend on `PAPER_LEAPS_ENABLED`; it manages already-held LEAPS through `paper:portfolio:review`, `paper:exit:review`, `paper:ops:review`, and the `optionSellToCloseExits` reviewed artifact section.
+  - LEAPS exit defaults: `LEAPS_MIN_DTE_AT_ENTRY=270`, `LEAPS_DTE_EXIT_THRESHOLD=180`, `LEAPS_REVIEW_LOSS_PCT=-20`, `LEAPS_HARD_STOP_LOSS_PCT=-35`, `LEAPS_PARTIAL_PROFIT_TAKE_PCT=75`, `LEAPS_FULL_PROFIT_TAKE_PCT=125`, `LEAPS_TREND_REVIEW_SMA=100`, `LEAPS_SEVERE_TREND_EXIT_SMA=200`, `LEAPS_MAX_BID_ASK_SPREAD_PCT=20`, `LEAPS_MIN_DELTA_REVIEW=0.45`, and `LEAPS_REVIEW_INTERVAL_DAYS=30`.
+  - LEAPS classification uses entry DTE from `paper_learning_records`, then paper execution ledger rows; if neither proves entry DTE, current DTE can classify only with `LEAPS_CLASSIFICATION_INFERRED`, so short-dated options are not promoted into LEAPS.
+  - LEAPS hard exits are `LEAPS_HARD_STOP_LOSS`, `LEAPS_FULL_PROFIT_TAKE`, `LEAPS_DTE_EXIT_WINDOW`, and `LEAPS_SEVERE_TREND_BREAK`; warning-only reasons are `LEAPS_REVIEW_LOSS_WARNING`, `LEAPS_PARTIAL_PROFIT_REVIEW`, `LEAPS_TREND_REVIEW`, `LEAPS_DELTA_DETERIORATION`, `LEAPS_DELTA_UNAVAILABLE`, and `LEAPS_PERIODIC_REVIEW_DUE`.
+  - LEAPS hard exits become executable only when bid/ask exists and spread is within `LEAPS_MAX_BID_ASK_SPREAD_PCT`; otherwise `LIMIT_EXIT_REQUIRED` or `LEAPS_QUOTE_UNAVAILABLE` keeps the reviewed candidate non-executable.
   - `paper:plan` and `paper:review` refresh empty or stale explicit discovery contract windows from Alpaca, then refresh quotes for ranked discovery alternatives before deciding whether payloads are executable.
   - `npm run options:diagnose -- --underlyings=SPY,QQQ` is the read-only diagnostic for local cache counts, Alpaca contract endpoint availability, SPY same-day contracts, LEAPS counts, sample symbols, quote availability, and zero-contract reasons.
   - Wide spreads are warnings unless `PAPER_OPTIONS_HARD_SPREAD_CAP_ENABLED=true` or the family-specific hard-spread flag is enabled.
@@ -68,6 +73,7 @@
   - `paper:ops:review` persists the latest reviewed payload artifact and operation log rows.
   - `paper:execute:reviewed -- --confirmPaper` refuses missing, stale, empty, or payload-signature-mismatched review artifacts before paper submission.
   - `paper:execute:reviewed` now supports `--sections=` so scheduler entry execution is limited to `equityBuys,equityAdds,optionBuys` and scheduler exit execution is limited to `equitySells,optionSellToCloseExits`.
+  - Reviewed LEAPS sell-to-close execution also fails closed unless `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, `LIVE_TRADING_ENABLED=false`, `PAPER_ORDER_EXECUTION_ENABLED=true`, `PAPER_OPTIONS_EXECUTION_ENABLED=true`, `AUTOMATED_PAPER_EXECUTION_ENABLED=true`, and `--confirmPaper` are all present.
   - `AUTOMATED_PAPER_EXECUTION_ENABLED=false` remains the default for review-only `paper-ops-*` timers.
   - Continuous monitor timers are installed from `scripts/install-paper-monitoring-systemd.sh` and run through `npm run paper:monitor`, which gates market hours/holidays, paper runtime, live-off flags, execution flags, and per-task locks.
 

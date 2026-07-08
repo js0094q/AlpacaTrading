@@ -10,6 +10,10 @@ const parseNumber = (value: string | undefined, fallback: number) => {
   const parsed = Number.parseFloat(value || "");
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 };
+const parseSignedNumber = (value: string | undefined, fallback: number) => {
+  const parsed = Number.parseFloat(value || "");
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
 const parseInteger = (value: string | undefined, fallback: number) => {
   const parsed = Number.parseInt(value || "", 10);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
@@ -74,6 +78,20 @@ const paperLeapsMaxOrderNotional = parseNumber(
   firstEnv("PAPER_LEAPS_MAX_ORDER_NOTIONAL", "PAPER_LEAPS_MAX_PREMIUM_PER_TRADE"),
   1500
 );
+
+export const paperLeapsExitConfig = () => ({
+  minDteAtEntry: Math.max(1, parseInteger(process.env.LEAPS_MIN_DTE_AT_ENTRY, 270)),
+  dteExitThreshold: Math.max(0, parseInteger(process.env.LEAPS_DTE_EXIT_THRESHOLD, 180)),
+  reviewLossPct: parseSignedNumber(process.env.LEAPS_REVIEW_LOSS_PCT, -20),
+  hardStopLossPct: parseSignedNumber(process.env.LEAPS_HARD_STOP_LOSS_PCT, -35),
+  partialProfitTakePct: parseSignedNumber(process.env.LEAPS_PARTIAL_PROFIT_TAKE_PCT, 75),
+  fullProfitTakePct: parseSignedNumber(process.env.LEAPS_FULL_PROFIT_TAKE_PCT, 125),
+  trendReviewSma: Math.max(1, parseInteger(process.env.LEAPS_TREND_REVIEW_SMA, 100)),
+  severeTrendExitSma: Math.max(1, parseInteger(process.env.LEAPS_SEVERE_TREND_EXIT_SMA, 200)),
+  maxBidAskSpreadPct: Math.max(0, parseNumber(process.env.LEAPS_MAX_BID_ASK_SPREAD_PCT, 20)),
+  minDeltaReview: Math.max(0, parseNumber(process.env.LEAPS_MIN_DELTA_REVIEW, 0.45)),
+  reviewIntervalDays: Math.max(1, parseInteger(process.env.LEAPS_REVIEW_INTERVAL_DAYS, 30))
+});
 
 export const config = {
   alpacaEnv: parseAlpacaEnv(),
@@ -168,6 +186,7 @@ export const config = {
       parseBoolean(process.env.PAPER_OPTIONS_HARD_SPREAD_CAP_ENABLED)
     )
   },
+  paperLeapsExit: paperLeapsExitConfig(),
   enableAggressivePaperStrategies:
     process.env.ENABLE_AGGRESSIVE_PAPER_STRATEGIES === "true",
   enableShortResearch: process.env.ENABLE_SHORT_RESEARCH !== "false",

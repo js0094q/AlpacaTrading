@@ -122,6 +122,17 @@ PAPER_LEAPS_MIN_DTE=180
 PAPER_LEAPS_MAX_DTE=730
 PAPER_LEAPS_MAX_SPREAD_PCT=15
 PAPER_LEAPS_HARD_SPREAD_CAP_ENABLED=false
+LEAPS_MIN_DTE_AT_ENTRY=270
+LEAPS_DTE_EXIT_THRESHOLD=180
+LEAPS_REVIEW_LOSS_PCT=-20
+LEAPS_HARD_STOP_LOSS_PCT=-35
+LEAPS_PARTIAL_PROFIT_TAKE_PCT=75
+LEAPS_FULL_PROFIT_TAKE_PCT=125
+LEAPS_TREND_REVIEW_SMA=100
+LEAPS_SEVERE_TREND_EXIT_SMA=200
+LEAPS_MAX_BID_ASK_SPREAD_PCT=20
+LEAPS_MIN_DELTA_REVIEW=0.45
+LEAPS_REVIEW_INTERVAL_DAYS=30
 PAPER_RUNTIME_DUPLICATE_RECONCILIATION_ENABLED=false
 ENABLE_OPTIONS_RESEARCH=true
 ENABLE_AGGRESSIVE_PAPER_STRATEGIES=true
@@ -296,7 +307,7 @@ npm run paper:options:discover -- --underlying=SPY --dte=0 --format=json
 npm run paper:ops:review -- --format=json
 ```
 
-`npm run paper:execute:reviewed -- --confirmPaper --format=json` is paper-only and requires `PAPER_ORDER_EXECUTION_ENABLED=true`. Option payloads also require `PAPER_OPTIONS_EXECUTION_ENABLED=true`. Do not use execution commands during implementation or review unless the user explicitly requests paper execution.
+`npm run paper:execute:reviewed -- --confirmPaper --format=json` is paper-only and requires `PAPER_ORDER_EXECUTION_ENABLED=true`. Option payloads also require `PAPER_OPTIONS_EXECUTION_ENABLED=true`. Reviewed LEAPS sell-to-close payloads additionally require `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, `LIVE_TRADING_ENABLED=false`, `AUTOMATED_PAPER_EXECUTION_ENABLED=true`, and `--confirmPaper`; failures use `PAPER_RUNTIME_REQUIRED`, `LIVE_TRADING_DISABLED_REQUIRED`, `PAPER_EXECUTION_FLAG_REQUIRED`, `PAPER_OPTIONS_EXECUTION_FLAG_REQUIRED`, `AUTOMATED_PAPER_EXECUTION_FLAG_REQUIRED`, or `PAPER_CONFIRMATION_REQUIRED`. Do not use execution commands during implementation or review unless the user explicitly requests paper execution.
 
 Systemd timers in `server/systemd/` implement the VPS automation schedule:
 
@@ -309,7 +320,7 @@ The continuous paper monitor is installed separately with `scripts/install-paper
 
 - `alpaca-paper-review.timer`: wakes every 30 minutes during weekday market-hour windows and runs the existing paper research/review workflow.
 - `alpaca-paper-execute.timer`: wakes after review windows and can execute only reviewed entry sections (`equityBuys`, `equityAdds`, `optionBuys`).
-- `alpaca-paper-exit-review.timer`: wakes every 15 minutes during the regular window and every 5 minutes in the final hour; final-hour review uses the late-day 0DTE exit path.
+- `alpaca-paper-exit-review.timer`: wakes every 15 minutes during the regular window and every 5 minutes in the final hour; exit review evaluates equity exits, generic option exits, 0DTE late-day exits, and LEAPS exit discipline.
 - `alpaca-paper-exit-execute.timer`: wakes after exit-review windows and can execute only reviewed exit sections (`equitySells`, `optionSellToCloseExits`).
 
 The monitor runner no-ops with `MARKET_CLOSED` outside regular market hours, weekends, and configured US market holidays. It fails closed unless `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, `LIVE_TRADING_ENABLED=false`, `PAPER_ORDER_EXECUTION_ENABLED=true`, `PAPER_OPTIONS_EXECUTION_ENABLED=true`, and `AUTOMATED_PAPER_EXECUTION_ENABLED=true` for execution tasks. See `docs/paper-monitoring-operations.md`.
@@ -459,6 +470,14 @@ Paper options are operationally enabled for the current paper runtime with `PAPE
 - naked options disabled by default
 
 Wide spreads, stale quotes with complete non-crossed bid/ask, weak discovery signals, and ask-fallback limit prices are warnings in paper mode by default. Spread caps become hard blockers only when `PAPER_OPTIONS_HARD_SPREAD_CAP_ENABLED=true` or a family-specific hard-spread flag is enabled. `OPTION_LIMIT_PRICE_UNAVAILABLE` remains a hard blocker when no usable bid/ask quote can produce a positive limit price. Last-price fallback is disabled unless `ALLOW_OPTIONS_LAST_PRICE_FALLBACK=true`; same-day expiration is disabled unless `ALLOW_0DTE_OPTIONS=true`. Legacy `PAPER_OPTIONS_MAX_PREMIUM_PER_ORDER`, `PAPER_OPTIONS_MAX_CONTRACTS`, `PAPER_0DTE_SPY_MAX_PREMIUM_PER_TRADE`, and `PAPER_LEAPS_MAX_PREMIUM_PER_TRADE` names remain accepted as aliases when the preferred paper-option cap names are unset.
+
+LEAPS paper exits are evaluated by `paper:portfolio:review`, `paper:exit:review`, and the `paper:ops:review` artifact flow. A contract is classified as LEAPS when entry DTE is at least `LEAPS_MIN_DTE_AT_ENTRY=270`; entry DTE is read from `paper_learning_records` first, then the paper execution ledger, and only falls back to current DTE with `LEAPS_CLASSIFICATION_INFERRED` when no entry record can be derived. Short-dated options are not classified as LEAPS by fallback.
+
+LEAPS hard sell-to-close reviews are generated for `LEAPS_HARD_STOP_LOSS` at `LEAPS_HARD_STOP_LOSS_PCT=-35`, `LEAPS_FULL_PROFIT_TAKE` at `LEAPS_FULL_PROFIT_TAKE_PCT=125`, `LEAPS_DTE_EXIT_WINDOW` at `LEAPS_DTE_EXIT_THRESHOLD=180`, and `LEAPS_SEVERE_TREND_BREAK` when a bullish call underlying closes below `LEAPS_SEVERE_TREND_EXIT_SMA=200`. Put LEAPS use the inverted trend check when present. These reviews populate `optionSellToCloseExits` only when the liquidity guard passes.
+
+LEAPS review-only warnings are `LEAPS_REVIEW_LOSS_WARNING` at `LEAPS_REVIEW_LOSS_PCT=-20`, `LEAPS_PARTIAL_PROFIT_REVIEW` at `LEAPS_PARTIAL_PROFIT_TAKE_PCT=75`, `LEAPS_TREND_REVIEW` below `LEAPS_TREND_REVIEW_SMA=100` for calls or above it for puts, `LEAPS_DELTA_DETERIORATION` below `LEAPS_MIN_DELTA_REVIEW=0.45`, `LEAPS_DELTA_UNAVAILABLE` when Greeks are missing, and `LEAPS_PERIODIC_REVIEW_DUE` after `LEAPS_REVIEW_INTERVAL_DAYS=30`. Multiple-contract partial-profit reviews include a non-executable partial candidate in review output; automated reviewed execution does not sell on review-only triggers alone.
+
+Before a LEAPS hard exit becomes executable, bid/ask liquidity must be present and `((ask - bid) / mid) * 100` must be no more than `LEAPS_MAX_BID_ASK_SPREAD_PCT=20`. Wider spreads add `LIMIT_EXIT_REQUIRED`; missing bid/ask adds `LEAPS_QUOTE_UNAVAILABLE`. Both conditions keep the reviewed candidate non-executable and prevent marketable sell orders.
 
 Multi-leg options remain intentionally out of scope. Do not model spreads as unrelated single-leg submissions until the system can represent every leg, net debit/credit, max risk/reward, strike ordering, expiration alignment, combined payload behavior, and partial-failure handling.
 
