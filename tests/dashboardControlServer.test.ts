@@ -314,6 +314,36 @@ describe("VPS dashboard control API", () => {
     ]);
   });
 
+  test("execute.confirm requires paper-only runtime even when paper flags are enabled", async () => {
+    process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
+    process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
+    setMockCommandRunner({
+      onCommand: (script) => {
+        if (script === "alpaca:health") {
+          return {
+            paperOnly: false,
+            liveTradingEnabled: false,
+            mutationAllowed: false,
+            accountStatus: "ACTIVE"
+          };
+        }
+        return {};
+      }
+    });
+
+    const response = await callControl("/api/v1/execute/confirm", "POST", {
+      ...defaultRequest.body,
+      riskProfile: "aggressive",
+      optionsEnabled: true,
+      assetClass: "all"
+    });
+
+    assert.equal(response.status, 403);
+    assert.equal(response.payload.ok, false);
+    assert.equal(response.payload.error?.code, "PAPER_ENV_REQUIRED");
+    assert.equal(commandCalls.map((entry) => entry.script).includes("paper:execute"), false);
+  });
+
   test("unsafe health state blocks mutating commands and prevents execution", async () => {
     setMockCommandRunner({
       onCommand: (script) => {

@@ -125,6 +125,24 @@ describe("Vercel dashboard VPS bridge mode", () => {
     assert.equal(payload.data.hello, "bridge summary");
   });
 
+  test("read-only summary remains available when paper execution flags are enabled", async () => {
+    process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
+    process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
+    setMockFetchResponse({ ok: true, data: { hello: "bridge summary" }, mode: "vercel-read-only" });
+
+    const { GET } = await importRoute<{ GET: () => Promise<Response> | Response }>(
+      "apps/dashboard/app/api/paper/summary/route.ts"
+    );
+    const response = await GET();
+    const payload = (await response.json()) as { ok: true; data: { hello: string } };
+
+    assert.equal(response.status, 200);
+    assert.equal(payload.ok, true);
+    assert.equal(payload.data.hello, "bridge summary");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, "https://vps.internal:4100/api/v1/summary");
+  });
+
   test("mutating actions reject missing dashboard admin token", async () => {
     const { POST } = await importRoute<{
       POST: (request: Request) => Promise<Response> | Response;

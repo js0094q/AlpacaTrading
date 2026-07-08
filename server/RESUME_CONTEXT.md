@@ -46,6 +46,7 @@
 ## Do-not-break requirements
 
 - Preserve paper-only guardrails (`ALPACA_ENV=paper`, `LIVE_TRADING_ENABLED=false`) on all runs.
+- Keep paper execution operationally enabled only through the guarded paper path (`PAPER_ORDER_EXECUTION_ENABLED=true`, `PAPER_OPTIONS_EXECUTION_ENABLED=true`, valid control/admin auth, and CLI `--confirmPaper`).
 - Do not add direct shell command execution in dashboard actions; keep allowlisted control endpoints only.
 - Do not configure direct client-side Alpaca credentials or local SQLite writes on Vercel.
 - Preserve option quote execution gates: stale/missing/crossed quotes and same-day expirations are non-executable unless explicitly enabled by runtime env.
