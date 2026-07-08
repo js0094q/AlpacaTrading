@@ -1,0 +1,13 @@
+[Unit]
+Description=Run Alpaca Paper Monitor reviewed exit execution after exit review windows
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09..14:2/15:00
+OnCalendar=Mon..Fri *-*-* 15:2/5:00
+Persistent=false
+RandomizedDelaySec=15
+Unit=alpaca-paper-exit-execute.service
+
+[Install]
+WantedBy=timers.target
+

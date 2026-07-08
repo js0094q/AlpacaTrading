@@ -67,7 +67,9 @@
   - `paper:options:discover` is review-only and labels current-session 0DTE versus `nextSessionPreparation: true`.
   - `paper:ops:review` persists the latest reviewed payload artifact and operation log rows.
   - `paper:execute:reviewed -- --confirmPaper` refuses missing, stale, empty, or payload-signature-mismatched review artifacts before paper submission.
-  - `AUTOMATED_PAPER_EXECUTION_ENABLED=false` remains the default; systemd ops timers generate reviews only.
+  - `paper:execute:reviewed` now supports `--sections=` so scheduler entry execution is limited to `equityBuys,equityAdds,optionBuys` and scheduler exit execution is limited to `equitySells,optionSellToCloseExits`.
+  - `AUTOMATED_PAPER_EXECUTION_ENABLED=false` remains the default for review-only `paper-ops-*` timers.
+  - Continuous monitor timers are installed from `scripts/install-paper-monitoring-systemd.sh` and run through `npm run paper:monitor`, which gates market hours/holidays, paper runtime, live-off flags, execution flags, and per-task locks.
 
 ## Token/env coordination
 
@@ -108,3 +110,4 @@
 - Do not relax paper-only gates without an explicit request.
 - Do not run `npm run paper:execute:reviewed -- --confirmPaper` or `npm run paper:execute -- --confirmPaper` unless the user explicitly requests paper execution.
 - No live execution route exists in the dashboard operations layer.
+- Automated paper execution is only allowed through the `alpaca-paper-*` monitor timers, reviewed artifacts, section filters, and paper-only/live-off runner guards.

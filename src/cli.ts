@@ -53,6 +53,10 @@ import {
 } from "./services/paperExecuteDryRunService.js";
 import { buildPaperReviewedPayloadExecutionReport } from "./services/paperReviewedPayloadExecutionService.js";
 import {
+  isReviewedPayloadSectionName,
+  type ReviewedPayloadSectionName
+} from "./services/paperReviewArtifactService.js";
+import {
   buildPaperRuntimeReport,
   formatPaperRuntimeReportAsTable
 } from "./services/paperRuntimeService.js";
@@ -132,6 +136,10 @@ const normalizePaperPlanFormat = (value?: string): "table" | "json" | undefined 
 };
 const normalizeAssetClass = (value?: string): "all" | "equity" | "option" | undefined => {
   return value === "equity" || value === "option" || value === "all" ? value : undefined;
+};
+const normalizeReviewedPayloadSections = (value?: string): ReviewedPayloadSectionName[] | undefined => {
+  const sections = parseList(value).filter(isReviewedPayloadSectionName);
+  return sections.length ? sections : undefined;
 };
 
 const appendReportAnalyticsSection = (
@@ -992,7 +1000,8 @@ const run = async () => {
     const format = args.format;
     const result = await buildPaperReviewedPayloadExecutionReport({
       confirmPaper: flagArg(args.confirmPaper),
-      expectedPayloadSignature: args.expectedPayloadSignature
+      expectedPayloadSignature: args.expectedPayloadSignature,
+      sections: normalizeReviewedPayloadSections(args.sections)
     });
 
     if (format === "json") {

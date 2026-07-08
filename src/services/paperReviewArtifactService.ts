@@ -8,6 +8,19 @@ export type ReviewedPayloadSectionName =
   | "optionBuys"
   | "optionSellToCloseExits";
 
+export const REVIEWED_PAYLOAD_SECTION_NAMES: ReviewedPayloadSectionName[] = [
+  "equityBuys",
+  "equityAdds",
+  "equitySells",
+  "optionBuys",
+  "optionSellToCloseExits"
+];
+
+export const isReviewedPayloadSectionName = (
+  value: string
+): value is ReviewedPayloadSectionName =>
+  REVIEWED_PAYLOAD_SECTION_NAMES.includes(value as ReviewedPayloadSectionName);
+
 export type ReviewedPayloadSections = Record<ReviewedPayloadSectionName, unknown[]>;
 
 export interface PaperReviewArtifact {

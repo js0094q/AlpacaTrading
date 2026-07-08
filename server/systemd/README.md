@@ -12,6 +12,14 @@ The repository now includes a paper control service template for the VPS dashboa
   on weekdays around 12:00 PM ET.
 - `paper-ops-late-day.service` / `.timer` — runs `npm run paper:ops:late-day -- --format=json`
   on weekdays around 3:15 PM ET.
+- `alpaca-paper-review.service` / `.timer` — runs `npm run paper:monitor -- --task=review`
+  every 30 minutes during weekday market-hour windows.
+- `alpaca-paper-execute.service` / `.timer` — runs reviewed entry execution through
+  `npm run paper:monitor -- --task=execute`.
+- `alpaca-paper-exit-review.service` / `.timer` — runs reviewed exit checks every 15 minutes
+  and every 5 minutes during the final hour.
+- `alpaca-paper-exit-execute.service` / `.timer` — runs reviewed exit execution through
+  `npm run paper:monitor -- --task=exit-execute`.
 
 ## Installing and enabling the control API service
 
@@ -56,6 +64,25 @@ systemctl list-timers 'paper-ops-*' --no-pager
 ```
 
 Timer services set `AUTOMATED_PAPER_EXECUTION_ENABLED=false`, so scheduled workflows stop at review payload generation.
+
+## Installing continuous paper monitor timers
+
+The continuous monitor uses reviewed artifacts only and separates entry execution from exit execution by payload section.
+
+```bash
+sudo bash /home/alpaca/Alpaca-Trading/scripts/install-paper-monitoring-systemd.sh
+systemctl list-timers 'alpaca-paper-*' --no-pager
+```
+
+Disable:
+
+```bash
+sudo bash /home/alpaca/Alpaca-Trading/scripts/disable-paper-monitoring-systemd.sh
+```
+
+The monitor runner fails closed unless the runtime env remains paper-only and live-off. Execution services set
+`AUTOMATED_PAPER_EXECUTION_ENABLED=true`, but the runner also requires `PAPER_ORDER_EXECUTION_ENABLED=true`,
+`PAPER_OPTIONS_EXECUTION_ENABLED=true`, and the reviewed executor's `--confirmPaper` boundary.
 
 ## Service operating guidance
 

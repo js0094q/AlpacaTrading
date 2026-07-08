@@ -13,6 +13,7 @@ import {
 } from "./paperExecutionLedgerService.js";
 import {
   isPaperReviewArtifactFresh,
+  isReviewedPayloadSectionName,
   latestPaperReviewArtifact,
   type PaperReviewArtifact,
   type ReviewedPayloadSectionName
@@ -74,6 +75,7 @@ export interface PaperReviewedExecutionReport {
 interface PaperReviewedExecutionInput {
   confirmPaper?: boolean;
   expectedPayloadSignature?: string;
+  sections?: ReviewedPayloadSectionName[];
 }
 
 interface NormalizedReviewedPayload {
@@ -185,6 +187,11 @@ const normalizePayload = (
 const allArtifactPayloads = (artifact: PaperReviewArtifact) =>
   (Object.entries(artifact.artifact.payloadSections) as Array<[ReviewedPayloadSectionName, unknown[]]>)
     .flatMap(([section, rows]) => rows.map((row, index) => ({ section, row, index })));
+
+const requestedSections = (sections: ReviewedPayloadSectionName[] | undefined) => {
+  const normalized = (sections ?? []).filter(isReviewedPayloadSectionName);
+  return normalized.length ? new Set(normalized) : null;
+};
 
 const toAlpacaPayload = (payload: NormalizedReviewedPayload): AlpacaPaperOrderRequest => ({
   symbol: payload.symbol,
@@ -306,9 +313,13 @@ export const buildPaperReviewedPayloadExecutionReport = async (
     });
   }
 
+  const sectionFilter = requestedSections(input.sections);
+  const reviewedPayloadRows = sectionFilter
+    ? allArtifactPayloads(artifact).filter(({ section }) => sectionFilter.has(section))
+    : allArtifactPayloads(artifact);
   const normalized: NormalizedReviewedPayload[] = [];
   const blocked: PaperReviewedExecutionReport["blocked"] = [];
-  for (const { section, row, index } of allArtifactPayloads(artifact)) {
+  for (const { section, row, index } of reviewedPayloadRows) {
     const result = normalizePayload(artifact, section, row, index);
     if ("blocked" in result) {
       blocked.push(result.blocked);
@@ -349,7 +360,7 @@ export const buildPaperReviewedPayloadExecutionReport = async (
       reason: blocked[0]?.reason ?? "NO_ELIGIBLE_REVIEWED_PAYLOADS",
       artifact,
       blocked,
-      reviewedPayloads: artifact.payloadCount
+      reviewedPayloads: reviewedPayloadRows.length
     });
   }
 
@@ -362,7 +373,7 @@ export const buildPaperReviewedPayloadExecutionReport = async (
       reason: "PAPER_ACCOUNT_NOT_ACTIVE",
       artifact,
       blocked: [{ reason: "PAPER_ACCOUNT_NOT_ACTIVE" }],
-      reviewedPayloads: artifact.payloadCount
+      reviewedPayloads: reviewedPayloadRows.length
     });
   }
 
@@ -478,7 +489,7 @@ export const buildPaperReviewedPayloadExecutionReport = async (
     blocked,
     errors,
     summary: {
-      reviewedPayloads: artifact.payloadCount,
+      reviewedPayloads: reviewedPayloadRows.length,
       eligiblePayloads: normalized.length,
       submitted: submitted.length,
       blocked: blocked.length,

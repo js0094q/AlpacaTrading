@@ -1,0 +1,20 @@
+[Unit]
+Description=Alpaca Paper Monitor Review Workflow
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=alpaca
+Group=alpaca
+WorkingDirectory=/home/alpaca/Alpaca-Trading
+EnvironmentFile=/opt/alpaca-investing/secrets/alpaca.env
+Environment=PATH=/usr/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=NODE_ENV=production
+Environment=AUTOMATED_PAPER_EXECUTION_ENABLED=false
+ExecStart=/usr/bin/npm run paper:monitor -- --task=review
+TimeoutStartSec=900
+SyslogIdentifier=alpaca-paper-review
+StandardOutput=journal
+StandardError=journal
+

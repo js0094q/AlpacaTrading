@@ -1,0 +1,20 @@
+[Unit]
+Description=Alpaca Paper Monitor Reviewed Entry Execution
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=alpaca
+Group=alpaca
+WorkingDirectory=/home/alpaca/Alpaca-Trading
+EnvironmentFile=/opt/alpaca-investing/secrets/alpaca.env
+Environment=PATH=/usr/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=NODE_ENV=production
+Environment=AUTOMATED_PAPER_EXECUTION_ENABLED=true
+ExecStart=/usr/bin/npm run paper:monitor -- --task=execute
+TimeoutStartSec=300
+SyslogIdentifier=alpaca-paper-execute
+StandardOutput=journal
+StandardError=journal
+

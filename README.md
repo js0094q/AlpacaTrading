@@ -304,6 +304,16 @@ Systemd timers in `server/systemd/` implement the VPS automation schedule:
 - `paper-ops-midday.timer`: weekdays around 12:00 PM ET.
 - `paper-ops-late-day.timer`: weekdays around 3:15 PM ET.
 
+Those `paper-ops-*` timers are review-only and set `AUTOMATED_PAPER_EXECUTION_ENABLED=false`.
+The continuous paper monitor is installed separately with `scripts/install-paper-monitoring-systemd.sh`:
+
+- `alpaca-paper-review.timer`: wakes every 30 minutes during weekday market-hour windows and runs the existing paper research/review workflow.
+- `alpaca-paper-execute.timer`: wakes after review windows and can execute only reviewed entry sections (`equityBuys`, `equityAdds`, `optionBuys`).
+- `alpaca-paper-exit-review.timer`: wakes every 15 minutes during the regular window and every 5 minutes in the final hour; final-hour review uses the late-day 0DTE exit path.
+- `alpaca-paper-exit-execute.timer`: wakes after exit-review windows and can execute only reviewed exit sections (`equitySells`, `optionSellToCloseExits`).
+
+The monitor runner no-ops with `MARKET_CLOSED` outside regular market hours, weekends, and configured US market holidays. It fails closed unless `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, `LIVE_TRADING_ENABLED=false`, `PAPER_ORDER_EXECUTION_ENABLED=true`, `PAPER_OPTIONS_EXECUTION_ENABLED=true`, and `AUTOMATED_PAPER_EXECUTION_ENABLED=true` for execution tasks. See `docs/paper-monitoring-operations.md`.
+
 Set the VPS timezone to `America/New_York` or adjust the timer calendar before enabling timers.
 
 Expected safety properties:
