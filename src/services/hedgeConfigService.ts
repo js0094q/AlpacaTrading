@@ -1,0 +1,214 @@
+import { canonicalJsonHash } from "../lib/canonicalJson.js";
+import {
+  HEDGE_PLAN_VERSION,
+  HEDGE_REGIME_MODEL_VERSION,
+  HEDGE_RISK_MODEL_VERSION
+} from "./hedgeTypes.js";
+
+export interface HedgeConfig {
+  executionEnabled: boolean;
+  riskModelVersion: string;
+  regimeModelVersion: string;
+  planVersion: string;
+  recommendationTtlMinutes: number;
+  recommendationFreshnessMinutes: number;
+  planTtlMinutes: number;
+  beta: {
+    benchmark: string;
+    lookbackDays: number;
+    observationInterval: string;
+    minimumObservations: number;
+    calculationVersion: string;
+    cacheTtlHours: number;
+    minimumCoverage: number;
+  };
+  regime: {
+    realizedVolatilityThreshold: number;
+    volatilityProxy: string;
+    crisisVolatilityLevel: number;
+  };
+  targetProtection: {
+    low: number;
+    moderate: number;
+    elevated: number;
+    high: number;
+    critical: number;
+  };
+  premiumNavCap: number;
+  leaps: {
+    minimumDte: number;
+    concentrationThreshold: number;
+    profitAllocation: number;
+    maxBidAskSpreadPct: number;
+  };
+  optionHedge: {
+    minimumDte: number;
+    maximumDte: number;
+    maximumContracts: number;
+    maxBidAskSpreadPct: number;
+  };
+  sectorMap: Record<string, string>;
+  warnings: string[];
+}
+
+const envBoolean = (value: string | undefined) => value === "true" || value === "1";
+
+const normalizeSymbol = (value: string | undefined, fallback: string) => {
+  const normalized = String(value || fallback).trim().toUpperCase();
+  return normalized || fallback;
+};
+
+export const buildHedgeConfig = (): HedgeConfig => {
+  const warnings: string[] = [];
+  const invalid = () => {
+    if (!warnings.includes("HEDGE_CONFIGURATION_VALUE_INVALID")) {
+      warnings.push("HEDGE_CONFIGURATION_VALUE_INVALID");
+    }
+  };
+  const positiveInteger = (value: string | undefined, fallback: number) => {
+    if (value === undefined || value.trim() === "") {
+      return fallback;
+    }
+    const parsed = Number(value);
+    if (!Number.isInteger(parsed) || parsed <= 0) {
+      invalid();
+      return fallback;
+    }
+    return parsed;
+  };
+  const positiveNumber = (value: string | undefined, fallback: number) => {
+    if (value === undefined || value.trim() === "") {
+      return fallback;
+    }
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      invalid();
+      return fallback;
+    }
+    return parsed;
+  };
+  const ratio = (value: string | undefined, fallback: number) => {
+    if (value === undefined || value.trim() === "") {
+      return fallback;
+    }
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
+      invalid();
+      return fallback;
+    }
+    return parsed;
+  };
+
+  let sectorMap: Record<string, string> = {};
+  const sectorJson = process.env.HEDGE_SECTOR_MAP_JSON?.trim();
+  if (sectorJson) {
+    try {
+      const parsed = JSON.parse(sectorJson) as unknown;
+      if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") {
+        throw new Error("sector map must be an object");
+      }
+      sectorMap = Object.fromEntries(
+        Object.entries(parsed as Record<string, unknown>)
+          .map(([symbol, sector]) => [
+            symbol.trim().toUpperCase(),
+            typeof sector === "string" ? sector.trim().toLowerCase() : ""
+          ])
+          .filter(([symbol, sector]) => Boolean(symbol && sector))
+      );
+    } catch {
+      sectorMap = {};
+      warnings.push("HEDGE_SECTOR_MAP_INVALID");
+    }
+  }
+
+  const optionMinimumDte = positiveInteger(process.env.HEDGE_OPTION_MIN_DTE, 30);
+  const optionMaximumDte = positiveInteger(process.env.HEDGE_OPTION_MAX_DTE, 120);
+
+  return {
+    executionEnabled: envBoolean(process.env.HEDGE_PAPER_EXECUTION_ENABLED),
+    riskModelVersion:
+      process.env.HEDGE_RISK_MODEL_VERSION?.trim() || HEDGE_RISK_MODEL_VERSION,
+    regimeModelVersion:
+      process.env.HEDGE_REGIME_MODEL_VERSION?.trim() || HEDGE_REGIME_MODEL_VERSION,
+    planVersion: process.env.HEDGE_PLAN_VERSION?.trim() || HEDGE_PLAN_VERSION,
+    recommendationTtlMinutes: positiveInteger(
+      process.env.HEDGE_RECOMMENDATION_TTL_MINUTES,
+      30
+    ),
+    recommendationFreshnessMinutes: positiveInteger(
+      process.env.HEDGE_RECOMMENDATION_FRESHNESS_MINUTES,
+      15
+    ),
+    planTtlMinutes: positiveInteger(process.env.HEDGE_PLAN_TTL_MINUTES, 30),
+    beta: {
+      benchmark: normalizeSymbol(process.env.HEDGE_BETA_BENCHMARK, "SPY"),
+      lookbackDays: positiveInteger(process.env.HEDGE_BETA_LOOKBACK_DAYS, 252),
+      observationInterval:
+        process.env.HEDGE_BETA_OBSERVATION_INTERVAL?.trim() || "1Day",
+      minimumObservations: positiveInteger(
+        process.env.HEDGE_BETA_MIN_OBSERVATIONS,
+        60
+      ),
+      calculationVersion:
+        process.env.HEDGE_BETA_CALCULATION_VERSION?.trim() || "beta-v1",
+      cacheTtlHours: positiveInteger(process.env.HEDGE_BETA_CACHE_TTL_HOURS, 24),
+      minimumCoverage: ratio(process.env.HEDGE_BETA_MIN_COVERAGE, 0.8)
+    },
+    regime: {
+      realizedVolatilityThreshold: positiveNumber(
+        process.env.HEDGE_REGIME_REALIZED_VOL_THRESHOLD,
+        0.25
+      ),
+      volatilityProxy: normalizeSymbol(
+        process.env.HEDGE_REGIME_VOLATILITY_PROXY,
+        "VIXY"
+      ),
+      crisisVolatilityLevel: positiveNumber(
+        process.env.HEDGE_REGIME_CRISIS_VOL_LEVEL,
+        40
+      )
+    },
+    targetProtection: {
+      low: ratio(process.env.HEDGE_TARGET_PROTECTION_LOW, 0),
+      moderate: ratio(process.env.HEDGE_TARGET_PROTECTION_MODERATE, 0.25),
+      elevated: ratio(process.env.HEDGE_TARGET_PROTECTION_ELEVATED, 0.35),
+      high: ratio(process.env.HEDGE_TARGET_PROTECTION_HIGH, 0.5),
+      critical: ratio(process.env.HEDGE_TARGET_PROTECTION_CRITICAL, 0.65)
+    },
+    premiumNavCap: ratio(process.env.HEDGE_PREMIUM_NAV_CAP, 0.01),
+    leaps: {
+      minimumDte: positiveInteger(process.env.HEDGE_LEAPS_MIN_DTE, 365),
+      concentrationThreshold: ratio(
+        process.env.HEDGE_LEAPS_CONCENTRATION_THRESHOLD,
+        0.35
+      ),
+      profitAllocation: ratio(process.env.HEDGE_PROFIT_ALLOCATION, 0.25),
+      maxBidAskSpreadPct: ratio(process.env.HEDGE_LEAPS_MAX_BID_ASK_SPREAD_PCT, 0.2)
+    },
+    optionHedge: {
+      minimumDte: optionMinimumDte,
+      maximumDte: Math.max(optionMinimumDte, optionMaximumDte),
+      maximumContracts: positiveInteger(process.env.HEDGE_MAX_OPTION_CONTRACTS, 10),
+      maxBidAskSpreadPct: ratio(process.env.HEDGE_MAX_OPTION_SPREAD_PCT, 0.2)
+    },
+    sectorMap,
+    warnings
+  };
+};
+
+export const hedgeConfigurationFingerprint = (config = buildHedgeConfig()) =>
+  canonicalJsonHash({
+    riskModelVersion: config.riskModelVersion,
+    regimeModelVersion: config.regimeModelVersion,
+    planVersion: config.planVersion,
+    recommendationTtlMinutes: config.recommendationTtlMinutes,
+    recommendationFreshnessMinutes: config.recommendationFreshnessMinutes,
+    planTtlMinutes: config.planTtlMinutes,
+    beta: config.beta,
+    regime: config.regime,
+    targetProtection: config.targetProtection,
+    premiumNavCap: config.premiumNavCap,
+    leaps: config.leaps,
+    optionHedge: config.optionHedge,
+    sectorMap: config.sectorMap
+  });

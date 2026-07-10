@@ -1,7 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { getDb, queryAll } from "../lib/db.js";
 
-export type PaperStrategyFamily = "zero_dte_spy" | "leaps" | "standard_option" | "equity";
+export type PaperStrategyFamily =
+  | "zero_dte_spy"
+  | "leaps"
+  | "standard_option"
+  | "equity"
+  | "portfolio_hedge";
 export type PaperLearningDecision = "submitted" | "skipped" | "rejected" | "no_op";
 export type PaperLearningStatus = "pending" | "evaluated" | "promoted" | "rejected";
 

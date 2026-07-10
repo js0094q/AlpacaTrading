@@ -1,4 +1,5 @@
 import { config as loadDotenv } from "dotenv";
+import { buildHedgeConfig } from "./services/hedgeConfigService.js";
 
 loadDotenv();
 loadDotenv({ path: ".env.txt", override: false });
@@ -187,6 +188,7 @@ export const config = {
     )
   },
   paperLeapsExit: paperLeapsExitConfig(),
+  hedge: buildHedgeConfig(),
   enableAggressivePaperStrategies:
     process.env.ENABLE_AGGRESSIVE_PAPER_STRATEGIES === "true",
   enableShortResearch: process.env.ENABLE_SHORT_RESEARCH !== "false",
