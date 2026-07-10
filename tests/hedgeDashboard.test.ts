@@ -4,6 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { after, before, test } from "node:test";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+
+import {
+  HedgePanel,
+  type HedgeDashboardRecommendation
+} from "../apps/dashboard/app/components/HedgePanel.js";
 
 const dbDir = mkdtempSync(join(tmpdir(), "alpaca-hedge-dashboard-test-"));
 process.env.RESEARCH_DB_PATH = join(dbDir, "research.db");
@@ -110,7 +117,9 @@ test("expired recommendation remains expired through the Vercel bridge", async (
     const { GET } = await import(`${url.href}?expired=${Date.now()}`) as {
       GET: (request?: Request) => Promise<Response> | Response;
     };
-    const response = await GET();
+    const response = await GET(
+      new Request("http://localhost/api/paper/hedge/recommendation")
+    );
     const payload = await response.json() as {
       ok: true;
       data: { effectiveStatus: string };
@@ -126,4 +135,85 @@ test("expired recommendation remains expired through the Vercel bridge", async (
     delete process.env.VPS_CONTROL_BASE_URL;
     delete process.env.VPS_CONTROL_TOKEN;
   }
+});
+
+const dashboardRecommendation = (
+  effectiveStatus: HedgeDashboardRecommendation["effectiveStatus"]
+): HedgeDashboardRecommendation => ({
+  recommendationId: "hedge-dashboard-recommendation",
+  effectiveStatus,
+  recommendationStatus: "current",
+  generatedAt: "2026-07-10T14:00:00.000Z",
+  expiresAt: "2026-07-10T14:30:00.000Z",
+  environment: "paper",
+  sourceSnapshotId: "portfolio-snapshot-dashboard",
+  riskModelVersion: "portfolio-risk-v1",
+  regimeModelVersion: "market-regime-v1",
+  configurationFingerprint: "configuration-fingerprint",
+  dataQualityStatus: "partial",
+  reviewedPayloadHash: "reviewed-hash",
+  decision: "trim_leaps_then_protect",
+  risk: {
+    portfolioBeta: 1.2,
+    betaCoverage: 0.9,
+    exposures: { grossExposurePct: 1.4, netExposurePct: 1.1 },
+    concentration: { largestUnderlyingWeight: 0.35, topFiveUnderlyingWeight: 0.8 },
+    scenarios: [
+      { benchmarkDeclinePct: 10, netModeledLoss: 100000, existingProtection: 25000 }
+    ]
+  },
+  regime: { regime: "risk-off", selectedRule: "RISK_OFF_LONG_TREND_BREAK" },
+  score: { total: 70, band: "high" },
+  sizing: {
+    targetScenarioDeclinePct: 10,
+    grossProtectionTarget: 60000,
+    existingMeasuredProtection: 25000,
+    netProtectionTarget: 35000,
+    residualUnprotectedLoss: 25000
+  },
+  leaps: {
+    profitFundedPremiumBudget: 2500,
+    unrealizedGainFundingProxy: true,
+    trimRecommendations: [{ symbol: "AAPL280120C00150000", quantityToTrim: 1 }]
+  },
+  candidates: [
+    {
+      candidateId: "spread-1",
+      rank: 1,
+      instrumentType: "put_spread",
+      symbol: "SPY spread",
+      expectedProtection: 10000,
+      estimatedCost: 2000,
+      units: 1,
+      blockers: ["MULTI_LEG_EXECUTION_UNSUPPORTED"]
+    }
+  ],
+  warnings: ["SECTOR_COVERAGE_PARTIAL"],
+  blockers: [],
+  integrityWarnings: []
+});
+
+test("dashboard labels expired hedge recommendations as not current", () => {
+  const html = renderToStaticMarkup(
+    createElement(HedgePanel, { recommendation: dashboardRecommendation("expired") })
+  );
+
+  assert.match(html, /EXPIRED/);
+  assert.match(html, /This recommendation is not current/);
+  assert.doesNotMatch(html, /Current recommendation/);
+});
+
+test("dashboard renders current risk, regime, LEAPS, sizing, and blocker details", () => {
+  const html = renderToStaticMarkup(
+    createElement(HedgePanel, { recommendation: dashboardRecommendation("current") })
+  );
+
+  assert.match(html, /Current recommendation/);
+  assert.match(html, /Risk score/);
+  assert.match(html, /70 \(high\)/);
+  assert.match(html, /risk-off/);
+  assert.match(html, /10% decline/);
+  assert.match(html, /Profit-funded premium budget/);
+  assert.match(html, /AAPL280120C00150000/);
+  assert.match(html, /MULTI_LEG_EXECUTION_UNSUPPORTED/);
 });
