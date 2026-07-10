@@ -7,6 +7,7 @@ import type {
   PersistedHedgeRecommendation,
   PortfolioHighWaterMark
 } from "./hedgeTypes.js";
+import type { HedgePlanArtifact } from "./hedgePlanService.js";
 
 interface HighWaterRow {
   environment: "paper";
@@ -412,4 +413,60 @@ export const attachReviewedPayloadHash = (
     )
     .run(updatedAt, canonicalJson(raw), recommendationId);
   return true;
+};
+
+export const persistHedgePlanRecord = (artifact: HedgePlanArtifact) => {
+  getDb()
+    .prepare(
+      `
+      INSERT INTO paper_learning_records(
+        id, created_at, updated_at, strategy_family, symbol,
+        underlying_symbol, decision, skip_reason, block_reason,
+        hypothesis, signal_inputs_json, learning_status,
+        promotion_eligible, promotion_block_reason,
+        source_candidate_id, source_plan_timestamp
+      ) VALUES (?, ?, ?, 'portfolio_hedge', ?, ?, 'no_op', ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        updated_at = excluded.updated_at,
+        skip_reason = excluded.skip_reason,
+        block_reason = excluded.block_reason,
+        hypothesis = excluded.hypothesis,
+        signal_inputs_json = excluded.signal_inputs_json,
+        promotion_eligible = 0,
+        promotion_block_reason = excluded.promotion_block_reason
+      `
+    )
+    .run(
+      artifact.planId,
+      artifact.createdAt,
+      artifact.createdAt,
+      artifact.reviewedPayload.candidates[0]?.underlying ?? "SPY",
+      artifact.reviewedPayload.candidates[0]?.underlying ?? "SPY",
+      artifact.status === "monitoring" ? "HEDGE_PLAN_MONITORING" : null,
+      artifact.status === "blocked" ? artifact.blockers[0] ?? "HEDGE_PLAN_BLOCKED" : null,
+      `Non-executable hedge plan for ${artifact.sourceSnapshotId}`,
+      canonicalJson(artifact),
+      "HEDGE_EXECUTION_NOT_IMPLEMENTED",
+      artifact.sourceSnapshotId,
+      artifact.createdAt
+    );
+  return artifact;
+};
+
+export const latestHedgePlan = (): HedgePlanArtifact | null => {
+  const row = getDb()
+    .prepare(
+      `
+      SELECT signal_inputs_json
+      FROM paper_learning_records
+      WHERE strategy_family = 'portfolio_hedge'
+        AND json_extract(signal_inputs_json, '$.recordType') = 'hedge_plan'
+      ORDER BY created_at DESC, updated_at DESC
+      LIMIT 1
+      `
+    )
+    .get() as { signal_inputs_json: string } | undefined;
+  if (!row) return null;
+  const raw = safeParse(row.signal_inputs_json);
+  return raw?.recordType === "hedge_plan" ? (raw as unknown as HedgePlanArtifact) : null;
 };
