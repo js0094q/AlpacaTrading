@@ -88,11 +88,11 @@ export interface HedgeRecommendationRecord {
   reviewedPayloadHash: string | null;
   decision: HedgeDecision;
   benchmark: string;
-  risk: Record<string, unknown>;
-  regime: Record<string, unknown>;
-  score: Record<string, unknown>;
-  sizing: Record<string, unknown>;
-  leaps: Record<string, unknown>;
+  risk: object;
+  regime: object;
+  score: object;
+  sizing: object;
+  leaps: object;
   candidates: HedgeCandidate[];
   warnings: string[];
   blockers: string[];
