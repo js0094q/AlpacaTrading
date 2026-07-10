@@ -716,6 +716,25 @@ Optional table options:
 
 `research:daily` does not submit orders. It is paper-first planning only.
 
+## Portfolio risk and hedge review
+
+The hedge layer on `paper-ops-layer` is read-only and paper-only. It normalizes equity and option exposure, uses observed Greeks when available, calculates signed-exposure portfolio beta, classifies the market regime deterministically, reports an explainable 100-point risk score, and ranks LEAPS trims or protective alternatives.
+
+Run the four supported commands with:
+
+```bash
+npm run hedge:risk -- --format=json
+npm run hedge:regime -- --format=json
+npm run hedge:review -- --format=json
+npm run hedge:plan -- --paperOnly --format=json
+```
+
+`hedge:plan` creates a signed, expiring planning artifact only. It does not create a broker order payload or add a section to the reviewed paper executor. There is no `hedge:execute` script or HTTP route. Put spreads are analyzed with `MULTI_LEG_EXECUTION_UNSUPPORTED`; SH and PSQ are secondary tactical alternatives with daily-reset and tracking-risk warnings.
+
+`HEDGE_PAPER_EXECUTION_ENABLED=false` is the required default and must remain false for this phase. Missing prices, Greeks, beta history, sector mappings, or regime evidence remain null and produce quality warnings, monitoring, or blockers.
+
+The bounded beta cache is compatible only when symbol, benchmark, lookback, interval, minimum observations, calculation version, latest aligned market-data date, and expiry all match. Persisted recommendations retain generated/expiry times, paper environment, source snapshot ID, risk/regime versions, configuration fingerprint, quality/status, and the reviewed-payload hash after planning. Dashboard reads re-evaluate freshness and never label stale or expired records current.
+
 ## Data persistence
 
 Local/VPS persistence uses `data/research.db` by default with the following collections/tables:
@@ -735,6 +754,11 @@ Local/VPS persistence uses `data/research.db` by default with the following coll
 - api_request_log
 - paper_recommendation_snapshots
 - paper_execution_ledger
+- paper_learning_records
+- paper_operation_log
+- paper_review_artifacts
+- portfolio_high_water_marks
+- portfolio_beta_cache
 
 Alpaca API request IDs are persisted in `api_request_log.request_id`.
 
@@ -750,6 +774,7 @@ On Vercel, API request logging does not write to local SQLite. Historical dashbo
 - Paper mode remains default (`ALPACA_LIVE_TRADE=false`).
 - Any future live execution path must add explicit opt-in gates.
 - Default provider behavior remains paper-only; do not add live-order code in this phase.
+- Hedge analysis and planning remain non-executable; keep `HEDGE_PAPER_EXECUTION_ENABLED=false`.
 
 ## Resume commands
 
@@ -795,6 +820,8 @@ npm run options:ingest -- --minDaysToExpiration=1 --maxDaysToExpiration=90 --min
 ### API/dashboard surface
 
 The dashboard exposes paper-only API routes under `/api/paper/*`. CLI commands remain the source of execution behavior; routes call the same service layer and add paper/live guard checks at the HTTP boundary.
+
+Cached hedge reads are available at `/api/paper/hedge/risk`, `/api/paper/hedge/regime`, and `/api/paper/hedge/recommendation`, backed by the corresponding `/api/v1/hedge/*` VPS control GET routes. They read persisted recommendations only and do not dispatch broker or CLI work.
 
 ## Known limitations (phase 1)
 
