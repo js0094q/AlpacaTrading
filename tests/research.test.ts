@@ -471,6 +471,60 @@ describe("Feature generation", () => {
     assert.equal(row.executable_price_source, "midpoint");
     assert.equal(row.rejection_reason, null);
   });
+
+  test("applies delta filters to current Alpaca camelCase option snapshots", async () => {
+    const optionSymbol = "SPY270115C00805000";
+    globalThis.fetch = async (input: string | Request | URL) => {
+      const target = String(input);
+      if (target.includes("/v2/options/contracts")) {
+        return makeMockResponse({
+          option_contracts: [{
+            symbol: optionSymbol,
+            underlying_symbol: "SPY",
+            type: "call",
+            expiration_date: "2027-01-15",
+            strike_price: 805,
+            multiplier: 100,
+            tradable: true
+          }]
+        });
+      }
+      if (target.includes("/v1beta1/options/snapshots")) {
+        return makeMockResponse({
+          snapshots: {
+            [optionSymbol]: {
+              symbol: optionSymbol,
+              underlying_symbol: "SPY",
+              greeks: { delta: 0.5 },
+              latestQuote: { t: new Date().toISOString(), bp: 16.4, ap: 16.52 },
+              impliedVolatility: 0.1379
+            }
+          }
+        });
+      }
+      if (target.includes("/v1beta1/options/quotes/latest")) {
+        return makeMockResponse({
+          quotes: {
+            [optionSymbol]: { t: new Date().toISOString(), bp: 16.4, ap: 16.52 }
+          }
+        });
+      }
+      return makeMockResponse({});
+    };
+
+    await ingestOptionContracts({ underlyingSymbols: ["SPY"] });
+    const result = await ingestOptionSnapshots({
+      underlyingSymbols: ["SPY"],
+      minDelta: 0.4,
+      maxDelta: 0.6
+    });
+    const row = getDb()
+      .prepare("SELECT delta FROM option_snapshots WHERE option_symbol = ?")
+      .get(optionSymbol) as { delta: number } | undefined;
+
+    assert.equal(result.rowsIngested, 1);
+    assert.equal(row?.delta, 0.5);
+  });
 });
 
 describe("Strategy selector", () => {

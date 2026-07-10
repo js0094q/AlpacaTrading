@@ -259,13 +259,13 @@ const insertOptionSnapshotRows = async (
   try {
     for (const { symbol, raw } of snapshots) {
       if (params?.minDelta !== undefined && params.minDelta !== null) {
-        const delta = raw.Greeks?.delta;
+        const delta = snapshotGreeks(raw)?.delta;
         if (typeof delta !== "number" || delta < params.minDelta) {
           continue;
         }
       }
       if (params?.maxDelta !== undefined && params.maxDelta !== null) {
-        const delta = raw.Greeks?.delta;
+        const delta = snapshotGreeks(raw)?.delta;
         if (typeof delta !== "number" || delta > params.maxDelta) {
           continue;
         }
