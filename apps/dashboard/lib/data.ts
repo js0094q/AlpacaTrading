@@ -67,6 +67,7 @@ type PaperBridgeSummary = {
   promotionReadiness?: unknown;
   optionContracts?: unknown;
   requestIds?: unknown;
+  hedge?: unknown;
 };
 
 const normalizeOpenOrdersRows = (value: unknown): unknown[] => {
@@ -126,6 +127,7 @@ export interface DashboardSnapshot {
   promotionReadiness: unknown[];
   optionContracts: OptionContractDashboardRow[];
   requestIds: unknown[];
+  hedge: DashboardResult<unknown>;
 }
 
 export type OptionContractDisplayCategory = "Discovered" | "Quoted" | "Executable" | "Rejected";
@@ -655,6 +657,39 @@ const latestPaperRecommendationSnapshots = async (limit = 10) => {
   return listPaperRecommendationSnapshots({ limit });
 };
 
+export const latestHedgeDashboardRecommendation = async () => {
+  const { latestHedgeRecommendationForCurrentConfig } = await import(
+    "../../../src/services/hedgePersistenceService"
+  );
+  return latestHedgeRecommendationForCurrentConfig();
+};
+
+export const latestHedgeDashboardRisk = async () => {
+  const recommendation = await latestHedgeDashboardRecommendation();
+  return {
+    paperOnly: true,
+    effectiveStatus: recommendation?.effectiveStatus ?? "blocked",
+    generatedAt: recommendation?.generatedAt ?? null,
+    expiresAt: recommendation?.expiresAt ?? null,
+    risk: recommendation?.risk ?? null,
+    warnings: recommendation?.integrityWarnings ?? ["NO_HEDGE_RECOMMENDATION"],
+    blockers: recommendation ? [] : ["NO_HEDGE_RECOMMENDATION"]
+  };
+};
+
+export const latestHedgeDashboardRegime = async () => {
+  const recommendation = await latestHedgeDashboardRecommendation();
+  return {
+    paperOnly: true,
+    effectiveStatus: recommendation?.effectiveStatus ?? "blocked",
+    generatedAt: recommendation?.generatedAt ?? null,
+    expiresAt: recommendation?.expiresAt ?? null,
+    regime: recommendation?.regime ?? null,
+    warnings: recommendation?.integrityWarnings ?? ["NO_HEDGE_RECOMMENDATION"],
+    blockers: recommendation ? [] : ["NO_HEDGE_RECOMMENDATION"]
+  };
+};
+
 export const buildCachedDashboardSnapshot = async (): Promise<DashboardSnapshot> => {
   const state = assertPaperDashboardAccess();
 
@@ -670,7 +705,7 @@ export const buildCachedDashboardSnapshot = async (): Promise<DashboardSnapshot>
       rowsOrEmpty(() => latestApiRequestIds(12))
     ]);
 
-  const [reviewDryRun, learningSummary, promotionReadiness] = await Promise.all([
+  const [reviewDryRun, learningSummary, promotionReadiness, hedge] = await Promise.all([
     captureWithTimeout("review", () => cachedReviewAndDryRun(), 3_000),
     captureWithTimeout("learningSummary", async () => {
       const { paperLearningSummary } = await import(
@@ -683,7 +718,12 @@ export const buildCachedDashboardSnapshot = async (): Promise<DashboardSnapshot>
         const service = await import("../../../src/services/paperLearningLedgerService");
         return service.buildPromotionReadinessAnalytics();
       })
-      .catch(() => [])
+      .catch(() => []),
+    captureWithTimeout(
+      "hedge",
+      () => latestHedgeDashboardRecommendation(),
+      3_000
+    )
   ]);
 
   const review =
@@ -727,7 +767,8 @@ export const buildCachedDashboardSnapshot = async (): Promise<DashboardSnapshot>
     learningSummary,
     promotionReadiness: Array.isArray(promotionReadiness) ? promotionReadiness : [],
     optionContracts: [],
-    requestIds
+    requestIds,
+    hedge
   } as DashboardSnapshot;
 };
 
@@ -740,7 +781,8 @@ export const buildDashboardSnapshot = async (): Promise<DashboardSnapshot> => {
       ...bridgeSummary,
       generatedAt: bridgeSummary.generatedAt || new Date().toISOString(),
       paperOnly: true,
-      mode: bridgeSummary.mode || VERCEL_READ_ONLY_MODE
+      mode: bridgeSummary.mode || VERCEL_READ_ONLY_MODE,
+      hedge: bridgeSummary.hedge ?? historicalUnavailable("hedge")
     } as DashboardSnapshot;
   }
 
@@ -775,11 +817,12 @@ export const buildDashboardSnapshot = async (): Promise<DashboardSnapshot> => {
       learningSummary: historicalUnavailable("learningSummary"),
       promotionReadiness: [],
       optionContracts: [],
-      requestIds: []
+      requestIds: [],
+      hedge: historicalUnavailable("hedge")
     };
   }
 
-  const [account, positions, openOrders, runtime, plan, review, dryRun, executions, learningSummary] =
+  const [account, positions, openOrders, runtime, plan, review, dryRun, executions, learningSummary, hedge] =
     await Promise.all([
       capture("account", () => getAlpacaAccountSnapshot()),
       capture("positions", () => listAlpacaPositions()),
@@ -832,7 +875,8 @@ export const buildDashboardSnapshot = async (): Promise<DashboardSnapshot> => {
           "../../../src/services/paperLearningLedgerService"
         );
         return paperLearningSummary();
-      })
+      }),
+      capture("hedge", () => latestHedgeDashboardRecommendation())
     ]);
   const [
     latestResearch,

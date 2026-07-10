@@ -16,6 +16,7 @@ import { listAlpacaOpenOrders } from "../../src/services/alpacaOrderReadService.
 import { listAlpacaPositions } from "../../src/services/alpacaPositionService.js";
 import { listPaperOperations } from "../../src/services/paperOperationLogService.js";
 import { latestReviewArtifactReadiness } from "../../src/services/paperOpsWorkflowService.js";
+import { latestHedgeRecommendationForCurrentConfig } from "../../src/services/hedgePersistenceService.js";
 import { safeTokenEquals } from "../../src/lib/safeToken.js";
 import { redactSensitiveData, redactSensitiveText } from "../../src/lib/securityRedaction.js";
 import {
@@ -693,6 +694,59 @@ const actionHandlers: Record<string, ActionConfig> = {
     action: "health",
     handler: async (_input, requestId) =>
       command("alpaca:health", ["--format=json"], 10_000, requestId, "health")
+  },
+  "/api/v1/hedge/recommendation": {
+    method: "GET",
+    timeoutMs: 30_000,
+    requireAdminToken: false,
+    requireMutationPrecheck: false,
+    action: "hedge.recommendation",
+    handler: async () =>
+      latestHedgeRecommendationForCurrentConfig() ?? {
+        paperOnly: true,
+        effectiveStatus: "blocked",
+        recommendationStatus: "blocked",
+        warnings: ["NO_HEDGE_RECOMMENDATION"],
+        blockers: ["NO_HEDGE_RECOMMENDATION"]
+      }
+  },
+  "/api/v1/hedge/risk": {
+    method: "GET",
+    timeoutMs: 30_000,
+    requireAdminToken: false,
+    requireMutationPrecheck: false,
+    action: "hedge.risk",
+    handler: async () => {
+      const recommendation = latestHedgeRecommendationForCurrentConfig();
+      return {
+        paperOnly: true,
+        effectiveStatus: recommendation?.effectiveStatus ?? "blocked",
+        generatedAt: recommendation?.generatedAt ?? null,
+        expiresAt: recommendation?.expiresAt ?? null,
+        risk: recommendation?.risk ?? null,
+        warnings: recommendation?.integrityWarnings ?? ["NO_HEDGE_RECOMMENDATION"],
+        blockers: recommendation ? [] : ["NO_HEDGE_RECOMMENDATION"]
+      };
+    }
+  },
+  "/api/v1/hedge/regime": {
+    method: "GET",
+    timeoutMs: 30_000,
+    requireAdminToken: false,
+    requireMutationPrecheck: false,
+    action: "hedge.regime",
+    handler: async () => {
+      const recommendation = latestHedgeRecommendationForCurrentConfig();
+      return {
+        paperOnly: true,
+        effectiveStatus: recommendation?.effectiveStatus ?? "blocked",
+        generatedAt: recommendation?.generatedAt ?? null,
+        expiresAt: recommendation?.expiresAt ?? null,
+        regime: recommendation?.regime ?? null,
+        warnings: recommendation?.integrityWarnings ?? ["NO_HEDGE_RECOMMENDATION"],
+        blockers: recommendation ? [] : ["NO_HEDGE_RECOMMENDATION"]
+      };
+    }
   },
   "/api/v1/account": {
     method: "GET",

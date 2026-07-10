@@ -8,6 +8,10 @@ import type {
   PortfolioHighWaterMark
 } from "./hedgeTypes.js";
 import type { HedgePlanArtifact } from "./hedgePlanService.js";
+import {
+  buildHedgeConfig,
+  hedgeConfigurationFingerprint
+} from "./hedgeConfigService.js";
 
 interface HighWaterRow {
   environment: "paper";
@@ -383,6 +387,19 @@ export const latestHedgeRecommendation = (input: {
         regimeModelVersion: input.regimeModelVersion
       })
     : null;
+};
+
+export const latestHedgeRecommendationForCurrentConfig = (input: {
+  asOf?: string;
+} = {}) => {
+  const config = buildHedgeConfig();
+  return latestHedgeRecommendation({
+    asOf: input.asOf,
+    freshnessMinutes: config.recommendationFreshnessMinutes,
+    configurationFingerprint: hedgeConfigurationFingerprint(config),
+    riskModelVersion: config.riskModelVersion,
+    regimeModelVersion: config.regimeModelVersion
+  });
 };
 
 export const attachReviewedPayloadHash = (
