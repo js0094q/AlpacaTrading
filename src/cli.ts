@@ -82,6 +82,7 @@ import {
   paperLearningSummary
 } from "./services/paperLearningLedgerService.js";
 import { config } from "./config.js";
+import { redactSensitiveData } from "./lib/securityRedaction.js";
 import { normalizeSymbol } from "./lib/utils.js";
 import { AlpacaApiError } from "./services/alpacaClient.js";
 import { buildPortfolioRiskSnapshot } from "./services/portfolioRiskService.js";
@@ -121,7 +122,7 @@ const subaction = process.argv[4];
 const args = parseArgs(command?.includes(":") ? process.argv.slice(3) : process.argv.slice(4));
 
 const print = (payload: unknown) => {
-  process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+  process.stdout.write(`${JSON.stringify(redactSensitiveData(payload), null, 2)}\n`);
 };
 
 const boolArg = (value?: string) => value === "true" || value === "1";
