@@ -191,9 +191,16 @@ export interface OptionContractRaw {
 }
 
 export interface OptionSnapshotRaw {
-  symbol: string;
-  underlying_symbol: string;
+  symbol?: string;
+  underlying_symbol?: string;
   Greeks?: {
+    delta?: number;
+    gamma?: number;
+    theta?: number;
+    vega?: number;
+    rho?: number;
+  };
+  greeks?: {
     delta?: number;
     gamma?: number;
     theta?: number;
@@ -208,13 +215,27 @@ export interface OptionSnapshotRaw {
     a?: number | null;
     p?: number | null;
   };
+  latestQuote?: {
+    t?: string | null;
+    bp?: number | null;
+    ap?: number | null;
+    b?: number | null;
+    a?: number | null;
+    p?: number | null;
+  };
   latest_trade?: {
     t?: string | null;
     p?: number | null;
   };
+  latestTrade?: {
+    t?: string | null;
+    p?: number | null;
+  };
   implied_volatility?: number | null;
+  impliedVolatility?: number | null;
   volume?: number | null;
   open_interest?: number | null;
+  openInterest?: number | null;
 }
 
 export interface OptionQuoteRaw {

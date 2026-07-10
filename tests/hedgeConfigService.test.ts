@@ -35,6 +35,34 @@ test("hedge configuration defaults to disabled paper execution", () => {
   assert.equal(config.leaps.minimumDte, 365);
   assert.equal(config.leaps.profitAllocation, 0.25);
   assert.equal(config.premiumNavCap, 0.01);
+  assert.equal(config.optionDataCoverage.minimumContractDeltaCoveragePct, 0.8);
+  assert.equal(config.optionDataCoverage.minimumMarketValueDeltaCoveragePct, 0.8);
+  assert.equal(config.optionDataCoverage.materialUnmeasuredOptionExposurePct, 0.1);
+});
+
+test("option delta coverage thresholds accept percentages and normalize to ratios", () => {
+  process.env.HEDGE_MIN_OPTION_DELTA_CONTRACT_COVERAGE_PCT = "85";
+  process.env.HEDGE_MIN_OPTION_DELTA_MARKET_VALUE_COVERAGE_PCT = "90";
+  process.env.HEDGE_MATERIAL_UNMEASURED_OPTION_EXPOSURE_PCT = "12.5";
+
+  const config = buildHedgeConfig();
+
+  assert.equal(config.optionDataCoverage.minimumContractDeltaCoveragePct, 0.85);
+  assert.equal(config.optionDataCoverage.minimumMarketValueDeltaCoveragePct, 0.9);
+  assert.equal(config.optionDataCoverage.materialUnmeasuredOptionExposurePct, 0.125);
+});
+
+test("invalid option delta coverage thresholds fail safely to defaults", () => {
+  process.env.HEDGE_MIN_OPTION_DELTA_CONTRACT_COVERAGE_PCT = "101";
+  process.env.HEDGE_MIN_OPTION_DELTA_MARKET_VALUE_COVERAGE_PCT = "-1";
+  process.env.HEDGE_MATERIAL_UNMEASURED_OPTION_EXPOSURE_PCT = "not-a-number";
+
+  const config = buildHedgeConfig();
+
+  assert.equal(config.optionDataCoverage.minimumContractDeltaCoveragePct, 0.8);
+  assert.equal(config.optionDataCoverage.minimumMarketValueDeltaCoveragePct, 0.8);
+  assert.equal(config.optionDataCoverage.materialUnmeasuredOptionExposurePct, 0.1);
+  assert.ok(config.warnings.includes("HEDGE_CONFIGURATION_VALUE_INVALID"));
 });
 
 test("invalid ratios fall back instead of widening risk limits", () => {

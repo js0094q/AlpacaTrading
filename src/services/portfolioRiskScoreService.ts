@@ -1,5 +1,6 @@
 import type { MarketRegimeSnapshot } from "./marketRegimeService.js";
 import type { PortfolioRiskSnapshot } from "./portfolioRiskService.js";
+import type { RiskAssessmentStatus } from "./hedgeTypes.js";
 
 export type PortfolioRiskBand = "low" | "moderate" | "elevated" | "high" | "critical";
 
@@ -26,6 +27,8 @@ export interface PortfolioRiskScoreComponent {
 export interface PortfolioRiskScore {
   total: number;
   band: PortfolioRiskBand;
+  measurementStatus: RiskAssessmentStatus;
+  effectiveBand: PortfolioRiskBand | "indeterminate";
   components: PortfolioRiskScoreComponent[];
   modelVersion: string;
 }
@@ -207,9 +210,23 @@ export const scorePortfolioRisk = (
           : total >= 25
             ? "moderate"
             : "low";
+  const measurementStatus: RiskAssessmentStatus =
+    risk.dataQualityStatus === "blocked" || risk.blockers.length
+      ? "blocked"
+      : risk.optionDataCoverage.materialCoverageMissing
+        ? "indeterminate"
+        : risk.dataQualityStatus === "complete" &&
+            regime.dataQualityStatus === "complete"
+          ? "measured"
+          : "partially_measured";
   return {
     total,
     band,
+    measurementStatus,
+    effectiveBand:
+      measurementStatus === "indeterminate" || measurementStatus === "blocked"
+        ? "indeterminate"
+        : band,
     components,
     modelVersion: risk.riskModelVersion
   };

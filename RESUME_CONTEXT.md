@@ -81,6 +81,8 @@
   - Read-only commands are `hedge:risk`, `hedge:regime`, `hedge:review`, and `hedge:plan -- --paperOnly`; no `hedge:execute` command exists.
   - `HEDGE_PAPER_EXECUTION_ENABLED=false` remains the fail-closed default.
   - Portfolio risk uses observed option Greeks, signed-exposure beta, grouped concentration, persisted paper high-water marks, and 5/8/10/15 percent benchmark-decline scenarios.
+  - Option delta coverage is reported by absolute contract quantity and absolute market value. Defaults are 80% on each basis with 10% of account equity as the materiality threshold; material gaps keep beta/scenario precision null, mark the effective risk band `indeterminate`, and force monitoring without hedge candidates.
+  - A 2026-07-10 read-only runtime check found valid complete Greeks for `SPY270115C00805000` and `QQQ270115C00840000`. Alpaca returned camelCase snapshot keys while the parser expected legacy-shaped aliases; ingestion now accepts both shapes. The observed issue was parser compatibility, not symbol, entitlement, batching, or snapshot availability for those samples.
   - Beta cache identity includes symbol, benchmark, lookback, interval, minimum observations, calculation version, and latest aligned market-data date; incompatible or expired rows are ignored.
   - Hedge recommendations prefer concentrated/profitable LEAPS trimming before paid protection, subtract existing puts/inverse exposure, and treat profit funding as an unrealized-gain proxy.
   - Put spreads remain analysis-only with `MULTI_LEG_EXECUTION_UNSUPPORTED`; SH/PSQ remain secondary alternatives.

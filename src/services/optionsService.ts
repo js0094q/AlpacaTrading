@@ -13,6 +13,7 @@ import {
   normalizeOptionQuote,
   optionsQuoteConfig
 } from "./optionQuoteNormalizer.js";
+import { parseOptionSymbol } from "./optionSymbolService.js";
 
 const ensureRunRow = (input: {
   runType: "options_contracts" | "options_snapshots";
@@ -78,17 +79,26 @@ const toNullableNumber = (value: unknown): number | null => {
   return null;
 };
 
+const snapshotQuote = (snapshot: OptionSnapshotRaw) =>
+  snapshot.latestQuote ?? snapshot.latest_quote;
+
+const snapshotTrade = (snapshot: OptionSnapshotRaw) =>
+  snapshot.latestTrade ?? snapshot.latest_trade;
+
+const snapshotGreeks = (snapshot: OptionSnapshotRaw) =>
+  snapshot.greeks ?? snapshot.Greeks;
+
 const quoteBid = (quote: OptionQuoteRaw | null | undefined, snapshot: OptionSnapshotRaw) =>
-  quote?.bp ?? quote?.b ?? snapshot.latest_quote?.bp ?? snapshot.latest_quote?.b ?? null;
+  quote?.bp ?? quote?.b ?? snapshotQuote(snapshot)?.bp ?? snapshotQuote(snapshot)?.b ?? null;
 
 const quoteAsk = (quote: OptionQuoteRaw | null | undefined, snapshot: OptionSnapshotRaw) =>
-  quote?.ap ?? quote?.a ?? snapshot.latest_quote?.ap ?? snapshot.latest_quote?.a ?? null;
+  quote?.ap ?? quote?.a ?? snapshotQuote(snapshot)?.ap ?? snapshotQuote(snapshot)?.a ?? null;
 
 const quoteTimestamp = (quote: OptionQuoteRaw | null | undefined, snapshot: OptionSnapshotRaw) =>
-  quote?.t ?? snapshot.latest_quote?.t ?? snapshot.latest_trade?.t ?? null;
+  quote?.t ?? snapshotQuote(snapshot)?.t ?? snapshotTrade(snapshot)?.t ?? null;
 
 const quoteLast = (snapshot: OptionSnapshotRaw) =>
-  snapshot.latest_trade?.p ?? snapshot.latest_quote?.p ?? null;
+  snapshotTrade(snapshot)?.p ?? snapshotQuote(snapshot)?.p ?? null;
 
 export const toSnapshotRow = (
   optionSymbol: string,
@@ -96,6 +106,7 @@ export const toSnapshotRow = (
   quoteData?: OptionQuoteRaw | null
 ) => {
   const timestamp = nowIso();
+  const parsedSymbol = parseOptionSymbol(optionSymbol);
   const quoteCfg = optionsQuoteConfig();
   const normalizedQuote = normalizeOptionQuote(
     {
@@ -114,7 +125,9 @@ export const toSnapshotRow = (
 
   return {
     optionSymbol,
-    underlyingSymbol: normalizeSymbol(symbolData.underlying_symbol || optionSymbol),
+    underlyingSymbol: normalizeSymbol(
+      symbolData.underlying_symbol || (parsedSymbol.ok ? parsedSymbol.underlying : optionSymbol)
+    ),
     timestamp,
     bid: normalizedQuote.bid,
     ask: normalizedQuote.ask,
@@ -129,13 +142,16 @@ export const toSnapshotRow = (
     volume:
       typeof symbolData.volume === "number" ? Math.round(symbolData.volume) : null,
     openInterest:
-      typeof symbolData.open_interest === "number" ? Math.round(symbolData.open_interest) : null,
-    impliedVolatility: symbolData.implied_volatility ?? null,
-    delta: symbolData.Greeks?.delta ?? null,
-    gamma: symbolData.Greeks?.gamma ?? null,
-    theta: symbolData.Greeks?.theta ?? null,
-    vega: symbolData.Greeks?.vega ?? null,
-    rho: symbolData.Greeks?.rho ?? null
+      typeof (symbolData.openInterest ?? symbolData.open_interest) === "number"
+        ? Math.round(symbolData.openInterest ?? symbolData.open_interest ?? 0)
+        : null,
+    impliedVolatility:
+      symbolData.impliedVolatility ?? symbolData.implied_volatility ?? null,
+    delta: snapshotGreeks(symbolData)?.delta ?? null,
+    gamma: snapshotGreeks(symbolData)?.gamma ?? null,
+    theta: snapshotGreeks(symbolData)?.theta ?? null,
+    vega: snapshotGreeks(symbolData)?.vega ?? null,
+    rho: snapshotGreeks(symbolData)?.rho ?? null
   };
 };
 

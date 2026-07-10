@@ -38,6 +38,8 @@ const regime = (name: MarketRegimeSnapshot["regime"]): MarketRegimeSnapshot => (
 const score = (band: PortfolioRiskScore["band"], total: number): PortfolioRiskScore => ({
   total,
   band,
+  measurementStatus: "measured",
+  effectiveBand: band,
   modelVersion: "portfolio-risk-v1",
   components: []
 });
@@ -87,6 +89,17 @@ const risk = (overrides: Partial<PortfolioRiskSnapshot> = {}): PortfolioRiskSnap
   },
   portfolioBeta: 1.2,
   betaCoverage: 1,
+  optionDataCoverage: {
+    totalOptionContracts: 4,
+    contractsWithDelta: 4,
+    contractsWithoutDelta: 0,
+    contractDeltaCoveragePct: 1,
+    totalOptionMarketValue: 400000,
+    optionMarketValueWithDelta: 400000,
+    optionMarketValueWithoutDelta: 0,
+    marketValueDeltaCoveragePct: 1,
+    materialCoverageMissing: false
+  },
   scenarios: [
     { benchmarkDeclinePct: 5, grossModeledLoss: 60_000, existingProtection: 5_000, netModeledLoss: 55_000, netModeledLossPct: 0.055, coverage: 1, warnings: [] },
     { benchmarkDeclinePct: 8, grossModeledLoss: 96_000, existingProtection: 8_000, netModeledLoss: 88_000, netModeledLossPct: 0.088, coverage: 1, warnings: [] },
@@ -156,6 +169,45 @@ test("blocks before selecting an instrument when the risk snapshot is blocked", 
   assert.equal(result.recommendationStatus, "blocked");
   assert.equal(result.decision, "blocked");
   assert.equal(result.candidates.length, 0);
+});
+
+test("material missing option delta forces monitoring before hedge sizing", () => {
+  const incompleteRisk = risk({
+    dataQualityStatus: "partial",
+    optionDataCoverage: {
+      totalOptionContracts: 20,
+      contractsWithDelta: 2,
+      contractsWithoutDelta: 18,
+      contractDeltaCoveragePct: 0.1,
+      totalOptionMarketValue: 300000,
+      optionMarketValueWithDelta: 30000,
+      optionMarketValueWithoutDelta: 270000,
+      marketValueDeltaCoveragePct: 0.1,
+      materialCoverageMissing: true
+    },
+    warnings: ["MATERIAL_OPTION_GREEKS_COVERAGE_INSUFFICIENT"]
+  });
+  const incompleteScore: PortfolioRiskScore = {
+    ...score("high", 70),
+    measurementStatus: "indeterminate",
+    effectiveBand: "indeterminate"
+  };
+
+  const result = recommendHedgeFromEvidence(
+    incompleteRisk,
+    regime("risk-off"),
+    incompleteScore,
+    evidence(),
+    buildHedgeConfig(),
+    { generatedAt: now }
+  );
+
+  assert.equal(result.recommendationStatus, "monitoring");
+  assert.equal(result.decision, "monitor");
+  assert.equal(result.sizing.netProtectionTarget, 0);
+  assert.equal(result.candidates.length, 0);
+  assert.ok(result.warnings.includes("MATERIAL_OPTION_GREEKS_COVERAGE_INSUFFICIENT"));
+  assert.ok(result.warnings.includes("HEDGE_SIZING_EVIDENCE_INSUFFICIENT"));
 });
 
 test("subtracts existing measured protection from the target", () => {

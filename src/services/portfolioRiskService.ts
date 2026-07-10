@@ -98,6 +98,18 @@ export interface PortfolioScenario {
   warnings: string[];
 }
 
+export interface OptionDataCoverage {
+  totalOptionContracts: number;
+  contractsWithDelta: number;
+  contractsWithoutDelta: number;
+  contractDeltaCoveragePct: number | null;
+  totalOptionMarketValue: number;
+  optionMarketValueWithDelta: number;
+  optionMarketValueWithoutDelta: number;
+  marketValueDeltaCoveragePct: number | null;
+  materialCoverageMissing: boolean;
+}
+
 export interface PortfolioRiskSnapshot {
   paperOnly: true;
   environment: "paper";
@@ -143,6 +155,7 @@ export interface PortfolioRiskSnapshot {
   };
   portfolioBeta: number | null;
   betaCoverage: number;
+  optionDataCoverage: OptionDataCoverage;
   scenarios: PortfolioScenario[];
   dataQualityStatus: HedgeDataQualityStatus;
   dataQuality: {
@@ -358,6 +371,60 @@ export const normalizePortfolioEvidence = (
     0
   );
   const optionPositions = normalizedPositions.filter((position) => position.assetClass === "option");
+  const totalOptionContracts = optionPositions.reduce(
+    (sum, position) => sum + Math.abs(position.quantity ?? 0),
+    0
+  );
+  const contractsWithDelta = optionPositions.reduce(
+    (sum, position) =>
+      sum + (position.delta === null ? 0 : Math.abs(position.quantity ?? 0)),
+    0
+  );
+  const totalOptionMarketValue = optionPositions.reduce(
+    (sum, position) => sum + Math.abs(position.marketValue ?? 0),
+    0
+  );
+  const optionMarketValueWithDelta = optionPositions.reduce(
+    (sum, position) =>
+      sum + (position.delta === null ? 0 : Math.abs(position.marketValue ?? 0)),
+    0
+  );
+  const contractDeltaCoveragePct = totalOptionContracts > 0
+    ? contractsWithDelta / totalOptionContracts
+    : null;
+  const marketValueDeltaCoveragePct = totalOptionMarketValue > 0
+    ? optionMarketValueWithDelta / totalOptionMarketValue
+    : null;
+  const optionMarketValueWithoutDelta = Math.max(
+    0,
+    totalOptionMarketValue - optionMarketValueWithDelta
+  );
+  const totalOptionMarketValuePct = ratio(totalOptionMarketValue, equity);
+  const unmeasuredOptionMarketValuePct = ratio(optionMarketValueWithoutDelta, equity);
+  const materialCoverageMissing =
+    (totalOptionMarketValuePct !== null &&
+      totalOptionMarketValuePct >=
+        config.optionDataCoverage.materialUnmeasuredOptionExposurePct &&
+      contractDeltaCoveragePct !== null &&
+      contractDeltaCoveragePct <
+        config.optionDataCoverage.minimumContractDeltaCoveragePct) ||
+    (unmeasuredOptionMarketValuePct !== null &&
+      unmeasuredOptionMarketValuePct >=
+        config.optionDataCoverage.materialUnmeasuredOptionExposurePct &&
+      marketValueDeltaCoveragePct !== null &&
+      marketValueDeltaCoveragePct <
+        config.optionDataCoverage.minimumMarketValueDeltaCoveragePct);
+  const optionDataCoverage: OptionDataCoverage = {
+    totalOptionContracts,
+    contractsWithDelta,
+    contractsWithoutDelta: Math.max(0, totalOptionContracts - contractsWithDelta),
+    contractDeltaCoveragePct,
+    totalOptionMarketValue,
+    optionMarketValueWithDelta,
+    optionMarketValueWithoutDelta,
+    marketValueDeltaCoveragePct,
+    materialCoverageMissing
+  };
   const deltaExposure = aggregateObserved(optionPositions, "deltaAdjustedExposure");
   const absoluteDeltaExposure =
     deltaExposure === null
@@ -402,6 +469,7 @@ export const normalizePortfolioEvidence = (
   );
   const betaCoverage = grossExposure > 0 ? betaMeasuredExposure / grossExposure : 1;
   const portfolioBeta =
+    !materialCoverageMissing &&
     equity !== null && equity > 0 && betaCoverage >= config.beta.minimumCoverage
       ? normalizedPositions.reduce((sum, position) => sum + (position.betaExposure ?? 0), 0) /
         equity
@@ -433,7 +501,7 @@ export const normalizePortfolioEvidence = (
       }
     }
     const netModeledLoss =
-      grossExposure === 0 || betaMeasuredExposure > 0
+      !materialCoverageMissing && (grossExposure === 0 || betaMeasuredExposure > 0)
         ? Math.max(0, grossModeledLoss - existingProtection)
         : null;
     return {
@@ -488,7 +556,10 @@ export const normalizePortfolioEvidence = (
     dataQuality.optionVegaCoverage < 1
       ? ["OPTION_GREEKS_COVERAGE_PARTIAL"]
       : []),
-    ...(sectorCoverage < 1 ? ["SECTOR_COVERAGE_PARTIAL"] : [])
+    ...(sectorCoverage < 1 ? ["SECTOR_COVERAGE_PARTIAL"] : []),
+    ...(materialCoverageMissing
+      ? ["MATERIAL_OPTION_GREEKS_COVERAGE_INSUFFICIENT"]
+      : [])
   ]);
   const dataQualityStatus: HedgeDataQualityStatus = blockers.length
     ? "blocked"
@@ -576,6 +647,7 @@ export const normalizePortfolioEvidence = (
     },
     portfolioBeta,
     betaCoverage,
+    optionDataCoverage,
     scenarios,
     dataQualityStatus,
     dataQuality,

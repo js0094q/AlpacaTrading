@@ -24,6 +24,11 @@ export interface HedgeDashboardRecommendation {
   risk?: {
     portfolioBeta?: number | null;
     betaCoverage?: number | null;
+    optionDataCoverage?: {
+      contractDeltaCoveragePct?: number | null;
+      marketValueDeltaCoveragePct?: number | null;
+      materialCoverageMissing?: boolean;
+    };
     exposures?: {
       grossExposurePct?: number | null;
       netExposurePct?: number | null;
@@ -45,6 +50,8 @@ export interface HedgeDashboardRecommendation {
   score?: {
     total?: number;
     band?: string;
+    measurementStatus?: string;
+    effectiveBand?: string;
   };
   sizing?: {
     targetScenarioDeclinePct?: number;
@@ -141,6 +148,8 @@ export const HedgePanel = ({
     ...(recommendation.integrityWarnings ?? [])
   ];
   const blockers = recommendation.blockers ?? [];
+  const materialOptionCoverageMissing =
+    recommendation.risk?.optionDataCoverage?.materialCoverageMissing === true;
 
   return (
     <div className="panel full hedge-panel">
@@ -156,9 +165,20 @@ export const HedgePanel = ({
         </span>
       </div>
 
+      {materialOptionCoverageMissing ? (
+        <p className="danger">
+          Incomplete risk measurement: Material option exposure could not be delta-measured.
+          The calculated score and band are not a conclusive low-risk classification.
+        </p>
+      ) : null}
+
       <div className="hedge-metrics">
         <div>
-          {metric("Risk score", `${recommendation.score?.total ?? "-"} (${recommendation.score?.band ?? "-"})`)}
+          {metric("Calculated risk score", recommendation.score?.total ?? "-")}
+          {metric("Calculated band", recommendation.score?.band ?? "-")}
+          {metric("Measurement status", recommendation.score?.measurementStatus ?? "-")}
+          {metric("Effective risk band", recommendation.score?.effectiveBand ?? "-")}
+          {metric("Effective decision status", recommendation.recommendationStatus ?? status)}
           {metric("Decision", recommendation.decision ?? "-")}
           {metric("Data quality", recommendation.dataQualityStatus ?? "-")}
           {metric("Market regime", recommendation.regime?.regime ?? "-")}
@@ -167,6 +187,14 @@ export const HedgePanel = ({
         <div>
           {metric("Portfolio beta", recommendation.risk?.portfolioBeta ?? "-")}
           {metric("Beta coverage", percent(recommendation.risk?.betaCoverage))}
+          {metric(
+            "Option delta contract coverage",
+            percent(recommendation.risk?.optionDataCoverage?.contractDeltaCoveragePct)
+          )}
+          {metric(
+            "Option delta market-value coverage",
+            percent(recommendation.risk?.optionDataCoverage?.marketValueDeltaCoveragePct)
+          )}
           {metric("Gross exposure", percent(recommendation.risk?.exposures?.grossExposurePct))}
           {metric("Net exposure", percent(recommendation.risk?.exposures?.netExposurePct))}
           {metric("Largest underlying", percent(recommendation.risk?.concentration?.largestUnderlyingWeight))}

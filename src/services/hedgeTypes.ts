@@ -8,6 +8,12 @@ export type HedgeDataQualityStatus =
   | "monitoring"
   | "blocked";
 
+export type RiskAssessmentStatus =
+  | "measured"
+  | "partially_measured"
+  | "indeterminate"
+  | "blocked";
+
 export type HedgeRecommendationStatus =
   | "current"
   | "monitoring"

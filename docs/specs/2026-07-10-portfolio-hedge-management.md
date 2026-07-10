@@ -224,6 +224,28 @@ Every snapshot has one of:
 
 The service records component coverage percentages for position prices, option delta, option gamma, option theta, option vega, beta, and sector classification.
 
+### Material option-delta coverage gate
+
+The snapshot also reports contract-quantity and absolute-market-value delta coverage:
+
+```ts
+optionDataCoverage: {
+  totalOptionContracts: number;
+  contractsWithDelta: number;
+  contractsWithoutDelta: number;
+  contractDeltaCoveragePct: number | null;
+  totalOptionMarketValue: number;
+  optionMarketValueWithDelta: number;
+  optionMarketValueWithoutDelta: number;
+  marketValueDeltaCoveragePct: number | null;
+  materialCoverageMissing: boolean;
+};
+```
+
+Coverage ratios use absolute held contract quantity and absolute observed option market value. Contract coverage is materially insufficient when total observed option market value is at least the configured material-exposure threshold and contract delta coverage is below its minimum. Market-value coverage is materially insufficient when unmeasured option market value is at least the configured percentage of account equity and market-value delta coverage is below its minimum.
+
+When either condition is material, portfolio beta, aggregate option delta, positive-delta concentration, and net scenario loss remain `null`. The engine records `MATERIAL_OPTION_GREEKS_COVERAGE_INSUFFICIENT`, returns monitoring, and does not size or rank a hedge. It may use market value, moneyness, and DTE only to characterize data completeness; it does not convert those fields into estimated delta.
+
 ## Portfolio Beta
 
 ### Formula
@@ -352,6 +374,8 @@ Each component returns its points, maximum, measured value, thresholds, rational
 - `80-100`: critical.
 
 No quality penalty repairs missing exposure. If material data is missing, numeric components remain bounded by observed data, the data-quality component increases, and recommendation status may still become monitoring or blocked.
+
+The score output distinguishes the calculated score from the confidence of the measurement. `band` remains the band calculated from supported numeric components. `measurementStatus` is `measured`, `partially_measured`, `indeterminate`, or `blocked`; `effectiveBand` becomes `indeterminate` when material option delta coverage is insufficient or the assessment is blocked. Missing evidence does not artificially add score points.
 
 ## Hedge Decision Logic
 
@@ -530,7 +554,9 @@ The VPS control layer may provide corresponding GET endpoints using the existing
 
 The dashboard reads cached persisted results rather than running broker or market-data work in the request path. It displays:
 
-- risk score and band;
+- calculated risk score and calculated band;
+- measurement status and effective risk band;
+- effective decision status and option delta coverage by contracts and market value;
 - effective recommendation status;
 - exposure, beta, concentration, and data-quality summaries;
 - scenario losses and existing protection;
@@ -586,6 +612,9 @@ New configuration is namespaced and has conservative defaults:
 - `HEDGE_BETA_CALCULATION_VERSION`;
 - `HEDGE_BETA_CACHE_TTL_HOURS`;
 - `HEDGE_BETA_MIN_COVERAGE`;
+- `HEDGE_MIN_OPTION_DELTA_CONTRACT_COVERAGE_PCT=80`;
+- `HEDGE_MIN_OPTION_DELTA_MARKET_VALUE_COVERAGE_PCT=80`;
+- `HEDGE_MATERIAL_UNMEASURED_OPTION_EXPOSURE_PCT=10`;
 - `HEDGE_REGIME_REALIZED_VOL_THRESHOLD`;
 - `HEDGE_REGIME_VOLATILITY_PROXY`;
 - `HEDGE_REGIME_CRISIS_VOL_LEVEL`;
@@ -598,6 +627,12 @@ New configuration is namespaced and has conservative defaults:
 - `HEDGE_SECTOR_MAP_JSON` for explicit local mappings only.
 
 Configuration validation rejects non-finite, negative, out-of-range, or internally inconsistent values. The configuration fingerprint hashes only normalized non-secret risk, regime, sizing, and freshness settings. It never includes tokens or credentials.
+
+The three option-coverage environment values are expressed as percentages from 0 through 100 and normalized internally to ratios.
+
+## Observed Option Snapshot Compatibility (2026-07-10)
+
+Read-only checks of current paper positions validated `SPY270115C00805000` and `QQQ270115C00840000` through Alpaca's `/v1beta1/options/snapshots` path. Both symbols were accepted and both responses included current quotes, implied volatility, and complete delta/gamma/theta/vega/rho values. The response used camelCase keys (`greeks`, `latestQuote`, `latestTrade`, and `impliedVolatility`), while the ingestion parser recognized only legacy-shaped keys (`Greeks`, `latest_quote`, `latest_trade`, and `implied_volatility`). The parser now accepts both shapes and derives a missing underlying from the canonical OCC symbol. This was a parser compatibility defect, not evidence of missing entitlement, unsupported OCC formatting, batching failure, stale market state, or unavailable snapshot data for the two representative contracts.
 
 ## Observability and Redaction
 

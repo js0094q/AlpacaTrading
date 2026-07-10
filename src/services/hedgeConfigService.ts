@@ -22,6 +22,11 @@ export interface HedgeConfig {
     cacheTtlHours: number;
     minimumCoverage: number;
   };
+  optionDataCoverage: {
+    minimumContractDeltaCoveragePct: number;
+    minimumMarketValueDeltaCoveragePct: number;
+    materialUnmeasuredOptionExposurePct: number;
+  };
   regime: {
     realizedVolatilityThreshold: number;
     volatilityProxy: string;
@@ -98,6 +103,17 @@ export const buildHedgeConfig = (): HedgeConfig => {
     }
     return parsed;
   };
+  const percentage = (value: string | undefined, fallback: number) => {
+    if (value === undefined || value.trim() === "") {
+      return fallback;
+    }
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed < 0 || parsed > 100) {
+      invalid();
+      return fallback;
+    }
+    return parsed / 100;
+  };
 
   let sectorMap: Record<string, string> = {};
   const sectorJson = process.env.HEDGE_SECTOR_MAP_JSON?.trim();
@@ -154,6 +170,20 @@ export const buildHedgeConfig = (): HedgeConfig => {
       cacheTtlHours: positiveInteger(process.env.HEDGE_BETA_CACHE_TTL_HOURS, 24),
       minimumCoverage: ratio(process.env.HEDGE_BETA_MIN_COVERAGE, 0.8)
     },
+    optionDataCoverage: {
+      minimumContractDeltaCoveragePct: percentage(
+        process.env.HEDGE_MIN_OPTION_DELTA_CONTRACT_COVERAGE_PCT,
+        0.8
+      ),
+      minimumMarketValueDeltaCoveragePct: percentage(
+        process.env.HEDGE_MIN_OPTION_DELTA_MARKET_VALUE_COVERAGE_PCT,
+        0.8
+      ),
+      materialUnmeasuredOptionExposurePct: percentage(
+        process.env.HEDGE_MATERIAL_UNMEASURED_OPTION_EXPOSURE_PCT,
+        0.1
+      )
+    },
     regime: {
       realizedVolatilityThreshold: positiveNumber(
         process.env.HEDGE_REGIME_REALIZED_VOL_THRESHOLD,
@@ -205,6 +235,7 @@ export const hedgeConfigurationFingerprint = (config = buildHedgeConfig()) =>
     recommendationFreshnessMinutes: config.recommendationFreshnessMinutes,
     planTtlMinutes: config.planTtlMinutes,
     beta: config.beta,
+    optionDataCoverage: config.optionDataCoverage,
     regime: config.regime,
     targetProtection: config.targetProtection,
     premiumNavCap: config.premiumNavCap,

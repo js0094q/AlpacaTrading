@@ -733,6 +733,10 @@ npm run hedge:plan -- --paperOnly --format=json
 
 `HEDGE_PAPER_EXECUTION_ENABLED=false` is the required default and must remain false for this phase. Missing prices, Greeks, beta history, sector mappings, or regime evidence remain null and produce quality warnings, monitoring, or blockers.
 
+Option delta completeness is measured by absolute held contract quantity and absolute option market value. Defaults require 80% coverage on each basis and treat 10% of account equity as material (`HEDGE_MIN_OPTION_DELTA_CONTRACT_COVERAGE_PCT=80`, `HEDGE_MIN_OPTION_DELTA_MARKET_VALUE_COVERAGE_PCT=80`, and `HEDGE_MATERIAL_UNMEASURED_OPTION_EXPOSURE_PCT=10`). When the material gate fails, beta and unsupported option exposure remain null, the calculated score is retained for audit, the effective risk band is `indeterminate`, and hedge sizing stops at monitoring.
+
+Alpaca option snapshots may use current camelCase fields (`greeks`, `latestQuote`, `latestTrade`, and `impliedVolatility`) or the legacy-shaped aliases already used by fixtures. Ingestion normalizes both without estimating missing Greeks.
+
 The bounded beta cache is compatible only when symbol, benchmark, lookback, interval, minimum observations, calculation version, latest aligned market-data date, and expiry all match. Persisted recommendations retain generated/expiry times, paper environment, source snapshot ID, risk/regime versions, configuration fingerprint, quality/status, and the reviewed-payload hash after planning. Dashboard reads re-evaluate freshness and never label stale or expired records current.
 
 ## Data persistence

@@ -50,6 +50,17 @@ const snapshot = (overrides: Partial<PortfolioRiskSnapshot> = {}): PortfolioRisk
   },
   portfolioBeta: 1.5,
   betaCoverage: 1,
+  optionDataCoverage: {
+    totalOptionContracts: 1,
+    contractsWithDelta: 1,
+    contractsWithoutDelta: 0,
+    contractDeltaCoveragePct: 1,
+    totalOptionMarketValue: 10000,
+    optionMarketValueWithDelta: 10000,
+    optionMarketValueWithoutDelta: 0,
+    marketValueDeltaCoveragePct: 1,
+    materialCoverageMissing: false
+  },
   scenarios: [],
   dataQualityStatus: "blocked",
   dataQuality: {
@@ -170,4 +181,64 @@ test("maps score totals to stable risk bands", () => {
 
   assert.equal(low.total, 0);
   assert.equal(low.band, "low");
+  assert.equal(low.measurementStatus, "measured");
+  assert.equal(low.effectiveBand, "low");
+});
+
+test("keeps a low calculated score but marks material missing option coverage indeterminate", () => {
+  const input = snapshot({
+    portfolioBeta: null,
+    dataQualityStatus: "monitoring",
+    optionDataCoverage: {
+      totalOptionContracts: 20,
+      contractsWithDelta: 2,
+      contractsWithoutDelta: 18,
+      contractDeltaCoveragePct: 0.1,
+      totalOptionMarketValue: 30000,
+      optionMarketValueWithDelta: 3000,
+      optionMarketValueWithoutDelta: 27000,
+      marketValueDeltaCoveragePct: 0.1,
+      materialCoverageMissing: true
+    },
+    exposures: {
+      grossExposure: 0,
+      netExposure: 0,
+      longExposure: 0,
+      shortOrInverseExposure: 0,
+      grossExposurePct: 0,
+      netExposurePct: 0
+    },
+    options: {
+      deltaExposure: null,
+      absoluteDeltaExposure: null,
+      absoluteDeltaExposurePct: null,
+      positiveDeltaExposure: null,
+      positiveDeltaExposurePct: null,
+      gammaExposure: null,
+      thetaExposure: null,
+      vegaExposure: null,
+      rhoExposure: null,
+      nearTermExposurePct: null
+    },
+    concentration: {
+      largestUnderlyingWeight: 0,
+      topFiveUnderlyingWeight: 0,
+      byUnderlying: {},
+      bySector: {},
+      unknownSectorWeight: 0
+    },
+    account: {
+      equity: 100000,
+      cash: 100000,
+      buyingPower: 100000,
+      highWaterMark: 100000,
+      drawdownPct: 0
+    }
+  });
+
+  const result = scorePortfolioRisk(input, regime("risk-on"));
+
+  assert.equal(result.band, "low");
+  assert.equal(result.measurementStatus, "indeterminate");
+  assert.equal(result.effectiveBand, "indeterminate");
 });

@@ -156,6 +156,11 @@ const dashboardRecommendation = (
   risk: {
     portfolioBeta: 1.2,
     betaCoverage: 0.9,
+    optionDataCoverage: {
+      contractDeltaCoveragePct: 1,
+      marketValueDeltaCoveragePct: 1,
+      materialCoverageMissing: false
+    },
     exposures: { grossExposurePct: 1.4, netExposurePct: 1.1 },
     concentration: { largestUnderlyingWeight: 0.35, topFiveUnderlyingWeight: 0.8 },
     scenarios: [
@@ -163,7 +168,12 @@ const dashboardRecommendation = (
     ]
   },
   regime: { regime: "risk-off", selectedRule: "RISK_OFF_LONG_TREND_BREAK" },
-  score: { total: 70, band: "high" },
+  score: {
+    total: 70,
+    band: "high",
+    measurementStatus: "measured",
+    effectiveBand: "high"
+  },
   sizing: {
     targetScenarioDeclinePct: 10,
     grossProtectionTarget: 60000,
@@ -209,11 +219,51 @@ test("dashboard renders current risk, regime, LEAPS, sizing, and blocker details
   );
 
   assert.match(html, /Current recommendation/);
-  assert.match(html, /Risk score/);
-  assert.match(html, /70 \(high\)/);
+  assert.match(html, /Calculated risk score/);
+  assert.match(html, /Calculated band/);
+  assert.match(html, />70</);
+  assert.match(html, />high</);
   assert.match(html, /risk-off/);
   assert.match(html, /10% decline/);
   assert.match(html, /Profit-funded premium budget/);
   assert.match(html, /AAPL280120C00150000/);
   assert.match(html, /MULTI_LEG_EXECUTION_UNSUPPORTED/);
+});
+
+test("dashboard presents incomplete low risk as indeterminate", () => {
+  const recommendation = dashboardRecommendation("current");
+  recommendation.recommendationStatus = "monitoring";
+  recommendation.decision = "monitor";
+  recommendation.dataQualityStatus = "monitoring";
+  recommendation.score = {
+    total: 4,
+    band: "low",
+    measurementStatus: "indeterminate",
+    effectiveBand: "indeterminate"
+  };
+  recommendation.risk = {
+    ...recommendation.risk,
+    portfolioBeta: null,
+    optionDataCoverage: {
+      contractDeltaCoveragePct: 0.12,
+      marketValueDeltaCoveragePct: 0.12,
+      materialCoverageMissing: true
+    }
+  };
+  recommendation.warnings = ["MATERIAL_OPTION_GREEKS_COVERAGE_INSUFFICIENT"];
+
+  const html = renderToStaticMarkup(createElement(HedgePanel, { recommendation }));
+
+  assert.match(html, /Calculated risk score/);
+  assert.match(html, />4</);
+  assert.match(html, /Calculated band/);
+  assert.match(html, />low</);
+  assert.match(html, /Measurement status/);
+  assert.match(html, /indeterminate/i);
+  assert.match(html, /Effective decision status/);
+  assert.match(html, /monitoring/);
+  assert.match(html, /Option delta contract coverage/);
+  assert.match(html, /12\.0%/);
+  assert.match(html, /Material option exposure could not be delta-measured/);
+  assert.match(html, /MATERIAL_OPTION_GREEKS_COVERAGE_INSUFFICIENT/);
 });

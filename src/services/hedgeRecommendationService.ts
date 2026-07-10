@@ -420,10 +420,18 @@ export const recommendHedgeFromEvidence = (
       blockers: unique([...risk.blockers, ...regime.blockers])
     };
   }
+  const materialOptionCoverageMissing =
+    risk.optionDataCoverage.materialCoverageMissing ||
+    score.measurementStatus === "indeterminate";
   const scenario = risk.scenarios.find(
     (entry) => entry.benchmarkDeclinePct === scenarioDeclinePct
   );
-  if (risk.dataQualityStatus === "monitoring" || !scenario || scenario.netModeledLoss === null) {
+  if (
+    materialOptionCoverageMissing ||
+    risk.dataQualityStatus === "monitoring" ||
+    !scenario ||
+    scenario.netModeledLoss === null
+  ) {
     return {
       ...base,
       recommendationId,
@@ -442,6 +450,9 @@ export const recommendHedgeFromEvidence = (
       warnings: unique([
         ...risk.warnings,
         ...regime.warnings,
+        ...(materialOptionCoverageMissing
+          ? ["MATERIAL_OPTION_GREEKS_COVERAGE_INSUFFICIENT"]
+          : []),
         "HEDGE_SIZING_EVIDENCE_INSUFFICIENT"
       ]),
       blockers: unique([...risk.blockers, ...regime.blockers])
