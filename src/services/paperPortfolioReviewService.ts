@@ -8,6 +8,7 @@ import {
   evaluateLeapsExit,
   type LeapsExitEvaluation
 } from "./leapsExitReviewService.js";
+import { parseOptionSymbol } from "./optionSymbolService.js";
 import { getTradingSafetyState } from "./tradingSafetyService.js";
 
 export type PaperPortfolioRecommendationType =
@@ -204,17 +205,13 @@ const latestCandidates = () =>
   );
 
 const optionSymbolMetadata = (symbol: string): { expirationDate: string; side: "call" | "put" } | null => {
-  const match = /^([A-Z]+)(\d{6})([CP])(\d{8})$/.exec(symbol.toUpperCase());
-  if (!match) {
+  const parsed = parseOptionSymbol(symbol);
+  if (!parsed.ok) {
     return null;
   }
-  const rawDate = match[2]!;
-  const year = Number(rawDate.slice(0, 2));
-  const month = rawDate.slice(2, 4);
-  const day = rawDate.slice(4, 6);
   return {
-    expirationDate: `${year >= 70 ? "19" : "20"}${String(year).padStart(2, "0")}-${month}-${day}`,
-    side: match[3] === "C" ? "call" : "put"
+    expirationDate: parsed.expirationDate,
+    side: parsed.optionType
   };
 };
 

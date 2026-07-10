@@ -1,4 +1,5 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
+import { canonicalJsonHash } from "../lib/canonicalJson.js";
 import { getDb, queryAll } from "../lib/db.js";
 
 export type ReviewedPayloadSectionName =
@@ -65,24 +66,8 @@ const emptySections = (): ReviewedPayloadSections => ({
   optionSellToCloseExits: []
 });
 
-const sortObject = (value: unknown): unknown => {
-  if (Array.isArray(value)) {
-    return value.map(sortObject);
-  }
-  if (!value || typeof value !== "object") {
-    return value;
-  }
-  return Object.fromEntries(
-    Object.entries(value as Record<string, unknown>)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, entry]) => [key, sortObject(entry)])
-  );
-};
-
 export const reviewedPayloadSignature = (sections: ReviewedPayloadSections) =>
-  createHash("sha256")
-    .update(JSON.stringify(sortObject(sections)))
-    .digest("hex");
+  canonicalJsonHash(sections);
 
 export const reviewedPayloadCount = (sections: ReviewedPayloadSections) =>
   Object.values(sections).reduce((total, entries) => total + entries.length, 0);

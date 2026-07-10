@@ -28,6 +28,7 @@ import {
   updatePaperExecutionLedgerEntry
 } from "./paperExecutionLedgerService.js";
 import { optionsQuoteConfig, roundOptionLimitPrice } from "./optionQuoteNormalizer.js";
+import { optionDaysToExpiration } from "./optionSymbolService.js";
 import type { RiskProfile } from "../types.js";
 
 type PaperExecuteFormat = "table" | "json";
@@ -1082,14 +1083,7 @@ const optionDte = (expirationDate: string | undefined): number | null => {
   if (!expirationDate) {
     return null;
   }
-  if (expirationDate === new Date().toISOString().slice(0, 10)) {
-    return 0;
-  }
-  const parsed = new Date(`${expirationDate}T23:59:59.000Z`);
-  if (Number.isNaN(parsed.getTime())) {
-    return null;
-  }
-  return Math.ceil((parsed.getTime() - Date.now()) / (24 * 60 * 60 * 1000));
+  return optionDaysToExpiration(expirationDate, new Date().toISOString());
 };
 
 const normalizeUpper = (value: string | undefined | null) => String(value || "").toUpperCase();

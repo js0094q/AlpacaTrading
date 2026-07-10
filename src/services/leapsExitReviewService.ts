@@ -2,6 +2,7 @@ import { paperLeapsExitConfig } from "../config.js";
 import { queryAll, queryOne } from "../lib/db.js";
 import { normalizeSymbol } from "../lib/utils.js";
 import { sma } from "./indicators.js";
+import { optionDaysToExpiration, parseOptionSymbol } from "./optionSymbolService.js";
 import type { AlpacaPositionSnapshot } from "./alpacaPositionService.js";
 
 export type LeapsExitReasonCode =
@@ -85,8 +86,6 @@ export interface LeapsExitReviewDeps {
   closesForSymbol?: (symbol: string, asOf: string, limit: number) => number[];
 }
 
-const MS_PER_DAY = 24 * 60 * 60 * 1000;
-
 const unique = <T extends string>(values: T[]) => [...new Set(values)];
 
 const numeric = (value: string | number | undefined | null): number | null => {
@@ -108,42 +107,24 @@ const pctFromPosition = (value: string | number | undefined | null): number | nu
 const roundMoney = (value: number) => Math.round(value * 100) / 100;
 const roundPct = (value: number) => Math.round(value * 100) / 100;
 
-const parseDateOnly = (value: string): number | null => {
-  const match = /^(\d{4})-(\d{2})-(\d{2})/.exec(value);
-  if (!match) {
-    return null;
-  }
-  const year = Number(match[1]);
-  const month = Number(match[2]);
-  const day = Number(match[3]);
-  const time = Date.UTC(year, month - 1, day);
-  return Number.isFinite(time) ? time : null;
-};
-
 export const daysToExpiration = (asOf: string, expirationDate: string | null): number | null => {
   if (!expirationDate) {
     return null;
   }
-  const start = parseDateOnly(asOf);
-  const expiration = parseDateOnly(expirationDate);
-  if (start === null || expiration === null) {
-    return null;
-  }
-  return Math.max(0, Math.round((expiration - start) / MS_PER_DAY));
+  const dte = optionDaysToExpiration(expirationDate, asOf);
+  return dte === null ? null : Math.max(0, dte);
 };
 
 const occMetadata = (contractSymbol: string): OptionMetadata | null => {
-  const match = /^([A-Z]+)(\d{6})([CP])(\d{8})$/.exec(contractSymbol.toUpperCase());
-  if (!match) {
+  const parsed = parseOptionSymbol(contractSymbol);
+  if (!parsed.ok) {
     return null;
   }
-  const rawDate = match[2]!;
-  const year = Number(rawDate.slice(0, 2));
   return {
-    underlyingSymbol: match[1]!,
-    contractSymbol: contractSymbol.toUpperCase(),
-    expirationDate: `${year >= 70 ? "19" : "20"}${rawDate.slice(0, 2)}-${rawDate.slice(2, 4)}-${rawDate.slice(4, 6)}`,
-    type: match[3] === "C" ? "call" : "put",
+    underlyingSymbol: parsed.underlying,
+    contractSymbol: parsed.normalizedSymbol,
+    expirationDate: parsed.expirationDate,
+    type: parsed.optionType,
     multiplier: 100
   };
 };
@@ -350,12 +331,8 @@ const daysSince = (from: string | null, to: string): number | null => {
   if (!from) {
     return null;
   }
-  const fromMs = parseDateOnly(from);
-  const toMs = parseDateOnly(to);
-  if (fromMs === null || toMs === null) {
-    return null;
-  }
-  return Math.max(0, Math.floor((toMs - fromMs) / MS_PER_DAY));
+  const days = optionDaysToExpiration(to.slice(0, 10), from);
+  return days === null ? null : Math.max(0, days);
 };
 
 const classifyLeaps = (input: {
