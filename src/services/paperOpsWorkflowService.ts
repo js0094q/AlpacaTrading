@@ -23,6 +23,10 @@ import {
   type PaperOperationTriggerSource,
   type PaperOperationStatus
 } from "./paperOperationLogService.js";
+import {
+  buildAndPersistHedgeReview,
+  type HedgeReviewReport
+} from "./hedgeLearningService.js";
 
 export interface PaperOpsWorkflowReport {
   paperOnly: true;
@@ -47,6 +51,7 @@ interface PaperOpsDeps {
   evaluateLearning?: typeof evaluatePaperLearningRecords;
   learningSummary?: typeof paperLearningSummary;
   promotionReadiness?: typeof buildPromotionReadinessAnalytics;
+  buildHedgeReview?: typeof buildAndPersistHedgeReview;
   now?: () => string;
 }
 
@@ -93,6 +98,11 @@ const sectionsFromReports = async (
 const statusFrom = (blockers: string[], warnings: string[]): PaperOperationStatus =>
   blockers.length ? "blocked" : warnings.length ? "warning" : "success";
 
+const hedgeRefreshWarnings = (report: HedgeReviewReport) => [
+  ...report.warnings,
+  ...(report.blockers.length ? ["HEDGE_REVIEW_REFRESH_BLOCKED"] : [])
+];
+
 export const runPaperOpsReview = async (
   input: {
     triggerSource?: PaperOperationTriggerSource;
@@ -117,6 +127,12 @@ export const runPaperOpsReview = async (
         moment: input.moment || "manual"
       }
     );
+    const hedgeReview = await (deps.buildHedgeReview ?? buildAndPersistHedgeReview)({
+      asOf: generatedAt,
+      triggerSource,
+      requestId: input.requestId ?? undefined,
+      correlationId: input.correlationId ?? undefined
+    });
     const { sections, dryRun } = await sectionsFromReports(portfolioReview, deps);
     const warnings = [
       ...dryRun.warnings,
@@ -136,6 +152,8 @@ export const runPaperOpsReview = async (
         dryRunStatus: dryRun.status,
         dryRunWouldSubmit: dryRun.summary.wouldSubmitCount,
         portfolioEligiblePayloads: portfolioReview.summary.eligiblePayloads,
+        hedgeRecommendationId: hedgeReview.recommendation.recommendationId,
+        hedgeRecommendationStatus: hedgeReview.status,
         payloadSections: Object.fromEntries(
           Object.entries(sections).map(([key, value]) => [key, value.length])
         )
@@ -144,7 +162,8 @@ export const runPaperOpsReview = async (
       blockers,
       details: {
         dryRun,
-        portfolioReview
+        portfolioReview,
+        hedgeReview
       }
     });
     const summary = {
@@ -175,7 +194,8 @@ export const runPaperOpsReview = async (
       details: {
         artifact,
         dryRun,
-        portfolioReview
+        portfolioReview,
+        hedgeReview
       },
       warnings,
       blockers
@@ -313,15 +333,20 @@ export const runPaperOpsMidday = async (
     const portfolioReview = await (deps.buildPortfolioReview ?? buildPaperPortfolioReviewReport)({
       moment: "midday"
     });
+    const hedgeReview = await (deps.buildHedgeReview ?? buildAndPersistHedgeReview)({
+      asOf: generatedAt,
+      triggerSource
+    });
     return finishWorkflow(
       operation.id,
       "midday",
       triggerSource,
       generatedAt,
       {
-        portfolioReview
+        portfolioReview,
+        hedgeReview
       },
-      portfolioReview.warnings,
+      [...portfolioReview.warnings, ...hedgeRefreshWarnings(hedgeReview)],
       portfolioReview.blockers
     );
   } catch (error) {
@@ -351,6 +376,10 @@ export const runPaperOpsLateDay = async (
     const portfolioReview = await (deps.buildPortfolioReview ?? buildPaperPortfolioReviewReport)({
       moment: "late_day"
     });
+    const hedgeReview = await (deps.buildHedgeReview ?? buildAndPersistHedgeReview)({
+      asOf: generatedAt,
+      triggerSource
+    });
     return finishWorkflow(
       operation.id,
       "late_day",
@@ -358,9 +387,10 @@ export const runPaperOpsLateDay = async (
       generatedAt,
       {
         portfolioReview,
+        hedgeReview,
         forcedExitReview: true
       },
-      portfolioReview.warnings,
+      [...portfolioReview.warnings, ...hedgeRefreshWarnings(hedgeReview)],
       portfolioReview.blockers
     );
   } catch (error) {

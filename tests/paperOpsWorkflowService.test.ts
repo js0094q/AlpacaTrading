@@ -54,6 +54,19 @@ const portfolioReview = async (moment = "manual") => ({
   moment
 });
 
+const hedgeReview = async () => ({
+  paperOnly: true,
+  environment: "paper",
+  generatedAt: "2026-07-10T14:00:00.000Z",
+  status: "monitoring",
+  recommendation: { recommendationId: "hedge-scheduler-test" },
+  risk: {},
+  regime: {},
+  score: {},
+  warnings: ["HEDGE_MONITORING"],
+  blockers: []
+});
+
 beforeEach(() => {
   process.env.AUTOMATED_PAPER_EXECUTION_ENABLED = "false";
   resetDatabase();
@@ -68,7 +81,8 @@ describe("paper ops workflows", () => {
   test("review workflow persists separated payload artifact and defaults to review-only", async () => {
     const report = await runPaperOpsReview({ triggerSource: "scheduler" }, {
       buildDryRun: dryRun as any,
-      buildPortfolioReview: portfolioReview as any
+      buildPortfolioReview: portfolioReview as any,
+      buildHedgeReview: hedgeReview as any
     });
 
     assert.equal(report.status, "success");
@@ -98,24 +112,36 @@ describe("paper ops workflows", () => {
       buildPortfolioReview: async () => {
         calls.push("review");
         return portfolioReview("morning") as any;
+      },
+      buildHedgeReview: async () => {
+        calls.push("hedge");
+        return hedgeReview() as any;
       }
     });
 
     assert.equal(report.workflow, "morning");
-    assert.deepEqual(calls, ["research", "learn", "discover", "review"]);
+    assert.deepEqual(calls, ["research", "learn", "discover", "review", "hedge"]);
   });
 
   test("midday workflow runs portfolio and exit review", async () => {
     let moment = "";
+    let hedgeCalls = 0;
     const report = await runPaperOpsMidday({}, {
       buildPortfolioReview: async (input) => {
         moment = input?.moment || "";
         return portfolioReview("midday") as any;
+      },
+      buildHedgeReview: async () => {
+        hedgeCalls += 1;
+        return hedgeReview() as any;
       }
     });
 
     assert.equal(report.workflow, "midday");
     assert.equal(moment, "midday");
+    assert.equal(hedgeCalls, 1);
+    assert.equal((report.details.hedgeReview as any).status, "monitoring");
+    assert.equal("executeHedge" in report.details, false);
   });
 
   test("late-day workflow runs forced 0DTE review path", async () => {
@@ -124,7 +150,8 @@ describe("paper ops workflows", () => {
       buildPortfolioReview: async (input) => {
         moment = input?.moment || "";
         return portfolioReview("late_day") as any;
-      }
+      },
+      buildHedgeReview: hedgeReview as any
     });
 
     assert.equal(report.workflow, "late_day");
