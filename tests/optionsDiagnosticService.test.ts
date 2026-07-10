@@ -17,9 +17,14 @@ process.env.ALPACA_PAPER_SECRET_KEY = "paper-secret";
 process.env.ALPACA_PAPER_BASE_URL = "https://paper-api.alpaca.markets";
 process.env.ALLOW_0DTE_OPTIONS = "true";
 
-const [{ closeDbForTests, getDb }, { buildOptionsDiagnosticReport }] = await Promise.all([
+const [
+  { closeDbForTests, getDb },
+  { buildOptionsDiagnosticReport },
+  { toSnapshotRow }
+] = await Promise.all([
   import("../src/lib/db.js"),
-  import("../src/services/optionsDiagnosticService.js")
+  import("../src/services/optionsDiagnosticService.js"),
+  import("../src/services/optionsService.js")
 ]);
 
 const makeMockResponse = (payload: unknown, status = 200) =>
@@ -173,6 +178,42 @@ after(() => {
 });
 
 describe("options diagnostic service", () => {
+  test("normalizes the current Alpaca camelCase option snapshot shape", () => {
+    const row = toSnapshotRow(
+      "SPY270115C00805000",
+      {
+        greeks: {
+          delta: 0.3459,
+          gamma: 0.0049,
+          rho: 1.2671,
+          theta: -0.0986,
+          vega: 2.0038
+        },
+        impliedVolatility: 0.1379,
+        latestQuote: {
+          t: "2026-07-10T19:59:59.416029802Z",
+          bp: 16.4,
+          ap: 16.52
+        },
+        latestTrade: {
+          t: "2026-07-10T18:59:21.881733892Z",
+          p: 16.85
+        }
+      } as unknown as Parameters<typeof toSnapshotRow>[1]
+    );
+
+    assert.equal(row.underlyingSymbol, "SPY");
+    assert.equal(row.delta, 0.3459);
+    assert.equal(row.gamma, 0.0049);
+    assert.equal(row.theta, -0.0986);
+    assert.equal(row.vega, 2.0038);
+    assert.equal(row.rho, 1.2671);
+    assert.equal(row.impliedVolatility, 0.1379);
+    assert.equal(row.bid, 16.4);
+    assert.equal(row.ask, 16.52);
+    assert.equal(row.last, 16.85);
+  });
+
   test("reports provider endpoints, local cache state, contract counts, and quote samples", async () => {
     const calls: string[] = [];
     setDiagnosticFetch(calls);

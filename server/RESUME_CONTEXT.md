@@ -18,7 +18,14 @@
   - Keep Vercel `DASHBOARD_ADMIN_TOKEN` in production env for admin endpoints.
 - Control action behavior:
   - `research.run` is intentionally bounded by the control server to `--barLookbackDays=120`, `ALPACA_REQUEST_TIMEOUT_MS=10000`, and `ALPACA_MAX_RETRIES=0` so optional slow Alpaca options calls do not exceed Vercel's synchronous timeout.
+  - `GET /api/v1/summary` returns cached/read-only dashboard state and does not dispatch fresh plan, review, or dry-run commands.
   - Public `POST /api/paper/research/run` was verified through `https://www.jlsprojects.com` with valid admin auth.
+  - The branch now defines cached GET-only hedge routes at `/api/v1/hedge/risk`, `/api/v1/hedge/regime`, and `/api/v1/hedge/recommendation`; this task did not deploy them.
+  - Hedge routes read the latest integrity-checked `paper_learning_records` payload and never dispatch commands or order fetches.
+- Paper monitor behavior:
+  - Exit review now evaluates LEAPS positions through the existing `optionSellToCloseExits` reviewed section; no separate LEAPS timer or execution command is required.
+  - Reviewed LEAPS sell-to-close execution fails closed unless paper runtime, live-off, paper execution, paper options execution, automated execution, and `--confirmPaper` gates are all satisfied.
+  - Existing paper-ops review moments may refresh hedge recommendations, but no hedge order section, execution command, or timer exists.
 - Security/hardening posture:
   - SSH key-only hardening is in place; password auth is disabled.
   - Root key recovery remains intentionally preserved until explicitly disabled.
@@ -46,7 +53,9 @@
 ## Do-not-break requirements
 
 - Preserve paper-only guardrails (`ALPACA_ENV=paper`, `LIVE_TRADING_ENABLED=false`) on all runs.
+- Keep `HEDGE_PAPER_EXECUTION_ENABLED=false`; hedge plans remain signed, expiring, and non-executable.
 - Keep paper execution operationally enabled only through the guarded paper path (`PAPER_ORDER_EXECUTION_ENABLED=true`, `PAPER_OPTIONS_EXECUTION_ENABLED=true`, valid control/admin auth, and CLI `--confirmPaper`).
+- Continuous paper monitor timers are installed with `scripts/install-paper-monitoring-systemd.sh`; they use `npm run paper:monitor`, reviewed payload artifacts, section filters, market-hours no-ops, and per-task locks.
 - Do not add direct shell command execution in dashboard actions; keep allowlisted control endpoints only.
 - Do not configure direct client-side Alpaca credentials or local SQLite writes on Vercel.
 - Preserve option quote execution gates: stale/missing/crossed quotes and same-day expirations are non-executable unless explicitly enabled by runtime env.

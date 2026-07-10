@@ -5,7 +5,7 @@ import { createServer, IncomingMessage } from "node:http";
 import { spawn } from "node:child_process";
 
 import {
-  buildDashboardSnapshot,
+  buildCachedDashboardSnapshot,
   latestPaperExecutions,
   latestPaperPlans,
   latestResearchRuns,
@@ -14,6 +14,18 @@ import {
 import { getAlpacaAccountSnapshot } from "../../src/services/alpacaAccountService.js";
 import { listAlpacaOpenOrders } from "../../src/services/alpacaOrderReadService.js";
 import { listAlpacaPositions } from "../../src/services/alpacaPositionService.js";
+import { listPaperOperations } from "../../src/services/paperOperationLogService.js";
+import { latestReviewArtifactReadiness } from "../../src/services/paperOpsWorkflowService.js";
+import { latestHedgeRecommendationForCurrentConfig } from "../../src/services/hedgePersistenceService.js";
+import { safeTokenEquals } from "../../src/lib/safeToken.js";
+import { redactSensitiveData, redactSensitiveText } from "../../src/lib/securityRedaction.js";
+import {
+  RuntimePreflightError,
+  assertRuntimeMutationPreflight,
+  buildRuntimePreflightChecks,
+  type RuntimeMutationActionType,
+  type RuntimePreflightChecks
+} from "../../src/services/runtimeMutationPreflight.js";
 
 type RiskProfile = "moderate" | "aggressive" | "conservative";
 type AssetClass = "all" | "equity" | "option";
@@ -23,12 +35,24 @@ type ControlInput = {
   optionsEnabled: boolean;
   maxCandidates: number;
   assetClass: AssetClass;
+  confirmPaper: boolean;
+  expectedPayloadSignature?: string;
+  underlying: string;
+  dte: number;
 };
 
 type Envelope = {
   ok: true;
+  status: string;
   action: string;
   requestId: string;
+  startedAt: string;
+  finishedAt: string;
+  durationMs: number;
+  summary?: unknown;
+  details?: unknown;
+  blockers?: unknown;
+  warnings?: unknown;
   data: unknown;
   params?: Record<string, unknown>;
   correlationId?: string;
@@ -44,6 +68,8 @@ type ErrorEnvelope = {
     message: string;
   };
   guard?: EnvironmentGuardState;
+  checks?: RuntimePreflightChecks;
+  failedChecks?: string[];
 };
 
 type AuditEntry = {
@@ -61,11 +87,19 @@ type AuditEntry = {
 
 type ActionHandler = (input: ControlInput, requestId: string) => Promise<unknown>;
 
+type ControlRuntimePreflight = {
+  actionType: RuntimeMutationActionType;
+  confirmPaper?: boolean;
+  confirmPaperFromInput?: boolean;
+  requireOptionsExecution?: boolean;
+};
+
 type ActionConfig = {
   method: "GET" | "POST";
   timeoutMs: number;
   requireAdminToken: boolean;
   requireMutationPrecheck: boolean;
+  runtimePreflight?: ControlRuntimePreflight;
   action: string;
   handler: ActionHandler;
 };
@@ -85,10 +119,16 @@ type OpenOrdersFetcher = () => Promise<unknown>;
 
 type EnvironmentGuardState = {
   paperOnly: boolean;
+  environment: string;
+  tradingMode: string;
   liveTradingEnabled: boolean;
   mutationAllowed: boolean;
+  paperExecutionEnabled: boolean;
   paperOrderExecutionEnabled: boolean;
   paperOptionsExecutionEnabled: boolean;
+  automatedPaperExecutionEnabled: boolean;
+  liveApiBaseUrlReachableOrConfigured: boolean;
+  paperApiBaseUrlConfigured: boolean;
 };
 
 const getControlToken = () => process.env.VPS_CONTROL_TOKEN?.trim() || "";
@@ -169,7 +209,7 @@ const runCommandViaSpawn = (
       }
 
       if (code !== 0) {
-        const err = (errored || output || "Command execution failed").trim();
+        const err = redactSensitiveText((errored || output || "Command execution failed").trim());
         reject(new Error(`${action} command failed (exit ${code}): ${err}`));
         return;
       }
@@ -246,25 +286,12 @@ const normalizeBoolean = (value: unknown, fallback = false) => {
   return typeof value === "boolean" ? value : fallback;
 };
 
-const parseEnvBoolean = (name: string) =>
-  process.env[name] === "true" || process.env[name] === "1";
-
 const buildEnvironmentGuardState = (payload?: Record<string, unknown>): EnvironmentGuardState => {
-  const liveTradingEnabled =
-    payload?.liveTradingEnabled === true ||
-    parseEnvBoolean("LIVE_TRADING_ENABLED") ||
-    parseEnvBoolean("ALPACA_LIVE_TRADE");
-  const alpacaEnv = String(process.env.ALPACA_ENV || "paper").toLowerCase();
+  const checks = buildRuntimePreflightChecks(payload || {});
 
   return {
-    paperOnly:
-      payload && "paperOnly" in payload
-        ? payload.paperOnly === true
-        : alpacaEnv === "paper" && !liveTradingEnabled,
-    liveTradingEnabled,
-    mutationAllowed: payload?.mutationAllowed === true,
-    paperOrderExecutionEnabled: parseEnvBoolean("PAPER_ORDER_EXECUTION_ENABLED"),
-    paperOptionsExecutionEnabled: parseEnvBoolean("PAPER_OPTIONS_EXECUTION_ENABLED")
+    ...checks,
+    paperOrderExecutionEnabled: checks.paperExecutionEnabled
   };
 };
 
@@ -272,13 +299,23 @@ class EnvironmentGuardError extends Error {
   code: string;
   status: number;
   guard: EnvironmentGuardState;
+  checks: RuntimePreflightChecks;
+  failedChecks: string[];
 
-  constructor(code: string, message: string, guard: EnvironmentGuardState, status = 403) {
+  constructor(
+    code: string,
+    message: string,
+    guard: EnvironmentGuardState,
+    status = 403,
+    failedChecks: string[] = []
+  ) {
     super(message);
     this.name = "EnvironmentGuardError";
     this.code = code;
     this.status = status;
     this.guard = guard;
+    this.checks = guard;
+    this.failedChecks = failedChecks;
   }
 }
 
@@ -296,7 +333,17 @@ const parseInput = (raw: unknown): ControlInput => {
     riskProfile: normalizeRiskProfile(body.riskProfile),
     optionsEnabled: normalizeBoolean(body.optionsEnabled, true),
     maxCandidates: safeInteger(body.maxCandidates, 10),
-    assetClass: parseAssetClass(body.assetClass)
+    assetClass: parseAssetClass(body.assetClass),
+    confirmPaper: normalizeBoolean(body.confirmPaper, false),
+    expectedPayloadSignature:
+      typeof body.expectedPayloadSignature === "string"
+        ? body.expectedPayloadSignature
+        : undefined,
+    underlying:
+      typeof body.underlying === "string" && body.underlying.trim()
+        ? body.underlying.trim().toUpperCase()
+        : "SPY",
+    dte: safeInteger(body.dte, 0, 0, 30)
   };
 };
 
@@ -353,7 +400,7 @@ const authorize = (request: IncomingMessage) => {
   }
   const presented = token.slice(7).trim();
   const configured = getControlToken();
-  return Boolean(configured && presented && presented === configured);
+  return safeTokenEquals(presented, configured);
 };
 
 const requestIdFromRequest = (request: IncomingMessage) =>
@@ -367,7 +414,7 @@ const logEntry = (entry: AuditEntry) => {
   try {
     const logPath = getLogPath();
     mkdirSync(dirname(logPath), { recursive: true });
-    appendFileSync(logPath, `${JSON.stringify(entry)}\n`);
+    appendFileSync(logPath, `${JSON.stringify(redactSensitiveData(entry))}\n`);
   } catch {
     // Logging is best-effort only.
   }
@@ -378,12 +425,36 @@ const wrapSuccess = (
   requestId: string,
   correlationId: string,
   data: unknown,
-  params: Record<string, unknown>
+  params: Record<string, unknown>,
+  timing: {
+    startedAt: string;
+    finishedAt: string;
+    durationMs: number;
+  }
 ): Envelope => ({
   ok: true,
+  status:
+    data && typeof data === "object" && "status" in data
+      ? String((data as { status?: unknown }).status || "success")
+      : "success",
   action,
   requestId,
   correlationId,
+  startedAt: timing.startedAt,
+  finishedAt: timing.finishedAt,
+  durationMs: timing.durationMs,
+  ...(data && typeof data === "object" && "summary" in data
+    ? { summary: (data as { summary?: unknown }).summary }
+    : {}),
+  ...(data && typeof data === "object" && "details" in data
+    ? { details: (data as { details?: unknown }).details }
+    : {}),
+  ...(data && typeof data === "object" && "blockers" in data
+    ? { blockers: (data as { blockers?: unknown }).blockers }
+    : {}),
+  ...(data && typeof data === "object" && "warnings" in data
+    ? { warnings: (data as { warnings?: unknown }).warnings }
+    : {}),
   data,
   params
 });
@@ -404,7 +475,8 @@ const wrapRouteError = (
   correlationId: string,
   code: string,
   message: string,
-  guard?: EnvironmentGuardState
+  guard?: EnvironmentGuardState,
+  failedChecks: string[] = []
 ): ErrorEnvelope => ({
   ok: false,
   action,
@@ -412,14 +484,16 @@ const wrapRouteError = (
   correlationId,
   error: {
     code,
-    message
+    message: redactSensitiveText(message)
   },
-  ...(guard ? { guard } : {})
+  ...(guard ? { guard, checks: guard, failedChecks } : {})
 });
 
 type MutabilityRequirement = {
   requireAggressiveMode?: boolean;
   requireOptionsExecution?: boolean;
+  actionType?: RuntimeMutationActionType;
+  confirmPaper?: boolean;
 };
 
 const verifyPaperMutability = async (requirements: MutabilityRequirement = {}) => {
@@ -436,27 +510,28 @@ const verifyPaperMutability = async (requirements: MutabilityRequirement = {}) =
 
   const payload = health as Record<string, unknown>;
   const guard = buildEnvironmentGuardState(payload);
-  if (payload.paperOnly !== true) {
-    throw new EnvironmentGuardError(
-      "PAPER_ENV_REQUIRED",
-      "Blocked by safety guard: paper-only mode is required.",
-      guard
+  try {
+    assertRuntimeMutationPreflight(
+      {
+        actionType: requirements.actionType || "research",
+        confirmPaper: requirements.confirmPaper,
+        requireOptionsExecution: requirements.requireOptionsExecution
+      },
+      payload
     );
+  } catch (error) {
+    if (error instanceof RuntimePreflightError) {
+      throw new EnvironmentGuardError(
+        error.code,
+        error.message,
+        buildEnvironmentGuardState(error.checks),
+        error.status,
+        error.failedChecks
+      );
+    }
+    throw error;
   }
-  if (payload.liveTradingEnabled) {
-    throw new EnvironmentGuardError(
-      "LIVE_TRADING_MUST_BE_DISABLED",
-      "Blocked by safety guard: live trading is enabled in the current environment.",
-      guard
-    );
-  }
-  if (payload.mutationAllowed !== false) {
-    throw new EnvironmentGuardError(
-      "MUTATION_GUARD_STATE_INVALID",
-      "Blocked by safety guard: mutation guard state is invalid for paper-only operation.",
-      guard
-    );
-  }
+
   if (payload.accountStatus !== "ACTIVE") {
     throw new EnvironmentGuardError(
       "PAPER_ACCOUNT_NOT_ACTIVE",
@@ -473,13 +548,6 @@ const verifyPaperMutability = async (requirements: MutabilityRequirement = {}) =
     );
   }
 
-  if (requirements.requireOptionsExecution && process.env.PAPER_OPTIONS_EXECUTION_ENABLED !== "true") {
-    throw new EnvironmentGuardError(
-      "PAPER_OPTIONS_EXECUTION_DISABLED",
-      "Blocked by safety guard: paper options execution is disabled.",
-      guard
-    );
-  }
 };
 
 const executeConfirmHandler = async (_input: ControlInput, requestId: string) => {
@@ -494,19 +562,6 @@ const executeConfirmHandler = async (_input: ControlInput, requestId: string) =>
   if (_input.assetClass !== "all") {
     throw new Error("execute.confirm supports assetClass=all only.");
   }
-
-  if (process.env.PAPER_ORDER_EXECUTION_ENABLED !== "true") {
-    throw new EnvironmentGuardError(
-      "PAPER_ORDER_EXECUTION_DISABLED",
-      "Blocked by safety guard: paper order execution is disabled.",
-      buildEnvironmentGuardState()
-    );
-  }
-
-  await verifyPaperMutability({
-    requireAggressiveMode: true,
-    requireOptionsExecution: true
-  });
 
   await openOrdersFetcher();
   return command(
@@ -541,6 +596,95 @@ const executeDryRunHandler = (input: ControlInput, requestId: string) =>
     "execute.dry-run"
   );
 
+const learnRunHandler = (_input: ControlInput, requestId: string) =>
+  command(
+    "paper:learn",
+    ["--format=json"],
+    120_000,
+    requestId,
+    "learn.run"
+  );
+
+const portfolioReviewHandler = (_input: ControlInput, requestId: string) =>
+  command(
+    "paper:portfolio:review",
+    ["--format=json"],
+    60_000,
+    requestId,
+    "portfolio.review"
+  );
+
+const optionsDiscoverHandler = (input: ControlInput, requestId: string) =>
+  command(
+    "paper:options:discover",
+    [
+      `--underlying=${input.underlying}`,
+      `--dte=${input.dte}`,
+      "--format=json"
+    ],
+    60_000,
+    requestId,
+    "options.discover"
+  );
+
+const opsReviewHandler = (_input: ControlInput, requestId: string) =>
+  command(
+    "paper:ops:review",
+    ["--format=json"],
+    120_000,
+    requestId,
+    "paper.ops.review"
+  );
+
+const executeReviewedHandler = async (input: ControlInput, requestId: string) => {
+  if (input.confirmPaper !== true) {
+    return {
+      paperOnly: true,
+      status: "blocked",
+      reason: "CONFIRM_PAPER_REQUIRED",
+      summary: {
+        eligiblePayloads: 0,
+        submitted: 0,
+        blocked: 1,
+        errors: 0
+      },
+      blockers: ["CONFIRM_PAPER_REQUIRED"],
+      warnings: []
+    };
+  }
+
+  const readiness = latestReviewArtifactReadiness();
+  if (!readiness.ready) {
+    return {
+      paperOnly: true,
+      status: readiness.status,
+      reason: readiness.reason,
+      summary: {
+        eligiblePayloads: readiness.artifact?.payloadCount ?? 0,
+        submitted: 0,
+        blocked: readiness.status === "blocked" ? 1 : 0,
+        errors: 0
+      },
+      blockers: readiness.status === "blocked" ? [readiness.reason] : [],
+      warnings: readiness.status === "warning" ? [readiness.reason] : [],
+      artifact: readiness.artifact ?? null
+    };
+  }
+
+  await openOrdersFetcher();
+  return command(
+    "paper:execute:reviewed",
+    [
+      "--confirmPaper",
+      `--expectedPayloadSignature=${readiness.artifact.payloadSignature}`,
+      "--format=json"
+    ],
+    120_000,
+    requestId,
+    "execute.reviewed"
+  );
+};
+
 const actionHandlers: Record<string, ActionConfig> = {
   "/api/v1/health": {
     method: "GET",
@@ -550,6 +694,59 @@ const actionHandlers: Record<string, ActionConfig> = {
     action: "health",
     handler: async (_input, requestId) =>
       command("alpaca:health", ["--format=json"], 10_000, requestId, "health")
+  },
+  "/api/v1/hedge/recommendation": {
+    method: "GET",
+    timeoutMs: 30_000,
+    requireAdminToken: false,
+    requireMutationPrecheck: false,
+    action: "hedge.recommendation",
+    handler: async () =>
+      latestHedgeRecommendationForCurrentConfig() ?? {
+        paperOnly: true,
+        effectiveStatus: "blocked",
+        recommendationStatus: "blocked",
+        warnings: ["NO_HEDGE_RECOMMENDATION"],
+        blockers: ["NO_HEDGE_RECOMMENDATION"]
+      }
+  },
+  "/api/v1/hedge/risk": {
+    method: "GET",
+    timeoutMs: 30_000,
+    requireAdminToken: false,
+    requireMutationPrecheck: false,
+    action: "hedge.risk",
+    handler: async () => {
+      const recommendation = latestHedgeRecommendationForCurrentConfig();
+      return {
+        paperOnly: true,
+        effectiveStatus: recommendation?.effectiveStatus ?? "blocked",
+        generatedAt: recommendation?.generatedAt ?? null,
+        expiresAt: recommendation?.expiresAt ?? null,
+        risk: recommendation?.risk ?? null,
+        warnings: recommendation?.integrityWarnings ?? ["NO_HEDGE_RECOMMENDATION"],
+        blockers: recommendation ? [] : ["NO_HEDGE_RECOMMENDATION"]
+      };
+    }
+  },
+  "/api/v1/hedge/regime": {
+    method: "GET",
+    timeoutMs: 30_000,
+    requireAdminToken: false,
+    requireMutationPrecheck: false,
+    action: "hedge.regime",
+    handler: async () => {
+      const recommendation = latestHedgeRecommendationForCurrentConfig();
+      return {
+        paperOnly: true,
+        effectiveStatus: recommendation?.effectiveStatus ?? "blocked",
+        generatedAt: recommendation?.generatedAt ?? null,
+        expiresAt: recommendation?.expiresAt ?? null,
+        regime: recommendation?.regime ?? null,
+        warnings: recommendation?.integrityWarnings ?? ["NO_HEDGE_RECOMMENDATION"],
+        blockers: recommendation ? [] : ["NO_HEDGE_RECOMMENDATION"]
+      };
+    }
   },
   "/api/v1/account": {
     method: "GET",
@@ -618,6 +815,7 @@ const actionHandlers: Record<string, ActionConfig> = {
     timeoutMs: 420_000,
     requireAdminToken: true,
     requireMutationPrecheck: true,
+    runtimePreflight: { actionType: "research" },
     action: "research.run",
     handler: async (input, requestId) =>
       command(
@@ -638,11 +836,105 @@ const actionHandlers: Record<string, ActionConfig> = {
         }
       )
   },
+  "/api/v1/actions/research/run": {
+    method: "POST",
+    timeoutMs: 420_000,
+    requireAdminToken: true,
+    requireMutationPrecheck: true,
+    runtimePreflight: { actionType: "research" },
+    action: "paper.actions.research.run",
+    handler: async (input, requestId) =>
+      command(
+        "paper:research",
+        [
+          `--riskProfile=${input.riskProfile}`,
+          `--optionsEnabled=${String(input.optionsEnabled)}`,
+          `--maxCandidates=${input.maxCandidates}`,
+          "--useAlpacaAssets=true",
+          "--barLookbackDays=120",
+          "--format=json"
+        ],
+        420_000,
+        requestId,
+        "paper.actions.research.run",
+        {
+          env: researchRunEnv()
+        }
+      )
+  },
+  "/api/v1/actions/learn/run": {
+    method: "POST",
+    timeoutMs: 120_000,
+    requireAdminToken: true,
+    requireMutationPrecheck: true,
+    runtimePreflight: { actionType: "learning" },
+    action: "paper.actions.learn.run",
+    handler: learnRunHandler
+  },
+  "/api/v1/actions/portfolio/review": {
+    method: "POST",
+    timeoutMs: 60_000,
+    requireAdminToken: true,
+    requireMutationPrecheck: true,
+    runtimePreflight: { actionType: "portfolio-review" },
+    action: "paper.actions.portfolio.review",
+    handler: portfolioReviewHandler
+  },
+  "/api/v1/actions/options/discover": {
+    method: "POST",
+    timeoutMs: 60_000,
+    requireAdminToken: true,
+    requireMutationPrecheck: true,
+    runtimePreflight: { actionType: "options-discovery" },
+    action: "paper.actions.options.discover",
+    handler: optionsDiscoverHandler
+  },
+  "/api/v1/actions/review": {
+    method: "POST",
+    timeoutMs: 120_000,
+    requireAdminToken: true,
+    requireMutationPrecheck: true,
+    runtimePreflight: { actionType: "review" },
+    action: "paper.actions.review",
+    handler: opsReviewHandler
+  },
+  "/api/v1/actions/execute": {
+    method: "POST",
+    timeoutMs: 120_000,
+    requireAdminToken: true,
+    requireMutationPrecheck: false,
+    runtimePreflight: {
+      actionType: "confirmed-paper-execution",
+      confirmPaperFromInput: true,
+      requireOptionsExecution: true
+    },
+    action: "paper.actions.execute",
+    handler: executeReviewedHandler
+  },
+  "/api/v1/actions/history": {
+    method: "GET",
+    timeoutMs: 30_000,
+    requireAdminToken: false,
+    requireMutationPrecheck: false,
+    action: "paper.actions.history",
+    handler: async () => ({
+      status: "success",
+      summary: {
+        operations: listPaperOperations(25).length,
+        reviewReady: latestReviewArtifactReadiness().ready
+      },
+      operations: listPaperOperations(25),
+      reviewReadiness: latestReviewArtifactReadiness(),
+      blockers: [],
+      warnings: []
+    })
+  },
   "/api/v1/review/run": {
     method: "POST",
     timeoutMs: 60_000,
     requireAdminToken: true,
     requireMutationPrecheck: true,
+    runtimePreflight: { actionType: "review" },
     action: "review.run",
     handler: async (input, requestId) =>
       command(
@@ -663,6 +955,7 @@ const actionHandlers: Record<string, ActionConfig> = {
     timeoutMs: 60_000,
     requireAdminToken: true,
     requireMutationPrecheck: true,
+    runtimePreflight: { actionType: "review" },
     action: "plan.run",
     handler: async (input, requestId) =>
       command(
@@ -683,6 +976,7 @@ const actionHandlers: Record<string, ActionConfig> = {
     timeoutMs: 120_000,
     requireAdminToken: true,
     requireMutationPrecheck: false,
+    runtimePreflight: { actionType: "dry-run-execution" },
     action: "execute.dry-run",
     handler: executeDryRunHandler
   },
@@ -699,6 +993,11 @@ const actionHandlers: Record<string, ActionConfig> = {
     timeoutMs: 120_000,
     requireAdminToken: true,
     requireMutationPrecheck: false,
+    runtimePreflight: {
+      actionType: "confirmed-paper-execution",
+      confirmPaper: true,
+      requireOptionsExecution: true
+    },
     action: "execute.confirm",
     handler: executeConfirmHandler
   },
@@ -708,13 +1007,14 @@ const actionHandlers: Record<string, ActionConfig> = {
     requireAdminToken: false,
     requireMutationPrecheck: false,
     action: "summary",
-    handler: async () => buildDashboardSnapshot()
+    handler: async () => buildCachedDashboardSnapshot()
   },
   "/api/v1/refresh": {
     method: "POST",
     timeoutMs: 60_000,
     requireAdminToken: true,
     requireMutationPrecheck: false,
+    runtimePreflight: { actionType: "review" },
     action: "refresh",
     handler: async (input, requestId) =>
       command(
@@ -735,7 +1035,7 @@ const actionHandlers: Record<string, ActionConfig> = {
 export const ACTION_HANDLERS = actionHandlers;
 
 const parseError = (error: unknown) =>
-  error instanceof Error ? error.message : String(error || "Control request failed.");
+  redactSensitiveText(error instanceof Error ? error.message : String(error || "Control request failed."));
 
 const classifyErrorCode = (message: string) =>
   message.includes("token")
@@ -756,8 +1056,30 @@ const routeErrorStatus = (error: unknown, code: string) =>
       ? 401
       : 500;
 
+const runtimePreflightForConfig = (
+  config: ActionConfig,
+  input: ControlInput
+): MutabilityRequirement | null => {
+  if (config.runtimePreflight) {
+    return {
+      actionType: config.runtimePreflight.actionType,
+      confirmPaper: config.runtimePreflight.confirmPaperFromInput
+        ? input.confirmPaper === true
+        : config.runtimePreflight.confirmPaper,
+      requireOptionsExecution: config.runtimePreflight.requireOptionsExecution
+    };
+  }
+
+  if (config.requireMutationPrecheck) {
+    return { actionType: "research" };
+  }
+
+  return null;
+};
+
 const routeHandler = async (request: IncomingMessage, response: any, config: ActionConfig) => {
   const startMs = Date.now();
+  const startedAt = new Date(startMs).toISOString();
   const correlationId = requestIdFromRequest(request);
   const requestId = randomUUID();
 
@@ -766,13 +1088,16 @@ const routeHandler = async (request: IncomingMessage, response: any, config: Act
       throw new Error("Missing or invalid control token.");
     }
 
-    if (config.requireMutationPrecheck) {
-      await verifyPaperMutability();
-    }
-
     const body = request.method === "POST" ? await readBody(request) : {};
     const input = parseInput(body);
+    const preflight = runtimePreflightForConfig(config, input);
+    if (preflight) {
+      await verifyPaperMutability(preflight);
+    }
+
     const data = await config.handler(input, requestId);
+    const durationMs = Date.now() - startMs;
+    const finishedAt = new Date(startMs + durationMs).toISOString();
     const payload = wrapSuccess(
       config.action,
       requestId,
@@ -782,11 +1107,18 @@ const routeHandler = async (request: IncomingMessage, response: any, config: Act
         riskProfile: input.riskProfile,
         optionsEnabled: input.optionsEnabled,
         maxCandidates: input.maxCandidates,
-        assetClass: input.assetClass
+        assetClass: input.assetClass,
+        confirmPaper: input.confirmPaper,
+        underlying: input.underlying,
+        dte: input.dte
+      },
+      {
+        startedAt,
+        finishedAt,
+        durationMs
       }
     );
 
-    const durationMs = Date.now() - startMs;
     logEntry({
       timestamp: new Date().toISOString(),
       action: config.action,
@@ -813,7 +1145,8 @@ const routeHandler = async (request: IncomingMessage, response: any, config: Act
       correlationId,
       code,
       message,
-      error instanceof EnvironmentGuardError ? error.guard : undefined
+      error instanceof EnvironmentGuardError ? error.guard : undefined,
+      error instanceof EnvironmentGuardError ? error.failedChecks : []
     );
     const durationMs = Date.now() - startMs;
 
@@ -830,7 +1163,7 @@ const routeHandler = async (request: IncomingMessage, response: any, config: Act
       status: "error",
       durationMs,
       resultSummary: "error",
-      error: message
+      error: redactSensitiveText(message)
     });
 
     response.statusCode = status;
@@ -884,7 +1217,7 @@ const requestListener = async (request: IncomingMessage, response: any) => {
           "unknown",
           randomUUID(),
           "CONTROL_ROUTE_HANDLER_ERROR",
-          error instanceof Error ? error.message : "Request handler failed."
+          redactSensitiveText(error instanceof Error ? error.message : "Request handler failed.")
         )
       )
     );

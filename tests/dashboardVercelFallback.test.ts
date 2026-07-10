@@ -40,6 +40,7 @@ const configureVercelPaperEnv = () => {
     "ALPACA_SECRET_KEY",
     "APCA_API_KEY_ID",
     "APCA_API_SECRET_KEY",
+    "DASHBOARD_ADMIN_TOKEN",
     "DASHBOARD_DATABASE_URL"
   ].forEach(deleteEnv);
 };
@@ -54,6 +55,7 @@ beforeEach(() => {
 afterEach(() => {
   deleteEnv("VERCEL");
   deleteEnv("RESEARCH_DB_PATH");
+  deleteEnv("DASHBOARD_ADMIN_TOKEN");
   deleteEnv("DASHBOARD_DATABASE_URL");
 });
 
@@ -161,12 +163,16 @@ describe("Vercel dashboard read-only fallback", () => {
   test("Vercel submit route stays disabled even when paper submit env vars are true", async () => {
     process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
     process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
+    process.env.DASHBOARD_ADMIN_TOKEN = "dashboard-admin-secret";
 
     const { POST } = await importRoute<{
       POST: (request: Request) => Promise<Response> | Response;
     }>("apps/dashboard/app/api/paper/execute/confirm/route.ts");
     const response = await POST(new Request("http://localhost/api/paper/execute/confirm", {
       method: "POST",
+      headers: {
+        authorization: "Bearer dashboard-admin-secret"
+      },
       body: JSON.stringify({ assetClass: "equity" })
     }));
     const { status, body } = await readJson(response);

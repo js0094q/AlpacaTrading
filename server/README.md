@@ -172,12 +172,26 @@ Before using Caddy:
 
 No public UI is deployed by these server bootstrap scripts. The optional paper-only dashboard lives in `apps/dashboard/` and must be deployed separately behind its documented paper guards.
 
-## Stop Future App Services
+## Cached hedge review routes
 
-No app services exist yet. When services are added later, stop them with:
+The control server exposes GET-only cached persistence reads at:
+
+```text
+/api/v1/hedge/risk
+/api/v1/hedge/regime
+/api/v1/hedge/recommendation
+```
+
+These routes do not spawn CLI commands, call broker order methods, or submit paper/live orders. The existing paper-ops moments may refresh a recommendation through the read-only service layer. Keep `HEDGE_PAPER_EXECUTION_ENABLED=false`; there is no hedge POST or execution route. Signed hedge plans are review artifacts, and put spreads remain blocked with `MULTI_LEG_EXECUTION_UNSUPPORTED`.
+
+## Stop App Services
+
+The VPS may run the paper-only dashboard control API and scheduled paper ops timers. Stop them before
+changing deployment artifacts, secrets, or security-relevant environment values:
 
 ```bash
-sudo systemctl stop <service-name>
+sudo systemctl stop alpaca-dashboard-control.service
+sudo systemctl stop paper-ops-morning.timer paper-ops-midday.timer paper-ops-late-day.timer
 docker compose -f /opt/alpaca-investing/app/docker-compose.yml down
 ```
 

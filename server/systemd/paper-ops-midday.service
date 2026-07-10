@@ -1,0 +1,18 @@
+[Unit]
+Description=Alpaca Paper Ops Midday Portfolio Review
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=alpaca
+Group=alpaca
+WorkingDirectory=/home/alpaca/Alpaca-Trading
+EnvironmentFile=/opt/alpaca-investing/secrets/alpaca.env
+Environment=PATH=/usr/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=NODE_ENV=production
+Environment=AUTOMATED_PAPER_EXECUTION_ENABLED=false
+ExecStart=/usr/bin/npm run paper:ops:midday -- --format=json
+TimeoutStartSec=300
+StandardOutput=append:/opt/alpaca-investing/logs/paper-ops-midday.log
+StandardError=append:/opt/alpaca-investing/logs/paper-ops-midday.error.log

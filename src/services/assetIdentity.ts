@@ -1,4 +1,5 @@
 import { normalizeSymbol } from "../lib/utils.js";
+import { parseOptionSymbol } from "./optionSymbolService.js";
 
 export type AssetIdentity =
   | {
@@ -21,8 +22,6 @@ type AssetLike = {
   underlying_symbol?: string | null;
 };
 
-const OPTION_SYMBOL_PATTERN = /^([A-Z]{1,6})(\d{6})([CP])(\d{8})$/;
-
 export const normalizeAssetClass = (value?: string | null): "equity" | "option" | null => {
   const normalized = String(value || "").trim().toLowerCase();
   if (["us_equity", "equity", "stock", "stocks"].includes(normalized)) {
@@ -35,13 +34,12 @@ export const normalizeAssetClass = (value?: string | null): "equity" | "option" 
 };
 
 export const optionUnderlyingFromSymbol = (symbol: string): string => {
-  const normalized = normalizeSymbol(symbol);
-  const match = OPTION_SYMBOL_PATTERN.exec(normalized);
-  return match?.[1] ?? "";
+  const parsed = parseOptionSymbol(symbol);
+  return parsed.ok ? parsed.underlying : "";
 };
 
 export const looksLikeOptionSymbol = (symbol: string): boolean =>
-  OPTION_SYMBOL_PATTERN.test(normalizeSymbol(symbol));
+  parseOptionSymbol(symbol).ok;
 
 export const getCandidateAssetIdentity = (candidate: AssetLike): AssetIdentity | null => {
   const assetClass = normalizeAssetClass(candidate.assetClass ?? candidate.asset_class);

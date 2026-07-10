@@ -49,6 +49,8 @@ const configureBridgeRuntime = () => {
   process.env.LIVE_TRADING_ENABLED = "false";
   process.env.PAPER_ORDER_EXECUTION_ENABLED = "false";
   process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "false";
+  process.env.AUTOMATED_PAPER_EXECUTION_ENABLED = "false";
+  process.env.ALPACA_PAPER_BASE_URL = "https://paper-api.alpaca.markets";
   process.env.VPS_CONTROL_BASE_URL = "https://vps.internal:4100";
   process.env.DASHBOARD_CONTROL_BASE_URL = "https://legacy-vps.example.com:4100";
   process.env.VPS_CONTROL_TOKEN = "bridge-secret";
@@ -161,6 +163,8 @@ describe("Vercel dashboard VPS bridge mode", () => {
   });
 
   test("mutating bridge call uses dashboard correlation token and does not reuse client token", async () => {
+    process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
+    process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
     const requestId = "client-correlation-id-007";
     const summaryPayload = {
       ok: true,
@@ -210,7 +214,83 @@ describe("Vercel dashboard VPS bridge mode", () => {
     assert.equal(calls[0].init.method, "POST");
   });
 
+  test("paper execution route fails closed before bridge when dashboard execution flag is disabled", async () => {
+    process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
+    const { POST } = await importRoute<{
+      POST: (request: Request) => Promise<Response> | Response;
+    }>("apps/dashboard/app/api/paper/execute/confirm/route.ts");
+
+    const response = await POST(new Request("http://localhost/api/paper/execute/confirm", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer dashboard-admin-secret"
+      },
+      body: JSON.stringify({
+        riskProfile: "aggressive",
+        optionsEnabled: true,
+        maxCandidates: 10,
+        assetClass: "all"
+      })
+    }));
+    const payload = (await response.json()) as {
+      ok: false;
+      error: { code: string; message: string };
+      checks: { paperExecutionEnabled: boolean; liveTradingEnabled: boolean };
+      failedChecks: string[];
+    };
+
+    assert.equal(response.status, 403);
+    assert.equal(payload.ok, false);
+    assert.equal(payload.error.code, "RUNTIME_PREFLIGHT_FAILED");
+    assert.equal(payload.error.message, "Runtime state does not permit this action.");
+    assert.equal(payload.checks.paperExecutionEnabled, false);
+    assert.equal(payload.checks.liveTradingEnabled, false);
+    assert.deepEqual(payload.failedChecks, ["paperExecutionEnabled"]);
+    assert.equal(calls.length, 0);
+  });
+
+  test("new paper actions route proxies to fixed VPS action path", async () => {
+    setMockFetchResponse({
+      ok: true,
+      status: "success",
+      action: "paper.actions.options.discover",
+      requestId: "vps-options-action",
+      correlationId: "client-options-action",
+      summary: { selected: 1 },
+      data: { status: "success", summary: { selected: 1 } }
+    });
+
+    const { POST } = await importRoute<{
+      POST: (request: Request) => Promise<Response> | Response;
+    }>("apps/dashboard/app/api/paper/actions/options/discover/route.ts");
+
+    const response = await POST(new Request("http://localhost/api/paper/actions/options/discover", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer dashboard-admin-secret",
+        "x-correlation-id": "client-options-action"
+      },
+      body: JSON.stringify({
+        underlying: "SPY",
+        dte: 0
+      })
+    }));
+    const payload = (await response.json()) as { ok: true; requestId: string };
+
+    assert.equal(response.status, 200);
+    assert.equal(payload.ok, true);
+    assert.equal(payload.requestId, "vps-options-action");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, "https://vps.internal:4100/api/v1/actions/options/discover");
+    assert.equal(headerValue(calls[0].init.headers, "authorization"), "Bearer bridge-secret");
+    assert.equal(headerValue(calls[0].init.headers, "x-correlation-id"), "client-options-action");
+  });
+
   test("bridge preserves structured VPS safety guard responses", async () => {
+    process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
+    process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
     setMockFetchResponse({
       ok: false,
       action: "execute.confirm",

@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Alpaca Paper Monitor reviewed entry execution after review windows
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09..15:5/30:00
+Persistent=false
+RandomizedDelaySec=30
+Unit=alpaca-paper-execute.service
+
+[Install]
+WantedBy=timers.target
+

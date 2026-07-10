@@ -95,6 +95,80 @@ button {
   line-height: 1.3;
 }
 
+.hedge-panel h3 {
+  margin: 0 0 10px;
+  font-size: 13px;
+}
+
+.hedge-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.hedge-header p {
+  margin: 4px 0 0;
+}
+
+.hedge-status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0 9px;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.hedge-status-current {
+  color: var(--accent);
+}
+
+.hedge-status-monitoring,
+.hedge-status-stale {
+  color: var(--warn);
+}
+
+.hedge-status-expired,
+.hedge-status-blocked {
+  color: var(--danger);
+}
+
+.hedge-metrics,
+.hedge-sections {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 18px;
+  margin-top: 14px;
+}
+
+.hedge-sections {
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.hedge-candidates {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.hedge-candidate {
+  display: grid;
+  grid-template-columns: minmax(180px, 1.3fr) 110px 80px 110px 130px minmax(180px, 1fr);
+  gap: 10px;
+  align-items: center;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  padding-top: 8px;
+  font-size: 12px;
+}
+
+.hedge-candidate:first-child {
+  border-top: 0;
+}
+
 .metric {
   display: grid;
   grid-template-columns: minmax(100px, 1fr) minmax(80px, auto);
@@ -173,6 +247,83 @@ button {
   gap: 8px;
 }
 
+.action-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.action-card {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-strong);
+  padding: 12px;
+}
+
+.action-card h3 {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.3;
+}
+
+.action-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.action-meta {
+  display: grid;
+  grid-template-columns: minmax(88px, auto) minmax(0, 1fr);
+  gap: 6px 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.action-meta strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-weight: 500;
+}
+
+.state-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #0f1115;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.state-pill.running {
+  color: var(--warn);
+}
+
+.state-pill.success {
+  color: var(--accent);
+}
+
+.state-pill.warning,
+.state-pill.blocked {
+  color: var(--warn);
+}
+
+.state-pill.failed {
+  color: var(--danger);
+}
+
 .action-button {
   min-height: 36px;
   border: 1px solid var(--line);
@@ -191,6 +342,28 @@ button {
 .action-button:disabled {
   cursor: wait;
   opacity: 0.65;
+}
+
+label input {
+  display: block;
+  width: min(420px, 100%);
+  min-height: 36px;
+  margin-top: 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #0b0c0f;
+  color: var(--text);
+  padding: 0 10px;
+}
+
+details {
+  min-width: 0;
+}
+
+summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .status {
@@ -238,6 +411,16 @@ pre {
   }
 
   .option-counts {
+    grid-template-columns: 1fr;
+  }
+
+  .action-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .hedge-metrics,
+  .hedge-sections,
+  .hedge-candidate {
     grid-template-columns: 1fr;
   }
 }

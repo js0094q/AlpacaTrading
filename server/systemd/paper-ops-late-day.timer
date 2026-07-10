@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Alpaca Paper Ops Late-Day Review at 3:15 PM ET on weekdays
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 15:15:00
+Persistent=false
+Unit=paper-ops-late-day.service
+
+[Install]
+WantedBy=timers.target

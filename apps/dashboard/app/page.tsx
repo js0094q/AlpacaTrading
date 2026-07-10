@@ -1,4 +1,8 @@
 import { ActionPanel } from "./components/ActionPanel";
+import {
+  HedgePanel,
+  type HedgeDashboardRecommendation
+} from "./components/HedgePanel";
 import { buildDashboardSnapshot, dashboardMoney, type DashboardSnapshot } from "../lib/data";
 
 export const dynamic = "force-dynamic";
@@ -171,6 +175,13 @@ export default async function DashboardPage() {
   const learningSummary = snapshot
     ? asResult<PaperLearningSummary>(snapshot.learningSummary as DashboardCaptureResult<PaperLearningSummary> | DashboardCaptureError)
     : null;
+  const hedge = snapshot
+    ? asResult<HedgeDashboardRecommendation | null>(
+        snapshot.hedge as
+          | DashboardCaptureResult<HedgeDashboardRecommendation | null>
+          | DashboardCaptureError
+      )
+    : null;
   const openOrderRows = openOrders?.ok ? openOrders.data.orders || [] : [];
   const optionRows = snapshot?.optionContracts || [];
   const promotionReadiness = (Array.isArray(snapshot?.promotionReadiness)
@@ -232,6 +243,11 @@ export default async function DashboardPage() {
             <p className="warning">{account?.error || "Unavailable"}</p>
           )}
         </div>
+
+        <HedgePanel
+          recommendation={hedge?.ok ? hedge.data : null}
+          error={hedge && !hedge.ok ? hedge.error : null}
+        />
 
         <div className="panel">
           <h2>Open Orders</h2>

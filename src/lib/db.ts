@@ -415,6 +415,74 @@ CREATE INDEX IF NOT EXISTS idx_paper_learning_records_strategy_status
 
 CREATE INDEX IF NOT EXISTS idx_paper_learning_records_option_symbol
   ON paper_learning_records(option_symbol);
+
+CREATE TABLE IF NOT EXISTS paper_operation_log (
+  id TEXT PRIMARY KEY,
+  action_type TEXT NOT NULL,
+  trigger_source TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  status TEXT NOT NULL,
+  request_id TEXT,
+  correlation_id TEXT,
+  command TEXT,
+  summary_json TEXT,
+  warnings_json TEXT,
+  blockers_json TEXT,
+  error_message TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_operation_log_started_at
+  ON paper_operation_log(started_at);
+
+CREATE TABLE IF NOT EXISTS paper_review_artifacts (
+  id TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  source_action TEXT NOT NULL,
+  status TEXT NOT NULL,
+  payload_signature TEXT NOT NULL,
+  payload_count INTEGER NOT NULL,
+  artifact_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_review_artifacts_created_at
+  ON paper_review_artifacts(created_at);
+
+CREATE TABLE IF NOT EXISTS portfolio_high_water_marks (
+  environment TEXT PRIMARY KEY,
+  equity REAL NOT NULL,
+  observed_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS portfolio_beta_cache (
+  symbol TEXT NOT NULL,
+  benchmark TEXT NOT NULL,
+  lookback_days INTEGER NOT NULL,
+  observation_interval TEXT NOT NULL,
+  minimum_observations INTEGER NOT NULL,
+  calculation_version TEXT NOT NULL,
+  latest_market_data_date TEXT NOT NULL,
+  beta REAL,
+  observations INTEGER NOT NULL,
+  data_start_date TEXT,
+  data_end_date TEXT,
+  status TEXT NOT NULL,
+  computed_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  PRIMARY KEY (
+    symbol,
+    benchmark,
+    lookback_days,
+    observation_interval,
+    minimum_observations,
+    calculation_version,
+    latest_market_data_date
+  )
+);
+
+CREATE INDEX IF NOT EXISTS idx_portfolio_beta_cache_expires_at
+  ON portfolio_beta_cache(expires_at);
 `;
 
 let database: DbHandle | null = null;

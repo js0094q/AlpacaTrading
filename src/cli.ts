@@ -51,19 +51,46 @@ import {
   formatPaperExecuteConfirmReportAsTable,
   formatPaperExecuteDryRunReportAsTable
 } from "./services/paperExecuteDryRunService.js";
+import { buildPaperReviewedPayloadExecutionReport } from "./services/paperReviewedPayloadExecutionService.js";
+import {
+  isReviewedPayloadSectionName,
+  type ReviewedPayloadSectionName
+} from "./services/paperReviewArtifactService.js";
 import {
   buildPaperRuntimeReport,
   formatPaperRuntimeReportAsTable
 } from "./services/paperRuntimeService.js";
 import { buildOptionsDiagnosticReport } from "./services/optionsDiagnosticService.js";
 import {
+  buildPaperPortfolioReviewReport,
+  formatPaperPortfolioReviewReportAsTable
+} from "./services/paperPortfolioReviewService.js";
+import {
+  buildPaperOptionsDiscoveryReport,
+  formatPaperOptionsDiscoveryReportAsTable
+} from "./services/paperOptionsDiscoveryService.js";
+import {
+  formatPaperOpsWorkflowReportAsTable,
+  runPaperOpsLateDay,
+  runPaperOpsMidday,
+  runPaperOpsMorning,
+  runPaperOpsReview
+} from "./services/paperOpsWorkflowService.js";
+import {
   buildPromotionReadinessAnalytics,
   evaluatePaperLearningRecords,
   paperLearningSummary
 } from "./services/paperLearningLedgerService.js";
 import { config } from "./config.js";
+import { redactSensitiveData } from "./lib/securityRedaction.js";
 import { normalizeSymbol } from "./lib/utils.js";
 import { AlpacaApiError } from "./services/alpacaClient.js";
+import { buildPortfolioRiskSnapshot } from "./services/portfolioRiskService.js";
+import { classifyMarketRegime } from "./services/marketRegimeService.js";
+import {
+  buildAndPersistHedgePlan,
+  buildAndPersistHedgeReview
+} from "./services/hedgeLearningService.js";
 
 const parseArg = (input: string): Record<string, string> | null => {
   const [rawKey, rawValue] = input.split("=", 2);
@@ -91,10 +118,11 @@ const parseList = (value?: string) =>
 
 const command = process.argv[2];
 const action = process.argv[3];
+const subaction = process.argv[4];
 const args = parseArgs(command?.includes(":") ? process.argv.slice(3) : process.argv.slice(4));
 
 const print = (payload: unknown) => {
-  process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+  process.stdout.write(`${JSON.stringify(redactSensitiveData(payload), null, 2)}\n`);
 };
 
 const boolArg = (value?: string) => value === "true" || value === "1";
@@ -115,6 +143,10 @@ const normalizePaperPlanFormat = (value?: string): "table" | "json" | undefined 
 };
 const normalizeAssetClass = (value?: string): "all" | "equity" | "option" | undefined => {
   return value === "equity" || value === "option" || value === "all" ? value : undefined;
+};
+const normalizeReviewedPayloadSections = (value?: string): ReviewedPayloadSectionName[] | undefined => {
+  const sections = parseList(value).filter(isReviewedPayloadSectionName);
+  return sections.length ? sections : undefined;
 };
 
 const appendReportAnalyticsSection = (
@@ -864,6 +896,221 @@ const run = async () => {
     return;
   }
 
+  if (
+    command === "paper:portfolio:review" ||
+    command === "paper:exit:review" ||
+    (command === "paper" && action === "portfolio" && subaction === "review")
+  ) {
+    const format = args.format;
+    const result = await buildPaperPortfolioReviewReport({
+      moment:
+        args.moment === "morning" ||
+        args.moment === "midday" ||
+        args.moment === "late_day" ||
+        args.moment === "manual"
+          ? args.moment
+          : "manual"
+    });
+
+    if (format === "json") {
+      print(result);
+      return;
+    }
+
+    print(formatPaperPortfolioReviewReportAsTable(result));
+    return;
+  }
+
+  if (
+    command === "paper:options:discover" ||
+    (command === "paper" && action === "options" && subaction === "discover")
+  ) {
+    const format = args.format;
+    const underlyings = args.underlyings ? parseList(args.underlyings) : undefined;
+    const result = await buildPaperOptionsDiscoveryReport({
+      underlying: args.underlying,
+      underlyings,
+      dte: toInt(args.dte, 0),
+      allowNextSessionPreparation:
+        args.nextSessionPreparation === undefined
+          ? undefined
+          : boolArg(args.nextSessionPreparation)
+    });
+
+    if (format === "json") {
+      print(result);
+      return;
+    }
+
+    print(formatPaperOptionsDiscoveryReportAsTable(result));
+    return;
+  }
+
+  if (
+    command === "paper:ops:morning" ||
+    (command === "paper" && action === "ops" && subaction === "morning")
+  ) {
+    const format = args.format;
+    const result = await runPaperOpsMorning({ triggerSource: "cli" });
+    if (format === "json") {
+      print(result);
+      return;
+    }
+    print(formatPaperOpsWorkflowReportAsTable(result));
+    return;
+  }
+
+  if (
+    command === "paper:ops:midday" ||
+    (command === "paper" && action === "ops" && subaction === "midday")
+  ) {
+    const format = args.format;
+    const result = await runPaperOpsMidday({ triggerSource: "cli" });
+    if (format === "json") {
+      print(result);
+      return;
+    }
+    print(formatPaperOpsWorkflowReportAsTable(result));
+    return;
+  }
+
+  if (
+    command === "paper:ops:late-day" ||
+    command === "paper:ops:late_day" ||
+    (command === "paper" && action === "ops" && (subaction === "late-day" || subaction === "late_day"))
+  ) {
+    const format = args.format;
+    const result = await runPaperOpsLateDay({ triggerSource: "cli" });
+    if (format === "json") {
+      print(result);
+      return;
+    }
+    print(formatPaperOpsWorkflowReportAsTable(result));
+    return;
+  }
+
+  if (
+    command === "paper:ops:review" ||
+    (command === "paper" && action === "ops" && subaction === "review")
+  ) {
+    const format = args.format;
+    const result = await runPaperOpsReview({ triggerSource: "cli" });
+    if (format === "json") {
+      print(result);
+      return;
+    }
+    print(formatPaperOpsWorkflowReportAsTable(result));
+    return;
+  }
+
+  if (command === "hedge:risk") {
+    const result = await buildPortfolioRiskSnapshot();
+    if (args.format === "json") {
+      print(result);
+      return;
+    }
+    print([
+      "Portfolio Hedge Risk",
+      `Environment: ${result.environment}`,
+      `Quality: ${result.dataQualityStatus}`,
+      `Portfolio beta: ${result.portfolioBeta ?? "unavailable"}`,
+      `Gross exposure: ${result.exposures.grossExposurePct ?? "unavailable"}`,
+      `Option delta contract coverage: ${result.optionDataCoverage.contractDeltaCoveragePct ?? "unavailable"}`,
+      `Option delta market-value coverage: ${result.optionDataCoverage.marketValueDeltaCoveragePct ?? "unavailable"}`,
+      `Warnings: ${result.warnings.join(", ") || "none"}`,
+      `Blockers: ${result.blockers.join(", ") || "none"}`,
+      "Read-only analysis. No orders were submitted."
+    ].join("\n"));
+    return;
+  }
+
+  if (command === "hedge:regime") {
+    const result = classifyMarketRegime();
+    if (args.format === "json") {
+      print(result);
+      return;
+    }
+    print([
+      "Portfolio Hedge Market Regime",
+      `Regime: ${result.regime}`,
+      `Rule: ${result.selectedRule}`,
+      `Quality: ${result.dataQualityStatus}`,
+      `Warnings: ${result.warnings.join(", ") || "none"}`,
+      "Read-only analysis. No orders were submitted."
+    ].join("\n"));
+    return;
+  }
+
+  if (command === "hedge:review") {
+    const result = await buildAndPersistHedgeReview({ triggerSource: "cli" });
+    if (args.format === "json") {
+      print(result);
+      return;
+    }
+    print([
+      "Portfolio Hedge Review",
+      `Status: ${result.status}`,
+      `Decision: ${result.recommendation.decision}`,
+      `Calculated risk score: ${result.score.total}`,
+      `Calculated band: ${result.score.band}`,
+      `Measurement status: ${result.score.measurementStatus}`,
+      `Effective risk band: ${result.score.effectiveBand}`,
+      `Regime: ${result.regime.regime}`,
+      `Warnings: ${result.warnings.join(", ") || "none"}`,
+      `Blockers: ${result.blockers.join(", ") || "none"}`,
+      "Read-only analysis. No orders were submitted."
+    ].join("\n"));
+    return;
+  }
+
+  if (command === "hedge:plan") {
+    const result = await buildAndPersistHedgePlan({
+      paperOnly: flagArg(args.paperOnly),
+      triggerSource: "cli"
+    });
+    if (args.format === "json") {
+      print(result);
+      return;
+    }
+    print([
+      "Portfolio Hedge Plan",
+      `Status: ${result.status}`,
+      `Plan: ${result.artifact?.planId || "none"}`,
+      `Expires: ${result.artifact?.expiresAt || "not-created"}`,
+      `Warnings: ${result.warnings.join(", ") || "none"}`,
+      `Blockers: ${result.blockers.join(", ") || "none"}`,
+      "Planning artifact only. Execution is not implemented. No orders were submitted."
+    ].join("\n"));
+    return;
+  }
+
+  if (command === "paper:execute:reviewed") {
+    const format = args.format;
+    const result = await buildPaperReviewedPayloadExecutionReport({
+      confirmPaper: flagArg(args.confirmPaper),
+      expectedPayloadSignature: args.expectedPayloadSignature,
+      sections: normalizeReviewedPayloadSections(args.sections)
+    });
+
+    if (format === "json") {
+      print(result);
+      return;
+    }
+
+    print([
+      "Paper Execute Reviewed Payloads",
+      `Status: ${result.status}`,
+      `Reason: ${result.reason || "none"}`,
+      `Artifact: ${result.artifactId || "none"}`,
+      `Reviewed payloads: ${result.summary.reviewedPayloads}`,
+      `Submitted: ${result.summary.submitted}`,
+      `Blocked: ${result.summary.blocked}`,
+      `Errors: ${result.summary.errors}`,
+      "Reviewed-payload execution is paper-only and requires --confirmPaper."
+    ].join("\n"));
+    return;
+  }
+
   if (command === "paper:plan" || (command === "paper" && action === "plan")) {
     const format = args.format;
     const result = await buildPaperPlanReport({
@@ -1065,7 +1312,7 @@ const run = async () => {
 
   print({
     error:
-      "Unknown command. See README for available commands including universe/data/options/features/targets/backtest/learn/research/alpaca:config/paper (including paper:analytics, paper:learn, paper:execute, paper:review, paper:plan, paper:snapshots, paper:trends, paper:runtime, paper:intel).",
+      "Unknown command. See README for available commands including universe/data/options/features/targets/backtest/learn/research/alpaca:config/paper (including paper:analytics, paper:learn, paper:execute, paper:review, paper:plan, paper:portfolio:review, paper:exit:review, paper:options:discover, paper:ops:morning, paper:ops:midday, paper:ops:late-day, paper:snapshots, paper:trends, paper:runtime, paper:intel).",
     command,
     action,
     config

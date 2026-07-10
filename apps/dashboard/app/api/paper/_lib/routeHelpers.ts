@@ -1,6 +1,7 @@
 import {
   DashboardGuardError,
   assertDashboardAdminToken,
+  assertDashboardRuntimePreflight,
   assertPaperDashboardAccess,
   assertPaperOptionsSubmissionEnabled,
   assertPaperOrderSubmissionEnabled,
@@ -8,6 +9,8 @@ import {
   sanitizeDashboardError
 } from "../../../../lib/guards";
 import { parsePaperActionInput, type PaperActionInput } from "../../../../lib/data";
+import { redactSensitiveData, redactSensitiveText } from "../../../../../../src/lib/securityRedaction";
+import type { RuntimeMutationActionType } from "../../../../../../src/services/runtimeMutationPreflight";
 import {
   buildVercelHistoricalFallback,
   isPaperDashboardBridgeEnabled,
@@ -53,15 +56,15 @@ const parseVpsError = (payload: unknown) => {
     const error = (payload as { error: unknown }).error;
     if (error && typeof error === "object") {
       if ("message" in error && typeof (error as { message?: unknown }).message === "string") {
-        return (error as { message: string }).message;
+        return redactSensitiveText((error as { message: string }).message);
       }
       if ("code" in error) {
-        return `Control error ${(error as { code?: unknown }).code}`;
+        return redactSensitiveText(`Control error ${(error as { code?: unknown }).code}`);
       }
-      return JSON.stringify(error);
+      return redactSensitiveText(JSON.stringify(error));
     }
     if (typeof error === "string") {
-      return error;
+      return redactSensitiveText(error);
     }
   }
   return null;
@@ -71,11 +74,69 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
   Boolean(value && typeof value === "object");
 
 const noStoreVpsControlJson = (payload: unknown) => {
-  if (isRecord(payload) && typeof payload._status === "number") {
-    const { _status, ...body } = payload;
+  const redactedPayload = redactSensitiveData(payload);
+  if (isRecord(redactedPayload) && typeof redactedPayload._status === "number") {
+    const { _status, ...body } = redactedPayload;
     return noStoreJson(body, { status: _status });
   }
-  return noStoreJson(payload);
+  return noStoreJson(redactedPayload);
+};
+
+const inferRuntimeActionType = (
+  vpsPath: string | undefined,
+  options: {
+    requireOrderSubmission?: boolean;
+  }
+): RuntimeMutationActionType => {
+  if (vpsPath?.includes("/execute/confirm") || vpsPath?.includes("/actions/execute")) {
+    return "confirmed-paper-execution";
+  }
+  if (vpsPath?.includes("/execute/dry-run")) {
+    return "dry-run-execution";
+  }
+  if (vpsPath?.includes("/actions/options/discover")) {
+    return "options-discovery";
+  }
+  if (vpsPath?.includes("/actions/portfolio/review")) {
+    return "portfolio-review";
+  }
+  if (vpsPath?.includes("/actions/learn/run")) {
+    return "learning";
+  }
+  if (vpsPath?.includes("/review") || vpsPath?.includes("/plan") || vpsPath?.includes("/refresh")) {
+    return "review";
+  }
+  if (options.requireOrderSubmission) {
+    return "confirmed-paper-execution";
+  }
+  return "research";
+};
+
+const assertDashboardMutationPreflight = (
+  input: PaperActionInput,
+  options: {
+    requireOrderSubmission?: boolean;
+    vpsPath?: string;
+  }
+) => {
+  const actionType = inferRuntimeActionType(options.vpsPath, options);
+  const isConfirmRoute = options.vpsPath?.includes("/execute/confirm") === true;
+  const isReviewedExecutionRoute = options.vpsPath?.includes("/actions/execute") === true;
+  const confirmPaper =
+    actionType !== "confirmed-paper-execution" ||
+    isConfirmRoute ||
+    input.confirmPaper === true;
+  const requireOptionsExecution =
+    actionType === "confirmed-paper-execution" &&
+    (isReviewedExecutionRoute ||
+      input.optionsEnabled !== false ||
+      input.assetClass === "option");
+
+  return assertDashboardRuntimePreflight({
+    actionType,
+    confirmPaper,
+    requireOptionsExecution
+  });
 };
 
 const callVpsControl = async (
@@ -129,7 +190,10 @@ const callVpsControl = async (
     try {
       payload = raw ? JSON.parse(raw) : null;
     } catch {
-      payload = { ok: false, error: raw || "VPS control response was not JSON" };
+      payload = {
+        ok: false,
+        error: redactSensitiveText(raw || "VPS control response was not JSON")
+      };
     }
 
     if (!response.ok && isRecord(payload)) {
@@ -144,7 +208,7 @@ const callVpsControl = async (
       const message =
         parseVpsError(payload) ||
         (payload && typeof payload === "object" && "error" in payload
-          ? String((payload as { error: unknown }).error)
+          ? redactSensitiveText(String((payload as { error: unknown }).error))
           : "VPS control request failed.");
       throw new DashboardGuardError("DASHBOARD_CONTROL_PROXY_ERROR", message, response.status);
     }
@@ -251,8 +315,18 @@ export const guardedPost = async (
     assertPaperDashboardAccess();
     const normalizedRequest = normalizeRequest(request);
     const input = await readActionInput(normalizedRequest);
+    const requireAdminToken = options.requireAdminToken !== false;
 
     const useBridge = isPaperDashboardBridgeEnabled() && Boolean(options.vpsPath);
+    if (requireAdminToken) {
+      assertDashboardAdminToken(adminTokenFromRequest(normalizedRequest));
+    }
+
+    assertDashboardMutationPreflight(input, {
+      requireOrderSubmission: options.requireOrderSubmission,
+      vpsPath: options.vpsPath
+    });
+
     if (options.requireOrderSubmission && !useBridge) {
       assertPaperOrderSubmissionEnabled();
     }
@@ -264,13 +338,9 @@ export const guardedPost = async (
       assertPaperOptionsSubmissionEnabled();
     }
 
-    if (options.requireAdminToken) {
-      assertDashboardAdminToken(adminTokenFromRequest(normalizedRequest));
-    }
-
     if (useBridge) {
       const response = await guardForVpsBridge(normalizedRequest, "POST", options.vpsPath!, {
-        requireAdmin: options.requireAdminToken,
+        requireAdmin: requireAdminToken,
         timeoutMs: options.timeoutMs,
         input
       });
@@ -300,6 +370,16 @@ export const guardedHistoricalPost = async (
     const normalizedRequest = normalizeRequest(request);
     const input = await readActionInput(normalizedRequest);
     const useBridge = isPaperDashboardBridgeEnabled() && Boolean(options.vpsPath);
+    const requireAdminToken = options.requireAdminToken !== false;
+
+    if (requireAdminToken) {
+      assertDashboardAdminToken(adminTokenFromRequest(normalizedRequest));
+    }
+
+    assertDashboardMutationPreflight(input, {
+      requireOrderSubmission: options.requireOrderSubmission,
+      vpsPath: options.vpsPath
+    });
 
     if (options.requireOrderSubmission && !useBridge) {
       assertPaperOrderSubmissionEnabled();
@@ -312,17 +392,13 @@ export const guardedHistoricalPost = async (
       assertPaperOptionsSubmissionEnabled();
     }
 
-    if (options.requireAdminToken) {
-      assertDashboardAdminToken(adminTokenFromRequest(normalizedRequest));
-    }
-
     if (shouldUseVercelReadOnlyFallback()) {
       return noStoreJson(buildVercelHistoricalFallback([]));
     }
 
     if (isPaperDashboardBridgeEnabled() && options.vpsPath) {
       const response = await guardForVpsBridge(normalizedRequest, "POST", options.vpsPath, {
-        requireAdmin: options.requireAdminToken,
+        requireAdmin: requireAdminToken,
         timeoutMs: options.timeoutMs,
         input
       });

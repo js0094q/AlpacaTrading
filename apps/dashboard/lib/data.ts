@@ -21,6 +21,10 @@ export interface PaperActionInput {
   optionsEnabled?: boolean;
   maxCandidates?: number;
   assetClass?: "all" | "equity" | "option";
+  confirmPaper?: boolean;
+  expectedPayloadSignature?: string;
+  underlying?: string;
+  dte?: number;
 }
 
 const numberOrNull = (value: unknown): number | null => {
@@ -63,6 +67,7 @@ type PaperBridgeSummary = {
   promotionReadiness?: unknown;
   optionContracts?: unknown;
   requestIds?: unknown;
+  hedge?: unknown;
 };
 
 const normalizeOpenOrdersRows = (value: unknown): unknown[] => {
@@ -122,6 +127,7 @@ export interface DashboardSnapshot {
   promotionReadiness: unknown[];
   optionContracts: OptionContractDashboardRow[];
   requestIds: unknown[];
+  hedge: DashboardResult<unknown>;
 }
 
 export type OptionContractDisplayCategory = "Discovered" | "Quoted" | "Executable" | "Rejected";
@@ -251,7 +257,17 @@ export const parsePaperActionInput = (value: unknown): PaperActionInput => {
     optionsEnabled:
       typeof record.optionsEnabled === "boolean" ? record.optionsEnabled : true,
     maxCandidates: safeLimit(record.maxCandidates, 10, 50),
-    assetClass: normalizeAssetClass(record.assetClass)
+    assetClass: normalizeAssetClass(record.assetClass),
+    confirmPaper: record.confirmPaper === true,
+    expectedPayloadSignature:
+      typeof record.expectedPayloadSignature === "string"
+        ? record.expectedPayloadSignature
+        : undefined,
+    underlying:
+      typeof record.underlying === "string" && record.underlying.trim()
+        ? record.underlying.trim().toUpperCase()
+        : "SPY",
+    dte: safeLimit(record.dte, 0, 30)
   };
 };
 
@@ -472,6 +488,147 @@ const historicalUnavailable = (label: string) => ({
   error: VERCEL_HISTORICAL_UNAVAILABLE_MESSAGE
 });
 
+const cachedSummaryUnavailable = (label: string) => ({
+  ok: false as const,
+  label,
+  error: "Fresh runtime generation is available from the dedicated action endpoints."
+});
+
+const DASHBOARD_CACHED_SECTION_TIMEOUT_MS = 8_000;
+
+const captureWithTimeout = async <T>(
+  label: string,
+  fn: () => Promise<T> | T,
+  timeoutMs = DASHBOARD_CACHED_SECTION_TIMEOUT_MS
+): Promise<DashboardResult<T>> => {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    const operation = Promise.resolve()
+      .then(fn)
+      .then((data) => ({ ok: true as const, label, data }))
+      .catch((error) => ({
+        ok: false as const,
+        label,
+        error:
+          error instanceof Error &&
+          /Missing Alpaca paper credentials/.test(error.message)
+            ? "DASHBOARD_ALPACA_ENV_NOT_CONFIGURED"
+            : "Unavailable. Confirm paper environment, credentials, and local DB access."
+      }));
+
+    const timeout = new Promise<DashboardResultError>((resolve) => {
+      timer = setTimeout(() => {
+        resolve({
+          ok: false,
+          label,
+          error: `Unavailable after ${timeoutMs}ms. Use the dedicated action endpoint for a fresh read.`
+        });
+      }, timeoutMs);
+    });
+
+    return await Promise.race([operation, timeout]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+};
+
+const rowsOrEmpty = async <T>(fn: () => Promise<T[]> | T[]): Promise<T[]> => {
+  try {
+    return await fn();
+  } catch {
+    return [];
+  }
+};
+
+const cachedPlanResult = (latestPlans: unknown[]): DashboardSnapshot["plan"] => ({
+  ok: true,
+  label: "plan",
+  data: {
+    plan: latestPlans.map((row, index) => {
+      const record = row && typeof row === "object" ? row as Record<string, unknown> : {};
+      const strategy = [record.direction, record.expression, record.option_symbol]
+        .map((entry) => typeof entry === "string" ? entry : "")
+        .filter(Boolean)
+        .join(" / ");
+      return {
+        symbol: typeof record.symbol === "string" ? record.symbol : "-",
+        decision:
+          typeof record.status === "string"
+            ? record.status
+            : typeof record.direction === "string"
+              ? record.direction
+              : "-",
+        latestRank: index + 1,
+        strategy: strategy || null,
+        estimatedNotional:
+          numberOrNull(record.estimated_max_loss) ??
+          numberOrNull(record.estimated_max_profit)
+      };
+    })
+  }
+});
+
+const cachedReviewAndDryRun = async (): Promise<{
+  review: DashboardSnapshot["review"];
+  dryRun: DashboardSnapshot["dryRun"];
+}> => {
+  const {
+    latestPaperReviewArtifact,
+    isPaperReviewArtifactFresh
+  } = await import("../../../src/services/paperReviewArtifactService");
+  const artifact = latestPaperReviewArtifact();
+  if (!artifact) {
+    return {
+      review: {
+        ok: false,
+        label: "review",
+        error: "No reviewed payload artifact is available yet."
+      },
+      dryRun: {
+        ok: false,
+        label: "dryRun",
+        error: "No reviewed payload artifact is available yet."
+      }
+    };
+  }
+
+  const fresh = isPaperReviewArtifactFresh(artifact);
+  const staleWarning = fresh ? [] : ["REVIEW_STALE_OR_PAYLOAD_CHANGED"];
+  const warnings = [...artifact.artifact.warnings, ...staleWarning];
+  const blockers = artifact.artifact.blockers;
+  const status = fresh ? artifact.status : "warning";
+
+  return {
+    review: {
+      ok: true,
+      label: "review",
+      data: {
+        review: {
+          status,
+          blockers,
+          warnings
+        },
+        planSummary: {
+          plannedOrders: artifact.payloadCount
+        }
+      }
+    },
+    dryRun: {
+      ok: true,
+      label: "dryRun",
+      data: {
+        summary: {
+          wouldSubmitCount: artifact.payloadCount,
+          payloadsBlocked: blockers.length
+        },
+        assetClass: "all"
+      }
+    }
+  };
+};
+
 export const latestPaperExecutions = async (limit = 50) => {
   if (shouldUseVercelReadOnlyFallback()) {
     return [];
@@ -500,6 +657,121 @@ const latestPaperRecommendationSnapshots = async (limit = 10) => {
   return listPaperRecommendationSnapshots({ limit });
 };
 
+export const latestHedgeDashboardRecommendation = async () => {
+  const { latestHedgeRecommendationForCurrentConfig } = await import(
+    "../../../src/services/hedgePersistenceService"
+  );
+  return latestHedgeRecommendationForCurrentConfig();
+};
+
+export const latestHedgeDashboardRisk = async () => {
+  const recommendation = await latestHedgeDashboardRecommendation();
+  return {
+    paperOnly: true,
+    effectiveStatus: recommendation?.effectiveStatus ?? "blocked",
+    generatedAt: recommendation?.generatedAt ?? null,
+    expiresAt: recommendation?.expiresAt ?? null,
+    risk: recommendation?.risk ?? null,
+    warnings: recommendation?.integrityWarnings ?? ["NO_HEDGE_RECOMMENDATION"],
+    blockers: recommendation ? [] : ["NO_HEDGE_RECOMMENDATION"]
+  };
+};
+
+export const latestHedgeDashboardRegime = async () => {
+  const recommendation = await latestHedgeDashboardRecommendation();
+  return {
+    paperOnly: true,
+    effectiveStatus: recommendation?.effectiveStatus ?? "blocked",
+    generatedAt: recommendation?.generatedAt ?? null,
+    expiresAt: recommendation?.expiresAt ?? null,
+    regime: recommendation?.regime ?? null,
+    warnings: recommendation?.integrityWarnings ?? ["NO_HEDGE_RECOMMENDATION"],
+    blockers: recommendation ? [] : ["NO_HEDGE_RECOMMENDATION"]
+  };
+};
+
+export const buildCachedDashboardSnapshot = async (): Promise<DashboardSnapshot> => {
+  const state = assertPaperDashboardAccess();
+
+  const [account, positions, openOrders, latestResearch, latestPlans, executions, snapshots, requestIds] =
+    await Promise.all([
+      captureWithTimeout("account", () => getAlpacaAccountSnapshot()),
+      captureWithTimeout("positions", () => listAlpacaPositions()),
+      captureWithTimeout("openOrders", () => listAlpacaOpenOrders()),
+      rowsOrEmpty(() => latestResearchRuns(5)),
+      rowsOrEmpty(() => latestPaperPlans(10)),
+      captureWithTimeout("executions", () => latestPaperExecutions(25)),
+      rowsOrEmpty(() => latestPaperRecommendationSnapshots(10)),
+      rowsOrEmpty(() => latestApiRequestIds(12))
+    ]);
+
+  const [reviewDryRun, learningSummary, promotionReadiness, hedge] = await Promise.all([
+    captureWithTimeout("review", () => cachedReviewAndDryRun(), 3_000),
+    captureWithTimeout("learningSummary", async () => {
+      const { paperLearningSummary } = await import(
+        "../../../src/services/paperLearningLedgerService"
+      );
+      return paperLearningSummary();
+    }, 3_000),
+    Promise.resolve()
+      .then(async () => {
+        const service = await import("../../../src/services/paperLearningLedgerService");
+        return service.buildPromotionReadinessAnalytics();
+      })
+      .catch(() => []),
+    captureWithTimeout(
+      "hedge",
+      () => latestHedgeDashboardRecommendation(),
+      3_000
+    )
+  ]);
+
+  const review =
+    reviewDryRun.ok
+      ? reviewDryRun.data.review
+      : {
+          ok: false as const,
+          label: "review",
+          error: reviewDryRun.error
+        };
+  const dryRun =
+    reviewDryRun.ok
+      ? reviewDryRun.data.dryRun
+      : {
+          ok: false as const,
+          label: "dryRun",
+          error: reviewDryRun.error
+        };
+
+  return {
+    paperOnly: true,
+    environment: state.alpacaEnv,
+    liveTradingEnabled: state.liveTradingEnabled,
+    generatedAt: new Date().toISOString(),
+    mode: "vps-cached-summary",
+    historicalDataAvailable: true,
+    durableStorageConfigured: false,
+    historicalWarning: null,
+    durableStorageWarning: null,
+    account,
+    positions,
+    runtime: cachedSummaryUnavailable("runtime"),
+    plan: cachedPlanResult(latestPlans),
+    review,
+    dryRun,
+    openOrders,
+    latestResearch,
+    latestPaperPlans: latestPlans,
+    snapshots,
+    executions,
+    learningSummary,
+    promotionReadiness: Array.isArray(promotionReadiness) ? promotionReadiness : [],
+    optionContracts: [],
+    requestIds,
+    hedge
+  } as DashboardSnapshot;
+};
+
 export const buildDashboardSnapshot = async (): Promise<DashboardSnapshot> => {
   const state = assertPaperDashboardAccess();
 
@@ -509,7 +781,8 @@ export const buildDashboardSnapshot = async (): Promise<DashboardSnapshot> => {
       ...bridgeSummary,
       generatedAt: bridgeSummary.generatedAt || new Date().toISOString(),
       paperOnly: true,
-      mode: bridgeSummary.mode || VERCEL_READ_ONLY_MODE
+      mode: bridgeSummary.mode || VERCEL_READ_ONLY_MODE,
+      hedge: bridgeSummary.hedge ?? historicalUnavailable("hedge")
     } as DashboardSnapshot;
   }
 
@@ -544,11 +817,12 @@ export const buildDashboardSnapshot = async (): Promise<DashboardSnapshot> => {
       learningSummary: historicalUnavailable("learningSummary"),
       promotionReadiness: [],
       optionContracts: [],
-      requestIds: []
+      requestIds: [],
+      hedge: historicalUnavailable("hedge")
     };
   }
 
-  const [account, positions, openOrders, runtime, plan, review, dryRun, executions, learningSummary] =
+  const [account, positions, openOrders, runtime, plan, review, dryRun, executions, learningSummary, hedge] =
     await Promise.all([
       capture("account", () => getAlpacaAccountSnapshot()),
       capture("positions", () => listAlpacaPositions()),
@@ -601,7 +875,8 @@ export const buildDashboardSnapshot = async (): Promise<DashboardSnapshot> => {
           "../../../src/services/paperLearningLedgerService"
         );
         return paperLearningSummary();
-      })
+      }),
+      capture("hedge", () => latestHedgeDashboardRecommendation())
     ]);
   const [
     latestResearch,
@@ -702,6 +977,64 @@ export const runPaperConfirm = async (input: PaperActionInput) => {
     optionsEnabled: input.optionsEnabled,
     maxCandidates: input.maxCandidates,
     assetClass: input.assetClass
+  });
+};
+
+export const runPaperLearningCommit = async () => {
+  const service = await import("../../../src/services/paperLearningLedgerService");
+  const evaluation = service.evaluatePaperLearningRecords({ limit: 100 });
+  return {
+    paperOnly: true,
+    status: "success",
+    summary: {
+      evaluatedRows: evaluation.evaluated,
+      submittedRows: 0,
+      pendingRows: evaluation.stillPending,
+      promotedSignals: service.paperLearningSummary().promoted,
+      demotedSignals: service.paperLearningSummary().rejected,
+      skippedReasons: evaluation.pendingReasons.slice(0, 20)
+    },
+    evaluation,
+    learningSummary: service.paperLearningSummary(),
+    promotionReadiness: service.buildPromotionReadinessAnalytics(),
+    blockers: [],
+    warnings: []
+  };
+};
+
+export const runPaperPortfolioReview = async (input: PaperActionInput) => {
+  const { buildPaperPortfolioReviewReport } = await import(
+    "../../../src/services/paperPortfolioReviewService"
+  );
+  return buildPaperPortfolioReviewReport({
+    moment: "manual"
+  });
+};
+
+export const runPaperOptionsDiscovery = async (input: PaperActionInput) => {
+  const { buildPaperOptionsDiscoveryReport } = await import(
+    "../../../src/services/paperOptionsDiscoveryService"
+  );
+  return buildPaperOptionsDiscoveryReport({
+    underlying: input.underlying,
+    dte: input.dte
+  });
+};
+
+export const runPaperOpsReviewAction = async () => {
+  const { runPaperOpsReview } = await import(
+    "../../../src/services/paperOpsWorkflowService"
+  );
+  return runPaperOpsReview({ triggerSource: "dashboard" });
+};
+
+export const runPaperReviewedExecution = async (input: PaperActionInput) => {
+  const { buildPaperReviewedPayloadExecutionReport } = await import(
+    "../../../src/services/paperReviewedPayloadExecutionService"
+  );
+  return buildPaperReviewedPayloadExecutionReport({
+    confirmPaper: input.confirmPaper,
+    expectedPayloadSignature: input.expectedPayloadSignature
   });
 };
 

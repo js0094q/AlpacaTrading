@@ -6,6 +6,21 @@ The repository now includes a paper control service template for the VPS dashboa
 
 - `dashboard-control.service` — runs `server/dashboard-control/server.ts` as `alpaca` using `.env` from
   `/opt/alpaca-investing/secrets/alpaca.env`.
+- `paper-ops-morning.service` / `.timer` — runs `npm run paper:ops:morning -- --format=json`
+  on weekdays around 8:30 AM ET.
+- `paper-ops-midday.service` / `.timer` — runs `npm run paper:ops:midday -- --format=json`
+  on weekdays around 12:00 PM ET.
+- `paper-ops-late-day.service` / `.timer` — runs `npm run paper:ops:late-day -- --format=json`
+  on weekdays around 3:15 PM ET.
+- `alpaca-paper-review.service` / `.timer` — runs `npm run paper:monitor -- --task=review`
+  every 30 minutes during weekday market-hour windows.
+- `alpaca-paper-execute.service` / `.timer` — runs reviewed entry execution through
+  `npm run paper:monitor -- --task=execute`.
+- `alpaca-paper-exit-review.service` / `.timer` — runs reviewed exit checks for equities,
+  generic options, LEAPS, and final-hour 0DTE exits every 15 minutes and every 5 minutes
+  during the final hour.
+- `alpaca-paper-exit-execute.service` / `.timer` — runs reviewed exit execution through
+  `npm run paper:monitor -- --task=exit-execute`.
 
 ## Installing and enabling the control API service
 
@@ -25,6 +40,50 @@ After install, verify control API health:
 ```bash
 curl -sS -H "Authorization: Bearer $VPS_CONTROL_TOKEN" http://127.0.0.1:4100/api/v1/health | cat
 ```
+
+## Installing paper ops timers
+
+Set or confirm the VPS timezone before enabling timer units:
+
+```bash
+timedatectl status
+sudo timedatectl set-timezone America/New_York
+```
+
+Install timers:
+
+```bash
+sudo cp /home/alpaca/Alpaca-Trading/server/systemd/paper-ops-morning.service /etc/systemd/system/paper-ops-morning.service
+sudo cp /home/alpaca/Alpaca-Trading/server/systemd/paper-ops-morning.timer /etc/systemd/system/paper-ops-morning.timer
+sudo cp /home/alpaca/Alpaca-Trading/server/systemd/paper-ops-midday.service /etc/systemd/system/paper-ops-midday.service
+sudo cp /home/alpaca/Alpaca-Trading/server/systemd/paper-ops-midday.timer /etc/systemd/system/paper-ops-midday.timer
+sudo cp /home/alpaca/Alpaca-Trading/server/systemd/paper-ops-late-day.service /etc/systemd/system/paper-ops-late-day.service
+sudo cp /home/alpaca/Alpaca-Trading/server/systemd/paper-ops-late-day.timer /etc/systemd/system/paper-ops-late-day.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now paper-ops-morning.timer paper-ops-midday.timer paper-ops-late-day.timer
+systemctl list-timers 'paper-ops-*' --no-pager
+```
+
+Timer services set `AUTOMATED_PAPER_EXECUTION_ENABLED=false`, so scheduled workflows stop at review payload generation.
+
+## Installing continuous paper monitor timers
+
+The continuous monitor uses reviewed artifacts only and separates entry execution from exit execution by payload section.
+
+```bash
+sudo bash /home/alpaca/Alpaca-Trading/scripts/install-paper-monitoring-systemd.sh
+systemctl list-timers 'alpaca-paper-*' --no-pager
+```
+
+Disable:
+
+```bash
+sudo bash /home/alpaca/Alpaca-Trading/scripts/disable-paper-monitoring-systemd.sh
+```
+
+The monitor runner fails closed unless the runtime env remains paper-only and live-off. Execution services set
+`AUTOMATED_PAPER_EXECUTION_ENABLED=true`, but the runner also requires `PAPER_ORDER_EXECUTION_ENABLED=true`,
+`PAPER_OPTIONS_EXECUTION_ENABLED=true`, and the reviewed executor's `--confirmPaper` boundary.
 
 ## Service operating guidance
 

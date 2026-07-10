@@ -18,9 +18,15 @@
   - `DASHBOARD_ADMIN_TOKEN` should be confirmed in Vercel production for dashboard admin/mutating routes.
 - Verified dashboard bridge state:
   - Public summary and refresh routes reach the VPS control service and return paper-only state.
-  - Dashboard page summary loads use the VPS summary bridge with a 30 second timeout; slow summary reads should not be labeled as environment-guard failures.
+  - Dashboard page summary loads use the VPS cached summary bridge with a 30 second timeout; fresh plan/review/dry-run generation remains on explicit protected action routes.
   - Public `POST /api/paper/research/run` completes with valid admin auth using bounded control-service research defaults.
   - Latest review is a clean no-op because all current equity candidates are already held in paper positions, so no eligible payloads exist.
+- Paper trading operations layer:
+  - Dashboard section: `Paper Trading Controls`.
+  - Vercel action routes proxy to allowlisted VPS routes under `/api/v1/actions/*`.
+  - `paper:ops:review` persists the latest reviewed payload artifact with separated sections for equity buys, equity adds, equity sells, option buys, and option sell-to-close exits.
+  - `paper:execute:reviewed -- --confirmPaper` executes only the latest fresh reviewed payload artifact and refuses stale or signature-mismatched payloads.
+  - Scheduled ops are systemd timers on the VPS; default automation stops at review payload generation.
 - Fast resume command sequence:
   - `ssh njalla-vps`
   - load Node 22 and secrets from `/opt/alpaca-investing/secrets/alpaca.env`
@@ -116,6 +122,17 @@ PAPER_LEAPS_MIN_DTE=180
 PAPER_LEAPS_MAX_DTE=730
 PAPER_LEAPS_MAX_SPREAD_PCT=15
 PAPER_LEAPS_HARD_SPREAD_CAP_ENABLED=false
+LEAPS_MIN_DTE_AT_ENTRY=270
+LEAPS_DTE_EXIT_THRESHOLD=180
+LEAPS_REVIEW_LOSS_PCT=-20
+LEAPS_HARD_STOP_LOSS_PCT=-35
+LEAPS_PARTIAL_PROFIT_TAKE_PCT=75
+LEAPS_FULL_PROFIT_TAKE_PCT=125
+LEAPS_TREND_REVIEW_SMA=100
+LEAPS_SEVERE_TREND_EXIT_SMA=200
+LEAPS_MAX_BID_ASK_SPREAD_PCT=20
+LEAPS_MIN_DELTA_REVIEW=0.45
+LEAPS_REVIEW_INTERVAL_DAYS=30
 PAPER_RUNTIME_DUPLICATE_RECONCILIATION_ENABLED=false
 ENABLE_OPTIONS_RESEARCH=true
 ENABLE_AGGRESSIVE_PAPER_STRATEGIES=true
@@ -125,6 +142,12 @@ ALPACA_REQUEST_TIMEOUT_MS=15000
 ALPACA_MAX_RETRIES=2
 VPS_RESEARCH_REQUEST_TIMEOUT_MS=10000
 VPS_RESEARCH_MAX_RETRIES=0
+VPS_CONTROL_TOKEN=
+DASHBOARD_ADMIN_TOKEN=
+AUTOMATED_PAPER_EXECUTION_ENABLED=false
+PAPER_0DTE_DISCOVERY_ENABLED=true
+PAPER_OPTION_EXIT_REVIEW_ENABLED=true
+PAPER_EQUITY_SCALE_IN_ENABLED=false
 ```
 
 The CLI loads `.env` first, then `.env.txt` as fallback when keys are missing. If both files exist, `.env` values take precedence over `.env.txt`.
@@ -257,6 +280,52 @@ It reports the Alpaca contract endpoints used, local `option_contracts` cache co
 
 Use `npm run paper:learn -- --format=json` to evaluate pending learning rows when local option mark data exists.
 The command also reports promotion-readiness analytics using live-like profit factor, trade count, observed days, drawdown, and spread gates.
+
+## Paper Trading Controls and Ops
+
+Dashboard controls live in `apps/dashboard/app/components/ActionPanel.tsx` and call only fixed dashboard API routes:
+
+```bash
+POST /api/paper/actions/research/run
+POST /api/paper/actions/learn/run
+POST /api/paper/actions/portfolio/review
+POST /api/paper/actions/options/discover
+POST /api/paper/actions/review
+POST /api/paper/actions/execute
+GET  /api/paper/actions/history
+```
+
+The VPS control server maps those routes to hardcoded commands only. No raw command string is accepted from the dashboard.
+
+```bash
+npm run paper:ops:morning -- --format=json
+npm run paper:ops:midday -- --format=json
+npm run paper:ops:late-day -- --format=json
+npm run paper:portfolio:review -- --format=json
+npm run paper:exit:review -- --format=json
+npm run paper:options:discover -- --underlying=SPY --dte=0 --format=json
+npm run paper:ops:review -- --format=json
+```
+
+`npm run paper:execute:reviewed -- --confirmPaper --format=json` is paper-only and requires `PAPER_ORDER_EXECUTION_ENABLED=true`. Option payloads also require `PAPER_OPTIONS_EXECUTION_ENABLED=true`. Reviewed LEAPS sell-to-close payloads additionally require `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, `LIVE_TRADING_ENABLED=false`, `AUTOMATED_PAPER_EXECUTION_ENABLED=true`, and `--confirmPaper`; failures use `PAPER_RUNTIME_REQUIRED`, `LIVE_TRADING_DISABLED_REQUIRED`, `PAPER_EXECUTION_FLAG_REQUIRED`, `PAPER_OPTIONS_EXECUTION_FLAG_REQUIRED`, `AUTOMATED_PAPER_EXECUTION_FLAG_REQUIRED`, or `PAPER_CONFIRMATION_REQUIRED`. Do not use execution commands during implementation or review unless the user explicitly requests paper execution.
+
+Systemd timers in `server/systemd/` implement the VPS automation schedule:
+
+- `paper-ops-morning.timer`: weekdays around 8:30 AM ET.
+- `paper-ops-midday.timer`: weekdays around 12:00 PM ET.
+- `paper-ops-late-day.timer`: weekdays around 3:15 PM ET.
+
+Those `paper-ops-*` timers are review-only and set `AUTOMATED_PAPER_EXECUTION_ENABLED=false`.
+The continuous paper monitor is installed separately with `scripts/install-paper-monitoring-systemd.sh`:
+
+- `alpaca-paper-review.timer`: wakes every 30 minutes during weekday market-hour windows and runs the existing paper research/review workflow.
+- `alpaca-paper-execute.timer`: wakes after review windows and can execute only reviewed entry sections (`equityBuys`, `equityAdds`, `optionBuys`).
+- `alpaca-paper-exit-review.timer`: wakes every 15 minutes during the regular window and every 5 minutes in the final hour; exit review evaluates equity exits, generic option exits, 0DTE late-day exits, and LEAPS exit discipline.
+- `alpaca-paper-exit-execute.timer`: wakes after exit-review windows and can execute only reviewed exit sections (`equitySells`, `optionSellToCloseExits`).
+
+The monitor runner no-ops with `MARKET_CLOSED` outside regular market hours, weekends, and configured US market holidays. It fails closed unless `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, `LIVE_TRADING_ENABLED=false`, `PAPER_ORDER_EXECUTION_ENABLED=true`, `PAPER_OPTIONS_EXECUTION_ENABLED=true`, and `AUTOMATED_PAPER_EXECUTION_ENABLED=true` for execution tasks. See `docs/paper-monitoring-operations.md`.
+
+Set the VPS timezone to `America/New_York` or adjust the timer calendar before enabling timers.
 
 Expected safety properties:
 
@@ -401,6 +470,14 @@ Paper options are operationally enabled for the current paper runtime with `PAPE
 - naked options disabled by default
 
 Wide spreads, stale quotes with complete non-crossed bid/ask, weak discovery signals, and ask-fallback limit prices are warnings in paper mode by default. Spread caps become hard blockers only when `PAPER_OPTIONS_HARD_SPREAD_CAP_ENABLED=true` or a family-specific hard-spread flag is enabled. `OPTION_LIMIT_PRICE_UNAVAILABLE` remains a hard blocker when no usable bid/ask quote can produce a positive limit price. Last-price fallback is disabled unless `ALLOW_OPTIONS_LAST_PRICE_FALLBACK=true`; same-day expiration is disabled unless `ALLOW_0DTE_OPTIONS=true`. Legacy `PAPER_OPTIONS_MAX_PREMIUM_PER_ORDER`, `PAPER_OPTIONS_MAX_CONTRACTS`, `PAPER_0DTE_SPY_MAX_PREMIUM_PER_TRADE`, and `PAPER_LEAPS_MAX_PREMIUM_PER_TRADE` names remain accepted as aliases when the preferred paper-option cap names are unset.
+
+LEAPS paper exits are evaluated by `paper:portfolio:review`, `paper:exit:review`, and the `paper:ops:review` artifact flow. A contract is classified as LEAPS when entry DTE is at least `LEAPS_MIN_DTE_AT_ENTRY=270`; entry DTE is read from `paper_learning_records` first, then the paper execution ledger, and only falls back to current DTE with `LEAPS_CLASSIFICATION_INFERRED` when no entry record can be derived. Short-dated options are not classified as LEAPS by fallback.
+
+LEAPS hard sell-to-close reviews are generated for `LEAPS_HARD_STOP_LOSS` at `LEAPS_HARD_STOP_LOSS_PCT=-35`, `LEAPS_FULL_PROFIT_TAKE` at `LEAPS_FULL_PROFIT_TAKE_PCT=125`, `LEAPS_DTE_EXIT_WINDOW` at `LEAPS_DTE_EXIT_THRESHOLD=180`, and `LEAPS_SEVERE_TREND_BREAK` when a bullish call underlying closes below `LEAPS_SEVERE_TREND_EXIT_SMA=200`. Put LEAPS use the inverted trend check when present. These reviews populate `optionSellToCloseExits` only when the liquidity guard passes.
+
+LEAPS review-only warnings are `LEAPS_REVIEW_LOSS_WARNING` at `LEAPS_REVIEW_LOSS_PCT=-20`, `LEAPS_PARTIAL_PROFIT_REVIEW` at `LEAPS_PARTIAL_PROFIT_TAKE_PCT=75`, `LEAPS_TREND_REVIEW` below `LEAPS_TREND_REVIEW_SMA=100` for calls or above it for puts, `LEAPS_DELTA_DETERIORATION` below `LEAPS_MIN_DELTA_REVIEW=0.45`, `LEAPS_DELTA_UNAVAILABLE` when Greeks are missing, and `LEAPS_PERIODIC_REVIEW_DUE` after `LEAPS_REVIEW_INTERVAL_DAYS=30`. Multiple-contract partial-profit reviews include a non-executable partial candidate in review output; automated reviewed execution does not sell on review-only triggers alone.
+
+Before a LEAPS hard exit becomes executable, bid/ask liquidity must be present and `((ask - bid) / mid) * 100` must be no more than `LEAPS_MAX_BID_ASK_SPREAD_PCT=20`. Wider spreads add `LIMIT_EXIT_REQUIRED`; missing bid/ask adds `LEAPS_QUOTE_UNAVAILABLE`. Both conditions keep the reviewed candidate non-executable and prevent marketable sell orders.
 
 Multi-leg options remain intentionally out of scope. Do not model spreads as unrelated single-leg submissions until the system can represent every leg, net debit/credit, max risk/reward, strike ordering, expiration alignment, combined payload behavior, and partial-failure handling.
 
@@ -639,6 +716,29 @@ Optional table options:
 
 `research:daily` does not submit orders. It is paper-first planning only.
 
+## Portfolio risk and hedge review
+
+The hedge layer on `paper-ops-layer` is read-only and paper-only. It normalizes equity and option exposure, uses observed Greeks when available, calculates signed-exposure portfolio beta, classifies the market regime deterministically, reports an explainable 100-point risk score, and ranks LEAPS trims or protective alternatives.
+
+Run the four supported commands with:
+
+```bash
+npm run hedge:risk -- --format=json
+npm run hedge:regime -- --format=json
+npm run hedge:review -- --format=json
+npm run hedge:plan -- --paperOnly --format=json
+```
+
+`hedge:plan` creates a signed, expiring planning artifact only. It does not create a broker order payload or add a section to the reviewed paper executor. There is no `hedge:execute` script or HTTP route. Put spreads are analyzed with `MULTI_LEG_EXECUTION_UNSUPPORTED`; SH and PSQ are secondary tactical alternatives with daily-reset and tracking-risk warnings.
+
+`HEDGE_PAPER_EXECUTION_ENABLED=false` is the required default and must remain false for this phase. Missing prices, Greeks, beta history, sector mappings, or regime evidence remain null and produce quality warnings, monitoring, or blockers.
+
+Option delta completeness is measured by absolute held contract quantity and absolute option market value. Defaults require 80% coverage on each basis and treat 10% of account equity as material (`HEDGE_MIN_OPTION_DELTA_CONTRACT_COVERAGE_PCT=80`, `HEDGE_MIN_OPTION_DELTA_MARKET_VALUE_COVERAGE_PCT=80`, and `HEDGE_MATERIAL_UNMEASURED_OPTION_EXPOSURE_PCT=10`). When the material gate fails, beta and unsupported option exposure remain null, the calculated score is retained for audit, the effective risk band is `indeterminate`, and hedge sizing stops at monitoring.
+
+Alpaca option snapshots may use current camelCase fields (`greeks`, `latestQuote`, `latestTrade`, and `impliedVolatility`) or the legacy-shaped aliases already used by fixtures. Ingestion normalizes both without estimating missing Greeks.
+
+The bounded beta cache is compatible only when symbol, benchmark, lookback, interval, minimum observations, calculation version, latest aligned market-data date, and expiry all match. Persisted recommendations retain generated/expiry times, paper environment, source snapshot ID, risk/regime versions, configuration fingerprint, quality/status, and the reviewed-payload hash after planning. Dashboard reads re-evaluate freshness and never label stale or expired records current.
+
 ## Data persistence
 
 Local/VPS persistence uses `data/research.db` by default with the following collections/tables:
@@ -658,6 +758,11 @@ Local/VPS persistence uses `data/research.db` by default with the following coll
 - api_request_log
 - paper_recommendation_snapshots
 - paper_execution_ledger
+- paper_learning_records
+- paper_operation_log
+- paper_review_artifacts
+- portfolio_high_water_marks
+- portfolio_beta_cache
 
 Alpaca API request IDs are persisted in `api_request_log.request_id`.
 
@@ -673,6 +778,7 @@ On Vercel, API request logging does not write to local SQLite. Historical dashbo
 - Paper mode remains default (`ALPACA_LIVE_TRADE=false`).
 - Any future live execution path must add explicit opt-in gates.
 - Default provider behavior remains paper-only; do not add live-order code in this phase.
+- Hedge analysis and planning remain non-executable; keep `HEDGE_PAPER_EXECUTION_ENABLED=false`.
 
 ## Resume commands
 
@@ -718,6 +824,8 @@ npm run options:ingest -- --minDaysToExpiration=1 --maxDaysToExpiration=90 --min
 ### API/dashboard surface
 
 The dashboard exposes paper-only API routes under `/api/paper/*`. CLI commands remain the source of execution behavior; routes call the same service layer and add paper/live guard checks at the HTTP boundary.
+
+Cached hedge reads are available at `/api/paper/hedge/risk`, `/api/paper/hedge/regime`, and `/api/paper/hedge/recommendation`, backed by the corresponding `/api/v1/hedge/*` VPS control GET routes. They read persisted recommendations only and do not dispatch broker or CLI work.
 
 ## Known limitations (phase 1)
 
