@@ -84,6 +84,12 @@ import {
 import { config } from "./config.js";
 import { normalizeSymbol } from "./lib/utils.js";
 import { AlpacaApiError } from "./services/alpacaClient.js";
+import { buildPortfolioRiskSnapshot } from "./services/portfolioRiskService.js";
+import { classifyMarketRegime } from "./services/marketRegimeService.js";
+import {
+  buildAndPersistHedgePlan,
+  buildAndPersistHedgeReview
+} from "./services/hedgeLearningService.js";
 
 const parseArg = (input: string): Record<string, string> | null => {
   const [rawKey, rawValue] = input.split("=", 2);
@@ -993,6 +999,82 @@ const run = async () => {
       return;
     }
     print(formatPaperOpsWorkflowReportAsTable(result));
+    return;
+  }
+
+  if (command === "hedge:risk") {
+    const result = await buildPortfolioRiskSnapshot();
+    if (args.format === "json") {
+      print(result);
+      return;
+    }
+    print([
+      "Portfolio Hedge Risk",
+      `Environment: ${result.environment}`,
+      `Quality: ${result.dataQualityStatus}`,
+      `Portfolio beta: ${result.portfolioBeta ?? "unavailable"}`,
+      `Gross exposure: ${result.exposures.grossExposurePct ?? "unavailable"}`,
+      `Warnings: ${result.warnings.join(", ") || "none"}`,
+      `Blockers: ${result.blockers.join(", ") || "none"}`,
+      "Read-only analysis. No orders were submitted."
+    ].join("\n"));
+    return;
+  }
+
+  if (command === "hedge:regime") {
+    const result = classifyMarketRegime();
+    if (args.format === "json") {
+      print(result);
+      return;
+    }
+    print([
+      "Portfolio Hedge Market Regime",
+      `Regime: ${result.regime}`,
+      `Rule: ${result.selectedRule}`,
+      `Quality: ${result.dataQualityStatus}`,
+      `Warnings: ${result.warnings.join(", ") || "none"}`,
+      "Read-only analysis. No orders were submitted."
+    ].join("\n"));
+    return;
+  }
+
+  if (command === "hedge:review") {
+    const result = await buildAndPersistHedgeReview({ triggerSource: "cli" });
+    if (args.format === "json") {
+      print(result);
+      return;
+    }
+    print([
+      "Portfolio Hedge Review",
+      `Status: ${result.status}`,
+      `Decision: ${result.recommendation.decision}`,
+      `Risk score: ${result.score.total} (${result.score.band})`,
+      `Regime: ${result.regime.regime}`,
+      `Warnings: ${result.warnings.join(", ") || "none"}`,
+      `Blockers: ${result.blockers.join(", ") || "none"}`,
+      "Read-only analysis. No orders were submitted."
+    ].join("\n"));
+    return;
+  }
+
+  if (command === "hedge:plan") {
+    const result = await buildAndPersistHedgePlan({
+      paperOnly: flagArg(args.paperOnly),
+      triggerSource: "cli"
+    });
+    if (args.format === "json") {
+      print(result);
+      return;
+    }
+    print([
+      "Portfolio Hedge Plan",
+      `Status: ${result.status}`,
+      `Plan: ${result.artifact?.planId || "none"}`,
+      `Expires: ${result.artifact?.expiresAt || "not-created"}`,
+      `Warnings: ${result.warnings.join(", ") || "none"}`,
+      `Blockers: ${result.blockers.join(", ") || "none"}`,
+      "Planning artifact only. Execution is not implemented. No orders were submitted."
+    ].join("\n"));
     return;
   }
 

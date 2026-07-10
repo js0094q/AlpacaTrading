@@ -1,0 +1,94 @@
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, test } from "node:test";
+
+const tempDir = mkdtempSync(join(tmpdir(), "alpaca-hedge-cli-test-"));
+const packageJson = JSON.parse(
+  readFileSync(join(process.cwd(), "package.json"), "utf8")
+) as { scripts: Record<string, string | undefined> };
+
+const safeEnv = {
+  ...process.env,
+  RESEARCH_DB_PATH: join(tempDir, "research.db"),
+  ALPACA_ENV: "paper",
+  TRADING_MODE: "paper",
+  ALPACA_LIVE_TRADE: "false",
+  LIVE_TRADING_ENABLED: "false",
+  HEDGE_PAPER_EXECUTION_ENABLED: "false",
+  ALPACA_PAPER_API_KEY: "test-key",
+  ALPACA_PAPER_SECRET_KEY: "test-secret",
+  ALPACA_PAPER_BASE_URL: "http://127.0.0.1:1",
+  ALPACA_REQUEST_TIMEOUT_MS: "100",
+  ALPACA_MAX_RETRIES: "0"
+};
+
+const runHedgeCli = (script: string, args: string[]) => {
+  const result = spawnSync("npm", ["--silent", "run", script, "--", ...args], {
+    cwd: process.cwd(),
+    env: safeEnv,
+    encoding: "utf8",
+    timeout: 15_000
+  });
+  return {
+    ...result,
+    json: result.stdout.trim() ? JSON.parse(result.stdout) as Record<string, unknown> : null
+  };
+};
+
+after(() => {
+  rmSync(tempDir, { recursive: true, force: true });
+});
+
+test("package exposes only the four read-only hedge scripts", () => {
+  assert.equal(packageJson.scripts["hedge:risk"], "tsx src/cli.ts hedge:risk");
+  assert.equal(packageJson.scripts["hedge:regime"], "tsx src/cli.ts hedge:regime");
+  assert.equal(packageJson.scripts["hedge:review"], "tsx src/cli.ts hedge:review");
+  assert.equal(packageJson.scripts["hedge:plan"], "tsx src/cli.ts hedge:plan");
+  assert.equal(packageJson.scripts["hedge:execute"], undefined);
+});
+
+test("hedge plan requires explicit paperOnly before account work", () => {
+  const result = runHedgeCli("hedge:plan", ["--format=json"]);
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.json?.status, "blocked");
+  assert.equal(result.json?.artifact, null);
+  assert.ok(
+    (result.json?.blockers as string[]).includes("HEDGE_PAPER_ONLY_CONFIRMATION_REQUIRED")
+  );
+});
+
+test("hedge risk emits blocked evidence instead of fabricating data", () => {
+  const result = runHedgeCli("hedge:risk", ["--format=json"]);
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.json?.paperOnly, true);
+  assert.equal(result.json?.environment, "paper");
+  assert.equal(result.json?.dataQualityStatus, "blocked");
+  assert.equal(result.stdout.includes("test-secret"), false);
+});
+
+test("hedge regime emits deterministic JSON from persisted evidence", () => {
+  const result = runHedgeCli("hedge:regime", ["--format=json"]);
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.json?.paperOnly, true);
+  assert.equal(result.json?.regime, "insufficient-data");
+});
+
+test("hedge review and paper-only plan never expose submission payloads", () => {
+  const review = runHedgeCli("hedge:review", ["--format=json"]);
+  const plan = runHedgeCli("hedge:plan", ["--paperOnly", "--format=json"]);
+
+  assert.equal(review.status, 0, review.stderr);
+  assert.equal(plan.status, 0, plan.stderr);
+  assert.equal(review.json?.paperOnly, true);
+  assert.equal(plan.json?.paperOnly, true);
+  assert.equal(review.stdout.includes("client_order_id"), false);
+  assert.equal(plan.stdout.includes("client_order_id"), false);
+  assert.equal(review.stdout.includes("test-secret"), false);
+  assert.equal(plan.stdout.includes("test-secret"), false);
+});
