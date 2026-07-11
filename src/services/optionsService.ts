@@ -13,7 +13,7 @@ import {
   normalizeOptionQuote,
   optionsQuoteConfig
 } from "./optionQuoteNormalizer.js";
-import { parseOptionSymbol } from "./optionSymbolService.js";
+import { normalizeOptionSnapshot } from "./optionSnapshotNormalizer.js";
 
 const ensureRunRow = (input: {
   runType: "options_contracts" | "options_snapshots";
@@ -79,26 +79,10 @@ const toNullableNumber = (value: unknown): number | null => {
   return null;
 };
 
-const snapshotQuote = (snapshot: OptionSnapshotRaw) =>
-  snapshot.latestQuote ?? snapshot.latest_quote;
-
-const snapshotTrade = (snapshot: OptionSnapshotRaw) =>
-  snapshot.latestTrade ?? snapshot.latest_trade;
-
-const snapshotGreeks = (snapshot: OptionSnapshotRaw) =>
-  snapshot.greeks ?? snapshot.Greeks;
-
-const quoteBid = (quote: OptionQuoteRaw | null | undefined, snapshot: OptionSnapshotRaw) =>
-  quote?.bp ?? quote?.b ?? snapshotQuote(snapshot)?.bp ?? snapshotQuote(snapshot)?.b ?? null;
-
-const quoteAsk = (quote: OptionQuoteRaw | null | undefined, snapshot: OptionSnapshotRaw) =>
-  quote?.ap ?? quote?.a ?? snapshotQuote(snapshot)?.ap ?? snapshotQuote(snapshot)?.a ?? null;
-
-const quoteTimestamp = (quote: OptionQuoteRaw | null | undefined, snapshot: OptionSnapshotRaw) =>
-  quote?.t ?? snapshotQuote(snapshot)?.t ?? snapshotTrade(snapshot)?.t ?? null;
-
-const quoteLast = (snapshot: OptionSnapshotRaw) =>
-  snapshotTrade(snapshot)?.p ?? snapshotQuote(snapshot)?.p ?? null;
+const asRecord = (value: unknown): Record<string, unknown> =>
+  value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
 
 export const toSnapshotRow = (
   optionSymbol: string,
@@ -106,15 +90,24 @@ export const toSnapshotRow = (
   quoteData?: OptionQuoteRaw | null
 ) => {
   const timestamp = nowIso();
-  const parsedSymbol = parseOptionSymbol(optionSymbol);
+  const rawWithLatestQuote = quoteData
+    ? {
+        ...symbolData,
+        latestQuote: {
+          ...asRecord(symbolData.latestQuote),
+          ...quoteData
+        }
+      }
+    : symbolData;
+  const canonical = normalizeOptionSnapshot(optionSymbol, rawWithLatestQuote);
   const quoteCfg = optionsQuoteConfig();
   const normalizedQuote = normalizeOptionQuote(
     {
-      optionSymbol,
-      bid: quoteBid(quoteData, symbolData),
-      ask: quoteAsk(quoteData, symbolData),
-      last: quoteLast(symbolData),
-      timestamp: quoteTimestamp(quoteData, symbolData)
+      optionSymbol: canonical.symbol,
+      bid: canonical.latestQuote?.bidPrice ?? null,
+      ask: canonical.latestQuote?.askPrice ?? null,
+      last: canonical.latestTrade?.price ?? null,
+      timestamp: canonical.latestQuote?.timestamp ?? canonical.latestTrade?.timestamp ?? null
     },
     new Date(timestamp),
     quoteCfg.maxAgeMs,
@@ -124,10 +117,8 @@ export const toSnapshotRow = (
   );
 
   return {
-    optionSymbol,
-    underlyingSymbol: normalizeSymbol(
-      symbolData.underlying_symbol || (parsedSymbol.ok ? parsedSymbol.underlying : optionSymbol)
-    ),
+    optionSymbol: canonical.symbol,
+    underlyingSymbol: canonical.underlying,
     timestamp,
     bid: normalizedQuote.bid,
     ask: normalizedQuote.ask,
@@ -139,19 +130,18 @@ export const toSnapshotRow = (
     executablePriceSource: normalizedQuote.executablePriceSource,
     rejectionReason: normalizedQuote.rejectionReason,
     quoteTimestamp: normalizedQuote.quoteTimestamp,
-    volume:
-      typeof symbolData.volume === "number" ? Math.round(symbolData.volume) : null,
-    openInterest:
-      typeof (symbolData.openInterest ?? symbolData.open_interest) === "number"
-        ? Math.round(symbolData.openInterest ?? symbolData.open_interest ?? 0)
-        : null,
-    impliedVolatility:
-      symbolData.impliedVolatility ?? symbolData.implied_volatility ?? null,
-    delta: snapshotGreeks(symbolData)?.delta ?? null,
-    gamma: snapshotGreeks(symbolData)?.gamma ?? null,
-    theta: snapshotGreeks(symbolData)?.theta ?? null,
-    vega: snapshotGreeks(symbolData)?.vega ?? null,
-    rho: snapshotGreeks(symbolData)?.rho ?? null
+    bidSize: canonical.latestQuote?.bidSize ?? null,
+    askSize: canonical.latestQuote?.askSize ?? null,
+    tradeSize: canonical.latestTrade?.size ?? null,
+    tradeTimestamp: canonical.latestTrade?.timestamp ?? null,
+    impliedVolatility: canonical.impliedVolatility,
+    delta: canonical.greeks.delta,
+    gamma: canonical.greeks.gamma,
+    theta: canonical.greeks.theta,
+    vega: canonical.greeks.vega,
+    rho: canonical.greeks.rho,
+    snapshotTimestamp: canonical.snapshotTimestamp,
+    normalizationPath: canonical.normalizationPath
   };
 };
 
@@ -243,8 +233,9 @@ const insertOptionSnapshotRows = async (
     INSERT INTO option_snapshots(
       option_symbol, underlying_symbol, timestamp, bid, ask, midpoint, last,
       quote_status, executable, executable_price, executable_price_source, rejection_reason, quote_timestamp,
-      volume, open_interest, implied_volatility, delta, gamma, theta, vega, rho, source
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'alpaca')
+      bid_size, ask_size, trade_size, trade_timestamp,
+      implied_volatility, delta, gamma, theta, vega, rho, snapshot_timestamp, normalization_path, source
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'alpaca')
     ON CONFLICT(option_symbol, timestamp) DO NOTHING
   `);
 
@@ -258,19 +249,17 @@ const insertOptionSnapshotRows = async (
   db.exec("BEGIN IMMEDIATE");
   try {
     for (const { symbol, raw } of snapshots) {
+      const row = toSnapshotRow(symbol, raw, quotesBySymbol.get(symbol));
       if (params?.minDelta !== undefined && params.minDelta !== null) {
-        const delta = snapshotGreeks(raw)?.delta;
-        if (typeof delta !== "number" || delta < params.minDelta) {
+        if (row.delta === null || row.delta < params.minDelta) {
           continue;
         }
       }
       if (params?.maxDelta !== undefined && params.maxDelta !== null) {
-        const delta = snapshotGreeks(raw)?.delta;
-        if (typeof delta !== "number" || delta > params.maxDelta) {
+        if (row.delta === null || row.delta > params.maxDelta) {
           continue;
         }
       }
-      const row = toSnapshotRow(symbol, raw, quotesBySymbol.get(symbol));
       const result = insert.run(
         row.optionSymbol,
         row.underlyingSymbol,
@@ -285,14 +274,18 @@ const insertOptionSnapshotRows = async (
         row.executablePriceSource,
         row.rejectionReason,
         row.quoteTimestamp,
-        row.volume,
-        row.openInterest,
+        row.bidSize,
+        row.askSize,
+        row.tradeSize,
+        row.tradeTimestamp,
         row.impliedVolatility,
         row.delta,
         row.gamma,
         row.theta,
         row.vega,
-        row.rho
+        row.rho,
+        row.snapshotTimestamp,
+        row.normalizationPath
       );
       if (result.changes === 1) {
         inserted += 1;
