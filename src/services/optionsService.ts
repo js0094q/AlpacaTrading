@@ -79,27 +79,15 @@ const toNullableNumber = (value: unknown): number | null => {
   return null;
 };
 
-const asRecord = (value: unknown): Record<string, unknown> =>
-  value !== null && typeof value === "object" && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : {};
-
 export const toSnapshotRow = (
   optionSymbol: string,
   symbolData: OptionSnapshotRaw,
   quoteData?: OptionQuoteRaw | null
 ) => {
   const timestamp = nowIso();
-  const rawWithLatestQuote = quoteData
-    ? {
-        ...symbolData,
-        latestQuote: {
-          ...asRecord(symbolData.latestQuote),
-          ...quoteData
-        }
-      }
-    : symbolData;
-  const canonical = normalizeOptionSnapshot(optionSymbol, rawWithLatestQuote);
+  const canonical = normalizeOptionSnapshot(optionSymbol, symbolData, {
+    latestQuote: quoteData
+  });
   const quoteCfg = optionsQuoteConfig();
   const normalizedQuote = normalizeOptionQuote(
     {
@@ -107,7 +95,7 @@ export const toSnapshotRow = (
       bid: canonical.latestQuote?.bidPrice ?? null,
       ask: canonical.latestQuote?.askPrice ?? null,
       last: canonical.latestTrade?.price ?? null,
-      timestamp: canonical.latestQuote?.timestamp ?? canonical.latestTrade?.timestamp ?? null
+      timestamp: canonical.latestQuote?.timestamp ?? null
     },
     new Date(timestamp),
     quoteCfg.maxAgeMs,

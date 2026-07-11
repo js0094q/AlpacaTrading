@@ -34,6 +34,10 @@ export type NormalizedOptionSnapshot = {
 
 type UnknownRecord = Record<string, unknown>;
 
+export type OptionSnapshotSupplementalEvidence = {
+  latestQuote?: unknown;
+};
+
 const asRecord = (value: unknown): UnknownRecord | null =>
   value !== null && typeof value === "object" && !Array.isArray(value)
     ? value as UnknownRecord
@@ -53,13 +57,10 @@ const finiteNumber = (value: unknown): number | null => {
   return Number.isFinite(parsed) ? parsed : null;
 };
 
-const finiteField = (
-  current: UnknownRecord | null,
-  currentKeys: string[],
-  legacy: UnknownRecord | null,
-  legacyKeys = currentKeys
+const finiteFromSources = (
+  sources: Array<{ record: UnknownRecord | null; keys: string[] }>
 ) => {
-  for (const [record, keys] of [[current, currentKeys], [legacy, legacyKeys]] as const) {
+  for (const { record, keys } of sources) {
     if (!record) continue;
     for (const key of keys) {
       const parsed = finiteNumber(record[key]);
@@ -68,6 +69,16 @@ const finiteField = (
   }
   return null;
 };
+
+const finiteField = (
+  current: UnknownRecord | null,
+  currentKeys: string[],
+  legacy: UnknownRecord | null,
+  legacyKeys = currentKeys
+) => finiteFromSources([
+  { record: current, keys: currentKeys },
+  { record: legacy, keys: legacyKeys }
+]);
 
 const ISO_TIMESTAMP_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$/;
 
@@ -102,13 +113,10 @@ const isoTimestamp = (value: unknown): string | null => {
   return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
 };
 
-const timestampField = (
-  current: UnknownRecord | null,
-  currentKeys: string[],
-  legacy: UnknownRecord | null,
-  legacyKeys = currentKeys
+const timestampFromSources = (
+  sources: Array<{ record: UnknownRecord | null; keys: string[] }>
 ) => {
-  for (const [record, keys] of [[current, currentKeys], [legacy, legacyKeys]] as const) {
+  for (const { record, keys } of sources) {
     if (!record) continue;
     for (const key of keys) {
       const parsed = isoTimestamp(record[key]);
@@ -118,6 +126,16 @@ const timestampField = (
   return null;
 };
 
+const timestampField = (
+  current: UnknownRecord | null,
+  currentKeys: string[],
+  legacy: UnknownRecord | null,
+  legacyKeys = currentKeys
+) => timestampFromSources([
+  { record: current, keys: currentKeys },
+  { record: legacy, keys: legacyKeys }
+]);
+
 const newestTimestamp = (values: Array<string | null>) =>
   values.reduce<string | null>((newest, value) => {
     if (!value) return newest;
@@ -126,7 +144,8 @@ const newestTimestamp = (values: Array<string | null>) =>
 
 export const normalizeOptionSnapshot = (
   symbol: string,
-  raw: unknown
+  raw: unknown,
+  supplemental: OptionSnapshotSupplementalEvidence = {}
 ): NormalizedOptionSnapshot => {
   const parsedSymbol = parseOptionSymbol(symbol);
   if (!parsedSymbol.ok) {
@@ -134,6 +153,7 @@ export const normalizeOptionSnapshot = (
   }
 
   const value = asRecord(raw) ?? {};
+  const fetchedQuote = asRecord(supplemental.latestQuote);
   const currentQuote = asRecord(value.latestQuote);
   const legacyQuote = asRecord(value.latest_quote);
   const currentTrade = asRecord(value.latestTrade);
@@ -147,7 +167,7 @@ export const normalizeOptionSnapshot = (
     "latestTrade",
     "impliedVolatility",
     "greeks"
-  ].some((key) => hasOwn(value, key));
+  ].some((key) => hasOwn(value, key)) || fetchedQuote !== null;
   const legacySeen = [
     "snapshot_timestamp",
     "timestamp",
@@ -158,11 +178,31 @@ export const normalizeOptionSnapshot = (
   ].some((key) => hasOwn(value, key));
 
   const quote = {
-    bidPrice: finiteField(currentQuote, ["bidPrice", "bp", "b"], legacyQuote, ["bid_price", "bp", "b"]),
-    askPrice: finiteField(currentQuote, ["askPrice", "ap", "a"], legacyQuote, ["ask_price", "ap", "a"]),
-    bidSize: finiteField(currentQuote, ["bidSize", "bs"], legacyQuote, ["bid_size", "bs"]),
-    askSize: finiteField(currentQuote, ["askSize", "as"], legacyQuote, ["ask_size", "as"]),
-    timestamp: timestampField(currentQuote, ["timestamp", "t"], legacyQuote, ["timestamp", "t"])
+    bidPrice: finiteFromSources([
+      { record: fetchedQuote, keys: ["bidPrice", "bid_price", "bp", "b"] },
+      { record: currentQuote, keys: ["bidPrice", "bp", "b"] },
+      { record: legacyQuote, keys: ["bid_price", "bp", "b"] }
+    ]),
+    askPrice: finiteFromSources([
+      { record: fetchedQuote, keys: ["askPrice", "ask_price", "ap", "a"] },
+      { record: currentQuote, keys: ["askPrice", "ap", "a"] },
+      { record: legacyQuote, keys: ["ask_price", "ap", "a"] }
+    ]),
+    bidSize: finiteFromSources([
+      { record: fetchedQuote, keys: ["bidSize", "bid_size", "bs"] },
+      { record: currentQuote, keys: ["bidSize", "bs"] },
+      { record: legacyQuote, keys: ["bid_size", "bs"] }
+    ]),
+    askSize: finiteFromSources([
+      { record: fetchedQuote, keys: ["askSize", "ask_size", "as"] },
+      { record: currentQuote, keys: ["askSize", "as"] },
+      { record: legacyQuote, keys: ["ask_size", "as"] }
+    ]),
+    timestamp: timestampFromSources([
+      { record: fetchedQuote, keys: ["timestamp", "t"] },
+      { record: currentQuote, keys: ["timestamp", "t"] },
+      { record: legacyQuote, keys: ["timestamp", "t"] }
+    ])
   };
   const latestQuote = Object.values(quote).some((field) => field !== null) ? quote : null;
 

@@ -1,7 +1,13 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
+import { DatabaseSync } from "node:sqlite";
+import { mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 import { normalizeOptionSnapshot } from "../src/services/optionSnapshotNormalizer.js";
+import { toSnapshotRow } from "../src/services/optionsService.js";
+import { closeDbForTests, getDb } from "../src/lib/db.js";
 
 describe("option snapshot normalizer", () => {
   test("normalizes the complete current snapshot shape", () => {
@@ -254,5 +260,147 @@ describe("option snapshot normalizer", () => {
       () => normalizeOptionSnapshot("SPY270230C00805000", {}),
       /OPTION_EXPIRATION_INVALID/
     );
+  });
+
+  test("gives independently fetched quote fields precedence across aliases", () => {
+    const sourceTimestamp = new Date(Date.now() - 60_000).toISOString();
+    const fetchedTimestamp = new Date(Date.now() - 1_000).toISOString();
+    const row = toSnapshotRow(
+      "SPY270115C00805000",
+      {
+        latestQuote: {
+          bp: 16.1,
+          ap: 16.3,
+          bs: 1,
+          as: 2,
+          t: sourceTimestamp
+        }
+      },
+      {
+        b: 16.4,
+        a: 16.52,
+        bs: 5,
+        as: 6,
+        t: fetchedTimestamp
+      }
+    );
+
+    assert.equal(row.bid, 16.4);
+    assert.equal(row.ask, 16.52);
+    assert.equal(row.bidSize, 5);
+    assert.equal(row.askSize, 6);
+    assert.equal(row.quoteTimestamp, fetchedTimestamp);
+    assert.equal(row.snapshotTimestamp, fetchedTimestamp);
+  });
+
+  test("never substitutes current trade time for a missing quote timestamp", () => {
+    const tradeTimestamp = new Date(Date.now() - 1_000).toISOString();
+    const row = toSnapshotRow("SPY270115C00805000", {
+      latestQuote: {
+        bp: 16.4,
+        ap: 16.52
+      },
+      latestTrade: {
+        p: 16.48,
+        s: 3,
+        t: tradeTimestamp
+      }
+    });
+
+    assert.equal(row.quoteTimestamp, null);
+    assert.equal(row.quoteStatus, "missing");
+    assert.equal(row.rejectionReason, "quote_timestamp_missing");
+    assert.equal(row.tradeTimestamp, tradeTimestamp);
+    assert.equal(row.snapshotTimestamp, tradeTimestamp);
+  });
+
+  test("migrates legacy snapshot rows additively and idempotently", () => {
+    closeDbForTests();
+    const tempDir = mkdtempSync(join(tmpdir(), "option-snapshot-migration-"));
+    const dbPath = join(tempDir, "legacy.db");
+    const previousDbPath = process.env.RESEARCH_DB_PATH;
+    const legacy = new DatabaseSync(dbPath);
+    legacy.exec(`
+      CREATE TABLE option_snapshots (
+        option_symbol TEXT NOT NULL,
+        underlying_symbol TEXT NOT NULL,
+        timestamp TEXT NOT NULL,
+        bid REAL,
+        ask REAL,
+        midpoint REAL,
+        last REAL,
+        quote_status TEXT,
+        executable INTEGER NOT NULL DEFAULT 0,
+        executable_price REAL,
+        executable_price_source TEXT,
+        rejection_reason TEXT,
+        quote_timestamp TEXT,
+        volume INTEGER,
+        open_interest INTEGER,
+        implied_volatility REAL,
+        delta REAL,
+        gamma REAL,
+        theta REAL,
+        vega REAL,
+        rho REAL,
+        source TEXT NOT NULL,
+        UNIQUE(option_symbol, timestamp)
+      );
+      INSERT INTO option_snapshots(
+        option_symbol, underlying_symbol, timestamp, bid, ask, source
+      ) VALUES (
+        'SPY270115C00805000', 'SPY', '2026-07-10T19:00:00.000Z', 16.4, 16.52, 'legacy-test'
+      );
+    `);
+    legacy.close();
+
+    const expectedColumns = [
+      "bid_size",
+      "ask_size",
+      "trade_size",
+      "trade_timestamp",
+      "snapshot_timestamp",
+      "normalization_path"
+    ];
+
+    try {
+      process.env.RESEARCH_DB_PATH = dbPath;
+      const first = getDb();
+      const firstColumns = first.prepare("PRAGMA table_info(option_snapshots)").all() as Array<{ name: string }>;
+      const preserved = first.prepare(`
+        SELECT option_symbol, bid, ask, source FROM option_snapshots
+      `).get() as { option_symbol: string; bid: number; ask: number; source: string };
+
+      assert.deepEqual(
+        expectedColumns.filter((column) => firstColumns.some((entry) => entry.name === column)),
+        expectedColumns
+      );
+      assert.deepEqual({ ...preserved }, {
+        option_symbol: "SPY270115C00805000",
+        bid: 16.4,
+        ask: 16.52,
+        source: "legacy-test"
+      });
+
+      closeDbForTests();
+      const second = getDb();
+      const secondColumns = second.prepare("PRAGMA table_info(option_snapshots)").all() as Array<{ name: string }>;
+      assert.equal(
+        secondColumns.filter((entry) => expectedColumns.includes(entry.name)).length,
+        expectedColumns.length
+      );
+      assert.equal(
+        (second.prepare("SELECT COUNT(*) AS count FROM option_snapshots").get() as { count: number }).count,
+        1
+      );
+    } finally {
+      closeDbForTests();
+      if (previousDbPath === undefined) {
+        delete process.env.RESEARCH_DB_PATH;
+      } else {
+        process.env.RESEARCH_DB_PATH = previousDbPath;
+      }
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 });
