@@ -1,4 +1,5 @@
 import React from "react";
+import type { PortfolioRiskSnapshot } from "../../../../src/services/portfolioRiskService.js";
 
 export type HedgeDashboardStatus =
   | "current"
@@ -6,6 +7,16 @@ export type HedgeDashboardStatus =
   | "stale"
   | "expired"
   | "blocked";
+
+type DeepPartial<T> = T extends Array<infer Item>
+  ? Array<DeepPartial<Item>>
+  : T extends object
+    ? { [Key in keyof T]?: DeepPartial<T[Key]> }
+    : T;
+
+type PartialGreekGroup = DeepPartial<
+  NonNullable<PortfolioRiskSnapshot["options"]["groupings"]>["byUnderlying"][string]
+>;
 
 export interface HedgeDashboardRecommendation {
   recommendationId?: string;
@@ -21,28 +32,7 @@ export interface HedgeDashboardRecommendation {
   dataQualityStatus?: string;
   reviewedPayloadHash?: string | null;
   decision?: string;
-  risk?: {
-    portfolioBeta?: number | null;
-    betaCoverage?: number | null;
-    optionDataCoverage?: {
-      contractDeltaCoveragePct?: number | null;
-      marketValueDeltaCoveragePct?: number | null;
-      materialCoverageMissing?: boolean;
-    };
-    exposures?: {
-      grossExposurePct?: number | null;
-      netExposurePct?: number | null;
-    };
-    concentration?: {
-      largestUnderlyingWeight?: number | null;
-      topFiveUnderlyingWeight?: number | null;
-    };
-    scenarios?: Array<{
-      benchmarkDeclinePct?: number;
-      netModeledLoss?: number | null;
-      existingProtection?: number | null;
-    }>;
-  };
+  risk?: DeepPartial<PortfolioRiskSnapshot> | null;
   regime?: {
     regime?: string;
     selectedRule?: string;
@@ -91,12 +81,17 @@ const money = (value: number | null | undefined) =>
         currency: "USD",
         maximumFractionDigits: 0
       }).format(value)
-    : "-";
+    : "Unavailable";
+
+const numeric = (value: number | null | undefined) =>
+  typeof value === "number" && Number.isFinite(value)
+    ? new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 }).format(value)
+    : "Unavailable";
 
 const percent = (value: number | null | undefined) =>
   typeof value === "number" && Number.isFinite(value)
     ? `${(value * 100).toFixed(1)}%`
-    : "-";
+    : "Unavailable";
 
 const metric = (label: string, value: string | number) => (
   <div className="metric" key={label}>
@@ -110,6 +105,40 @@ const statusCopy = (status: HedgeDashboardStatus) => {
     return "Current recommendation";
   }
   return `${status.toUpperCase()} — This recommendation is not current.`;
+};
+
+const freshnessCopy = (
+  freshness: DeepPartial<PortfolioRiskSnapshot["options"]["freshness"]> | undefined
+) => freshness
+  ? `current ${freshness.current ?? 0}; stale ${freshness.stale ?? 0}; expired ${freshness.expired ?? 0}; malformed ${freshness.malformed ?? 0}`
+  : "Unavailable";
+
+const groupingRows = (
+  title: string,
+  groups: Record<string, PartialGreekGroup | undefined> | undefined
+) => {
+  const entries = Object.entries(groups ?? {});
+  return (
+    <div>
+      <h4>{title}</h4>
+      <div className="list">
+        {entries.map(([key, group]) => (
+          <div className="row" key={`${title}-${key}`}>
+            <strong>{key}</strong>
+            <span>{group?.quality ?? "incomplete"}</span>
+            <span className="mono">
+              Delta {numeric(group?.deltaShares)} shares / {money(group?.deltaDollars)}
+            </span>
+            <span className="mono">Gamma {numeric(group?.gammaSharesPerDollar)} shares/$1</span>
+            <span className="mono">Theta {money(group?.thetaDollarsPerDay)}/day</span>
+            <span className="mono">Vega {money(group?.vegaDollarsPerVolPoint)}/vol point</span>
+            <span className="mono">Rho {money(group?.rhoDollarsPerRatePoint)}/rate point</span>
+          </div>
+        ))}
+        {!entries.length ? <p className="subtle">No grouping evidence available.</p> : null}
+      </div>
+    </div>
+  );
 };
 
 export const HedgePanel = ({
@@ -150,6 +179,13 @@ export const HedgePanel = ({
   const blockers = recommendation.blockers ?? [];
   const materialOptionCoverageMissing =
     recommendation.risk?.optionDataCoverage?.materialCoverageMissing === true;
+  const optionRisk = recommendation.risk?.options;
+  const coverage = optionRisk?.coverage;
+  const groupings = optionRisk?.groupings;
+  const tradingState =
+    recommendation.environment === "paper"
+      ? "Paper only — Live trading disabled"
+      : "Unavailable";
 
   return (
     <div className="panel full hedge-panel">
@@ -205,8 +241,80 @@ export const HedgePanel = ({
           {metric("Source snapshot", recommendation.sourceSnapshotId ?? "-")}
           {metric("Risk model", recommendation.riskModelVersion ?? "-")}
           {metric("Regime model", recommendation.regimeModelVersion ?? "-")}
+          {metric("Trading state", tradingState)}
         </div>
       </div>
+
+      <section>
+        <h3>Portfolio option Greeks</h3>
+        <div className="hedge-metrics">
+          <div>
+            {metric("Delta shares", numeric(optionRisk?.deltaShares))}
+            {metric("Delta dollars", money(optionRisk?.deltaDollars))}
+            {metric(
+              "Gamma shares per $1 underlying move",
+              numeric(optionRisk?.gammaSharesPerDollar)
+            )}
+            {metric("Theta dollars per day", money(optionRisk?.thetaDollarsPerDay))}
+            {metric(
+              "Vega dollars per volatility point",
+              money(optionRisk?.vegaDollarsPerVolPoint)
+            )}
+            {metric("Rho dollars per rate point", money(optionRisk?.rhoDollarsPerRatePoint))}
+          </div>
+          <div>
+            {metric(
+              "IV weighted by contracts",
+              percent(optionRisk?.impliedVolatility?.weightedByAbsoluteContracts)
+            )}
+            {metric(
+              "IV weighted by market value",
+              percent(optionRisk?.impliedVolatility?.weightedByAbsoluteMarketValue)
+            )}
+            {metric(
+              "IV weighted by vega",
+              percent(optionRisk?.impliedVolatility?.weightedByAbsoluteVega)
+            )}
+            {metric("Greek freshness", freshnessCopy(optionRisk?.freshness))}
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <h3>Greek evidence coverage</h3>
+        <div className="hedge-metrics">
+          {([
+            ["Delta", "delta"],
+            ["Gamma", "gamma"],
+            ["Theta", "theta"],
+            ["Vega", "vega"],
+            ["Rho", "rho"],
+            ["IV", "impliedVolatility"]
+          ] as const).map(([label, key]) => (
+            <div key={key}>
+              {metric(
+                `${label} contract coverage`,
+                percent(coverage?.[key]?.absoluteContracts?.coverageRatio)
+              )}
+              {metric(
+                `${label} market-value coverage`,
+                percent(coverage?.[key]?.absoluteMarketValue?.coverageRatio)
+              )}
+              {metric(`${label} freshness`, freshnessCopy(coverage?.[key]?.freshness))}
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section>
+        <h3>Greek exposure groupings</h3>
+        <div className="hedge-sections">
+          {groupingRows("By underlying", groupings?.byUnderlying)}
+          {groupingRows("By expiration", groupings?.byExpiration)}
+          {groupingRows("By option type", groupings?.byOptionType)}
+          {groupingRows("By DTE bucket", groupings?.byDteBucket)}
+        </div>
+      </section>
 
       <div className="hedge-sections">
         <section>

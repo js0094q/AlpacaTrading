@@ -103,6 +103,61 @@ after(() => {
 });
 
 describe("Vercel dashboard VPS bridge mode", () => {
+  test("hedge risk GET preserves the complete cached Greek payload", async () => {
+    const riskPayload = {
+      paperOnly: true,
+      environment: "paper",
+      liveTradingEnabled: false,
+      effectiveStatus: "current",
+      warnings: ["NESTED_RISK_WARNING"],
+      blockers: ["NESTED_RISK_BLOCKER"],
+      risk: {
+        options: {
+          deltaShares: 60,
+          deltaDollars: 36000,
+          gammaSharesPerDollar: 2,
+          thetaDollarsPerDay: -20,
+          vegaDollarsPerVolPoint: 80,
+          rhoDollarsPerRatePoint: 10,
+          impliedVolatility: {
+            weightedByAbsoluteContracts: 0.3,
+            weightedByAbsoluteMarketValue: 0.32,
+            weightedByAbsoluteVega: 0.35
+          },
+          coverage: {
+            delta: {
+              absoluteContracts: { coverageRatio: 1 },
+              absoluteMarketValue: { coverageRatio: 1 },
+              freshness: { current: 1, stale: 0, expired: 0, malformed: 0, total: 1 }
+            }
+          },
+          freshness: { current: 1, stale: 0, expired: 0, malformed: 0, total: 1 },
+          groupings: {
+            byUnderlying: { SPY: { deltaDollars: 36000, quality: "complete" } },
+            byExpiration: {},
+            byOptionType: {},
+            byDteBucket: {}
+          }
+        },
+        warnings: ["NESTED_RISK_WARNING"],
+        blockers: ["NESTED_RISK_BLOCKER"]
+      }
+    };
+    setMockFetchResponse({ ok: true, data: riskPayload });
+
+    const { GET } = await importRoute<{
+      GET: (request: Request) => Promise<Response> | Response;
+    }>("apps/dashboard/app/api/paper/hedge/risk/route.ts");
+    const response = await GET(new Request("http://localhost/api/paper/hedge/risk"));
+    const payload = await response.json() as { ok: true; data: typeof riskPayload };
+
+    assert.equal(response.status, 200);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, "https://vps.internal:4100/api/v1/hedge/risk");
+    assert.equal(calls[0].init.method, "GET");
+    assert.deepEqual(payload.data, riskPayload);
+  });
+
   test("summary route forwards using control token", async () => {
     setMockFetchResponse({ ok: true, data: { hello: "bridge summary" }, mode: "vercel-read-only" });
 

@@ -665,16 +665,11 @@ export const latestHedgeDashboardRecommendation = async () => {
 };
 
 export const latestHedgeDashboardRisk = async () => {
+  const { buildPersistedHedgeRiskRead } = await import(
+    "../../../src/services/hedgePersistenceService"
+  );
   const recommendation = await latestHedgeDashboardRecommendation();
-  return {
-    paperOnly: true,
-    effectiveStatus: recommendation?.effectiveStatus ?? "blocked",
-    generatedAt: recommendation?.generatedAt ?? null,
-    expiresAt: recommendation?.expiresAt ?? null,
-    risk: recommendation?.risk ?? null,
-    warnings: recommendation?.integrityWarnings ?? ["NO_HEDGE_RECOMMENDATION"],
-    blockers: recommendation ? [] : ["NO_HEDGE_RECOMMENDATION"]
-  };
+  return buildPersistedHedgeRiskRead(recommendation);
 };
 
 export const latestHedgeDashboardRegime = async () => {

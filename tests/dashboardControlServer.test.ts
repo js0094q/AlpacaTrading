@@ -237,6 +237,23 @@ describe("VPS dashboard control API", () => {
     assert.deepEqual(paths, expected);
   });
 
+  test("hedge risk GET is cached, paper-only, and does not call commands or orders", async () => {
+    const route = module.ACTION_HANDLERS["/api/v1/hedge/risk"];
+    const payload = await route.handler({}, "hedge-risk-read") as {
+      paperOnly: boolean;
+      environment: string;
+      liveTradingEnabled: boolean;
+    };
+
+    assert.equal(route.method, "GET");
+    assert.equal(route.requireMutationPrecheck, false);
+    assert.equal(payload.paperOnly, true);
+    assert.equal(payload.environment, "paper");
+    assert.equal(payload.liveTradingEnabled, false);
+    assert.equal(commandCalls.length, 0);
+    assert.equal(openOrderCalls, 0);
+  });
+
   test("mutating endpoint rejects missing admin token", async () => {
     const response = await callControl("/api/v1/research/run", "POST", defaultRequest.body, null);
 

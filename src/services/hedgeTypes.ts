@@ -1,3 +1,5 @@
+import type { PortfolioRiskSnapshot } from "./portfolioRiskService.js";
+
 export const HEDGE_RISK_MODEL_VERSION = "portfolio-risk-v1";
 export const HEDGE_REGIME_MODEL_VERSION = "market-regime-v1";
 export const HEDGE_PLAN_VERSION = "hedge-plan-v1";
@@ -94,7 +96,7 @@ export interface HedgeRecommendationRecord {
   reviewedPayloadHash: string | null;
   decision: HedgeDecision;
   benchmark: string;
-  risk: object;
+  risk: PortfolioRiskSnapshot;
   regime: object;
   score: object;
   sizing: object;
@@ -106,8 +108,22 @@ export interface HedgeRecommendationRecord {
   correlationId: string | null;
 }
 
-export interface PersistedHedgeRecommendation extends HedgeRecommendationRecord {
+export interface PersistedHedgeRecommendation
+  extends Omit<HedgeRecommendationRecord, "risk"> {
+  risk: PortfolioRiskSnapshot | null;
   effectiveStatus: HedgeRecommendationStatus;
   integrityWarnings: string[];
   persistedAt: string;
+}
+
+export interface PersistedHedgeRiskRead {
+  paperOnly: true;
+  environment: "paper";
+  liveTradingEnabled: false;
+  effectiveStatus: HedgeRecommendationStatus;
+  generatedAt: string | null;
+  expiresAt: string | null;
+  risk: PortfolioRiskSnapshot | null;
+  warnings: string[];
+  blockers: string[];
 }

@@ -24,6 +24,7 @@ import {
   writeBetaCache
 } from "../src/services/hedgePersistenceService.js";
 import type { HedgeRecommendationRecord } from "../src/services/hedgeTypes.js";
+import type { PortfolioRiskSnapshot } from "../src/services/portfolioRiskService.js";
 
 const now = "2026-07-10T14:00:00.000Z";
 const later = "2026-07-10T16:00:00.000Z";
@@ -37,6 +38,130 @@ const identity = {
   calculationVersion: "beta-v1",
   latestMarketDataDate: "2026-07-09"
 };
+
+const coverageBasis = {
+  total: 1,
+  measured: 1,
+  unmeasured: 0,
+  coverageRatio: 1
+};
+
+const currentFreshness = {
+  current: 1,
+  stale: 0,
+  expired: 0,
+  malformed: 0,
+  total: 1
+};
+
+const validRiskSnapshot = (): PortfolioRiskSnapshot => ({
+  paperOnly: true,
+  environment: "paper",
+  generatedAt: now,
+  snapshotId: "portfolio_snapshot_hash",
+  sourceAccountSnapshotId: "account_snapshot_hash",
+  riskModelVersion: "portfolio-risk-v1",
+  configurationFingerprint: "config_hash",
+  account: {
+    equity: 100_000,
+    cash: 10_000,
+    buyingPower: 20_000,
+    highWaterMark: 105_000,
+    drawdownPct: 0.0476
+  },
+  positions: [],
+  exposures: {
+    grossExposure: 120_000,
+    netExposure: 90_000,
+    longExposure: 105_000,
+    shortOrInverseExposure: 15_000,
+    grossExposurePct: 1.2,
+    netExposurePct: 0.9
+  },
+  options: {
+    deltaExposure: 36_000,
+    absoluteDeltaExposure: 36_000,
+    absoluteDeltaExposurePct: 0.36,
+    positiveDeltaExposure: 36_000,
+    positiveDeltaExposurePct: 0.36,
+    gammaExposure: 2,
+    thetaExposure: -20,
+    vegaExposure: 80,
+    rhoExposure: 10,
+    nearTermExposurePct: 0,
+    deltaShares: 60,
+    deltaDollars: 36_000,
+    absoluteDeltaShares: 60,
+    absoluteDeltaDollars: 36_000,
+    gammaSharesPerDollar: 2,
+    absoluteGammaSharesPerDollar: 2,
+    thetaDollarsPerDay: -20,
+    absoluteThetaDollarsPerDay: 20,
+    positiveThetaDollarsPerDay: 0,
+    negativeThetaDollarsPerDay: -20,
+    vegaDollarsPerVolPoint: 80,
+    absoluteVegaDollarsPerVolPoint: 80,
+    rhoDollarsPerRatePoint: 10,
+    absoluteRhoDollarsPerRatePoint: 10,
+    impliedVolatility: {
+      weightedByAbsoluteContracts: 0.3,
+      weightedByAbsoluteMarketValue: 0.32,
+      weightedByAbsoluteVega: 0.35
+    },
+    coverage: Object.fromEntries(
+      ["delta", "gamma", "theta", "vega", "rho", "impliedVolatility"].map((metric) => [
+        metric,
+        {
+          positions: { ...coverageBasis },
+          absoluteContracts: { ...coverageBasis },
+          absoluteMarketValue: { ...coverageBasis },
+          freshness: { ...currentFreshness }
+        }
+      ])
+    ) as PortfolioRiskSnapshot["options"]["coverage"],
+    freshness: { ...currentFreshness },
+    groupings: {
+      byUnderlying: {},
+      byExpiration: {},
+      byOptionType: {},
+      byDteBucket: {}
+    },
+    executionEligible: true
+  },
+  concentration: {
+    largestUnderlyingWeight: 0.4,
+    topFiveUnderlyingWeight: 0.8,
+    byUnderlying: { SPY: 0.4 },
+    bySector: { unknown: 0.4 },
+    unknownSectorWeight: 0.4
+  },
+  portfolioBeta: 1.1,
+  betaCoverage: 1,
+  optionDataCoverage: {
+    totalOptionContracts: 1,
+    contractsWithDelta: 1,
+    contractsWithoutDelta: 0,
+    contractDeltaCoveragePct: 1,
+    totalOptionMarketValue: 10_000,
+    optionMarketValueWithDelta: 10_000,
+    optionMarketValueWithoutDelta: 0,
+    marketValueDeltaCoveragePct: 1,
+    materialCoverageMissing: false
+  },
+  scenarios: [],
+  dataQualityStatus: "complete",
+  dataQuality: {
+    positionPriceCoverage: 1,
+    optionDeltaCoverage: 1,
+    optionGammaCoverage: 1,
+    optionThetaCoverage: 1,
+    optionVegaCoverage: 1,
+    betaCoverage: 1,
+    sectorCoverage: 1
+  },
+  warnings: ["NESTED_RISK_WARNING"],
+  blockers: []
+});
 
 const recommendation = (): HedgeRecommendationRecord => ({
   recordType: "hedge_recommendation",
@@ -53,7 +178,7 @@ const recommendation = (): HedgeRecommendationRecord => ({
   reviewedPayloadHash: null,
   decision: "monitor",
   benchmark: "SPY",
-  risk: { grossExposurePct: 90 },
+  risk: validRiskSnapshot(),
   regime: { regime: "neutral" },
   score: { total: 20, band: "low" },
   sizing: { netProtectionTarget: 0 },
@@ -229,4 +354,74 @@ test("malformed persisted records fail closed", () => {
   });
   assert.equal(result?.effectiveStatus, "blocked");
   assert.ok(result?.integrityWarnings.includes("HEDGE_RECOMMENDATION_INTEGRITY_INVALID"));
+});
+
+test("missing or malformed persisted Greek payloads fail closed", () => {
+  const record = recommendation();
+  const risk = validRiskSnapshot();
+  delete (risk.options as { coverage?: unknown }).coverage;
+  persistHedgeRecommendation({
+    ...record,
+    recommendationId: "hedge_rec_missing_greeks",
+    risk
+  });
+
+  const result = latestHedgeRecommendation({
+    asOf: "2026-07-10T14:05:00.000Z",
+    freshnessMinutes: 15,
+    configurationFingerprint: "config_hash",
+    riskModelVersion: "portfolio-risk-v1",
+    regimeModelVersion: "market-regime-v1"
+  });
+
+  assert.equal(result?.effectiveStatus, "blocked");
+  assert.ok(result?.integrityWarnings.includes("HEDGE_RISK_PAYLOAD_INVALID"));
+});
+
+test("nested risk model mismatch is never treated as current", () => {
+  const risk = validRiskSnapshot();
+  risk.riskModelVersion = "portfolio-risk-v0";
+  persistHedgeRecommendation({
+    ...recommendation(),
+    recommendationId: "hedge_rec_nested_model_mismatch",
+    risk
+  });
+
+  const result = latestHedgeRecommendation({
+    asOf: "2026-07-10T14:05:00.000Z",
+    freshnessMinutes: 15,
+    configurationFingerprint: "config_hash",
+    riskModelVersion: "portfolio-risk-v1",
+    regimeModelVersion: "market-regime-v1"
+  });
+
+  assert.equal(result?.effectiveStatus, "stale");
+  assert.ok(result?.integrityWarnings.includes("HEDGE_RISK_PAYLOAD_MODEL_MISMATCH"));
+});
+
+test("fresh recommendation with stale nested Greek evidence is stale", () => {
+  const risk = validRiskSnapshot();
+  risk.options.freshness = {
+    current: 0,
+    stale: 1,
+    expired: 0,
+    malformed: 0,
+    total: 1
+  };
+  persistHedgeRecommendation({
+    ...recommendation(),
+    recommendationId: "hedge_rec_stale_nested_evidence",
+    risk
+  });
+
+  const result = latestHedgeRecommendation({
+    asOf: "2026-07-10T14:05:00.000Z",
+    freshnessMinutes: 15,
+    configurationFingerprint: "config_hash",
+    riskModelVersion: "portfolio-risk-v1",
+    regimeModelVersion: "market-regime-v1"
+  });
+
+  assert.equal(result?.effectiveStatus, "stale");
+  assert.ok(result?.integrityWarnings.includes("HEDGE_RISK_EVIDENCE_STALE"));
 });

@@ -4,9 +4,19 @@ import type {
   BetaCacheEntry,
   BetaCacheIdentity,
   HedgeRecommendationRecord,
+  PersistedHedgeRiskRead,
   PersistedHedgeRecommendation,
   PortfolioHighWaterMark
 } from "./hedgeTypes.js";
+import type {
+  CoverageBasis,
+  FreshnessCounts,
+  OptionGreekGroup,
+  OptionMetric,
+  OptionMetricCoverage,
+  PortfolioRiskSnapshot,
+  WeightedImpliedVolatility
+} from "./portfolioRiskService.js";
 import type { HedgePlanArtifact } from "./hedgePlanService.js";
 import {
   buildHedgeConfig,
@@ -60,6 +70,183 @@ const isoTime = (value: unknown) => {
   const time = typeof value === "string" ? Date.parse(value) : Number.NaN;
   return Number.isFinite(time) ? time : null;
 };
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  Boolean(value && typeof value === "object" && !Array.isArray(value));
+
+const isStringArray = (value: unknown): value is string[] =>
+  Array.isArray(value) && value.every((entry) => typeof entry === "string");
+
+const isFiniteOrNull = (value: unknown): value is number | null =>
+  value === null || (typeof value === "number" && Number.isFinite(value));
+
+const hasFiniteOrNullFields = (
+  value: Record<string, unknown>,
+  fields: readonly string[]
+) => fields.every((field) => field in value && isFiniteOrNull(value[field]));
+
+const isFreshnessCounts = (value: unknown): value is FreshnessCounts => {
+  if (!isRecord(value)) return false;
+  const fields = ["current", "stale", "expired", "malformed", "total"] as const;
+  if (!fields.every((field) => Number.isInteger(value[field]) && Number(value[field]) >= 0)) {
+    return false;
+  }
+  return (
+    Number(value.current) +
+      Number(value.stale) +
+      Number(value.expired) +
+      Number(value.malformed) ===
+    Number(value.total)
+  );
+};
+
+const isCoverageBasis = (value: unknown): value is CoverageBasis => {
+  if (!isRecord(value)) return false;
+  const { total, measured, unmeasured, coverageRatio } = value;
+  if (
+    !isFiniteOrNull(total) ||
+    !isFiniteOrNull(measured) ||
+    !isFiniteOrNull(unmeasured) ||
+    !isFiniteOrNull(coverageRatio)
+  ) {
+    return false;
+  }
+  return (
+    (total === null || total >= 0) &&
+    (measured === null || measured >= 0) &&
+    (unmeasured === null || unmeasured >= 0) &&
+    (coverageRatio === null || (coverageRatio >= 0 && coverageRatio <= 1))
+  );
+};
+
+const isMetricCoverage = (value: unknown): value is OptionMetricCoverage =>
+  isRecord(value) &&
+  isCoverageBasis(value.positions) &&
+  isCoverageBasis(value.absoluteContracts) &&
+  isCoverageBasis(value.absoluteMarketValue) &&
+  isFreshnessCounts(value.freshness);
+
+const isWeightedIv = (value: unknown): value is WeightedImpliedVolatility =>
+  isRecord(value) &&
+  hasFiniteOrNullFields(value, [
+    "weightedByAbsoluteContracts",
+    "weightedByAbsoluteMarketValue",
+    "weightedByAbsoluteVega"
+  ]);
+
+const optionMetrics: OptionMetric[] = [
+  "delta",
+  "gamma",
+  "theta",
+  "vega",
+  "rho",
+  "impliedVolatility"
+];
+
+const isGreekGroup = (value: unknown): value is OptionGreekGroup =>
+  isRecord(value) &&
+  Number.isInteger(value.positionCount) &&
+  Number(value.positionCount) >= 0 &&
+  hasFiniteOrNullFields(value, [
+    "absoluteContracts",
+    "absoluteMarketValue",
+    "deltaShares",
+    "deltaDollars",
+    "gammaSharesPerDollar",
+    "thetaDollarsPerDay",
+    "vegaDollarsPerVolPoint",
+    "rhoDollarsPerRatePoint"
+  ]) &&
+  isWeightedIv(value.impliedVolatility) &&
+  (value.quality === "complete" || value.quality === "incomplete") &&
+  Array.isArray(value.missingMetrics) &&
+  value.missingMetrics.every(
+    (metric) => typeof metric === "string" && optionMetrics.includes(metric as OptionMetric)
+  );
+
+const isGreekGrouping = (value: unknown) =>
+  isRecord(value) && Object.values(value).every(isGreekGroup);
+
+const explicitOptionTotalFields = [
+  "deltaShares",
+  "deltaDollars",
+  "absoluteDeltaShares",
+  "absoluteDeltaDollars",
+  "gammaSharesPerDollar",
+  "absoluteGammaSharesPerDollar",
+  "thetaDollarsPerDay",
+  "absoluteThetaDollarsPerDay",
+  "positiveThetaDollarsPerDay",
+  "negativeThetaDollarsPerDay",
+  "vegaDollarsPerVolPoint",
+  "absoluteVegaDollarsPerVolPoint",
+  "rhoDollarsPerRatePoint",
+  "absoluteRhoDollarsPerRatePoint"
+] as const;
+
+const isCurrentRiskPayload = (value: unknown): value is PortfolioRiskSnapshot => {
+  if (!isRecord(value) || !isRecord(value.options)) return false;
+  const options = value.options;
+  const coverage = options.coverage;
+  if (
+    value.paperOnly !== true ||
+    value.environment !== "paper" ||
+    typeof value.snapshotId !== "string" ||
+    value.snapshotId.length === 0 ||
+    isoTime(value.generatedAt) === null ||
+    typeof value.riskModelVersion !== "string" ||
+    typeof value.configurationFingerprint !== "string" ||
+    !Array.isArray(value.positions) ||
+    !isStringArray(value.warnings) ||
+    !isStringArray(value.blockers) ||
+    !hasFiniteOrNullFields(options, explicitOptionTotalFields) ||
+    !isWeightedIv(options.impliedVolatility) ||
+    !isFreshnessCounts(options.freshness) ||
+    !isRecord(coverage) ||
+    !isRecord(options.groupings) ||
+    !isGreekGrouping(options.groupings.byUnderlying) ||
+    !isGreekGrouping(options.groupings.byExpiration) ||
+    !isGreekGrouping(options.groupings.byOptionType) ||
+    !isGreekGrouping(options.groupings.byDteBucket) ||
+    typeof options.executionEligible !== "boolean"
+  ) {
+    return false;
+  }
+  if (!optionMetrics.every((metric) => isMetricCoverage(coverage[metric]))) {
+    return false;
+  }
+
+  return value.positions.every((position) => {
+    if (!isRecord(position) || position.assetClass !== "option") return isRecord(position);
+    return (
+      hasFiniteOrNullFields(position, [
+        "delta",
+        "gamma",
+        "theta",
+        "vega",
+        "rho",
+        "deltaShares",
+        "deltaDollars",
+        "gammaSharesPerDollar",
+        "thetaDollarsPerDay",
+        "vegaDollarsPerVolPoint",
+        "rhoDollarsPerRatePoint",
+        "impliedVolatility"
+      ]) &&
+      (position.greekObservationTimestamp === null ||
+        typeof position.greekObservationTimestamp === "string") &&
+      (position.greekObservationFreshness === "current" ||
+        position.greekObservationFreshness === "stale" ||
+        position.greekObservationFreshness === "expired" ||
+        position.greekObservationFreshness === "malformed")
+    );
+  });
+};
+
+const hasNonCurrentGreekEvidence = (risk: PortfolioRiskSnapshot) =>
+  (risk.options.freshness?.stale ?? 0) > 0 ||
+  (risk.options.freshness?.expired ?? 0) > 0 ||
+  (risk.options.freshness?.malformed ?? 0) > 0;
 
 const mapHighWater = (row: HighWaterRow): PortfolioHighWaterMark => ({
   environment: row.environment,
@@ -288,13 +475,30 @@ const mapRecommendation = (
   if (raw.regimeModelVersion !== input.regimeModelVersion) {
     integrityWarnings.push("HEDGE_REGIME_MODEL_VERSION_MISMATCH");
   }
+  const validRisk = isCurrentRiskPayload(raw.risk) ? raw.risk : null;
+  if (!validRisk) {
+    integrityWarnings.push("HEDGE_RISK_PAYLOAD_INVALID");
+  } else {
+    if (validRisk.riskModelVersion !== raw.riskModelVersion) {
+      integrityWarnings.push("HEDGE_RISK_PAYLOAD_MODEL_MISMATCH");
+    }
+    if (validRisk.configurationFingerprint !== raw.configurationFingerprint) {
+      integrityWarnings.push("HEDGE_RISK_CONFIGURATION_FINGERPRINT_MISMATCH");
+    }
+    if (hasNonCurrentGreekEvidence(validRisk)) {
+      integrityWarnings.push("HEDGE_RISK_EVIDENCE_STALE");
+    }
+  }
 
   const asOfTime = Date.parse(input.asOf);
   let effectiveStatus: PersistedHedgeRecommendation["effectiveStatus"] =
     raw.recommendationStatus === "monitoring" || raw.recommendationStatus === "blocked"
       ? raw.recommendationStatus
       : "current";
-  if (integrityWarnings.includes("HEDGE_RECOMMENDATION_INTEGRITY_INVALID")) {
+  if (
+    integrityWarnings.includes("HEDGE_RECOMMENDATION_INTEGRITY_INVALID") ||
+    integrityWarnings.includes("HEDGE_RISK_PAYLOAD_INVALID")
+  ) {
     effectiveStatus = "blocked";
   } else if (expires !== null && asOfTime > expires) {
     effectiveStatus = "expired";
@@ -306,7 +510,7 @@ const mapRecommendation = (
     effectiveStatus = "stale";
   }
 
-  const fallback: HedgeRecommendationRecord = {
+  const fallback: Omit<PersistedHedgeRecommendation, "effectiveStatus" | "integrityWarnings" | "persistedAt"> = {
     recordType: "hedge_recommendation",
     recommendationId: typeof raw.recommendationId === "string" ? raw.recommendationId : row.id,
     generatedAt: typeof raw.generatedAt === "string" ? raw.generatedAt : row.created_at,
@@ -338,7 +542,7 @@ const mapRecommendation = (
         ? raw.decision
         : "blocked",
     benchmark: typeof raw.benchmark === "string" ? raw.benchmark : "SPY",
-    risk: raw.risk && typeof raw.risk === "object" ? (raw.risk as Record<string, unknown>) : {},
+    risk: validRisk,
     regime:
       raw.regime && typeof raw.regime === "object" ? (raw.regime as Record<string, unknown>) : {},
     score: raw.score && typeof raw.score === "object" ? (raw.score as Record<string, unknown>) : {},
@@ -358,6 +562,29 @@ const mapRecommendation = (
     persistedAt: row.updated_at
   };
 };
+
+const uniqueStrings = (values: string[]) => [...new Set(values)];
+
+export const buildPersistedHedgeRiskRead = (
+  recommendation: PersistedHedgeRecommendation | null
+): PersistedHedgeRiskRead => ({
+  paperOnly: true,
+  environment: "paper",
+  liveTradingEnabled: false,
+  effectiveStatus: recommendation?.effectiveStatus ?? "blocked",
+  generatedAt: recommendation?.generatedAt ?? null,
+  expiresAt: recommendation?.expiresAt ?? null,
+  risk: recommendation?.risk ?? null,
+  warnings: recommendation
+    ? uniqueStrings([
+        ...recommendation.integrityWarnings,
+        ...(recommendation.risk?.warnings ?? [])
+      ])
+    : ["NO_HEDGE_RECOMMENDATION"],
+  blockers: recommendation
+    ? uniqueStrings(recommendation.risk?.blockers ?? [])
+    : ["NO_HEDGE_RECOMMENDATION"]
+});
 
 export const latestHedgeRecommendation = (input: {
   asOf?: string;

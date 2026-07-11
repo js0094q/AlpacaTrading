@@ -16,7 +16,10 @@ import { listAlpacaOpenOrders } from "../../src/services/alpacaOrderReadService.
 import { listAlpacaPositions } from "../../src/services/alpacaPositionService.js";
 import { listPaperOperations } from "../../src/services/paperOperationLogService.js";
 import { latestReviewArtifactReadiness } from "../../src/services/paperOpsWorkflowService.js";
-import { latestHedgeRecommendationForCurrentConfig } from "../../src/services/hedgePersistenceService.js";
+import {
+  buildPersistedHedgeRiskRead,
+  latestHedgeRecommendationForCurrentConfig
+} from "../../src/services/hedgePersistenceService.js";
 import { safeTokenEquals } from "../../src/lib/safeToken.js";
 import { redactSensitiveData, redactSensitiveText } from "../../src/lib/securityRedaction.js";
 import {
@@ -716,18 +719,8 @@ const actionHandlers: Record<string, ActionConfig> = {
     requireAdminToken: false,
     requireMutationPrecheck: false,
     action: "hedge.risk",
-    handler: async () => {
-      const recommendation = latestHedgeRecommendationForCurrentConfig();
-      return {
-        paperOnly: true,
-        effectiveStatus: recommendation?.effectiveStatus ?? "blocked",
-        generatedAt: recommendation?.generatedAt ?? null,
-        expiresAt: recommendation?.expiresAt ?? null,
-        risk: recommendation?.risk ?? null,
-        warnings: recommendation?.integrityWarnings ?? ["NO_HEDGE_RECOMMENDATION"],
-        blockers: recommendation ? [] : ["NO_HEDGE_RECOMMENDATION"]
-      };
-    }
+    handler: async () =>
+      buildPersistedHedgeRiskRead(latestHedgeRecommendationForCurrentConfig())
   },
   "/api/v1/hedge/regime": {
     method: "GET",

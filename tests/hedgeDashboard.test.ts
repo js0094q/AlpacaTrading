@@ -162,6 +162,56 @@ const dashboardRecommendation = (
       materialCoverageMissing: false
     },
     exposures: { grossExposurePct: 1.4, netExposurePct: 1.1 },
+    options: {
+      deltaShares: 60,
+      deltaDollars: 36000,
+      gammaSharesPerDollar: 2,
+      thetaDollarsPerDay: -20,
+      vegaDollarsPerVolPoint: 80,
+      rhoDollarsPerRatePoint: 10,
+      impliedVolatility: {
+        weightedByAbsoluteContracts: 0.3,
+        weightedByAbsoluteMarketValue: 0.32,
+        weightedByAbsoluteVega: 0.35
+      },
+      coverage: Object.fromEntries(
+        ["delta", "gamma", "theta", "vega", "rho", "impliedVolatility"].map((name) => [
+          name,
+          {
+            positions: { total: 1, measured: 1, unmeasured: 0, coverageRatio: 1 },
+            absoluteContracts: { total: 1, measured: 1, unmeasured: 0, coverageRatio: 1 },
+            absoluteMarketValue: { total: 10000, measured: 10000, unmeasured: 0, coverageRatio: 1 },
+            freshness: { current: 1, stale: 0, expired: 0, malformed: 0, total: 1 }
+          }
+        ])
+      ),
+      freshness: { current: 1, stale: 0, expired: 0, malformed: 0, total: 1 },
+      groupings: {
+        byUnderlying: {
+          SPY: {
+            positionCount: 1,
+            absoluteContracts: 1,
+            absoluteMarketValue: 10000,
+            deltaShares: 60,
+            deltaDollars: 36000,
+            gammaSharesPerDollar: 2,
+            thetaDollarsPerDay: -20,
+            vegaDollarsPerVolPoint: 80,
+            rhoDollarsPerRatePoint: 10,
+            impliedVolatility: {
+              weightedByAbsoluteContracts: 0.3,
+              weightedByAbsoluteMarketValue: 0.32,
+              weightedByAbsoluteVega: 0.35
+            },
+            quality: "complete",
+            missingMetrics: []
+          }
+        },
+        byExpiration: { "2026-09-18": { positionCount: 1, quality: "complete" } },
+        byOptionType: { call: { positionCount: 1, quality: "complete" } },
+        byDteBucket: { "61-90": { positionCount: 1, quality: "complete" } }
+      }
+    },
     concentration: { largestUnderlyingWeight: 0.35, topFiveUnderlyingWeight: 0.8 },
     scenarios: [
       { benchmarkDeclinePct: 10, netModeledLoss: 100000, existingProtection: 25000 }
@@ -266,4 +316,50 @@ test("dashboard presents incomplete low risk as indeterminate", () => {
   assert.match(html, /12\.0%/);
   assert.match(html, /Material option exposure could not be delta-measured/);
   assert.match(html, /MATERIAL_OPTION_GREEKS_COVERAGE_INSUFFICIENT/);
+});
+
+test("dashboard renders complete Greek units, IV, coverage, freshness, groupings, and paper state", () => {
+  const html = renderToStaticMarkup(
+    createElement(HedgePanel, { recommendation: dashboardRecommendation("current") })
+  );
+
+  for (const label of [
+    "Delta shares",
+    "Delta dollars",
+    "Gamma shares per $1 underlying move",
+    "Theta dollars per day",
+    "Vega dollars per volatility point",
+    "Rho dollars per rate point",
+    "IV weighted by contracts",
+    "IV weighted by market value",
+    "IV weighted by vega",
+    "Delta contract coverage",
+    "Gamma market-value coverage",
+    "Theta contract coverage",
+    "Vega market-value coverage",
+    "Rho contract coverage",
+    "IV market-value coverage",
+    "Greek freshness",
+    "By underlying",
+    "By expiration",
+    "By option type",
+    "By DTE bucket",
+    "Paper only",
+    "Live trading disabled"
+  ]) {
+    assert.match(html, new RegExp(label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  }
+  assert.match(html, /SPY/);
+  assert.match(html, /61-90/);
+  assert.match(html, /30\.0%/);
+  assert.match(html, /current 1.*stale 0.*expired 0.*malformed 0/i);
+});
+
+test("dashboard renders missing Greek metrics as unavailable rather than zero", () => {
+  const recommendation = dashboardRecommendation("current");
+  recommendation.risk!.options!.gammaSharesPerDollar = null;
+  const html = renderToStaticMarkup(createElement(HedgePanel, { recommendation }));
+
+  assert.match(html, /Gamma shares per \$1 underlying move<\/span><strong>Unavailable/);
+  assert.doesNotMatch(html, /Gamma shares per \$1 underlying move<\/span><strong>0/);
 });
