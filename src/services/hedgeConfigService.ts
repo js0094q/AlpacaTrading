@@ -27,6 +27,10 @@ export interface HedgeConfig {
     minimumMarketValueDeltaCoveragePct: number;
     materialUnmeasuredOptionExposurePct: number;
   };
+  optionGreeksFreshness: {
+    currentMaxAgeSeconds: number;
+    staleMaxAgeSeconds: number;
+  };
   regime: {
     realizedVolatilityThreshold: number;
     volatilityProxy: string;
@@ -139,6 +143,24 @@ export const buildHedgeConfig = (): HedgeConfig => {
 
   const optionMinimumDte = positiveInteger(process.env.HEDGE_OPTION_MIN_DTE, 30);
   const optionMaximumDte = positiveInteger(process.env.HEDGE_OPTION_MAX_DTE, 120);
+  const configuredCurrentGreeksAge = positiveNumber(
+    process.env.OPTION_GREEKS_CURRENT_MAX_AGE_SECONDS,
+    60
+  );
+  const configuredStaleGreeksAge = positiveNumber(
+    process.env.OPTION_GREEKS_STALE_MAX_AGE_SECONDS,
+    900
+  );
+  const validOptionalPositive = (value: string | undefined) => {
+    if (value === undefined || value.trim() === "") return true;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed > 0;
+  };
+  const validGreeksAgePolicy =
+    validOptionalPositive(process.env.OPTION_GREEKS_CURRENT_MAX_AGE_SECONDS) &&
+    validOptionalPositive(process.env.OPTION_GREEKS_STALE_MAX_AGE_SECONDS) &&
+    configuredCurrentGreeksAge < configuredStaleGreeksAge;
+  if (!validGreeksAgePolicy) invalid();
 
   return {
     executionEnabled: envBoolean(process.env.HEDGE_PAPER_EXECUTION_ENABLED),
@@ -173,16 +195,20 @@ export const buildHedgeConfig = (): HedgeConfig => {
     optionDataCoverage: {
       minimumContractDeltaCoveragePct: percentage(
         process.env.HEDGE_MIN_OPTION_DELTA_CONTRACT_COVERAGE_PCT,
-        0.8
+        0.9
       ),
       minimumMarketValueDeltaCoveragePct: percentage(
         process.env.HEDGE_MIN_OPTION_DELTA_MARKET_VALUE_COVERAGE_PCT,
-        0.8
+        0.95
       ),
       materialUnmeasuredOptionExposurePct: percentage(
         process.env.HEDGE_MATERIAL_UNMEASURED_OPTION_EXPOSURE_PCT,
         0.1
       )
+    },
+    optionGreeksFreshness: {
+      currentMaxAgeSeconds: validGreeksAgePolicy ? configuredCurrentGreeksAge : 60,
+      staleMaxAgeSeconds: validGreeksAgePolicy ? configuredStaleGreeksAge : 900
     },
     regime: {
       realizedVolatilityThreshold: positiveNumber(
@@ -236,6 +262,7 @@ export const hedgeConfigurationFingerprint = (config = buildHedgeConfig()) =>
     planTtlMinutes: config.planTtlMinutes,
     beta: config.beta,
     optionDataCoverage: config.optionDataCoverage,
+    optionGreeksFreshness: config.optionGreeksFreshness,
     regime: config.regime,
     targetProtection: config.targetProtection,
     premiumNavCap: config.premiumNavCap,

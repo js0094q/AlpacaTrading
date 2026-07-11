@@ -35,9 +35,13 @@ test("hedge configuration defaults to disabled paper execution", () => {
   assert.equal(config.leaps.minimumDte, 365);
   assert.equal(config.leaps.profitAllocation, 0.25);
   assert.equal(config.premiumNavCap, 0.01);
-  assert.equal(config.optionDataCoverage.minimumContractDeltaCoveragePct, 0.8);
-  assert.equal(config.optionDataCoverage.minimumMarketValueDeltaCoveragePct, 0.8);
+  assert.equal(config.optionDataCoverage.minimumContractDeltaCoveragePct, 0.9);
+  assert.equal(config.optionDataCoverage.minimumMarketValueDeltaCoveragePct, 0.95);
   assert.equal(config.optionDataCoverage.materialUnmeasuredOptionExposurePct, 0.1);
+  assert.deepEqual(config.optionGreeksFreshness, {
+    currentMaxAgeSeconds: 60,
+    staleMaxAgeSeconds: 900
+  });
 });
 
 test("option delta coverage thresholds accept percentages and normalize to ratios", () => {
@@ -59,9 +63,48 @@ test("invalid option delta coverage thresholds fail safely to defaults", () => {
 
   const config = buildHedgeConfig();
 
-  assert.equal(config.optionDataCoverage.minimumContractDeltaCoveragePct, 0.8);
-  assert.equal(config.optionDataCoverage.minimumMarketValueDeltaCoveragePct, 0.8);
+  assert.equal(config.optionDataCoverage.minimumContractDeltaCoveragePct, 0.9);
+  assert.equal(config.optionDataCoverage.minimumMarketValueDeltaCoveragePct, 0.95);
   assert.equal(config.optionDataCoverage.materialUnmeasuredOptionExposurePct, 0.1);
+  assert.ok(config.warnings.includes("HEDGE_CONFIGURATION_VALUE_INVALID"));
+});
+
+test("option Greek freshness accepts positive ordered ages", () => {
+  process.env.OPTION_GREEKS_CURRENT_MAX_AGE_SECONDS = "30";
+  process.env.OPTION_GREEKS_STALE_MAX_AGE_SECONDS = "300";
+
+  const config = buildHedgeConfig();
+
+  assert.deepEqual(config.optionGreeksFreshness, {
+    currentMaxAgeSeconds: 30,
+    staleMaxAgeSeconds: 300
+  });
+  assert.ok(!config.warnings.includes("HEDGE_CONFIGURATION_VALUE_INVALID"));
+});
+
+test("invalid or unordered Greek ages use conservative defaults", () => {
+  process.env.OPTION_GREEKS_CURRENT_MAX_AGE_SECONDS = "900";
+  process.env.OPTION_GREEKS_STALE_MAX_AGE_SECONDS = "60";
+
+  const config = buildHedgeConfig();
+
+  assert.deepEqual(config.optionGreeksFreshness, {
+    currentMaxAgeSeconds: 60,
+    staleMaxAgeSeconds: 900
+  });
+  assert.ok(config.warnings.includes("HEDGE_CONFIGURATION_VALUE_INVALID"));
+});
+
+test("one invalid Greek age resets the complete age policy", () => {
+  process.env.OPTION_GREEKS_CURRENT_MAX_AGE_SECONDS = "not-a-number";
+  process.env.OPTION_GREEKS_STALE_MAX_AGE_SECONDS = "300";
+
+  const config = buildHedgeConfig();
+
+  assert.deepEqual(config.optionGreeksFreshness, {
+    currentMaxAgeSeconds: 60,
+    staleMaxAgeSeconds: 900
+  });
   assert.ok(config.warnings.includes("HEDGE_CONFIGURATION_VALUE_INVALID"));
 });
 
