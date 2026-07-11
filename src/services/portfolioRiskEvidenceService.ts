@@ -17,6 +17,8 @@ export interface OptionRiskEvidence {
   bid: number | null;
   ask: number | null;
   midpoint: number | null;
+  bidSize: number | null;
+  askSize: number | null;
   quoteTimestamp: string | null;
   snapshotTimestamp: string | null;
   quoteStatus: string | null;
@@ -41,6 +43,8 @@ interface OptionEvidenceRow {
   bid: number | null;
   ask: number | null;
   midpoint: number | null;
+  bid_size: number | null;
+  ask_size: number | null;
   quote_timestamp: string | null;
   snapshot_timestamp: string | null;
   quote_status: string | null;
@@ -69,7 +73,8 @@ export const readOptionRiskEvidence = (symbol: string): OptionRiskEvidence => {
   const row = queryOne<OptionEvidenceRow>(
     `
     SELECT delta, gamma, theta, vega, rho, implied_volatility,
-           bid, ask, midpoint, quote_timestamp, snapshot_timestamp,
+           bid, ask, midpoint, bid_size, ask_size,
+           quote_timestamp, snapshot_timestamp,
            quote_status, source, normalization_path
     FROM option_snapshots
     WHERE option_symbol = ?
@@ -94,6 +99,8 @@ export const readOptionRiskEvidence = (symbol: string): OptionRiskEvidence => {
     bid: finiteOrNull(row?.bid),
     ask: finiteOrNull(row?.ask),
     midpoint: finiteOrNull(row?.midpoint),
+    bidSize: finiteOrNull(row?.bid_size),
+    askSize: finiteOrNull(row?.ask_size),
     quoteTimestamp: textOrNull(row?.quote_timestamp),
     snapshotTimestamp: textOrNull(row?.snapshot_timestamp),
     quoteStatus: textOrNull(row?.quote_status),

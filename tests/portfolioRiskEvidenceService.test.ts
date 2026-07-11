@@ -74,6 +74,8 @@ test("reads canonical option identity and normalized evidence columns", () => {
     bid: 9,
     ask: 11,
     midpoint: 10,
+    bidSize: 12,
+    askSize: 14,
     quoteTimestamp: "2026-07-10T13:59:44.000Z",
     snapshotTimestamp: "2026-07-10T13:59:45.000Z",
     quoteStatus: "tradable",

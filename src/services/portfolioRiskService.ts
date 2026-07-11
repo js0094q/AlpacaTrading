@@ -47,6 +47,8 @@ export interface OptionRiskEvidence
   quoteStatus?: string | null;
   source?: string | null;
   normalizationPath?: CanonicalOptionRiskEvidence["normalizationPath"];
+  bidSize?: number | null;
+  askSize?: number | null;
 }
 
 export interface PositionBetaEvidence {
@@ -110,6 +112,8 @@ export interface NormalizedRiskPosition {
   bid: number | null;
   ask: number | null;
   midpoint: number | null;
+  bidSize?: number | null;
+  askSize?: number | null;
   bidAskSpreadPct: number | null;
   quoteTimestamp: string | null;
   inverseExposure: boolean;
@@ -580,19 +584,20 @@ export const normalizePortfolioEvidence = (
     if (isOption && !parsed.ok) {
       warnings.push("OPTION_SYMBOL_PARSE_FAILED");
     }
+    const observedUnderlyingPrice = numberOrNull(evidence.underlyingPrices[underlying]);
     const underlyingPrice =
-      evidence.underlyingPrices[underlying] ?? (!isOption ? currentPrice : null);
-    const multiplier = isOption ? optionEvidence?.multiplier ?? null : null;
-    const delta = isOption ? optionEvidence?.delta ?? null : null;
-    const gamma = isOption ? optionEvidence?.gamma ?? null : null;
-    const theta = isOption ? optionEvidence?.theta ?? null : null;
-    const vega = isOption ? optionEvidence?.vega ?? null : null;
-    const rho = isOption ? optionEvidence?.rho ?? null : null;
+      observedUnderlyingPrice ?? (!isOption ? currentPrice : null);
+    const multiplier = isOption ? numberOrNull(optionEvidence?.multiplier) : null;
+    const delta = isOption ? numberOrNull(optionEvidence?.delta) : null;
+    const gamma = isOption ? numberOrNull(optionEvidence?.gamma) : null;
+    const theta = isOption ? numberOrNull(optionEvidence?.theta) : null;
+    const vega = isOption ? numberOrNull(optionEvidence?.vega) : null;
+    const rho = isOption ? numberOrNull(optionEvidence?.rho) : null;
     const impliedVolatility = isOption
-      ? optionEvidence?.impliedVolatility ?? null
+      ? numberOrNull(optionEvidence?.impliedVolatility)
       : null;
     const greekObservationTimestamp = isOption
-      ? optionEvidence?.snapshotTimestamp ?? optionEvidence?.quoteTimestamp ?? null
+      ? optionEvidence?.snapshotTimestamp ?? null
       : null;
     const greekObservationFreshness = isOption
       ? observationFreshness(greekObservationTimestamp, asOf, config)
@@ -626,7 +631,7 @@ export const normalizePortfolioEvidence = (
         : null
       : marketValue;
     const betaEvidence = evidence.betas[underlying];
-    const beta = betaEvidence?.beta ?? null;
+    const beta = numberOrNull(betaEvidence?.beta);
     if (beta === null && deltaAdjustedExposure !== null && deltaAdjustedExposure !== 0) {
       warnings.push("POSITION_BETA_UNAVAILABLE");
     }
@@ -654,9 +659,11 @@ export const normalizePortfolioEvidence = (
         : isOption
           ? null
           : 0;
-    const bid = optionEvidence?.bid ?? null;
-    const ask = optionEvidence?.ask ?? null;
-    const midpoint = optionEvidence?.midpoint ?? null;
+    const bid = numberOrNull(optionEvidence?.bid);
+    const ask = numberOrNull(optionEvidence?.ask);
+    const midpoint = numberOrNull(optionEvidence?.midpoint);
+    const bidSize = numberOrNull(optionEvidence?.bidSize);
+    const askSize = numberOrNull(optionEvidence?.askSize);
     const bidAskSpreadPct =
       bid !== null && ask !== null && midpoint !== null && midpoint > 0 && ask >= bid
         ? (ask - bid) / midpoint
@@ -717,6 +724,8 @@ export const normalizePortfolioEvidence = (
       bid,
       ask,
       midpoint,
+      bidSize,
+      askSize,
       bidAskSpreadPct,
       quoteTimestamp: optionEvidence?.quoteTimestamp ?? null,
       inverseExposure: underlying === "SH" || underlying === "PSQ",
@@ -1051,10 +1060,11 @@ export const normalizePortfolioEvidence = (
         ? "partial"
         : "complete";
 
+  const observedHighWaterMark = numberOrNull(evidence.highWaterMark);
   const highWaterMark =
-    equity !== null && evidence.highWaterMark !== null
-      ? Math.max(equity, evidence.highWaterMark)
-      : evidence.highWaterMark ?? equity;
+    equity !== null && observedHighWaterMark !== null
+      ? Math.max(equity, observedHighWaterMark)
+      : observedHighWaterMark ?? equity;
   const accountSnapshot = {
     equity,
     cash,

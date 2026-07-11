@@ -44,7 +44,8 @@ test("uses observed option delta and multiplier for signed exposure", () => {
           bid: 49,
           ask: 51,
           midpoint: 50,
-          quoteTimestamp: asOf
+          quoteTimestamp: asOf,
+          snapshotTimestamp: asOf
         }
       },
       underlyingPrices: { AAPL: 200 },
@@ -99,7 +100,8 @@ test("does not fabricate missing option Greeks", () => {
           bid: 49,
           ask: 51,
           midpoint: 50,
-          quoteTimestamp: asOf
+          quoteTimestamp: asOf,
+          snapshotTimestamp: asOf
         }
       },
       underlyingPrices: { AAPL: 200 },
@@ -154,7 +156,8 @@ test("material contract-count delta coverage makes beta and scenarios indetermin
           bid: 89,
           ask: 91,
           midpoint: 90,
-          quoteTimestamp: asOf
+          quoteTimestamp: asOf,
+          snapshotTimestamp: asOf
         },
         [unmeasured]: {
           multiplier: 100,
@@ -166,7 +169,8 @@ test("material contract-count delta coverage makes beta and scenarios indetermin
           bid: 1,
           ask: 1.2,
           midpoint: 1.1,
-          quoteTimestamp: asOf
+          quoteTimestamp: asOf,
+          snapshotTimestamp: asOf
         }
       },
       underlyingPrices: { SPY: 750 },
@@ -221,7 +225,8 @@ test("material market-value delta coverage makes beta and sizing inputs indeterm
           bid: 1,
           ask: 1.2,
           midpoint: 1.1,
-          quoteTimestamp: asOf
+          quoteTimestamp: asOf,
+          snapshotTimestamp: asOf
         },
         [unmeasured]: {
           multiplier: 100,
@@ -233,7 +238,8 @@ test("material market-value delta coverage makes beta and sizing inputs indeterm
           bid: 99,
           ask: 101,
           midpoint: 100,
-          quoteTimestamp: asOf
+          quoteTimestamp: asOf,
+          snapshotTimestamp: asOf
         }
       },
       underlyingPrices: { QQQ: 650 },
@@ -284,7 +290,8 @@ test("calculates signed portfolio beta and grouped concentration", () => {
           bid: 49,
           ask: 51,
           midpoint: 50,
-          quoteTimestamp: asOf
+          quoteTimestamp: asOf,
+          snapshotTimestamp: asOf
         }
       },
       underlyingPrices: { AAPL: 200 },
@@ -341,7 +348,8 @@ test("long puts and inverse beta reduce modeled scenario loss", () => {
           bid: 29,
           ask: 31,
           midpoint: 30,
-          quoteTimestamp: asOf
+          quoteTimestamp: asOf,
+          snapshotTimestamp: asOf
         }
       },
       underlyingPrices: { AAPL: 200, SPY: 500, SH: 50 },
@@ -681,4 +689,220 @@ test("missing multiplier keeps raw Greeks visible but group totals incomplete", 
   assert.ok(result.options.groupings);
   assert.equal(result.options.groupings.byUnderlying.SPY?.quality, "incomplete");
   assert.ok(result.options.groupings.byUnderlying.SPY?.missingMetrics.includes("delta"));
+});
+
+test("fresh quote timestamp cannot rescue a missing Greek snapshot timestamp", () => {
+  const symbol = "SPY260918C00600000";
+  const result = normalizePortfolioEvidence(
+    account,
+    [{ symbol, assetClass: "us_option", qty: "1", marketValue: "10000" }],
+    {
+      optionEvidence: {
+        [symbol]: {
+          multiplier: 100, delta: 0.5, gamma: 0.01, theta: -0.05, vega: 0.2, rho: 0.1,
+          impliedVolatility: 0.3, bid: 9, ask: 11, midpoint: 10,
+          quoteTimestamp: asOf, snapshotTimestamp: null
+        }
+      },
+      underlyingPrices: { SPY: 600 },
+      betas: { SPY: { beta: 1, status: "calculated", warnings: [] } },
+      highWaterMark: 100000
+    },
+    buildHedgeConfig(),
+    asOf
+  );
+
+  assert.equal(result.positions[0]?.quoteTimestamp, asOf);
+  assert.equal(result.positions[0]?.greekObservationTimestamp, null);
+  assert.equal(result.positions[0]?.greekObservationFreshness, "malformed");
+  assert.equal(result.options.executionEligible, false);
+});
+
+test("fresh quote timestamp cannot rescue a stale Greek snapshot timestamp", () => {
+  const symbol = "SPY260918C00600000";
+  const staleTimestamp = "2026-07-10T13:58:59.000Z";
+  const result = normalizePortfolioEvidence(
+    account,
+    [{ symbol, assetClass: "us_option", qty: "1", marketValue: "10000" }],
+    {
+      optionEvidence: {
+        [symbol]: {
+          multiplier: 100, delta: 0.5, gamma: 0.01, theta: -0.05, vega: 0.2, rho: 0.1,
+          impliedVolatility: 0.3, bid: 9, ask: 11, midpoint: 10,
+          quoteTimestamp: asOf, snapshotTimestamp: staleTimestamp
+        }
+      },
+      underlyingPrices: { SPY: 600 },
+      betas: { SPY: { beta: 1, status: "calculated", warnings: [] } },
+      highWaterMark: 100000
+    },
+    buildHedgeConfig(),
+    asOf
+  );
+
+  assert.equal(result.positions[0]?.quoteTimestamp, asOf);
+  assert.equal(result.positions[0]?.greekObservationTimestamp, staleTimestamp);
+  assert.equal(result.positions[0]?.greekObservationFreshness, "stale");
+  assert.equal(result.options.executionEligible, false);
+});
+
+test("non-finite injected numeric evidence normalizes to null and fails closed", () => {
+  const symbol = "SPY260918C00600000";
+  const result = normalizePortfolioEvidence(
+    account,
+    [{ symbol, assetClass: "us_option", qty: "1", marketValue: "10000" }],
+    {
+      optionEvidence: {
+        [symbol]: {
+          multiplier: Number.NaN,
+          delta: Number.POSITIVE_INFINITY,
+          gamma: Number.NEGATIVE_INFINITY,
+          theta: Number.NaN,
+          vega: Number.POSITIVE_INFINITY,
+          rho: Number.NEGATIVE_INFINITY,
+          impliedVolatility: Number.NaN,
+          bid: Number.POSITIVE_INFINITY,
+          ask: Number.NEGATIVE_INFINITY,
+          midpoint: Number.NaN,
+          bidSize: Number.POSITIVE_INFINITY,
+          askSize: Number.NaN,
+          quoteTimestamp: asOf,
+          snapshotTimestamp: asOf
+        }
+      },
+      underlyingPrices: { SPY: Number.POSITIVE_INFINITY },
+      betas: {
+        SPY: { beta: Number.NaN, status: "calculated", warnings: [] }
+      },
+      highWaterMark: Number.POSITIVE_INFINITY
+    },
+    buildHedgeConfig(),
+    asOf
+  );
+
+  const position = result.positions[0];
+  assert.ok(position);
+  assert.equal(position.multiplier, null);
+  assert.equal(position.delta, null);
+  assert.equal(position.gamma, null);
+  assert.equal(position.theta, null);
+  assert.equal(position.vega, null);
+  assert.equal(position.rho, null);
+  assert.equal(position.impliedVolatility, null);
+  assert.equal(position.bid, null);
+  assert.equal(position.ask, null);
+  assert.equal(position.midpoint, null);
+  assert.equal(position.bidSize, null);
+  assert.equal(position.askSize, null);
+  assert.equal(position.underlyingPrice, null);
+  assert.equal(position.beta, null);
+  assert.equal(result.account.highWaterMark, 100000);
+  assert.equal(result.options.coverage?.delta.positions.measured, 0);
+  assert.equal(result.options.groupings?.byUnderlying.SPY?.quality, "incomplete");
+  assert.equal(result.options.executionEligible, false);
+});
+
+test("delta execution coverage passes exactly at signed 90 percent contracts and 95 percent market value", () => {
+  const measured = "SPY260918C00600000";
+  const unmeasured = "SPY260918P00600000";
+  const result = normalizePortfolioEvidence(
+    account,
+    [
+      { symbol: measured, assetClass: "us_option", qty: "9", marketValue: "9500", side: "long" },
+      { symbol: unmeasured, assetClass: "us_option", qty: "1", marketValue: "-500", side: "short" }
+    ],
+    {
+      optionEvidence: {
+        [measured]: {
+          multiplier: 100, delta: 0.5, gamma: 0.01, theta: -0.05, vega: 0.2, rho: 0.1,
+          impliedVolatility: 0.3, bid: 9, ask: 11, midpoint: 10,
+          quoteTimestamp: asOf, snapshotTimestamp: asOf
+        },
+        [unmeasured]: {
+          multiplier: 100, delta: null, gamma: null, theta: null, vega: null, rho: null,
+          impliedVolatility: null, bid: 4, ask: 6, midpoint: 5,
+          quoteTimestamp: asOf, snapshotTimestamp: asOf
+        }
+      },
+      underlyingPrices: { SPY: 600 },
+      betas: { SPY: { beta: 1, status: "calculated", warnings: [] } },
+      highWaterMark: 100000
+    },
+    buildHedgeConfig(),
+    asOf
+  );
+
+  assert.equal(result.optionDataCoverage.contractDeltaCoveragePct, 0.9);
+  assert.equal(result.optionDataCoverage.marketValueDeltaCoveragePct, 0.95);
+  assert.equal(result.options.executionEligible, true);
+});
+
+test("delta execution coverage fails when signed absolute contracts are just below 90 percent", () => {
+  const measured = "SPY260918C00600000";
+  const unmeasured = "SPY260918P00600000";
+  const result = normalizePortfolioEvidence(
+    account,
+    [
+      { symbol: measured, assetClass: "us_option", qty: "8.999", marketValue: "9500", side: "long" },
+      { symbol: unmeasured, assetClass: "us_option", qty: "1.001", marketValue: "-500", side: "short" }
+    ],
+    {
+      optionEvidence: {
+        [measured]: {
+          multiplier: 100, delta: 0.5, gamma: 0.01, theta: -0.05, vega: 0.2, rho: 0.1,
+          impliedVolatility: 0.3, bid: 9, ask: 11, midpoint: 10,
+          quoteTimestamp: asOf, snapshotTimestamp: asOf
+        },
+        [unmeasured]: {
+          multiplier: 100, delta: null, gamma: null, theta: null, vega: null, rho: null,
+          impliedVolatility: null, bid: 4, ask: 6, midpoint: 5,
+          quoteTimestamp: asOf, snapshotTimestamp: asOf
+        }
+      },
+      underlyingPrices: { SPY: 600 },
+      betas: { SPY: { beta: 1, status: "calculated", warnings: [] } },
+      highWaterMark: 100000
+    },
+    buildHedgeConfig(),
+    asOf
+  );
+
+  assert.ok((result.optionDataCoverage.contractDeltaCoveragePct ?? 1) < 0.9);
+  assert.equal(result.optionDataCoverage.marketValueDeltaCoveragePct, 0.95);
+  assert.equal(result.options.executionEligible, false);
+});
+
+test("delta execution coverage fails when signed absolute market value is just below 95 percent", () => {
+  const measured = "SPY260918C00600000";
+  const unmeasured = "SPY260918P00600000";
+  const result = normalizePortfolioEvidence(
+    account,
+    [
+      { symbol: measured, assetClass: "us_option", qty: "9", marketValue: "9499", side: "long" },
+      { symbol: unmeasured, assetClass: "us_option", qty: "1", marketValue: "-501", side: "short" }
+    ],
+    {
+      optionEvidence: {
+        [measured]: {
+          multiplier: 100, delta: 0.5, gamma: 0.01, theta: -0.05, vega: 0.2, rho: 0.1,
+          impliedVolatility: 0.3, bid: 9, ask: 11, midpoint: 10,
+          quoteTimestamp: asOf, snapshotTimestamp: asOf
+        },
+        [unmeasured]: {
+          multiplier: 100, delta: null, gamma: null, theta: null, vega: null, rho: null,
+          impliedVolatility: null, bid: 4, ask: 6, midpoint: 5,
+          quoteTimestamp: asOf, snapshotTimestamp: asOf
+        }
+      },
+      underlyingPrices: { SPY: 600 },
+      betas: { SPY: { beta: 1, status: "calculated", warnings: [] } },
+      highWaterMark: 100000
+    },
+    buildHedgeConfig(),
+    asOf
+  );
+
+  assert.equal(result.optionDataCoverage.contractDeltaCoveragePct, 0.9);
+  assert.ok((result.optionDataCoverage.marketValueDeltaCoveragePct ?? 1) < 0.95);
+  assert.equal(result.options.executionEligible, false);
 });
