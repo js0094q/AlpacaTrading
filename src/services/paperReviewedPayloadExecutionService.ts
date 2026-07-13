@@ -12,12 +12,15 @@ import {
   updatePaperExecutionLedgerEntry
 } from "./paperExecutionLedgerService.js";
 import {
+  findPaperReviewPayloadDecision,
   isPaperReviewArtifactFresh,
   isReviewedPayloadSectionName,
   latestPaperReviewArtifact,
   type PaperReviewArtifact,
   type ReviewedPayloadSectionName
 } from "./paperReviewArtifactService.js";
+import { appendDecisionLifecycleEvent } from "./marketDecisionEvidenceService.js";
+import type { DecisionId } from "../types.js";
 import { getTradingSafetyState } from "./tradingSafetyService.js";
 
 export type PaperReviewedExecutionStatus =
@@ -80,6 +83,8 @@ interface PaperReviewedExecutionInput {
 
 interface NormalizedReviewedPayload {
   section: ReviewedPayloadSectionName;
+  payloadIndex: number;
+  decisionId: DecisionId | null;
   assetClass: "equity" | "option";
   symbol: string;
   side: "buy" | "sell";
@@ -168,6 +173,13 @@ const normalizePayload = (
 
   return {
     section,
+    payloadIndex: index,
+    decisionId:
+      findPaperReviewPayloadDecision({
+        artifactId: artifact.id,
+        section,
+        payloadIndex: index
+      })?.decision_id ?? null,
     assetClass,
     symbol,
     side,
@@ -462,9 +474,22 @@ export const buildPaperReviewedPayloadExecutionReport = async (
       status: "attempted",
       sourcePlanId: artifact.id,
       sourceCandidateId: payload.sourceCandidateId ?? null,
+      decisionId: payload.decisionId,
+      decisionLinkageStatus: payload.decisionId ? "EXACT" : "LEGACY_UNLINKED",
       payload: payload.raw,
       rawPayload: toAlpacaPayload(payload)
     });
+
+    if (payload.decisionId) {
+      appendDecisionLifecycleEvent({
+        decisionId: payload.decisionId,
+        status: "PAPER_ELIGIBLE",
+        reasonCodes: ["REVIEWED_PAYLOAD_ELIGIBLE"],
+        sourceType: "paper_review_artifact",
+        sourceId: `${artifact.id}:${payload.section}:${payload.payloadIndex}:eligible`,
+        evidence: { artifactId: artifact.id, ledgerId: ledger.id }
+      });
+    }
 
     try {
       const response: AlpacaApiResponse<AlpacaSubmittedOrder> = await submit(toAlpacaPayload(payload));
@@ -479,6 +504,22 @@ export const buildPaperReviewedPayloadExecutionReport = async (
         reason: null,
         rawResponse: order
       });
+      if (payload.decisionId) {
+        appendDecisionLifecycleEvent({
+          decisionId: payload.decisionId,
+          status: status === "filled" ? "FILLED" : "SUBMITTED",
+          reasonCodes: [
+            status === "filled" ? "BROKER_CONFIRMED_FILL" : "BROKER_ORDER_ACCEPTED"
+          ],
+          sourceType: "paper_execution_ledger",
+          sourceId: String(ledger.id),
+          evidence: {
+            alpacaOrderId: order.id,
+            alpacaStatus: status,
+            requestId: response.requestId ?? null
+          }
+        });
+      }
       submitted.push({
         section: payload.section,
         assetClass: payload.assetClass,

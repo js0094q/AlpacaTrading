@@ -21,6 +21,9 @@ import { buildPaperReviewedPayloadExecutionReport } from "../src/services/paperR
 
 const resetDatabase = () => {
   resetSqliteTestDb(getDb(), `
+    DELETE FROM paper_review_decisions;
+    DELETE FROM decision_lifecycle_events;
+    DELETE FROM decision_snapshots;
     DELETE FROM paper_review_artifacts;
     DELETE FROM paper_execution_ledger;
   `);

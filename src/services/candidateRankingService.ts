@@ -1,9 +1,15 @@
 import { getDb, queryAll, queryOne } from "../lib/db.js";
 import { normalizeSymbol, uuid } from "../lib/utils.js";
+import {
+  appendDecisionLifecycleEvent,
+  hashAllowlistedConfig,
+  persistDecisionSnapshot
+} from "./marketDecisionEvidenceService.js";
 import { createDecisionId } from "./marketDecisionIdentityService.js";
 import type {
   CandidateDecisionRecord,
   DecisionId,
+  DecisionStatus,
   PaperTradeCandidateRow,
   PreferredExpression,
   RiskProfile,
@@ -599,6 +605,32 @@ export const persistCandidateDecisions = (input: {
   researchRunId: string;
   decisions: CandidateDecisionRecord[];
 }) => {
+  const researchRun = queryOne<{ config_json: string }>(
+    "SELECT config_json FROM research_runs WHERE id = ?",
+    [input.researchRunId]
+  );
+  let researchConfig: Record<string, unknown> = {};
+  if (researchRun?.config_json) {
+    try {
+      const parsed = JSON.parse(researchRun.config_json) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        researchConfig = parsed as Record<string, unknown>;
+      }
+    } catch {
+      researchConfig = {};
+    }
+  }
+  const strategyConfigHash = hashAllowlistedConfig(researchConfig, [
+    "barLookbackDays",
+    "maxCandidates",
+    "maxPerDirection",
+    "maxPerExpression",
+    "maxPerSymbol",
+    "optionsEnabled",
+    "requireSectorDiversity",
+    "riskProfile",
+    "useAlpacaAssets"
+  ]);
   const rows = input.decisions.map((decision) => ({
     ...decision,
     researchRunId: input.researchRunId
@@ -692,7 +724,88 @@ export const persistCandidateDecisions = (input: {
     const persisted = getDb()
       .prepare("SELECT decision_id FROM paper_trade_candidates WHERE id = ?")
       .get(row.id) as { decision_id: string };
-    persistedRows.push({ ...row, decisionId: persisted.decision_id as DecisionId });
+    const persistedDecisionId = persisted.decision_id as DecisionId;
+    const status = row.decision.toUpperCase() as DecisionStatus;
+    const sourceTimestamp =
+      typeof row.signalInputs.observatorySourceTimestamp === "string"
+        ? row.signalInputs.observatorySourceTimestamp
+        : null;
+    const marketDataRequestId =
+      typeof row.signalInputs.observatoryRequestId === "string"
+        ? row.signalInputs.observatoryRequestId
+        : null;
+    const feed =
+      typeof row.signalInputs.observatoryEffectiveFeed === "string"
+        ? row.signalInputs.observatoryEffectiveFeed
+        : null;
+    const close =
+      typeof row.signalInputs.close === "number" ? row.signalInputs.close : null;
+    const riskConfigHash = hashAllowlistedConfig(
+      {
+        riskProfile: row.riskProfile,
+        estimatedMaxLoss: row.estimatedMaxLoss,
+        estimatedMaxProfit: row.estimatedMaxProfit
+      },
+      ["estimatedMaxLoss", "estimatedMaxProfit", "riskProfile"]
+    );
+
+    persistDecisionSnapshot({
+      decisionId: persistedDecisionId,
+      originType: "paper_trade_candidate",
+      originId: row.id,
+      decisionRole: row.decision === "selected" ? "entry" : "non_executable",
+      candidateId: row.id,
+      createdAt: row.asOf,
+      strategyFamily: row.strategyFamily,
+      symbol: row.symbol,
+      underlyingSymbol: row.optionSymbol ? row.symbol : null,
+      optionSymbol: row.optionSymbol ?? null,
+      researchRunId: row.researchRunId,
+      candidateRank: row.rank,
+      candidateStatus: row.decision,
+      decisionStatus: status,
+      score: row.score,
+      confidence: row.confidence,
+      reasonCodes: [row.decisionReason],
+      rationale: row.rationale,
+      signalInputs: row.signalInputs,
+      marketState: { close, feed, sourceTimestamp },
+      instrumentState: {
+        optionSymbol: row.optionSymbol ?? null,
+        shortStrike: row.shortStrike ?? null,
+        strike: row.strike ?? null
+      },
+      riskState: {
+        estimatedMaxLoss: row.estimatedMaxLoss,
+        estimatedMaxProfit: row.estimatedMaxProfit,
+        riskProfile: row.riskProfile
+      },
+      dataQualityStatus: row.dataQualityStatus,
+      sourceTimestamps: {
+        candidateAsOf: row.asOf,
+        marketDataSource: sourceTimestamp
+      },
+      environment: process.env.ALPACA_ENV === "live" ? "live" : "paper",
+      configAllowlistVersion: "phase1b-v1",
+      strategyConfigHash,
+      riskConfigHash,
+      marketDataRequestId,
+      feed
+    });
+    appendDecisionLifecycleEvent({
+      decisionId: persistedDecisionId,
+      status,
+      reasonCodes: [row.decisionReason],
+      occurredAt: row.asOf,
+      sourceType: "paper_trade_candidate",
+      sourceId: row.id,
+      evidence: {
+        candidateId: row.id,
+        dataQualityStatus: row.dataQualityStatus,
+        researchRunId: row.researchRunId
+      }
+    });
+    persistedRows.push({ ...row, decisionId: persistedDecisionId });
   }
   return persistedRows;
 };

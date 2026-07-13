@@ -22,6 +22,9 @@ import {
 
 const resetDatabase = () => {
   resetSqliteTestDb(getDb(), `
+    DELETE FROM paper_review_decisions;
+    DELETE FROM decision_lifecycle_events;
+    DELETE FROM decision_snapshots;
     DELETE FROM paper_review_artifacts;
     DELETE FROM paper_operation_log;
   `);
@@ -89,6 +92,17 @@ describe("paper ops workflows", () => {
     assert.equal(report.reviewOnly, true);
     assert.equal(report.automatedExecutionEnabled, false);
     assert.equal((report.summary.sections as Record<string, number>).equityBuys, 1);
+    const evidence = getDb().prepare(`
+      SELECT prd.decision_role, ds.decision_status
+      FROM paper_review_decisions prd
+      JOIN decision_snapshots ds ON ds.decision_id = prd.decision_id
+      WHERE prd.artifact_id = ? AND prd.section = 'equityBuys'
+    `).get(String(report.summary.artifactId)) as {
+      decision_role: string;
+      decision_status: string;
+    };
+    assert.equal(evidence.decision_role, "entry");
+    assert.equal(evidence.decision_status, "REVIEWED");
   });
 
   test("morning workflow runs research, learn, discover, and review", async () => {

@@ -201,6 +201,37 @@ export type PositionLifecycleId = string & {
 };
 
 export type DecisionRole = "entry" | "exit" | "non_executable";
+export type DecisionStatus =
+  | "DISCOVERED"
+  | "DATA_INCOMPLETE"
+  | "SCORED"
+  | "REJECTED"
+  | "SKIPPED"
+  | "SELECTED"
+  | "REVIEWED"
+  | "BLOCKED"
+  | "PAPER_ELIGIBLE"
+  | "SUBMITTED"
+  | "FILLED"
+  | "OPEN"
+  | "CLOSED"
+  | "EXPIRED";
+declare const decisionReasonCodeBrand: unique symbol;
+declare const exitReasonCodeBrand: unique symbol;
+declare const dataQualityStatusBrand: unique symbol;
+export type DecisionReasonCode = string & {
+  readonly [decisionReasonCodeBrand]: true;
+};
+export type ExitReasonCode = string & { readonly [exitReasonCodeBrand]: true };
+export type DataQualityStatus = string & {
+  readonly [dataQualityStatusBrand]: true;
+};
+export type OutcomeCompletenessStatus =
+  | "COMPLETE"
+  | "PARTIAL"
+  | "INSUFFICIENT_OBSERVATIONS"
+  | "LEGACY_UNAVAILABLE"
+  | "AMBIGUOUS_LINEAGE";
 export type LinkageStatus =
   | "EXACT"
   | "EXACT_LEGACY_REUSE"
