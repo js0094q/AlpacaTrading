@@ -9,10 +9,13 @@ export interface HedgeExecutionGateInput {
   duplicateDetected: boolean;
   instrumentSupported: boolean;
   runtimePreflightPassed: boolean;
+  liveTradingEnabled?: boolean;
+  liveHedgeExecutionEnabled?: boolean;
+  multiLegExecution?: boolean;
 }
 
 export interface HedgeExecutionGateResult {
-  allowed: false;
+  allowed: boolean;
   blockers: string[];
   checks: Record<string, boolean>;
 }
@@ -30,14 +33,16 @@ export const evaluateHedgeExecutionGate = (
     reviewedPayloadHashMatches: input.reviewedPayloadHashMatches,
     duplicateProtectionClear: !input.duplicateDetected,
     instrumentSupported: input.instrumentSupported,
-    runtimePreflightPassed: input.runtimePreflightPassed
+    runtimePreflightPassed: input.runtimePreflightPassed,
+    liveTradingDisabled: input.liveTradingEnabled !== true,
+    liveHedgeExecutionDisabled: input.liveHedgeExecutionEnabled !== true,
+    singleLegOnly: input.multiLegExecution !== true
   };
   const blockers = Object.entries(checks)
     .filter(([, passed]) => !passed)
     .map(([name]) => `HEDGE_EXECUTION_GATE_${name.replace(/[A-Z]/g, (letter) => `_${letter}`).toUpperCase()}_FAILED`);
-  blockers.push("HEDGE_EXECUTION_NOT_IMPLEMENTED");
   return {
-    allowed: false,
+    allowed: blockers.length === 0,
     blockers,
     checks
   };
