@@ -62,6 +62,83 @@ CREATE TABLE IF NOT EXISTS market_bars (
 CREATE INDEX IF NOT EXISTS idx_market_bars_symbol_timeframe_timestamp
   ON market_bars(symbol, timeframe, timestamp);
 
+CREATE TABLE IF NOT EXISTS stock_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ingestion_run_id INTEGER,
+  symbol TEXT NOT NULL,
+  observed_at TEXT NOT NULL,
+  source_timestamp TEXT,
+  requested_feed TEXT NOT NULL,
+  effective_feed TEXT NOT NULL,
+  currency TEXT,
+  latest_trade_price REAL,
+  latest_trade_size REAL,
+  latest_trade_exchange TEXT,
+  latest_trade_conditions_json TEXT NOT NULL,
+  trade_timestamp TEXT,
+  bid_price REAL,
+  ask_price REAL,
+  bid_size REAL,
+  ask_size REAL,
+  bid_exchange TEXT,
+  ask_exchange TEXT,
+  quote_conditions_json TEXT NOT NULL,
+  quote_timestamp TEXT,
+  midpoint REAL,
+  spread REAL,
+  spread_pct REAL,
+  minute_timestamp TEXT,
+  minute_open REAL,
+  minute_high REAL,
+  minute_low REAL,
+  minute_close REAL,
+  minute_volume REAL,
+  minute_trade_count REAL,
+  minute_vwap REAL,
+  daily_timestamp TEXT,
+  daily_open REAL,
+  daily_high REAL,
+  daily_low REAL,
+  daily_close REAL,
+  daily_volume REAL,
+  daily_trade_count REAL,
+  daily_vwap REAL,
+  previous_daily_timestamp TEXT,
+  previous_daily_open REAL,
+  previous_daily_high REAL,
+  previous_daily_low REAL,
+  previous_daily_close REAL,
+  previous_daily_volume REAL,
+  previous_daily_trade_count REAL,
+  previous_daily_vwap REAL,
+  daily_return REAL,
+  gap_from_previous_close REAL,
+  return_from_open REAL,
+  distance_from_vwap REAL,
+  intraday_range REAL,
+  relative_current_day_volume REAL,
+  freshness_status TEXT NOT NULL,
+  data_quality_status TEXT NOT NULL,
+  source TEXT NOT NULL,
+  request_id TEXT,
+  error_summary TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_stock_snapshots_dedupe
+  ON stock_snapshots(symbol, requested_feed, source_timestamp);
+
+CREATE INDEX IF NOT EXISTS idx_stock_snapshots_symbol_observed
+  ON stock_snapshots(symbol, observed_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_stock_snapshots_freshness
+  ON stock_snapshots(freshness_status);
+
+CREATE INDEX IF NOT EXISTS idx_stock_snapshots_source_timestamp
+  ON stock_snapshots(source_timestamp);
+
+CREATE INDEX IF NOT EXISTS idx_stock_snapshots_ingestion_run
+  ON stock_snapshots(ingestion_run_id);
+
 CREATE TABLE IF NOT EXISTS option_contracts (
   underlying_symbol TEXT NOT NULL,
   option_symbol TEXT PRIMARY KEY,

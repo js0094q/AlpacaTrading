@@ -53,6 +53,75 @@ export interface MarketBarRow {
   source: "alpaca";
 }
 
+export type StockSnapshotFreshnessStatus = "FRESH" | "STALE" | "UNKNOWN";
+export type StockSnapshotDataQualityStatus =
+  | "COMPLETE"
+  | "PARTIAL"
+  | "MISSING_QUOTE"
+  | "MISSING_TRADE"
+  | "MISSING_MINUTE_BAR"
+  | "SOURCE_ERROR";
+
+export interface StockSnapshotRow {
+  symbol: string;
+  observedAt: string;
+  sourceTimestamp: string | null;
+  requestedFeed: string;
+  effectiveFeed: string;
+  currency: string | null;
+  latestTradePrice: number | null;
+  latestTradeSize: number | null;
+  latestTradeExchange: string | null;
+  latestTradeConditions: string[];
+  tradeTimestamp: string | null;
+  bidPrice: number | null;
+  askPrice: number | null;
+  bidSize: number | null;
+  askSize: number | null;
+  bidExchange: string | null;
+  askExchange: string | null;
+  quoteConditions: string[];
+  quoteTimestamp: string | null;
+  midpoint: number | null;
+  spread: number | null;
+  spreadPct: number | null;
+  minuteTimestamp: string | null;
+  minuteOpen: number | null;
+  minuteHigh: number | null;
+  minuteLow: number | null;
+  minuteClose: number | null;
+  minuteVolume: number | null;
+  minuteTradeCount: number | null;
+  minuteVwap: number | null;
+  dailyTimestamp: string | null;
+  dailyOpen: number | null;
+  dailyHigh: number | null;
+  dailyLow: number | null;
+  dailyClose: number | null;
+  dailyVolume: number | null;
+  dailyTradeCount: number | null;
+  dailyVwap: number | null;
+  previousDailyTimestamp: string | null;
+  previousDailyOpen: number | null;
+  previousDailyHigh: number | null;
+  previousDailyLow: number | null;
+  previousDailyClose: number | null;
+  previousDailyVolume: number | null;
+  previousDailyTradeCount: number | null;
+  previousDailyVwap: number | null;
+  dailyReturn: number | null;
+  gapFromPreviousClose: number | null;
+  returnFromOpen: number | null;
+  distanceFromVwap: number | null;
+  intradayRange: number | null;
+  relativeCurrentDayVolume: number | null;
+  freshnessStatus: StockSnapshotFreshnessStatus;
+  dataQualityStatus: StockSnapshotDataQualityStatus;
+  source: "alpaca";
+  requestId: string | null;
+  errorSummary: string | null;
+}
+
 export interface OptionContractRow {
   underlyingSymbol: string;
   optionSymbol: string;
