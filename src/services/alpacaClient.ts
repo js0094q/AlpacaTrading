@@ -45,11 +45,15 @@ export interface AlpacaSubmittedOrder {
   side?: string;
   type?: string;
   time_in_force?: string;
+  position_intent?: string;
   limit_price?: string;
   status?: string;
-  submitted_at?: string;
   filled_qty?: string;
   filled_avg_price?: string;
+  filled_at?: string;
+  created_at?: string;
+  submitted_at?: string;
+  updated_at?: string;
 }
 
 export interface AlpacaAccountRaw {
@@ -58,6 +62,7 @@ export interface AlpacaAccountRaw {
   cash?: string;
   equity?: string;
   portfolio_value?: string;
+  position_market_value?: string;
   buying_power?: string;
   options_buying_power?: string;
   options_approved_level?: number | string;
@@ -90,6 +95,84 @@ export interface AlpacaPositionRaw {
   qty?: string;
   qty_available?: string;
   side?: string;
+  avg_entry_price?: string;
+  cost_basis?: string;
+  market_value?: string;
+  current_price?: string;
+  unrealized_pl?: string;
+  unrealized_plpc?: string;
+}
+
+export interface AlpacaStockSnapshotRaw {
+  latestTrade?: {
+    p?: number | string | null;
+    t?: string | null;
+  };
+  latestQuote?: {
+    bp?: number | string | null;
+    ap?: number | string | null;
+    t?: string | null;
+  };
+  dailyBar?: {
+    c?: number | string | null;
+  };
+  minuteBar?: {
+    c?: number | string | null;
+  };
+  prevDailyBar?: {
+    c?: number | string | null;
+  };
+}
+
+export interface AlpacaOptionSnapshotRaw {
+  latest_quote?: {
+    t?: string | null;
+    bp?: number | string | null;
+    ap?: number | string | null;
+    b?: number | string | null;
+    a?: number | string | null;
+    p?: number | string | null;
+  };
+  latest_trade?: {
+    t?: string | null;
+    p?: number | string | null;
+  };
+  latestQuote?: {
+    t?: string | null;
+    bp?: number | string | null;
+    ap?: number | string | null;
+    b?: number | string | null;
+    a?: number | string | null;
+    p?: number | string | null;
+  };
+  latestTrade?: {
+    t?: string | null;
+    p?: number | string | null;
+  };
+  underlying_symbol?: string;
+  symbol?: string;
+}
+
+export interface AlpacaBatchedSnapshotResponse<T> {
+  data: Record<string, T>;
+  requestIds: string[];
+  status: number;
+  urls: string[];
+}
+
+export interface AlpacaAccountActivityRaw {
+  id?: string;
+  activity_type?: string;
+  type?: string;
+  transaction_time?: string;
+  date?: string;
+  symbol?: string;
+  qty?: string;
+  side?: string;
+  order_id?: string;
+  order_status?: string;
+  price?: string;
+  net_amount?: string;
 }
 
 const firstEnv = (...names: string[]) => {
@@ -317,13 +400,89 @@ export const cancelPaperOrder = async (
 };
 
 export const listRecentPaperOrders = async (
-  limit = 50
+  input: number | { limit?: number; after?: string } = 50
 ): Promise<AlpacaApiResponse<AlpacaSubmittedOrder[]>> => {
+  const limit = typeof input === "number" ? input : input.limit ?? 50;
+  const after = typeof input === "number" ? undefined : input.after;
   const safeLimit = Number.isFinite(limit) && limit > 0 ? Math.min(500, Math.floor(limit)) : 50;
-  return requestPaperTradingJson<AlpacaSubmittedOrder[]>(
-    `/v2/orders?status=all&limit=${safeLimit}&nested=false`
+  const params = new URLSearchParams({
+    status: "all",
+    limit: String(safeLimit),
+    nested: "false"
+  });
+  if (after) {
+    params.set("after", after);
+  }
+  return requestPaperTradingJson<AlpacaSubmittedOrder[]>(`/v2/orders?${params.toString()}`);
+};
+
+export const listPaperAccountActivities = async (
+  input: { limit?: number; after?: string } = {}
+): Promise<AlpacaApiResponse<AlpacaAccountActivityRaw[]>> => {
+  const limit = input.limit ?? 100;
+  const safeLimit = Number.isFinite(limit) && limit > 0 ? Math.min(100, Math.floor(limit)) : 100;
+  const params = new URLSearchParams({
+    page_size: String(safeLimit)
+  });
+  if (input.after) {
+    params.set("after", input.after);
+  }
+  return requestPaperTradingJson<AlpacaAccountActivityRaw[]>(
+    `/v2/account/activities?${params.toString()}`
   );
 };
+
+const parseSnapshotMap = <T>(payload: unknown): Record<string, T> => {
+  if (!payload || typeof payload !== "object") {
+    return {};
+  }
+  const value = payload as {
+    snapshots?: Record<string, T>;
+    data?: Record<string, T>;
+  };
+  return value.snapshots || value.data || {};
+};
+
+const getBatchedDataSnapshots = async <T>(
+  endpoint: string,
+  symbols: string[],
+  chunkSize = 100
+): Promise<AlpacaBatchedSnapshotResponse<T>> => {
+  const uniqueSymbols = [...new Set(symbols.map((symbol) => symbol.trim().toUpperCase()).filter(Boolean))];
+  const data: Record<string, T> = {};
+  const requestIds: string[] = [];
+  const urls: string[] = [];
+  let status = 200;
+
+  for (let index = 0; index < uniqueSymbols.length; index += chunkSize) {
+    const chunk = uniqueSymbols.slice(index, index + chunkSize);
+    const params = new URLSearchParams({ symbols: chunk.join(",") });
+    const response = await getAlpacaDataEndpoint<unknown>(`${endpoint}?${params.toString()}`);
+    Object.assign(data, parseSnapshotMap<T>(response.data));
+    if (response.requestId) {
+      requestIds.push(response.requestId);
+    }
+    urls.push(response.url);
+    status = response.status;
+  }
+
+  return {
+    data,
+    requestIds,
+    status,
+    urls
+  };
+};
+
+export const getLatestStockSnapshots = async (
+  symbols: string[]
+): Promise<AlpacaBatchedSnapshotResponse<AlpacaStockSnapshotRaw>> =>
+  getBatchedDataSnapshots<AlpacaStockSnapshotRaw>("/v2/stocks/snapshots", symbols);
+
+export const getLatestOptionSnapshots = async (
+  symbols: string[]
+): Promise<AlpacaBatchedSnapshotResponse<AlpacaOptionSnapshotRaw>> =>
+  getBatchedDataSnapshots<AlpacaOptionSnapshotRaw>("/v1beta1/options/snapshots", symbols);
 
 const requestJson = async <T>(
   endpoint: string,

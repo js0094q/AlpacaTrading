@@ -12,6 +12,7 @@ import { getTradingSafetyState } from "./tradingSafetyService.js";
 import {
   getAccount,
   getOptionContract,
+  listPaperAccountActivities,
   listRecentPaperOrders,
   listPaperPositions,
   submitPaperOrder,
@@ -27,6 +28,10 @@ import {
   insertPaperExecutionLedgerEntry,
   updatePaperExecutionLedgerEntry
 } from "./paperExecutionLedgerService.js";
+import {
+  reconcilePaperAccountBeforeExecution,
+  type PaperAccountReconciliationReport
+} from "./paperAccountReconciliationService.js";
 import { optionsQuoteConfig, roundOptionLimitPrice } from "./optionQuoteNormalizer.js";
 import { optionDaysToExpiration } from "./optionSymbolService.js";
 import type { RiskProfile } from "../types.js";
@@ -65,6 +70,7 @@ export type PaperExecuteBlockerCode =
   | "UNSUPPORTED_OPTION_STRATEGY"
   | "OPTION_RISK_LIMIT_EXCEEDED"
   | "ALPACA_PAPER_ORDER_SUBMISSION_FAILED"
+  | "ACCOUNT_RECONCILIATION_MISMATCH"
   | "DUPLICATE_PAPER_ORDER_BLOCKED"
   | "UNSUPPORTED_ASSET_CLASS"
   | "CLIENT_ORDER_ID_INVALID";
@@ -178,6 +184,7 @@ interface PaperExecuteDeps {
 interface PaperConfirmDeps extends PaperExecuteDeps {
   getAccount?: typeof getAccount;
   getOptionContract?: typeof getOptionContract;
+  listPaperAccountActivities?: typeof listPaperAccountActivities;
   listRecentPaperOrders?: typeof listRecentPaperOrders;
   listPaperPositions?: typeof listPaperPositions;
   submitPaperOrder?: typeof submitPaperOrder;
@@ -212,6 +219,7 @@ const BLOCKER_ORDER: PaperExecuteBlockerCode[] = [
   "UNSUPPORTED_OPTION_STRATEGY",
   "OPTION_RISK_LIMIT_EXCEEDED",
   "ALPACA_PAPER_ORDER_SUBMISSION_FAILED",
+  "ACCOUNT_RECONCILIATION_MISMATCH",
   "DUPLICATE_PAPER_ORDER_BLOCKED",
   "UNSUPPORTED_ASSET_CLASS",
   "CLIENT_ORDER_ID_INVALID"
@@ -855,6 +863,8 @@ export interface PaperExecuteConfirmReport {
   assetClass: PaperExecuteAssetClassFilter;
   status: PaperExecuteConfirmStatus;
   reason: PaperExecuteBlockerCode | null;
+  mutationAttempted: boolean;
+  reconciliation?: PaperAccountReconciliationReport;
   submitted: PaperExecuteSubmittedOrder[];
   blocked: PaperExecuteConfirmBlocked[];
   errors: Array<{
@@ -1036,6 +1046,8 @@ const emptyConfirmReport = (input: {
   candidateCounts?: PaperReviewReport["candidateCounts"];
   topSkipReasons?: string[];
   source?: PaperExecuteDryRunReport["source"];
+  mutationAttempted?: boolean;
+  reconciliation?: PaperAccountReconciliationReport;
 }): PaperExecuteConfirmReport => ({
   paperOnly: true,
   environment: input.environment,
@@ -1044,6 +1056,8 @@ const emptyConfirmReport = (input: {
   assetClass: input.assetClass,
   status: input.status || ((input.errors?.length || 0) > 0 ? "blocked" : "no_op"),
   reason: input.reason ?? null,
+  mutationAttempted: input.mutationAttempted ?? false,
+  reconciliation: input.reconciliation,
   submitted: [],
   blocked: input.blocked || [],
   errors: input.errors || [],
@@ -1471,15 +1485,136 @@ export const buildPaperExecuteConfirmPaperReport = async (
 
   const getAccountFn = deps.getAccount ?? getAccount;
   const getOptionContractFn = deps.getOptionContract ?? getOptionContract;
+  const listActivitiesFn = deps.listPaperAccountActivities ?? listPaperAccountActivities;
   const listPositionsFn = deps.listPaperPositions ?? listPaperPositions;
   const listRecentOrdersFn = deps.listRecentPaperOrders ?? listRecentPaperOrders;
   const submitOrderFn = deps.submitPaperOrder ?? submitPaperOrder;
 
+  let reconciliation: PaperAccountReconciliationReport;
+  let reconciliationAccount: AlpacaAccountRaw;
+  let reconciliationPositions: AlpacaPositionRaw[];
+  try {
+    const reconciliationSnapshot = await reconcilePaperAccountBeforeExecution({
+      getAccount: getAccountFn,
+      listPaperPositions: listPositionsFn,
+      listRecentPaperOrders: listRecentOrdersFn,
+      listPaperAccountActivities: listActivitiesFn,
+      now: deps.now
+    });
+    reconciliation = reconciliationSnapshot.report;
+    reconciliationAccount = reconciliationSnapshot.account;
+    reconciliationPositions = reconciliationSnapshot.positions;
+  } catch (error) {
+    const requestId = error instanceof AlpacaApiError ? error.requestId : undefined;
+    reconciliation = {
+      status: "blocked",
+      reconciliationStatus: "blocked",
+      code: "ACCOUNT_RECONCILIATION_MISMATCH",
+      mutationAttempted: false,
+      since: "unavailable",
+      reconciliationEvents: [],
+      paperSyncRemovedSymbols: [],
+      paperSyncPendingSymbols: [],
+      paperSyncRestoredSymbols: [],
+      missingSymbols: [],
+      expectedQuantities: {},
+      recentBuyFillOrderIds: [],
+      sellFillsFound: false,
+      nonFillAdjustmentActivitiesFound: false,
+      accountCash: null,
+      accountEquity: null,
+      accountPositionMarketValue: null,
+      sumPositionsMarketValue: 0,
+      alpacaRequestIds: requestId ? { account: requestId } : {},
+      marketValueMismatch: false,
+      accountMathMismatch: false,
+      warnings: [
+        error instanceof Error
+          ? error.message
+          : "Paper account reconciliation could not complete."
+      ]
+    };
+    const reconciliationBlocked = dryRunReport.wouldSubmit.map((payload) =>
+      blockConfirmPayload(
+        payload,
+        "ACCOUNT_RECONCILIATION_MISMATCH",
+        "Paper account reconciliation failed before submission."
+      )
+    );
+    return {
+      ...emptyConfirmReport({
+        generatedAt,
+        environment: state.alpacaEnv,
+        assetClass,
+        status: "blocked",
+        reason: "ACCOUNT_RECONCILIATION_MISMATCH",
+        blocked: [...preflightBlocked, ...reconciliationBlocked],
+        errors: [
+          {
+            reason: "ACCOUNT_RECONCILIATION_MISMATCH",
+            message:
+              error instanceof Error
+                ? error.message
+                : "Paper account reconciliation could not complete.",
+            requestId
+          }
+        ],
+        candidateCounts: dryRunReport.candidateCounts,
+        topSkipReasons: dryRunReport.topSkipReasons,
+        source: dryRunReport.source,
+        reconciliation
+      }),
+      summary: {
+        eligiblePayloads: dryRunReport.wouldSubmit.length,
+        submitted: 0,
+        blocked: preflightBlocked.length + reconciliationBlocked.length,
+        errors: 1
+      }
+    };
+  }
+
+  if (reconciliation.reconciliationStatus === "blocked") {
+    const reconciliationBlocked = dryRunReport.wouldSubmit.map((payload) =>
+      blockConfirmPayload(
+        payload,
+        "ACCOUNT_RECONCILIATION_MISMATCH",
+        "Alpaca paper account reconciliation mismatch blocked submission."
+      )
+    );
+    return {
+      ...emptyConfirmReport({
+        generatedAt,
+        environment: state.alpacaEnv,
+        assetClass,
+        status: "blocked",
+        reason: "ACCOUNT_RECONCILIATION_MISMATCH",
+        blocked: [...preflightBlocked, ...reconciliationBlocked],
+        errors: [
+          {
+            reason: "ACCOUNT_RECONCILIATION_MISMATCH",
+            message: "Alpaca paper account state is inconsistent; no paper orders were submitted."
+          }
+        ],
+        candidateCounts: dryRunReport.candidateCounts,
+        topSkipReasons: dryRunReport.topSkipReasons,
+        source: dryRunReport.source,
+        reconciliation
+      }),
+      summary: {
+        eligiblePayloads: dryRunReport.wouldSubmit.length,
+        submitted: 0,
+        blocked: preflightBlocked.length + reconciliationBlocked.length,
+        errors: 1
+      }
+    };
+  }
+
   const submitted: PaperExecuteSubmittedOrder[] = [];
   const blocked: PaperExecuteConfirmBlocked[] = [...preflightBlocked];
-  let account: AlpacaAccountRaw | null = null;
-  let positions: AlpacaPositionRaw[] = [];
+  let account: AlpacaAccountRaw | null = reconciliationAccount;
+  let positions: AlpacaPositionRaw[] = reconciliationPositions;
   let recentPaperOrders: AlpacaSubmittedOrder[] | null = null;
+  let mutationAttempted = false;
 
   for (const payload of dryRunReport.wouldSubmit) {
     if (payload.assetClass === "option" && !paperOptionsExecutionEnabled) {
@@ -1620,6 +1755,7 @@ export const buildPaperExecuteConfirmPaperReport = async (
     );
 
     try {
+      mutationAttempted = true;
       const response = await submitOrderFn(toAlpacaOrderPayload(payload));
       const order = response.data;
       const alpacaOrderId = order.id;
@@ -1700,6 +1836,8 @@ export const buildPaperExecuteConfirmPaperReport = async (
         : "submitted"
       : "blocked",
     reason: errors[0]?.reason ?? blocked[0]?.reason ?? null,
+    mutationAttempted,
+    reconciliation,
     submitted,
     blocked,
     errors,
@@ -1870,6 +2008,43 @@ export const formatPaperExecuteConfirmReportAsTable = (
         blocked.reason
       ].join(" ")
     );
+  }
+
+  if (report.reconciliation && report.reconciliation.reconciliationStatus !== "ok") {
+    const reconciliation = report.reconciliation;
+    lines.push("Reconciliation:");
+    lines.push(`- Status: ${reconciliation.reconciliationStatus}`);
+    lines.push(`- Mutation attempted: ${String(reconciliation.mutationAttempted)}`);
+    lines.push(
+      `- Events: ${reconciliation.reconciliationEvents.map((event) => `${event.type}:${event.symbol}`).join(", ") || "none"}`
+    );
+    lines.push(
+      `- Pending symbols: ${reconciliation.paperSyncPendingSymbols.join(", ") || "none"}`
+    );
+    lines.push(
+      `- Restored symbols: ${reconciliation.paperSyncRestoredSymbols.join(", ") || "none"}`
+    );
+    lines.push(
+      `- Paper sync removed symbols: ${reconciliation.paperSyncRemovedSymbols.join(", ") || "none"}`
+    );
+    lines.push(`- Missing symbols: ${reconciliation.missingSymbols.join(", ") || "none"}`);
+    lines.push(
+      `- Expected quantities: ${JSON.stringify(reconciliation.expectedQuantities)}`
+    );
+    lines.push(
+      `- Recent buy fill order IDs: ${reconciliation.recentBuyFillOrderIds.join(", ") || "none"}`
+    );
+    lines.push(`- Sell fills found: ${String(reconciliation.sellFillsFound)}`);
+    lines.push(
+      `- Non-FILL adjustment activities found: ${String(reconciliation.nonFillAdjustmentActivitiesFound)}`
+    );
+    lines.push(`- Account cash: ${reconciliation.accountCash || "unknown"}`);
+    lines.push(`- Account equity: ${reconciliation.accountEquity || "unknown"}`);
+    lines.push(
+      `- Account position_market_value: ${reconciliation.accountPositionMarketValue || "unknown"}`
+    );
+    lines.push(`- Sum positions market value: ${reconciliation.sumPositionsMarketValue.toFixed(2)}`);
+    lines.push(`- Alpaca request IDs: ${JSON.stringify(reconciliation.alpacaRequestIds)}`);
   }
 
   if (report.errors.length) {

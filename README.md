@@ -134,6 +134,7 @@ LEAPS_MAX_BID_ASK_SPREAD_PCT=20
 LEAPS_MIN_DELTA_REVIEW=0.45
 LEAPS_REVIEW_INTERVAL_DAYS=30
 PAPER_RUNTIME_DUPLICATE_RECONCILIATION_ENABLED=false
+PAPER_POSITION_SYNC_FRESHNESS_MINUTES=2160
 ENABLE_OPTIONS_RESEARCH=true
 ENABLE_AGGRESSIVE_PAPER_STRATEGIES=true
 ENABLE_SHORT_RESEARCH=true
@@ -260,8 +261,10 @@ npm run paper:intel -- --format=json
 npm run options:diagnose -- --underlyings=SPY,QQQ
 npm run paper:plan -- --riskProfile=aggressive --optionsEnabled=true --format=json
 npm run paper:review -- --riskProfile=aggressive --optionsEnabled=true --format=json
+npm run paper:exit:review -- --format=json
 npm run paper:execute -- --dryRun --riskProfile=aggressive --optionsEnabled=true --format=json
 npm run paper:execute -- --confirmPaper --riskProfile=aggressive --optionsEnabled=true --assetClass=all --format=json
+npm run paper:exit:execute -- --confirmPaper --format=json
 npm run paper:learn -- --format=json
 ```
 
@@ -326,12 +329,70 @@ The continuous paper monitor is installed separately with `scripts/install-paper
 The monitor runner no-ops with `MARKET_CLOSED` outside regular market hours, weekends, and configured US market holidays. It fails closed unless `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, `LIVE_TRADING_ENABLED=false`, `PAPER_ORDER_EXECUTION_ENABLED=true`, `PAPER_OPTIONS_EXECUTION_ENABLED=true`, and `AUTOMATED_PAPER_EXECUTION_ENABLED=true` for execution tasks. See `docs/paper-monitoring-operations.md`.
 
 Set the VPS timezone to `America/New_York` or adjust the timer calendar before enabling timers.
+### Paper exit management
+
+Paper exit management is separate from entry planning. Review is read-only:
+
+```bash
+npm run paper:exit:review
+npm run paper:exit:review -- --format=json
+```
+
+Confirmed execution is paper-only and guarded:
+
+```bash
+npm run paper:exit:execute -- --confirmPaper
+npm run paper:exit:execute -- --confirmPaper --format=json
+```
+
+`paper:exit:review` fetches `/v2/account`, `/v2/positions`, current-day `/v2/orders?status=all`, current-day `/v2/account/activities`, market clock data, and latest stock/option snapshots when available. It returns current sell candidates and skipped positions with Alpaca request IDs and `mutationAttempted: false`.
+
+`paper:exit:execute --confirmPaper` reruns review first and also requires the existing `PAPER_ORDER_EXECUTION_ENABLED=true` paper mutation gate. It never submits skipped positions.
+
+Default 0DTE option rules:
+
+- outside the final 2 hours: sell-to-close at `-50%` unrealized P/L (`ODTE_STOP_LOSS_50`) or `+50%` unrealized P/L (`ODTE_TAKE_PROFIT_50`)
+- inside the final 2 hours: sell-to-close at `-25%` (`ODTE_EOD_STOP_LOSS_25`) or `+25%` (`ODTE_EOD_TAKE_PROFIT_25`)
+- inside the final 30 minutes: force sell-to-close sellable 0DTE contracts (`ODTE_FORCE_EXIT_BEFORE_CLOSE`)
+- below `minSellableOptionValue=0.05`: skip by default with `ODTE_BELOW_MIN_SELLABLE_VALUE`
+
+0DTE sell payloads use `side=sell`, `positionIntent=sell_to_close`, `timeInForce=day`, and a conservative limit price from a fresh bid when reliable option quote data exists. Stale or missing option quotes do not produce execution payloads. LEAPS are classified separately and are skipped by default; 0DTE rules never sell LEAPS.
+
+LEAPS exits are paper-only and disabled unless `--includeLEAPS=true` is explicitly provided:
+
+```bash
+npm run paper:exit:review -- --includeLEAPS=true --format=json
+npm run paper:exit:execute -- --confirmPaper --includeLEAPS=true --format=json
+```
+
+Default LEAPS exit rules:
+
+- sell-to-close at `-35%` unrealized P/L (`LEAPS_STOP_LOSS_35`)
+- sell-to-close at `+75%` unrealized P/L (`LEAPS_TAKE_PROFIT_75`)
+- sell-to-close known LEAPS that decay below `120` DTE (`LEAPS_DTE_DECAY_EXIT`)
+- skip when no fresh sellable quote is available (`LEAPS_QUOTE_UNAVAILABLE`)
+- skip below `leapsMinSellableOptionValue=0.05` (`LEAPS_BELOW_MIN_SELLABLE_VALUE`)
+
+LEAPS sell payloads use `side=sell`, `positionIntent=sell_to_close`, `timeInForce=day`, and a conservative limit price from the bid. Market LEAPS exits are not enabled. Contracts that were originally recorded as LEAPS in the paper learning ledger can still be recognized for the DTE decay rule after current DTE falls below the normal `180` DTE LEAPS classification threshold, but only if the contract still exists in `/v2/positions`; local-only records never create synthetic sell payloads.
+
+Default equity exit rules:
+
+- sell at `-5%` unrealized P/L (`EQUITY_STOP_LOSS_5`)
+- sell at `+8%` unrealized P/L (`EQUITY_TAKE_PROFIT_8`)
+- use `/v2/positions.qty_available` when present, including fractional quantities
+- skip positions with existing open or pending sell orders (`EXIT_ORDER_ALREADY_OPEN`)
+
+Alpaca paper sync behavior remains part of the guardrail model. Orders and activities may show simulated fills before `/v2/positions` synchronizes, and paper positions may temporarily disappear and later reappear. `/v2/positions` and `/v2/account` remain the authority for current exposure. The exit review never fabricates sell fills, never creates sell payloads for local-only missing positions, and preserves reconciliation events such as `PAPER_POSITION_SYNC_PENDING`, `PAPER_POSITION_SYNC_RESTORED`, and `PAPER_SYNC_POSITION_REMOVAL`.
+
+Account reconciliation blocks execution when current exposure cannot be safely calculated, including material `account.position_market_value` mismatches against the sum of `/v2/positions.market_value`. The default tolerance is `$2` or `0.25%`, whichever is larger. Live-account mismatches remain hard failures, and no live exit behavior is added.
 
 Expected safety properties:
 
 - Paper environment only (`ALPACA_ENV=paper`).
 - Inspection, research, plan, review, and dry-run commands remain read-only.
-- `paper:execute --confirmPaper` is the only intentional order-submission path and submits to Alpaca paper endpoints only after hard gates pass.
+- `paper:execute --confirmPaper` is the intentional entry/planned-order submission path and submits to Alpaca paper endpoints only after hard gates pass.
+- `paper:exit:execute --confirmPaper` is paper-only and submits only generated exit candidates after review and hard gates pass.
+- `paper:execute --confirmPaper` runs a read-only account reconciliation before any submission.
 - No live trading.
 - No live account mutations.
 - Request IDs are surfaced when provided by Alpaca.
@@ -409,6 +470,7 @@ npm run paper:execute -- --dryRun --riskProfile=aggressive --optionsEnabled=true
 `paper:execute --dryRun` returns `DRY_RUN_OR_CONFIRM_PAPER_REQUIRED` when neither dry-run nor confirm flags are present.
 If the plan has no eligible payloads after candidate filtering, `paper:execute --dryRun` and `paper:execute --confirmPaper` return `status: "no_op"` with `reason: "NO_ELIGIBLE_PAPER_PAYLOADS"` and submit zero orders.
 `paper:execute --confirmPaper` submits eligible equity and options payloads to Alpaca paper.
+Before any paper submission, `paper:execute --confirmPaper` fetches `/v2/account`, `/v2/positions`, `/v2/orders?status=all`, and `/v2/account/activities` over the configured reconciliation lookback.
 
 Required command forms:
 
@@ -432,6 +494,20 @@ Paper endpoint-only safety note:
 
 `paper:execute --confirmPaper` submits to Alpaca paper endpoints only and includes request IDs where available.
 When option payloads are present, execution rebuilds plan/review with the supplied `--riskProfile` and `--optionsEnabled=true` flags before submission; default moderate/options-disabled execution cannot submit option payloads.
+
+### Alpaca paper reconciliation
+
+Alpaca paper trading has an observed EOD/BOD synchronization limitation: `/v2/orders` and `/v2/account/activities` can show simulated fills before `/v2/positions` is fully synchronized, and missing paper positions can later reappear. For current paper exposure, this project treats `/v2/positions` plus `/v2/account` as authoritative.
+
+The pre-execution reconciliation guard preserves buy-fill evidence and Alpaca request IDs without inventing sell fills or realized P/L:
+
+- `PAPER_POSITION_SYNC_PENDING`: recent paper buy fill evidence exists, but `/v2/positions` does not yet show the symbol inside `PAPER_POSITION_SYNC_FRESHNESS_MINUTES` (default `2160` minutes). This is warning-only when account math is consistent.
+- `PAPER_POSITION_SYNC_RESTORED`: a symbol previously recorded as pending or paper-sync removed is now present in `/v2/positions` again.
+- `PAPER_SYNC_POSITION_REMOVAL`: missing state persisted beyond the freshness window, account math is consistent without the symbol, and no sell/order/activity explains the removal. This remains a paper-environment reconciliation event, not a synthetic sell.
+- `ACCOUNT_RECONCILIATION_MISMATCH`: hard fail before mutation when `account.position_market_value` materially differs from the sum of `/v2/positions.market_value`, account cash/equity/market value are internally inconsistent, exposure cannot be safely calculated, or a live account has an unexplained ledger mismatch.
+
+Confirm-paper JSON includes `reconciliationStatus`, `reconciliationEvents`, `paperSyncRemovedSymbols`, `accountCash`, `accountEquity`, `accountPositionMarketValue`, `sumPositionsMarketValue`, `alpacaRequestIds`, and `mutationAttempted`.
+Missing paper symbols are excluded from current exposure calculations unless `/v2/positions` confirms them. The local audit trail records reconciliation events in `paper_reconciliation_events`; it does not create fake sell fills. When a symbol reappears, `PAPER_POSITION_SYNC_RESTORED` records the restoration and current exposure follows `/v2/positions` again.
 
 ## Paper Risk Posture
 
@@ -765,6 +841,7 @@ Local/VPS persistence uses `data/research.db` by default with the following coll
 - paper_review_artifacts
 - portfolio_high_water_marks
 - portfolio_beta_cache
+- paper_reconciliation_events
 
 Alpaca API request IDs are persisted in `api_request_log.request_id`.
 

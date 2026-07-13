@@ -157,6 +157,35 @@ export const listPaperExecutionLedgerEntries = (
   return rows.map(mapRow);
 };
 
+export const getLatestSuccessfulPaperExecutionCreatedAt = (): string | null => {
+  const row = queryOne<{ created_at: string | null }>(
+    `
+    SELECT MAX(created_at) AS created_at
+    FROM paper_execution_ledger
+    WHERE mode = 'confirmPaper'
+      AND status IN ('accepted', 'submitted')
+    `
+  );
+  return row?.created_at ?? null;
+};
+
+export const listSuccessfulPaperExecutionLedgerEntriesSince = (
+  since: string
+): PaperExecutionLedgerEntry[] => {
+  const rows = queryAll<LedgerRow>(
+    `
+    SELECT *
+    FROM paper_execution_ledger
+    WHERE mode = 'confirmPaper'
+      AND status IN ('accepted', 'submitted')
+      AND created_at >= ?
+    ORDER BY created_at ASC, id ASC
+    `,
+    [since]
+  );
+  return rows.map(mapRow);
+};
+
 export const insertPaperExecutionLedgerEntry = (input: {
   mode: string;
   assetClass: string;
