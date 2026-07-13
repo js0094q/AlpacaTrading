@@ -10,6 +10,10 @@ import type {
 import { appendDecisionLifecycleEvent } from "./marketDecisionEvidenceService.js";
 import { createPositionLifecycleId } from "./marketDecisionIdentityService.js";
 import { linkPaperExecutionPositionLifecycle } from "./paperExecutionLedgerService.js";
+import {
+  linkPaperLearningRecordsToOutcome,
+  linkPaperLearningRecordsToOutcomeRevision
+} from "./paperLearningLedgerService.js";
 
 const canonicalJson = (value: unknown) => JSON.stringify(canonicalizeJson(value));
 const round = (value: number | null, digits = 8) =>
@@ -764,6 +768,13 @@ export const persistPaperPositionOutcome = (input: {
     calculationBasis,
     createdAt
   );
+  linkPaperLearningRecordsToOutcome({
+    entryDecisionId: position.entryDecisionId,
+    exitDecisionId: position.terminalExitDecisionId,
+    positionLifecycleId: input.positionLifecycleId,
+    outcomeId,
+    completenessStatus
+  });
   return mapOutcome(
     queryOne<OutcomeRow>(
       "SELECT * FROM paper_position_outcomes WHERE outcome_id = ? LIMIT 1",
@@ -813,6 +824,10 @@ export const appendPaperPositionOutcomeRevision = (input: {
     canonicalJson(input.correctedFields),
     new Date().toISOString()
   );
+  linkPaperLearningRecordsToOutcomeRevision({
+    outcomeId: input.outcomeId,
+    revisionId
+  });
   return {
     revisionId,
     outcomeId: input.outcomeId,

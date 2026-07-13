@@ -1,5 +1,25 @@
 # Resume Context: Alpaca Trading Research Infra
 
+## Market Observatory Phase 1B implementation checkpoint (2026-07-13)
+
+- Phase 1B starts from Phase 1A `9bcb097` on `feat/market-observatory` and adds
+  migration `2026-07-13-market-observatory-phase-1b`.
+- Candidate, decision, and position-lifecycle UUIDs are distinct. Decision origins
+  are retry-idempotent; exit reviews receive separate decision IDs.
+- Immutable snapshots and append-only events preserve selected, rejected, skipped,
+  blocked, review, eligibility, fill, open, and close evidence. Provenance hashes
+  include allowlisted strategy/risk settings only.
+- Analytical positions require exact confirmed-fill ledger lineage. Observations
+  are append-only; ambiguous Alpaca netting suppresses per-decision return/MFE/MAE.
+- Original outcomes are unique per lifecycle and use persisted observations only.
+  Option and underlying bases remain separate; corrections append as revisions.
+- Learning links candidate, entry/exit decisions, lifecycle, original outcome,
+  effective revision, completeness, and linkage. Promotion thresholds are unchanged.
+- Read-only inspection is `npm run paper:trace -- --decisionId <uuid>`.
+- Deployment must migrate a controlled copy first, preserve paper/live flags,
+  enable `alpaca-market-observatory.timer`, and account for all 51 symbols as
+  `COMPLETE` or explicit `PARTIAL`. Do not force a paper trade for validation.
+
 ## Market Observatory Phase 1A branch checkpoint (2026-07-13)
 
 - `feat/market-observatory` starts from `main@1d274301fab8739702d0105bcf8e6b7ff504761a`.

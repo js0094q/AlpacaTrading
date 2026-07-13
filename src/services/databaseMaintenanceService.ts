@@ -32,8 +32,12 @@ const requiredColumns: Record<string, string[]> = {
   ],
   paper_learning_records: [
     "decision_id",
+    "entry_decision_id",
+    "exit_decision_id",
     "position_lifecycle_id",
     "outcome_id",
+    "effective_outcome_revision_id",
+    "outcome_completeness_status",
     "decision_linkage_status"
   ],
   hedge_execution_reviews: [
@@ -56,7 +60,9 @@ const requiredIndexes = [
   "idx_paper_execution_decision_id",
   "idx_paper_execution_position_lifecycle",
   "idx_paper_learning_decision_id",
+  "idx_paper_learning_entry_decision_id",
   "idx_paper_learning_position_lifecycle",
+  "idx_paper_learning_outcome_id",
   "idx_decision_snapshots_symbol_created",
   "idx_paper_positions_symbol_status",
   "idx_paper_position_observations_symbol_time"

@@ -338,6 +338,31 @@ augments only the latest research feature row. All scored candidate outcomes are
 persisted, while only `selected` candidates can enter existing guarded paper
 planning and runtime paths.
 
+Phase 1B keeps candidate, decision, and broker-reconciled position lifecycle IDs
+distinct. Immutable `decision_snapshots` retain decision-time evidence; later
+review, eligibility, fill, open, and close states append to
+`decision_lifecycle_events`. Analytical positions are created only from exact
+confirmed fills in `paper_execution_ledger`. If Alpaca nets more than one possible
+decision into a symbol position, the linked lifecycles are marked
+`AMBIGUOUS_NETTED_POSITION` and per-decision return/MFE/MAE stay null.
+
+Run and verify the additive migration (the database flag defaults to
+`RESEARCH_DB_PATH` when omitted):
+
+```bash
+npm run db:migrate -- --database /path/to/research.db
+npm run db:verify -- --database /path/to/research.db
+```
+
+Terminal outcomes use persisted observations only and keep option-position and
+underlying-return bases separate. One original outcome is retained per lifecycle;
+corrections append as revisions. Trace one decision without returning raw payload
+or secret-bearing model/environment data:
+
+```bash
+npm run paper:trace -- --decisionId <uuid>
+```
+
 Those legacy `paper-ops-*` timers are review-only and override `AUTOMATED_PAPER_EXECUTION_ENABLED=false`; bounded paper execution tasks use the checked-in target value `true` only with their own confirmation and paper-runtime gates.
 The continuous paper monitor is installed separately with `scripts/install-paper-monitoring-systemd.sh`:
 
@@ -361,6 +386,7 @@ Expected safety properties:
 - No live trading.
 - No live account mutations.
 - Request IDs are surfaced when provided by Alpaca.
+- `paper:trace`, `db:verify`, and observatory collection submit no orders.
 - `--confirmPaper` requires explicit hard gates and still keeps paper endpoint-only submission.
 
 Read-only paper intelligence commands:

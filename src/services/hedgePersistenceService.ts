@@ -29,6 +29,12 @@ import {
   buildHedgeConfig,
   hedgeConfigurationFingerprint
 } from "./hedgeConfigService.js";
+import {
+  appendDecisionLifecycleEvent,
+  hashAllowlistedConfig,
+  persistDecisionSnapshot
+} from "./marketDecisionEvidenceService.js";
+import type { PositionLifecycleId } from "../types.js";
 
 interface HighWaterRow {
   environment: "paper";
@@ -1073,14 +1079,76 @@ export const latestHedgePlan = (): HedgePlanArtifact | null => {
 };
 
 export const persistHedgeExecutionReview = (review: HedgeExecutionReview) => {
+  const exactOpenPositions = review.reviewType === "exit"
+    ? (getDb().prepare(`
+        SELECT position_lifecycle_id
+        FROM paper_positions
+        WHERE status = 'OPEN'
+          AND UPPER(COALESCE(option_symbol, symbol)) = UPPER(?)
+        ORDER BY opened_at, position_lifecycle_id
+      `).all(review.orderIntent.symbol) as Array<{
+        position_lifecycle_id: PositionLifecycleId;
+      }>)
+    : [];
+  const positionLifecycleId =
+    exactOpenPositions.length === 1
+      ? exactOpenPositions[0].position_lifecycle_id
+      : null;
+  const snapshot = persistDecisionSnapshot({
+    originType: "hedge_execution_review",
+    originId: review.reviewId,
+    decisionRole: review.reviewType,
+    candidateId: review.candidateId,
+    positionLifecycleId,
+    createdAt: review.createdAt,
+    strategyFamily: "portfolio_hedge",
+    symbol: review.orderIntent.underlying,
+    underlyingSymbol: review.orderIntent.underlying,
+    optionSymbol: review.orderIntent.symbol,
+    decisionStatus: review.blockers.length ? "BLOCKED" : "REVIEWED",
+    reasonCodes: review.blockers.length
+      ? review.blockers
+      : review.warnings.length
+        ? review.warnings
+        : ["HEDGE_REVIEW_READY"],
+    rationale: {
+      candidateId: review.candidateId,
+      sourceRecommendationId: review.sourceRecommendationId
+    },
+    instrumentState: {
+      orderType: review.orderIntent.orderType,
+      quantity: review.orderIntent.quantity,
+      side: review.orderIntent.side,
+      structure: review.orderIntent.structure
+    },
+    riskState: review.caps,
+    dataQualityStatus: review.blockers.length ? "BLOCKED" : "COMPLETE",
+    sourceTimestamps: { reviewCreatedAt: review.createdAt },
+    environment: "paper",
+    configAllowlistVersion: "phase1b-v1",
+    strategyConfigHash: hashAllowlistedConfig(review, [
+      "orderIntent.side",
+      "orderIntent.structure",
+      "orderIntent.underlying",
+      "reviewType"
+    ]),
+    riskConfigHash: hashAllowlistedConfig(review, [
+      "caps.maxNotional",
+      "caps.maxPremium",
+      "orderIntent.maxNotional",
+      "orderIntent.maxPremium"
+    ]),
+    marketDataRequestId: review.requestId
+  });
   getDb()
     .prepare(
       `
       INSERT INTO hedge_execution_reviews(
         review_id, created_at, expires_at, review_type, client_order_id,
         account_hash, source_recommendation_id, source_snapshot_id,
-        payload_hash, signature, status, review_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        payload_hash, signature, status, review_json, decision_id,
+        decision_role, position_lifecycle_id, decision_linkage_status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'EXACT')
       ON CONFLICT(review_id) DO UPDATE SET
         expires_at = excluded.expires_at,
         status = excluded.status,
@@ -1099,8 +1167,28 @@ export const persistHedgeExecutionReview = (review: HedgeExecutionReview) => {
       review.payloadHash,
       review.signature,
       "reviewed",
-      canonicalJson(review)
+      canonicalJson(review),
+      snapshot.decisionId,
+      review.reviewType,
+      positionLifecycleId
     );
+  appendDecisionLifecycleEvent({
+    decisionId: snapshot.decisionId,
+    status: review.blockers.length ? "BLOCKED" : "REVIEWED",
+    reasonCodes: review.blockers.length
+      ? review.blockers
+      : review.warnings.length
+        ? review.warnings
+        : ["HEDGE_REVIEW_READY"],
+    occurredAt: review.createdAt,
+    sourceType: "hedge_execution_review",
+    sourceId: review.reviewId,
+    evidence: {
+      positionLifecycleId,
+      reviewId: review.reviewId,
+      reviewType: review.reviewType
+    }
+  });
   return review;
 };
 

@@ -921,8 +921,22 @@ export const runPhase1BMigrations = (db: DbHandle) => {
       "decision_linkage_status TEXT NOT NULL DEFAULT 'LEGACY_UNLINKED'"
     );
     addPhase1BColumn(db, "paper_learning_records", "decision_id", "decision_id TEXT");
+    addPhase1BColumn(db, "paper_learning_records", "entry_decision_id", "entry_decision_id TEXT");
+    addPhase1BColumn(db, "paper_learning_records", "exit_decision_id", "exit_decision_id TEXT");
     addPhase1BColumn(db, "paper_learning_records", "position_lifecycle_id", "position_lifecycle_id TEXT");
     addPhase1BColumn(db, "paper_learning_records", "outcome_id", "outcome_id TEXT");
+    addPhase1BColumn(
+      db,
+      "paper_learning_records",
+      "effective_outcome_revision_id",
+      "effective_outcome_revision_id TEXT"
+    );
+    addPhase1BColumn(
+      db,
+      "paper_learning_records",
+      "outcome_completeness_status",
+      "outcome_completeness_status TEXT"
+    );
     addPhase1BColumn(
       db,
       "paper_learning_records",
@@ -969,7 +983,9 @@ export const runPhase1BMigrations = (db: DbHandle) => {
       ["paper_execution_ledger", "CREATE INDEX IF NOT EXISTS idx_paper_execution_decision_id ON paper_execution_ledger(decision_id)"],
       ["paper_execution_ledger", "CREATE INDEX IF NOT EXISTS idx_paper_execution_position_lifecycle ON paper_execution_ledger(position_lifecycle_id)"],
       ["paper_learning_records", "CREATE INDEX IF NOT EXISTS idx_paper_learning_decision_id ON paper_learning_records(decision_id)"],
+      ["paper_learning_records", "CREATE INDEX IF NOT EXISTS idx_paper_learning_entry_decision_id ON paper_learning_records(entry_decision_id)"],
       ["paper_learning_records", "CREATE INDEX IF NOT EXISTS idx_paper_learning_position_lifecycle ON paper_learning_records(position_lifecycle_id)"],
+      ["paper_learning_records", "CREATE INDEX IF NOT EXISTS idx_paper_learning_outcome_id ON paper_learning_records(outcome_id)"],
       ["hedge_execution_reviews", "CREATE INDEX IF NOT EXISTS idx_hedge_execution_reviews_decision_id ON hedge_execution_reviews(decision_id)"],
       ["hedge_learning_events", "CREATE INDEX IF NOT EXISTS idx_hedge_learning_events_decision_id ON hedge_learning_events(decision_id)"]
     ] as const;

@@ -377,6 +377,40 @@ npm run paper:execute -- --confirmPaper --assetClass=option --format=json
 
 ## Scheduled Paper Ops Automation
 
+### Phase 1B database and observatory deployment
+
+Before changing runtime state, verify the merged target SHA, paper/live flags,
+active services/timers/locks, database path, disk space, broker-order baseline,
+and current SQLite integrity without displaying secret files.
+
+Stop affected SQLite writers and create a timestamped backup. Apply the migration
+twice to a controlled copy, then verify it:
+
+```bash
+npm run db:migrate -- --database /path/to/copied-research.db
+npm run db:migrate -- --database /path/to/copied-research.db
+npm run db:verify -- --database /path/to/copied-research.db
+```
+
+After the copy passes, migrate and verify production before restoring writers.
+Confirm the named migration, required tables/columns/indexes, retained legacy row
+counts, no new exact-linkage orphans, and `PRAGMA integrity_check`. Deploy only the
+merged SHA with fast-forward-only Git operations, install/build, reinstall the
+checked-in units, restore the prior service/timer state, and enable:
+
+```bash
+sudo systemctl enable --now alpaca-market-observatory.timer
+systemctl status alpaca-market-observatory.timer --no-pager
+systemctl list-timers 'alpaca-market-observatory*' --no-pager
+```
+
+The acceptance run must account for all 51 symbols. Use `COMPLETE` only when all
+51 observations persist; use `PARTIAL` when every bounded failure has a structured
+reason and all successful symbols persist. Outside regular hours, verify
+`SKIPPED_MARKET_CLOSED`, service/timer/schema/migration health, universe size,
+paper-only Alpaca access, and a safe bounded probe. Record regular-session
+collection as pending; never fabricate market-open evidence or force a paper trade.
+
 Use systemd timers for VPS automation. Before enabling timers, set the VPS timezone to New York market time or adjust the `OnCalendar` entries:
 
 ```bash

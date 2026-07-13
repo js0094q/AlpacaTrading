@@ -670,6 +670,18 @@ test("persists and verifies an HMAC hedge review on every read", () => {
   });
   persistHedgeExecutionReview(review);
 
+  const linkage = getDb().prepare(`
+    SELECT her.decision_id, her.decision_role, her.decision_linkage_status,
+           ds.origin_type, ds.decision_status
+    FROM hedge_execution_reviews her
+    JOIN decision_snapshots ds ON ds.decision_id = her.decision_id
+    WHERE her.review_id = ?
+  `).get(review.reviewId) as Record<string, unknown>;
+  assert.equal(linkage.decision_role, "entry");
+  assert.equal(linkage.decision_linkage_status, "EXACT");
+  assert.equal(linkage.origin_type, "hedge_execution_review");
+  assert.equal(linkage.decision_status, "REVIEWED");
+
   const valid = readHedgeExecutionReview({
     reviewId: review.reviewId,
     signingKey: "persistence-test-key",

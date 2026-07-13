@@ -102,6 +102,7 @@ import {
   migrateDatabaseFile,
   verifyDatabaseFile
 } from "./services/databaseMaintenanceService.js";
+import { buildMarketDecisionTrace } from "./services/marketDecisionTraceService.js";
 
 const parseArg = (input: string): Record<string, string> | null => {
   const [rawKey, rawValue] = input.split("=", 2);
@@ -270,6 +271,14 @@ const run = async () => {
 
   if (command === "db:verify") {
     print(verifyDatabaseFile(args.database || undefined));
+    return;
+  }
+
+  if (command === "paper:trace") {
+    if (!args.decisionId) {
+      throw new Error("PAPER_TRACE_DECISION_ID_REQUIRED");
+    }
+    print(buildMarketDecisionTrace(args.decisionId));
     return;
   }
 
@@ -1402,7 +1411,7 @@ const run = async () => {
 
   print({
     error:
-      "Unknown command. See README for available commands including db:migrate/db:verify/universe/data/options/features/targets/backtest/learn/research/alpaca:config/paper (including paper:analytics, paper:learn, paper:execute, paper:review, paper:plan, paper:portfolio:review, paper:exit:review, paper:options:discover, paper:ops:morning, paper:ops:midday, paper:ops:late-day, paper:snapshots, paper:trends, paper:runtime, paper:intel).",
+      "Unknown command. See README for available commands including db:migrate/db:verify/universe/data/options/features/targets/backtest/learn/research/alpaca:config/paper (including paper:analytics, paper:learn, paper:trace, paper:execute, paper:review, paper:plan, paper:portfolio:review, paper:exit:review, paper:options:discover, paper:ops:morning, paper:ops:midday, paper:ops:late-day, paper:snapshots, paper:trends, paper:runtime, paper:intel).",
     command,
     action,
     config
