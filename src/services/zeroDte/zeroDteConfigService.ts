@@ -6,6 +6,14 @@ import {
 
 const DEFAULT_UNDERLYINGS = ["SPY", "QQQ", "IWM"];
 const DEFAULT_OUTCOME_HORIZONS_MINUTES = [5, 15, 30, 60];
+const DEFAULT_DISCOVERY_START_ET = "09:35";
+const DEFAULT_NEW_ENTRY_CUTOFF_ET = "15:15";
+const DEFAULT_FORCE_EXIT_ET = "15:50";
+const DEFAULT_ENGINE_INTERVAL_SECONDS = 60;
+const DEFAULT_MIN_PREMIUM = 0.1;
+const DEFAULT_MAX_PREMIUM = 5;
+const DEFAULT_MIN_SCORE_MOVEMENT = 5;
+const SESSION_TIME_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
 
 const readValue = (env: NodeJS.ProcessEnv, name: string) => env[name];
 
@@ -41,9 +49,35 @@ const parseNonNegativeInteger = (value: string | undefined, fallback: number) =>
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
 };
 
+const parsePositiveInteger = (value: string | undefined, fallback: number) => {
+  if (value === undefined || value.trim() === "") {
+    return fallback;
+  }
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+};
+
+const parsePositiveNumber = (value: string | undefined, fallback: number) => {
+  if (value === undefined || value.trim() === "") {
+    return fallback;
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+
 const parseString = (value: string | undefined, fallback: string) => {
   const normalized = value?.trim();
   return normalized ? normalized : fallback;
+};
+
+const parseSessionTime = (value: string | undefined, fallback: string) => {
+  const normalized = value?.trim();
+  return normalized && SESSION_TIME_PATTERN.test(normalized) ? normalized : fallback;
+};
+
+const sessionMinutes = (value: string) => {
+  const [hours, minutes] = value.split(":").map(Number);
+  return hours * 60 + minutes;
 };
 
 const parseSymbolList = (value: string | undefined, fallback: string[]) => {
@@ -77,6 +111,38 @@ const parseOutcomeHorizons = (value: string | undefined) => {
 };
 
 export const loadZeroDteConfig = (env: NodeJS.ProcessEnv = process.env): ZeroDteConfig => {
+  const parsedDiscoveryStartEt = parseSessionTime(
+    readValue(env, "ZERO_DTE_DISCOVERY_START_ET"),
+    DEFAULT_DISCOVERY_START_ET
+  );
+  const parsedNewEntryCutoffEt = parseSessionTime(
+    readValue(env, "ZERO_DTE_NEW_ENTRY_CUTOFF_ET"),
+    DEFAULT_NEW_ENTRY_CUTOFF_ET
+  );
+  const parsedForceExitEt = parseSessionTime(
+    readValue(env, "ZERO_DTE_FORCE_EXIT_ET"),
+    DEFAULT_FORCE_EXIT_ET
+  );
+  const sessionIsOrdered =
+    sessionMinutes(parsedDiscoveryStartEt) < sessionMinutes(parsedNewEntryCutoffEt) &&
+    sessionMinutes(parsedNewEntryCutoffEt) < sessionMinutes(parsedForceExitEt);
+  const discoveryStartEt = sessionIsOrdered
+    ? parsedDiscoveryStartEt
+    : DEFAULT_DISCOVERY_START_ET;
+  const newEntryCutoffEt = sessionIsOrdered
+    ? parsedNewEntryCutoffEt
+    : DEFAULT_NEW_ENTRY_CUTOFF_ET;
+  const forceExitEt = sessionIsOrdered ? parsedForceExitEt : DEFAULT_FORCE_EXIT_ET;
+  const parsedMinPremium = parseNonNegativeNumber(
+    readValue(env, "ZERO_DTE_MIN_PREMIUM"),
+    DEFAULT_MIN_PREMIUM
+  );
+  const parsedMaxPremium = parseNonNegativeNumber(
+    readValue(env, "ZERO_DTE_MAX_PREMIUM"),
+    DEFAULT_MAX_PREMIUM
+  );
+  const premiumRangeIsOrdered = parsedMinPremium <= parsedMaxPremium;
+
   const normalized = {
     enabled: parseBoolean(readValue(env, "ZERO_DTE_ENGINE_ENABLED"), true),
     paperExecutionEnabled: parseBoolean(
@@ -85,18 +151,12 @@ export const loadZeroDteConfig = (env: NodeJS.ProcessEnv = process.env): ZeroDte
     ),
     shadowEnabled: parseBoolean(readValue(env, "ZERO_DTE_SHADOW_ENABLED"), true),
     underlyings: parseSymbolList(readValue(env, "ZERO_DTE_UNDERLYINGS"), DEFAULT_UNDERLYINGS),
-    discoveryStartEt: parseString(
-      readValue(env, "ZERO_DTE_DISCOVERY_START_ET"),
-      "09:35"
-    ),
-    newEntryCutoffEt: parseString(
-      readValue(env, "ZERO_DTE_NEW_ENTRY_CUTOFF_ET"),
-      "15:15"
-    ),
-    forceExitEt: parseString(readValue(env, "ZERO_DTE_FORCE_EXIT_ET"), "15:50"),
-    engineIntervalSeconds: parseNonNegativeInteger(
+    discoveryStartEt,
+    newEntryCutoffEt,
+    forceExitEt,
+    engineIntervalSeconds: parsePositiveInteger(
       readValue(env, "ZERO_DTE_ENGINE_INTERVAL_SECONDS"),
-      60
+      DEFAULT_ENGINE_INTERVAL_SECONDS
     ),
     queueMaxActive: parseNonNegativeInteger(
       readValue(env, "ZERO_DTE_QUEUE_MAX_ACTIVE"),
@@ -120,8 +180,12 @@ export const loadZeroDteConfig = (env: NodeJS.ProcessEnv = process.env): ZeroDte
       250
     ),
     maxSpreadPct: parseNonNegativeNumber(readValue(env, "ZERO_DTE_MAX_SPREAD_PCT"), 15),
-    minPremium: parseNonNegativeNumber(readValue(env, "ZERO_DTE_MIN_PREMIUM"), 0.1),
-    maxPremium: parseNonNegativeNumber(readValue(env, "ZERO_DTE_MAX_PREMIUM"), 5),
+    minPremium: premiumRangeIsOrdered ? parsedMinPremium : DEFAULT_MIN_PREMIUM,
+    maxPremium: premiumRangeIsOrdered ? parsedMaxPremium : DEFAULT_MAX_PREMIUM,
+    minScoreMovement: parsePositiveNumber(
+      readValue(env, "ZERO_DTE_MIN_SCORE_MOVEMENT"),
+      DEFAULT_MIN_SCORE_MOVEMENT
+    ),
     signalShortWindow: parseNonNegativeInteger(
       readValue(env, "ZERO_DTE_SIGNAL_SHORT_WINDOW"),
       3

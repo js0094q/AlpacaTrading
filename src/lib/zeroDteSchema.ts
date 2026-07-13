@@ -119,7 +119,7 @@ CREATE INDEX IF NOT EXISTS idx_zero_dte_candidates_option_symbol
 CREATE TABLE IF NOT EXISTS zero_dte_candidate_observations (
   observation_id TEXT PRIMARY KEY,
   candidate_id TEXT NOT NULL,
-  engine_run_id TEXT,
+  engine_run_id TEXT NOT NULL,
   observed_at TEXT NOT NULL,
   market_timestamp TEXT,
   state TEXT NOT NULL,
@@ -162,7 +162,7 @@ CREATE INDEX IF NOT EXISTS idx_zero_dte_candidate_observations_candidate_observe
 CREATE TABLE IF NOT EXISTS zero_dte_playbook_evaluations (
   evaluation_id TEXT PRIMARY KEY,
   candidate_id TEXT NOT NULL,
-  engine_run_id TEXT,
+  engine_run_id TEXT NOT NULL,
   playbook TEXT NOT NULL,
   score REAL NOT NULL,
   confidence REAL NOT NULL,
@@ -186,7 +186,7 @@ CREATE INDEX IF NOT EXISTS idx_zero_dte_playbook_evaluations_candidate_playbook
 CREATE TABLE IF NOT EXISTS zero_dte_decisions (
   decision_id TEXT PRIMARY KEY,
   decision_group_id TEXT NOT NULL,
-  engine_run_id TEXT,
+  engine_run_id TEXT NOT NULL,
   candidate_id TEXT NOT NULL,
   trading_date TEXT NOT NULL,
   action TEXT NOT NULL,
@@ -311,7 +311,7 @@ CREATE TABLE IF NOT EXISTS zero_dte_position_marks (
   created_at TEXT NOT NULL,
   FOREIGN KEY(paper_trade_id) REFERENCES zero_dte_paper_trades(paper_trade_id),
   FOREIGN KEY(shadow_trade_id) REFERENCES zero_dte_shadow_trades(shadow_trade_id),
-  CHECK (paper_trade_id IS NOT NULL OR shadow_trade_id IS NOT NULL)
+  CHECK ((paper_trade_id IS NOT NULL) <> (shadow_trade_id IS NOT NULL))
 );
 
 CREATE INDEX IF NOT EXISTS idx_zero_dte_position_marks_trade_marked_at
@@ -319,7 +319,7 @@ CREATE INDEX IF NOT EXISTS idx_zero_dte_position_marks_trade_marked_at
 
 CREATE TABLE IF NOT EXISTS zero_dte_terminal_outcomes (
   outcome_id TEXT PRIMARY KEY,
-  candidate_id TEXT,
+  candidate_id TEXT NOT NULL,
   paper_trade_id TEXT,
   shadow_trade_id TEXT,
   decision_id TEXT,
@@ -342,8 +342,38 @@ CREATE TABLE IF NOT EXISTS zero_dte_terminal_outcomes (
   FOREIGN KEY(paper_trade_id) REFERENCES zero_dte_paper_trades(paper_trade_id),
   FOREIGN KEY(shadow_trade_id) REFERENCES zero_dte_shadow_trades(shadow_trade_id),
   FOREIGN KEY(decision_id) REFERENCES zero_dte_decisions(decision_id),
-  UNIQUE(paper_trade_id, shadow_trade_id, outcome_type, horizon_minutes)
+  CHECK (
+    (paper_trade_id IS NULL AND shadow_trade_id IS NULL)
+    OR (paper_trade_id IS NOT NULL AND shadow_trade_id IS NULL)
+    OR (paper_trade_id IS NULL AND shadow_trade_id IS NOT NULL)
+  )
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_zero_dte_terminal_outcomes_candidate_only
+  ON zero_dte_terminal_outcomes(
+    candidate_id,
+    outcome_type,
+    COALESCE(horizon_minutes, -1)
+  )
+  WHERE paper_trade_id IS NULL AND shadow_trade_id IS NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_zero_dte_terminal_outcomes_paper_trade
+  ON zero_dte_terminal_outcomes(
+    candidate_id,
+    paper_trade_id,
+    outcome_type,
+    COALESCE(horizon_minutes, -1)
+  )
+  WHERE paper_trade_id IS NOT NULL AND shadow_trade_id IS NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_zero_dte_terminal_outcomes_shadow_trade
+  ON zero_dte_terminal_outcomes(
+    candidate_id,
+    shadow_trade_id,
+    outcome_type,
+    COALESCE(horizon_minutes, -1)
+  )
+  WHERE paper_trade_id IS NULL AND shadow_trade_id IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_zero_dte_terminal_outcomes_candidate_recorded_at
   ON zero_dte_terminal_outcomes(candidate_id, evaluated_at);

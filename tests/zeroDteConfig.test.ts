@@ -34,6 +34,7 @@ test("0DTE Level 2 configuration uses paper-safe specification defaults", () => 
   assert.equal(config.maxSpreadPct, 15);
   assert.equal(config.minPremium, 0.1);
   assert.equal(config.maxPremium, 5);
+  assert.equal(config.minScoreMovement, 5);
   assert.equal(config.signalShortWindow, 3);
   assert.equal(config.signalMediumWindow, 5);
   assert.equal(config.minConfirmationObservations, 2);
@@ -70,6 +71,76 @@ test("invalid non-negative values fall back to their defaults", () => {
   assert.equal(config.minOptionVolume, 100);
   assert.equal(config.minPremium, 0.1);
   assert.equal(config.maxOpenPositions, 3);
+});
+
+test("parses a positive minimum score movement and includes it in the configuration hash", () => {
+  const configured = loadZeroDteConfig({
+    ZERO_DTE_MIN_SCORE_MOVEMENT: "7.5"
+  });
+
+  assert.equal(configured.minScoreMovement, 7.5);
+  assert.notEqual(configured.configurationVersionId, loadZeroDteConfig({}).configurationVersionId);
+});
+
+test("zero or invalid minimum score movement falls back to the paper-safe default", () => {
+  for (const value of ["0", "-1", "not-a-number"]) {
+    assert.equal(
+      loadZeroDteConfig({ ZERO_DTE_MIN_SCORE_MOVEMENT: value }).minScoreMovement,
+      5
+    );
+  }
+});
+
+test("invalid session strings fall back to their documented defaults", () => {
+  const config = loadZeroDteConfig({
+    ZERO_DTE_DISCOVERY_START_ET: "9:35",
+    ZERO_DTE_NEW_ENTRY_CUTOFF_ET: "25:15",
+    ZERO_DTE_FORCE_EXIT_ET: "15:5"
+  });
+
+  assert.equal(config.discoveryStartEt, "09:35");
+  assert.equal(config.newEntryCutoffEt, "15:15");
+  assert.equal(config.forceExitEt, "15:50");
+});
+
+test("invalid session ordering fails closed to the complete default session", () => {
+  const config = loadZeroDteConfig({
+    ZERO_DTE_DISCOVERY_START_ET: "15:15",
+    ZERO_DTE_NEW_ENTRY_CUTOFF_ET: "09:35",
+    ZERO_DTE_FORCE_EXIT_ET: "15:50"
+  });
+
+  assert.deepEqual(
+    {
+      discoveryStartEt: config.discoveryStartEt,
+      newEntryCutoffEt: config.newEntryCutoffEt,
+      forceExitEt: config.forceExitEt
+    },
+    {
+      discoveryStartEt: "09:35",
+      newEntryCutoffEt: "15:15",
+      forceExitEt: "15:50"
+    }
+  );
+});
+
+test("zero or invalid engine intervals fall back to a strictly positive default", () => {
+  for (const value of ["0", "-1", "1.5", "not-a-number"]) {
+    assert.equal(
+      loadZeroDteConfig({ ZERO_DTE_ENGINE_INTERVAL_SECONDS: value }).engineIntervalSeconds,
+      60
+    );
+  }
+});
+
+test("a minimum premium above the maximum fails closed to the premium defaults", () => {
+  const config = loadZeroDteConfig({
+    ZERO_DTE_MIN_PREMIUM: "6",
+    ZERO_DTE_MAX_PREMIUM: "5"
+  });
+
+  assert.equal(config.minPremium, 0.1);
+  assert.equal(config.maxPremium, 5);
 });
 
 test("outcome horizons are numeric, sorted, and deduplicated", () => {

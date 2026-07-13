@@ -49,6 +49,7 @@ export interface ZeroDteConfig {
   maxSpreadPct: number;
   minPremium: number;
   maxPremium: number;
+  minScoreMovement: number;
   signalShortWindow: number;
   signalMediumWindow: number;
   minConfirmationObservations: number;
