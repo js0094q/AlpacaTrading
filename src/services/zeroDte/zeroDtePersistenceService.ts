@@ -265,6 +265,7 @@ const TERMINAL_QUEUE_STATES = [
   "rejected",
   "skipped"
 ] as const;
+const TERMINAL_QUEUE_STATE_SET = new Set<ZeroDteCandidateState>(TERMINAL_QUEUE_STATES);
 
 const requiredText = (value: string | null | undefined, field: string) => {
   if (typeof value !== "string" || value.trim() === "") {
@@ -440,10 +441,25 @@ const rowToCandidate = (row: Record<string, unknown>): ZeroDteCandidate => ({
 const rowToQueueCandidate = (row: Record<string, unknown>): ZeroDteQueueCandidate => {
   const candidate = rowToCandidate(row);
   const eligible = candidate.state === "eligible";
+  const blockers = candidate.blockerCodes.filter(
+    (code) => code.trim() !== "" && code !== "NONE"
+  );
+  const executableQuote =
+    candidate.quoteBid !== null &&
+    candidate.quoteAsk !== null &&
+    candidate.quoteMidpoint !== null &&
+    candidate.quoteBid > 0 &&
+    candidate.quoteAsk >= candidate.quoteBid &&
+    candidate.quoteMidpoint > 0;
+  const executable =
+    eligible &&
+    candidate.direction !== "neutral" &&
+    blockers.length === 0 &&
+    executableQuote;
   return {
     ...candidate,
     eligible,
-    executable: eligible,
+    executable,
     totalScore: candidate.score,
     quote: {
       bid: candidate.quoteBid,
@@ -513,16 +529,33 @@ export const upsertZeroDteCandidate = (input: ZeroDteCandidateUpsert): ZeroDteCa
       expirationDate: identity.expirationDate,
       strike: input.strike
     });
-    if (!existing && input.candidateId && input.candidateId !== canonicalCandidateId) {
+    if (input.candidateId && input.candidateId !== canonicalCandidateId) {
       throw new RangeError("0DTE candidate ID does not match canonical identity");
+    }
+    if (existing && String(existing.candidate_id) !== canonicalCandidateId) {
+      throw new RangeError("0DTE persisted candidate ID does not match canonical identity");
     }
     const candidateId = String(existing?.candidate_id ?? input.candidateId ?? canonicalCandidateId);
     const previousState = existing ? String(existing.state) as ZeroDteCandidateState : null;
     const stateChanged = !existing || previousState !== input.state;
-    const reappeared = Boolean(input.reappeared) || Boolean(
-      existing && previousState && REAPPEARANCE_STATES.has(previousState) &&
-      !REAPPEARANCE_STATES.has(input.state)
+    const validReappearance = Boolean(
+      existing && previousState &&
+      REAPPEARANCE_STATES.has(previousState) &&
+      previousState !== input.state &&
+      !TERMINAL_QUEUE_STATE_SET.has(input.state)
     );
+    if (input.reappeared && !validReappearance) {
+      throw new Error("ZERO_DTE_REAPPEARANCE_TRANSITION_REQUIRED");
+    }
+    if (
+      existing && previousState &&
+      TERMINAL_QUEUE_STATE_SET.has(previousState) &&
+      previousState !== input.state &&
+      !input.reappeared
+    ) {
+      throw new Error("ZERO_DTE_TERMINAL_CANDIDATE_REAPPEARANCE_REQUIRED");
+    }
+    const reappeared = Boolean(input.reappeared);
     const previousReappearanceCount = dbInteger(existing?.reappearance_count) ?? 0;
     const reappearanceCount = previousReappearanceCount + (reappeared ? 1 : 0);
     const lastSeenAt = isoTimestamp(input.lastSeenAt, "last seen timestamp");
@@ -865,11 +898,7 @@ export const listZeroDteQueue = (input: {
   const tradingDate = requiredText(input.tradingDate, "trading date");
   const limit = validateLimit(input.limit, 20);
   if (limit === 0) return [];
-  const ranked = rankZeroDteQueue(
-    queueRows(tradingDate).map(rowToQueueCandidate) as unknown as Parameters<
-      typeof rankZeroDteQueue
-    >[0]
-  ) as unknown as ZeroDteQueueCandidate[];
+  const ranked = rankZeroDteQueue(queueRows(tradingDate).map(rowToQueueCandidate));
   return ranked.slice(0, limit);
 };
 

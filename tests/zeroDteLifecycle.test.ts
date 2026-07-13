@@ -186,6 +186,37 @@ test("lifecycle events append corrections and preserve all linkage IDs", () => {
   assert.equal(rows[0]?.decision_group_id, "task5-group-1");
   assert.doesNotMatch(rows[0]?.details_json ?? "", /task5-secret-value/);
   assert.deepEqual(rows.map((row) => row.reason_code), ["HIGH_SCORE", "CORRECTED_SCORE"]);
+
+  assert.throws(
+    () =>
+      appendZeroDteLifecycleEvent({
+        eventId: "task5-mismatched-candidate-event",
+        eventType: "candidate_selected",
+        engineRunId: runId,
+        candidateId: "task5-unrelated-candidate",
+        decisionId: "task5-decision-1",
+        decisionGroupId: "task5-group-1",
+        accountMode: "paper",
+        strategyVersion: "zero-dte-level-2-v1",
+        configurationVersionId: configId,
+        occurredAt: timestamp
+      }),
+    /DECISION_CANDIDATE_MISMATCH/
+  );
+  assert.throws(
+    () =>
+      appendZeroDteLifecycleEvent({
+        eventId: "task5-missing-candidate-event",
+        eventType: "candidate_selected",
+        engineRunId: runId,
+        candidateId: "task5-missing-candidate",
+        accountMode: "paper",
+        strategyVersion: "zero-dte-level-2-v1",
+        configurationVersionId: configId,
+        occurredAt: timestamp
+      }),
+    /CANDIDATE_NOT_FOUND/
+  );
 });
 
 test("live account modes are rejected before persistence", () => {
@@ -204,7 +235,7 @@ test("live account modes are rejected before persistence", () => {
         configurationVersionId: configId,
         decidedAt: timestamp
       }),
-    /paper-only|live/i
+    /PAPER_ONLY|paper-only|live/i
   );
   assert.throws(
     () =>
@@ -218,7 +249,23 @@ test("live account modes are rejected before persistence", () => {
         configurationVersionId: configId,
         occurredAt: timestamp
       }),
-    /paper-only|live/i
+    /PAPER_ONLY|paper-only|live/i
+  );
+  assert.throws(
+    () =>
+      insertZeroDteDecision({
+        decisionId: "task5-real-mode-decision",
+        decisionGroupId: "task5-real-mode-group",
+        engineRunId: runId,
+        candidateId,
+        tradingDate: "2026-07-13",
+        action: "select",
+        accountMode: "real",
+        strategyVersion: "zero-dte-level-2-v1",
+        configurationVersionId: configId,
+        decidedAt: timestamp
+      }),
+    /PAPER_ONLY|paper-only|account mode/i
   );
   assert.equal(
     (getDb().prepare(

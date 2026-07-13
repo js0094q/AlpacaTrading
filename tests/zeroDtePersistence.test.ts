@@ -1085,6 +1085,11 @@ test("candidate upsert uses the identity unique key and records state transition
     }
   }));
 
+  assert.throws(
+    () => upsertZeroDteCandidate(taskFiveCandidateInput({ candidateId: "task5-noncanonical-id" })),
+    /candidate ID does not match canonical identity/
+  );
+
   assert.equal(first.candidateId, second.candidateId);
   assert.equal(
     (getDb().prepare("SELECT COUNT(*) AS count FROM zero_dte_candidates WHERE candidate_id = ?").get(first.candidateId) as { count: number }).count,
@@ -1146,6 +1151,46 @@ test("reappearing candidates reuse one row and append an explicit reappearance e
       { event_type: "candidate_observed", reason_code: "SIGNAL_REAPPEARED" }
     ]
   );
+});
+
+test("terminal candidates require an explicit valid reappearance transition", () => {
+  seedTaskFiveRunFixtures();
+  const first = upsertZeroDteCandidate(taskFiveCandidateInput({
+    optionSymbol: "SPY260713C00504000",
+    state: "expired" as const,
+    stateReasonCode: "EXPIRATION_REACHED"
+  }));
+
+  assert.throws(
+    () =>
+      upsertZeroDteCandidate(taskFiveCandidateInput({
+        optionSymbol: "SPY260713C00504000",
+        state: "eligible" as const,
+        stateReasonCode: "SIGNAL_REAPPEARED",
+        lifecycleContext: {
+          ...taskFiveLifecycleContext,
+          occurredAt: "2026-07-13T19:13:00.000Z"
+        }
+      })),
+    /TERMINAL_CANDIDATE_REAPPEARANCE_REQUIRED/
+  );
+
+  const reappeared = upsertZeroDteCandidate(taskFiveCandidateInput({
+    optionSymbol: "SPY260713C00504000",
+    state: "watching" as const,
+    reappeared: true,
+    stateReasonCode: "SIGNAL_REAPPEARED",
+    lastSeenAt: "2026-07-13T19:13:00.000Z",
+    stateChangedAt: "2026-07-13T19:13:00.000Z",
+    lifecycleContext: {
+      ...taskFiveLifecycleContext,
+      occurredAt: "2026-07-13T19:13:00.000Z"
+    }
+  }));
+
+  assert.equal(reappeared.candidateId, first.candidateId);
+  assert.equal(reappeared.reappearanceCount, 1);
+  assert.equal(reappeared.state, "watching");
 });
 
 test("observations append and evaluations remain unique per candidate run playbook", () => {
@@ -1257,14 +1302,29 @@ test("queue and summary reads expose typed components and sanitize evidence", ()
       apiKey: "should-not-persist"
     }
   }));
+  upsertZeroDteCandidate(taskFiveCandidateInput({
+    tradingDate: "2026-07-14",
+    optionSymbol: "SPY260713C00503000",
+    state: "eligible" as const,
+    score: 77,
+    quoteBid: null,
+    quoteAsk: null,
+    quoteMidpoint: null,
+    blockerCodes: ["QUOTE_MISSING"]
+  }));
 
   const queue = listZeroDteQueue({ tradingDate: "2026-07-14", limit: 10 });
-  assert.equal(queue.length, 1);
-  assert.equal(queue[0]?.candidateId, candidate.candidateId);
-  assert.equal(queue[0]?.eligible, true);
-  assert.equal(queue[0]?.componentScores.playbook, 40);
-  assert.equal(queue[0]?.quote.bid, 1.2);
-  assert.deepEqual(queue[0]?.blockers, ["NONE"]);
+  assert.equal(queue.length, 2);
+  const executableCandidate = queue.find((item) => item.candidateId === candidate.candidateId);
+  const blockedCandidate = queue.find((item) => item.candidateId !== candidate.candidateId);
+  assert.equal(executableCandidate?.eligible, true);
+  assert.equal(executableCandidate?.executable, true);
+  assert.equal(executableCandidate?.componentScores.playbook, 40);
+  assert.equal(executableCandidate?.quote.bid, 1.2);
+  assert.deepEqual(executableCandidate?.blockers, ["NONE"]);
+  assert.equal(blockedCandidate?.eligible, true);
+  assert.equal(blockedCandidate?.executable, false);
+  assert.deepEqual(blockedCandidate?.blockers, ["QUOTE_MISSING"]);
 
   const rawEvidence = getDb().prepare(
     "SELECT state_reason_json FROM zero_dte_candidates WHERE candidate_id = ?"
@@ -1274,8 +1334,8 @@ test("queue and summary reads expose typed components and sanitize evidence", ()
 
   const summary = readZeroDteSummary({ tradingDate: "2026-07-14", limit: 10 });
   assert.equal(summary.paperOnly, true);
-  assert.equal(summary.queue.length, 1);
-  assert.equal(summary.counts.candidates, 1);
-  assert.equal(summary.counts.byState.eligible, 1);
-  assert.equal(summary.lifecycle.counts.candidate_discovered, 1);
+  assert.equal(summary.queue.length, 2);
+  assert.equal(summary.counts.candidates, 2);
+  assert.equal(summary.counts.byState.eligible, 2);
+  assert.equal(summary.lifecycle.counts.candidate_discovered, 2);
 });

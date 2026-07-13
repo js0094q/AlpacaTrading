@@ -164,12 +164,12 @@ const optionalIsoTimestamp = (value: string | null | undefined, field: string) =
 
 const assertPaperOnlyAccountMode = (value: string) => {
   const mode = requiredText(value, "account mode").toLowerCase();
-  if (mode.includes("live") || mode === "production" || mode === "prod") {
+  if (!(["paper", "shadow", "dry_run", "test"] as const).includes(mode as ZeroDteAccountMode)) {
     throw new Error(
-      "ZERO_DTE_PAPER_ONLY_ACCOUNT_MODE_REQUIRED: live account mode is forbidden"
+      "ZERO_DTE_PAPER_ONLY_ACCOUNT_MODE_REQUIRED: only paper, shadow, dry_run, or test modes are allowed"
     );
   }
-  return mode;
+  return mode as ZeroDteAccountMode;
 };
 
 const sanitizeJsonValue = (
@@ -286,6 +286,124 @@ const rowToLifecycleEvent = (row: Record<string, unknown>): ZeroDteLifecycleEven
   createdAt: String(row.created_at)
 });
 
+const assertLifecycleLinkage = (input: {
+  db: DatabaseSync;
+  accountMode: ZeroDteAccountMode;
+  engineRunId: string | null;
+  candidateId: string | null;
+  decisionId: string | null;
+  decisionGroupId: string | null;
+  paperTradeId: string | null;
+  shadowTradeId: string | null;
+}) => {
+  if (input.paperTradeId && input.accountMode !== "paper") {
+    throw new Error("ZERO_DTE_PAPER_TRADE_REQUIRES_PAPER_ACCOUNT_MODE");
+  }
+  if (input.shadowTradeId && input.accountMode !== "shadow") {
+    throw new Error("ZERO_DTE_SHADOW_TRADE_REQUIRES_SHADOW_ACCOUNT_MODE");
+  }
+
+  const decision = input.decisionId
+    ? input.db.prepare(
+      `SELECT candidate_id, decision_group_id, account_mode
+       FROM zero_dte_decisions
+       WHERE decision_id = ?`
+    ).get(input.decisionId) as {
+      candidate_id: string;
+      decision_group_id: string;
+      account_mode: string;
+    } | undefined
+    : undefined;
+  if (input.decisionId && !decision) {
+    throw new Error("ZERO_DTE_LIFECYCLE_DECISION_NOT_FOUND");
+  }
+  if (decision && input.candidateId && decision.candidate_id !== input.candidateId) {
+    throw new Error("ZERO_DTE_LIFECYCLE_DECISION_CANDIDATE_MISMATCH");
+  }
+  if (decision && input.decisionGroupId && decision.decision_group_id !== input.decisionGroupId) {
+    throw new Error("ZERO_DTE_LIFECYCLE_DECISION_GROUP_MISMATCH");
+  }
+  if (decision && decision.account_mode !== input.accountMode) {
+    throw new Error("ZERO_DTE_LIFECYCLE_DECISION_ACCOUNT_MODE_MISMATCH");
+  }
+
+  const candidate = input.candidateId
+    ? input.db.prepare(
+      "SELECT candidate_id FROM zero_dte_candidates WHERE candidate_id = ?"
+    ).get(input.candidateId)
+    : undefined;
+  if (input.candidateId && !candidate) {
+    throw new Error("ZERO_DTE_LIFECYCLE_CANDIDATE_NOT_FOUND");
+  }
+
+  const paperTrade = input.paperTradeId
+    ? input.db.prepare(
+      `SELECT candidate_id, decision_id
+       FROM zero_dte_paper_trades
+       WHERE paper_trade_id = ?`
+    ).get(input.paperTradeId) as {
+      candidate_id: string;
+      decision_id: string;
+    } | undefined
+    : undefined;
+  if (input.paperTradeId && !paperTrade) {
+    throw new Error("ZERO_DTE_LIFECYCLE_PAPER_TRADE_NOT_FOUND");
+  }
+
+  const shadowTrade = input.shadowTradeId
+    ? input.db.prepare(
+      `SELECT candidate_id, decision_id, decision_group_id
+       FROM zero_dte_shadow_trades
+       WHERE shadow_trade_id = ?`
+    ).get(input.shadowTradeId) as {
+      candidate_id: string;
+      decision_id: string | null;
+      decision_group_id: string;
+    } | undefined
+    : undefined;
+  if (input.shadowTradeId && !shadowTrade) {
+    throw new Error("ZERO_DTE_LIFECYCLE_SHADOW_TRADE_NOT_FOUND");
+  }
+
+  const tradeCandidateId = paperTrade?.candidate_id ?? shadowTrade?.candidate_id ?? null;
+  if (tradeCandidateId && input.candidateId && tradeCandidateId !== input.candidateId) {
+    throw new Error("ZERO_DTE_LIFECYCLE_TRADE_CANDIDATE_MISMATCH");
+  }
+
+  const tradeDecisionId = paperTrade?.decision_id ?? shadowTrade?.decision_id ?? null;
+  if (tradeDecisionId && input.decisionId && tradeDecisionId !== input.decisionId) {
+    throw new Error("ZERO_DTE_LIFECYCLE_TRADE_DECISION_MISMATCH");
+  }
+  if (shadowTrade && input.decisionGroupId && shadowTrade.decision_group_id !== input.decisionGroupId) {
+    throw new Error("ZERO_DTE_LIFECYCLE_TRADE_GROUP_MISMATCH");
+  }
+  const tradeDecision = tradeDecisionId
+    ? input.db.prepare(
+      `SELECT candidate_id, decision_group_id
+       FROM zero_dte_decisions
+       WHERE decision_id = ?`
+    ).get(tradeDecisionId) as {
+      candidate_id: string;
+      decision_group_id: string;
+    } | undefined
+    : undefined;
+  if (tradeDecision && tradeDecision.candidate_id !== tradeCandidateId) {
+    throw new Error("ZERO_DTE_LIFECYCLE_TRADE_DECISION_CANDIDATE_MISMATCH");
+  }
+  if (tradeDecision && input.decisionGroupId && tradeDecision.decision_group_id !== input.decisionGroupId) {
+    throw new Error("ZERO_DTE_LIFECYCLE_TRADE_DECISION_GROUP_MISMATCH");
+  }
+  if (shadowTrade && tradeDecision && shadowTrade.decision_group_id !== tradeDecision.decision_group_id) {
+    throw new Error("ZERO_DTE_LIFECYCLE_SHADOW_TRADE_DECISION_GROUP_MISMATCH");
+  }
+  if (input.engineRunId) {
+    const run = input.db.prepare(
+      "SELECT run_id FROM zero_dte_engine_runs WHERE run_id = ?"
+    ).get(input.engineRunId);
+    if (!run) throw new Error("ZERO_DTE_LIFECYCLE_ENGINE_RUN_NOT_FOUND");
+  }
+};
+
 export const insertZeroDteDecisionRow = (
   db: DatabaseSync,
   input: ZeroDteDecisionInput
@@ -317,6 +435,28 @@ export const insertZeroDteDecisionRow = (
     throw new RangeError("0DTE score threshold must be finite");
   }
   const reasonCodes = (input.reasonCodes ?? []).map((code) => requiredText(code, "reason code"));
+  const candidate = db.prepare(
+    "SELECT trading_date FROM zero_dte_candidates WHERE candidate_id = ?"
+  ).get(candidateId) as { trading_date: string } | undefined;
+  if (!candidate) throw new Error("ZERO_DTE_DECISION_CANDIDATE_NOT_FOUND");
+  if (candidate.trading_date !== tradingDate) {
+    throw new Error("ZERO_DTE_DECISION_TRADING_DATE_MISMATCH");
+  }
+  const run = db.prepare(
+    `SELECT trading_date, configuration_version_id
+     FROM zero_dte_engine_runs
+     WHERE run_id = ?`
+  ).get(engineRunId) as {
+    trading_date: string;
+    configuration_version_id: string;
+  } | undefined;
+  if (!run) throw new Error("ZERO_DTE_DECISION_ENGINE_RUN_NOT_FOUND");
+  if (run.trading_date !== tradingDate) {
+    throw new Error("ZERO_DTE_DECISION_ENGINE_RUN_DATE_MISMATCH");
+  }
+  if (run.configuration_version_id !== configurationVersionId) {
+    throw new Error("ZERO_DTE_DECISION_CONFIGURATION_MISMATCH");
+  }
   db.prepare(
     `INSERT INTO zero_dte_decisions
       (decision_id, decision_group_id, engine_run_id, candidate_id, trading_date,
@@ -380,6 +520,16 @@ export const insertZeroDteLifecycleEventRow = (
   if (paperTradeId && shadowTradeId) {
     throw new Error("ZERO_DTE_LIFECYCLE_EVENT_TRADE_DOMAIN_CONFLICT");
   }
+  assertLifecycleLinkage({
+    db,
+    accountMode,
+    engineRunId,
+    candidateId,
+    decisionId,
+    decisionGroupId,
+    paperTradeId,
+    shadowTradeId
+  });
 
   db.prepare(
     `INSERT INTO zero_dte_lifecycle_events

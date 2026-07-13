@@ -2,8 +2,8 @@ export interface ZeroDteQueueCandidate extends Record<string, unknown> {
   candidateId: string;
   eligible?: boolean;
   executable?: boolean;
-  totalScore?: number;
-  score?: number;
+  totalScore?: number | null;
+  score?: number | null;
   shortSlope?: number | null;
   signalSlope?: number | null;
   liquidityScore?: number | null;
@@ -14,7 +14,7 @@ export interface ZeroDteQueueCandidate extends Record<string, unknown> {
   spread?: number | null;
   componentScores?: Record<string, unknown>;
   blockers?: string[];
-  rank?: number;
+  rank?: number | null;
 }
 
 export interface ZeroDteQueueSliceOptions {
@@ -103,9 +103,9 @@ const compareQueueCandidates = (
   return compareCandidateIds(left, right);
 };
 
-export const rankZeroDteQueue = (
-  candidates: ZeroDteQueueCandidate[]
-): ZeroDteQueueCandidate[] => {
+export const rankZeroDteQueue = <T extends ZeroDteQueueCandidate>(
+  candidates: T[]
+): T[] => {
   const decorated = candidates.map((candidate, originalIndex) => ({
     candidate,
     originalIndex
