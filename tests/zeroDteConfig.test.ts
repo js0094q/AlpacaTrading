@@ -20,6 +20,9 @@ test("0DTE Level 2 configuration uses paper-safe specification defaults", () => 
   assert.equal(config.enabled, true);
   assert.equal(config.paperExecutionEnabled, true);
   assert.equal(config.shadowEnabled, true);
+  assert.equal(config.shadowSlippage, 0.05);
+  assert.equal(config.shadowFeePerContract, 0.65);
+  assert.equal(config.shadowMaxQuoteAgeMs, 60_000);
   assert.deepEqual(config.underlyings, ["SPY", "QQQ", "IWM"]);
   assert.equal(config.discoveryStartEt, "09:35");
   assert.equal(config.newEntryCutoffEt, "15:15");
@@ -141,6 +144,19 @@ test("underlying freshness uses a positive paper-safe default and rejects invali
       60_000
     );
   }
+});
+
+test("shadow fill assumptions are configurable and included in the configuration hash", () => {
+  const configured = loadZeroDteConfig({
+    ZERO_DTE_SHADOW_SLIPPAGE: "0.08",
+    ZERO_DTE_SHADOW_FEE_PER_CONTRACT: "0.7",
+    ZERO_DTE_SHADOW_MAX_QUOTE_AGE_MS: "90000"
+  });
+
+  assert.equal(configured.shadowSlippage, 0.08);
+  assert.equal(configured.shadowFeePerContract, 0.7);
+  assert.equal(configured.shadowMaxQuoteAgeMs, 90_000);
+  assert.notEqual(configured.configurationVersionId, loadZeroDteConfig({}).configurationVersionId);
 });
 
 test("a minimum premium above the maximum fails closed to the premium defaults", () => {

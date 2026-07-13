@@ -13,6 +13,9 @@ const DEFAULT_ENGINE_INTERVAL_SECONDS = 60;
 const DEFAULT_MIN_PREMIUM = 0.1;
 const DEFAULT_MAX_PREMIUM = 5;
 const DEFAULT_UNDERLYING_MAX_AGE_MS = 60_000;
+const DEFAULT_SHADOW_SLIPPAGE = 0.05;
+const DEFAULT_SHADOW_FEE_PER_CONTRACT = 0.65;
+const DEFAULT_SHADOW_MAX_QUOTE_AGE_MS = 60_000;
 const DEFAULT_MIN_SCORE_MOVEMENT = 5;
 const SESSION_TIME_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
 
@@ -151,6 +154,18 @@ export const loadZeroDteConfig = (env: NodeJS.ProcessEnv = process.env): ZeroDte
       true
     ),
     shadowEnabled: parseBoolean(readValue(env, "ZERO_DTE_SHADOW_ENABLED"), true),
+    shadowSlippage: parseNonNegativeNumber(
+      readValue(env, "ZERO_DTE_SHADOW_SLIPPAGE"),
+      DEFAULT_SHADOW_SLIPPAGE
+    ),
+    shadowFeePerContract: parseNonNegativeNumber(
+      readValue(env, "ZERO_DTE_SHADOW_FEE_PER_CONTRACT"),
+      DEFAULT_SHADOW_FEE_PER_CONTRACT
+    ),
+    shadowMaxQuoteAgeMs: parsePositiveInteger(
+      readValue(env, "ZERO_DTE_SHADOW_MAX_QUOTE_AGE_MS"),
+      DEFAULT_SHADOW_MAX_QUOTE_AGE_MS
+    ),
     underlyings: parseSymbolList(readValue(env, "ZERO_DTE_UNDERLYINGS"), DEFAULT_UNDERLYINGS),
     discoveryStartEt,
     newEntryCutoffEt,

@@ -35,6 +35,9 @@ export interface ZeroDteConfig {
   enabled: boolean;
   paperExecutionEnabled: boolean;
   shadowEnabled: boolean;
+  shadowSlippage: number;
+  shadowFeePerContract: number;
+  shadowMaxQuoteAgeMs: number;
   underlyings: string[];
   discoveryStartEt: string;
   newEntryCutoffEt: string;
