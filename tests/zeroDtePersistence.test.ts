@@ -9,6 +9,13 @@ import {
   runZeroDteMigrations,
   ZERO_DTE_HARDENING_MIGRATION_VERSION
 } from "../src/lib/zeroDteSchema.js";
+import {
+  appendZeroDteCandidateObservation,
+  insertZeroDtePlaybookEvaluation,
+  listZeroDteQueue,
+  readZeroDteSummary,
+  upsertZeroDteCandidate
+} from "../src/services/zeroDte/zeroDtePersistenceService.js";
 import { configureSqliteTestDb } from "./helpers/sqliteTestDb.js";
 
 const dbDir = mkdtempSync(join(tmpdir(), "zero-dte-level-2-schema-"));
@@ -967,4 +974,308 @@ test("terminal outcome uniqueness handles nullable trade IDs", () => {
       horizonMinutes: 60
     })
   );
+});
+
+const taskFiveConfigId = "task5-config-1";
+const taskFiveRunIds = ["task5-run-1", "task5-run-2"] as const;
+const taskFiveTimestamp = "2026-07-13T19:10:00.000Z";
+
+const seedTaskFiveRunFixtures = () => {
+  const db = getDb();
+  db.prepare(
+    `INSERT OR IGNORE INTO zero_dte_configuration_versions
+      (configuration_version_id, strategy_version, configuration_hash,
+       configuration_json, created_at)
+     VALUES (?, ?, ?, ?, ?)`
+  ).run(
+    taskFiveConfigId,
+    "zero-dte-level-2-v1",
+    "task5-config-hash",
+    JSON.stringify({ source: "test" }),
+    taskFiveTimestamp
+  );
+
+  for (const runId of taskFiveRunIds) {
+    db.prepare(
+      `INSERT OR IGNORE INTO zero_dte_engine_runs
+        (run_id, trading_date, mode, account_mode, status, strategy_version,
+         configuration_version_id, started_at, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      runId,
+      "2026-07-13",
+      "test",
+      "paper",
+      "running",
+      "zero-dte-level-2-v1",
+      taskFiveConfigId,
+      taskFiveTimestamp,
+      taskFiveTimestamp
+    );
+  }
+};
+
+const taskFiveLifecycleContext = {
+  engineRunId: taskFiveRunIds[0],
+  accountMode: "paper" as const,
+  strategyVersion: "zero-dte-level-2-v1",
+  configurationVersionId: taskFiveConfigId,
+  marketTimestamp: taskFiveTimestamp,
+  occurredAt: taskFiveTimestamp
+};
+
+const taskFiveCandidateInput = (overrides: Record<string, unknown> = {}) => ({
+  tradingDate: "2026-07-13",
+  underlyingSymbol: "SPY",
+  optionSymbol: "SPY260713C00500000",
+  playbook: "trend_continuation" as const,
+  direction: "bullish" as const,
+  expirationDate: "2026-07-13",
+  strike: 500,
+  state: "watching" as const,
+  score: 42,
+  playbookScore: 40,
+  signalStrengthAdjustment: 2,
+  liquidityAdjustment: 1,
+  regimeAdjustment: 0,
+  executionQualityAdjustment: 1,
+  riskPenalty: 0,
+  staleDataPenalty: 0,
+  confidence: 70,
+  signalSlope: 3,
+  shortWindowSlope: 3,
+  mediumWindowSlope: 2,
+  liquidityScore: 80,
+  freshnessScore: 95,
+  setupAgeSeconds: 60,
+  quoteBid: 1.2,
+  quoteAsk: 1.4,
+  quoteMidpoint: 1.3,
+  premium: 1.3,
+  spreadPct: 15.38,
+  volume: 500,
+  openInterest: 900,
+  impliedVolatility: 0.32,
+  delta: 0.51,
+  gamma: 0.08,
+  theta: -0.2,
+  vega: 0.1,
+  marketTimestamp: taskFiveTimestamp,
+  lastSeenAt: taskFiveTimestamp,
+  stateChangedAt: taskFiveTimestamp,
+  stateReasonCode: "INITIAL_OBSERVATION",
+  stateReason: { source: "test" },
+  blockerCodes: [],
+  lifecycleContext: taskFiveLifecycleContext,
+  ...overrides
+});
+
+test("candidate upsert uses the identity unique key and records state transitions", () => {
+  seedTaskFiveRunFixtures();
+  const first = upsertZeroDteCandidate(taskFiveCandidateInput());
+  const second = upsertZeroDteCandidate(taskFiveCandidateInput({
+    state: "strengthening" as const,
+    score: 65,
+    stateReasonCode: "SCORE_MOVED_ABOVE_CONFIRMATION",
+    lastSeenAt: "2026-07-13T19:11:00.000Z",
+    stateChangedAt: "2026-07-13T19:11:00.000Z",
+    lifecycleContext: {
+      ...taskFiveLifecycleContext,
+      occurredAt: "2026-07-13T19:11:00.000Z"
+    }
+  }));
+
+  assert.equal(first.candidateId, second.candidateId);
+  assert.equal(
+    (getDb().prepare("SELECT COUNT(*) AS count FROM zero_dte_candidates WHERE candidate_id = ?").get(first.candidateId) as { count: number }).count,
+    1
+  );
+  assert.equal(second.state, "strengthening");
+  assert.equal(second.score, 65);
+  assert.deepEqual(
+    (getDb().prepare(
+      `SELECT event_type, reason_code
+       FROM zero_dte_lifecycle_events
+       WHERE candidate_id = ?
+       ORDER BY occurred_at ASC`
+    ).all(first.candidateId) as Array<{ event_type: string; reason_code: string | null }>).map(
+      (row) => ({ event_type: row.event_type, reason_code: row.reason_code })
+    ),
+    [
+      { event_type: "candidate_discovered", reason_code: "INITIAL_OBSERVATION" },
+      { event_type: "candidate_strengthened", reason_code: "SCORE_MOVED_ABOVE_CONFIRMATION" }
+    ]
+  );
+});
+
+test("reappearing candidates reuse one row and append an explicit reappearance event", () => {
+  seedTaskFiveRunFixtures();
+  const first = upsertZeroDteCandidate(taskFiveCandidateInput({
+    optionSymbol: "SPY260713C00503000",
+    state: "weakening" as const,
+    stateReasonCode: "WEAKENING_SIGNAL"
+  }));
+  const reappeared = upsertZeroDteCandidate(taskFiveCandidateInput({
+    optionSymbol: "SPY260713C00503000",
+    state: "watching" as const,
+    score: 72,
+    reappeared: true,
+    stateReasonCode: "SIGNAL_REAPPEARED",
+    lastSeenAt: "2026-07-13T19:12:00.000Z",
+    stateChangedAt: "2026-07-13T19:12:00.000Z",
+    lifecycleContext: {
+      ...taskFiveLifecycleContext,
+      occurredAt: "2026-07-13T19:12:00.000Z"
+    }
+  }));
+
+  assert.equal(first.candidateId, reappeared.candidateId);
+  assert.equal(reappeared.reappearanceCount, 1);
+  assert.deepEqual(
+    (getDb().prepare(
+      `SELECT event_type, reason_code
+       FROM zero_dte_lifecycle_events
+       WHERE candidate_id = ?
+       ORDER BY occurred_at ASC`
+    ).all(first.candidateId) as Array<{ event_type: string; reason_code: string | null }>).map(
+      (row) => ({ event_type: row.event_type, reason_code: row.reason_code })
+    ),
+    [
+      { event_type: "candidate_discovered", reason_code: "WEAKENING_SIGNAL" },
+      { event_type: "candidate_reappeared", reason_code: "SIGNAL_REAPPEARED" },
+      { event_type: "candidate_observed", reason_code: "SIGNAL_REAPPEARED" }
+    ]
+  );
+});
+
+test("observations append and evaluations remain unique per candidate run playbook", () => {
+  seedTaskFiveRunFixtures();
+  const candidate = upsertZeroDteCandidate(taskFiveCandidateInput({
+    optionSymbol: "SPY260713C00501000"
+  }));
+
+  for (const [index, runId] of taskFiveRunIds.entries()) {
+    appendZeroDteCandidateObservation({
+      observationId: `task5-observation-${index + 1}`,
+      candidateId: candidate.candidateId,
+      engineRunId: runId,
+      observedAt: `2026-07-13T19:${10 + index}:00.000Z`,
+      state: index === 0 ? "watching" : "strengthening",
+      totalScore: 42 + index,
+      playbookScore: 40 + index,
+      confidence: 70,
+      signalSlope: 3,
+      shortWindowSlope: 3,
+      mediumWindowSlope: 2,
+      liquidityScore: 80,
+      freshnessScore: 95,
+      quoteBid: 1.2,
+      quoteAsk: 1.4,
+      quoteMidpoint: 1.3,
+      premium: 1.3,
+      spreadPct: 15.38,
+      volume: 500,
+      openInterest: 900,
+      dataQualityFlags: [],
+      supportingSignals: [{ code: "VWAP_RECLAIM" }],
+      opposingSignals: [],
+      blockerCodes: [],
+      evidence: { note: "paper-only test" }
+    });
+
+    for (const playbook of [
+      "trend_continuation",
+      "reversal",
+      "breakout",
+      "gamma_proxy",
+      "volatility_expansion"
+    ] as const) {
+      insertZeroDtePlaybookEvaluation({
+        evaluationId: `task5-evaluation-${index + 1}-${playbook}`,
+        candidateId: candidate.candidateId,
+        engineRunId: runId,
+        playbook,
+        score: 50 + index,
+        confidence: 70,
+        direction: "bullish",
+        eligible: true,
+        supportingSignals: [{ code: "TEST_SIGNAL" }],
+        opposingSignals: [],
+        blockerCodes: [],
+        missingInputs: [],
+        evidence: { playbook },
+        evaluatedAt: `2026-07-13T19:${10 + index}:00.000Z`
+      });
+    }
+  }
+
+  insertZeroDtePlaybookEvaluation({
+    evaluationId: "task5-evaluation-duplicate",
+    candidateId: candidate.candidateId,
+    engineRunId: taskFiveRunIds[0],
+    playbook: "trend_continuation",
+    score: 99,
+    confidence: 99,
+    direction: "bearish",
+    eligible: false,
+    supportingSignals: [],
+    opposingSignals: [],
+    blockerCodes: ["DUPLICATE_TEST"],
+    missingInputs: [],
+    evidence: {},
+    evaluatedAt: taskFiveTimestamp
+  });
+
+  assert.equal(
+    (getDb().prepare("SELECT COUNT(*) AS count FROM zero_dte_candidate_observations WHERE candidate_id = ?").get(candidate.candidateId) as { count: number }).count,
+    2
+  );
+  assert.equal(
+    (getDb().prepare("SELECT COUNT(*) AS count FROM zero_dte_playbook_evaluations WHERE candidate_id = ?").get(candidate.candidateId) as { count: number }).count,
+    10
+  );
+  assert.equal(
+    (getDb().prepare(
+      `SELECT score, direction
+       FROM zero_dte_playbook_evaluations
+       WHERE candidate_id = ? AND engine_run_id = ? AND playbook = ?`
+    ).get(candidate.candidateId, taskFiveRunIds[0], "trend_continuation") as { score: number; direction: string }).score,
+    50
+  );
+});
+
+test("queue and summary reads expose typed components and sanitize evidence", () => {
+  seedTaskFiveRunFixtures();
+  const candidate = upsertZeroDteCandidate(taskFiveCandidateInput({
+    tradingDate: "2026-07-14",
+    optionSymbol: "SPY260713C00502000",
+    state: "eligible" as const,
+    score: 88,
+    blockerCodes: ["NONE"],
+    stateReason: {
+      note: "Authorization: Bearer task-secret-value",
+      apiKey: "should-not-persist"
+    }
+  }));
+
+  const queue = listZeroDteQueue({ tradingDate: "2026-07-14", limit: 10 });
+  assert.equal(queue.length, 1);
+  assert.equal(queue[0]?.candidateId, candidate.candidateId);
+  assert.equal(queue[0]?.eligible, true);
+  assert.equal(queue[0]?.componentScores.playbook, 40);
+  assert.equal(queue[0]?.quote.bid, 1.2);
+  assert.deepEqual(queue[0]?.blockers, ["NONE"]);
+
+  const rawEvidence = getDb().prepare(
+    "SELECT state_reason_json FROM zero_dte_candidates WHERE candidate_id = ?"
+  ).get(candidate.candidateId) as { state_reason_json: string };
+  assert.doesNotMatch(rawEvidence.state_reason_json, /task-secret-value|should-not-persist/);
+  assert.match(rawEvidence.state_reason_json, /REDACTED|note/);
+
+  const summary = readZeroDteSummary({ tradingDate: "2026-07-14", limit: 10 });
+  assert.equal(summary.paperOnly, true);
+  assert.equal(summary.queue.length, 1);
+  assert.equal(summary.counts.candidates, 1);
+  assert.equal(summary.counts.byState.eligible, 1);
+  assert.equal(summary.lifecycle.counts.candidate_discovered, 1);
 });
