@@ -7,7 +7,6 @@ import {
   type AlpacaPaperOrderRequest,
   type AlpacaSubmittedOrder
 } from "./alpacaClient.js";
-import { buildHedgeConfig } from "./hedgeConfigService.js";
 import {
   createHedgeExecutionReview,
   verifyHedgeExecutionReview,

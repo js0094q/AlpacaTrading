@@ -25,6 +25,16 @@ export interface PaperActionInput {
   expectedPayloadSignature?: string;
   underlying?: string;
   dte?: number;
+  quantity?: number;
+  reviewId?: string;
+  symbol?: string;
+  expirationDate?: string;
+  entryPrice?: number;
+  currentPrice?: number;
+  entryAt?: string;
+  asOf?: string;
+  staleThesis?: boolean;
+  riskNormalizationObservations?: number;
 }
 
 const numberOrNull = (value: unknown): number | null => {
@@ -267,7 +277,17 @@ export const parsePaperActionInput = (value: unknown): PaperActionInput => {
       typeof record.underlying === "string" && record.underlying.trim()
         ? record.underlying.trim().toUpperCase()
         : "SPY",
-    dte: safeLimit(record.dte, 0, 30)
+    dte: safeLimit(record.dte, 0, 30),
+    quantity: numberOrNull(record.quantity) !== null ? Math.max(1, Math.floor(numberOrNull(record.quantity)!)) : undefined,
+    reviewId: typeof record.reviewId === "string" && record.reviewId.trim() ? record.reviewId.trim() : undefined,
+    symbol: typeof record.symbol === "string" && record.symbol.trim() ? record.symbol.trim().toUpperCase() : undefined,
+    expirationDate: typeof record.expirationDate === "string" ? record.expirationDate : undefined,
+    entryPrice: numberOrNull(record.entryPrice) ?? undefined,
+    currentPrice: numberOrNull(record.currentPrice) ?? undefined,
+    entryAt: typeof record.entryAt === "string" ? record.entryAt : undefined,
+    asOf: typeof record.asOf === "string" ? record.asOf : undefined,
+    staleThesis: record.staleThesis === true,
+    riskNormalizationObservations: numberOrNull(record.riskNormalizationObservations) ?? undefined
   };
 };
 
@@ -685,6 +705,28 @@ export const latestHedgeDashboardRegime = async () => {
   };
 };
 
+export const latestHedgeExecutionStatus = async () => {
+  if (isPaperDashboardBridgeEnabled()) {
+    return fetchPaperBridgePayload("api/v1/hedge/execution");
+  }
+  if (shouldUseVercelReadOnlyFallback()) return historicalUnavailable("hedgeExecution");
+  const { listPaperExecutionLedgerEntries } = await import(
+    "../../../src/services/paperExecutionLedgerService"
+  );
+  return { paperOnly: true, environment: "paper", entries: listPaperExecutionLedgerEntries(100) };
+};
+
+export const latestHedgeLearningStatus = async () => {
+  if (isPaperDashboardBridgeEnabled()) {
+    return fetchPaperBridgePayload("api/v1/hedge/learning");
+  }
+  if (shouldUseVercelReadOnlyFallback()) return historicalUnavailable("hedgeLearning");
+  const { listRecentHedgeLearningEvents } = await import(
+    "../../../src/services/hedgeLearningLifecycleService"
+  );
+  return { paperOnly: true, environment: "paper", events: listRecentHedgeLearningEvents(100) };
+};
+
 export const buildCachedDashboardSnapshot = async (): Promise<DashboardSnapshot> => {
   const state = assertPaperDashboardAccess();
 
@@ -1031,6 +1073,48 @@ export const runPaperReviewedExecution = async (input: PaperActionInput) => {
     confirmPaper: input.confirmPaper,
     expectedPayloadSignature: input.expectedPayloadSignature
   });
+};
+
+export const runHedgeReviewAction = async () => {
+  const { buildAndPersistHedgeReview } = await import(
+    "../../../src/services/hedgeLearningService"
+  );
+  return buildAndPersistHedgeReview({ triggerSource: "dashboard-hedge-review" });
+};
+
+export const runHedgeExecutionAction = async (input: PaperActionInput) => {
+  const { executeReviewedPaperHedge } = await import(
+    "../../../src/services/hedgeExecutionService"
+  );
+  return executeReviewedPaperHedge({ reviewId: input.reviewId ?? "", confirmPaper: input.confirmPaper === true });
+};
+
+export const runHedgeExitReviewAction = async (input: PaperActionInput) => {
+  const { buildHedgeExitReview } = await import("../../../src/services/hedgeExitService");
+  return buildHedgeExitReview({
+    symbol: input.symbol ?? "",
+    underlying: input.underlying ?? "SPY",
+    quantity: input.quantity ?? 1,
+    entryPrice: input.entryPrice ?? 0,
+    currentPrice: input.currentPrice ?? 0,
+    expirationDate: input.expirationDate ?? "",
+    entryAt: input.entryAt ?? new Date().toISOString(),
+    asOf: input.asOf ?? new Date().toISOString(),
+    accountHash: "dashboard-paper-account",
+    sourceRecommendationId: "dashboard-hedge-exit",
+    sourceSnapshotId: "dashboard-snapshot",
+    sourceRegimeId: "dashboard-regime",
+    riskModelVersion: "portfolio-risk-v1",
+    regimeModelVersion: "market-regime-v1",
+    configurationFingerprint: "dashboard-config",
+    staleThesis: input.staleThesis,
+    riskNormalizationObservations: input.riskNormalizationObservations
+  });
+};
+
+export const runHedgeExitExecutionAction = async (input: PaperActionInput) => {
+  const { executeReviewedPaperHedgeExit } = await import("../../../src/services/hedgeExitService");
+  return executeReviewedPaperHedgeExit({ reviewId: input.reviewId ?? "", confirmPaper: input.confirmPaper === true });
 };
 
 export const dashboardMoney = (value: unknown) => {

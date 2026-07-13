@@ -307,6 +307,7 @@ export const guardedPost = async (
     requireOrderSubmission?: boolean;
     requireOptionsSubmission?: boolean;
     requireAdminToken?: boolean;
+    requireHedgeDashboardMutations?: boolean;
     vpsPath?: string;
     timeoutMs?: number;
   } = {}
@@ -320,6 +321,9 @@ export const guardedPost = async (
     const useBridge = isPaperDashboardBridgeEnabled() && Boolean(options.vpsPath);
     if (requireAdminToken) {
       assertDashboardAdminToken(adminTokenFromRequest(normalizedRequest));
+    }
+    if (options.requireHedgeDashboardMutations && process.env.HEDGE_DASHBOARD_MUTATIONS_ENABLED !== "true") {
+      throw new DashboardGuardError("HEDGE_DASHBOARD_MUTATIONS_DISABLED", "Hedge dashboard mutation controls are disabled.");
     }
 
     assertDashboardMutationPreflight(input, {
@@ -361,6 +365,7 @@ export const guardedHistoricalPost = async (
     requireOrderSubmission?: boolean;
     requireOptionsSubmission?: boolean;
     requireAdminToken?: boolean;
+    requireHedgeDashboardMutations?: boolean;
     vpsPath?: string;
     timeoutMs?: number;
   } = {}
@@ -374,6 +379,9 @@ export const guardedHistoricalPost = async (
 
     if (requireAdminToken) {
       assertDashboardAdminToken(adminTokenFromRequest(normalizedRequest));
+    }
+    if (options.requireHedgeDashboardMutations && process.env.HEDGE_DASHBOARD_MUTATIONS_ENABLED !== "true") {
+      throw new DashboardGuardError("HEDGE_DASHBOARD_MUTATIONS_DISABLED", "Hedge dashboard mutation controls are disabled.");
     }
 
     assertDashboardMutationPreflight(input, {

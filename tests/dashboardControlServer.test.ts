@@ -76,6 +76,7 @@ const configureDefaultRuntime = () => {
   process.env.ENABLE_AGGRESSIVE_PAPER_STRATEGIES = "true";
   process.env.PAPER_ORDER_EXECUTION_ENABLED = "false";
   process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
+  process.env.HEDGE_DASHBOARD_MUTATIONS_ENABLED = "false";
   process.env.AUTOMATED_PAPER_EXECUTION_ENABLED = "false";
   process.env.ALPACA_ENV = "paper";
   process.env.TRADING_MODE = "paper";
@@ -218,9 +219,15 @@ describe("VPS dashboard control API", () => {
       "/api/v1/execute/dry-run",
       "/api/v1/execute/dry-run/latest",
       "/api/v1/health",
+      "/api/v1/hedge/execute",
+      "/api/v1/hedge/execution",
+      "/api/v1/hedge/exit/execute",
+      "/api/v1/hedge/exit/review",
+      "/api/v1/hedge/learning",
       "/api/v1/hedge/risk",
       "/api/v1/hedge/regime",
       "/api/v1/hedge/recommendation",
+      "/api/v1/hedge/review",
       "/api/v1/orders",
       "/api/v1/positions",
       "/api/v1/plan/latest",
@@ -252,6 +259,25 @@ describe("VPS dashboard control API", () => {
     assert.equal(payload.liveTradingEnabled, false);
     assert.equal(commandCalls.length, 0);
     assert.equal(openOrderCalls, 0);
+  });
+
+  test("hedge mutation routes require the explicit dashboard mutation flag", async () => {
+    const response = await callControl("/api/v1/hedge/review", "POST", defaultRequest.body);
+
+    assert.equal(response.status, 403);
+    assert.equal(response.payload.ok, false);
+    assert.equal(response.payload.error?.code, "HEDGE_DASHBOARD_MUTATIONS_DISABLED");
+    assert.equal(commandCalls.length, 0);
+  });
+
+  test("authenticated hedge review dispatches only the fixed paper review command", async () => {
+    process.env.HEDGE_DASHBOARD_MUTATIONS_ENABLED = "true";
+    const response = await callControl("/api/v1/hedge/review", "POST", defaultRequest.body);
+
+    assert.equal(response.status, 200, response.text);
+    assert.equal(response.payload.action, "hedge.review");
+    assert.deepEqual(commandCalls.map((entry) => entry.script), ["alpaca:health", "hedge:review"]);
+    assert.equal(commandCalls.at(-1)?.args.at(-1), "--format=json");
   });
 
   test("mutating endpoint rejects missing admin token", async () => {

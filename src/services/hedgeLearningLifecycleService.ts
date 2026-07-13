@@ -122,6 +122,14 @@ export const listHedgeLearningEvents = (reviewId: string): HedgeLearningEvent[] 
     [reviewId]
   ).map(mapRow);
 
+export const listRecentHedgeLearningEvents = (limit = 50): HedgeLearningEvent[] => {
+  const safeLimit = Number.isFinite(limit) && limit > 0 ? Math.min(500, Math.floor(limit)) : 50;
+  return queryAll<HedgeLearningEventRow>(
+    `SELECT * FROM hedge_learning_events ORDER BY created_at DESC, event_id DESC LIMIT ?`,
+    [safeLimit]
+  ).map(mapRow);
+};
+
 export const evaluateHedgeLearning = (reviewId: string) => {
   const events = listHedgeLearningEvents(reviewId);
   const observed = (types: HedgeLearningEventType[]) =>
