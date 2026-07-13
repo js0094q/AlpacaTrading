@@ -80,6 +80,10 @@ CREATE TABLE IF NOT EXISTS option_snapshots (
   executable_price_source TEXT,
   rejection_reason TEXT,
   quote_timestamp TEXT,
+  bid_size REAL,
+  ask_size REAL,
+  trade_size REAL,
+  trade_timestamp TEXT,
   volume INTEGER,
   open_interest INTEGER,
   implied_volatility REAL,
@@ -88,6 +92,8 @@ CREATE TABLE IF NOT EXISTS option_snapshots (
   theta REAL,
   vega REAL,
   rho REAL,
+  snapshot_timestamp TEXT,
+  normalization_path TEXT,
   source TEXT NOT NULL,
   UNIQUE(option_symbol, timestamp)
 );
@@ -449,6 +455,35 @@ CREATE TABLE IF NOT EXISTS paper_review_artifacts (
 CREATE INDEX IF NOT EXISTS idx_paper_review_artifacts_created_at
   ON paper_review_artifacts(created_at);
 
+CREATE TABLE IF NOT EXISTS hedge_execution_reviews (
+  review_id TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  review_type TEXT NOT NULL,
+  client_order_id TEXT NOT NULL UNIQUE,
+  account_hash TEXT NOT NULL,
+  source_recommendation_id TEXT NOT NULL,
+  source_snapshot_id TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
+  signature TEXT NOT NULL,
+  status TEXT NOT NULL,
+  review_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_hedge_execution_reviews_expires_at
+  ON hedge_execution_reviews(expires_at);
+
+CREATE TABLE IF NOT EXISTS hedge_learning_events (
+  event_id TEXT PRIMARY KEY,
+  review_id TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  evidence_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_hedge_learning_events_review_id
+  ON hedge_learning_events(review_id, created_at);
+
 CREATE TABLE IF NOT EXISTS portfolio_high_water_marks (
   environment TEXT PRIMARY KEY,
   equity REAL NOT NULL,
@@ -504,6 +539,12 @@ const runMigrations = (db: DbHandle) => {
   addColumnIfMissing(db, "option_snapshots", "executable_price_source", "executable_price_source TEXT");
   addColumnIfMissing(db, "option_snapshots", "rejection_reason", "rejection_reason TEXT");
   addColumnIfMissing(db, "option_snapshots", "quote_timestamp", "quote_timestamp TEXT");
+  addColumnIfMissing(db, "option_snapshots", "bid_size", "bid_size REAL");
+  addColumnIfMissing(db, "option_snapshots", "ask_size", "ask_size REAL");
+  addColumnIfMissing(db, "option_snapshots", "trade_size", "trade_size REAL");
+  addColumnIfMissing(db, "option_snapshots", "trade_timestamp", "trade_timestamp TEXT");
+  addColumnIfMissing(db, "option_snapshots", "snapshot_timestamp", "snapshot_timestamp TEXT");
+  addColumnIfMissing(db, "option_snapshots", "normalization_path", "normalization_path TEXT");
   addColumnIfMissing(db, "paper_execution_ledger", "side", "side TEXT");
   addColumnIfMissing(db, "paper_execution_ledger", "order_type", "order_type TEXT");
   addColumnIfMissing(db, "paper_execution_ledger", "time_in_force", "time_in_force TEXT");

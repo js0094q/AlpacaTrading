@@ -8,7 +8,13 @@ export type PaperExecutionLedgerStatus =
   | "rejected"
   | "failed"
   | "duplicate_blocked"
-  | "attempted";
+  | "attempted"
+  | "reserved"
+  | "released"
+  | "filled"
+  | "canceled"
+  | "expired"
+  | "partial";
 
 export interface PaperExecutionLedgerEntry {
   id: number;
@@ -125,6 +131,16 @@ export const findPaperExecutionByDedupeKey = (
   return row ? mapRow(row) : null;
 };
 
+export const findPaperExecutionByClientOrderId = (
+  clientOrderId: string
+): PaperExecutionLedgerEntry | null => {
+  const row = queryOne<LedgerRow>(
+    `SELECT * FROM paper_execution_ledger WHERE client_order_id = ? LIMIT 1`,
+    [clientOrderId]
+  );
+  return row ? mapRow(row) : null;
+};
+
 export const listPaperExecutionLedgerEntries = (
   limit = 50
 ): PaperExecutionLedgerEntry[] => {
@@ -157,6 +173,7 @@ export const insertPaperExecutionLedgerEntry = (input: {
   maxRisk?: number | null;
   dedupeKey: string;
   clientOrderId: string;
+  requestId?: string | null;
   status: PaperExecutionLedgerStatus;
   reason?: string | null;
   blockedReason?: string | null;
@@ -193,6 +210,7 @@ export const insertPaperExecutionLedgerEntry = (input: {
         max_risk,
         dedupe_key,
         client_order_id,
+        request_id,
         status,
         reason,
         blocked_reason,
@@ -202,7 +220,7 @@ export const insertPaperExecutionLedgerEntry = (input: {
         payload_json,
         raw_payload_json,
         raw_response_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `
     )
     .run(
@@ -223,6 +241,7 @@ export const insertPaperExecutionLedgerEntry = (input: {
       input.maxRisk ?? null,
       input.dedupeKey,
       input.clientOrderId,
+      input.requestId ?? null,
       input.status,
       input.reason ?? null,
       input.blockedReason ?? input.reason ?? null,
@@ -255,7 +274,7 @@ export const insertPaperExecutionLedgerEntry = (input: {
     clientOrderId: input.clientOrderId,
     alpacaOrderId: null,
     alpacaStatus: null,
-    requestId: null,
+    requestId: input.requestId ?? null,
     sourcePlanId: input.sourcePlanId ?? null,
     sourceCandidateId: input.sourceCandidateId ?? null,
     status: input.status,
@@ -312,4 +331,88 @@ export const updatePaperExecutionLedgerEntry = (
       rawResponseJson,
       id
     );
+};
+
+export const reservePaperExecutionAttempt = (input: {
+  reviewId: string;
+  clientOrderId: string;
+  symbol: string;
+  underlyingSymbol?: string | null;
+  quantity: number;
+  limitPrice: number;
+  estimatedPremium: number;
+  expiresAt: string;
+  requestId?: string | null;
+  mode?: "hedge-entry" | "hedge-exit";
+  side?: "buy" | "sell";
+  positionIntent?: "buy_to_open" | "sell_to_close";
+}) => {
+  const mode = input.mode ?? "hedge-entry";
+  const side = input.side ?? "buy";
+  const positionIntent = input.positionIntent ?? "buy_to_open";
+  try {
+    const entry = insertPaperExecutionLedgerEntry({
+      mode,
+      assetClass: "option",
+      symbol: input.symbol,
+      underlyingSymbol: input.underlyingSymbol ?? null,
+      strategy: "portfolio_hedge",
+      side,
+      orderType: "limit",
+      timeInForce: "day",
+      qty: String(input.quantity),
+      limitPrice: String(input.limitPrice),
+      estimatedPremium: input.estimatedPremium,
+      maxRisk: input.estimatedPremium,
+      dedupeKey: `${mode === "hedge-exit" ? "hedge-exit" : "hedge-review"}:${input.reviewId}`,
+      clientOrderId: input.clientOrderId,
+      status: "reserved",
+      requestId: input.requestId ?? null,
+      sourcePlanId: input.reviewId,
+      payload: {
+        reviewId: input.reviewId,
+        clientOrderId: input.clientOrderId,
+        symbol: input.symbol,
+        quantity: input.quantity,
+        limitPrice: input.limitPrice,
+        estimatedPremium: input.estimatedPremium,
+        expiresAt: input.expiresAt,
+        mode,
+        side,
+        positionIntent
+      }
+    });
+    return { reserved: true as const, entry, blockers: [] as string[] };
+  } catch (error) {
+    const existing = findPaperExecutionByClientOrderId(input.clientOrderId);
+    return {
+      reserved: false as const,
+      entry: existing,
+      blockers: ["HEDGE_DUPLICATE_ORDER"],
+      error: error instanceof Error ? error.message : "HEDGE_RESERVATION_FAILED"
+    };
+  }
+};
+
+export const releaseExpiredHedgeReservations = (
+  asOf = new Date().toISOString()
+) => {
+  const rows = queryAll<{ id: number }>(
+    `
+    SELECT id
+    FROM paper_execution_ledger
+    WHERE mode IN ('hedge-entry', 'hedge-exit')
+      AND status = 'reserved'
+      AND json_extract(payload_json, '$.expiresAt') < ?
+    `,
+    [asOf]
+  );
+  for (const row of rows) {
+    updatePaperExecutionLedgerEntry(row.id, {
+      status: "released",
+      reason: "HEDGE_RESERVATION_EXPIRED",
+      blockedReason: "HEDGE_RESERVATION_EXPIRED"
+    });
+  }
+  return rows.length;
 };

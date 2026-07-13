@@ -16,7 +16,12 @@ import { listAlpacaOpenOrders } from "../../src/services/alpacaOrderReadService.
 import { listAlpacaPositions } from "../../src/services/alpacaPositionService.js";
 import { listPaperOperations } from "../../src/services/paperOperationLogService.js";
 import { latestReviewArtifactReadiness } from "../../src/services/paperOpsWorkflowService.js";
-import { latestHedgeRecommendationForCurrentConfig } from "../../src/services/hedgePersistenceService.js";
+import {
+  buildPersistedHedgeRiskRead,
+  latestHedgeRecommendationForCurrentConfig
+} from "../../src/services/hedgePersistenceService.js";
+import { listPaperExecutionLedgerEntries } from "../../src/services/paperExecutionLedgerService.js";
+import { evaluateHedgeLearning, listRecentHedgeLearningEvents } from "../../src/services/hedgeLearningLifecycleService.js";
 import { safeTokenEquals } from "../../src/lib/safeToken.js";
 import { redactSensitiveData, redactSensitiveText } from "../../src/lib/securityRedaction.js";
 import {
@@ -39,6 +44,16 @@ type ControlInput = {
   expectedPayloadSignature?: string;
   underlying: string;
   dte: number;
+  quantity?: number;
+  reviewId?: string;
+  symbol?: string;
+  expirationDate?: string;
+  entryPrice?: number;
+  currentPrice?: number;
+  entryAt?: string;
+  asOf?: string;
+  staleThesis?: boolean;
+  riskNormalizationObservations?: number;
 };
 
 type Envelope = {
@@ -99,6 +114,7 @@ type ActionConfig = {
   timeoutMs: number;
   requireAdminToken: boolean;
   requireMutationPrecheck: boolean;
+  requireHedgeDashboardMutations?: boolean;
   runtimePreflight?: ControlRuntimePreflight;
   action: string;
   handler: ActionHandler;
@@ -343,7 +359,17 @@ const parseInput = (raw: unknown): ControlInput => {
       typeof body.underlying === "string" && body.underlying.trim()
         ? body.underlying.trim().toUpperCase()
         : "SPY",
-    dte: safeInteger(body.dte, 0, 0, 30)
+    dte: safeInteger(body.dte, 0, 0, 30),
+    quantity: typeof body.quantity === "number" ? Math.max(1, Math.floor(body.quantity)) : undefined,
+    reviewId: typeof body.reviewId === "string" && body.reviewId.trim() ? body.reviewId.trim() : undefined,
+    symbol: typeof body.symbol === "string" && body.symbol.trim() ? body.symbol.trim().toUpperCase() : undefined,
+    expirationDate: typeof body.expirationDate === "string" ? body.expirationDate : undefined,
+    entryPrice: typeof body.entryPrice === "number" ? body.entryPrice : undefined,
+    currentPrice: typeof body.currentPrice === "number" ? body.currentPrice : undefined,
+    entryAt: typeof body.entryAt === "string" ? body.entryAt : undefined,
+    asOf: typeof body.asOf === "string" ? body.asOf : undefined,
+    staleThesis: normalizeBoolean(body.staleThesis, false),
+    riskNormalizationObservations: typeof body.riskNormalizationObservations === "number" ? body.riskNormalizationObservations : undefined
   };
 };
 
@@ -685,6 +711,66 @@ const executeReviewedHandler = async (input: ControlInput, requestId: string) =>
   );
 };
 
+const hedgeReviewHandler = (_input: ControlInput, requestId: string) =>
+  command("hedge:review", ["--format=json"], 120_000, requestId, "hedge.review");
+
+const hedgeExecuteHandler = (input: ControlInput, requestId: string) => {
+  if (input.confirmPaper !== true) {
+    return Promise.resolve({ paperOnly: true, status: "blocked", blockers: ["CONFIRM_PAPER_REQUIRED"] });
+  }
+  if (!input.reviewId) {
+    return Promise.resolve({ paperOnly: true, status: "blocked", blockers: ["HEDGE_REVIEW_ID_REQUIRED"] });
+  }
+  return command(
+    "hedge:execute",
+    [`--reviewId=${input.reviewId}`, "--confirmPaper", "--format=json"],
+    120_000,
+    requestId,
+    "hedge.execute"
+  );
+};
+
+const hedgeExitReviewHandler = (input: ControlInput, requestId: string) => {
+  if (!input.symbol || !input.expirationDate || input.entryPrice === undefined || input.currentPrice === undefined) {
+    return Promise.resolve({ paperOnly: true, environment: "paper", status: "blocked", blockers: ["HEDGE_EXIT_INPUT_REQUIRED"] });
+  }
+  return command(
+    "hedge:exit:review",
+    [
+      `--symbol=${input.symbol}`,
+      `--underlying=${input.underlying}`,
+      `--quantity=${input.quantity || 1}`,
+      `--entryPrice=${input.entryPrice}`,
+      `--currentPrice=${input.currentPrice}`,
+      `--expirationDate=${input.expirationDate}`,
+      `--entryAt=${input.entryAt || new Date().toISOString()}`,
+      ...(input.asOf ? [`--asOf=${input.asOf}`] : []),
+      ...(input.staleThesis ? ["--staleThesis"] : []),
+      `--riskNormalizationObservations=${input.riskNormalizationObservations || 0}`,
+      "--format=json"
+    ],
+    60_000,
+    requestId,
+    "hedge.exit.review"
+  );
+};
+
+const hedgeExitExecuteHandler = (input: ControlInput, requestId: string) => {
+  if (input.confirmPaper !== true) {
+    return Promise.resolve({ paperOnly: true, status: "blocked", blockers: ["CONFIRM_PAPER_REQUIRED"] });
+  }
+  if (!input.reviewId) {
+    return Promise.resolve({ paperOnly: true, status: "blocked", blockers: ["HEDGE_REVIEW_ID_REQUIRED"] });
+  }
+  return command(
+    "hedge:exit:execute",
+    [`--reviewId=${input.reviewId}`, "--confirmPaper", "--format=json"],
+    120_000,
+    requestId,
+    "hedge.exit.execute"
+  );
+};
+
 const actionHandlers: Record<string, ActionConfig> = {
   "/api/v1/health": {
     method: "GET",
@@ -716,18 +802,8 @@ const actionHandlers: Record<string, ActionConfig> = {
     requireAdminToken: false,
     requireMutationPrecheck: false,
     action: "hedge.risk",
-    handler: async () => {
-      const recommendation = latestHedgeRecommendationForCurrentConfig();
-      return {
-        paperOnly: true,
-        effectiveStatus: recommendation?.effectiveStatus ?? "blocked",
-        generatedAt: recommendation?.generatedAt ?? null,
-        expiresAt: recommendation?.expiresAt ?? null,
-        risk: recommendation?.risk ?? null,
-        warnings: recommendation?.integrityWarnings ?? ["NO_HEDGE_RECOMMENDATION"],
-        blockers: recommendation ? [] : ["NO_HEDGE_RECOMMENDATION"]
-      };
-    }
+    handler: async () =>
+      buildPersistedHedgeRiskRead(latestHedgeRecommendationForCurrentConfig())
   },
   "/api/v1/hedge/regime": {
     method: "GET",
@@ -747,6 +823,76 @@ const actionHandlers: Record<string, ActionConfig> = {
         blockers: recommendation ? [] : ["NO_HEDGE_RECOMMENDATION"]
       };
     }
+  },
+  "/api/v1/hedge/review": {
+    method: "POST",
+    timeoutMs: 120_000,
+    requireAdminToken: true,
+    requireMutationPrecheck: true,
+    requireHedgeDashboardMutations: true,
+    runtimePreflight: { actionType: "review" },
+    action: "hedge.review",
+    handler: hedgeReviewHandler
+  },
+  "/api/v1/hedge/execute": {
+    method: "POST",
+    timeoutMs: 120_000,
+    requireAdminToken: true,
+    requireMutationPrecheck: false,
+    requireHedgeDashboardMutations: true,
+    runtimePreflight: {
+      actionType: "confirmed-paper-execution",
+      confirmPaperFromInput: true,
+      requireOptionsExecution: true
+    },
+    action: "hedge.execute",
+    handler: hedgeExecuteHandler
+  },
+  "/api/v1/hedge/exit/review": {
+    method: "POST",
+    timeoutMs: 60_000,
+    requireAdminToken: true,
+    requireMutationPrecheck: true,
+    requireHedgeDashboardMutations: true,
+    runtimePreflight: { actionType: "review" },
+    action: "hedge.exit.review",
+    handler: hedgeExitReviewHandler
+  },
+  "/api/v1/hedge/exit/execute": {
+    method: "POST",
+    timeoutMs: 120_000,
+    requireAdminToken: true,
+    requireMutationPrecheck: false,
+    requireHedgeDashboardMutations: true,
+    runtimePreflight: {
+      actionType: "confirmed-paper-execution",
+      confirmPaperFromInput: true,
+      requireOptionsExecution: true
+    },
+    action: "hedge.exit.execute",
+    handler: hedgeExitExecuteHandler
+  },
+  "/api/v1/hedge/execution": {
+    method: "GET",
+    timeoutMs: 30_000,
+    requireAdminToken: false,
+    requireMutationPrecheck: false,
+    action: "hedge.execution",
+    handler: async () => ({ paperOnly: true, environment: "paper", entries: listPaperExecutionLedgerEntries(100) })
+  },
+  "/api/v1/hedge/learning": {
+    method: "GET",
+    timeoutMs: 30_000,
+    requireAdminToken: false,
+    requireMutationPrecheck: false,
+    action: "hedge.learning",
+    handler: async (input) => ({
+      paperOnly: true,
+      environment: "paper",
+      reviewId: input.reviewId || null,
+      evaluation: input.reviewId ? evaluateHedgeLearning(input.reviewId) : null,
+      events: listRecentHedgeLearningEvents(100)
+    })
   },
   "/api/v1/account": {
     method: "GET",
@@ -1087,6 +1233,13 @@ const routeHandler = async (request: IncomingMessage, response: any, config: Act
     if (config.requireAdminToken && !authorize(request)) {
       throw new Error("Missing or invalid control token.");
     }
+    if (config.requireHedgeDashboardMutations && process.env.HEDGE_DASHBOARD_MUTATIONS_ENABLED !== "true") {
+      throw new EnvironmentGuardError(
+        "HEDGE_DASHBOARD_MUTATIONS_DISABLED",
+        "Hedge dashboard mutation controls are disabled.",
+        buildEnvironmentGuardState()
+      );
+    }
 
     const body = request.method === "POST" ? await readBody(request) : {};
     const input = parseInput(body);
@@ -1110,7 +1263,8 @@ const routeHandler = async (request: IncomingMessage, response: any, config: Act
         assetClass: input.assetClass,
         confirmPaper: input.confirmPaper,
         underlying: input.underlying,
-        dte: input.dte
+        dte: input.dte,
+        ...(input.reviewId ? { reviewId: input.reviewId } : {})
       },
       {
         startedAt,

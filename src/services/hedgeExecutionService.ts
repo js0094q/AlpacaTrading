@@ -1,0 +1,437 @@
+import { canonicalJsonHash } from "../lib/canonicalJson.js";
+import {
+  cancelPaperOrder,
+  getAccount,
+  getPaperOrder,
+  replacePaperOrder,
+  submitPaperOrder,
+  type AlpacaAccountRaw,
+  type AlpacaApiResponse,
+  type AlpacaPaperOrderRequest,
+  type AlpacaPositionRaw,
+  type AlpacaSubmittedOrder
+} from "./alpacaClient.js";
+import { fetchOptionQuotes, fetchOptionSnapshots } from "./providers/alpaca.js";
+import { normalizeOptionSnapshot } from "./optionSnapshotNormalizer.js";
+import { buildHedgeConfig } from "./hedgeConfigService.js";
+import {
+  reconcileHedgeAccountState,
+  type HedgeAccountReconciliationResult
+} from "./hedgeAccountReconciliationService.js";
+import {
+  readHedgeExecutionReview,
+  markHedgeExecutionReviewConsumed,
+} from "./hedgePersistenceService.js";
+import type {
+  HedgeExecutionReview,
+  HedgeExecutionReviewVerification
+} from "./hedgeExecutionReviewService.js";
+import {
+  listPaperExecutionLedgerEntries,
+  releaseExpiredHedgeReservations,
+  reservePaperExecutionAttempt,
+  updatePaperExecutionLedgerEntry,
+} from "./paperExecutionLedgerService.js";
+import {
+  validatePaperHedgeOptionOrder,
+  type PaperHedgeOptionOrderValidation
+} from "./paperOptionOrderValidationService.js";
+import { getTradingSafetyState } from "./tradingSafetyService.js";
+
+export type HedgeExecutionStatus =
+  | "filled"
+  | "partial"
+  | "submitted"
+  | "canceled"
+  | "rejected"
+  | "blocked"
+  | "no_op";
+
+export interface HedgeExecutionReport {
+  paperOnly: true;
+  environment: "paper" | "live";
+  status: HedgeExecutionStatus;
+  reviewId: string;
+  clientOrderId: string | null;
+  brokerOrderId: string | null;
+  symbol: string | null;
+  requestId: string | null;
+  correlationId: string | null;
+  filledQuantity: number;
+  averageFillPrice: number | null;
+  attempts: number;
+  reservationId: number | null;
+  blockers: string[];
+  warnings: string[];
+  verification?: HedgeExecutionReviewVerification;
+  reconciliation?: HedgeAccountReconciliationResult;
+  validation?: PaperHedgeOptionOrderValidation;
+}
+
+export interface HedgeQuoteRefresh {
+  bid: number | null;
+  ask: number | null;
+  midpoint: number | null;
+  delta: number | null;
+  quoteTimestamp: string | null;
+}
+
+interface HedgeOpenOrderSnapshot {
+  symbol: string;
+  client_order_id?: string;
+  status?: string;
+}
+
+export interface HedgeExecutionDeps {
+  getAccount?: typeof getAccount;
+  listPositions?: () => Promise<{ positions: AlpacaPositionRaw[]; requestId?: string }>;
+  listOrders?: () => Promise<{ orders: HedgeOpenOrderSnapshot[]; requestId?: string }>;
+  submitPaperOrder?: typeof submitPaperOrder;
+  getPaperOrder?: typeof getPaperOrder;
+  replacePaperOrder?: typeof replacePaperOrder;
+  cancelPaperOrder?: typeof cancelPaperOrder;
+  refreshQuote?: (symbol: string) => Promise<HedgeQuoteRefresh>;
+  readReview?: typeof readHedgeExecutionReview;
+  now?: () => string;
+  sleep?: (milliseconds: number) => Promise<void>;
+  maxRepriceAttempts?: number;
+}
+
+const parseBoolean = (name: string) => process.env[name] === "true" || process.env[name] === "1";
+const numberValue = (value: unknown) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+export const paperAccountIdentityHash = (account: Partial<AlpacaAccountRaw>) =>
+  canonicalJsonHash({
+    id: account.id ?? null,
+    status: account.status ?? null,
+    equity: account.equity ?? null,
+    buyingPower: account.buying_power ?? null,
+    optionsApprovedLevel: account.options_approved_level ?? null
+  });
+
+const defaultListPositions = async () => {
+  const { listPaperPositions } = await import("./alpacaClient.js");
+  const response = await listPaperPositions();
+  return { positions: response.data, requestId: response.requestId };
+};
+
+const defaultListOrders = async () => {
+  const { listRecentPaperOrders } = await import("./alpacaClient.js");
+  const response = await listRecentPaperOrders(100);
+  return { orders: response.data, requestId: response.requestId };
+};
+
+const defaultRefreshQuote = async (symbol: string): Promise<HedgeQuoteRefresh> => {
+  const [snapshots, quotes] = await Promise.all([
+    fetchOptionSnapshots([symbol]),
+    fetchOptionQuotes([symbol])
+  ]);
+  const normalized = normalizeOptionSnapshot(symbol, snapshots[0]?.raw ?? {}, {
+    latestQuote: quotes[0]?.raw
+  });
+  return {
+    bid: normalized.latestQuote?.bidPrice ?? null,
+    ask: normalized.latestQuote?.askPrice ?? null,
+    midpoint:
+      normalized.latestQuote?.bidPrice !== null && normalized.latestQuote?.askPrice !== null &&
+      normalized.latestQuote?.bidPrice !== undefined && normalized.latestQuote?.askPrice !== undefined
+        ? (normalized.latestQuote.bidPrice + normalized.latestQuote.askPrice) / 2
+        : null,
+    delta: normalized.greeks.delta,
+    quoteTimestamp: normalized.latestQuote?.timestamp ?? normalized.snapshotTimestamp ?? null
+  };
+};
+
+const blockedReport = (input: {
+  reviewId: string;
+  environment?: "paper" | "live";
+  blockers: string[];
+  review?: HedgeExecutionReview | null;
+  verification?: HedgeExecutionReviewVerification;
+}) => ({
+  paperOnly: true as const,
+  environment: input.environment ?? "paper",
+  status: "blocked" as const,
+  reviewId: input.reviewId,
+  clientOrderId: input.review?.clientOrderId ?? null,
+  brokerOrderId: null,
+  symbol: input.review?.orderIntent.symbol ?? null,
+  requestId: input.review?.requestId ?? null,
+  correlationId: input.review?.correlationId ?? null,
+  filledQuantity: 0,
+  averageFillPrice: null,
+  attempts: 0,
+  reservationId: null,
+  blockers: [...new Set(input.blockers)],
+  warnings: [],
+  ...(input.verification ? { verification: input.verification } : {})
+});
+
+const orderStatus = (order: AlpacaSubmittedOrder | null) => String(order?.status || "").toLowerCase();
+
+export const executeReviewedPaperHedge = async (
+  input: { reviewId: string; confirmPaper: boolean },
+  deps: HedgeExecutionDeps = {}
+): Promise<HedgeExecutionReport> => {
+  if (input.confirmPaper !== true) return blockedReport({ reviewId: input.reviewId, blockers: ["CONFIRM_PAPER_REQUIRED"] });
+  const state = getTradingSafetyState();
+  const environment = state.alpacaEnv === "paper" ? "paper" : "live";
+  const unsafeBlockers = [
+    ...(environment !== "paper" ? ["HEDGE_ENVIRONMENT_NOT_PAPER"] : []),
+    ...(state.liveTradingEnabled || parseBoolean("ALPACA_LIVE_TRADE") || parseBoolean("LIVE_TRADING_ENABLED") ? ["HEDGE_LIVE_TRADING_ENABLED"] : []),
+    ...(!parseBoolean("PAPER_ORDER_EXECUTION_ENABLED") ? ["PAPER_EXECUTION_FLAG_REQUIRED"] : []),
+    ...(!parseBoolean("PAPER_OPTIONS_EXECUTION_ENABLED") ? ["HEDGE_OPTIONS_EXECUTION_DISABLED"] : []),
+    ...(!parseBoolean("HEDGE_PAPER_EXECUTION_ENABLED") ? ["HEDGE_EXECUTION_DISABLED"] : []),
+    ...(parseBoolean("HEDGE_LIVE_EXECUTION_ENABLED") ? ["HEDGE_LIVE_EXECUTION_ENABLED"] : []),
+    ...(parseBoolean("MULTI_LEG_HEDGE_EXECUTION_ENABLED") ? ["MULTI_LEG_EXECUTION_UNSUPPORTED"] : []),
+    ...(!process.env.HEDGE_REVIEW_SIGNING_KEY?.trim() ? ["HEDGE_REVIEW_SIGNING_KEY_REQUIRED"] : [])
+  ];
+  if (unsafeBlockers.length) return blockedReport({ reviewId: input.reviewId, environment, blockers: unsafeBlockers });
+
+  const now = deps.now?.() ?? new Date().toISOString();
+  releaseExpiredHedgeReservations(now);
+  const signingKey = process.env.HEDGE_REVIEW_SIGNING_KEY!.trim();
+  const stored = (deps.readReview ?? readHedgeExecutionReview)({
+    reviewId: input.reviewId,
+    signingKey,
+    asOf: now
+  });
+  if (!stored.review || !stored.verification.valid) {
+    return blockedReport({
+      reviewId: input.reviewId,
+      blockers: stored.verification.blockers,
+      review: stored.review,
+      verification: stored.verification
+    });
+  }
+  const review = stored.review;
+  if (review.orderIntent.structure !== "long_put" || review.orderIntent.side !== "buy_to_open") {
+    return blockedReport({ reviewId: input.reviewId, blockers: ["MULTI_LEG_EXECUTION_UNSUPPORTED"], review });
+  }
+
+  const accountResponse = await (deps.getAccount ?? getAccount)();
+  const account = accountResponse.data;
+  const accountHash = paperAccountIdentityHash(account);
+  const positionsResponse = await (deps.listPositions ?? defaultListPositions)();
+  const ordersResponse = await (deps.listOrders ?? defaultListOrders)();
+  const reconciliation = reconcileHedgeAccountState({
+    review,
+    currentAccountHash: accountHash,
+    accountStatus: String(account.status || ""),
+    accountEnvironment: environment,
+    buyingPower: numberValue(account.buying_power) ?? 0,
+    requiredPremium: review.orderIntent.maxPremium,
+    optionApprovalLevel: numberValue(account.options_approved_level) ?? 0,
+    positions: positionsResponse.positions.map((position) => ({
+      symbol: String(position.symbol || ""),
+      quantity: numberValue(position.qty) ?? 0
+    })),
+    openOrders: ordersResponse.orders.map((order) => ({
+      symbol: String(order.symbol || ""),
+      clientOrderId: order.client_order_id,
+      status: order.status
+    })),
+    ledger: listPaperExecutionLedgerEntries(100).map((entry) => ({
+      clientOrderId: entry.clientOrderId,
+      status: entry.status
+    }))
+  });
+  if (!reconciliation.valid) {
+    return { ...blockedReport({ reviewId: input.reviewId, blockers: reconciliation.blockers, review }), reconciliation };
+  }
+
+  const config = buildHedgeConfig();
+  const quote = await (deps.refreshQuote ?? defaultRefreshQuote)(review.orderIntent.symbol);
+  const validation = validatePaperHedgeOptionOrder({
+    environment,
+    liveTradingEnabled: state.liveTradingEnabled,
+    optionsExecutionEnabled: parseBoolean("PAPER_OPTIONS_EXECUTION_ENABLED"),
+    symbol: review.orderIntent.symbol,
+    underlying: review.orderIntent.underlying,
+    quantity: review.orderIntent.quantity,
+    limitPrice: review.orderIntent.limitPrice,
+    bid: quote.bid,
+    ask: quote.ask,
+    delta: quote.delta,
+    dte: Number(review.marketEvidence.daysToExpiration ?? 0),
+    quoteTimestamp: quote.quoteTimestamp,
+    asOf: now,
+    maxQuoteAgeSeconds: config.executionPolicy.limitPriceMaxAgeSeconds,
+    maxSpreadPct: config.executionPolicy.maxBidAskSpreadPct,
+    maxQuantity: review.caps.maxQuantity,
+    maxPremium: review.caps.maxPremium,
+    maxPortfolioAllocation: config.executionPolicy.maxNewHedgePremiumPctEquity,
+    portfolioEquity: numberValue(account.equity) ?? 0,
+    buyingPower: numberValue(account.buying_power) ?? 0,
+    optionApprovalLevel: numberValue(account.options_approved_level) ?? 0,
+    structure: review.orderIntent.structure,
+    targetAbsDeltaMin: config.executionPolicy.targetAbsDeltaMin,
+    targetAbsDeltaMax: config.executionPolicy.targetAbsDeltaMax,
+    minDte: config.executionPolicy.minDte,
+    maxDte: config.executionPolicy.maxDte
+  });
+  if (!validation.valid) {
+    return { ...blockedReport({ reviewId: input.reviewId, blockers: validation.blockers, review }), reconciliation, validation };
+  }
+
+  const reservation = reservePaperExecutionAttempt({
+    reviewId: review.reviewId,
+    clientOrderId: review.clientOrderId,
+    symbol: review.orderIntent.symbol,
+    underlyingSymbol: review.orderIntent.underlying,
+    quantity: review.orderIntent.quantity,
+    limitPrice: review.orderIntent.limitPrice,
+    estimatedPremium: review.orderIntent.maxPremium,
+    expiresAt: review.expiresAt,
+    requestId: review.requestId
+  });
+  if (!reservation.reserved) {
+    return {
+      ...blockedReport({ reviewId: input.reviewId, blockers: reservation.blockers, review }),
+      reconciliation,
+      validation,
+      reservationId: reservation.entry?.id ?? null
+    } as HedgeExecutionReport;
+  }
+
+  const payload: AlpacaPaperOrderRequest = {
+    symbol: review.orderIntent.symbol,
+    qty: String(review.orderIntent.quantity),
+    side: "buy",
+    type: "limit",
+    time_in_force: "day",
+    limit_price: String(review.orderIntent.limitPrice),
+    client_order_id: review.clientOrderId,
+    position_intent: "buy_to_open"
+  };
+  let response: AlpacaApiResponse<AlpacaSubmittedOrder>;
+  try {
+    response = await (deps.submitPaperOrder ?? submitPaperOrder)(payload);
+  } catch (error) {
+    updatePaperExecutionLedgerEntry(reservation.entry.id, {
+      status: "failed",
+      reason: "HEDGE_ORDER_SUBMISSION_FAILED",
+      errorMessage: error instanceof Error ? error.message : "Paper hedge submission failed."
+    });
+    return {
+      ...blockedReport({ reviewId: input.reviewId, blockers: ["HEDGE_ORDER_SUBMISSION_FAILED"], review }),
+      reconciliation,
+      validation,
+      reservationId: reservation.entry.id
+    } as HedgeExecutionReport;
+  }
+  const brokerOrderId = response.data.id ?? null;
+  updatePaperExecutionLedgerEntry(reservation.entry.id, {
+    status: "submitted",
+    alpacaOrderId: brokerOrderId,
+    alpacaStatus: response.data.status ?? "submitted",
+    requestId: response.requestId
+  });
+  if (!brokerOrderId) {
+    return {
+      ...blockedReport({ reviewId: input.reviewId, blockers: ["HEDGE_BROKER_ORDER_ID_MISSING"], review }),
+      reconciliation,
+      validation,
+      reservationId: reservation.entry.id
+    } as HedgeExecutionReport;
+  }
+
+  const getOrder = deps.getPaperOrder ?? getPaperOrder;
+  const replaceOrder = deps.replacePaperOrder ?? replacePaperOrder;
+  const cancelOrder = deps.cancelPaperOrder ?? cancelPaperOrder;
+  const maxRepriceAttempts = Math.max(0, Math.floor(deps.maxRepriceAttempts ?? config.executionPolicy.maxRepriceAttempts));
+  let attempts = 0;
+  let latest: AlpacaSubmittedOrder | null = null;
+  for (let reprice = 0; reprice <= maxRepriceAttempts; reprice += 1) {
+    attempts += 1;
+    const orderResponse = await getOrder(brokerOrderId);
+    latest = orderResponse.data;
+    const status = orderStatus(latest);
+    const filledQuantity = numberValue(latest.filled_qty) ?? 0;
+    if (status === "filled") {
+      updatePaperExecutionLedgerEntry(reservation.entry.id, { status: "filled", alpacaStatus: status, requestId: orderResponse.requestId });
+      markHedgeExecutionReviewConsumed(review.reviewId);
+      return {
+        paperOnly: true,
+        environment: "paper",
+        status: "filled",
+        reviewId: review.reviewId,
+        clientOrderId: review.clientOrderId,
+        brokerOrderId,
+        symbol: review.orderIntent.symbol,
+        requestId: orderResponse.requestId ?? response.requestId ?? null,
+        correlationId: review.correlationId,
+        filledQuantity,
+        averageFillPrice: numberValue(latest.filled_avg_price),
+        attempts,
+        reservationId: reservation.entry.id,
+        blockers: [],
+        warnings: [],
+        reconciliation,
+        validation
+      };
+    }
+    if (["rejected", "canceled", "expired"].includes(status)) {
+      const terminal = status === "rejected" ? "rejected" : "canceled";
+      updatePaperExecutionLedgerEntry(reservation.entry.id, { status: terminal, alpacaStatus: status, requestId: orderResponse.requestId });
+      markHedgeExecutionReviewConsumed(review.reviewId);
+      return {
+        paperOnly: true,
+        environment: "paper",
+        status: terminal,
+        reviewId: review.reviewId,
+        clientOrderId: review.clientOrderId,
+        brokerOrderId,
+        symbol: review.orderIntent.symbol,
+        requestId: orderResponse.requestId ?? response.requestId ?? null,
+        correlationId: review.correlationId,
+        filledQuantity,
+        averageFillPrice: numberValue(latest.filled_avg_price),
+        attempts,
+        reservationId: reservation.entry.id,
+        blockers: terminal === "rejected" ? ["HEDGE_ORDER_REJECTED"] : [],
+        warnings: [],
+        reconciliation,
+        validation
+      };
+    }
+    if (reprice < maxRepriceAttempts) {
+      const nextQuote = await (deps.refreshQuote ?? defaultRefreshQuote)(review.orderIntent.symbol);
+      if (!nextQuote.ask || nextQuote.ask <= 0 || nextQuote.ask > review.orderIntent.limitPrice) break;
+      await replaceOrder(brokerOrderId, { limit_price: String(Math.min(nextQuote.ask, review.orderIntent.limitPrice)) });
+      await (deps.sleep ?? (async () => undefined))(0);
+    }
+  }
+
+  const canceled = await cancelOrder(brokerOrderId);
+  const filledQuantity = numberValue(latest?.filled_qty) ?? 0;
+  const status: HedgeExecutionStatus = filledQuantity > 0 ? "partial" : "canceled";
+  updatePaperExecutionLedgerEntry(reservation.entry.id, {
+    status,
+    alpacaStatus: "canceled",
+    requestId: canceled.requestId
+  });
+  markHedgeExecutionReviewConsumed(review.reviewId);
+  return {
+    paperOnly: true,
+    environment: "paper",
+    status,
+    reviewId: review.reviewId,
+    clientOrderId: review.clientOrderId,
+    brokerOrderId,
+    symbol: review.orderIntent.symbol,
+    requestId: canceled.requestId ?? response.requestId ?? null,
+    correlationId: review.correlationId,
+    filledQuantity,
+    averageFillPrice: numberValue(latest?.filled_avg_price),
+    attempts,
+    reservationId: reservation.entry.id,
+    blockers: [],
+    warnings: status === "partial" ? ["HEDGE_PARTIAL_FILL_CANCELED_REMAINDER"] : [],
+    reconciliation,
+    validation
+  };
+};

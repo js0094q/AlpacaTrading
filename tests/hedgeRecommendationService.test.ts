@@ -313,7 +313,7 @@ test("sizes protection against modeled loss rather than NAV allocation", () => {
   assert.equal(result.sizing.netProtectionTarget, 50_000);
   const put = result.candidates.find((candidate) => candidate.instrumentType === "protective_put");
   assert.ok(put);
-  assert.equal(put.executable, false);
+  assert.equal(put.executable, true);
   assert.ok((put.units ?? 0) > 0);
 });
 

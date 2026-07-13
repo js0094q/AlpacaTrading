@@ -119,9 +119,6 @@ export const buildAndPersistHedgePlan = async (
   if (safety.alpacaEnv !== "paper" || safety.liveTradingEnabled) {
     return blockedPlan(generatedAt, ["HEDGE_PAPER_ENVIRONMENT_REQUIRED"]);
   }
-  if (config.executionEnabled) {
-    return blockedPlan(generatedAt, ["HEDGE_EXECUTION_MUST_REMAIN_DISABLED"]);
-  }
 
   const review = await (deps.buildReview ?? buildAndPersistHedgeReview)({
     config,

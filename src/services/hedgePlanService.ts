@@ -61,7 +61,6 @@ export const createHedgePlan = (input: {
   const blockers = unique([
     ...input.recommendation.blockers,
     ...(!input.paperOnly ? ["HEDGE_PAPER_ONLY_CONFIRMATION_REQUIRED"] : []),
-    ...(input.config.executionEnabled ? ["HEDGE_EXECUTION_MUST_REMAIN_DISABLED"] : []),
     ...(input.recommendation.environment !== "paper"
       ? ["HEDGE_PAPER_ENVIRONMENT_REQUIRED"]
       : [])
@@ -115,7 +114,7 @@ export const createHedgePlan = (input: {
     warnings: unique([
       ...input.recommendation.warnings,
       "HEDGE_PLAN_NON_EXECUTABLE",
-      "HEDGE_EXECUTION_NOT_IMPLEMENTED"
+      "HEDGE_PLAN_REQUIRES_EXECUTION_REVIEW"
     ]),
     blockers,
     requestId: input.recommendation.requestId,

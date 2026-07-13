@@ -190,60 +190,51 @@ export interface OptionContractRaw {
   status?: string;
 }
 
+interface OptionSnapshotComponentRaw {
+  [key: string]: unknown;
+  t?: string | null;
+  timestamp?: string | null;
+  bp?: number | null;
+  ap?: number | null;
+  b?: number | null;
+  a?: number | null;
+  bs?: number | null;
+  as?: number | null;
+  p?: number | null;
+  s?: number | null;
+  delta?: number | null;
+  gamma?: number | null;
+  theta?: number | null;
+  vega?: number | null;
+  rho?: number | null;
+}
+
 export interface OptionSnapshotRaw {
+  [key: string]: unknown;
   symbol?: string;
   underlying_symbol?: string;
-  Greeks?: {
-    delta?: number;
-    gamma?: number;
-    theta?: number;
-    vega?: number;
-    rho?: number;
-  };
-  greeks?: {
-    delta?: number;
-    gamma?: number;
-    theta?: number;
-    vega?: number;
-    rho?: number;
-  };
-  latest_quote?: {
-    t?: string | null;
-    bp?: number | null;
-    ap?: number | null;
-    b?: number | null;
-    a?: number | null;
-    p?: number | null;
-  };
-  latestQuote?: {
-    t?: string | null;
-    bp?: number | null;
-    ap?: number | null;
-    b?: number | null;
-    a?: number | null;
-    p?: number | null;
-  };
-  latest_trade?: {
-    t?: string | null;
-    p?: number | null;
-  };
-  latestTrade?: {
-    t?: string | null;
-    p?: number | null;
-  };
+  snapshotTimestamp?: string | null;
+  snapshot_timestamp?: string | null;
+  timestamp?: string | null;
+  Greeks?: OptionSnapshotComponentRaw;
+  greeks?: OptionSnapshotComponentRaw;
+  latest_quote?: OptionSnapshotComponentRaw;
+  latestQuote?: OptionSnapshotComponentRaw;
+  latest_trade?: OptionSnapshotComponentRaw;
+  latestTrade?: OptionSnapshotComponentRaw;
   implied_volatility?: number | null;
   impliedVolatility?: number | null;
-  volume?: number | null;
-  open_interest?: number | null;
-  openInterest?: number | null;
 }
 
 export interface OptionQuoteRaw {
+  [key: string]: unknown;
   t?: string | null;
   bp?: number | null;
   ap?: number | null;
   b?: number | null;
   a?: number | null;
+  bs?: number | null;
+  as?: number | null;
 }
 
 const parseOptionContractPayload = (payload: unknown): OptionContractRaw[] => {

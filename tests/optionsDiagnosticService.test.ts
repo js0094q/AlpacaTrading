@@ -52,7 +52,10 @@ const resetDatabase = () => {
   `);
 };
 
-const setDiagnosticFetch = (calls: string[]) => {
+const setDiagnosticFetch = (
+  calls: string[],
+  options: { currentSnapshot?: boolean; omitFetchedQuotes?: boolean } = {}
+) => {
   globalThis.fetch = async (input: string | Request | URL) => {
     const target = String(input);
     calls.push(target);
@@ -126,7 +129,20 @@ const setDiagnosticFetch = (calls: string[]) => {
         snapshots: Object.fromEntries(
           symbols.map((symbol) => [
             symbol,
-            {
+            options.currentSnapshot ? {
+              symbol,
+              underlying_symbol: symbol.startsWith("QQQ") ? "QQQ" : "SPY",
+              latestQuote: {
+                t: "2026-07-10T19:59:59.416029802Z",
+                bp: 2,
+                ap: 2.2
+              },
+              latestTrade: {
+                t: "2026-07-10T19:58:00Z",
+                p: 2.1
+              },
+              greeks: { delta: 0.7 }
+            } : {
               symbol,
               underlying_symbol: symbol.startsWith("QQQ") ? "QQQ" : "SPY",
               latest_quote: {
@@ -151,7 +167,7 @@ const setDiagnosticFetch = (calls: string[]) => {
         .split(",")
         .filter(Boolean);
       return makeMockResponse({
-        quotes: Object.fromEntries(
+        quotes: options.omitFetchedQuotes ? {} : Object.fromEntries(
           symbols.map((symbol) => [
             symbol,
             {
@@ -236,6 +252,28 @@ describe("options diagnostic service", () => {
     assert.equal(report.quoteAvailability.samples.every((sample) => sample.latestQuoteAvailable), true);
     assert.equal(calls.some((target) => target.includes("/v2/options/contracts")), true);
     assert.equal(calls.some((target) => target.includes("/v1beta1/options/quotes/latest")), true);
+  });
+
+  test("routes current snapshot aliases through the canonical diagnostic boundary", async () => {
+    const calls: string[] = [];
+    setDiagnosticFetch(calls, {
+      currentSnapshot: true,
+      omitFetchedQuotes: true
+    });
+
+    const report = await buildOptionsDiagnosticReport({
+      underlyings: ["SPY"],
+      asOfDate: "2026-07-06",
+      leapsMinDte: 180,
+      leapsMaxDte: 730,
+      sampleSize: 1
+    });
+    const sample = report.quoteAvailability.samples[0];
+
+    assert.equal(sample?.latestQuoteAvailable, true);
+    assert.equal(sample?.bid, 2);
+    assert.equal(sample?.ask, 2.2);
+    assert.equal(sample?.quoteTimestamp, "2026-07-10T19:59:59.416Z");
   });
 
   test("invalid same-day date filter is reported instead of silently returning zero", async () => {

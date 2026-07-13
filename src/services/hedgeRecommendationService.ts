@@ -33,6 +33,12 @@ export interface OptionHedgeCandidateEvidence {
   delta: number | null;
   openInterest: number | null;
   volume: number | null;
+  theta?: number | null;
+  quoteTimestamp?: string | null;
+  snapshotTimestamp?: string | null;
+  contractDeltaCoveragePct?: number | null;
+  marketValueDeltaCoveragePct?: number | null;
+  multiplier?: number | null;
 }
 
 export interface HedgeRecommendationEvidence {
@@ -43,6 +49,8 @@ export interface HedgeRecommendationEvidence {
     recommendation: string;
     reasons: string[];
   }>;
+  existingHedgePremium?: number;
+  dailyHedgePremium?: number;
 }
 
 export interface HedgeSizingSummary {
@@ -192,11 +200,16 @@ const protectivePutCandidate = (
   }
   if (spreadPct === null) {
     blockers.push("HEDGE_OPTION_SPREAD_UNAVAILABLE");
-  } else if (spreadPct > config.optionHedge.maxBidAskSpreadPct) {
+  } else if (spreadPct > config.executionPolicy.maxBidAskSpreadPct) {
     blockers.push("HEDGE_OPTION_SPREAD_TOO_WIDE");
   }
   if (option.delta === null) {
-    warnings.push("HEDGE_OPTION_DELTA_UNAVAILABLE");
+    blockers.push("HEDGE_OPTION_DELTA_UNAVAILABLE");
+  } else if (
+    Math.abs(option.delta) < config.executionPolicy.targetAbsDeltaMin ||
+    Math.abs(option.delta) > config.executionPolicy.targetAbsDeltaMax
+  ) {
+    blockers.push("HEDGE_DELTA_OUT_OF_RANGE");
   }
   const terminalUnderlying = option.underlyingPrice * (1 - scenarioDeclinePct / 100);
   const premiumPerContract = option.midpoint === null ? null : option.midpoint * 100;
@@ -218,38 +231,58 @@ const protectivePutCandidate = (
       : 0;
   const units = desiredUnits === null
     ? null
-    : Math.max(0, Math.min(desiredUnits, budgetUnits, config.optionHedge.maximumContracts));
+    : Math.max(
+        0,
+        Math.min(
+          desiredUnits,
+          budgetUnits,
+          config.executionPolicy.maxNewContractsPerRun
+        )
+      );
   if (units === 0) blockers.push("HEDGE_PREMIUM_BUDGET_INSUFFICIENT");
+  const estimatedCost =
+    premiumPerContract === null || units === null
+      ? null
+      : roundMoney(premiumPerContract * units);
+  if (estimatedCost !== null && estimatedCost < config.executionPolicy.minOrderNotionalDollars) {
+    blockers.push("HEDGE_MIN_ORDER_NOTIONAL_NOT_MET");
+  }
+  const finalBlockers = unique(blockers);
   return {
     candidateId: `hedge_put_${canonicalJsonHash({ option: option.optionSymbol, scenarioDeclinePct }).slice(0, 20)}`,
     rank: 0,
     instrumentType: "protective_put",
     symbol: option.optionSymbol,
     underlying: option.underlying,
-    executable: false,
+    executable: finalBlockers.length === 0 && units !== null && units > 0,
     expectedProtection:
       protectionPerContract === null || units === null
         ? null
         : roundMoney(protectionPerContract * units),
-    estimatedCost:
-      premiumPerContract === null || units === null
-        ? null
-        : roundMoney(premiumPerContract * units),
+    estimatedCost,
     units,
     rationale: [
       `Modeled at a ${scenarioDeclinePct}% ${option.underlying} decline.`,
       "Sized against modeled portfolio loss protection, not NAV allocation."
     ],
     warnings,
-    blockers: unique(blockers),
+    blockers: finalBlockers,
     details: {
       expirationDate: option.expirationDate,
       daysToExpiration: option.daysToExpiration,
       strikePrice: option.strikePrice,
       underlyingPrice: option.underlyingPrice,
       midpoint: option.midpoint,
+      bid: option.bid,
+      ask: option.ask,
       spreadPct,
       delta: option.delta,
+      theta: option.theta ?? null,
+      quoteTimestamp: option.quoteTimestamp ?? null,
+      snapshotTimestamp: option.snapshotTimestamp ?? null,
+      multiplier: option.multiplier ?? 100,
+      contractDeltaCoveragePct: option.contractDeltaCoveragePct ?? null,
+      marketValueDeltaCoveragePct: option.marketValueDeltaCoveragePct ?? null,
       premiumPerContract,
       terminalPayoffPerContract,
       protectionPerContract,
@@ -359,6 +392,82 @@ const emptySizing = (scenario: 5 | 8 | 10 | 15): HedgeSizingSummary => ({
   premiumBudget: 0,
   residualUnprotectedLoss: 0
 });
+
+export interface HedgeCandidateRankingInput {
+  options: OptionHedgeCandidateEvidence[];
+  netProtectionTarget: number;
+  premiumBudget: number;
+  accountEquity: number;
+  scenarioDeclinePct: number;
+  config: HedgeConfig;
+  asOf?: string;
+}
+
+const candidateRankingScore = (candidate: HedgeCandidate, config: HedgeConfig) => {
+  const details = candidate.details ?? {};
+  const protectionPerDollar =
+    (candidate.expectedProtection ?? 0) / Math.max(1, candidate.estimatedCost ?? 0);
+  const spreadPct = Number(details.spreadPct);
+  const spreadQuality = Number.isFinite(spreadPct)
+    ? Math.max(0, 1 - spreadPct / Math.max(0.01, config.executionPolicy.maxBidAskSpreadPct))
+    : 0;
+  const dte = Number(details.daysToExpiration);
+  const dteQuality = Number.isFinite(dte)
+    ? Math.max(
+        0,
+        1 - Math.abs(dte - config.executionPolicy.targetDte) /
+          Math.max(1, config.executionPolicy.maxDte - config.executionPolicy.minDte)
+      )
+    : 0;
+  const delta = Math.abs(Number(details.delta));
+  const targetDelta =
+    (config.executionPolicy.targetAbsDeltaMin + config.executionPolicy.targetAbsDeltaMax) / 2;
+  const deltaQuality = Number.isFinite(delta)
+    ? Math.max(0, 1 - Math.abs(delta - targetDelta) / Math.max(0.01, targetDelta))
+    : 0;
+  const thetaBurden = Math.abs(Number(details.theta) || 0);
+  return protectionPerDollar * 0.55 + spreadQuality * 0.2 + dteQuality * 0.15 +
+    deltaQuality * 0.08 - Math.min(1, thetaBurden) * 0.02;
+};
+
+export const rankHedgeCandidates = (
+  input: HedgeCandidateRankingInput
+): HedgeCandidate[] => {
+  const asOf = input.asOf ?? new Date().toISOString();
+  const eligibleOptions = input.options.filter((option) =>
+    input.config.executionPolicy.allowedUnderlyings.includes(option.underlying.toUpperCase()) &&
+    option.daysToExpiration >= input.config.executionPolicy.minDte &&
+    option.daysToExpiration <= input.config.executionPolicy.maxDte
+  );
+  const puts = eligibleOptions.map((option) => {
+    const candidate = protectivePutCandidate(
+      option,
+      input.netProtectionTarget,
+      Math.min(
+        input.premiumBudget,
+        Math.max(0, input.accountEquity * input.config.executionPolicy.maxNewHedgePremiumPctEquity)
+      ),
+      input.scenarioDeclinePct,
+      input.config
+    );
+    const timestamp = option.quoteTimestamp ?? option.snapshotTimestamp;
+    if (timestamp) {
+      const ageSeconds = (Date.parse(asOf) - Date.parse(timestamp)) / 1000;
+      if (!Number.isFinite(ageSeconds) || ageSeconds < 0 || ageSeconds > input.config.executionPolicy.limitPriceMaxAgeSeconds) {
+        return {
+          ...candidate,
+          executable: false,
+          blockers: unique([...candidate.blockers, "HEDGE_QUOTE_STALE"])
+        };
+      }
+    }
+    return candidate;
+  });
+  return puts
+    .sort((left, right) => candidateRankingScore(right, input.config) - candidateRankingScore(left, input.config))
+    .slice(0, input.config.executionPolicy.maxOrdersPerRun)
+    .map((candidate, index) => ({ ...candidate, rank: index + 1 }));
+};
 
 export const recommendHedgeFromEvidence = (
   risk: PortfolioRiskSnapshot,
@@ -475,33 +584,39 @@ export const recommendHedgeFromEvidence = (
     config
   );
   const navBudget = Math.max(0, risk.account.equity ?? 0) * config.premiumNavCap;
-  const premiumBudget = roundMoney(
+  const configuredPremiumBudget = roundMoney(
     leaps.profitFundedPremiumBudget > 0
       ? Math.min(leaps.profitFundedPremiumBudget, navBudget)
       : navBudget
   );
+  const equity = Math.max(0, risk.account.equity ?? 0);
+  const premiumBudget = roundMoney(
+    Math.min(
+      configuredPremiumBudget,
+      equity * config.executionPolicy.maxNewHedgePremiumPctEquity,
+      Math.max(
+        0,
+        equity * config.executionPolicy.maxTotalHedgePremiumPctEquity -
+          Math.max(0, evidence.existingHedgePremium ?? 0)
+      ),
+      Math.max(
+        0,
+        equity * config.executionPolicy.maxDailyHedgePremiumPctEquity -
+          Math.max(0, evidence.dailyHedgePremium ?? 0)
+      )
+    )
+  );
   let candidates: HedgeCandidate[] = [];
   if (netProtectionTarget > 0 && score.total >= 45) {
-    const puts = evidence.optionCandidates
-      .filter(
-        (option) =>
-          option.daysToExpiration >= config.optionHedge.minimumDte &&
-          option.daysToExpiration <= config.optionHedge.maximumDte
-      )
-      .map((option) =>
-        protectivePutCandidate(
-          option,
-          netProtectionTarget,
-          premiumBudget,
-          scenarioDeclinePct,
-          config
-        )
-      )
-      .sort((left, right) => {
-        const leftRatio = (left.expectedProtection ?? 0) / Math.max(1, left.estimatedCost ?? 0);
-        const rightRatio = (right.expectedProtection ?? 0) / Math.max(1, right.estimatedCost ?? 0);
-        return rightRatio - leftRatio;
-      });
+    const puts = rankHedgeCandidates({
+      options: evidence.optionCandidates,
+      netProtectionTarget,
+      premiumBudget,
+      accountEquity: equity,
+      scenarioDeclinePct,
+      config,
+      asOf: generatedAt
+    });
     candidates = [
       ...puts,
       ...putSpreadCandidates(
@@ -572,6 +687,10 @@ interface CandidateRow {
   delta: number | null;
   open_interest: number | null;
   volume: number | null;
+  theta: number | null;
+  quote_timestamp: string | null;
+  snapshot_timestamp: string | null;
+  multiplier: number | null;
 }
 
 const latestPrice = (symbol: string) =>
@@ -589,7 +708,8 @@ export const discoverHedgeRecommendationEvidence = (
   const rows = queryAll<CandidateRow>(
     `
     SELECT c.option_symbol, c.underlying_symbol, c.expiration_date, c.strike,
-           s.bid, s.ask, s.midpoint, s.delta, s.open_interest, s.volume
+           s.bid, s.ask, s.midpoint, s.delta, s.open_interest, s.volume,
+           s.theta, s.quote_timestamp, s.snapshot_timestamp, c.multiplier
     FROM option_contracts c
     LEFT JOIN option_snapshots s
       ON s.option_symbol = c.option_symbol
@@ -621,7 +741,11 @@ export const discoverHedgeRecommendationEvidence = (
       midpoint: row.midpoint,
       delta: row.delta,
       openInterest: row.open_interest,
-      volume: row.volume
+      volume: row.volume,
+      theta: row.theta,
+      quoteTimestamp: row.quote_timestamp,
+      snapshotTimestamp: row.snapshot_timestamp,
+      multiplier: row.multiplier
     }];
   });
   return {

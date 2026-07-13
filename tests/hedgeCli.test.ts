@@ -42,12 +42,20 @@ after(() => {
   rmSync(tempDir, { recursive: true, force: true });
 });
 
-test("package exposes only the four read-only hedge scripts", () => {
+test("package exposes the read-only hedge scripts and guarded paper executor", () => {
   assert.equal(packageJson.scripts["hedge:risk"], "tsx src/cli.ts hedge:risk");
   assert.equal(packageJson.scripts["hedge:regime"], "tsx src/cli.ts hedge:regime");
   assert.equal(packageJson.scripts["hedge:review"], "tsx src/cli.ts hedge:review");
   assert.equal(packageJson.scripts["hedge:plan"], "tsx src/cli.ts hedge:plan");
-  assert.equal(packageJson.scripts["hedge:execute"], undefined);
+  assert.equal(packageJson.scripts["hedge:execute"], "tsx src/cli.ts hedge:execute");
+});
+
+test("hedge execute fails closed before broker access when the paper flag is disabled", () => {
+  const result = runHedgeCli("hedge:execute", ["--confirmPaper", "--reviewId=missing", "--format=json"]);
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.json?.status, "blocked");
+  assert.ok((result.json?.blockers as string[]).includes("HEDGE_EXECUTION_DISABLED"));
 });
 
 test("hedge plan requires explicit paperOnly before account work", () => {

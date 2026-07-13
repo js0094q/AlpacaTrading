@@ -25,7 +25,7 @@
 - Paper monitor behavior:
   - Exit review now evaluates LEAPS positions through the existing `optionSellToCloseExits` reviewed section; no separate LEAPS timer or execution command is required.
   - Reviewed LEAPS sell-to-close execution fails closed unless paper runtime, live-off, paper execution, paper options execution, automated execution, and `--confirmPaper` gates are all satisfied.
-  - Existing paper-ops review moments may refresh hedge recommendations, but no hedge order section, execution command, or timer exists.
+  - Existing paper-ops review moments may refresh hedge recommendations; authenticated hedge review/entry/exit routes are bounded by the VPS control allowlist and paper-only gates.
 - Security/hardening posture:
   - SSH key-only hardening is in place; password auth is disabled.
   - Root key recovery remains intentionally preserved until explicitly disabled.
@@ -53,7 +53,7 @@
 ## Do-not-break requirements
 
 - Preserve paper-only guardrails (`ALPACA_ENV=paper`, `LIVE_TRADING_ENABLED=false`) on all runs.
-- Keep `HEDGE_PAPER_EXECUTION_ENABLED=false`; hedge plans remain signed, expiring, and non-executable.
+- Keep `HEDGE_LIVE_EXECUTION_ENABLED=false` and `MULTI_LEG_HEDGE_EXECUTION_ENABLED=false`; hedge plans remain signed and expiring, while the separate reviewed executor is paper-only and single-leg.
 - Keep paper execution operationally enabled only through the guarded paper path (`PAPER_ORDER_EXECUTION_ENABLED=true`, `PAPER_OPTIONS_EXECUTION_ENABLED=true`, valid control/admin auth, and CLI `--confirmPaper`).
 - Continuous paper monitor timers are installed with `scripts/install-paper-monitoring-systemd.sh`; they use `npm run paper:monitor`, reviewed payload artifacts, section filters, market-hours no-ops, and per-task locks.
 - Do not add direct shell command execution in dashboard actions; keep allowlisted control endpoints only.

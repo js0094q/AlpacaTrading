@@ -50,6 +50,7 @@ const configureBridgeRuntime = () => {
   process.env.PAPER_ORDER_EXECUTION_ENABLED = "false";
   process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "false";
   process.env.AUTOMATED_PAPER_EXECUTION_ENABLED = "false";
+  process.env.HEDGE_DASHBOARD_MUTATIONS_ENABLED = "false";
   process.env.ALPACA_PAPER_BASE_URL = "https://paper-api.alpaca.markets";
   process.env.VPS_CONTROL_BASE_URL = "https://vps.internal:4100";
   process.env.DASHBOARD_CONTROL_BASE_URL = "https://legacy-vps.example.com:4100";
@@ -95,6 +96,7 @@ afterEach(() => {
   deleteEnv("VPS_CONTROL_BASE_URL");
   deleteEnv("VPS_CONTROL_TOKEN");
   deleteEnv("DASHBOARD_ADMIN_TOKEN");
+  deleteEnv("HEDGE_DASHBOARD_MUTATIONS_ENABLED");
   globalThis.fetch = originalFetch;
 });
 
@@ -103,6 +105,61 @@ after(() => {
 });
 
 describe("Vercel dashboard VPS bridge mode", () => {
+  test("hedge risk GET preserves the complete cached Greek payload", async () => {
+    const riskPayload = {
+      paperOnly: true,
+      environment: "paper",
+      liveTradingEnabled: false,
+      effectiveStatus: "current",
+      warnings: ["NESTED_RISK_WARNING"],
+      blockers: ["NESTED_RISK_BLOCKER"],
+      risk: {
+        options: {
+          deltaShares: 60,
+          deltaDollars: 36000,
+          gammaSharesPerDollar: 2,
+          thetaDollarsPerDay: -20,
+          vegaDollarsPerVolPoint: 80,
+          rhoDollarsPerRatePoint: 10,
+          impliedVolatility: {
+            weightedByAbsoluteContracts: 0.3,
+            weightedByAbsoluteMarketValue: 0.32,
+            weightedByAbsoluteVega: 0.35
+          },
+          coverage: {
+            delta: {
+              absoluteContracts: { coverageRatio: 1 },
+              absoluteMarketValue: { coverageRatio: 1 },
+              freshness: { current: 1, stale: 0, expired: 0, malformed: 0, total: 1 }
+            }
+          },
+          freshness: { current: 1, stale: 0, expired: 0, malformed: 0, total: 1 },
+          groupings: {
+            byUnderlying: { SPY: { deltaDollars: 36000, quality: "complete" } },
+            byExpiration: {},
+            byOptionType: {},
+            byDteBucket: {}
+          }
+        },
+        warnings: ["NESTED_RISK_WARNING"],
+        blockers: ["NESTED_RISK_BLOCKER"]
+      }
+    };
+    setMockFetchResponse({ ok: true, data: riskPayload });
+
+    const { GET } = await importRoute<{
+      GET: (request: Request) => Promise<Response> | Response;
+    }>("apps/dashboard/app/api/paper/hedge/risk/route.ts");
+    const response = await GET(new Request("http://localhost/api/paper/hedge/risk"));
+    const payload = await response.json() as { ok: true; data: typeof riskPayload };
+
+    assert.equal(response.status, 200);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, "https://vps.internal:4100/api/v1/hedge/risk");
+    assert.equal(calls[0].init.method, "GET");
+    assert.deepEqual(payload.data, riskPayload);
+  });
+
   test("summary route forwards using control token", async () => {
     setMockFetchResponse({ ok: true, data: { hello: "bridge summary" }, mode: "vercel-read-only" });
 
@@ -286,6 +343,55 @@ describe("Vercel dashboard VPS bridge mode", () => {
     assert.equal(calls[0].url, "https://vps.internal:4100/api/v1/actions/options/discover");
     assert.equal(headerValue(calls[0].init.headers, "authorization"), "Bearer bridge-secret");
     assert.equal(headerValue(calls[0].init.headers, "x-correlation-id"), "client-options-action");
+  });
+
+  test("authenticated hedge review route proxies to the fixed VPS hedge path", async () => {
+    process.env.HEDGE_DASHBOARD_MUTATIONS_ENABLED = "true";
+    setMockFetchResponse({ ok: true, action: "hedge.review", data: { status: "current" } });
+
+    const { POST } = await importRoute<{
+      POST: (request: Request) => Promise<Response> | Response;
+    }>("apps/dashboard/app/api/paper/hedge/review/route.ts");
+    const response = await POST(new Request("http://localhost/api/paper/hedge/review", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer dashboard-admin-secret",
+        "x-correlation-id": "hedge-review-correlation"
+      },
+      body: JSON.stringify({})
+    }));
+
+    assert.equal(response.status, 200);
+    assert.equal(calls[0].url, "https://vps.internal:4100/api/v1/hedge/review");
+    assert.equal(calls[0].init.method, "POST");
+    assert.equal(headerValue(calls[0].init.headers, "x-correlation-id"), "hedge-review-correlation");
+  });
+
+  test("hedge execution route requires paper confirmation and both paper option flags", async () => {
+    process.env.HEDGE_DASHBOARD_MUTATIONS_ENABLED = "true";
+    process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
+    process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
+    setMockFetchResponse({ ok: true, action: "hedge.execute", data: { status: "blocked" } });
+
+    const { POST } = await importRoute<{
+      POST: (request: Request) => Promise<Response> | Response;
+    }>("apps/dashboard/app/api/paper/hedge/execute/route.ts");
+    const response = await POST(new Request("http://localhost/api/paper/hedge/execute", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer dashboard-admin-secret"
+      },
+      body: JSON.stringify({ reviewId: "hedge-review-1", confirmPaper: true })
+    }));
+
+    assert.equal(response.status, 200);
+    assert.equal(calls[0].url, "https://vps.internal:4100/api/v1/hedge/execute");
+    assert.equal(calls[0].init.method, "POST");
+    const body = JSON.parse(String(calls[0].init.body)) as { reviewId: string; confirmPaper: boolean };
+    assert.equal(body.reviewId, "hedge-review-1");
+    assert.equal(body.confirmPaper, true);
   });
 
   test("bridge preserves structured VPS safety guard responses", async () => {

@@ -12,6 +12,7 @@ type ActionConfig = {
   requiresReviewedPayloads?: boolean;
   confirmMessage?: string;
   warning?: string;
+  requiresReviewId?: boolean;
   payload?: Record<string, unknown>;
 };
 
@@ -54,6 +55,40 @@ const actions: ActionConfig[] = [
     warning: "Paper-mutating action",
     confirmMessage:
       "Execute latest reviewed payloads in the Alpaca PAPER account only? This requires confirmPaper and will not run live orders.",
+    payload: {
+      confirmPaper: true
+    }
+  },
+  {
+    label: "Review Paper Hedge",
+    description: "Creates the current signed, expiring paper hedge review through the guarded VPS route.",
+    path: "/api/paper/hedge/review"
+  },
+  {
+    label: "Execute Reviewed Paper Hedge",
+    description: "Paper account only. Requires a reviewed hedge ID and explicit confirmation.",
+    path: "/api/paper/hedge/execute",
+    submit: true,
+    requiresReviewId: true,
+    warning: "Paper-mutating hedge action",
+    confirmMessage: "Execute this reviewed long-put hedge in the Alpaca PAPER account only?",
+    payload: {
+      confirmPaper: true
+    }
+  },
+  {
+    label: "Review Paper Hedge Exit",
+    description: "Evaluates a held long-put hedge for profit, loss, DTE, stale-thesis, or risk-normalization exit.",
+    path: "/api/paper/hedge/exit/review"
+  },
+  {
+    label: "Execute Reviewed Hedge Exit",
+    description: "Paper account only. Requires a reviewed sell-to-close hedge exit ID.",
+    path: "/api/paper/hedge/exit/execute",
+    submit: true,
+    requiresReviewId: true,
+    warning: "Paper-mutating hedge exit",
+    confirmMessage: "Execute this reviewed hedge sell-to-close exit in the Alpaca PAPER account only?",
     payload: {
       confirmPaper: true
     }
@@ -303,6 +338,14 @@ export function ActionPanel({ readOnly = false }: { readOnly?: boolean }) {
       return;
     }
 
+    const reviewId = action.requiresReviewId
+      ? window.prompt("Enter the persisted hedge review ID:")?.trim()
+      : undefined;
+    if (action.requiresReviewId && !reviewId) {
+      setStatus("A persisted hedge review ID is required.");
+      return;
+    }
+
     if (action.submit && action.confirmMessage && !window.confirm(action.confirmMessage)) {
       setStatus("Action cancelled.");
       return;
@@ -323,7 +366,8 @@ export function ActionPanel({ readOnly = false }: { readOnly?: boolean }) {
       optionsEnabled: true,
       maxCandidates: 10,
       assetClass: "all",
-      ...(action.payload || {})
+      ...(action.payload || {}),
+      ...(reviewId ? { reviewId } : {})
     };
 
     try {

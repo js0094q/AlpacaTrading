@@ -9,6 +9,7 @@ import {
   type OptionChainFilters,
   type OptionContractRaw
 } from "./providers/alpaca.js";
+import { normalizeOptionSnapshot } from "./optionSnapshotNormalizer.js";
 
 interface OptionsDiagnosticInput {
   underlyings?: string[];
@@ -208,13 +209,16 @@ const quoteAvailability = async (symbols: string[]): Promise<QuoteAvailabilityRe
         const normalized = normalizeSymbol(symbol);
         const quote = quotesBySymbol.get(normalized);
         const snapshot = snapshotsBySymbol.get(normalized);
+        const canonical = normalizeOptionSnapshot(normalized, snapshot ?? {}, {
+          latestQuote: quote
+        });
         return {
           symbol: normalized,
-          latestQuoteAvailable: Boolean(quote),
+          latestQuoteAvailable: canonical.latestQuote !== null,
           snapshotAvailable: Boolean(snapshot),
-          bid: quote?.bp ?? quote?.b ?? snapshot?.latest_quote?.bp ?? snapshot?.latest_quote?.b ?? null,
-          ask: quote?.ap ?? quote?.a ?? snapshot?.latest_quote?.ap ?? snapshot?.latest_quote?.a ?? null,
-          quoteTimestamp: quote?.t ?? snapshot?.latest_quote?.t ?? snapshot?.latest_trade?.t ?? null
+          bid: canonical.latestQuote?.bidPrice ?? null,
+          ask: canonical.latestQuote?.askPrice ?? null,
+          quoteTimestamp: canonical.latestQuote?.timestamp ?? null
         };
       }),
       error: null

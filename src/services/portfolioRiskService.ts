@@ -1,5 +1,4 @@
 import { canonicalJsonHash } from "../lib/canonicalJson.js";
-import { queryOne } from "../lib/db.js";
 import type { AlpacaAccountSnapshot } from "./alpacaAccountService.js";
 import { getAlpacaAccountSnapshot } from "./alpacaAccountService.js";
 import type { AlpacaPositionSnapshot } from "./alpacaPositionService.js";
@@ -15,20 +14,41 @@ import {
 } from "./hedgePersistenceService.js";
 import type { HedgeDataQualityStatus } from "./hedgeTypes.js";
 import { optionDaysToExpiration, parseOptionSymbol } from "./optionSymbolService.js";
+import {
+  readOptionRiskEvidence,
+  readUnderlyingPriceEvidence,
+  type OptionRiskEvidence as CanonicalOptionRiskEvidence,
+  type UnderlyingPriceEvidence
+} from "./portfolioRiskEvidenceService.js";
 import { portfolioBetasForSymbols } from "./portfolioBetaService.js";
 import { getTradingSafetyState } from "./tradingSafetyService.js";
 
-export interface OptionRiskEvidence {
-  multiplier: number | null;
-  delta: number | null;
-  gamma: number | null;
-  theta: number | null;
-  vega: number | null;
-  rho: number | null;
-  bid: number | null;
-  ask: number | null;
-  midpoint: number | null;
-  quoteTimestamp: string | null;
+export interface OptionRiskEvidence
+  extends Pick<
+    CanonicalOptionRiskEvidence,
+    | "multiplier"
+    | "delta"
+    | "gamma"
+    | "theta"
+    | "vega"
+    | "rho"
+    | "bid"
+    | "ask"
+    | "midpoint"
+    | "quoteTimestamp"
+  > {
+  symbol?: string;
+  underlying?: string;
+  expirationDate?: string;
+  strikePrice?: number;
+  optionType?: "call" | "put";
+  impliedVolatility?: number | null;
+  snapshotTimestamp?: string | null;
+  quoteStatus?: string | null;
+  source?: string | null;
+  normalizationPath?: CanonicalOptionRiskEvidence["normalizationPath"];
+  bidSize?: number | null;
+  askSize?: number | null;
 }
 
 export interface PositionBetaEvidence {
@@ -40,6 +60,7 @@ export interface PositionBetaEvidence {
 export interface PortfolioRiskEvidence {
   optionEvidence: Record<string, OptionRiskEvidence>;
   underlyingPrices: Record<string, number | null>;
+  underlyingPriceTimestamps?: Record<string, string | null>;
   betas: Record<string, PositionBetaEvidence>;
   highWaterMark: number | null;
   warnings?: string[];
@@ -73,14 +94,26 @@ export interface NormalizedRiskPosition {
   moneynessPct: number | null;
   deltaEquivalentShares: number | null;
   deltaAdjustedExposure: number | null;
+  deltaShares?: number | null;
+  deltaDollars?: number | null;
   betaExposure: number | null;
   gammaExposure: number | null;
   thetaExposure: number | null;
   vegaExposure: number | null;
   rhoExposure: number | null;
+  gammaSharesPerDollar?: number | null;
+  thetaDollarsPerDay?: number | null;
+  vegaDollarsPerVolPoint?: number | null;
+  rhoDollarsPerRatePoint?: number | null;
+  impliedVolatility?: number | null;
+  greekObservationTimestamp?: string | null;
+  greekObservationFreshness?: ObservationFreshness;
+  underlyingPriceTimestamp?: string | null;
   bid: number | null;
   ask: number | null;
   midpoint: number | null;
+  bidSize?: number | null;
+  askSize?: number | null;
   bidAskSpreadPct: number | null;
   quoteTimestamp: string | null;
   inverseExposure: boolean;
@@ -108,6 +141,66 @@ export interface OptionDataCoverage {
   optionMarketValueWithoutDelta: number;
   marketValueDeltaCoveragePct: number | null;
   materialCoverageMissing: boolean;
+}
+
+export type OptionMetric =
+  | "delta"
+  | "gamma"
+  | "theta"
+  | "vega"
+  | "rho"
+  | "impliedVolatility";
+
+export type ObservationFreshness = "current" | "stale" | "expired" | "malformed";
+
+export interface FreshnessCounts {
+  current: number;
+  stale: number;
+  expired: number;
+  malformed: number;
+  total: number;
+}
+
+export interface CoverageBasis {
+  total: number | null;
+  measured: number | null;
+  unmeasured: number | null;
+  coverageRatio: number | null;
+}
+
+export interface OptionMetricCoverage {
+  positions: CoverageBasis;
+  absoluteContracts: CoverageBasis;
+  absoluteMarketValue: CoverageBasis;
+  freshness: FreshnessCounts;
+}
+
+export interface WeightedImpliedVolatility {
+  weightedByAbsoluteContracts: number | null;
+  weightedByAbsoluteMarketValue: number | null;
+  weightedByAbsoluteVega: number | null;
+}
+
+export interface OptionGreekGroup {
+  positionCount: number;
+  absoluteContracts: number | null;
+  absoluteMarketValue: number | null;
+  deltaShares: number | null;
+  deltaDollars: number | null;
+  gammaSharesPerDollar: number | null;
+  thetaDollarsPerDay: number | null;
+  vegaDollarsPerVolPoint: number | null;
+  rhoDollarsPerRatePoint: number | null;
+  impliedVolatility: WeightedImpliedVolatility;
+  quality: "complete" | "incomplete";
+  missingMetrics: OptionMetric[];
+}
+
+export interface OptionGreekGroupings {
+  byUnderlying: Record<string, OptionGreekGroup>;
+  byExpiration: Record<string, OptionGreekGroup>;
+  byOptionType: Record<string, OptionGreekGroup>;
+  byDteBucket: Record<string, OptionGreekGroup>;
 }
 
 export interface PortfolioRiskSnapshot {
@@ -145,6 +238,25 @@ export interface PortfolioRiskSnapshot {
     vegaExposure: number | null;
     rhoExposure: number | null;
     nearTermExposurePct: number | null;
+    deltaShares?: number | null;
+    deltaDollars?: number | null;
+    absoluteDeltaShares?: number | null;
+    absoluteDeltaDollars?: number | null;
+    gammaSharesPerDollar?: number | null;
+    absoluteGammaSharesPerDollar?: number | null;
+    thetaDollarsPerDay?: number | null;
+    absoluteThetaDollarsPerDay?: number | null;
+    positiveThetaDollarsPerDay?: number | null;
+    negativeThetaDollarsPerDay?: number | null;
+    vegaDollarsPerVolPoint?: number | null;
+    absoluteVegaDollarsPerVolPoint?: number | null;
+    rhoDollarsPerRatePoint?: number | null;
+    absoluteRhoDollarsPerRatePoint?: number | null;
+    impliedVolatility?: WeightedImpliedVolatility;
+    coverage?: Record<OptionMetric, OptionMetricCoverage>;
+    freshness?: FreshnessCounts;
+    groupings?: OptionGreekGroupings;
+    executionEligible?: boolean;
   };
   concentration: {
     largestUnderlyingWeight: number | null;
@@ -218,6 +330,230 @@ const aggregateObserved = (
   return observed.reduce<number>((sum, value) => sum + (value ?? 0), 0);
 };
 
+const aggregateNullable = (
+  positions: NormalizedRiskPosition[],
+  field:
+    | "deltaShares"
+    | "deltaDollars"
+    | "gammaSharesPerDollar"
+    | "thetaDollarsPerDay"
+    | "vegaDollarsPerVolPoint"
+    | "rhoDollarsPerRatePoint"
+) => {
+  if (!positions.length) return 0;
+  const values = positions.map((position) => position[field] ?? null);
+  if (values.some((value) => value === null)) return null;
+  return values.reduce<number>((sum, value) => sum + (value ?? 0), 0);
+};
+
+const aggregateAbsoluteNullable = (
+  positions: NormalizedRiskPosition[],
+  field:
+    | "gammaSharesPerDollar"
+    | "thetaDollarsPerDay"
+    | "vegaDollarsPerVolPoint"
+    | "rhoDollarsPerRatePoint"
+) => {
+  if (!positions.length) return 0;
+  const values = positions.map((position) => position[field] ?? null);
+  if (values.some((value) => value === null)) return null;
+  return values.reduce<number>((sum, value) => sum + Math.abs(value ?? 0), 0);
+};
+
+const emptyFreshnessCounts = (): FreshnessCounts => ({
+  current: 0,
+  stale: 0,
+  expired: 0,
+  malformed: 0,
+  total: 0
+});
+
+const observationFreshness = (
+  timestamp: string | null | undefined,
+  asOf: string,
+  config: HedgeConfig
+): ObservationFreshness => {
+  if (!timestamp) return "malformed";
+  const observedAt = Date.parse(timestamp);
+  const currentTime = Date.parse(asOf);
+  if (!Number.isFinite(observedAt) || !Number.isFinite(currentTime) || observedAt > currentTime) {
+    return "malformed";
+  }
+  const ageSeconds = (currentTime - observedAt) / 1000;
+  if (ageSeconds <= config.optionGreeksFreshness.currentMaxAgeSeconds) return "current";
+  if (ageSeconds <= config.optionGreeksFreshness.staleMaxAgeSeconds) return "stale";
+  return "expired";
+};
+
+const metricValue = (position: NormalizedRiskPosition, metric: OptionMetric) =>
+  metric === "impliedVolatility" ? position.impliedVolatility ?? null : position[metric];
+
+const coverageBasis = (
+  total: number | null,
+  measured: number | null
+): CoverageBasis => ({
+  total,
+  measured,
+  unmeasured: total === null || measured === null ? null : Math.max(0, total - measured),
+  coverageRatio:
+    total !== null && measured !== null && total > 0 ? measured / total : null
+});
+
+const metricCoverage = (
+  positions: NormalizedRiskPosition[],
+  metric: OptionMetric
+): OptionMetricCoverage => {
+  const measuredPositions = positions.filter((position) => metricValue(position, metric) !== null);
+  const quantityComplete = positions.every((position) => position.quantity !== null);
+  const marketValueComplete = positions.every((position) => position.marketValue !== null);
+  const totalContracts = quantityComplete
+    ? positions.reduce((sum, position) => sum + Math.abs(position.quantity ?? 0), 0)
+    : null;
+  const measuredContracts = quantityComplete
+    ? measuredPositions.reduce((sum, position) => sum + Math.abs(position.quantity ?? 0), 0)
+    : null;
+  const totalMarketValue = marketValueComplete
+    ? positions.reduce((sum, position) => sum + Math.abs(position.marketValue ?? 0), 0)
+    : null;
+  const measuredMarketValue = marketValueComplete
+    ? measuredPositions.reduce((sum, position) => sum + Math.abs(position.marketValue ?? 0), 0)
+    : null;
+  const freshness = measuredPositions.reduce((counts, position) => {
+    const status = position.greekObservationFreshness ?? "malformed";
+    counts[status] += 1;
+    counts.total += 1;
+    return counts;
+  }, emptyFreshnessCounts());
+  return {
+    positions: coverageBasis(positions.length, measuredPositions.length),
+    absoluteContracts: coverageBasis(totalContracts, measuredContracts),
+    absoluteMarketValue: coverageBasis(totalMarketValue, measuredMarketValue),
+    freshness
+  };
+};
+
+const weightedImpliedVolatility = (
+  positions: NormalizedRiskPosition[]
+): WeightedImpliedVolatility => {
+  const weighted = (weight: (position: NormalizedRiskPosition) => number | null) => {
+    const observations = positions
+      .map((position) => ({ value: position.impliedVolatility ?? null, weight: weight(position) }))
+      .filter(
+        (entry): entry is { value: number; weight: number } =>
+          entry.value !== null && entry.weight !== null && entry.weight > 0
+      );
+    const denominator = observations.reduce((sum, entry) => sum + entry.weight, 0);
+    return denominator > 0
+      ? observations.reduce((sum, entry) => sum + entry.value * entry.weight, 0) / denominator
+      : null;
+  };
+  return {
+    weightedByAbsoluteContracts: weighted((position) =>
+      position.quantity === null ? null : Math.abs(position.quantity)
+    ),
+    weightedByAbsoluteMarketValue: weighted((position) =>
+      position.marketValue === null ? null : Math.abs(position.marketValue)
+    ),
+    weightedByAbsoluteVega: weighted((position) =>
+      position.vegaDollarsPerVolPoint === null ||
+      position.vegaDollarsPerVolPoint === undefined
+        ? null
+        : Math.abs(position.vegaDollarsPerVolPoint)
+    )
+  };
+};
+
+const dteBucket = (daysToExpiration: number | null) => {
+  if (daysToExpiration === null) return "unknown";
+  if (daysToExpiration < 0) return "expired";
+  if (daysToExpiration <= 30) return "0-30";
+  if (daysToExpiration <= 60) return "31-60";
+  if (daysToExpiration <= 90) return "61-90";
+  if (daysToExpiration <= 180) return "91-180";
+  if (daysToExpiration <= 365) return "181-365";
+  return "366+";
+};
+
+const greekGroup = (positions: NormalizedRiskPosition[]): OptionGreekGroup => {
+  const missingMetrics = ([
+    "delta",
+    "gamma",
+    "theta",
+    "vega",
+    "rho",
+    "impliedVolatility"
+  ] as const).filter((metric) => positions.some((position) => {
+    if (metric === "delta") {
+      return (
+        position.delta === null ||
+        position.deltaShares === null ||
+        position.deltaShares === undefined ||
+        position.deltaDollars === null ||
+        position.deltaDollars === undefined
+      );
+    }
+    if (metric === "gamma") {
+      return position.gammaSharesPerDollar === null || position.gammaSharesPerDollar === undefined;
+    }
+    if (metric === "theta") {
+      return position.thetaDollarsPerDay === null || position.thetaDollarsPerDay === undefined;
+    }
+    if (metric === "vega") {
+      return (
+        position.vegaDollarsPerVolPoint === null ||
+        position.vegaDollarsPerVolPoint === undefined
+      );
+    }
+    if (metric === "rho") {
+      return (
+        position.rhoDollarsPerRatePoint === null ||
+        position.rhoDollarsPerRatePoint === undefined
+      );
+    }
+    return position.impliedVolatility === null || position.impliedVolatility === undefined;
+  }));
+  const quantityComplete = positions.every((position) => position.quantity !== null);
+  const marketValueComplete = positions.every((position) => position.marketValue !== null);
+  const currentEvidence = positions.every(
+    (position) => position.greekObservationFreshness === "current"
+  );
+  return {
+    positionCount: positions.length,
+    absoluteContracts: quantityComplete
+      ? positions.reduce((sum, position) => sum + Math.abs(position.quantity ?? 0), 0)
+      : null,
+    absoluteMarketValue: marketValueComplete
+      ? positions.reduce((sum, position) => sum + Math.abs(position.marketValue ?? 0), 0)
+      : null,
+    deltaShares: aggregateNullable(positions, "deltaShares"),
+    deltaDollars: aggregateNullable(positions, "deltaDollars"),
+    gammaSharesPerDollar: aggregateNullable(positions, "gammaSharesPerDollar"),
+    thetaDollarsPerDay: aggregateNullable(positions, "thetaDollarsPerDay"),
+    vegaDollarsPerVolPoint: aggregateNullable(positions, "vegaDollarsPerVolPoint"),
+    rhoDollarsPerRatePoint: aggregateNullable(positions, "rhoDollarsPerRatePoint"),
+    impliedVolatility: weightedImpliedVolatility(positions),
+    quality:
+      !missingMetrics.length && quantityComplete && marketValueComplete && currentEvidence
+        ? "complete"
+        : "incomplete",
+    missingMetrics: [...missingMetrics]
+  };
+};
+
+const groupBy = (
+  positions: NormalizedRiskPosition[],
+  keyFor: (position: NormalizedRiskPosition) => string
+) => {
+  const groups: Record<string, NormalizedRiskPosition[]> = {};
+  for (const position of positions) {
+    const key = keyFor(position);
+    (groups[key] ??= []).push(position);
+  }
+  return Object.fromEntries(
+    Object.entries(groups).map(([key, groupPositions]) => [key, greekGroup(groupPositions)])
+  );
+};
+
 export const normalizePortfolioEvidence = (
   accountInput: AlpacaAccountSnapshot,
   positionInputs: AlpacaPositionSnapshot[],
@@ -237,7 +573,7 @@ export const normalizePortfolioEvidence = (
     let marketValue = signedMarketValue(position);
     const warnings: string[] = [];
     const blockers: string[] = [];
-    if (marketValue === null && quantity !== null && currentPrice !== null) {
+    if (!isOption && marketValue === null && quantity !== null && currentPrice !== null) {
       marketValue = quantity * currentPrice;
       warnings.push("MARKET_VALUE_DERIVED_FROM_OBSERVED_PRICE");
     }
@@ -248,22 +584,45 @@ export const normalizePortfolioEvidence = (
     if (isOption && !parsed.ok) {
       warnings.push("OPTION_SYMBOL_PARSE_FAILED");
     }
+    const observedUnderlyingPrice = numberOrNull(evidence.underlyingPrices[underlying]);
     const underlyingPrice =
-      evidence.underlyingPrices[underlying] ?? (!isOption ? currentPrice : null);
-    const multiplier = isOption ? optionEvidence?.multiplier ?? null : null;
-    const delta = isOption ? optionEvidence?.delta ?? null : null;
-    const gamma = isOption ? optionEvidence?.gamma ?? null : null;
-    const theta = isOption ? optionEvidence?.theta ?? null : null;
-    const vega = isOption ? optionEvidence?.vega ?? null : null;
-    const rho = isOption ? optionEvidence?.rho ?? null : null;
+      observedUnderlyingPrice ?? (!isOption ? currentPrice : null);
+    const multiplier = isOption ? numberOrNull(optionEvidence?.multiplier) : null;
+    const delta = isOption ? numberOrNull(optionEvidence?.delta) : null;
+    const gamma = isOption ? numberOrNull(optionEvidence?.gamma) : null;
+    const theta = isOption ? numberOrNull(optionEvidence?.theta) : null;
+    const vega = isOption ? numberOrNull(optionEvidence?.vega) : null;
+    const rho = isOption ? numberOrNull(optionEvidence?.rho) : null;
+    const impliedVolatility = isOption
+      ? numberOrNull(optionEvidence?.impliedVolatility)
+      : null;
+    const greekObservationTimestamp = isOption
+      ? optionEvidence?.snapshotTimestamp ?? null
+      : null;
+    const greekObservationFreshness = isOption
+      ? observationFreshness(greekObservationTimestamp, asOf, config)
+      : undefined;
     if (isOption && delta === null) warnings.push("OPTION_DELTA_UNAVAILABLE");
+    if (isOption && multiplier === null) warnings.push("OPTION_MULTIPLIER_UNAVAILABLE");
     if (isOption && gamma === null) warnings.push("OPTION_GAMMA_UNAVAILABLE");
     if (isOption && theta === null) warnings.push("OPTION_THETA_UNAVAILABLE");
     if (isOption && vega === null) warnings.push("OPTION_VEGA_UNAVAILABLE");
+    if (isOption && rho === null) warnings.push("OPTION_RHO_UNAVAILABLE");
+    if (isOption && impliedVolatility === null) {
+      warnings.push("OPTION_IMPLIED_VOLATILITY_UNAVAILABLE");
+    }
+    if (isOption && greekObservationFreshness !== "current") {
+      warnings.push(`OPTION_GREEKS_${String(greekObservationFreshness).toUpperCase()}`);
+    }
+    if (isOption && greekObservationFreshness === "stale") {
+      warnings.push("HEDGE_GREEKS_STALE");
+    }
     if (underlyingPrice === null) warnings.push("UNDERLYING_PRICE_UNAVAILABLE");
     if (marketValue === null) warnings.push("POSITION_PRICE_UNAVAILABLE");
+    const usableGreekObservation =
+      greekObservationFreshness === "current" || greekObservationFreshness === "stale";
     const deltaEquivalentShares =
-      isOption && quantity !== null && multiplier !== null && delta !== null
+      isOption && usableGreekObservation && quantity !== null && multiplier !== null && delta !== null
         ? quantity * multiplier * delta
         : null;
     const deltaAdjustedExposure = isOption
@@ -272,37 +631,39 @@ export const normalizePortfolioEvidence = (
         : null
       : marketValue;
     const betaEvidence = evidence.betas[underlying];
-    const beta = betaEvidence?.beta ?? null;
+    const beta = numberOrNull(betaEvidence?.beta);
     if (beta === null && deltaAdjustedExposure !== null && deltaAdjustedExposure !== 0) {
       warnings.push("POSITION_BETA_UNAVAILABLE");
     }
     const gammaExposure =
-      isOption && quantity !== null && multiplier !== null && gamma !== null
+      isOption && usableGreekObservation && quantity !== null && multiplier !== null && gamma !== null
         ? quantity * multiplier * gamma
         : isOption
           ? null
           : 0;
     const thetaExposure =
-      isOption && quantity !== null && multiplier !== null && theta !== null
+      isOption && usableGreekObservation && quantity !== null && multiplier !== null && theta !== null
         ? quantity * multiplier * theta
         : isOption
           ? null
           : 0;
     const vegaExposure =
-      isOption && quantity !== null && multiplier !== null && vega !== null
+      isOption && usableGreekObservation && quantity !== null && multiplier !== null && vega !== null
         ? quantity * multiplier * vega
         : isOption
           ? null
           : 0;
     const rhoExposure =
-      isOption && quantity !== null && multiplier !== null && rho !== null
+      isOption && usableGreekObservation && quantity !== null && multiplier !== null && rho !== null
         ? quantity * multiplier * rho
         : isOption
           ? null
           : 0;
-    const bid = optionEvidence?.bid ?? null;
-    const ask = optionEvidence?.ask ?? null;
-    const midpoint = optionEvidence?.midpoint ?? null;
+    const bid = numberOrNull(optionEvidence?.bid);
+    const ask = numberOrNull(optionEvidence?.ask);
+    const midpoint = numberOrNull(optionEvidence?.midpoint);
+    const bidSize = numberOrNull(optionEvidence?.bidSize);
+    const askSize = numberOrNull(optionEvidence?.askSize);
     const bidAskSpreadPct =
       bid !== null && ask !== null && midpoint !== null && midpoint > 0 && ask >= bid
         ? (ask - bid) / midpoint
@@ -341,6 +702,8 @@ export const normalizePortfolioEvidence = (
           : null,
       deltaEquivalentShares,
       deltaAdjustedExposure,
+      deltaShares: deltaEquivalentShares,
+      deltaDollars: isOption ? deltaAdjustedExposure : null,
       betaExposure:
         deltaAdjustedExposure !== null && beta !== null
           ? deltaAdjustedExposure * beta
@@ -349,9 +712,20 @@ export const normalizePortfolioEvidence = (
       thetaExposure,
       vegaExposure,
       rhoExposure,
+      gammaSharesPerDollar: isOption ? gammaExposure : null,
+      thetaDollarsPerDay: isOption ? thetaExposure : null,
+      vegaDollarsPerVolPoint: isOption ? vegaExposure : null,
+      rhoDollarsPerRatePoint: isOption ? rhoExposure : null,
+      impliedVolatility,
+      greekObservationTimestamp,
+      greekObservationFreshness,
+      underlyingPriceTimestamp:
+        evidence.underlyingPriceTimestamps?.[underlying] ?? null,
       bid,
       ask,
       midpoint,
+      bidSize,
+      askSize,
       bidAskSpreadPct,
       quoteTimestamp: optionEvidence?.quoteTimestamp ?? null,
       inverseExposure: underlying === "SH" || underlying === "PSQ",
@@ -371,6 +745,23 @@ export const normalizePortfolioEvidence = (
     0
   );
   const optionPositions = normalizedPositions.filter((position) => position.assetClass === "option");
+  const optionFreshness = optionPositions.reduce((counts, position) => {
+    const status = position.greekObservationFreshness ?? "malformed";
+    counts[status] += 1;
+    counts.total += 1;
+    return counts;
+  }, emptyFreshnessCounts());
+  const optionMetrics = [
+    "delta",
+    "gamma",
+    "theta",
+    "vega",
+    "rho",
+    "impliedVolatility"
+  ] as const;
+  const optionMetricCoverage = Object.fromEntries(
+    optionMetrics.map((metric) => [metric, metricCoverage(optionPositions, metric)])
+  ) as Record<OptionMetric, OptionMetricCoverage>;
   const totalOptionContracts = optionPositions.reduce(
     (sum, position) => sum + Math.abs(position.quantity ?? 0),
     0
@@ -401,19 +792,72 @@ export const normalizePortfolioEvidence = (
   );
   const totalOptionMarketValuePct = ratio(totalOptionMarketValue, equity);
   const unmeasuredOptionMarketValuePct = ratio(optionMarketValueWithoutDelta, equity);
+  const currentDeltaContracts = optionPositions.reduce(
+    (sum, position) =>
+      sum +
+      (position.deltaDollars !== null &&
+      position.deltaDollars !== undefined &&
+      position.greekObservationFreshness === "current"
+        ? Math.abs(position.quantity ?? 0)
+        : 0),
+    0
+  );
+  const currentDeltaMarketValue = optionPositions.reduce(
+    (sum, position) =>
+      sum +
+      (position.deltaDollars !== null &&
+      position.deltaDollars !== undefined &&
+      position.greekObservationFreshness === "current"
+        ? Math.abs(position.marketValue ?? 0)
+        : 0),
+    0
+  );
+  const currentContractDeltaCoveragePct = totalOptionContracts > 0
+    ? currentDeltaContracts / totalOptionContracts
+    : null;
+  const currentMarketValueDeltaCoveragePct = totalOptionMarketValue > 0
+    ? currentDeltaMarketValue / totalOptionMarketValue
+    : null;
+  const nonCurrentDeltaMarketValue = Math.max(
+    0,
+    totalOptionMarketValue - currentDeltaMarketValue
+  );
+  const nonCurrentDeltaMarketValuePct = ratio(nonCurrentDeltaMarketValue, equity);
+  const freshnessInsufficient =
+    optionFreshness.stale > 0 ||
+    optionFreshness.expired > 0 ||
+    optionFreshness.malformed > 0;
   const materialCoverageMissing =
+    freshnessInsufficient ||
     (totalOptionMarketValuePct !== null &&
       totalOptionMarketValuePct >=
         config.optionDataCoverage.materialUnmeasuredOptionExposurePct &&
-      contractDeltaCoveragePct !== null &&
-      contractDeltaCoveragePct <
+      currentContractDeltaCoveragePct !== null &&
+      currentContractDeltaCoveragePct <
         config.optionDataCoverage.minimumContractDeltaCoveragePct) ||
-    (unmeasuredOptionMarketValuePct !== null &&
+    (((unmeasuredOptionMarketValuePct !== null &&
       unmeasuredOptionMarketValuePct >=
-        config.optionDataCoverage.materialUnmeasuredOptionExposurePct &&
-      marketValueDeltaCoveragePct !== null &&
-      marketValueDeltaCoveragePct <
+        config.optionDataCoverage.materialUnmeasuredOptionExposurePct) ||
+      (nonCurrentDeltaMarketValuePct !== null &&
+      nonCurrentDeltaMarketValuePct >=
+        config.optionDataCoverage.materialUnmeasuredOptionExposurePct)) &&
+      currentMarketValueDeltaCoveragePct !== null &&
+      currentMarketValueDeltaCoveragePct <
         config.optionDataCoverage.minimumMarketValueDeltaCoveragePct);
+  const executionEligible =
+    optionPositions.length === 0 ||
+    (optionPositions.every(
+      (position) => position.quantity !== null && position.marketValue !== null
+    ) &&
+      currentContractDeltaCoveragePct !== null &&
+      currentContractDeltaCoveragePct >=
+        config.optionDataCoverage.minimumContractDeltaCoveragePct &&
+      currentMarketValueDeltaCoveragePct !== null &&
+      currentMarketValueDeltaCoveragePct >=
+        config.optionDataCoverage.minimumMarketValueDeltaCoveragePct &&
+      optionFreshness.expired === 0 &&
+      optionFreshness.malformed === 0 &&
+      optionFreshness.stale === 0);
   const optionDataCoverage: OptionDataCoverage = {
     totalOptionContracts,
     contractsWithDelta,
@@ -445,6 +889,51 @@ export const normalizePortfolioEvidence = (
       ? sum + Math.abs(position.deltaAdjustedExposure ?? 0)
       : sum;
   }, 0);
+  const optionDeltaShares = aggregateNullable(optionPositions, "deltaShares");
+  const optionDeltaDollars = aggregateNullable(optionPositions, "deltaDollars");
+  const optionGammaSharesPerDollar = aggregateNullable(
+    optionPositions,
+    "gammaSharesPerDollar"
+  );
+  const optionThetaDollarsPerDay = aggregateNullable(
+    optionPositions,
+    "thetaDollarsPerDay"
+  );
+  const optionVegaDollarsPerVolPoint = aggregateNullable(
+    optionPositions,
+    "vegaDollarsPerVolPoint"
+  );
+  const optionRhoDollarsPerRatePoint = aggregateNullable(
+    optionPositions,
+    "rhoDollarsPerRatePoint"
+  );
+  const absoluteDeltaShares = optionDeltaShares === null
+    ? null
+    : optionPositions.reduce((sum, position) => sum + Math.abs(position.deltaShares ?? 0), 0);
+  const absoluteDeltaDollars = optionDeltaDollars === null
+    ? null
+    : optionPositions.reduce((sum, position) => sum + Math.abs(position.deltaDollars ?? 0), 0);
+  const positiveThetaDollarsPerDay = optionThetaDollarsPerDay === null
+    ? null
+    : optionPositions.reduce(
+        (sum, position) => sum + Math.max(0, position.thetaDollarsPerDay ?? 0),
+        0
+      );
+  const negativeThetaDollarsPerDay = optionThetaDollarsPerDay === null
+    ? null
+    : optionPositions.reduce(
+        (sum, position) => sum + Math.min(0, position.thetaDollarsPerDay ?? 0),
+        0
+      );
+  const optionGroupings: OptionGreekGroupings = {
+    byUnderlying: groupBy(optionPositions, (position) => position.underlying),
+    byExpiration: groupBy(
+      optionPositions,
+      (position) => position.expirationDate ?? "unknown"
+    ),
+    byOptionType: groupBy(optionPositions, (position) => position.optionType ?? "unknown"),
+    byDteBucket: groupBy(optionPositions, (position) => dteBucket(position.daysToExpiration))
+  };
 
   const underlyingExposure: Record<string, number> = {};
   const sectorExposure: Record<string, number> = {};
@@ -571,10 +1060,11 @@ export const normalizePortfolioEvidence = (
         ? "partial"
         : "complete";
 
+  const observedHighWaterMark = numberOrNull(evidence.highWaterMark);
   const highWaterMark =
-    equity !== null && evidence.highWaterMark !== null
-      ? Math.max(equity, evidence.highWaterMark)
-      : evidence.highWaterMark ?? equity;
+    equity !== null && observedHighWaterMark !== null
+      ? Math.max(equity, observedHighWaterMark)
+      : observedHighWaterMark ?? equity;
   const accountSnapshot = {
     equity,
     cash,
@@ -620,19 +1110,56 @@ export const normalizePortfolioEvidence = (
       netExposurePct: equity !== null && equity > 0 ? netExposure / equity : null
     },
     options: {
-      deltaExposure,
-      absoluteDeltaExposure,
+      deltaExposure: materialCoverageMissing ? null : deltaExposure,
+      absoluteDeltaExposure: materialCoverageMissing ? null : absoluteDeltaExposure,
       absoluteDeltaExposurePct:
-        absoluteDeltaExposure === null ? null : ratio(absoluteDeltaExposure, equity),
-      positiveDeltaExposure,
+        materialCoverageMissing || absoluteDeltaExposure === null
+          ? null
+          : ratio(absoluteDeltaExposure, equity),
+      positiveDeltaExposure: materialCoverageMissing ? null : positiveDeltaExposure,
       positiveDeltaExposurePct:
-        positiveDeltaExposure === null ? null : ratio(positiveDeltaExposure, equity),
+        materialCoverageMissing || positiveDeltaExposure === null
+          ? null
+          : ratio(positiveDeltaExposure, equity),
       gammaExposure: aggregateObserved(optionPositions, "gammaExposure"),
       thetaExposure: aggregateObserved(optionPositions, "thetaExposure"),
       vegaExposure: aggregateObserved(optionPositions, "vegaExposure"),
       rhoExposure: aggregateObserved(optionPositions, "rhoExposure"),
       nearTermExposurePct:
-        deltaExposure === null ? null : ratio(nearTermExposure, equity)
+        materialCoverageMissing || deltaExposure === null
+          ? null
+          : ratio(nearTermExposure, equity),
+      deltaShares: materialCoverageMissing ? null : optionDeltaShares,
+      deltaDollars: materialCoverageMissing ? null : optionDeltaDollars,
+      absoluteDeltaShares: materialCoverageMissing ? null : absoluteDeltaShares,
+      absoluteDeltaDollars: materialCoverageMissing ? null : absoluteDeltaDollars,
+      gammaSharesPerDollar: optionGammaSharesPerDollar,
+      absoluteGammaSharesPerDollar: aggregateAbsoluteNullable(
+        optionPositions,
+        "gammaSharesPerDollar"
+      ),
+      thetaDollarsPerDay: optionThetaDollarsPerDay,
+      absoluteThetaDollarsPerDay: aggregateAbsoluteNullable(
+        optionPositions,
+        "thetaDollarsPerDay"
+      ),
+      positiveThetaDollarsPerDay,
+      negativeThetaDollarsPerDay,
+      vegaDollarsPerVolPoint: optionVegaDollarsPerVolPoint,
+      absoluteVegaDollarsPerVolPoint: aggregateAbsoluteNullable(
+        optionPositions,
+        "vegaDollarsPerVolPoint"
+      ),
+      rhoDollarsPerRatePoint: optionRhoDollarsPerRatePoint,
+      absoluteRhoDollarsPerRatePoint: aggregateAbsoluteNullable(
+        optionPositions,
+        "rhoDollarsPerRatePoint"
+      ),
+      impliedVolatility: weightedImpliedVolatility(optionPositions),
+      coverage: optionMetricCoverage,
+      freshness: optionFreshness,
+      groupings: optionGroupings,
+      executionEligible
     },
     concentration: {
       largestUnderlyingWeight: equity !== null ? underlyingWeights[0] ?? 0 : null,
@@ -656,65 +1183,11 @@ export const normalizePortfolioEvidence = (
   };
 };
 
-interface OptionEvidenceRow {
-  multiplier: number | null;
-  delta: number | null;
-  gamma: number | null;
-  theta: number | null;
-  vega: number | null;
-  rho: number | null;
-  bid: number | null;
-  ask: number | null;
-  midpoint: number | null;
-  quote_timestamp: string | null;
-  timestamp: string | null;
-}
-
-const latestOptionEvidence = (symbol: string): OptionRiskEvidence => {
-  const row = queryOne<OptionEvidenceRow>(
-    `
-    SELECT c.multiplier, s.delta, s.gamma, s.theta, s.vega, s.rho,
-           s.bid, s.ask, s.midpoint, s.quote_timestamp, s.timestamp
-    FROM option_contracts c
-    LEFT JOIN option_snapshots s
-      ON s.option_symbol = c.option_symbol
-     AND s.timestamp = (
-       SELECT MAX(latest.timestamp)
-       FROM option_snapshots latest
-       WHERE latest.option_symbol = c.option_symbol
-     )
-    WHERE c.option_symbol = ?
-    LIMIT 1
-    `,
-    [symbol]
-  );
-  return {
-    multiplier: numberOrNull(row?.multiplier) ?? 100,
-    delta: numberOrNull(row?.delta),
-    gamma: numberOrNull(row?.gamma),
-    theta: numberOrNull(row?.theta),
-    vega: numberOrNull(row?.vega),
-    rho: numberOrNull(row?.rho),
-    bid: numberOrNull(row?.bid),
-    ask: numberOrNull(row?.ask),
-    midpoint: numberOrNull(row?.midpoint),
-    quoteTimestamp: row?.quote_timestamp ?? row?.timestamp ?? null
-  };
-};
-
-const latestUnderlyingPrice = (symbol: string) => {
-  const row = queryOne<{ close: number }>(
-    `SELECT close FROM market_bars
-     WHERE symbol = ? AND timeframe = '1Day'
-     ORDER BY timestamp DESC LIMIT 1`,
-    [symbol]
-  );
-  return numberOrNull(row?.close);
-};
-
 export interface PortfolioRiskDeps {
   getAccount?: typeof getAlpacaAccountSnapshot;
   getPositions?: typeof listAlpacaPositions;
+  getOptionEvidence?: typeof readOptionRiskEvidence;
+  getUnderlyingPriceEvidence?: typeof readUnderlyingPriceEvidence;
 }
 
 export const buildPortfolioRiskSnapshot = async (
@@ -752,14 +1225,23 @@ export const buildPortfolioRiskSnapshot = async (
       })
     );
     const betas = portfolioBetasForSymbols({ symbols: underlyings, config, asOf });
+    const getOptionEvidence = deps.getOptionEvidence ?? readOptionRiskEvidence;
+    const getUnderlyingEvidence =
+      deps.getUnderlyingPriceEvidence ?? readUnderlyingPriceEvidence;
     const optionEvidence = Object.fromEntries(
       positions
         .map((position) => parseOptionSymbol(position.symbol))
         .filter((parsed) => parsed.ok)
-        .map((parsed) => [parsed.normalizedSymbol, latestOptionEvidence(parsed.normalizedSymbol)])
+        .map((parsed) => [parsed.normalizedSymbol, getOptionEvidence(parsed.normalizedSymbol)])
     );
+    const underlyingEvidence = Object.fromEntries(
+      underlyings.map((symbol) => [symbol, getUnderlyingEvidence(symbol)])
+    ) as Record<string, UnderlyingPriceEvidence>;
     const underlyingPrices = Object.fromEntries(
-      underlyings.map((symbol) => [symbol, latestUnderlyingPrice(symbol)])
+      Object.entries(underlyingEvidence).map(([symbol, row]) => [symbol, row.price])
+    );
+    const underlyingPriceTimestamps = Object.fromEntries(
+      Object.entries(underlyingEvidence).map(([symbol, row]) => [symbol, row.timestamp])
     );
     const equity = numberOrNull(account.equity ?? account.portfolioValue);
     let highWaterMark = latestPortfolioHighWaterMark("paper")?.equity ?? null;
@@ -776,6 +1258,7 @@ export const buildPortfolioRiskSnapshot = async (
       {
         optionEvidence,
         underlyingPrices,
+        underlyingPriceTimestamps,
         betas,
         highWaterMark
       },

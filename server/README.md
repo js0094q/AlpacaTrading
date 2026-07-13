@@ -182,7 +182,7 @@ The control server exposes GET-only cached persistence reads at:
 /api/v1/hedge/recommendation
 ```
 
-These routes do not spawn CLI commands, call broker order methods, or submit paper/live orders. The existing paper-ops moments may refresh a recommendation through the read-only service layer. Keep `HEDGE_PAPER_EXECUTION_ENABLED=false`; there is no hedge POST or execution route. Signed hedge plans are review artifacts, and put spreads remain blocked with `MULTI_LEG_EXECUTION_UNSUPPORTED`.
+The GET routes remain cached, paper-only persistence reads. Authenticated POST routes now use a fixed VPS allowlist for hedge review, reviewed entry execution, exit review, and reviewed exit execution. Each mutation route requires the dashboard admin token, `HEDGE_DASHBOARD_MUTATIONS_ENABLED=true`, paper runtime preflight, and the relevant explicit paper execution flags; execution still fails closed for live environment, live hedge execution, stale/consumed reviews, duplicate reservations, and multi-leg payloads. Signed hedge plans remain separate review artifacts, and put spreads remain blocked with `MULTI_LEG_EXECUTION_UNSUPPORTED`.
 
 ## Stop App Services
 
