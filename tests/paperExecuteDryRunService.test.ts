@@ -28,6 +28,10 @@ import {
   formatPaperExecuteConfirmReportAsTable,
   formatPaperExecuteDryRunReportAsTable
 } from "../src/services/paperExecuteDryRunService.js";
+import {
+  getLatestPaperReconciliationEventForTests,
+  reconcilePaperAccountBeforeExecution
+} from "../src/services/paperAccountReconciliationService.js";
 import { closeDbForTests, getDb } from "../src/lib/db.js";
 import type { PaperPlanCandidate, PaperPlanReport } from "../src/services/paperPlanService.js";
 import type { PaperReviewReport } from "../src/services/paperReviewService.js";
@@ -113,6 +117,7 @@ const mockAccount = (values: Partial<AlpacaAccountRaw> = {}): AlpacaAccountRaw =
   cash: "100000",
   equity: "100000",
   portfolio_value: "100000",
+  position_market_value: "0.00",
   buying_power: "100000",
   options_buying_power: "100000",
   options_approved_level: 2,
@@ -190,6 +195,18 @@ const confirmWith = async (
       requestId: "positions-request-id",
       status: 200,
       url: "https://paper-api.alpaca.markets/v2/positions"
+    }),
+    listRecentPaperOrders: async () => ({
+      data: [],
+      requestId: "orders-request-id",
+      status: 200,
+      url: "https://paper-api.alpaca.markets/v2/orders?status=all"
+    }),
+    listPaperAccountActivities: async () => ({
+      data: [],
+      requestId: "activities-request-id",
+      status: 200,
+      url: "https://paper-api.alpaca.markets/v2/account/activities"
     }),
     submitPaperOrder: mockSubmitSuccess,
     ...deps
@@ -429,7 +446,15 @@ beforeEach(() => {
   delete process.env.PAPER_LEAPS_MAX_PREMIUM_PER_CONTRACT;
   delete process.env.PAPER_LEAPS_MAX_ORDER_NOTIONAL;
   delete process.env.PAPER_RUNTIME_DUPLICATE_RECONCILIATION_ENABLED;
-  resetSqliteTestDb(getDb(), "DELETE FROM paper_execution_ledger;");
+  delete process.env.PAPER_RECONCILIATION_AFTER;
+  delete process.env.PAPER_ACCOUNT_RECONCILIATION_AFTER;
+  delete process.env.PAPER_RECONCILIATION_LOOKBACK_DAYS;
+  delete process.env.PAPER_RECONCILIATION_ORDER_LIMIT;
+  delete process.env.PAPER_RECONCILIATION_ACTIVITY_LIMIT;
+  resetSqliteTestDb(getDb(), `
+    DELETE FROM paper_reconciliation_events;
+    DELETE FROM paper_execution_ledger;
+  `);
 });
 
 describe("paper execute dry-run service guardrails", () => {
@@ -866,6 +891,440 @@ describe("paper execute confirm-paper guardrails", () => {
     assert.equal(report.submitted.map((entry) => entry.assetClass).includes("equity"), true);
     assert.equal(report.blocked.some((entry) => entry.reason === "PAPER_OPTIONS_EXECUTION_DISABLED"), true);
   });
+
+  test("paper reconciliation passes when account and positions match recent buys", async () => {
+    process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
+    let submitCalls = 0;
+    const report = await confirmWith({}, {}, { confirmPaper: true }, {
+      getAccount: async () => ({
+        data: mockAccount({
+          cash: "99900.00",
+          equity: "100000.00",
+          position_market_value: "100.00"
+        }),
+        requestId: "account-reconcile-id",
+        status: 200,
+        url: "https://paper-api.alpaca.markets/v2/account"
+      }),
+      listPaperPositions: async () => ({
+        data: [mockPosition({ symbol: "AAPL", qty: "1", market_value: "100.00" })],
+        requestId: "positions-reconcile-id",
+        status: 200,
+        url: "https://paper-api.alpaca.markets/v2/positions"
+      }),
+      listPaperAccountActivities: async () => ({
+        data: [
+          {
+            activity_type: "FILL",
+            symbol: "AAPL",
+            side: "buy",
+            qty: "1",
+            order_id: "buy-aapl"
+          }
+        ],
+        requestId: "activities-reconcile-id",
+        status: 200,
+        url: "https://paper-api.alpaca.markets/v2/account/activities"
+      }),
+      submitPaperOrder: async (payload) => {
+        submitCalls += 1;
+        return mockSubmitSuccess(payload);
+      }
+    });
+
+    assert.equal(report.errors.length, 0);
+    assert.equal(report.submitted.length, 1);
+    assert.equal(submitCalls, 1);
+    assert.equal(report.reconciliation?.reconciliationStatus, "ok");
+    assert.equal(report.reconciliation?.sumPositionsMarketValue, 100);
+  });
+
+  test("paper missing position within sync window returns pending warning and continues", async () => {
+    process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
+    process.env.PAPER_POSITION_SYNC_FRESHNESS_MINUTES = "120";
+    let submitCalls = 0;
+    const report = await confirmWith({}, {}, { confirmPaper: true }, {
+      getAccount: async () => ({
+        data: mockAccount({
+          cash: "98500.00",
+          equity: "100000.00",
+          position_market_value: "0.00"
+        }),
+        requestId: "account-mismatch-id",
+        status: 200,
+        url: "https://paper-api.alpaca.markets/v2/account"
+      }),
+      listPaperPositions: async () => ({
+        data: [],
+        requestId: "positions-mismatch-id",
+        status: 200,
+        url: "https://paper-api.alpaca.markets/v2/positions"
+      }),
+      listPaperAccountActivities: async () => ({
+        data: [
+          {
+            activity_type: "FILL",
+            transaction_time: "2026-07-02T21:00:00.000Z",
+            symbol: "HRB",
+            side: "buy",
+            qty: "3",
+            order_id: "buy-hrb"
+          }
+        ],
+        requestId: "activities-mismatch-id",
+        status: 200,
+        url: "https://paper-api.alpaca.markets/v2/account/activities"
+      }),
+      submitPaperOrder: async (payload) => {
+        submitCalls += 1;
+        return mockSubmitSuccess(payload);
+      }
+    });
+
+    assert.equal(report.errors.length, 0);
+    assert.equal(report.submitted.length, 1);
+    assert.equal(submitCalls, 1);
+    assert.equal(report.mutationAttempted, true);
+    assert.equal(report.reconciliation?.reconciliationStatus, "warning");
+    assert.equal(report.reconciliation?.reconciliationEvents[0]?.type, "PAPER_POSITION_SYNC_PENDING");
+    assert.deepEqual(report.reconciliation?.paperSyncPendingSymbols, ["HRB"]);
+    assert.deepEqual(report.reconciliation?.missingSymbols, ["HRB"]);
+    assert.equal(report.reconciliation?.expectedQuantities.HRB, "3");
+    assert.deepEqual(report.reconciliation?.recentBuyFillOrderIds, ["buy-hrb"]);
+    assert.equal(report.reconciliation?.sellFillsFound, false);
+    assert.equal(report.reconciliation?.nonFillAdjustmentActivitiesFound, false);
+    assert.equal(report.reconciliation?.accountCash, "98500.00");
+    assert.equal(report.reconciliation?.accountEquity, "100000.00");
+    assert.equal(report.reconciliation?.accountPositionMarketValue, "0.00");
+    assert.equal(report.reconciliation?.sumPositionsMarketValue, 0);
+    assert.deepEqual(report.reconciliation?.alpacaRequestIds, {
+      account: "account-mismatch-id",
+      positions: "positions-mismatch-id",
+      orders: "orders-request-id",
+      activities: "activities-mismatch-id"
+    });
+    assert.equal(
+      getLatestPaperReconciliationEventForTests("HRB")?.eventType,
+      "PAPER_POSITION_SYNC_PENDING"
+    );
+  });
+
+  test("paper reconciliation passes missing position with corresponding sell fill", async () => {
+    process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
+    let submitCalls = 0;
+    const report = await confirmWith({}, {}, { confirmPaper: true }, {
+      getAccount: async () => ({
+        data: mockAccount({ position_market_value: "0.00" }),
+        requestId: "account-request-id",
+        status: 200,
+        url: "https://paper-api.alpaca.markets/v2/account"
+      }),
+      listPaperPositions: async () => ({
+        data: [],
+        requestId: "positions-request-id",
+        status: 200,
+        url: "https://paper-api.alpaca.markets/v2/positions"
+      }),
+      listPaperAccountActivities: async () => ({
+        data: [
+          {
+            activity_type: "FILL",
+            symbol: "HRB",
+            side: "buy",
+            qty: "3",
+            order_id: "buy-hrb"
+          },
+          {
+            activity_type: "FILL",
+            symbol: "HRB",
+            side: "sell",
+            qty: "3",
+            order_id: "sell-hrb"
+          }
+        ],
+        requestId: "activities-request-id",
+        status: 200,
+        url: "https://paper-api.alpaca.markets/v2/account/activities"
+      }),
+      submitPaperOrder: async (payload) => {
+        submitCalls += 1;
+        return mockSubmitSuccess(payload);
+      }
+    });
+
+    assert.equal(report.errors.length, 0);
+    assert.equal(report.submitted.length, 1);
+    assert.equal(submitCalls, 1);
+    assert.equal(report.reconciliation?.reconciliationStatus, "ok");
+    assert.equal(report.reconciliation?.sellFillsFound, true);
+    assert.equal(report.reconciliation?.expectedQuantities.HRB, "0");
+  });
+
+  test("paper reconciliation keeps non-FILL adjustment evidence without fake sells", async () => {
+    process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
+    let submitCalls = 0;
+    const report = await confirmWith({}, {}, { confirmPaper: true }, {
+      getAccount: async () => ({
+        data: mockAccount({ position_market_value: "0.00" }),
+        requestId: "account-request-id",
+        status: 200,
+        url: "https://paper-api.alpaca.markets/v2/account"
+      }),
+      listPaperPositions: async () => ({
+        data: [],
+        requestId: "positions-request-id",
+        status: 200,
+        url: "https://paper-api.alpaca.markets/v2/positions"
+      }),
+      listPaperAccountActivities: async () => ({
+        data: [
+          {
+            activity_type: "FILL",
+            symbol: "HRB",
+            side: "buy",
+            qty: "3",
+            order_id: "buy-hrb"
+          },
+          {
+            activity_type: "JNLC",
+            symbol: "HRB",
+            qty: "-3"
+          }
+        ],
+        requestId: "activities-request-id",
+        status: 200,
+        url: "https://paper-api.alpaca.markets/v2/account/activities"
+      }),
+      submitPaperOrder: async (payload) => {
+        submitCalls += 1;
+        return mockSubmitSuccess(payload);
+      }
+    });
+
+    assert.equal(report.errors.length, 0);
+    assert.equal(report.submitted.length, 1);
+    assert.equal(submitCalls, 1);
+    assert.equal(report.reconciliation?.reconciliationStatus, "warning");
+    assert.equal(report.reconciliation?.reconciliationEvents[0]?.type, "PAPER_POSITION_SYNC_PENDING");
+    assert.equal(report.reconciliation?.nonFillAdjustmentActivitiesFound, true);
+    const sellLedgerRows = getDb()
+      .prepare("SELECT COUNT(*) AS count FROM paper_execution_ledger WHERE side = 'sell'")
+      .get() as { count: number };
+    assert.equal(sellLedgerRows.count, 0);
+  });
+
+  test("paper reappeared position returns restored event", async () => {
+    process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
+    process.env.PAPER_POSITION_SYNC_FRESHNESS_MINUTES = "120";
+    await reconcilePaperAccountBeforeExecution({
+      now: () => now,
+      getAccount: async () => ({
+        data: mockAccount({ cash: "99900.00", equity: "100000.00", position_market_value: "0.00" }),
+        requestId: "account-pending-id",
+        status: 200,
+        url: "https://paper-api.alpaca.markets/v2/account"
+      }),
+      listPaperPositions: async () => ({
+        data: [],
+        requestId: "positions-pending-id",
+        status: 200,
+        url: "https://paper-api.alpaca.markets/v2/positions"
+      }),
+      listRecentPaperOrders: async () => ({
+        data: [],
+        requestId: "orders-pending-id",
+        status: 200,
+        url: "https://paper-api.alpaca.markets/v2/orders?status=all"
+      }),
+      listPaperAccountActivities: async () => ({
+        data: [
+          {
+            activity_type: "FILL",
+            transaction_time: "2026-07-02T21:00:00.000Z",
+            symbol: "HRB",
+            side: "buy",
+            qty: "3",
+            order_id: "buy-hrb"
+          }
+        ],
+        requestId: "activities-pending-id",
+        status: 200,
+        url: "https://paper-api.alpaca.markets/v2/account/activities"
+      })
+    });
+
+    const restored = await reconcilePaperAccountBeforeExecution({
+      now: () => now,
+      getAccount: async () => ({
+        data: mockAccount({ cash: "99700.00", equity: "100000.00", position_market_value: "300.00" }),
+        requestId: "account-restored-id",
+        status: 200,
+        url: "https://paper-api.alpaca.markets/v2/account"
+      }),
+      listPaperPositions: async () => ({
+        data: [mockPosition({ symbol: "HRB", qty: "3", market_value: "300.00" })],
+        requestId: "positions-restored-id",
+        status: 200,
+        url: "https://paper-api.alpaca.markets/v2/positions"
+      }),
+      listRecentPaperOrders: async () => ({
+        data: [],
+        requestId: "orders-restored-id",
+        status: 200,
+        url: "https://paper-api.alpaca.markets/v2/orders?status=all"
+      }),
+      listPaperAccountActivities: async () => ({
+        data: [
+          {
+            activity_type: "FILL",
+            transaction_time: "2026-07-02T21:00:00.000Z",
+            symbol: "HRB",
+            side: "buy",
+            qty: "3",
+            order_id: "buy-hrb"
+          }
+        ],
+        requestId: "activities-restored-id",
+        status: 200,
+        url: "https://paper-api.alpaca.markets/v2/account/activities"
+      })
+    });
+
+    assert.equal(restored.report.reconciliationStatus, "warning");
+    assert.equal(restored.report.reconciliationEvents[0]?.type, "PAPER_POSITION_SYNC_RESTORED");
+    assert.deepEqual(restored.report.paperSyncRestoredSymbols, ["HRB"]);
+    assert.equal(
+      getLatestPaperReconciliationEventForTests("HRB")?.eventType,
+      "PAPER_POSITION_SYNC_RESTORED"
+    );
+  });
+
+  test("stale missing paper position becomes paper sync removal warning", async () => {
+    process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
+    process.env.PAPER_POSITION_SYNC_FRESHNESS_MINUTES = "30";
+    const report = await confirmWith({}, {}, { confirmPaper: true }, {
+      getAccount: async () => ({
+        data: mockAccount({
+          cash: "98500.00",
+          equity: "100000.00",
+          position_market_value: "0.00"
+        }),
+        requestId: "account-removal-id",
+        status: 200,
+        url: "https://paper-api.alpaca.markets/v2/account"
+      }),
+      listPaperPositions: async () => ({
+        data: [],
+        requestId: "positions-removal-id",
+        status: 200,
+        url: "https://paper-api.alpaca.markets/v2/positions"
+      }),
+      listPaperAccountActivities: async () => ({
+        data: [
+          {
+            activity_type: "FILL",
+            transaction_time: "2026-07-02T19:00:00.000Z",
+            symbol: "HRB",
+            side: "buy",
+            qty: "3",
+            order_id: "buy-hrb"
+          }
+        ],
+        requestId: "activities-removal-id",
+        status: 200,
+        url: "https://paper-api.alpaca.markets/v2/account/activities"
+      })
+    });
+
+    assert.equal(report.errors.length, 0);
+    assert.equal(report.submitted.length, 1);
+    assert.equal(report.reconciliation?.reconciliationStatus, "warning");
+    assert.equal(report.reconciliation?.reconciliationEvents[0]?.type, "PAPER_SYNC_POSITION_REMOVAL");
+    assert.deepEqual(report.reconciliation?.paperSyncRemovedSymbols, ["HRB"]);
+    assert.equal(
+      getLatestPaperReconciliationEventForTests("HRB")?.eventType,
+      "PAPER_SYNC_POSITION_REMOVAL"
+    );
+  });
+
+  test("paper account position_market_value mismatch hard fails before mutation", async () => {
+    process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
+    let submitCalls = 0;
+    const report = await confirmWith({}, {}, { confirmPaper: true }, {
+      getAccount: async () => ({
+        data: mockAccount({
+          cash: "99900.00",
+          equity: "100000.00",
+          position_market_value: "200.00"
+        }),
+        requestId: "account-bad-math-id",
+        status: 200,
+        url: "https://paper-api.alpaca.markets/v2/account"
+      }),
+      listPaperPositions: async () => ({
+        data: [mockPosition({ symbol: "AAPL", qty: "1", market_value: "100.00" })],
+        requestId: "positions-bad-math-id",
+        status: 200,
+        url: "https://paper-api.alpaca.markets/v2/positions"
+      }),
+      submitPaperOrder: async (payload) => {
+        submitCalls += 1;
+        return mockSubmitSuccess(payload);
+      }
+    });
+
+    assert.equal(report.status, "blocked");
+    assert.equal(report.reason, "ACCOUNT_RECONCILIATION_MISMATCH");
+    assert.equal(report.errors[0]?.reason, "ACCOUNT_RECONCILIATION_MISMATCH");
+    assert.equal(report.reconciliation?.marketValueMismatch, true);
+    assert.equal(report.mutationAttempted, false);
+    assert.equal(submitCalls, 0);
+  });
+
+  test("live missing expected position hard fails reconciliation", async () => {
+    process.env.ALPACA_ENV = "live";
+    const result = await reconcilePaperAccountBeforeExecution({
+      now: () => now,
+      getAccount: async () => ({
+        data: mockAccount({ cash: "99900.00", equity: "100000.00", position_market_value: "0.00" }),
+        requestId: "account-live-id",
+        status: 200,
+        url: "https://paper-api.alpaca.markets/v2/account"
+      }),
+      listPaperPositions: async () => ({
+        data: [],
+        requestId: "positions-live-id",
+        status: 200,
+        url: "https://paper-api.alpaca.markets/v2/positions"
+      }),
+      listRecentPaperOrders: async () => ({
+        data: [],
+        requestId: "orders-live-id",
+        status: 200,
+        url: "https://paper-api.alpaca.markets/v2/orders?status=all"
+      }),
+      listPaperAccountActivities: async () => ({
+        data: [
+          {
+            activity_type: "FILL",
+            transaction_time: "2026-07-02T21:00:00.000Z",
+            symbol: "HRB",
+            side: "buy",
+            qty: "3",
+            order_id: "buy-hrb"
+          }
+        ],
+        requestId: "activities-live-id",
+        status: 200,
+        url: "https://paper-api.alpaca.markets/v2/account/activities"
+      })
+    });
+
+    assert.equal(result.report.reconciliationStatus, "blocked");
+    assert.equal(result.report.code, "ACCOUNT_RECONCILIATION_MISMATCH");
+    assert.deepEqual(result.report.missingSymbols, ["HRB"]);
+    assert.equal(result.report.reconciliationEvents.length, 0);
+  });
 });
 
 describe("paper execute confirm-paper options", () => {
@@ -986,6 +1445,18 @@ describe("paper execute confirm-paper options", () => {
           requestId: "positions-request-id",
           status: 200,
           url: "https://paper-api.alpaca.markets/v2/positions"
+        }),
+        listRecentPaperOrders: async () => ({
+          data: [],
+          requestId: "orders-request-id",
+          status: 200,
+          url: "https://paper-api.alpaca.markets/v2/orders?status=all"
+        }),
+        listPaperAccountActivities: async () => ({
+          data: [],
+          requestId: "activities-request-id",
+          status: 200,
+          url: "https://paper-api.alpaca.markets/v2/account/activities"
         }),
         submitPaperOrder: mockSubmitSuccess
       }

@@ -41,7 +41,7 @@
   windows with market-hour and non-overlap gates. No deployment occurred in this
   phase.
 
-## Latest VPS handoff status (2026-07-05 UTC)
+## Latest VPS handoff status (2026-07-07 UTC)
 
 - VPS was rebuilt from empty and re-bootstrapped from this repo.
 - SSH target remains `alpaca@185.193.127.15` and can be reached as:
@@ -60,6 +60,16 @@
   - `LIVE_TRADING_ENABLED=false`
   - `PAPER_ORDER_EXECUTION_ENABLED=true`
   - `PAPER_OPTIONS_EXECUTION_ENABLED=true`
+- Paper exit management is paper-only and guarded:
+  - `npm run paper:exit:review -- --format=json` is read-only and reviews open `/v2/positions` for exit candidates.
+  - `npm run paper:exit:execute -- --confirmPaper --format=json` reruns review first, requires `PAPER_ORDER_EXECUTION_ENABLED=true`, and submits only generated paper exit candidates.
+  - No live exit path exists; execution remains paper endpoint-only and requires explicit confirmation.
+  - 0DTE option exits default to 50% stop/profit outside the final 2 hours, 25% stop/profit inside the final 2 hours, force exit inside the final 30 minutes when value is at least `0.05`, and skip near-worthless contracts with `ODTE_BELOW_MIN_SELLABLE_VALUE`.
+  - Equity exits default to 5% stop loss and 8% take profit, using `qty_available` when present and skipping symbols with active sell orders.
+  - LEAPS are classified separately and skipped by default with `LEAPS_SKIPPED_BY_DEFAULT`; 0DTE rules do not sell LEAPS.
+  - Explicit `--includeLEAPS=true` enables paper-only LEAPS exit candidates for `LEAPS_STOP_LOSS_35`, `LEAPS_TAKE_PROFIT_75`, and `LEAPS_DTE_DECAY_EXIT`.
+  - LEAPS exits use sell-to-close limit orders from fresh bid quotes only; stale or unavailable quotes skip with `LEAPS_QUOTE_UNAVAILABLE`, and contracts below `0.05` skip with `LEAPS_BELOW_MIN_SELLABLE_VALUE`.
+  - Known LEAPS from the paper learning ledger may be recognized for DTE decay after falling below the normal 180-DTE classification threshold, but only when `/v2/positions` still shows the contract.
 - Options quote/execution controls after the quote-status fix:
   - `OPTIONS_QUOTE_MAX_AGE_MS=900000` by default.
   - `ALLOW_OPTIONS_LAST_PRICE_FALLBACK=false` by default.
@@ -132,6 +142,17 @@
   - Cached GET routes are `/api/v1/hedge/risk`, `/api/v1/hedge/regime`, and `/api/v1/hedge/recommendation`, with matching Vercel `/api/paper/hedge/*` routes.
   - Authenticated hedge mutation routes are `/api/v1/hedge/review`, `/api/v1/hedge/execute`, `/api/v1/hedge/exit/review`, and `/api/v1/hedge/exit/execute`; status and learning reads are `/api/v1/hedge/execution` and `/api/v1/hedge/learning`.
   - The dashboard marks `stale` and `expired` recommendations as not current and displays model versions, quality, scenarios, LEAPS logic, candidates, warnings, and blockers.
+- Alpaca paper reconciliation behavior after the July 6 equity-fill incident:
+  - Alpaca paper `/v2/orders` and `/v2/account/activities` can show simulated fills before `/v2/positions` is fully synchronized.
+  - Missing paper positions can later reappear in `/v2/positions`; do not invent sell fills or realized P/L for that gap.
+  - `/v2/positions` and `/v2/account` are authoritative for current paper exposure.
+  - `paper:exit:review` and `paper:exit:execute` follow the same authority model: no synthetic sells, no sell payloads for local-only missing positions, and reconciliation events are preserved.
+  - `paper:execute --confirmPaper` now performs a read-only reconciliation before any submit call and records audit events:
+    - `PAPER_POSITION_SYNC_PENDING` while a missing filled paper position is still inside `PAPER_POSITION_SYNC_FRESHNESS_MINUTES`.
+    - `PAPER_POSITION_SYNC_RESTORED` when a previously missing symbol reappears in `/v2/positions`.
+    - `PAPER_SYNC_POSITION_REMOVAL` only after the sync window expires and account math is consistent without the missing symbol.
+  - Hard fail remains `ACCOUNT_RECONCILIATION_MISMATCH` when `account.position_market_value` differs materially from the sum of `/v2/positions.market_value`, account cash/equity/market value are internally inconsistent, exposure cannot be safely calculated, or the mismatch is live-account behavior. The position-market-value tolerance defaults to `$2` or `0.25%`, whichever is larger.
+  - Missing paper symbols are excluded from current exposure calculations unless `/v2/positions` confirms them; evidence and Alpaca request IDs are preserved in `paper_reconciliation_events`.
 
 ## Token/env coordination
 

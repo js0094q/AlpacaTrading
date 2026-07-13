@@ -481,6 +481,28 @@ CREATE INDEX IF NOT EXISTS idx_paper_execution_ledger_symbol
 CREATE INDEX IF NOT EXISTS idx_paper_execution_ledger_dedupe_key
   ON paper_execution_ledger(dedupe_key);
 
+CREATE TABLE IF NOT EXISTS paper_reconciliation_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  status TEXT NOT NULL,
+  expected_qty TEXT,
+  recent_buy_fill_order_ids_json TEXT NOT NULL,
+  sell_fills_found INTEGER NOT NULL DEFAULT 0,
+  non_fill_adjustment_activities_found INTEGER NOT NULL DEFAULT 0,
+  account_cash TEXT,
+  account_equity TEXT,
+  account_position_market_value TEXT,
+  sum_positions_market_value REAL NOT NULL DEFAULT 0,
+  alpaca_request_ids_json TEXT NOT NULL,
+  details_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_reconciliation_events_symbol_created_at
+  ON paper_reconciliation_events(symbol, created_at);
+
 CREATE TABLE IF NOT EXISTS paper_learning_records (
   id TEXT PRIMARY KEY,
   created_at TEXT NOT NULL,

@@ -58,6 +58,14 @@ import {
   type ReviewedPayloadSectionName
 } from "./services/paperReviewArtifactService.js";
 import {
+  buildPaperExitReviewResult,
+  formatPaperExitReviewAsTable
+} from "./services/paperExitReviewService.js";
+import {
+  buildPaperExitExecutionResult,
+  formatPaperExitExecutionAsTable
+} from "./services/paperExitExecutionService.js";
+import {
   buildPaperRuntimeReport,
   formatPaperRuntimeReportAsTable
 } from "./services/paperRuntimeService.js";
@@ -1303,6 +1311,77 @@ const run = async () => {
     return;
   }
 
+  if (command === "paper:exit:review" || (command === "paper" && action === "exit-review")) {
+    const format = normalizePaperPlanFormat(args.format) || "table";
+    const result = await buildPaperExitReviewResult({
+      includeEquities: optionalBoolArg(args.includeEquities),
+      includeOptions: optionalBoolArg(args.includeOptions),
+      include0DTE: optionalBoolArg(args.include0DTE),
+      includeLEAPS: optionalBoolArg(args.includeLEAPS),
+      optionStopLossPct: toOptionalFloat(args.optionStopLossPct),
+      optionTakeProfitPct: toOptionalFloat(args.optionTakeProfitPct),
+      optionEodWindowMinutes: toOptionalFloat(args.optionEodWindowMinutes),
+      optionEodStopLossPct: toOptionalFloat(args.optionEodStopLossPct),
+      optionEodTakeProfitPct: toOptionalFloat(args.optionEodTakeProfitPct),
+      optionForceExitMinutesBeforeClose: toOptionalFloat(args.optionForceExitMinutesBeforeClose),
+      minSellableOptionValue: toOptionalFloat(args.minSellableOptionValue),
+      equityStopLossPct: toOptionalFloat(args.equityStopLossPct),
+      equityTakeProfitPct: toOptionalFloat(args.equityTakeProfitPct),
+      leapsStopLossPct: toOptionalFloat(args.leapsStopLossPct),
+      leapsTakeProfitPct: toOptionalFloat(args.leapsTakeProfitPct),
+      leapsMinDteForLeaps: toOptionalFloat(args.leapsMinDteForLeaps),
+      leapsDecayExitDte: toOptionalFloat(args.leapsDecayExitDte),
+      leapsMaxHoldDays: toOptionalFloat(args.leapsMaxHoldDays),
+      leapsMinSellableOptionValue: toOptionalFloat(args.leapsMinSellableOptionValue),
+      format
+    });
+    if (format === "json") {
+      print(result);
+    } else {
+      print(formatPaperExitReviewAsTable(result));
+    }
+    if (result.status === "blocked") {
+      process.exitCode = 1;
+    }
+    return;
+  }
+
+  if (command === "paper:exit:execute" || (command === "paper" && action === "exit-execute")) {
+    const format = normalizePaperPlanFormat(args.format) || "table";
+    const result = await buildPaperExitExecutionResult({
+      confirmPaper: flagArg(args.confirmPaper),
+      includeEquities: optionalBoolArg(args.includeEquities),
+      includeOptions: optionalBoolArg(args.includeOptions),
+      include0DTE: optionalBoolArg(args.include0DTE),
+      includeLEAPS: optionalBoolArg(args.includeLEAPS),
+      optionStopLossPct: toOptionalFloat(args.optionStopLossPct),
+      optionTakeProfitPct: toOptionalFloat(args.optionTakeProfitPct),
+      optionEodWindowMinutes: toOptionalFloat(args.optionEodWindowMinutes),
+      optionEodStopLossPct: toOptionalFloat(args.optionEodStopLossPct),
+      optionEodTakeProfitPct: toOptionalFloat(args.optionEodTakeProfitPct),
+      optionForceExitMinutesBeforeClose: toOptionalFloat(args.optionForceExitMinutesBeforeClose),
+      minSellableOptionValue: toOptionalFloat(args.minSellableOptionValue),
+      equityStopLossPct: toOptionalFloat(args.equityStopLossPct),
+      equityTakeProfitPct: toOptionalFloat(args.equityTakeProfitPct),
+      leapsStopLossPct: toOptionalFloat(args.leapsStopLossPct),
+      leapsTakeProfitPct: toOptionalFloat(args.leapsTakeProfitPct),
+      leapsMinDteForLeaps: toOptionalFloat(args.leapsMinDteForLeaps),
+      leapsDecayExitDte: toOptionalFloat(args.leapsDecayExitDte),
+      leapsMaxHoldDays: toOptionalFloat(args.leapsMaxHoldDays),
+      leapsMinSellableOptionValue: toOptionalFloat(args.leapsMinSellableOptionValue),
+      format
+    });
+    if (format === "json") {
+      print(result);
+    } else {
+      print(formatPaperExitExecutionAsTable(result));
+    }
+    if (result.status === "blocked" || result.status === "error") {
+      process.exitCode = 1;
+    }
+    return;
+  }
+
   if (command === "paper" && action === "intel") {
     const format = args.format;
     const result: PaperIntelReport = await buildPaperIntelligenceReport({
@@ -1411,7 +1490,7 @@ const run = async () => {
 
   print({
     error:
-      "Unknown command. See README for available commands including db:migrate/db:verify/universe/data/options/features/targets/backtest/learn/research/alpaca:config/paper (including paper:analytics, paper:learn, paper:trace, paper:execute, paper:review, paper:plan, paper:portfolio:review, paper:exit:review, paper:options:discover, paper:ops:morning, paper:ops:midday, paper:ops:late-day, paper:snapshots, paper:trends, paper:runtime, paper:intel).",
+      "Unknown command. See README for available commands including db:migrate/db:verify/universe/data/options/features/targets/backtest/learn/research/alpaca:config/paper (including paper:analytics, paper:learn, paper:trace, paper:execute, paper:execute:reviewed, paper:review, paper:plan, paper:portfolio:review, paper:exit:review, paper:exit:execute, paper:options:discover, paper:ops:morning, paper:ops:midday, paper:ops:late-day, paper:snapshots, paper:trends, paper:runtime, paper:intel).",
     command,
     action,
     config
