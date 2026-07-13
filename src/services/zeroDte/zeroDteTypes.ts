@@ -44,6 +44,7 @@ export interface ZeroDteConfig {
   queueTopN: number;
   executionTopN: number;
   maxStrikesEachSide: number;
+  underlyingMaxAgeMs: number;
   minOptionVolume: number;
   minOpenInterest: number;
   maxSpreadPct: number;

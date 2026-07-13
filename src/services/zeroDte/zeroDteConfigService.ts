@@ -12,6 +12,7 @@ const DEFAULT_FORCE_EXIT_ET = "15:50";
 const DEFAULT_ENGINE_INTERVAL_SECONDS = 60;
 const DEFAULT_MIN_PREMIUM = 0.1;
 const DEFAULT_MAX_PREMIUM = 5;
+const DEFAULT_UNDERLYING_MAX_AGE_MS = 60_000;
 const DEFAULT_MIN_SCORE_MOVEMENT = 5;
 const SESSION_TIME_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
 
@@ -170,6 +171,10 @@ export const loadZeroDteConfig = (env: NodeJS.ProcessEnv = process.env): ZeroDte
     maxStrikesEachSide: parseNonNegativeInteger(
       readValue(env, "ZERO_DTE_MAX_STRIKES_EACH_SIDE"),
       5
+    ),
+    underlyingMaxAgeMs: parsePositiveInteger(
+      readValue(env, "ZERO_DTE_UNDERLYING_MAX_AGE_MS"),
+      DEFAULT_UNDERLYING_MAX_AGE_MS
     ),
     minOptionVolume: parseNonNegativeInteger(
       readValue(env, "ZERO_DTE_MIN_OPTION_VOLUME"),

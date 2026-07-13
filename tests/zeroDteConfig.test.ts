@@ -133,6 +133,16 @@ test("zero or invalid engine intervals fall back to a strictly positive default"
   }
 });
 
+test("underlying freshness uses a positive paper-safe default and rejects invalid values", () => {
+  assert.equal(loadZeroDteConfig().underlyingMaxAgeMs, 60_000);
+  for (const value of ["0", "-1", "1.5", "not-a-number"]) {
+    assert.equal(
+      loadZeroDteConfig({ ZERO_DTE_UNDERLYING_MAX_AGE_MS: value }).underlyingMaxAgeMs,
+      60_000
+    );
+  }
+});
+
 test("a minimum premium above the maximum fails closed to the premium defaults", () => {
   const config = loadZeroDteConfig({
     ZERO_DTE_MIN_PREMIUM: "6",

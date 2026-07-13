@@ -1,5 +1,6 @@
 import { recordApiRequest } from "../apiLog.js";
 import { config } from "../../config.js";
+import { assertReadOnlyAlpacaAccessAllowed } from "../tradingSafetyService.js";
 import type { Timeframe } from "../../types.js";
 
 export interface RawBar {
@@ -72,6 +73,7 @@ const requestJson = async <T>(
   options: RequestInit = {},
   baseUrl: "data" | "trade" = "data"
 ): Promise<ApiResponse<T>> => {
+  assertReadOnlyAlpacaAccessAllowed();
   const apiRoot = baseUrl === "trade"
     ? (config.paperByDefault ? config.alpaca.paperBaseUrl : config.alpaca.liveBaseUrl)
     : config.alpaca.dataBaseUrl;
@@ -177,6 +179,7 @@ export interface OptionChainFilters {
 }
 
 export interface OptionContractRaw {
+  requestId?: string | null;
   symbol?: string;
   underlying_symbol?: string;
   root_symbol?: string;
@@ -474,6 +477,10 @@ export const fetchOptionContracts = async (
   filters: OptionChainFilters
 ): Promise<OptionContractRaw[]> => {
   const contracts: OptionContractRaw[] = [];
+  const requestedLimit =
+    filters.limit === undefined || filters.limit === null
+      ? null
+      : normalizeOptionContractLimit(filters.limit);
   let pageToken: string | null = null;
   const seenTokens = new Set<string>();
   let pageCount = 0;
@@ -493,7 +500,18 @@ export const fetchOptionContracts = async (
       next_page_token?: string | null;
       page_token?: string | null;
     }>(endpoint, { method: "GET" }, "trade");
-    contracts.push(...parseOptionContractPayload(response.data));
+    const pageContracts = parseOptionContractPayload(response.data).map((contract) => ({
+      ...contract,
+      requestId: response.requestId
+    }));
+    const remaining = requestedLimit === null
+      ? pageContracts
+      : pageContracts.slice(0, Math.max(0, requestedLimit - contracts.length));
+    contracts.push(...remaining);
+
+    if (requestedLimit !== null && contracts.length >= requestedLimit) {
+      break;
+    }
 
     const next = response.data.next_page_token || response.data.page_token || null;
     if (!next) {
@@ -506,7 +524,7 @@ export const fetchOptionContracts = async (
     pageToken = next;
   }
 
-  return contracts.filter((contract) => {
+  const filtered = contracts.filter((contract) => {
     const expiration = contract.expiration_date;
     if (!expiration) {
       return false;
@@ -532,6 +550,7 @@ export const fetchOptionContracts = async (
     }
     return true;
   });
+  return requestedLimit === null ? filtered : filtered.slice(0, requestedLimit);
 };
 
 export const fetchOptionSnapshots = async (

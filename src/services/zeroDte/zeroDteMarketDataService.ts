@@ -8,6 +8,7 @@ import { getAlpacaMarketClock } from "../alpacaMarketClockService.js";
 import { normalizeOptionQuote } from "../optionQuoteNormalizer.js";
 import { normalizeOptionSnapshot } from "../optionSnapshotNormalizer.js";
 import { parseOptionSymbol } from "../optionSymbolService.js";
+import { assertReadOnlyAlpacaAccessAllowed } from "../tradingSafetyService.js";
 import {
   fetchBars,
   fetchOptionContracts,
@@ -62,6 +63,11 @@ export interface ZeroDteOptionQuote {
   requestId?: string | null;
 }
 
+export interface ZeroDteBarsResult {
+  bars: ZeroDteBar[];
+  requestIds: string[];
+}
+
 export interface ZeroDteMarketDataProvider {
   getClock(): Promise<{ timestamp: string; isOpen: boolean; nextClose: string; requestId?: string }>;
   getStockSnapshot(symbols: string[]): Promise<Record<string, ZeroDteStockSnapshot>>;
@@ -70,7 +76,7 @@ export interface ZeroDteMarketDataProvider {
     timeframe: "1Min" | "5Min" | "15Min",
     start: string,
     end: string
-  ): Promise<ZeroDteBar[]>;
+  ): Promise<ZeroDteBar[] | ZeroDteBarsResult>;
   listContracts(input: {
     underlying: string;
     expirationDate: string;
@@ -115,6 +121,8 @@ export interface ZeroDteMarketContext {
     clock: string | null;
     underlying: string | null;
     option: string | null;
+    bars: string[];
+    contracts: string[];
   };
   blockers: string[];
 }
@@ -133,6 +141,15 @@ const finiteNumber = (value: unknown): number | null => {
 const validTimestamp = (value: string | null | undefined) => {
   if (!value || !Number.isFinite(Date.parse(value))) return null;
   return new Date(value).toISOString();
+};
+
+const uniqueRequestIds = (values: Array<string | null | undefined>) =>
+  Array.from(new Set(values.filter((value): value is string => Boolean(value))));
+
+const isFreshTimestamp = (timestamp: string | null, now: string, maxAgeMs: number) => {
+  if (!timestamp) return false;
+  const ageMs = Date.parse(now) - Date.parse(timestamp);
+  return Number.isFinite(ageMs) && ageMs >= 0 && ageMs <= maxAgeMs;
 };
 
 const newYorkDate = (value: string) => {
@@ -196,21 +213,45 @@ const stockPrice = (snapshot: ZeroDteStockSnapshot) => {
 const directionFor = (type: "call" | "put"): ZeroDteDirection =>
   type === "call" ? "bullish" : "bearish";
 
-const contractFromRaw = (raw: OptionContractRaw): ZeroDteContract | null => {
+export const normalizeZeroDteContract = (raw: OptionContractRaw): ZeroDteContract | null => {
   const parsed = raw.symbol ? parseOptionSymbol(raw.symbol) : null;
   if (!parsed?.ok) return null;
-  const strike = finiteNumber(raw.strike_price) ?? parsed.strikePrice;
-  const type = raw.type === "put" ? "put" : raw.type === "call" ? "call" : parsed.optionType;
-  const expirationDate = raw.expiration_date ?? parsed.expirationDate;
-  const underlying = (raw.underlying_symbol ?? parsed.underlying).trim().toUpperCase();
-  if (!underlying || !expirationDate || strike === null || strike < 0) return null;
+
+  const rawType = raw.type === undefined || raw.type === null
+    ? null
+    : String(raw.type).trim().toLowerCase();
+  const rawUnderlying = raw.underlying_symbol === undefined || raw.underlying_symbol === null
+    ? null
+    : String(raw.underlying_symbol).trim().toUpperCase();
+  const rawRoot = raw.root_symbol === undefined || raw.root_symbol === null
+    ? null
+    : String(raw.root_symbol).trim().toUpperCase();
+  const rawExpiration = raw.expiration_date === undefined || raw.expiration_date === null
+    ? null
+    : String(raw.expiration_date).trim();
+  const rawStrike = raw.strike_price === undefined || raw.strike_price === null
+    ? null
+    : finiteNumber(raw.strike_price);
+
+  if (
+    (rawType !== null && rawType !== parsed.optionType) ||
+    (rawUnderlying !== null && rawUnderlying !== parsed.underlying) ||
+    (rawRoot !== null && rawRoot !== parsed.underlying) ||
+    (rawExpiration !== null && rawExpiration !== parsed.expirationDate) ||
+    (raw.strike_price !== undefined && raw.strike_price !== null &&
+      (rawStrike === null || rawStrike !== parsed.strikePrice))
+  ) {
+    return null;
+  }
+
   return {
     symbol: parsed.normalizedSymbol,
-    underlying,
-    expirationDate,
-    type,
-    strike,
-    tradable: raw.tradable === true || raw.tradeable === true || raw.status === "active"
+    underlying: parsed.underlying,
+    expirationDate: parsed.expirationDate,
+    type: parsed.optionType,
+    strike: parsed.strikePrice,
+    tradable: raw.tradable === true || raw.tradeable === true || raw.status === "active",
+    requestId: raw.requestId ?? null
   };
 };
 
@@ -309,26 +350,33 @@ export const createAlpacaZeroDteMarketDataProvider = (): ZeroDteMarketDataProvid
   },
 
   async getBars(symbol, timeframe, start, end) {
+    assertReadOnlyAlpacaAccessAllowed();
     const rows = await fetchBars({ symbols: [symbol], timeframe, start, end });
-    return rows
-      .find((row) => row.symbol.toUpperCase() === symbol.toUpperCase())
-      ?.bars.map((bar) => ({
-        timestamp: bar.t,
-        open: bar.o,
-        high: bar.h,
-        low: bar.l,
-        close: bar.c,
-        volume: bar.v
-      })) ?? [];
+    return {
+      bars: rows
+        .filter((row) => row.symbol.toUpperCase() === symbol.toUpperCase())
+        .flatMap((row) => row.bars.map((bar) => ({
+          timestamp: bar.t,
+          open: bar.o,
+          high: bar.h,
+          low: bar.l,
+          close: bar.c,
+          volume: bar.v
+        }))),
+      requestIds: uniqueRequestIds(rows.map((row) => row.requestId))
+    };
   },
 
   async listContracts(input) {
+    assertReadOnlyAlpacaAccessAllowed();
     const contracts = await fetchOptionContracts({
       underlyingSymbols: [input.underlying],
       expirationDate: input.expirationDate,
       limit: input.limit
     });
-    return contracts.map(contractFromRaw).filter((contract): contract is ZeroDteContract => contract !== null);
+    return contracts
+      .map(normalizeZeroDteContract)
+      .filter((contract): contract is ZeroDteContract => contract !== null);
   },
 
   async getOptionSnapshots(symbols) {
@@ -356,6 +404,26 @@ export const createAlpacaZeroDteMarketDataProvider = (): ZeroDteMarketDataProvid
   }
 });
 
+const normalizeBarsResult = (
+  result: ZeroDteBar[] | ZeroDteBarsResult
+): ZeroDteBarsResult => {
+  if (Array.isArray(result)) {
+    return {
+      bars: result,
+      requestIds: uniqueRequestIds(
+        result.map((bar) => typeof bar.requestId === "string" ? bar.requestId : null)
+      )
+    };
+  }
+  return {
+    bars: result.bars ?? [],
+    requestIds: uniqueRequestIds([
+      ...result.requestIds,
+      ...result.bars.map((bar) => typeof bar.requestId === "string" ? bar.requestId : null)
+    ])
+  };
+};
+
 export const collectZeroDteMarketContexts = async (input: {
   now: string;
   config: ZeroDteConfig;
@@ -382,16 +450,31 @@ export const collectZeroDteMarketContexts = async (input: {
     const snapshot = stockSnapshots[underlying] ?? stockSnapshots[underlying.toLowerCase()];
     if (!snapshot) continue;
     const underlyingContext = stockPrice(snapshot);
-    if (!underlyingContext) continue;
-
-    const barsByTimeframe = Object.fromEntries(
-      await Promise.all(
-        TIMEFRAMES.map(async (timeframe) => [
-          timeframe,
-          await input.provider.getBars(underlying, timeframe, start, ingestedAt)
-        ] as const)
+    if (
+      !underlyingContext ||
+      !isFreshTimestamp(
+        underlyingContext.timestamp,
+        ingestedAt,
+        input.config.underlyingMaxAgeMs
       )
+    ) {
+      continue;
+    }
+
+    const barResults = await Promise.all(
+      TIMEFRAMES.map(async (timeframe) => [
+        timeframe,
+        normalizeBarsResult(
+          await input.provider.getBars(underlying, timeframe, start, ingestedAt)
+        )
+      ] as const)
+    );
+    const barsByTimeframe = Object.fromEntries(
+      barResults.map(([timeframe, result]) => [timeframe, result.bars])
     ) as Record<"1Min" | "5Min" | "15Min", ZeroDteBar[]>;
+    const barRequestIds = uniqueRequestIds(
+      barResults.flatMap(([, result]) => result.requestIds)
+    );
     const contracts = await input.provider.listContracts({
       underlying,
       expirationDate: tradingDate,
@@ -407,6 +490,9 @@ export const collectZeroDteMarketContexts = async (input: {
       ),
       underlyingContext.price,
       input.config.maxStrikesEachSide
+    );
+    const contractRequestIds = uniqueRequestIds(
+      contracts.map((contract) => contract.requestId)
     );
     if (!selectedContracts.length) continue;
 
@@ -481,7 +567,9 @@ export const collectZeroDteMarketContexts = async (input: {
         requestIds: {
           clock: clock.requestId ?? null,
           underlying: snapshot.requestId ?? null,
-          option: sourceOption.requestId ?? null
+          option: sourceOption.requestId ?? null,
+          bars: barRequestIds,
+          contracts: contractRequestIds
         },
         blockers: quoteBlockers(normalizedQuote.quoteStatus, normalizedQuote.rejectionReason)
       });
