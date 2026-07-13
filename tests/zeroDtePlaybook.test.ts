@@ -194,6 +194,58 @@ test("breakout is ineligible without opening-range evidence", () => {
   assert.equal(present.eligible, true);
 });
 
+test("breakout is ineligible until price is outside the opening range", () => {
+  const insideRange = findEvaluation(
+    makeContext("bullish", {
+      openingRange: { high: 120, low: 80, minutes: 15, source: "test" }
+    }),
+    "breakout"
+  );
+
+  assert.equal(insideRange.eligible, false);
+  assert.ok(insideRange.blockers.includes("OPENING_RANGE_NOT_BROKEN"));
+});
+
+test("neutral directions are never executable option-entry playbooks", () => {
+  const context = makeContext("bullish", { direction: "neutral" });
+  const evaluations = evaluateZeroDtePlaybooks(context);
+
+  assert.ok(evaluations.length > 0);
+  assert.ok(evaluations.every((entry) => entry.direction === "neutral"));
+  assert.ok(evaluations.every((entry) => entry.eligible === false));
+  assert.ok(
+    evaluations.every((entry) => entry.blockers.includes("NEUTRAL_DIRECTION_NOT_EXECUTABLE"))
+  );
+});
+
+test("crossed or explicitly invalid option quotes block playbook eligibility", () => {
+  const crossed = findEvaluation(
+    makeContext("bullish", {
+      option: {
+        ...makeOption("call"),
+        bid: 1.4,
+        ask: 1.2
+      }
+    }),
+    "trend_continuation"
+  );
+  const invalid = findEvaluation(
+    makeContext("bullish", {
+      option: {
+        ...makeOption("call"),
+        quoteStatus: "invalid",
+        executable: false
+      }
+    }),
+    "trend_continuation"
+  );
+
+  assert.equal(crossed.eligible, false);
+  assert.ok(crossed.blockers.includes("OPTION_QUOTE_CROSSED"));
+  assert.equal(invalid.eligible, false);
+  assert.ok(invalid.blockers.includes("OPTION_QUOTE_INVALID"));
+});
+
 test("gamma proxy is insufficient and ineligible when gamma or open interest is absent", () => {
   const missing = findEvaluation(
     makeContext("bullish", {

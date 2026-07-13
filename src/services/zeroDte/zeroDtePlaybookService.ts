@@ -379,14 +379,29 @@ const deriveMarketContext = (context: ZeroDtePlaybookContext): DerivedMarketCont
 
 const optionLiquidityScore = (
   context: ZeroDtePlaybookContext,
-  derived: DerivedMarketContext
+  _derived: DerivedMarketContext,
+  collector: SignalCollector
 ): number | null => {
-  const configured = readNumber(context.indicators, ["liquidityScore", "optionLiquidityScore"]);
-  if (configured !== null) return clamp(configured, 0, 100);
-
   const quote = context.option;
+  const quoteRecord = asRecord(quote);
+  const quoteStatus = readString(quoteRecord, ["quoteStatus", "quote_status", "status"]);
+  const executable = readBoolean(quoteRecord, ["executable"]);
   const bid = finite(quote.bid);
   const ask = finite(quote.ask);
+  if (quoteStatus !== null && quoteStatus.toLowerCase() !== "valid") {
+    addBlocker(collector, `OPTION_QUOTE_${quoteStatus.toUpperCase()}`);
+    return null;
+  }
+  if (executable === false) {
+    addBlocker(collector, "OPTION_QUOTE_NOT_EXECUTABLE");
+    return null;
+  }
+  if (bid !== null && ask !== null && ask < bid) {
+    addBlocker(collector, "OPTION_QUOTE_CROSSED");
+    return null;
+  }
+  const configured = readNumber(context.indicators, ["liquidityScore", "optionLiquidityScore"]);
+  if (configured !== null) return clamp(configured, 0, 100);
   const midpoint = finite(quote.midpoint) ?? (bid !== null && ask !== null ? (bid + ask) / 2 : null);
   const spreadPct =
     finite(quote.spreadPct) ??
@@ -576,7 +591,10 @@ const finalize = (input: FinalizeInput): PlaybookEvaluation => {
   const rawScore = Object.values(componentContributions).reduce((sum, value) => sum + value, 0) + (input.scoreAdjustment ?? 0);
   const score = clamp(Number.isFinite(rawScore) ? rawScore : 0, 0, 100);
   const missingInputs = unique(input.collector.missingInputs);
-  const blockers = unique(input.collector.blockers);
+  const blockers = unique([
+    ...input.collector.blockers,
+    ...(input.direction === "neutral" ? ["NEUTRAL_DIRECTION_NOT_EXECUTABLE"] : [])
+  ]);
   const eligible = blockers.length === 0 && score >= input.threshold;
   const status = input.status ?? (blockers.length ? "blocked" : "ready");
   const components = { ...componentContributions };
@@ -616,7 +634,7 @@ const evaluateTrendContinuation = (
   derived: DerivedMarketContext
 ) => {
   const collector = coreCollector(derived);
-  const liquidity = optionLiquidityScore(context, derived);
+  const liquidity = optionLiquidityScore(context, derived, collector);
   const components = {
     vwapDistance: addDirectionalMagnitude({
       collector,
@@ -915,6 +933,9 @@ const evaluateBreakout = (
           ? openingRange.low - price
           : Math.max(price - openingRange.high, openingRange.low - price)
       : null;
+  if (breakoutDistance !== null && breakoutDistance <= 0) {
+    addBlocker(collector, "OPENING_RANGE_NOT_BROKEN");
+  }
   const rangeWidth = openingRange ? openingRange.high - openingRange.low : null;
   const compression =
     readBoolean(context.indicators, ["compression", "rangeCompression", "consolidation"]) ??
@@ -974,7 +995,7 @@ const evaluateBreakout = (
       direction,
       15
     ),
-    liquidity: addLiquiditySignal(collector, optionLiquidityScore(context, derived), 10, direction),
+    liquidity: addLiquiditySignal(collector, optionLiquidityScore(context, derived, collector), 10, direction),
     falseBreakRisk: falseBreakRisk === null ? 0 : clamp(falseBreakRisk, 0, 1) * 10
   };
   if (falseBreakRisk !== null && falseBreakRisk > 0.5) {
@@ -1036,7 +1057,7 @@ const evaluateGammaProxy = (
       }
     });
   }
-  const liquidity = optionLiquidityScore(context, derived);
+  const liquidity = optionLiquidityScore(context, derived, collector);
   const components = {
     gammaMagnitude: clamp(Math.abs(gamma) * 1_000, 0, 50),
     openInterestDepth: clamp(Math.log10(openInterest + 1) / 4 * 30, 0, 30),
@@ -1103,7 +1124,7 @@ const evaluateVolatilityExpansion = (
     velocity: derived.velocity === null ? 0 : clamp(Math.abs(derived.velocity) / 1, 0, 1) * 10,
     breadth: derived.breadth === null ? 0 : clamp(Math.abs(derived.breadth) / 1, 0, 1) * 8,
     crossIndexConfirmation: derived.crossIndexConfirmation === true ? 8 : 0,
-    liquidity: addLiquiditySignal(collector, optionLiquidityScore(context, derived), 7, direction)
+    liquidity: addLiquiditySignal(collector, optionLiquidityScore(context, derived, collector), 7, direction)
   };
   if (derived.realizedVolatility === null || derived.realizedVolatilityBaseline === null) {
     addMissing(collector, "realizedVolatility");
