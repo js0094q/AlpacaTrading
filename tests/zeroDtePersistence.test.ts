@@ -3,8 +3,12 @@ import { after, test } from "node:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { DatabaseSync } from "node:sqlite";
 
-import { runZeroDteMigrations } from "../src/lib/zeroDteSchema.js";
+import {
+  runZeroDteMigrations,
+  ZERO_DTE_HARDENING_MIGRATION_VERSION
+} from "../src/lib/zeroDteSchema.js";
 import { configureSqliteTestDb } from "./helpers/sqliteTestDb.js";
 
 const dbDir = mkdtempSync(join(tmpdir(), "zero-dte-level-2-schema-"));
@@ -44,6 +48,355 @@ const levelTwoIndexes = [
   "uq_zero_dte_terminal_outcomes_shadow_trade",
   "idx_zero_dte_configuration_versions_created_at"
 ] as const;
+
+const hardeningTriggerNames = [
+  "trg_zero_dte_candidate_observations_engine_run_insert",
+  "trg_zero_dte_candidate_observations_engine_run_update",
+  "trg_zero_dte_playbook_evaluations_engine_run_insert",
+  "trg_zero_dte_playbook_evaluations_engine_run_update",
+  "trg_zero_dte_decisions_engine_run_insert",
+  "trg_zero_dte_decisions_engine_run_update",
+  "trg_zero_dte_position_marks_exactly_one_insert",
+  "trg_zero_dte_position_marks_exactly_one_update",
+  "trg_zero_dte_terminal_outcomes_integrity_insert",
+  "trg_zero_dte_terminal_outcomes_integrity_update",
+  "trg_zero_dte_terminal_outcomes_paper_candidate_insert",
+  "trg_zero_dte_terminal_outcomes_paper_candidate_update",
+  "trg_zero_dte_terminal_outcomes_shadow_candidate_insert",
+  "trg_zero_dte_terminal_outcomes_shadow_candidate_update",
+  "trg_zero_dte_terminal_outcomes_unique_candidate_insert",
+  "trg_zero_dte_terminal_outcomes_unique_candidate_update",
+  "trg_zero_dte_terminal_outcomes_unique_paper_insert",
+  "trg_zero_dte_terminal_outcomes_unique_paper_update",
+  "trg_zero_dte_terminal_outcomes_unique_shadow_insert",
+  "trg_zero_dte_terminal_outcomes_unique_shadow_update"
+] as const;
+
+const namesInSqliteMasterFor = (
+  db: DatabaseSync,
+  type: "table" | "index" | "trigger",
+  names: readonly string[]
+) => {
+  const placeholders = names.map(() => "?").join(", ");
+  return db
+    .prepare(
+      `SELECT name FROM sqlite_master WHERE type = ? AND name IN (${placeholders}) ORDER BY name`
+    )
+    .all(type, ...names) as Array<{ name: string }>;
+};
+
+const createBaseVersionCompatibleDb = () => {
+  const db = new DatabaseSync(":memory:");
+  db.exec(`
+    CREATE TABLE schema_migrations (
+      version TEXT PRIMARY KEY,
+      applied_at TEXT NOT NULL
+    );
+    INSERT INTO schema_migrations (version, applied_at)
+      VALUES ('2026-07-13-zero-dte-level-2', '2026-07-13T18:00:00.000Z');
+
+    CREATE TABLE zero_dte_configuration_versions (
+      configuration_version_id TEXT PRIMARY KEY,
+      strategy_version TEXT NOT NULL,
+      configuration_hash TEXT NOT NULL UNIQUE,
+      configuration_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE zero_dte_engine_runs (
+      run_id TEXT PRIMARY KEY,
+      trading_date TEXT NOT NULL,
+      mode TEXT NOT NULL,
+      account_mode TEXT NOT NULL,
+      status TEXT NOT NULL,
+      strategy_version TEXT NOT NULL,
+      configuration_version_id TEXT NOT NULL,
+      started_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(configuration_version_id)
+        REFERENCES zero_dte_configuration_versions(configuration_version_id)
+    );
+
+    CREATE TABLE zero_dte_candidates (
+      candidate_id TEXT PRIMARY KEY,
+      trading_date TEXT NOT NULL,
+      underlying_symbol TEXT NOT NULL,
+      option_symbol TEXT NOT NULL,
+      playbook TEXT NOT NULL,
+      direction TEXT NOT NULL,
+      expiration_date TEXT NOT NULL,
+      strike REAL NOT NULL,
+      state TEXT NOT NULL,
+      score REAL,
+      first_seen_at TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL,
+      state_changed_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE zero_dte_candidate_observations (
+      observation_id TEXT PRIMARY KEY,
+      candidate_id TEXT NOT NULL,
+      engine_run_id TEXT,
+      observed_at TEXT NOT NULL,
+      state TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(candidate_id) REFERENCES zero_dte_candidates(candidate_id),
+      FOREIGN KEY(engine_run_id) REFERENCES zero_dte_engine_runs(run_id)
+    );
+
+    CREATE TABLE zero_dte_playbook_evaluations (
+      evaluation_id TEXT PRIMARY KEY,
+      candidate_id TEXT NOT NULL,
+      engine_run_id TEXT,
+      playbook TEXT NOT NULL,
+      score REAL NOT NULL,
+      confidence REAL NOT NULL,
+      direction TEXT NOT NULL,
+      evaluated_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(candidate_id, engine_run_id, playbook),
+      FOREIGN KEY(candidate_id) REFERENCES zero_dte_candidates(candidate_id),
+      FOREIGN KEY(engine_run_id) REFERENCES zero_dte_engine_runs(run_id)
+    );
+
+    CREATE TABLE zero_dte_decisions (
+      decision_id TEXT PRIMARY KEY,
+      decision_group_id TEXT NOT NULL,
+      engine_run_id TEXT,
+      candidate_id TEXT NOT NULL,
+      trading_date TEXT NOT NULL,
+      action TEXT NOT NULL,
+      account_mode TEXT NOT NULL,
+      strategy_version TEXT NOT NULL,
+      configuration_version_id TEXT NOT NULL,
+      decided_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(engine_run_id) REFERENCES zero_dte_engine_runs(run_id),
+      FOREIGN KEY(candidate_id) REFERENCES zero_dte_candidates(candidate_id),
+      FOREIGN KEY(configuration_version_id)
+        REFERENCES zero_dte_configuration_versions(configuration_version_id)
+    );
+
+    CREATE TABLE zero_dte_paper_trades (
+      paper_trade_id TEXT PRIMARY KEY,
+      decision_id TEXT NOT NULL,
+      candidate_id TEXT NOT NULL,
+      trading_date TEXT NOT NULL,
+      underlying_symbol TEXT NOT NULL,
+      option_symbol TEXT NOT NULL,
+      playbook TEXT NOT NULL,
+      direction TEXT NOT NULL,
+      status TEXT NOT NULL,
+      quantity INTEGER NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(decision_id) REFERENCES zero_dte_decisions(decision_id),
+      FOREIGN KEY(candidate_id) REFERENCES zero_dte_candidates(candidate_id)
+    );
+
+    CREATE TABLE zero_dte_shadow_trades (
+      shadow_trade_id TEXT PRIMARY KEY,
+      decision_group_id TEXT NOT NULL,
+      decision_id TEXT,
+      candidate_id TEXT NOT NULL,
+      trading_date TEXT NOT NULL,
+      underlying_symbol TEXT NOT NULL,
+      option_symbol TEXT NOT NULL,
+      playbook TEXT NOT NULL,
+      direction TEXT NOT NULL,
+      alternative_type TEXT NOT NULL,
+      status TEXT NOT NULL,
+      quantity INTEGER NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(decision_id) REFERENCES zero_dte_decisions(decision_id),
+      FOREIGN KEY(candidate_id) REFERENCES zero_dte_candidates(candidate_id)
+    );
+
+    CREATE TABLE zero_dte_position_marks (
+      mark_id TEXT PRIMARY KEY,
+      paper_trade_id TEXT,
+      shadow_trade_id TEXT,
+      marked_at TEXT NOT NULL,
+      source TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(paper_trade_id) REFERENCES zero_dte_paper_trades(paper_trade_id),
+      FOREIGN KEY(shadow_trade_id) REFERENCES zero_dte_shadow_trades(shadow_trade_id),
+      CHECK (paper_trade_id IS NOT NULL OR shadow_trade_id IS NOT NULL)
+    );
+
+    CREATE TABLE zero_dte_terminal_outcomes (
+      outcome_id TEXT PRIMARY KEY,
+      candidate_id TEXT,
+      paper_trade_id TEXT,
+      shadow_trade_id TEXT,
+      decision_id TEXT,
+      trading_date TEXT NOT NULL,
+      outcome_type TEXT NOT NULL,
+      horizon_minutes INTEGER,
+      terminal_state TEXT NOT NULL,
+      completeness_status TEXT NOT NULL,
+      evaluated_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(candidate_id) REFERENCES zero_dte_candidates(candidate_id),
+      FOREIGN KEY(paper_trade_id) REFERENCES zero_dte_paper_trades(paper_trade_id),
+      FOREIGN KEY(shadow_trade_id) REFERENCES zero_dte_shadow_trades(shadow_trade_id),
+      FOREIGN KEY(decision_id) REFERENCES zero_dte_decisions(decision_id),
+      UNIQUE(paper_trade_id, shadow_trade_id, outcome_type, horizon_minutes)
+    );
+  `);
+  db.exec("PRAGMA foreign_keys = ON;");
+  return db;
+};
+
+const seedBaseVersionFixtures = (db: DatabaseSync) => {
+  const timestamp = "2026-07-13T19:00:00.000Z";
+
+  db.prepare(
+    `INSERT INTO zero_dte_configuration_versions
+      (configuration_version_id, strategy_version, configuration_hash, configuration_json, created_at)
+     VALUES (?, ?, ?, ?, ?)`
+  ).run("config-1", "zero-dte-level-2-v1", "hash-1", "{}", timestamp);
+
+  db.prepare(
+    `INSERT INTO zero_dte_engine_runs
+      (run_id, trading_date, mode, account_mode, status, strategy_version,
+       configuration_version_id, started_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    "run-1",
+    "2026-07-13",
+    "test",
+    "paper",
+    "completed",
+    "zero-dte-level-2-v1",
+    "config-1",
+    timestamp,
+    timestamp
+  );
+
+  for (const candidateId of ["candidate-1", "candidate-2"]) {
+    db.prepare(
+      `INSERT INTO zero_dte_candidates
+        (candidate_id, trading_date, underlying_symbol, option_symbol, playbook,
+         direction, expiration_date, strike, state, first_seen_at, last_seen_at,
+         state_changed_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      candidateId,
+      "2026-07-13",
+      "SPY",
+      `${candidateId}-option`,
+      "trend_continuation",
+      "bullish",
+      "2026-07-13",
+      500,
+      "eligible",
+      timestamp,
+      timestamp,
+      timestamp,
+      timestamp,
+      timestamp
+    );
+  }
+
+  db.prepare(
+    `INSERT INTO zero_dte_decisions
+      (decision_id, decision_group_id, engine_run_id, candidate_id, trading_date,
+       action, account_mode, strategy_version, configuration_version_id,
+       decided_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    "decision-1",
+    "group-1",
+    "run-1",
+    "candidate-1",
+    "2026-07-13",
+    "select",
+    "paper",
+    "zero-dte-level-2-v1",
+    "config-1",
+    timestamp,
+    timestamp
+  );
+
+  db.prepare(
+    `INSERT INTO zero_dte_paper_trades
+      (paper_trade_id, decision_id, candidate_id, trading_date, underlying_symbol,
+       option_symbol, playbook, direction, status, quantity, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    "paper-1",
+    "decision-1",
+    "candidate-1",
+    "2026-07-13",
+    "SPY",
+    "candidate-1-option",
+    "trend_continuation",
+    "bullish",
+    "open",
+    1,
+    timestamp,
+    timestamp
+  );
+
+  db.prepare(
+    `INSERT INTO zero_dte_shadow_trades
+      (shadow_trade_id, decision_group_id, decision_id, candidate_id, trading_date,
+       underlying_symbol, option_symbol, playbook, direction, alternative_type,
+       status, quantity, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    "shadow-1",
+    "group-1",
+    "decision-1",
+    "candidate-1",
+    "2026-07-13",
+    "SPY",
+    "candidate-1-option",
+    "trend_continuation",
+    "bullish",
+    "runner_up",
+    "open",
+    1,
+    timestamp,
+    timestamp
+  );
+
+  // These rows were legal under the base migration and must remain readable after hardening.
+  db.prepare(
+    `INSERT INTO zero_dte_candidate_observations
+      (observation_id, candidate_id, engine_run_id, observed_at, state, created_at)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).run(
+    "legacy-null-engine-run",
+    "candidate-1",
+    null,
+    timestamp,
+    "eligible",
+    timestamp
+  );
+
+  db.prepare(
+    `INSERT INTO zero_dte_terminal_outcomes
+      (outcome_id, candidate_id, paper_trade_id, trading_date, outcome_type,
+       horizon_minutes, terminal_state, completeness_status, evaluated_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    "legacy-mismatched-candidate",
+    "candidate-2",
+    "paper-1",
+    "2026-07-13",
+    "legacy_mismatch",
+    5,
+    "closed",
+    "complete",
+    timestamp,
+    timestamp
+  );
+};
 
 const namesInSqliteMaster = (type: "table" | "index", names: readonly string[]) => {
   const placeholders = names.map(() => "?").join(", ");
@@ -193,15 +546,17 @@ const insertPositionMark = (
     );
 };
 
-const insertTerminalOutcome = (input: {
+type TerminalOutcomeInput = {
   outcomeId: string;
   candidateId: string | null;
   paperTradeId?: string | null;
   shadowTradeId?: string | null;
   outcomeType?: string;
   horizonMinutes?: number | null;
-}) => {
-  seedIntegrityFixtures()
+};
+
+const insertTerminalOutcomeInto = (db: DatabaseSync, input: TerminalOutcomeInput) => {
+  db
     .prepare(
       `INSERT INTO zero_dte_terminal_outcomes
         (outcome_id, candidate_id, paper_trade_id, shadow_trade_id,
@@ -216,12 +571,16 @@ const insertTerminalOutcome = (input: {
       input.shadowTradeId ?? null,
       "2026-07-13",
       input.outcomeType ?? "terminal",
-      input.horizonMinutes ?? 5,
+      input.horizonMinutes === undefined ? 5 : input.horizonMinutes,
       "closed",
       "complete",
       "2026-07-13T19:02:00.000Z",
       "2026-07-13T19:02:00.000Z"
     );
+};
+
+const insertTerminalOutcome = (input: TerminalOutcomeInput) => {
+  insertTerminalOutcomeInto(getDb(), input);
 };
 
 after(() => {
@@ -272,6 +631,126 @@ test("initialization is idempotent and records one migration row", () => {
     ) as { count: number }).count,
     1
   );
+});
+
+test("base-version databases receive non-destructive hardening exactly once", () => {
+  const db = createBaseVersionCompatibleDb();
+  seedBaseVersionFixtures(db);
+
+  runZeroDteMigrations(db);
+
+  assert.deepEqual(
+    namesInSqliteMasterFor(db, "trigger", hardeningTriggerNames).map((row) => row.name),
+    [...hardeningTriggerNames].sort()
+  );
+  assert.equal(
+    (
+      db
+        .prepare(
+          "SELECT COUNT(*) AS count FROM schema_migrations WHERE version = ?"
+        )
+        .get(ZERO_DTE_HARDENING_MIGRATION_VERSION) as { count: number }
+    ).count,
+    1
+  );
+  assert.equal(
+    (
+      db
+        .prepare(
+          "SELECT COUNT(*) AS count FROM zero_dte_candidate_observations WHERE observation_id = ?"
+        )
+        .get("legacy-null-engine-run") as { count: number }
+    ).count,
+    1
+  );
+  assert.equal(
+    (
+      db
+        .prepare(
+          "SELECT COUNT(*) AS count FROM zero_dte_terminal_outcomes WHERE outcome_id = ?"
+        )
+        .get("legacy-mismatched-candidate") as { count: number }
+    ).count,
+    1
+  );
+
+  assert.throws(() =>
+    db
+      .prepare(
+        `INSERT INTO zero_dte_candidate_observations
+          (observation_id, candidate_id, engine_run_id, observed_at, state, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        "upgraded-observation-without-run",
+        "candidate-1",
+        null,
+        "2026-07-13T19:03:00.000Z",
+        "eligible",
+        "2026-07-13T19:03:00.000Z"
+      )
+  );
+  assert.throws(() =>
+    db
+      .prepare(
+        `INSERT INTO zero_dte_position_marks
+          (mark_id, paper_trade_id, shadow_trade_id, marked_at, source, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        "upgraded-mark-both",
+        "paper-1",
+        "shadow-1",
+        "2026-07-13T19:03:00.000Z",
+        "test",
+        "2026-07-13T19:03:00.000Z"
+      )
+  );
+  assert.throws(() =>
+    insertTerminalOutcomeInto(db, {
+      outcomeId: "upgraded-mismatched-paper-outcome",
+      candidateId: "candidate-2",
+      paperTradeId: "paper-1",
+      outcomeType: "upgraded_mismatch",
+      horizonMinutes: 5
+    })
+  );
+  assert.throws(() =>
+    insertTerminalOutcomeInto(db, {
+      outcomeId: "upgraded-orphan-outcome",
+      candidateId: null,
+      outcomeType: "upgraded_orphan",
+      horizonMinutes: 5
+    })
+  );
+
+  insertTerminalOutcomeInto(db, {
+    outcomeId: "upgraded-candidate-only-1",
+    candidateId: "candidate-1",
+    outcomeType: "upgraded_candidate_only",
+    horizonMinutes: 30
+  });
+  assert.throws(() =>
+    insertTerminalOutcomeInto(db, {
+      outcomeId: "upgraded-candidate-only-duplicate",
+      candidateId: "candidate-1",
+      outcomeType: "upgraded_candidate_only",
+      horizonMinutes: 30
+    })
+  );
+
+  runZeroDteMigrations(db);
+  assert.equal(
+    (
+      db
+        .prepare(
+          "SELECT COUNT(*) AS count FROM schema_migrations WHERE version = ?"
+        )
+        .get(ZERO_DTE_HARDENING_MIGRATION_VERSION) as { count: number }
+    ).count,
+    1
+  );
+  db.close();
 });
 
 test("material observations, playbook evaluations, and decisions require an engine run", () => {

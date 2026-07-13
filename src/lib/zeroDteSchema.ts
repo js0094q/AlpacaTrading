@@ -1,6 +1,8 @@
 import type { DatabaseSync } from "node:sqlite";
 
 export const ZERO_DTE_MIGRATION_VERSION = "2026-07-13-zero-dte-level-2";
+export const ZERO_DTE_HARDENING_MIGRATION_VERSION =
+  "2026-07-13-zero-dte-level-2-hardening";
 
 const zeroDteSchema = `
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -349,32 +351,6 @@ CREATE TABLE IF NOT EXISTS zero_dte_terminal_outcomes (
   )
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS uq_zero_dte_terminal_outcomes_candidate_only
-  ON zero_dte_terminal_outcomes(
-    candidate_id,
-    outcome_type,
-    COALESCE(horizon_minutes, -1)
-  )
-  WHERE paper_trade_id IS NULL AND shadow_trade_id IS NULL;
-
-CREATE UNIQUE INDEX IF NOT EXISTS uq_zero_dte_terminal_outcomes_paper_trade
-  ON zero_dte_terminal_outcomes(
-    candidate_id,
-    paper_trade_id,
-    outcome_type,
-    COALESCE(horizon_minutes, -1)
-  )
-  WHERE paper_trade_id IS NOT NULL AND shadow_trade_id IS NULL;
-
-CREATE UNIQUE INDEX IF NOT EXISTS uq_zero_dte_terminal_outcomes_shadow_trade
-  ON zero_dte_terminal_outcomes(
-    candidate_id,
-    shadow_trade_id,
-    outcome_type,
-    COALESCE(horizon_minutes, -1)
-  )
-  WHERE paper_trade_id IS NULL AND shadow_trade_id IS NOT NULL;
-
 CREATE INDEX IF NOT EXISTS idx_zero_dte_terminal_outcomes_candidate_recorded_at
   ON zero_dte_terminal_outcomes(candidate_id, evaluated_at);
 
@@ -408,14 +384,294 @@ CREATE INDEX IF NOT EXISTS idx_zero_dte_lifecycle_events_candidate_occurred_at
   ON zero_dte_lifecycle_events(candidate_id, occurred_at);
 `;
 
+const zeroDteUniqueIndexes = `
+CREATE UNIQUE INDEX IF NOT EXISTS uq_zero_dte_terminal_outcomes_candidate_only
+  ON zero_dte_terminal_outcomes(
+    candidate_id,
+    outcome_type,
+    COALESCE(horizon_minutes, -1)
+  )
+  WHERE paper_trade_id IS NULL AND shadow_trade_id IS NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_zero_dte_terminal_outcomes_paper_trade
+  ON zero_dte_terminal_outcomes(
+    candidate_id,
+    paper_trade_id,
+    outcome_type,
+    COALESCE(horizon_minutes, -1)
+  )
+  WHERE paper_trade_id IS NOT NULL AND shadow_trade_id IS NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_zero_dte_terminal_outcomes_shadow_trade
+  ON zero_dte_terminal_outcomes(
+    candidate_id,
+    shadow_trade_id,
+    outcome_type,
+    COALESCE(horizon_minutes, -1)
+  )
+  WHERE paper_trade_id IS NULL AND shadow_trade_id IS NOT NULL;
+`;
+
+const zeroDteHardeningSchema = `
+CREATE TRIGGER IF NOT EXISTS trg_zero_dte_candidate_observations_engine_run_insert
+BEFORE INSERT ON zero_dte_candidate_observations
+WHEN NEW.engine_run_id IS NULL
+BEGIN
+  SELECT RAISE(ABORT, 'zero_dte_candidate_observations.engine_run_id is required');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_zero_dte_candidate_observations_engine_run_update
+BEFORE UPDATE ON zero_dte_candidate_observations
+WHEN NEW.engine_run_id IS NULL
+BEGIN
+  SELECT RAISE(ABORT, 'zero_dte_candidate_observations.engine_run_id is required');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_zero_dte_playbook_evaluations_engine_run_insert
+BEFORE INSERT ON zero_dte_playbook_evaluations
+WHEN NEW.engine_run_id IS NULL
+BEGIN
+  SELECT RAISE(ABORT, 'zero_dte_playbook_evaluations.engine_run_id is required');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_zero_dte_playbook_evaluations_engine_run_update
+BEFORE UPDATE ON zero_dte_playbook_evaluations
+WHEN NEW.engine_run_id IS NULL
+BEGIN
+  SELECT RAISE(ABORT, 'zero_dte_playbook_evaluations.engine_run_id is required');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_zero_dte_decisions_engine_run_insert
+BEFORE INSERT ON zero_dte_decisions
+WHEN NEW.engine_run_id IS NULL
+BEGIN
+  SELECT RAISE(ABORT, 'zero_dte_decisions.engine_run_id is required');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_zero_dte_decisions_engine_run_update
+BEFORE UPDATE ON zero_dte_decisions
+WHEN NEW.engine_run_id IS NULL
+BEGIN
+  SELECT RAISE(ABORT, 'zero_dte_decisions.engine_run_id is required');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_zero_dte_position_marks_exactly_one_insert
+BEFORE INSERT ON zero_dte_position_marks
+WHEN (NEW.paper_trade_id IS NOT NULL) = (NEW.shadow_trade_id IS NOT NULL)
+BEGIN
+  SELECT RAISE(ABORT, 'zero_dte_position_marks requires exactly one trade domain');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_zero_dte_position_marks_exactly_one_update
+BEFORE UPDATE ON zero_dte_position_marks
+WHEN (NEW.paper_trade_id IS NOT NULL) = (NEW.shadow_trade_id IS NOT NULL)
+BEGIN
+  SELECT RAISE(ABORT, 'zero_dte_position_marks requires exactly one trade domain');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_zero_dte_terminal_outcomes_integrity_insert
+BEFORE INSERT ON zero_dte_terminal_outcomes
+WHEN NEW.candidate_id IS NULL
+  OR (NEW.paper_trade_id IS NOT NULL AND NEW.shadow_trade_id IS NOT NULL)
+BEGIN
+  SELECT RAISE(ABORT, 'zero_dte_terminal_outcomes requires a candidate and at most one trade');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_zero_dte_terminal_outcomes_integrity_update
+BEFORE UPDATE ON zero_dte_terminal_outcomes
+WHEN NEW.candidate_id IS NULL
+  OR (NEW.paper_trade_id IS NOT NULL AND NEW.shadow_trade_id IS NOT NULL)
+BEGIN
+  SELECT RAISE(ABORT, 'zero_dte_terminal_outcomes requires a candidate and at most one trade');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_zero_dte_terminal_outcomes_paper_candidate_insert
+BEFORE INSERT ON zero_dte_terminal_outcomes
+WHEN NEW.paper_trade_id IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1
+    FROM zero_dte_paper_trades
+    WHERE paper_trade_id = NEW.paper_trade_id
+      AND candidate_id = NEW.candidate_id
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'zero_dte_terminal_outcomes paper trade candidate mismatch');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_zero_dte_terminal_outcomes_paper_candidate_update
+BEFORE UPDATE ON zero_dte_terminal_outcomes
+WHEN NEW.paper_trade_id IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1
+    FROM zero_dte_paper_trades
+    WHERE paper_trade_id = NEW.paper_trade_id
+      AND candidate_id = NEW.candidate_id
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'zero_dte_terminal_outcomes paper trade candidate mismatch');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_zero_dte_terminal_outcomes_shadow_candidate_insert
+BEFORE INSERT ON zero_dte_terminal_outcomes
+WHEN NEW.shadow_trade_id IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1
+    FROM zero_dte_shadow_trades
+    WHERE shadow_trade_id = NEW.shadow_trade_id
+      AND candidate_id = NEW.candidate_id
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'zero_dte_terminal_outcomes shadow trade candidate mismatch');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_zero_dte_terminal_outcomes_shadow_candidate_update
+BEFORE UPDATE ON zero_dte_terminal_outcomes
+WHEN NEW.shadow_trade_id IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1
+    FROM zero_dte_shadow_trades
+    WHERE shadow_trade_id = NEW.shadow_trade_id
+      AND candidate_id = NEW.candidate_id
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'zero_dte_terminal_outcomes shadow trade candidate mismatch');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_zero_dte_terminal_outcomes_unique_candidate_insert
+BEFORE INSERT ON zero_dte_terminal_outcomes
+WHEN NEW.paper_trade_id IS NULL
+  AND NEW.shadow_trade_id IS NULL
+  AND EXISTS (
+    SELECT 1
+    FROM zero_dte_terminal_outcomes AS existing
+    WHERE existing.candidate_id = NEW.candidate_id
+      AND existing.paper_trade_id IS NULL
+      AND existing.shadow_trade_id IS NULL
+      AND existing.outcome_type = NEW.outcome_type
+      AND COALESCE(existing.horizon_minutes, -1) = COALESCE(NEW.horizon_minutes, -1)
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'duplicate zero_dte candidate terminal outcome');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_zero_dte_terminal_outcomes_unique_candidate_update
+BEFORE UPDATE ON zero_dte_terminal_outcomes
+WHEN NEW.paper_trade_id IS NULL
+  AND NEW.shadow_trade_id IS NULL
+  AND EXISTS (
+    SELECT 1
+    FROM zero_dte_terminal_outcomes AS existing
+    WHERE existing.outcome_id <> NEW.outcome_id
+      AND existing.candidate_id = NEW.candidate_id
+      AND existing.paper_trade_id IS NULL
+      AND existing.shadow_trade_id IS NULL
+      AND existing.outcome_type = NEW.outcome_type
+      AND COALESCE(existing.horizon_minutes, -1) = COALESCE(NEW.horizon_minutes, -1)
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'duplicate zero_dte candidate terminal outcome');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_zero_dte_terminal_outcomes_unique_paper_insert
+BEFORE INSERT ON zero_dte_terminal_outcomes
+WHEN NEW.paper_trade_id IS NOT NULL
+  AND NEW.shadow_trade_id IS NULL
+  AND EXISTS (
+    SELECT 1
+    FROM zero_dte_terminal_outcomes AS existing
+    WHERE existing.candidate_id = NEW.candidate_id
+      AND existing.paper_trade_id = NEW.paper_trade_id
+      AND existing.shadow_trade_id IS NULL
+      AND existing.outcome_type = NEW.outcome_type
+      AND COALESCE(existing.horizon_minutes, -1) = COALESCE(NEW.horizon_minutes, -1)
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'duplicate zero_dte paper terminal outcome');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_zero_dte_terminal_outcomes_unique_paper_update
+BEFORE UPDATE ON zero_dte_terminal_outcomes
+WHEN NEW.paper_trade_id IS NOT NULL
+  AND NEW.shadow_trade_id IS NULL
+  AND EXISTS (
+    SELECT 1
+    FROM zero_dte_terminal_outcomes AS existing
+    WHERE existing.outcome_id <> NEW.outcome_id
+      AND existing.candidate_id = NEW.candidate_id
+      AND existing.paper_trade_id = NEW.paper_trade_id
+      AND existing.shadow_trade_id IS NULL
+      AND existing.outcome_type = NEW.outcome_type
+      AND COALESCE(existing.horizon_minutes, -1) = COALESCE(NEW.horizon_minutes, -1)
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'duplicate zero_dte paper terminal outcome');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_zero_dte_terminal_outcomes_unique_shadow_insert
+BEFORE INSERT ON zero_dte_terminal_outcomes
+WHEN NEW.paper_trade_id IS NULL
+  AND NEW.shadow_trade_id IS NOT NULL
+  AND EXISTS (
+    SELECT 1
+    FROM zero_dte_terminal_outcomes AS existing
+    WHERE existing.candidate_id = NEW.candidate_id
+      AND existing.paper_trade_id IS NULL
+      AND existing.shadow_trade_id = NEW.shadow_trade_id
+      AND existing.outcome_type = NEW.outcome_type
+      AND COALESCE(existing.horizon_minutes, -1) = COALESCE(NEW.horizon_minutes, -1)
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'duplicate zero_dte shadow terminal outcome');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_zero_dte_terminal_outcomes_unique_shadow_update
+BEFORE UPDATE ON zero_dte_terminal_outcomes
+WHEN NEW.paper_trade_id IS NULL
+  AND NEW.shadow_trade_id IS NOT NULL
+  AND EXISTS (
+    SELECT 1
+    FROM zero_dte_terminal_outcomes AS existing
+    WHERE existing.outcome_id <> NEW.outcome_id
+      AND existing.candidate_id = NEW.candidate_id
+      AND existing.paper_trade_id IS NULL
+      AND existing.shadow_trade_id = NEW.shadow_trade_id
+      AND existing.outcome_type = NEW.outcome_type
+      AND COALESCE(existing.horizon_minutes, -1) = COALESCE(NEW.horizon_minutes, -1)
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'duplicate zero_dte shadow terminal outcome');
+END;
+`;
+
 export const runZeroDteMigrations = (db: DatabaseSync): void => {
   db.exec("PRAGMA foreign_keys = ON;");
+  const hasExistingZeroDteSchema = Boolean(
+    db
+      .prepare(
+        "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'zero_dte_engine_runs'"
+      )
+      .get()
+  );
   try {
     db.exec("BEGIN IMMEDIATE;");
     db.exec(zeroDteSchema);
+    try {
+      db.exec(zeroDteUniqueIndexes);
+    } catch (error) {
+      if (!hasExistingZeroDteSchema) {
+        throw error;
+      }
+      // Keep existing rows intact. The hardening triggers below still enforce
+      // uniqueness for future writes if a legacy database contains duplicates.
+    }
+    db.exec(zeroDteHardeningSchema);
+    const appliedAt = new Date().toISOString();
     db.prepare(
       "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)"
-    ).run(ZERO_DTE_MIGRATION_VERSION, new Date().toISOString());
+    ).run(ZERO_DTE_MIGRATION_VERSION, appliedAt);
+    db.prepare(
+      "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)"
+    ).run(ZERO_DTE_HARDENING_MIGRATION_VERSION, appliedAt);
     db.exec("COMMIT;");
   } catch (error) {
     try {
