@@ -59,6 +59,8 @@ export interface HedgeExecutionReviewInput {
   generatedAt: string;
   signingKey: string;
   candidate: HedgeCandidate;
+  reviewType?: "entry" | "exit";
+  orderSide?: "buy_to_open" | "sell_to_close";
   reviewTtlSeconds?: number;
   requestId?: string;
   correlationId?: string | null;
@@ -123,6 +125,8 @@ export const createHedgeExecutionReview = (
     throw new Error("HEDGE_REVIEW_PRICE_REQUIRED");
   }
   const createdAt = input.generatedAt;
+  const reviewType = input.reviewType ?? "entry";
+  const orderSide = input.orderSide ?? (reviewType === "exit" ? "sell_to_close" : "buy_to_open");
   const ttlSeconds = Math.max(1, Math.floor(input.reviewTtlSeconds ?? 300));
   const expiresAt = new Date(Date.parse(createdAt) + ttlSeconds * 1000).toISOString();
   const maxPremium = Math.round(estimatedCost * 100) / 100;
@@ -130,7 +134,7 @@ export const createHedgeExecutionReview = (
     structure: "long_put",
     symbol: input.candidate.symbol,
     underlying: input.candidate.underlying,
-    side: "buy_to_open",
+    side: orderSide,
     orderType: "limit",
     timeInForce: "day",
     quantity,
@@ -141,7 +145,7 @@ export const createHedgeExecutionReview = (
   };
   const reviewBase = {
     recordType: "hedge_execution_review" as const,
-    reviewType: "entry" as const,
+    reviewType,
     createdAt,
     expiresAt,
     environment: "paper" as const,
@@ -181,7 +185,7 @@ export const createHedgeExecutionReview = (
     correlationId: input.correlationId ?? null
   };
   const payloadHash = canonicalJsonHash(reviewBase);
-  const clientOrderId = `hedge-entry-${payloadHash.slice(0, 24)}`;
+  const clientOrderId = `hedge-${reviewType}-${payloadHash.slice(0, 24)}`;
   const review = {
     ...reviewBase,
     clientOrderId,
@@ -206,7 +210,7 @@ export const verifyHedgeExecutionReview = (input: {
   const blockers: string[] = [];
   const calculatedPayloadHash = canonicalJsonHash(unsignedPayload(input.review));
   if (input.review.recordType !== "hedge_execution_review") blockers.push("HEDGE_REVIEW_SCHEMA_INVALID");
-  if (input.review.reviewType !== "entry") blockers.push("HEDGE_REVIEW_TYPE_INVALID");
+  if (!["entry", "exit"].includes(input.review.reviewType)) blockers.push("HEDGE_REVIEW_TYPE_INVALID");
   if (input.review.environment !== "paper" || input.review.paperOnly !== true) blockers.push("HEDGE_ENVIRONMENT_NOT_PAPER");
   if (input.review.liveTradingEnabled !== false) blockers.push("HEDGE_LIVE_TRADING_ENABLED");
   if (calculatedPayloadHash !== input.review.payloadHash) blockers.push("HEDGE_PAYLOAD_CHANGED");
@@ -218,7 +222,8 @@ export const verifyHedgeExecutionReview = (input: {
   if (input.accountHash !== undefined && input.accountHash !== input.review.accountHash) blockers.push("HEDGE_ACCOUNT_IDENTITY_MISMATCH");
   if (input.configurationFingerprint !== undefined && input.configurationFingerprint !== input.review.configurationFingerprint) blockers.push("HEDGE_CONFIGURATION_MISMATCH");
   if (input.sourceSnapshotId !== undefined && input.sourceSnapshotId !== input.review.sourceSnapshotId) blockers.push("HEDGE_SOURCE_SNAPSHOT_MISMATCH");
-  if (input.review.orderIntent.structure !== "long_put" || input.review.orderIntent.side !== "buy_to_open") blockers.push("MULTI_LEG_EXECUTION_UNSUPPORTED");
+  const expectedSide = input.review.reviewType === "exit" ? "sell_to_close" : "buy_to_open";
+  if (input.review.orderIntent.structure !== "long_put" || input.review.orderIntent.side !== expectedSide) blockers.push("MULTI_LEG_EXECUTION_UNSUPPORTED");
   if (input.review.orderIntent.quantity < 1 || input.review.orderIntent.quantity > input.review.caps.maxQuantity) blockers.push("HEDGE_QUANTITY_CAP_EXCEEDED");
   if (input.review.orderIntent.maxPremium > input.review.caps.maxPremium) blockers.push("HEDGE_PREMIUM_CAP_EXCEEDED");
   return { valid: blockers.length === 0, blockers: unique(blockers), calculatedPayloadHash };

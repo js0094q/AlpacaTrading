@@ -92,6 +92,11 @@ import {
   buildAndPersistHedgeReview
 } from "./services/hedgeLearningService.js";
 import { executeReviewedPaperHedge } from "./services/hedgeExecutionService.js";
+import {
+  buildHedgeExitReview,
+  executeReviewedPaperHedgeExit
+} from "./services/hedgeExitService.js";
+import { evaluateHedgeLearning } from "./services/hedgeLearningLifecycleService.js";
 
 const parseArg = (input: string): Record<string, string> | null => {
   const [rawKey, rawValue] = input.split("=", 2);
@@ -1091,6 +1096,52 @@ const run = async () => {
       confirmPaper: flagArg(args.confirmPaper)
     });
     print(result);
+    return;
+  }
+
+  if (command === "hedge:exit:review") {
+    if (!args.symbol || !args.underlying || !args.expirationDate) {
+      print({ paperOnly: true, environment: "paper", status: "blocked", blockers: ["HEDGE_EXIT_INPUT_REQUIRED"] });
+      return;
+    }
+    const asOf = args.asOf ?? new Date().toISOString();
+    const result = buildHedgeExitReview({
+      symbol: args.symbol,
+      underlying: args.underlying,
+      quantity: toInt(args.quantity, 1),
+      entryPrice: Number(args.entryPrice ?? 0),
+      currentPrice: Number(args.currentPrice ?? 0),
+      expirationDate: args.expirationDate,
+      entryAt: args.entryAt ?? asOf,
+      asOf,
+      bid: args.bid ? Number(args.bid) : null,
+      ask: args.ask ? Number(args.ask) : null,
+      delta: args.delta ? Number(args.delta) : null,
+      accountHash: args.accountHash ?? "cli-paper-account",
+      sourceRecommendationId: args.sourceRecommendationId ?? "cli-hedge-exit",
+      sourceSnapshotId: args.sourceSnapshotId ?? "cli-snapshot",
+      sourceRegimeId: args.sourceRegimeId ?? "cli-regime",
+      riskModelVersion: args.riskModelVersion ?? "portfolio-risk-v1",
+      regimeModelVersion: args.regimeModelVersion ?? "market-regime-v1",
+      configurationFingerprint: args.configurationFingerprint ?? "cli-config",
+      staleThesis: flagArg(args.staleThesis),
+      riskNormalizationObservations: toInt(args.riskNormalizationObservations),
+      signingKey: process.env.HEDGE_REVIEW_SIGNING_KEY
+    });
+    print(result);
+    return;
+  }
+
+  if (command === "hedge:exit:execute") {
+    print(await executeReviewedPaperHedgeExit({
+      reviewId: String(args.reviewId || ""),
+      confirmPaper: flagArg(args.confirmPaper)
+    }));
+    return;
+  }
+
+  if (command === "hedge:learning") {
+    print(evaluateHedgeLearning(String(args.reviewId || "")));
     return;
   }
 

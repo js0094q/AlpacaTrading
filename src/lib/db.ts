@@ -473,6 +473,17 @@ CREATE TABLE IF NOT EXISTS hedge_execution_reviews (
 CREATE INDEX IF NOT EXISTS idx_hedge_execution_reviews_expires_at
   ON hedge_execution_reviews(expires_at);
 
+CREATE TABLE IF NOT EXISTS hedge_learning_events (
+  event_id TEXT PRIMARY KEY,
+  review_id TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  evidence_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_hedge_learning_events_review_id
+  ON hedge_learning_events(review_id, created_at);
+
 CREATE TABLE IF NOT EXISTS portfolio_high_water_marks (
   environment TEXT PRIMARY KEY,
   equity REAL NOT NULL,

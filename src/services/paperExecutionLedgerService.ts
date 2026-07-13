@@ -343,22 +343,28 @@ export const reservePaperExecutionAttempt = (input: {
   estimatedPremium: number;
   expiresAt: string;
   requestId?: string | null;
+  mode?: "hedge-entry" | "hedge-exit";
+  side?: "buy" | "sell";
+  positionIntent?: "buy_to_open" | "sell_to_close";
 }) => {
+  const mode = input.mode ?? "hedge-entry";
+  const side = input.side ?? "buy";
+  const positionIntent = input.positionIntent ?? "buy_to_open";
   try {
     const entry = insertPaperExecutionLedgerEntry({
-      mode: "hedge-entry",
+      mode,
       assetClass: "option",
       symbol: input.symbol,
       underlyingSymbol: input.underlyingSymbol ?? null,
       strategy: "portfolio_hedge",
-      side: "buy",
+      side,
       orderType: "limit",
       timeInForce: "day",
       qty: String(input.quantity),
       limitPrice: String(input.limitPrice),
       estimatedPremium: input.estimatedPremium,
       maxRisk: input.estimatedPremium,
-      dedupeKey: `hedge-review:${input.reviewId}`,
+      dedupeKey: `${mode === "hedge-exit" ? "hedge-exit" : "hedge-review"}:${input.reviewId}`,
       clientOrderId: input.clientOrderId,
       status: "reserved",
       requestId: input.requestId ?? null,
@@ -370,7 +376,10 @@ export const reservePaperExecutionAttempt = (input: {
         quantity: input.quantity,
         limitPrice: input.limitPrice,
         estimatedPremium: input.estimatedPremium,
-        expiresAt: input.expiresAt
+        expiresAt: input.expiresAt,
+        mode,
+        side,
+        positionIntent
       }
     });
     return { reserved: true as const, entry, blockers: [] as string[] };
@@ -392,7 +401,7 @@ export const releaseExpiredHedgeReservations = (
     `
     SELECT id
     FROM paper_execution_ledger
-    WHERE mode = 'hedge-entry'
+    WHERE mode IN ('hedge-entry', 'hedge-exit')
       AND status = 'reserved'
       AND json_extract(payload_json, '$.expiresAt') < ?
     `,
