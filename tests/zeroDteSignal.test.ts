@@ -93,6 +93,34 @@ test("an expired setup that returns with meaningful strength is marked as reappe
   assert.equal(summary.reappeared, true);
 });
 
+test("an expired setup with a first return observation is reappeared while watching", () => {
+  const summary = summarizeZeroDteSignal({
+    scores: [{ observedAt: observedAt(0), score: 56 }],
+    previousState: "expired",
+    minimumMovement,
+    minimumConfirmationObservations: config.minConfirmationObservations
+  });
+
+  assert.equal(summary.state, "watching");
+  assert.equal(summary.reappeared, true);
+});
+
+test("zero minimum movement is rejected instead of classifying unchanged scores", () => {
+  assert.throws(
+    () =>
+      summarizeZeroDteSignal({
+        scores: [
+          { observedAt: observedAt(0), score: 100 },
+          { observedAt: observedAt(1), score: 100 }
+        ],
+        previousState: "watching",
+        minimumMovement: 0,
+        minimumConfirmationObservations: config.minConfirmationObservations
+      }),
+    /positive/
+  );
+});
+
 test("slopes remain nullable until their configured observation windows are available", () => {
   const summary = summarizeZeroDteSignal({
     scores: [

@@ -131,8 +131,8 @@ const classifyState = (input: {
 export const summarizeZeroDteSignal = (
   input: ZeroDteSignalSummaryInput
 ): ZeroDteSignalSummary => {
-  if (!Number.isFinite(input.minimumMovement) || input.minimumMovement < 0) {
-    throw new RangeError("0DTE minimum movement must be a finite non-negative number");
+  if (!Number.isFinite(input.minimumMovement) || input.minimumMovement <= 0) {
+    throw new RangeError("0DTE minimum movement must be a finite positive number");
   }
   if (
     !Number.isFinite(input.minimumConfirmationObservations) ||
@@ -180,7 +180,7 @@ export const summarizeZeroDteSignal = (
     setupAgeMs,
     state,
     reappeared:
-      state === "strengthening" &&
+      observationCount > 0 &&
       input.previousState !== null &&
       REAPPEARANCE_STATES.has(input.previousState)
   };

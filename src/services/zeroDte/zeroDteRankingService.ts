@@ -41,8 +41,12 @@ const readFiniteNumber = (
   return null;
 };
 
-const isEligible = (candidate: ZeroDteQueueCandidate) =>
-  candidate.eligible === true || candidate.executable === true;
+const isEligible = (candidate: ZeroDteQueueCandidate) => {
+  if (candidate.eligible === false || candidate.executable === false) {
+    return false;
+  }
+  return candidate.eligible === true || candidate.executable === true;
+};
 
 const compareDescending = (left: number | null, right: number | null) =>
   (right ?? Number.NEGATIVE_INFINITY) - (left ?? Number.NEGATIVE_INFINITY);

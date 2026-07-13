@@ -136,3 +136,27 @@ test("queue and execution top-N selections remain separate slices", () => {
   assert.ok(slices.execution.every((entry) => entry.eligible));
   assert.notEqual(slices.queue, slices.execution);
 });
+
+test("conflicting eligibility and executable flags fail closed", () => {
+  const slices = selectZeroDteQueue([
+    candidate("zdt_eligible-but-not-executable", {
+      eligible: true,
+      executable: false,
+      totalScore: 100
+    }),
+    candidate("zdt_executable-but-not-eligible", {
+      eligible: false,
+      executable: true,
+      totalScore: 99
+    }),
+    candidate("zdt_consistent-eligible", {
+      eligible: true,
+      executable: true,
+      totalScore: 98
+    })
+  ], { executionTopN: 3 });
+
+  assert.deepEqual(slices.execution.map((entry) => entry.candidateId), [
+    "zdt_consistent-eligible"
+  ]);
+});
