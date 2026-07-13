@@ -213,6 +213,9 @@ export interface OptionSnapshotRaw {
   [key: string]: unknown;
   symbol?: string;
   underlying_symbol?: string;
+  volume?: number | string | null;
+  open_interest?: number | string | null;
+  openInterest?: number | string | null;
   snapshotTimestamp?: string | null;
   snapshot_timestamp?: string | null;
   timestamp?: string | null;

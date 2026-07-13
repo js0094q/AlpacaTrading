@@ -268,6 +268,8 @@ describe("option snapshot normalizer", () => {
     const row = toSnapshotRow(
       "SPY270115C00805000",
       {
+        volume: 1234,
+        open_interest: 5678,
         latestQuote: {
           bp: 16.1,
           ap: 16.3,
@@ -291,6 +293,8 @@ describe("option snapshot normalizer", () => {
     assert.equal(row.askSize, 6);
     assert.equal(row.quoteTimestamp, fetchedTimestamp);
     assert.equal(row.snapshotTimestamp, fetchedTimestamp);
+    assert.equal(row.volume, 1234);
+    assert.equal(row.openInterest, 5678);
   });
 
   test("never substitutes current trade time for a missing quote timestamp", () => {

@@ -9,8 +9,11 @@ import {
 import {
   attachReviewedPayloadHash,
   persistHedgePlanRecord,
-  persistHedgeRecommendation
+  persistHedgeRecommendation,
+  persistHedgeExecutionReview
 } from "./hedgePersistenceService.js";
+import { createHedgeExecutionReview } from "./hedgeExecutionReviewService.js";
+import { canonicalJsonHash } from "../lib/canonicalJson.js";
 import {
   createHedgePlan,
   verifyHedgePlan,
@@ -30,6 +33,7 @@ export interface HedgeReviewReport {
   score: HedgeRecommendation["score"];
   warnings: string[];
   blockers: string[];
+  executionReviewId: string | null;
 }
 
 export interface HedgePlanReport {
@@ -68,6 +72,38 @@ export const buildAndPersistHedgeReview = async (
     correlationId: input.correlationId
   });
   persistHedgeRecommendation(recommendation);
+  const executableCandidate = recommendation.candidates.find(
+    (candidate) =>
+      candidate.instrumentType === "protective_put" &&
+      candidate.executable === true &&
+      candidate.blockers.length === 0
+  );
+  const signingKey = process.env.HEDGE_REVIEW_SIGNING_KEY?.trim() ?? "";
+  const executionReview = executableCandidate && signingKey && recommendation.risk.accountIdentityHash
+    ? createHedgeExecutionReview({
+        accountHash: recommendation.risk.accountIdentityHash,
+        sourceRecommendationId: recommendation.recommendationId,
+        sourceSnapshotId: recommendation.sourceSnapshotId,
+        sourceRegimeId: `hedge_regime_${canonicalJsonHash({
+          generatedAt: recommendation.generatedAt,
+          modelVersion: recommendation.regimeModelVersion,
+          regime: recommendation.regime
+        }).slice(0, 24)}`,
+        riskModelVersion: recommendation.riskModelVersion,
+        regimeModelVersion: recommendation.regimeModelVersion,
+        configurationFingerprint: recommendation.configurationFingerprint,
+        generatedAt,
+        signingKey,
+        candidate: executableCandidate,
+        reviewType: "entry",
+        orderSide: "buy_to_open",
+        requestId: `hedge_execution_review_${recommendation.recommendationId}`,
+        correlationId: input.correlationId
+      })
+    : null;
+  if (executionReview) {
+    persistHedgeExecutionReview(executionReview);
+  }
   return {
     paperOnly: true,
     environment: "paper",
@@ -78,7 +114,8 @@ export const buildAndPersistHedgeReview = async (
     regime: recommendation.regime,
     score: recommendation.score,
     warnings: recommendation.warnings,
-    blockers: recommendation.blockers
+    blockers: recommendation.blockers,
+    executionReviewId: executionReview?.reviewId ?? null
   };
 };
 

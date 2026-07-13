@@ -87,8 +87,8 @@ test("executes only the current paper hedge quantity for a sell-to-close exit", 
     { reviewId: built.review.reviewId, confirmPaper: true },
     {
       review: built.review,
-      account: { id: "paper-account", status: "ACTIVE", buying_power: "10000", equity: "100000", options_approved_level: 3 },
-      currentPositionQuantity: 1,
+      getAccount: async () => ({ data: { id: "paper-account", status: "ACTIVE", buying_power: "10000", equity: "100000", options_approved_level: 3 }, status: 200, url: "paper" }),
+      listPositions: async () => ({ data: [{ symbol: input.symbol, qty: "1" }], status: 200, url: "paper" }),
       now: () => input.asOf,
       refreshQuote: async () => ({ bid: 7.4, ask: 7.6, midpoint: 7.5, quoteTimestamp: input.asOf }),
       submitPaperOrder: async (payload) => {

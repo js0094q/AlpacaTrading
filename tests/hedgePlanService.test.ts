@@ -101,7 +101,7 @@ const recommendation = (): HedgeRecommendation => ({
 });
 
 beforeEach(() => {
-  getDb().exec("DELETE FROM paper_learning_records;");
+  getDb().exec("DELETE FROM paper_learning_records; DELETE FROM hedge_execution_reviews;");
 });
 
 after(() => {
@@ -233,6 +233,32 @@ test("hedge review orchestration persists one deterministic recommendation", asy
       .get(source.recommendationId)?.count,
     1
   );
+});
+
+test("hedge review orchestration persists an executable entry review", async () => {
+  process.env.HEDGE_REVIEW_SIGNING_KEY = "hedge-review-test-key";
+  const source = recommendation();
+  source.risk = { ...source.risk, accountIdentityHash: "account-hash" };
+  source.candidates[0] = {
+    ...source.candidates[0]!,
+    executable: true,
+    details: { midpoint: 5, multiplier: 100 }
+  };
+
+  try {
+    const report = await buildAndPersistHedgeReview(
+      { config, asOf: now, requestId: source.requestId },
+      { buildRecommendation: async () => source }
+    );
+
+    assert.ok(report.executionReviewId);
+    const row = getDb()
+      .prepare("SELECT review_type, status FROM hedge_execution_reviews WHERE review_id = ?")
+      .get(report.executionReviewId) as { review_type: string; status: string } | undefined;
+    assert.deepEqual({ ...row }, { review_type: "entry", status: "reviewed" });
+  } finally {
+    delete process.env.HEDGE_REVIEW_SIGNING_KEY;
+  }
 });
 
 test("plan orchestration rejects missing paper-only intent before building a review", async () => {

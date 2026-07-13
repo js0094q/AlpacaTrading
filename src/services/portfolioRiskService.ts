@@ -209,6 +209,7 @@ export interface PortfolioRiskSnapshot {
   generatedAt: string;
   snapshotId: string;
   sourceAccountSnapshotId: string | null;
+  accountIdentityHash?: string | null;
   riskModelVersion: string;
   configurationFingerprint: string;
   account: {
@@ -1083,6 +1084,15 @@ export const normalizePortfolioEvidence = (
         accountCreatedAt: accountInput.createdAt ?? null
       })
     : null;
+  const accountIdentityHash = accountInput.id
+    ? canonicalJsonHash({
+        id: accountInput.id ?? null,
+        status: accountInput.status ?? null,
+        equity: accountInput.equity ?? null,
+        buyingPower: accountInput.buyingPower ?? null,
+        optionsApprovedLevel: accountInput.optionsApprovedLevel ?? null
+      })
+    : null;
   const snapshotId = canonicalJsonHash({
     environment: "paper",
     account: accountSnapshot,
@@ -1097,6 +1107,7 @@ export const normalizePortfolioEvidence = (
     generatedAt: asOf,
     snapshotId,
     sourceAccountSnapshotId,
+    accountIdentityHash,
     riskModelVersion: config.riskModelVersion,
     configurationFingerprint,
     account: accountSnapshot,
