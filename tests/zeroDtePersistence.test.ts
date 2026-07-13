@@ -243,8 +243,7 @@ const createBaseVersionCompatibleDb = () => {
       FOREIGN KEY(candidate_id) REFERENCES zero_dte_candidates(candidate_id),
       FOREIGN KEY(paper_trade_id) REFERENCES zero_dte_paper_trades(paper_trade_id),
       FOREIGN KEY(shadow_trade_id) REFERENCES zero_dte_shadow_trades(shadow_trade_id),
-      FOREIGN KEY(decision_id) REFERENCES zero_dte_decisions(decision_id),
-      UNIQUE(paper_trade_id, shadow_trade_id, outcome_type, horizon_minutes)
+      FOREIGN KEY(decision_id) REFERENCES zero_dte_decisions(decision_id)
     );
   `);
   db.exec("PRAGMA foreign_keys = ON;");
@@ -712,6 +711,15 @@ test("base-version databases receive non-destructive hardening exactly once", ()
       candidateId: "candidate-2",
       paperTradeId: "paper-1",
       outcomeType: "upgraded_mismatch",
+      horizonMinutes: 5
+    })
+  );
+  assert.throws(() =>
+    insertTerminalOutcomeInto(db, {
+      outcomeId: "upgraded-legacy-trade-duplicate",
+      candidateId: "candidate-1",
+      paperTradeId: "paper-1",
+      outcomeType: "legacy_mismatch",
       horizonMinutes: 5
     })
   );

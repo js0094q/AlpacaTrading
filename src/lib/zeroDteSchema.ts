@@ -395,7 +395,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_zero_dte_terminal_outcomes_candidate_only
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_zero_dte_terminal_outcomes_paper_trade
   ON zero_dte_terminal_outcomes(
-    candidate_id,
     paper_trade_id,
     outcome_type,
     COALESCE(horizon_minutes, -1)
@@ -404,7 +403,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_zero_dte_terminal_outcomes_paper_trade
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_zero_dte_terminal_outcomes_shadow_trade
   ON zero_dte_terminal_outcomes(
-    candidate_id,
     shadow_trade_id,
     outcome_type,
     COALESCE(horizon_minutes, -1)
@@ -579,8 +577,7 @@ WHEN NEW.paper_trade_id IS NOT NULL
   AND EXISTS (
     SELECT 1
     FROM zero_dte_terminal_outcomes AS existing
-    WHERE existing.candidate_id = NEW.candidate_id
-      AND existing.paper_trade_id = NEW.paper_trade_id
+    WHERE existing.paper_trade_id = NEW.paper_trade_id
       AND existing.shadow_trade_id IS NULL
       AND existing.outcome_type = NEW.outcome_type
       AND COALESCE(existing.horizon_minutes, -1) = COALESCE(NEW.horizon_minutes, -1)
@@ -597,7 +594,6 @@ WHEN NEW.paper_trade_id IS NOT NULL
     SELECT 1
     FROM zero_dte_terminal_outcomes AS existing
     WHERE existing.outcome_id <> NEW.outcome_id
-      AND existing.candidate_id = NEW.candidate_id
       AND existing.paper_trade_id = NEW.paper_trade_id
       AND existing.shadow_trade_id IS NULL
       AND existing.outcome_type = NEW.outcome_type
@@ -614,8 +610,7 @@ WHEN NEW.paper_trade_id IS NULL
   AND EXISTS (
     SELECT 1
     FROM zero_dte_terminal_outcomes AS existing
-    WHERE existing.candidate_id = NEW.candidate_id
-      AND existing.paper_trade_id IS NULL
+    WHERE existing.paper_trade_id IS NULL
       AND existing.shadow_trade_id = NEW.shadow_trade_id
       AND existing.outcome_type = NEW.outcome_type
       AND COALESCE(existing.horizon_minutes, -1) = COALESCE(NEW.horizon_minutes, -1)
@@ -632,7 +627,6 @@ WHEN NEW.paper_trade_id IS NULL
     SELECT 1
     FROM zero_dte_terminal_outcomes AS existing
     WHERE existing.outcome_id <> NEW.outcome_id
-      AND existing.candidate_id = NEW.candidate_id
       AND existing.paper_trade_id IS NULL
       AND existing.shadow_trade_id = NEW.shadow_trade_id
       AND existing.outcome_type = NEW.outcome_type
