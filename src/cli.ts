@@ -3,6 +3,7 @@ loadDotenv();
 loadDotenv({ path: ".env.txt", override: false });
 import { addTicker, getActiveUniverse, getAllUniverse, removeTicker, setTickerEnabled, seedInitialUniverse } from "./services/universeService.js";
 import { ingestBars } from "./services/marketDataIngest.js";
+import { runStockObservation } from "./services/stockObservationService.js";
 import { ingestOptionContracts, ingestOptionSnapshots } from "./services/optionsService.js";
 import { buildFeatures } from "./services/featureService.js";
 import { generateTargets, getTargets } from "./services/targetService.js";
@@ -298,6 +299,19 @@ const run = async () => {
       end: args.end
     });
     print(result);
+    return;
+  }
+
+  if (command === "observatory" && action === "collect") {
+    const result = await runStockObservation({
+      symbols: parseList(args.symbols),
+      feed: args.feed,
+      currency: args.currency
+    });
+    print(result);
+    if (result.status === "failed") {
+      process.exitCode = 1;
+    }
     return;
   }
 

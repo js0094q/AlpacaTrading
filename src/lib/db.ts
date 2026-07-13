@@ -234,7 +234,11 @@ CREATE TABLE IF NOT EXISTS ingestion_runs (
   started_at TEXT NOT NULL,
   completed_at TEXT,
   rows_ingested INTEGER NOT NULL DEFAULT 0,
-  notes TEXT
+  notes TEXT,
+  requested_symbols INTEGER NOT NULL DEFAULT 0,
+  successful_symbols INTEGER NOT NULL DEFAULT 0,
+  failed_symbols INTEGER NOT NULL DEFAULT 0,
+  error_summary TEXT
 );
 
 CREATE TABLE IF NOT EXISTS backtest_runs (
@@ -340,6 +344,11 @@ CREATE TABLE IF NOT EXISTS paper_trade_candidates (
   option_symbol TEXT,
   strike REAL,
   short_strike REAL,
+  decision TEXT NOT NULL DEFAULT 'selected',
+  decision_reason TEXT,
+  strategy_family TEXT,
+  signal_inputs_json TEXT NOT NULL DEFAULT '{}',
+  data_quality_status TEXT NOT NULL DEFAULT 'UNOBSERVED',
   FOREIGN KEY(research_run_id) REFERENCES research_runs(id) ON DELETE CASCADE
 );
 
@@ -630,6 +639,15 @@ const runMigrations = (db: DbHandle) => {
   addColumnIfMissing(db, "universe_symbols", "asset_attributes_json", "asset_attributes_json TEXT");
   addColumnIfMissing(db, "universe_symbols", "asset_validated_at", "asset_validated_at TEXT");
   addColumnIfMissing(db, "universe_symbols", "asset_request_id", "asset_request_id TEXT");
+  addColumnIfMissing(db, "ingestion_runs", "requested_symbols", "requested_symbols INTEGER NOT NULL DEFAULT 0");
+  addColumnIfMissing(db, "ingestion_runs", "successful_symbols", "successful_symbols INTEGER NOT NULL DEFAULT 0");
+  addColumnIfMissing(db, "ingestion_runs", "failed_symbols", "failed_symbols INTEGER NOT NULL DEFAULT 0");
+  addColumnIfMissing(db, "ingestion_runs", "error_summary", "error_summary TEXT");
+  addColumnIfMissing(db, "paper_trade_candidates", "decision", "decision TEXT NOT NULL DEFAULT 'selected'");
+  addColumnIfMissing(db, "paper_trade_candidates", "decision_reason", "decision_reason TEXT");
+  addColumnIfMissing(db, "paper_trade_candidates", "strategy_family", "strategy_family TEXT");
+  addColumnIfMissing(db, "paper_trade_candidates", "signal_inputs_json", "signal_inputs_json TEXT NOT NULL DEFAULT '{}'");
+  addColumnIfMissing(db, "paper_trade_candidates", "data_quality_status", "data_quality_status TEXT NOT NULL DEFAULT 'UNOBSERVED'");
   addColumnIfMissing(db, "option_snapshots", "quote_status", "quote_status TEXT");
   addColumnIfMissing(db, "option_snapshots", "executable", "executable INTEGER NOT NULL DEFAULT 0");
   addColumnIfMissing(db, "option_snapshots", "executable_price", "executable_price REAL");

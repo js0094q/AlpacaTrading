@@ -684,7 +684,7 @@ export const buildPaperOutcomeAnalytics = (
   const includeRankingSlices = input.includeRankingSlices && (topN > 0 || bottomN > 0);
   const includeBacklogAging = input.includeBacklogAging !== false;
 
-  const clauses: string[] = [];
+  const clauses: string[] = ["c.decision = 'selected'"];
   const params: string[] = [];
   if (since) {
     clauses.push("r.started_at >= ?");

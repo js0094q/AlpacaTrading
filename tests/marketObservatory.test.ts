@@ -1,6 +1,6 @@
 import { after, beforeEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { resetSqliteTestDb } from "./helpers/sqliteTestDb.js";
@@ -13,19 +13,28 @@ process.env.ALPACA_ENV = "paper";
 process.env.TRADING_MODE = "paper";
 process.env.ALPACA_LIVE_TRADE = "false";
 process.env.LIVE_TRADING_ENABLED = "false";
+process.env.ALPACA_MAX_RETRIES = "1";
 
 const [
   libDb,
   universeService,
   stockSnapshotNormalizer,
   stockObservationService,
-  alpacaProvider
+  alpacaProvider,
+  featureService,
+  candidateRankingService,
+  paperTradeService,
+  learningService
 ] = await Promise.all([
   import("../src/lib/db.js"),
   import("../src/services/universeService.js"),
   import("../src/services/stockSnapshotNormalizer.js"),
   import("../src/services/stockObservationService.js"),
-  import("../src/services/providers/alpaca.js")
+  import("../src/services/providers/alpaca.js"),
+  import("../src/services/featureService.js"),
+  import("../src/services/candidateRankingService.js"),
+  import("../src/services/paperTradeService.js"),
+  import("../src/services/learningService.js")
 ]);
 
 const { closeDbForTests, getDb } = libDb;
@@ -36,8 +45,12 @@ const {
   seedInitialUniverse
 } = universeService;
 const { normalizeStockSnapshot } = stockSnapshotNormalizer;
-const { persistStockSnapshot } = stockObservationService;
+const { persistStockSnapshot, runStockObservation } = stockObservationService;
 const { fetchStockSnapshots } = alpacaProvider;
+const { buildFeatures } = featureService;
+const { persistCandidateDecisions, rankResearchCandidates } = candidateRankingService;
+const { buildPaperTradePlans } = paperTradeService;
+const { runLearning } = learningService;
 
 const originalSymbols = [
   "SPY", "NEE", "POOL", "NFG", "CVS", "SOFI", "XLE", "XLK", "QQQ", "IWM",
@@ -53,9 +66,27 @@ const requestedSymbols = [
 
 const resetDatabase = () => {
   resetSqliteTestDb(getDb(), `
+    DELETE FROM paper_trade_evaluations;
+    DELETE FROM paper_trade_plans;
+    DELETE FROM paper_trade_candidates;
+    DELETE FROM research_runs;
+    DELETE FROM learning_runs;
+    DELETE FROM target_snapshots;
+    DELETE FROM feature_snapshots;
+    DELETE FROM market_bars;
     DELETE FROM stock_snapshots;
+    DELETE FROM ingestion_runs;
     DELETE FROM universe_symbols;
   `);
+};
+
+const insertResearchRun = (id: string) => {
+  getDb().prepare(`
+    INSERT INTO research_runs(
+      id, started_at, completed_at, status, risk_profile, options_enabled,
+      universe_size, targets_generated, candidates_selected, config_json
+    ) VALUES (?, ?, ?, 'completed', 'moderate', 0, 51, 4, 1, '{}')
+  `).run(id, "2026-07-13T16:45:00.000Z", "2026-07-13T16:46:00.000Z");
 };
 
 const completeSnapshot = {
@@ -217,6 +248,20 @@ describe("market observatory stock snapshots", () => {
     assert.equal(rows[1]?.error, "SOURCE_SYMBOL_MISSING");
   });
 
+  test("bounds provider retries and returns explicit source errors", async () => {
+    let attempts = 0;
+    globalThis.fetch = async () => {
+      attempts += 1;
+      throw new Error("temporary network failure");
+    };
+
+    const rows = await fetchStockSnapshots({ symbols: ["AAPL"], feed: "iex" });
+
+    assert.equal(attempts, 2);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]?.error, "STOCK_SNAPSHOT_REQUEST_FAILED");
+  });
+
   test("normalizes complete evidence while preserving source and ingestion timestamps", () => {
     const row = normalizeStockSnapshot({
       symbol: "AAPL",
@@ -337,5 +382,308 @@ describe("market observatory stock snapshots", () => {
     assert.equal(stored.length, 1);
     assert.equal(stored[0]?.source_timestamp, "2026-07-13T16:44:50.000Z");
     assert.equal(stored[0]?.observed_at, "2026-07-13T16:45:00.000Z");
+  });
+});
+
+describe("market observatory research traceability", () => {
+  test("enriches only the latest feature row with the latest raw observation", async () => {
+    const insertBar = getDb().prepare(`
+      INSERT INTO market_bars(symbol, timeframe, timestamp, open, high, low, close, volume, source)
+      VALUES (?, '1Day', ?, ?, ?, ?, ?, ?, 'test')
+    `);
+    insertBar.run("AAPL", "2026-07-10T04:00:00.000Z", 96, 99, 95, 97, 200_000);
+    insertBar.run("AAPL", "2026-07-13T04:00:00.000Z", 98, 101, 97.5, 100, 100_000);
+    persistStockSnapshot(normalizeStockSnapshot({
+      symbol: "AAPL",
+      raw: completeSnapshot,
+      observedAt: "2026-07-13T16:45:00.000Z",
+      requestedFeed: "iex",
+      effectiveFeed: "iex",
+      currency: "USD",
+      now: new Date("2026-07-13T16:45:00.000Z")
+    }));
+
+    await buildFeatures({ symbols: ["AAPL"], timeframe: "1Day" });
+
+    const rows = getDb()
+      .prepare("SELECT timestamp, features FROM feature_snapshots WHERE symbol = ? ORDER BY timestamp")
+      .all("AAPL") as Array<{ timestamp: string; features: string }>;
+    const earlier = JSON.parse(rows[0]?.features ?? "{}") as Record<string, unknown>;
+    const latest = JSON.parse(rows[1]?.features ?? "{}") as Record<string, unknown>;
+    assert.equal(rows.length, 2);
+    assert.equal(earlier.observatoryObservedAt, undefined);
+    assert.equal(latest.observatoryObservedAt, "2026-07-13T16:45:00.000Z");
+    assert.equal(latest.observatoryEffectiveFeed, "iex");
+    assert.ok(Math.abs(Number(latest.observatorySpread) - 0.2) < 1e-10);
+    assert.equal(latest.observatoryDataQualityStatus, "COMPLETE");
+    assert.equal(latest.observatoryFreshnessStatus, "FRESH");
+    assert.equal(latest.observatoryDailyReturn, 100 / 97 - 1);
+  });
+
+  test("persists selected, rejected, skipped, and blocked scored decisions without planning non-selected rows", () => {
+    const researchRunId = "market-observatory-decisions";
+    insertResearchRun(researchRunId);
+    const asOf = "2026-07-13T16:45:00.000Z";
+    const targets = ["AAPL", "MSFT", "PLTR", "SMCI"].map((symbol, index) => ({
+      symbol,
+      asOf,
+      direction: "long" as const,
+      horizon: "1d" as const,
+      entryReference: 100 + index,
+      upsideTarget: 110 + index,
+      downsideRisk: 95 + index,
+      stopLoss: 95 + index,
+      takeProfit: 110 + index,
+      confidence: 0.8 - index * 0.05,
+      expectedReturn: 0.05 - index * 0.005,
+      volatilityAdjustedScore: 1 - index * 0.1,
+      riskProfile: "moderate" as const,
+      preferredExpression: "shares" as const,
+      rationale: [`traceable ${symbol}`]
+    }));
+    const ranked = rankResearchCandidates({
+      researchRunId,
+      riskProfile: "moderate",
+      optionsEnabled: false,
+      targets,
+      maxCandidates: 1,
+      maxPerSymbol: 1,
+      maxPerDirection: 4,
+      maxPerExpression: 4
+    });
+    const decisions = ranked.decisions.map((entry, index) => {
+      if (index === 1) {
+        return { ...entry, decision: "rejected" as const, decisionReason: "TEST_REJECTED" };
+      }
+      if (index === 3) {
+        return { ...entry, decision: "blocked" as const, decisionReason: "TEST_BLOCKED" };
+      }
+      return entry;
+    });
+
+    const persisted = persistCandidateDecisions({ researchRunId, decisions });
+    const selectedTarget = targets.find((target) => target.symbol === ranked.candidates[0]?.symbol);
+    assert.ok(selectedTarget);
+    getDb().prepare(`
+      INSERT INTO target_snapshots(
+        symbol, as_of, direction, horizon, entry_reference, upside_target,
+        downside_risk, stop_loss, take_profit, confidence, expected_return,
+        volatility_adjusted_score, risk_profile, preferred_expression, rationale
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      selectedTarget.symbol,
+      selectedTarget.asOf,
+      selectedTarget.direction,
+      selectedTarget.horizon,
+      selectedTarget.entryReference,
+      selectedTarget.upsideTarget,
+      selectedTarget.downsideRisk,
+      selectedTarget.stopLoss,
+      selectedTarget.takeProfit,
+      selectedTarget.confidence,
+      selectedTarget.expectedReturn,
+      selectedTarget.volatilityAdjustedScore,
+      selectedTarget.riskProfile,
+      selectedTarget.preferredExpression,
+      JSON.stringify(selectedTarget.rationale)
+    );
+    buildPaperTradePlans({
+      researchRunId,
+      candidates: ranked.candidates,
+      riskProfile: "moderate"
+    });
+
+    assert.equal(ranked.candidates.length, 1);
+    assert.equal(ranked.decisions.length, 4);
+    assert.equal(persisted.length, 4);
+    const stored = getDb()
+      .prepare(`
+        SELECT decision, decision_reason, strategy_family, signal_inputs_json,
+               data_quality_status
+        FROM paper_trade_candidates
+        WHERE research_run_id = ?
+        ORDER BY rank, symbol
+      `)
+      .all(researchRunId) as Array<Record<string, unknown>>;
+    assert.deepEqual(new Set(stored.map((row) => row.decision)), new Set([
+      "selected", "rejected", "skipped", "blocked"
+    ]));
+    assert.equal(stored.every((row) => typeof row.decision_reason === "string"), true);
+    assert.equal(stored.every((row) => typeof row.strategy_family === "string"), true);
+    assert.equal(stored.every((row) => typeof row.signal_inputs_json === "string"), true);
+    assert.equal(stored.every((row) => typeof row.data_quality_status === "string"), true);
+    const plans = getDb()
+      .prepare("SELECT COUNT(*) AS count FROM paper_trade_plans WHERE research_run_id = ?")
+      .get(researchRunId) as { count: number };
+    assert.equal(plans.count, 1);
+  });
+
+  test("new canonical symbols remain available to learning", async () => {
+    getDb().prepare(`
+      INSERT INTO feature_snapshots(symbol, timestamp, features)
+      VALUES ('PLTR', '2026-07-13T16:45:00.000Z', ?)
+    `).run(JSON.stringify({ close: 140, observatoryDataQualityStatus: "COMPLETE" }));
+
+    const model = await runLearning();
+
+    assert.equal(model.universe.includes("PLTR"), true);
+  });
+});
+
+describe("market observatory collection", () => {
+  test("market-open collection records a completed ingestion run", async () => {
+    const result = await runStockObservation({
+      getClock: async () => ({ isOpen: true }),
+      refreshAssets: async () => ({ checked: 0, active: 0, disabled: 0, failed: [] }),
+      getSnapshots: async ({ symbols, feed, currency }: {
+        symbols: string[];
+        feed: string;
+        currency?: string;
+      }) => symbols.map((symbol) => ({
+        symbol,
+        raw: completeSnapshot,
+        requestedFeed: feed,
+        effectiveFeed: feed,
+        currency: currency ?? null,
+        requestId: "snapshot-request"
+      })),
+      now: () => new Date("2026-07-13T16:45:00.000Z")
+    });
+
+    assert.equal(result.status, "completed");
+    assert.equal(result.requestedSymbols, 51);
+    assert.equal(result.successfulSymbols, 51);
+    assert.equal(result.failedSymbols, 0);
+    assert.equal(result.rowsWritten, 51);
+    const run = getDb()
+      .prepare(`
+        SELECT run_type, status, requested_symbols, successful_symbols,
+               failed_symbols, rows_ingested, error_summary
+        FROM ingestion_runs WHERE id = ?
+      `)
+      .get(result.runId) as Record<string, unknown>;
+    assert.equal(run.run_type, "stock_snapshots");
+    assert.equal(run.status, "completed");
+    assert.equal(run.requested_symbols, 51);
+    assert.equal(run.successful_symbols, 51);
+    assert.equal(run.failed_symbols, 0);
+    assert.equal(run.rows_ingested, 51);
+    assert.equal(run.error_summary, null);
+  });
+
+  test("market-closed collection records a skip and never requests snapshots", async () => {
+    let calls = 0;
+    const result = await runStockObservation({
+      symbols: ["AAPL", "MSFT"],
+      getClock: async () => ({ isOpen: false }),
+      refreshAssets: async () => ({ checked: 0, active: 0, disabled: 0, failed: [] }),
+      getSnapshots: async () => {
+        calls += 1;
+        return [];
+      },
+      now: () => new Date("2026-07-13T12:00:00.000Z")
+    });
+
+    assert.equal(result.status, "skipped_market_closed");
+    assert.equal(result.requestedSymbols, 2);
+    assert.equal(result.rowsWritten, 0);
+    assert.equal(calls, 0);
+    const run = getDb()
+      .prepare("SELECT status, rows_ingested FROM ingestion_runs WHERE id = ?")
+      .get(result.runId) as Record<string, unknown>;
+    assert.equal(run.status, "skipped_market_closed");
+    assert.equal(run.rows_ingested, 0);
+  });
+
+  test("partial symbol failure preserves successful rows and run evidence", async () => {
+    const result = await runStockObservation({
+      symbols: ["AAPL", "MSFT"],
+      getClock: async () => ({ isOpen: true }),
+      refreshAssets: async () => ({ checked: 0, active: 0, disabled: 0, failed: [] }),
+      getSnapshots: async () => [
+        {
+          symbol: "AAPL",
+          raw: completeSnapshot,
+          requestedFeed: "iex",
+          effectiveFeed: "iex",
+          currency: "USD",
+          requestId: "snapshot-request"
+        },
+        {
+          symbol: "MSFT",
+          raw: null,
+          requestedFeed: "iex",
+          effectiveFeed: "iex",
+          currency: "USD",
+          requestId: "snapshot-request",
+          error: "SOURCE_SYMBOL_MISSING" as const
+        }
+      ],
+      now: () => new Date("2026-07-13T16:45:00.000Z")
+    });
+
+    assert.equal(result.status, "partial");
+    assert.equal(result.successfulSymbols, 1);
+    assert.equal(result.failedSymbols, 1);
+    assert.equal(result.rowsWritten, 2);
+    assert.deepEqual(result.errors, [{ symbol: "MSFT", reason: "SOURCE_SYMBOL_MISSING" }]);
+    const rows = getDb()
+      .prepare("SELECT symbol, data_quality_status FROM stock_snapshots ORDER BY symbol")
+      .all() as Array<Record<string, unknown>>;
+    assert.deepEqual(rows.map((row) => ({
+      symbol: row.symbol,
+      data_quality_status: row.data_quality_status
+    })), [
+      { symbol: "AAPL", data_quality_status: "COMPLETE" },
+      { symbol: "MSFT", data_quality_status: "SOURCE_ERROR" }
+    ]);
+  });
+
+  test("temporary persistence failure is isolated to one symbol", async () => {
+    const result = await runStockObservation({
+      symbols: ["AAPL", "MSFT"],
+      getClock: async () => ({ isOpen: true }),
+      refreshAssets: async () => ({ checked: 0, active: 0, disabled: 0, failed: [] }),
+      getSnapshots: async ({ symbols, feed, currency }: {
+        symbols: string[];
+        feed: string;
+        currency?: string;
+      }) => symbols.map((symbol) => ({
+        symbol,
+        raw: completeSnapshot,
+        requestedFeed: feed,
+        effectiveFeed: feed,
+        currency: currency ?? null,
+        requestId: "snapshot-request"
+      })),
+      persistSnapshot: (row, runId) => {
+        if (row.symbol === "MSFT") {
+          throw new Error("database temporarily busy");
+        }
+        return persistStockSnapshot(row, runId);
+      },
+      now: () => new Date("2026-07-13T16:45:00.000Z")
+    });
+
+    assert.equal(result.status, "partial");
+    assert.equal(result.successfulSymbols, 1);
+    assert.equal(result.failedSymbols, 1);
+    assert.equal(result.rowsWritten, 1);
+    assert.deepEqual(result.errors, [{
+      symbol: "MSFT",
+      reason: "PERSISTENCE_ERROR:database temporarily busy"
+    }]);
+    const stored = getDb()
+      .prepare("SELECT symbol FROM stock_snapshots ORDER BY symbol")
+      .all() as Array<{ symbol: string }>;
+    assert.deepEqual(stored.map((row) => row.symbol), ["AAPL"]);
+  });
+
+  test("observation service has no order-submission dependency", () => {
+    const source = readFileSync(
+      join(process.cwd(), "src/services/stockObservationService.ts"),
+      "utf8"
+    );
+    assert.doesNotMatch(source, /submitPaperOrder|paperExecute|confirmPaper|\/v2\/orders/);
   });
 });

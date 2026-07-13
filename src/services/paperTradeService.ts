@@ -610,7 +610,7 @@ export const buildResearchReport = (input?: ResearchReportInput): ReportPayload 
     `
     SELECT symbol, direction, preferred_expression, score, rank, rationale
     FROM paper_trade_candidates
-    WHERE research_run_id = ?
+    WHERE research_run_id = ? AND decision = 'selected'
     ORDER BY rank ASC
     LIMIT 10
   `,

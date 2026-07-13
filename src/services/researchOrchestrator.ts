@@ -17,7 +17,7 @@ import { runLearning } from "./learningService.js";
 import { generateTargets } from "./targetService.js";
 import { dedupeSymbols, nowIso, normalizeSymbol } from "../lib/utils.js";
 import { getDb } from "../lib/db.js";
-import { rankResearchCandidates, persistRankedCandidates } from "./candidateRankingService.js";
+import { rankResearchCandidates, persistCandidateDecisions } from "./candidateRankingService.js";
 import { buildPaperTradePlans } from "./paperTradeService.js";
 import type { PaperTradeCandidateRow } from "../types.js";
 
@@ -354,10 +354,11 @@ export const runResearchDaily = async (
       requireSectorDiversity: input.requireSectorDiversity
     });
 
-    persistedCandidates = persistRankedCandidates({
+    const persistedDecisions = persistCandidateDecisions({
       researchRunId: runId,
-      candidates: ranked.candidates
+      decisions: ranked.decisions
     });
+    persistedCandidates = persistedDecisions.filter((candidate) => candidate.decision === "selected");
 
     buildPaperTradePlans({
       researchRunId: runId,

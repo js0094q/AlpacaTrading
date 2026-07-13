@@ -199,6 +199,7 @@ const latestCandidates = () =>
       LIMIT 1
     ) latest
       ON latest.id = c.research_run_id
+    WHERE c.decision = 'selected'
     ORDER BY c.rank ASC
     LIMIT 50
     `

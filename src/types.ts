@@ -225,6 +225,16 @@ export interface PaperTradeCandidateRow {
   estimatedExitValue?: number | null;
 }
 
+export type CandidateDecision = "selected" | "rejected" | "skipped" | "blocked";
+
+export interface CandidateDecisionRecord extends Omit<PaperTradeCandidateRow, "researchRunId"> {
+  decision: CandidateDecision;
+  decisionReason: string;
+  strategyFamily: string;
+  signalInputs: Record<string, string | number | null>;
+  dataQualityStatus: string;
+}
+
 export interface PaperTradePlanRow {
   id: string;
   researchRunId: string;
@@ -298,14 +308,18 @@ export interface StrategySelectorResult {
 
 export interface IngestionRunRow {
   id: number;
-  runType: "bars" | "options_contracts" | "options_snapshots";
-  status: "running" | "completed" | "failed";
+  runType: "bars" | "options_contracts" | "options_snapshots" | "stock_snapshots";
+  status: "running" | "completed" | "partial" | "failed" | "skipped_market_closed";
   symbols: string;
   timeframe?: Timeframe | null;
   startedAt: string;
   completedAt: string | null;
   rowsIngested: number;
   notes: string | null;
+  requestedSymbols: number;
+  successfulSymbols: number;
+  failedSymbols: number;
+  errorSummary: string | null;
 }
 
 export interface BacktestTradeRow {

@@ -3,6 +3,7 @@ import { getBars } from "./marketDataIngest.js";
 import { getActiveSymbols, seedInitialUniverse } from "./universeService.js";
 import { normalizeSymbol } from "../lib/utils.js";
 import { sma, ema, rollingStd, rsi, atr, macd, classifyTrend, distanceFrom } from "./indicators.js";
+import { getLatestStockObservationFeatures } from "./stockObservationService.js";
 import type { Timeframe, FeatureSnapshotRow } from "../types.js";
 
 const parseFeatureRow = (row: Record<string, unknown>): FeatureSnapshotRow => {
@@ -434,6 +435,14 @@ export const buildFeatures = async (options?: {
     for (const symbol of symbols) {
       const bars = collectBars(symbol, timeframe, options?.start, options?.end);
       const featureRows = calculateRows(bars, optionContext);
+      const latestObservation = getLatestStockObservationFeatures(symbol);
+      const latestFeatureRow = featureRows.at(-1);
+      if (latestObservation && latestFeatureRow) {
+        latestFeatureRow.features = {
+          ...latestFeatureRow.features,
+          ...latestObservation
+        };
+      }
       for (const row of featureRows) {
         insert.run(row.symbol, row.timestamp, JSON.stringify(row.features));
         total += 1;

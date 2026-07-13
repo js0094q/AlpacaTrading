@@ -1,6 +1,7 @@
 import { getDb, queryAll, queryOne } from "../lib/db.js";
 import { normalizeSymbol, uuid } from "../lib/utils.js";
 import type {
+  CandidateDecisionRecord,
   PaperTradeCandidateRow,
   PreferredExpression,
   RiskProfile,
@@ -66,6 +67,7 @@ export interface RankedCandidate extends Omit<PaperTradeCandidateRow, "researchR
 
 export interface CandidateRankingResult {
   candidates: RankedCandidate[];
+  decisions: CandidateDecisionRecord[];
   warnings: string[];
 }
 
@@ -432,6 +434,7 @@ export const rankResearchCandidates = (input: CandidateRankingInput): CandidateR
   const warnings: string[] = [];
   const learning = parseLearningSummary();
   const backtest = parseBacktestPerformance();
+  const signalInputsByCandidate = new Map<string, Record<string, string | number | null>>();
 
   const scored = sourceFromTargets(input.targets).map((target) => {
     const optionCandidate = getOptionCandidate(target.symbol, target.as_of);
@@ -463,8 +466,10 @@ export const rankResearchCandidates = (input: CandidateRankingInput): CandidateR
       learning.directionalAccuracy === null ? null : Math.max(0, 1 - learning.directionalAccuracy);
 
     const candidatePerf = backtest?.byExpression[target.preferred_expression];
+    const id = uuid();
+    signalInputsByCandidate.set(id, featureSnapshot);
     return {
-      id: uuid(),
+      id,
       symbol: target.symbol,
       asOf: target.as_of,
       rank: 0,
@@ -501,11 +506,13 @@ export const rankResearchCandidates = (input: CandidateRankingInput): CandidateR
   const bySymbol = new Map<string, number>();
   const byDirection = new Map<CandidateDirection, number>();
   const byExpression = new Map<PreferredExpression, number>();
+  const skippedReasons = new Map<string, string>();
   const selected: RankedCandidate[] = [];
 
   for (const candidate of sorted) {
     if (selected.length >= maxCandidates) {
-      break;
+      skippedReasons.set(candidate.id, "MAX_CANDIDATES_REACHED");
+      continue;
     }
 
     const symbolCount = bySymbol.get(candidate.symbol) ?? 0;
@@ -513,12 +520,15 @@ export const rankResearchCandidates = (input: CandidateRankingInput): CandidateR
     const expressionCount = byExpression.get(candidate.preferredExpression) ?? 0;
 
     if (symbolCount >= maxPerSymbol) {
+      skippedReasons.set(candidate.id, "MAX_PER_SYMBOL_REACHED");
       continue;
     }
     if (directionCount >= maxPerDirection) {
+      skippedReasons.set(candidate.id, "MAX_PER_DIRECTION_REACHED");
       continue;
     }
     if (expressionCount >= maxPerExpression) {
+      skippedReasons.set(candidate.id, "MAX_PER_EXPRESSION_REACHED");
       continue;
     }
 
@@ -530,6 +540,7 @@ export const rankResearchCandidates = (input: CandidateRankingInput): CandidateR
 
   if (!selected.length && sorted.length && input.riskProfile === "aggressive") {
     selected.push(...sorted.slice(0, maxCandidates));
+    selected.forEach((candidate) => skippedReasons.delete(candidate.id));
     warnings.push(
       `Aggressive mode relaxed diversity constraints to avoid empty selection after strict filtering.`
     );
@@ -537,6 +548,26 @@ export const rankResearchCandidates = (input: CandidateRankingInput): CandidateR
 
   selected.forEach((candidate, index) => {
     candidate.rank = index + 1;
+  });
+  const selectedRankById = new Map(selected.map((candidate) => [candidate.id, candidate.rank]));
+  const decisions: CandidateDecisionRecord[] = sorted.map((candidate, index) => {
+    const signalInputs = signalInputsByCandidate.get(candidate.id) ?? {};
+    const selectedRank = selectedRankById.get(candidate.id);
+    return {
+      ...candidate,
+      rank: selectedRank ?? index + 1,
+      decision: selectedRank === undefined ? "skipped" : "selected",
+      decisionReason:
+        selectedRank === undefined
+          ? skippedReasons.get(candidate.id) ?? "RANKING_CONSTRAINT"
+          : "RANKED_SELECTED",
+      strategyFamily: candidate.preferredExpression,
+      signalInputs,
+      dataQualityStatus:
+        typeof signalInputs.observatoryDataQualityStatus === "string"
+          ? signalInputs.observatoryDataQualityStatus
+          : "UNOBSERVED"
+    };
   });
 
   if (selected.length >= 4) {
@@ -559,15 +590,15 @@ export const rankResearchCandidates = (input: CandidateRankingInput): CandidateR
     }
   }
 
-  return { candidates: selected, warnings };
+  return { candidates: selected, decisions, warnings };
 };
 
-export const persistRankedCandidates = (input: {
+export const persistCandidateDecisions = (input: {
   researchRunId: string;
-  candidates: Omit<PaperTradeCandidateRow, "researchRunId">[];
-}): PaperTradeCandidateRow[] => {
-  const rows = input.candidates.map((candidate): PaperTradeCandidateRow => ({
-    ...candidate,
+  decisions: CandidateDecisionRecord[];
+}) => {
+  const rows = input.decisions.map((decision) => ({
+    ...decision,
     researchRunId: input.researchRunId
   }));
   const insert = getDb().prepare(`
@@ -600,9 +631,15 @@ export const persistRankedCandidates = (input: {
       option_outperformance_accuracy,
       option_symbol,
       strike,
-      short_strike
+      short_strike,
+      decision,
+      decision_reason,
+      strategy_family,
+      signal_inputs_json,
+      data_quality_status
     ) VALUES (
-      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+      ?, ?, ?, ?, ?
     )
   `);
   for (const row of rows) {
@@ -635,8 +672,29 @@ export const persistRankedCandidates = (input: {
       row.optionOutperformanceAccuracy,
       row.optionSymbol ?? null,
       row.strike ?? null,
-      row.shortStrike ?? null
+      row.shortStrike ?? null,
+      row.decision,
+      row.decisionReason,
+      row.strategyFamily,
+      JSON.stringify(row.signalInputs),
+      row.dataQualityStatus
     );
   }
   return rows;
 };
+
+export const persistRankedCandidates = (input: {
+  researchRunId: string;
+  candidates: Omit<PaperTradeCandidateRow, "researchRunId">[];
+}): PaperTradeCandidateRow[] =>
+  persistCandidateDecisions({
+    researchRunId: input.researchRunId,
+    decisions: input.candidates.map((candidate) => ({
+      ...candidate,
+      decision: "selected",
+      decisionReason: "RANKED_SELECTED",
+      strategyFamily: candidate.preferredExpression,
+      signalInputs: {},
+      dataQualityStatus: "UNOBSERVED"
+    }))
+  });
