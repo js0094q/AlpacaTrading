@@ -29,6 +29,16 @@ export interface UniverseSymbolRow {
   createdAt: string;
   updatedAt: string;
   tradable: 0 | 1;
+  assetId: string | null;
+  assetStatus: string | null;
+  exchange: string | null;
+  fractionable: 0 | 1 | null;
+  shortable: 0 | 1 | null;
+  marginable: 0 | 1 | null;
+  optionsEnabled: 0 | 1 | null;
+  assetAttributes: string[];
+  assetValidatedAt: string | null;
+  assetRequestId: string | null;
 }
 
 export interface MarketBarRow {

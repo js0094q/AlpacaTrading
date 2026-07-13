@@ -32,6 +32,16 @@ CREATE TABLE IF NOT EXISTS universe_symbols (
   enabled INTEGER NOT NULL DEFAULT 1,
   source TEXT NOT NULL,
   tradable INTEGER NOT NULL DEFAULT 1,
+  asset_id TEXT,
+  asset_status TEXT,
+  exchange TEXT,
+  fractionable INTEGER,
+  shortable INTEGER,
+  marginable INTEGER,
+  options_enabled INTEGER,
+  asset_attributes_json TEXT,
+  asset_validated_at TEXT,
+  asset_request_id TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -533,6 +543,16 @@ const addColumnIfMissing = (db: DbHandle, table: string, column: string, ddl: st
 };
 
 const runMigrations = (db: DbHandle) => {
+  addColumnIfMissing(db, "universe_symbols", "asset_id", "asset_id TEXT");
+  addColumnIfMissing(db, "universe_symbols", "asset_status", "asset_status TEXT");
+  addColumnIfMissing(db, "universe_symbols", "exchange", "exchange TEXT");
+  addColumnIfMissing(db, "universe_symbols", "fractionable", "fractionable INTEGER");
+  addColumnIfMissing(db, "universe_symbols", "shortable", "shortable INTEGER");
+  addColumnIfMissing(db, "universe_symbols", "marginable", "marginable INTEGER");
+  addColumnIfMissing(db, "universe_symbols", "options_enabled", "options_enabled INTEGER");
+  addColumnIfMissing(db, "universe_symbols", "asset_attributes_json", "asset_attributes_json TEXT");
+  addColumnIfMissing(db, "universe_symbols", "asset_validated_at", "asset_validated_at TEXT");
+  addColumnIfMissing(db, "universe_symbols", "asset_request_id", "asset_request_id TEXT");
   addColumnIfMissing(db, "option_snapshots", "quote_status", "quote_status TEXT");
   addColumnIfMissing(db, "option_snapshots", "executable", "executable INTEGER NOT NULL DEFAULT 0");
   addColumnIfMissing(db, "option_snapshots", "executable_price", "executable_price REAL");
