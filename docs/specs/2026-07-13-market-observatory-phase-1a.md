@@ -160,9 +160,9 @@ reason. Paper plan construction still receives only selected candidates.
 
 1. paper/live safety assertion for read-only access;
 2. canonical seed initialization;
-3. stale/missing asset-reference refresh;
-4. Alpaca market-clock check;
-5. `skipped_market_closed` run completion when closed;
+3. Alpaca market-clock check;
+4. `skipped_market_closed` run completion when closed;
+5. stale/missing asset-reference refresh while the market is open;
 6. one bounded multi-symbol stock-snapshot collection;
 7. normalization and per-symbol persistence;
 8. completed/partial/failed run finalization.

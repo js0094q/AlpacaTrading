@@ -1,5 +1,26 @@
 # Resume Context: Alpaca Trading Research Infra
 
+## Market Observatory Phase 1A branch checkpoint (2026-07-13)
+
+- `feat/market-observatory` starts from `main@1d274301fab8739702d0105bcf8e6b7ff504761a`.
+- `src/config/universe.seed.ts` remains canonical. It now contains 51 unique
+  symbols: all 32 prior names plus 19 net-new names from the requested 20-name
+  set; `TSLA` was already present.
+- Alpaca asset metadata is normalized into `universe_symbols`; inactive or
+  non-tradable rows are retained but disabled. All 20 requested names were
+  read-only validated active, tradable, fractionable, shortable, and
+  options-enabled on 2026-07-13.
+- `stock_snapshots` stores feed-aware trade, quote, minute, daily, and
+  previous-daily observations with separate source/ingestion timestamps,
+  derived values, freshness, quality, request IDs, and ingestion-run evidence.
+- Latest observatory evidence enriches only the latest feature row. Every scored
+  candidate persists with a decision and reason; only `selected` candidates can
+  enter paper planning, runtime, review, or outcome analytics.
+- `npm run observatory:collect` is read-only. The checked-in systemd timer invokes
+  it through the existing monitor runner every 15 minutes during weekday market
+  windows with market-hour and non-overlap gates. No deployment occurred in this
+  phase.
+
 ## Latest VPS handoff status (2026-07-05 UTC)
 
 - VPS was rebuilt from empty and re-bootstrapped from this repo.
