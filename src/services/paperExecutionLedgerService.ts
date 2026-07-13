@@ -1,4 +1,9 @@
 import { getDb, queryAll, queryOne } from "../lib/db.js";
+import type {
+  DecisionId,
+  LinkageStatus,
+  PositionLifecycleId
+} from "../types.js";
 
 export type PaperExecutionLedgerStatus =
   | "built"
@@ -40,6 +45,9 @@ export interface PaperExecutionLedgerEntry {
   requestId: string | null;
   sourcePlanId: string | null;
   sourceCandidateId: string | null;
+  decisionId: DecisionId | null;
+  positionLifecycleId: PositionLifecycleId | null;
+  decisionLinkageStatus: LinkageStatus;
   status: PaperExecutionLedgerStatus;
   reason: string | null;
   blockedReason: string | null;
@@ -73,6 +81,9 @@ interface LedgerRow {
   request_id: string | null;
   source_plan_id: string | null;
   source_candidate_id: string | null;
+  decision_id: DecisionId | null;
+  position_lifecycle_id: PositionLifecycleId | null;
+  decision_linkage_status: LinkageStatus;
   status: PaperExecutionLedgerStatus;
   reason: string | null;
   blocked_reason: string | null;
@@ -106,6 +117,9 @@ const mapRow = (row: LedgerRow): PaperExecutionLedgerEntry => ({
   requestId: row.request_id,
   sourcePlanId: row.source_plan_id,
   sourceCandidateId: row.source_candidate_id,
+  decisionId: row.decision_id,
+  positionLifecycleId: row.position_lifecycle_id,
+  decisionLinkageStatus: row.decision_linkage_status,
   status: row.status,
   reason: row.reason,
   blockedReason: row.blocked_reason,
@@ -180,6 +194,9 @@ export const insertPaperExecutionLedgerEntry = (input: {
   errorMessage?: string | null;
   sourcePlanId?: string | null;
   sourceCandidateId?: string | null;
+  decisionId?: DecisionId | null;
+  positionLifecycleId?: PositionLifecycleId | null;
+  decisionLinkageStatus?: LinkageStatus;
   payload: unknown;
   rawPayload?: unknown;
   rawResponse?: unknown;
@@ -189,6 +206,16 @@ export const insertPaperExecutionLedgerEntry = (input: {
   const rawPayloadJson = JSON.stringify(input.rawPayload ?? input.payload);
   const rawResponseJson =
     input.rawResponse === undefined ? null : JSON.stringify(input.rawResponse);
+  const exactCandidate =
+    !input.decisionId && input.sourceCandidateId
+      ? queryOne<{ decision_id: DecisionId | null }>(
+          "SELECT decision_id FROM paper_trade_candidates WHERE id = ? LIMIT 1",
+          [input.sourceCandidateId]
+        )
+      : null;
+  const decisionId = input.decisionId ?? exactCandidate?.decision_id ?? null;
+  const decisionLinkageStatus =
+    input.decisionLinkageStatus ?? (decisionId ? "EXACT" : "LEGACY_UNLINKED");
   const result = getDb()
     .prepare(
       `
@@ -217,10 +244,13 @@ export const insertPaperExecutionLedgerEntry = (input: {
         error_message,
         source_plan_id,
         source_candidate_id,
+        decision_id,
+        position_lifecycle_id,
+        decision_linkage_status,
         payload_json,
         raw_payload_json,
         raw_response_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `
     )
     .run(
@@ -248,6 +278,9 @@ export const insertPaperExecutionLedgerEntry = (input: {
       input.errorMessage ?? null,
       input.sourcePlanId ?? null,
       input.sourceCandidateId ?? null,
+      decisionId,
+      input.positionLifecycleId ?? null,
+      decisionLinkageStatus,
       payloadJson,
       rawPayloadJson,
       rawResponseJson
@@ -277,6 +310,9 @@ export const insertPaperExecutionLedgerEntry = (input: {
     requestId: input.requestId ?? null,
     sourcePlanId: input.sourcePlanId ?? null,
     sourceCandidateId: input.sourceCandidateId ?? null,
+    decisionId,
+    positionLifecycleId: input.positionLifecycleId ?? null,
+    decisionLinkageStatus,
     status: input.status,
     reason: input.reason ?? null,
     blockedReason: input.blockedReason ?? input.reason ?? null,

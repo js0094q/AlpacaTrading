@@ -98,6 +98,10 @@ import {
   executeReviewedPaperHedgeExit
 } from "./services/hedgeExitService.js";
 import { evaluateHedgeLearning } from "./services/hedgeLearningLifecycleService.js";
+import {
+  migrateDatabaseFile,
+  verifyDatabaseFile
+} from "./services/databaseMaintenanceService.js";
 
 const parseArg = (input: string): Record<string, string> | null => {
   const [rawKey, rawValue] = input.split("=", 2);
@@ -109,13 +113,14 @@ const parseArg = (input: string): Record<string, string> | null => {
 
 const parseArgs = (argv: string[]) => {
   const output: Record<string, string | undefined> = {};
-  argv.forEach((item) => {
+  argv.forEach((item, index) => {
     const parsed = parseArg(item);
     if (!parsed) {
       return;
     }
     const [key, value] = Object.entries(parsed)[0]!;
-    output[key] = value;
+    const following = argv[index + 1];
+    output[key] = value || (following && !following.startsWith("--") ? following : value);
   });
   return output;
 };
@@ -258,6 +263,16 @@ const formatPadded = (
 const buildSafeBoolean = (value?: boolean) => (value ? "true" : "false");
 
 const run = async () => {
+  if (command === "db:migrate") {
+    print(migrateDatabaseFile(args.database || undefined));
+    return;
+  }
+
+  if (command === "db:verify") {
+    print(verifyDatabaseFile(args.database || undefined));
+    return;
+  }
+
   if (command === "universe") {
     if (action === "seed") {
       const result = await seedInitialUniverse();
@@ -1387,7 +1402,7 @@ const run = async () => {
 
   print({
     error:
-      "Unknown command. See README for available commands including universe/data/options/features/targets/backtest/learn/research/alpaca:config/paper (including paper:analytics, paper:learn, paper:execute, paper:review, paper:plan, paper:portfolio:review, paper:exit:review, paper:options:discover, paper:ops:morning, paper:ops:midday, paper:ops:late-day, paper:snapshots, paper:trends, paper:runtime, paper:intel).",
+      "Unknown command. See README for available commands including db:migrate/db:verify/universe/data/options/features/targets/backtest/learn/research/alpaca:config/paper (including paper:analytics, paper:learn, paper:execute, paper:review, paper:plan, paper:portfolio:review, paper:exit:review, paper:options:discover, paper:ops:morning, paper:ops:midday, paper:ops:late-day, paper:snapshots, paper:trends, paper:runtime, paper:intel).",
     command,
     action,
     config

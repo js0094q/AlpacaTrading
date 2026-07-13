@@ -1,6 +1,7 @@
 import { getDb, queryAll, queryOne } from "../lib/db.js";
 import { normalizeSymbol, nowIso, uuid } from "../lib/utils.js";
 import type {
+  DecisionId,
   PaperTradeCandidateRow,
   PaperTradeEvaluationRow,
   PaperTradePlanRow,
@@ -24,6 +25,7 @@ interface EvaluationPlanRow {
   id: string;
   research_run_id: string;
   candidate_id: string;
+  decision_id: DecisionId | null;
   symbol: string;
   created_at: string;
   status: "planned" | "entered" | "closed" | "expired" | "skipped";
@@ -342,6 +344,8 @@ export const buildPaperTradePlans = (input: PlanBuildInput): PaperTradePlanRow[]
       id,
       research_run_id,
       candidate_id,
+      decision_id,
+      decision_linkage_status,
       symbol,
       created_at,
       status,
@@ -360,7 +364,7 @@ export const buildPaperTradePlans = (input: PlanBuildInput): PaperTradePlanRow[]
       thesis,
       invalidation,
       learning_objective
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   const out: PaperTradePlanRow[] = [];
@@ -394,10 +398,15 @@ export const buildPaperTradePlans = (input: PlanBuildInput): PaperTradePlanRow[]
       : Math.max(1, Math.abs(candidate.estimatedMaxLoss ?? candidate.expectedReturn ?? 1) * 5);
 
     const planId = `plan_${uuid()}`;
+    const identity = queryOne<{ decision_id: DecisionId | null }>(
+      "SELECT decision_id FROM paper_trade_candidates WHERE id = ? LIMIT 1",
+      [candidate.id]
+    );
     const plan: PaperTradePlanRow = {
       id: planId,
       researchRunId: input.researchRunId,
       candidateId: candidate.id,
+      decisionId: identity?.decision_id ?? null,
       symbol: candidate.symbol,
       createdAt: nowIso(),
       status: "planned",
@@ -425,6 +434,8 @@ export const buildPaperTradePlans = (input: PlanBuildInput): PaperTradePlanRow[]
       plan.id,
       plan.researchRunId,
       plan.candidateId,
+      plan.decisionId,
+      plan.decisionId ? "EXACT" : "LEGACY_UNLINKED",
       plan.symbol,
       plan.createdAt,
       plan.status,
@@ -470,6 +481,8 @@ export const evaluatePaperTrades = (input?: EvaluationInput) => {
       id,
       research_run_id,
       candidate_id,
+      decision_id,
+      decision_linkage_status,
       plan_id,
       horizon,
       evaluated_at,
@@ -480,7 +493,7 @@ export const evaluatePaperTrades = (input?: EvaluationInput) => {
       return_pct,
       outcome,
       notes
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   const updatePlan = getDb().prepare(`
@@ -507,10 +520,13 @@ export const evaluatePaperTrades = (input?: EvaluationInput) => {
 
     const outcome = resolveOutcome(plan, markPrice, due, dueAsIso);
 
+    const evaluationId = `eval_${uuid()}`;
     insert.run(
-      `eval_${uuid()}`,
+      evaluationId,
       plan.research_run_id,
       plan.candidate_id,
+      plan.decision_id,
+      plan.decision_id ? "EXACT" : "LEGACY_UNLINKED",
       plan.id,
       horizon,
       asOf,
@@ -539,9 +555,10 @@ export const evaluatePaperTrades = (input?: EvaluationInput) => {
     );
 
     results.push({
-      id: `eval_${uuid()}`,
+      id: evaluationId,
       researchRunId: plan.research_run_id,
       candidateId: plan.candidate_id,
+      decisionId: plan.decision_id,
       planId: plan.id,
       evaluatedAt: asOf,
       markPrice,

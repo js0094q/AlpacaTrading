@@ -1,7 +1,9 @@
 import { getDb, queryAll, queryOne } from "../lib/db.js";
 import { normalizeSymbol, uuid } from "../lib/utils.js";
+import { createDecisionId } from "./marketDecisionIdentityService.js";
 import type {
   CandidateDecisionRecord,
+  DecisionId,
   PaperTradeCandidateRow,
   PreferredExpression,
   RiskProfile,
@@ -604,6 +606,8 @@ export const persistCandidateDecisions = (input: {
   const insert = getDb().prepare(`
     INSERT INTO paper_trade_candidates(
       id,
+      decision_id,
+      decision_linkage_status,
       research_run_id,
       symbol,
       as_of,
@@ -638,13 +642,19 @@ export const persistCandidateDecisions = (input: {
       signal_inputs_json,
       data_quality_status
     ) VALUES (
-      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-      ?, ?, ?, ?, ?
-    )
+      ?, ?, 'EXACT', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+      ?, ?, ?, ?, ?, ?, ?, ?
+    ) ON CONFLICT(id) DO NOTHING
   `);
+  const persistedRows: Array<(typeof rows)[number] & { decisionId: DecisionId }> = [];
   for (const row of rows) {
+    const existing = getDb()
+      .prepare("SELECT decision_id FROM paper_trade_candidates WHERE id = ?")
+      .get(row.id) as { decision_id: string | null } | undefined;
+    const decisionId = existing?.decision_id ?? createDecisionId();
     insert.run(
       row.id,
+      decisionId,
       row.researchRunId,
       row.symbol,
       row.asOf,
@@ -679,8 +689,12 @@ export const persistCandidateDecisions = (input: {
       JSON.stringify(row.signalInputs),
       row.dataQualityStatus
     );
+    const persisted = getDb()
+      .prepare("SELECT decision_id FROM paper_trade_candidates WHERE id = ?")
+      .get(row.id) as { decision_id: string };
+    persistedRows.push({ ...row, decisionId: persisted.decision_id as DecisionId });
   }
-  return rows;
+  return persistedRows;
 };
 
 export const persistRankedCandidates = (input: {

@@ -192,8 +192,25 @@ export interface ResearchRunRow {
   summaryJson: string | null;
 }
 
+declare const decisionIdBrand: unique symbol;
+declare const positionLifecycleIdBrand: unique symbol;
+
+export type DecisionId = string & { readonly [decisionIdBrand]: true };
+export type PositionLifecycleId = string & {
+  readonly [positionLifecycleIdBrand]: true;
+};
+
+export type DecisionRole = "entry" | "exit" | "non_executable";
+export type LinkageStatus =
+  | "EXACT"
+  | "EXACT_LEGACY_REUSE"
+  | "AMBIGUOUS_NETTED_POSITION"
+  | "LEGACY_UNLINKED"
+  | "PARTIAL_BROKER_RECONCILIATION";
+
 export interface PaperTradeCandidateRow {
   id: string;
+  decisionId?: DecisionId | null;
   researchRunId: string;
   symbol: string;
   asOf: string;
@@ -239,6 +256,7 @@ export interface PaperTradePlanRow {
   id: string;
   researchRunId: string;
   candidateId: string;
+  decisionId: DecisionId | null;
   symbol: string;
   createdAt: string;
   status: "planned" | "entered" | "closed" | "expired" | "skipped";
@@ -267,6 +285,7 @@ export interface PaperTradeEvaluationRow {
   researchRunId: string;
   planId: string;
   candidateId: string;
+  decisionId: DecisionId | null;
   evaluatedAt: string;
   markPrice: number | null;
   estimatedExitValue: number | null;
