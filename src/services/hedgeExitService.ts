@@ -1,6 +1,8 @@
 import {
   cancelPaperOrder,
+  getAccount,
   getPaperOrder,
+  listPaperPositions,
   submitPaperOrder,
   type AlpacaAccountRaw,
   type AlpacaApiResponse,
@@ -70,6 +72,8 @@ export interface HedgeExitReviewResult {
 export interface HedgeExitExecutionDeps {
   review?: HedgeExecutionReview;
   account?: AlpacaAccountRaw;
+  getAccount?: typeof getAccount;
+  listPositions?: typeof listPaperPositions;
   currentPositionQuantity?: number;
   refreshQuote?: (symbol: string) => Promise<{ bid: number | null; ask: number | null; midpoint: number | null; quoteTimestamp?: string | null }>;
   submitPaperOrder?: (payload: Record<string, unknown>) => Promise<AlpacaApiResponse<AlpacaSubmittedOrder>>;
@@ -221,11 +225,30 @@ export const executeReviewedPaperHedgeExit = async (
   if (!verification.valid || review.reviewType !== "exit" || review.orderIntent.side !== "sell_to_close") {
     return { ...executionBlocked(input.reviewId, [...verification.blockers, "HEDGE_EXIT_REVIEW_INVALID"]), verification };
   }
-  const account = deps.account;
+  let account = deps.account;
+  if (!account) {
+    try {
+      account = (await (deps.getAccount ?? getAccount)()).data;
+    } catch {
+      return executionBlocked(input.reviewId, ["HEDGE_ACCOUNT_NOT_VERIFIED"]);
+    }
+  }
   if (!account || account.status !== "ACTIVE" || !account.id) {
     return executionBlocked(input.reviewId, ["HEDGE_ACCOUNT_NOT_VERIFIED"]);
   }
-  const currentQuantity = finite(deps.currentPositionQuantity, 0);
+  let currentQuantity = finite(deps.currentPositionQuantity, 0);
+  if (deps.currentPositionQuantity === undefined) {
+    try {
+      const positions = (await (deps.listPositions ?? listPaperPositions)()).data;
+      const heldPosition = positions.find(
+        (position) =>
+          String(position.symbol || "").toUpperCase() === review.orderIntent.symbol.toUpperCase()
+      );
+      currentQuantity = finite(heldPosition?.qty, 0);
+    } catch {
+      return executionBlocked(input.reviewId, ["HEDGE_EXIT_POSITION_NOT_VERIFIED"]);
+    }
+  }
   if (currentQuantity <= 0 || currentQuantity < review.orderIntent.quantity) {
     return executionBlocked(input.reviewId, ["HEDGE_EXIT_QUANTITY_UNAVAILABLE"]);
   }

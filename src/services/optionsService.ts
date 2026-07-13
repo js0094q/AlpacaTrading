@@ -103,6 +103,8 @@ export const toSnapshotRow = (
       allowLastPriceFallback: quoteCfg.allowLastPriceFallback
     }
   );
+  const volume = toNullableNumber(symbolData.volume);
+  const openInterest = toNullableNumber(symbolData.openInterest ?? symbolData.open_interest);
 
   return {
     optionSymbol: canonical.symbol,
@@ -118,6 +120,8 @@ export const toSnapshotRow = (
     executablePriceSource: normalizedQuote.executablePriceSource,
     rejectionReason: normalizedQuote.rejectionReason,
     quoteTimestamp: normalizedQuote.quoteTimestamp,
+    volume: volume === null ? null : Math.round(volume),
+    openInterest: openInterest === null ? null : Math.round(openInterest),
     bidSize: canonical.latestQuote?.bidSize ?? null,
     askSize: canonical.latestQuote?.askSize ?? null,
     tradeSize: canonical.latestTrade?.size ?? null,
@@ -221,9 +225,9 @@ const insertOptionSnapshotRows = async (
     INSERT INTO option_snapshots(
       option_symbol, underlying_symbol, timestamp, bid, ask, midpoint, last,
       quote_status, executable, executable_price, executable_price_source, rejection_reason, quote_timestamp,
-      bid_size, ask_size, trade_size, trade_timestamp,
+      volume, open_interest, bid_size, ask_size, trade_size, trade_timestamp,
       implied_volatility, delta, gamma, theta, vega, rho, snapshot_timestamp, normalization_path, source
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'alpaca')
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'alpaca')
     ON CONFLICT(option_symbol, timestamp) DO NOTHING
   `);
 
@@ -262,6 +266,8 @@ const insertOptionSnapshotRows = async (
         row.executablePriceSource,
         row.rejectionReason,
         row.quoteTimestamp,
+        row.volume,
+        row.openInterest,
         row.bidSize,
         row.askSize,
         row.tradeSize,
