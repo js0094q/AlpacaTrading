@@ -246,6 +246,22 @@ test("crossed or explicitly invalid option quotes block playbook eligibility", (
   assert.ok(invalid.blockers.includes("OPTION_QUOTE_INVALID"));
 });
 
+test("reversal also blocks invalid or non-executable option quotes", () => {
+  const evaluation = findEvaluation(
+    makeContext("bearish", {
+      option: {
+        ...makeOption("put"),
+        quoteStatus: "invalid",
+        executable: 0
+      }
+    }),
+    "reversal"
+  );
+
+  assert.equal(evaluation.eligible, false);
+  assert.ok(evaluation.blockers.includes("OPTION_QUOTE_INVALID"));
+});
+
 test("gamma proxy is insufficient and ineligible when gamma or open interest is absent", () => {
   const missing = findEvaluation(
     makeContext("bullish", {

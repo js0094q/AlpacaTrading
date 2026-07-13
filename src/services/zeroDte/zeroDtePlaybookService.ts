@@ -142,6 +142,9 @@ const readBoolean = (source: Record<string, unknown>, names: string[]) => {
       if (value.trim().toLowerCase() === "true") return true;
       if (value.trim().toLowerCase() === "false") return false;
     }
+    if (typeof value === "number" && (value === 0 || value === 1)) {
+      return value === 1;
+    }
   }
   return null;
 };
@@ -724,6 +727,7 @@ const evaluateReversal = (
   derived: DerivedMarketContext
 ) => {
   const collector = coreCollector(derived);
+  const liquidity = optionLiquidityScore(context, derived, collector);
   const indicators = context.indicators;
   const priorDirection =
     normalizeDirection(readString(indicators, ["lastMoveDirection", "priorDirection", "momentumDirection"])) ??
@@ -841,7 +845,8 @@ const evaluateReversal = (
       supportingDescription: "Supported divergence confirms the reversal thesis",
       opposingDescription: "Supported divergence is not confirmed",
       direction
-    })
+    }),
+    liquidity: addLiquiditySignal(collector, liquidity, 10, direction)
   };
   const confirmationCount = [
     extension !== null && extension >= 1,
