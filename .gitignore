@@ -27,6 +27,7 @@ id_rsa
 
 # Runtime artifacts
 node_modules/
+.worktrees/
 dist/
 .next/
 data/
