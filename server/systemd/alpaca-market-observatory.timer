@@ -1,0 +1,11 @@
+[Unit]
+Description=Collect Alpaca Paper Market Observatory snapshots every 15 minutes
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09..15:0/15:00
+Persistent=false
+RandomizedDelaySec=15
+Unit=alpaca-market-observatory.service
+
+[Install]
+WantedBy=timers.target

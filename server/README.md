@@ -191,6 +191,7 @@ changing deployment artifacts, secrets, or security-relevant environment values:
 
 ```bash
 sudo systemctl stop alpaca-dashboard-control.service
+sudo systemctl stop alpaca-market-observatory.timer
 sudo systemctl stop paper-ops-morning.timer paper-ops-midday.timer paper-ops-late-day.timer
 docker compose -f /opt/alpaca-investing/app/docker-compose.yml down
 ```

@@ -65,6 +65,18 @@ const maybeCreateLearningLedgerRecord = (event: HedgeLearningEvent) => {
       ? "rejected"
       : "no_op";
   try {
+    const reviewLink = getDb().prepare(`
+      SELECT decision_id, decision_role, position_lifecycle_id,
+             decision_linkage_status
+      FROM hedge_execution_reviews
+      WHERE review_id = ?
+      LIMIT 1
+    `).get(event.reviewId) as {
+      decision_id: import("../types.js").DecisionId | null;
+      decision_role: "entry" | "exit" | null;
+      position_lifecycle_id: import("../types.js").PositionLifecycleId | null;
+      decision_linkage_status: import("../types.js").LinkageStatus;
+    } | undefined;
     insertPaperLearningRecord({
       id: `hedge-learning-${event.reviewId}`,
       strategyFamily: "portfolio_hedge",
@@ -79,7 +91,15 @@ const maybeCreateLearningLedgerRecord = (event: HedgeLearningEvent) => {
         evidence: event.evidence
       },
       learningStatus: "pending",
-      sourceCandidateId: typeof event.evidence.candidateId === "string" ? event.evidence.candidateId : null
+      sourceCandidateId: typeof event.evidence.candidateId === "string" ? event.evidence.candidateId : null,
+      decisionId: reviewLink?.decision_id ?? null,
+      entryDecisionId:
+        reviewLink?.decision_role === "entry" ? reviewLink.decision_id : null,
+      exitDecisionId:
+        reviewLink?.decision_role === "exit" ? reviewLink.decision_id : null,
+      positionLifecycleId: reviewLink?.position_lifecycle_id ?? null,
+      decisionLinkageStatus:
+        reviewLink?.decision_linkage_status ?? "LEGACY_UNLINKED"
     });
   } catch {
     // The event ledger remains authoritative when a legacy learning row already exists.
@@ -95,15 +115,36 @@ export const recordHedgeLearningEvent = (input: {
 }) => {
   const createdAt = input.createdAt ?? new Date().toISOString();
   const evidence = (sanitize(input.evidence ?? {}) ?? {}) as Record<string, unknown>;
+  const reviewLink = getDb().prepare(`
+    SELECT decision_id, position_lifecycle_id, decision_linkage_status
+    FROM hedge_execution_reviews
+    WHERE review_id = ?
+    LIMIT 1
+  `).get(input.reviewId) as {
+    decision_id: string | null;
+    position_lifecycle_id: string | null;
+    decision_linkage_status: string;
+  } | undefined;
   const result = getDb()
     .prepare(
       `
-      INSERT INTO hedge_learning_events(event_id, review_id, event_type, created_at, evidence_json)
-      VALUES (?, ?, ?, ?, ?)
+      INSERT INTO hedge_learning_events(
+        event_id, review_id, event_type, created_at, evidence_json,
+        decision_id, position_lifecycle_id, decision_linkage_status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(event_id) DO NOTHING
       `
     )
-    .run(input.eventId, input.reviewId, input.eventType, createdAt, JSON.stringify(evidence));
+    .run(
+      input.eventId,
+      input.reviewId,
+      input.eventType,
+      createdAt,
+      JSON.stringify(evidence),
+      reviewLink?.decision_id ?? null,
+      reviewLink?.position_lifecycle_id ?? null,
+      reviewLink?.decision_linkage_status ?? "LEGACY_UNLINKED"
+    );
   const created = Number(result.changes) === 1;
   const event: HedgeLearningEvent = {
     eventId: input.eventId,

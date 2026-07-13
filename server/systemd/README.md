@@ -12,6 +12,9 @@ The repository now includes a paper control service template for the VPS dashboa
   on weekdays around 12:00 PM ET.
 - `paper-ops-late-day.service` / `.timer` — runs `npm run paper:ops:late-day -- --format=json`
   on weekdays around 3:15 PM ET.
+- `alpaca-market-observatory.service` / `.timer` — runs the read-only
+  `npm run paper:monitor -- --task=observatory` collector every 15 minutes during
+  weekday regular-market windows.
 - `alpaca-paper-review.service` / `.timer` — runs `npm run paper:monitor -- --task=review`
   every 30 minutes during weekday market-hour windows.
 - `alpaca-paper-execute.service` / `.timer` — runs reviewed entry execution through
@@ -68,11 +71,11 @@ Timer services set `AUTOMATED_PAPER_EXECUTION_ENABLED=false`, so scheduled workf
 
 ## Installing continuous paper monitor timers
 
-The continuous monitor uses reviewed artifacts only and separates entry execution from exit execution by payload section.
+The continuous monitor includes the non-executing market observatory collector and separates reviewed entry execution from exit execution by payload section.
 
 ```bash
 sudo bash /home/alpaca/Alpaca-Trading/scripts/install-paper-monitoring-systemd.sh
-systemctl list-timers 'alpaca-paper-*' --no-pager
+systemctl list-timers 'alpaca-*' --no-pager
 ```
 
 Disable:
