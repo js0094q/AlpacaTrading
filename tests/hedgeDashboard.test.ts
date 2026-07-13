@@ -146,6 +146,8 @@ const dashboardRecommendation = (
   generatedAt: "2026-07-10T14:00:00.000Z",
   expiresAt: "2026-07-10T14:30:00.000Z",
   environment: "paper",
+  paperOnly: true,
+  liveTradingEnabled: false,
   sourceSnapshotId: "portfolio-snapshot-dashboard",
   riskModelVersion: "portfolio-risk-v1",
   regimeModelVersion: "market-regime-v1",
@@ -362,4 +364,52 @@ test("dashboard renders missing Greek metrics as unavailable rather than zero", 
 
   assert.match(html, /Gamma shares per \$1 underlying move<\/span><strong>Unavailable/);
   assert.doesNotMatch(html, /Gamma shares per \$1 underlying move<\/span><strong>0/);
+});
+
+test("dashboard renders partial freshness as unavailable", () => {
+  const recommendation = dashboardRecommendation("current");
+  delete recommendation.risk!.options!.freshness!.malformed;
+  const html = renderToStaticMarkup(createElement(HedgePanel, { recommendation }));
+
+  assert.match(html, /Greek freshness<\/span><strong>Unavailable/);
+  assert.doesNotMatch(html, /Greek freshness<\/span><strong>current 1.*malformed 0/);
+});
+
+test("dashboard fails closed on mismatched paper safety evidence", () => {
+  for (const patch of [
+    { paperOnly: false },
+    { environment: "live" },
+    { liveTradingEnabled: true }
+  ]) {
+    const recommendation = { ...dashboardRecommendation("current"), ...patch };
+    const html = renderToStaticMarkup(createElement(HedgePanel, { recommendation }));
+    assert.match(html, /Trading state<\/span><strong>Unavailable/);
+    assert.doesNotMatch(html, /Paper only — Live trading disabled/);
+  }
+});
+
+test("dashboard renders complete coverage arithmetic and grouped weighted IV", () => {
+  const html = renderToStaticMarkup(
+    createElement(HedgePanel, { recommendation: dashboardRecommendation("current") })
+  );
+
+  for (const label of [
+    "Delta positions total",
+    "Delta positions measured",
+    "Delta positions unmeasured",
+    "Delta position coverage",
+    "Delta contracts total",
+    "Delta contracts measured",
+    "Delta contracts unmeasured",
+    "Delta contract coverage",
+    "Delta market value total",
+    "Delta market value measured",
+    "Delta market value unmeasured",
+    "Delta market-value coverage",
+    "Group IV weighted by contracts",
+    "Group IV weighted by market value",
+    "Group IV weighted by vega"
+  ]) {
+    assert.match(html, new RegExp(label));
+  }
 });

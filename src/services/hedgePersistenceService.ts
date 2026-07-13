@@ -11,6 +11,8 @@ import type {
 import type {
   CoverageBasis,
   FreshnessCounts,
+  NormalizedRiskPosition,
+  ObservationFreshness,
   OptionGreekGroup,
   OptionMetric,
   OptionMetricCoverage,
@@ -80,6 +82,15 @@ const isStringArray = (value: unknown): value is string[] =>
 const isFiniteOrNull = (value: unknown): value is number | null =>
   value === null || (typeof value === "number" && Number.isFinite(value));
 
+const isFiniteNumber = (value: unknown): value is number =>
+  typeof value === "number" && Number.isFinite(value);
+
+const isStringOrNull = (value: unknown): value is string | null =>
+  value === null || typeof value === "string";
+
+const nearlyEqual = (left: number, right: number) =>
+  Math.abs(left - right) <= 1e-9 * Math.max(1, Math.abs(left), Math.abs(right));
+
 const hasFiniteOrNullFields = (
   value: Record<string, unknown>,
   fields: readonly string[]
@@ -111,11 +122,25 @@ const isCoverageBasis = (value: unknown): value is CoverageBasis => {
   ) {
     return false;
   }
+  if (total === null) {
+    return measured === null && unmeasured === null && coverageRatio === null;
+  }
+  if (
+    total < 0 ||
+    measured === null ||
+    measured < 0 ||
+    unmeasured === null ||
+    unmeasured < 0 ||
+    !nearlyEqual(total, measured + unmeasured)
+  ) {
+    return false;
+  }
+  if (total === 0) return coverageRatio === null;
   return (
-    (total === null || total >= 0) &&
-    (measured === null || measured >= 0) &&
-    (unmeasured === null || unmeasured >= 0) &&
-    (coverageRatio === null || (coverageRatio >= 0 && coverageRatio <= 1))
+    coverageRatio !== null &&
+    coverageRatio >= 0 &&
+    coverageRatio <= 1 &&
+    nearlyEqual(coverageRatio, measured / total)
   );
 };
 
@@ -184,8 +209,252 @@ const explicitOptionTotalFields = [
   "absoluteRhoDollarsPerRatePoint"
 ] as const;
 
+const legacyOptionTotalFields = [
+  "deltaExposure",
+  "absoluteDeltaExposure",
+  "absoluteDeltaExposurePct",
+  "positiveDeltaExposure",
+  "positiveDeltaExposurePct",
+  "gammaExposure",
+  "thetaExposure",
+  "vegaExposure",
+  "rhoExposure",
+  "nearTermExposurePct"
+] as const;
+
+const positionNumericFields = [
+  "quantity",
+  "marketValue",
+  "currentPrice",
+  "underlyingPrice",
+  "costBasis",
+  "unrealizedPl",
+  "unrealizedPlPct",
+  "beta",
+  "multiplier",
+  "delta",
+  "gamma",
+  "theta",
+  "vega",
+  "rho",
+  "strikePrice",
+  "daysToExpiration",
+  "moneynessPct",
+  "deltaEquivalentShares",
+  "deltaAdjustedExposure",
+  "deltaShares",
+  "deltaDollars",
+  "betaExposure",
+  "gammaExposure",
+  "thetaExposure",
+  "vegaExposure",
+  "rhoExposure",
+  "gammaSharesPerDollar",
+  "thetaDollarsPerDay",
+  "vegaDollarsPerVolPoint",
+  "rhoDollarsPerRatePoint",
+  "impliedVolatility",
+  "bid",
+  "ask",
+  "midpoint",
+  "bidSize",
+  "askSize",
+  "bidAskSpreadPct"
+] as const;
+
+const isObservationFreshness = (value: unknown): value is ObservationFreshness =>
+  value === "current" || value === "stale" || value === "expired" || value === "malformed";
+
+const isRiskPosition = (value: unknown): value is NormalizedRiskPosition =>
+  isRecord(value) &&
+  typeof value.symbol === "string" &&
+  value.symbol.length > 0 &&
+  typeof value.underlying === "string" &&
+  value.underlying.length > 0 &&
+  (value.assetClass === "equity" || value.assetClass === "option") &&
+  (value.optionType === null || value.optionType === "call" || value.optionType === "put") &&
+  typeof value.sector === "string" &&
+  typeof value.betaStatus === "string" &&
+  hasFiniteOrNullFields(value, positionNumericFields) &&
+  isStringOrNull(value.expirationDate) &&
+  isStringOrNull(value.greekObservationTimestamp) &&
+  (value.assetClass === "equity" || isObservationFreshness(value.greekObservationFreshness)) &&
+  isStringOrNull(value.underlyingPriceTimestamp) &&
+  isStringOrNull(value.quoteTimestamp) &&
+  typeof value.inverseExposure === "boolean" &&
+  isStringArray(value.warnings) &&
+  isStringArray(value.blockers);
+
+const isRatio = (value: unknown): value is number =>
+  isFiniteNumber(value) && value >= 0 && value <= 1;
+
+const isScenario = (value: unknown) =>
+  isRecord(value) &&
+  (value.benchmarkDeclinePct === 5 ||
+    value.benchmarkDeclinePct === 8 ||
+    value.benchmarkDeclinePct === 10 ||
+    value.benchmarkDeclinePct === 15) &&
+  isFiniteNumber(value.grossModeledLoss) &&
+  isFiniteNumber(value.existingProtection) &&
+  isFiniteOrNull(value.netModeledLoss) &&
+  isFiniteOrNull(value.netModeledLossPct) &&
+  isRatio(value.coverage) &&
+  isStringArray(value.warnings);
+
+const isOptionDataCoverage = (value: unknown) => {
+  if (!isRecord(value)) return false;
+  const numericFields = [
+    "totalOptionContracts",
+    "contractsWithDelta",
+    "contractsWithoutDelta",
+    "totalOptionMarketValue",
+    "optionMarketValueWithDelta",
+    "optionMarketValueWithoutDelta"
+  ] as const;
+  if (!numericFields.every((field) => isFiniteNumber(value[field]) && Number(value[field]) >= 0)) {
+    return false;
+  }
+  const totalContracts = Number(value.totalOptionContracts);
+  const contractsWithDelta = Number(value.contractsWithDelta);
+  const contractsWithoutDelta = Number(value.contractsWithoutDelta);
+  const totalMarketValue = Number(value.totalOptionMarketValue);
+  const marketValueWithDelta = Number(value.optionMarketValueWithDelta);
+  const marketValueWithoutDelta = Number(value.optionMarketValueWithoutDelta);
+  return (
+    nearlyEqual(totalContracts, contractsWithDelta + contractsWithoutDelta) &&
+    nearlyEqual(totalMarketValue, marketValueWithDelta + marketValueWithoutDelta) &&
+    (totalContracts === 0
+      ? value.contractDeltaCoveragePct === null
+      : isRatio(value.contractDeltaCoveragePct) &&
+        nearlyEqual(Number(value.contractDeltaCoveragePct), contractsWithDelta / totalContracts)) &&
+    (totalMarketValue === 0
+      ? value.marketValueDeltaCoveragePct === null
+      : isRatio(value.marketValueDeltaCoveragePct) &&
+        nearlyEqual(Number(value.marketValueDeltaCoveragePct), marketValueWithDelta / totalMarketValue)) &&
+    typeof value.materialCoverageMissing === "boolean"
+  );
+};
+
+const dteBucket = (daysToExpiration: number | null) => {
+  if (daysToExpiration === null) return "unknown";
+  if (daysToExpiration < 0) return "expired";
+  if (daysToExpiration <= 30) return "0-30";
+  if (daysToExpiration <= 60) return "31-60";
+  if (daysToExpiration <= 90) return "61-90";
+  if (daysToExpiration <= 180) return "91-180";
+  if (daysToExpiration <= 365) return "181-365";
+  return "366+";
+};
+
+const groupingMatchesPositions = (
+  grouping: Record<string, OptionGreekGroup>,
+  positions: NormalizedRiskPosition[],
+  keyFor: (position: NormalizedRiskPosition) => string
+) => {
+  const expected = new Map<string, NormalizedRiskPosition[]>();
+  for (const position of positions) {
+    const key = keyFor(position);
+    expected.set(key, [...(expected.get(key) ?? []), position]);
+  }
+  if (
+    Object.keys(grouping).length !== expected.size ||
+    Object.keys(grouping).some((key) => !expected.has(key))
+  ) {
+    return false;
+  }
+  return [...expected].every(([key, groupPositions]) => {
+    const group = grouping[key];
+    const quantityComplete = groupPositions.every((position) => position.quantity !== null);
+    const marketValueComplete = groupPositions.every((position) => position.marketValue !== null);
+    const expectedContracts = quantityComplete
+      ? groupPositions.reduce((sum, position) => sum + Math.abs(position.quantity ?? 0), 0)
+      : null;
+    const expectedMarketValue = marketValueComplete
+      ? groupPositions.reduce((sum, position) => sum + Math.abs(position.marketValue ?? 0), 0)
+      : null;
+    return (
+      group.positionCount === groupPositions.length &&
+      (expectedContracts === null
+        ? group.absoluteContracts === null
+        : group.absoluteContracts !== null && nearlyEqual(group.absoluteContracts, expectedContracts)) &&
+      (expectedMarketValue === null
+        ? group.absoluteMarketValue === null
+        : group.absoluteMarketValue !== null &&
+          nearlyEqual(group.absoluteMarketValue, expectedMarketValue))
+    );
+  });
+};
+
+const metricValue = (position: NormalizedRiskPosition, metric: OptionMetric) =>
+  metric === "impliedVolatility" ? position.impliedVolatility : position[metric];
+
+const expectedCoverageBasis = (
+  total: number | null,
+  measured: number | null
+): CoverageBasis => ({
+  total,
+  measured,
+  unmeasured: total === null || measured === null ? null : Math.max(0, total - measured),
+  coverageRatio: total !== null && measured !== null && total > 0 ? measured / total : null
+});
+
+const sameCoverageBasis = (actual: CoverageBasis, expected: CoverageBasis) =>
+  (["total", "measured", "unmeasured", "coverageRatio"] as const).every((field) => {
+    const left = actual[field];
+    const right = expected[field];
+    return left === null || right === null
+      ? left === right
+      : nearlyEqual(left, right);
+  });
+
+const metricCoverageMatchesPositions = (
+  coverage: Record<OptionMetric, OptionMetricCoverage>,
+  positions: NormalizedRiskPosition[]
+) => optionMetrics.every((metric) => {
+  const measuredPositions = positions.filter((position) => metricValue(position, metric) !== null);
+  const quantityComplete = positions.every((position) => position.quantity !== null);
+  const marketValueComplete = positions.every((position) => position.marketValue !== null);
+  const totalContracts = quantityComplete
+    ? positions.reduce((sum, position) => sum + Math.abs(position.quantity ?? 0), 0)
+    : null;
+  const measuredContracts = quantityComplete
+    ? measuredPositions.reduce((sum, position) => sum + Math.abs(position.quantity ?? 0), 0)
+    : null;
+  const totalMarketValue = marketValueComplete
+    ? positions.reduce((sum, position) => sum + Math.abs(position.marketValue ?? 0), 0)
+    : null;
+  const measuredMarketValue = marketValueComplete
+    ? measuredPositions.reduce((sum, position) => sum + Math.abs(position.marketValue ?? 0), 0)
+    : null;
+  return (
+    sameCoverageBasis(
+      coverage[metric].positions,
+      expectedCoverageBasis(positions.length, measuredPositions.length)
+    ) &&
+    sameCoverageBasis(
+      coverage[metric].absoluteContracts,
+      expectedCoverageBasis(totalContracts, measuredContracts)
+    ) &&
+    sameCoverageBasis(
+      coverage[metric].absoluteMarketValue,
+      expectedCoverageBasis(totalMarketValue, measuredMarketValue)
+    )
+  );
+});
+
 const isCurrentRiskPayload = (value: unknown): value is PortfolioRiskSnapshot => {
-  if (!isRecord(value) || !isRecord(value.options)) return false;
+  if (
+    !isRecord(value) ||
+    !isRecord(value.account) ||
+    !isRecord(value.exposures) ||
+    !isRecord(value.options) ||
+    !isRecord(value.concentration) ||
+    !isRecord(value.dataQuality)
+  ) return false;
+  const account = value.account as Record<string, unknown>;
+  const exposures = value.exposures as Record<string, unknown>;
+  const concentration = value.concentration as Record<string, unknown>;
+  const dataQuality = value.dataQuality as Record<string, unknown>;
   const options = value.options;
   const coverage = options.coverage;
   if (
@@ -193,12 +462,19 @@ const isCurrentRiskPayload = (value: unknown): value is PortfolioRiskSnapshot =>
     value.environment !== "paper" ||
     typeof value.snapshotId !== "string" ||
     value.snapshotId.length === 0 ||
+    !isStringOrNull(value.sourceAccountSnapshotId) ||
     isoTime(value.generatedAt) === null ||
-    typeof value.riskModelVersion !== "string" ||
-    typeof value.configurationFingerprint !== "string" ||
-    !Array.isArray(value.positions) ||
+    typeof value.riskModelVersion !== "string" || value.riskModelVersion.length === 0 ||
+    typeof value.configurationFingerprint !== "string" || value.configurationFingerprint.length === 0 ||
+    !Array.isArray(value.positions) || !value.positions.every(isRiskPosition) ||
+    !hasFiniteOrNullFields(account, ["equity", "cash", "buyingPower", "highWaterMark", "drawdownPct"]) ||
+    !["grossExposure", "netExposure", "longExposure", "shortOrInverseExposure"].every(
+      (field) => isFiniteNumber(exposures[field])
+    ) ||
+    !hasFiniteOrNullFields(exposures, ["grossExposurePct", "netExposurePct"]) ||
     !isStringArray(value.warnings) ||
     !isStringArray(value.blockers) ||
+    !hasFiniteOrNullFields(options, legacyOptionTotalFields) ||
     !hasFiniteOrNullFields(options, explicitOptionTotalFields) ||
     !isWeightedIv(options.impliedVolatility) ||
     !isFreshnessCounts(options.freshness) ||
@@ -216,31 +492,88 @@ const isCurrentRiskPayload = (value: unknown): value is PortfolioRiskSnapshot =>
     return false;
   }
 
-  return value.positions.every((position) => {
-    if (!isRecord(position) || position.assetClass !== "option") return isRecord(position);
-    return (
-      hasFiniteOrNullFields(position, [
-        "delta",
-        "gamma",
-        "theta",
-        "vega",
-        "rho",
-        "deltaShares",
-        "deltaDollars",
-        "gammaSharesPerDollar",
-        "thetaDollarsPerDay",
-        "vegaDollarsPerVolPoint",
-        "rhoDollarsPerRatePoint",
-        "impliedVolatility"
-      ]) &&
-      (position.greekObservationTimestamp === null ||
-        typeof position.greekObservationTimestamp === "string") &&
-      (position.greekObservationFreshness === "current" ||
-        position.greekObservationFreshness === "stale" ||
-        position.greekObservationFreshness === "expired" ||
-        position.greekObservationFreshness === "malformed")
+  if (
+    !hasFiniteOrNullFields(concentration, [
+      "largestUnderlyingWeight",
+      "topFiveUnderlyingWeight",
+      "unknownSectorWeight"
+    ]) ||
+    !isRecord(concentration.byUnderlying) ||
+    !Object.values(concentration.byUnderlying).every(isFiniteNumber) ||
+    !isRecord(concentration.bySector) ||
+    !Object.values(concentration.bySector).every(isFiniteNumber) ||
+    !isFiniteOrNull(value.portfolioBeta) ||
+    !isRatio(value.betaCoverage) ||
+    !isOptionDataCoverage(value.optionDataCoverage) ||
+    !Array.isArray(value.scenarios) ||
+    !value.scenarios.every(isScenario) ||
+    !(value.dataQualityStatus === "complete" ||
+      value.dataQualityStatus === "partial" ||
+      value.dataQualityStatus === "monitoring" ||
+      value.dataQualityStatus === "blocked") ||
+    !["positionPriceCoverage", "optionDeltaCoverage", "optionGammaCoverage", "optionThetaCoverage", "optionVegaCoverage", "betaCoverage", "sectorCoverage"].every(
+      (field) => isRatio(dataQuality[field])
+    )
+  ) {
+    return false;
+  }
+
+  const optionPositions = value.positions.filter((position) => position.assetClass === "option");
+  const groupings = options.groupings as unknown as PortfolioRiskSnapshot["options"]["groupings"];
+  const typedCoverage = coverage as Record<OptionMetric, OptionMetricCoverage>;
+  return Boolean(
+    groupings &&
+    metricCoverageMatchesPositions(typedCoverage, optionPositions) &&
+    groupingMatchesPositions(groupings.byUnderlying, optionPositions, (position) => position.underlying) &&
+    groupingMatchesPositions(groupings.byExpiration, optionPositions, (position) => position.expirationDate ?? "unknown") &&
+    groupingMatchesPositions(groupings.byOptionType, optionPositions, (position) => position.optionType ?? "unknown") &&
+    groupingMatchesPositions(groupings.byDteBucket, optionPositions, (position) => dteBucket(position.daysToExpiration))
+  );
+};
+
+const freshnessCounts = (positions: NormalizedRiskPosition[]): FreshnessCounts =>
+  positions.reduce<FreshnessCounts>((counts, position) => {
+    const status = position.greekObservationFreshness ?? "malformed";
+    counts[status] += 1;
+    counts.total += 1;
+    return counts;
+  }, { current: 0, stale: 0, expired: 0, malformed: 0, total: 0 });
+
+const classifyFreshness = (
+  timestamp: string | null | undefined,
+  asOf: string
+): ObservationFreshness => {
+  const observedAt = typeof timestamp === "string" ? Date.parse(timestamp) : Number.NaN;
+  const currentTime = Date.parse(asOf);
+  if (!Number.isFinite(observedAt) || !Number.isFinite(currentTime) || observedAt > currentTime) {
+    return "malformed";
+  }
+  const { currentMaxAgeSeconds, staleMaxAgeSeconds } = buildHedgeConfig().optionGreeksFreshness;
+  const ageSeconds = (currentTime - observedAt) / 1000;
+  if (ageSeconds <= currentMaxAgeSeconds) return "current";
+  if (ageSeconds <= staleMaxAgeSeconds) return "stale";
+  return "expired";
+};
+
+const recomputeRiskFreshness = (risk: PortfolioRiskSnapshot, asOf: string) => {
+  const optionPositions = risk.positions.filter((position) => position.assetClass === "option");
+  for (const position of optionPositions) {
+    position.greekObservationFreshness = classifyFreshness(
+      position.greekObservationTimestamp,
+      asOf
     );
-  });
+  }
+  risk.options.freshness = freshnessCounts(optionPositions);
+  for (const metric of optionMetrics) {
+    const measured = optionPositions.filter((position) =>
+      isFiniteOrNull(metric === "impliedVolatility" ? position.impliedVolatility : position[metric]) &&
+      (metric === "impliedVolatility" ? position.impliedVolatility : position[metric]) !== null
+    );
+    if (risk.options.coverage?.[metric]) {
+      risk.options.coverage[metric].freshness = freshnessCounts(measured);
+    }
+  }
+  return risk;
 };
 
 const hasNonCurrentGreekEvidence = (risk: PortfolioRiskSnapshot) =>
@@ -466,6 +799,9 @@ const mapRecommendation = (
   if (!validStrings || generated === null || expires === null || raw.recordType !== "hedge_recommendation") {
     integrityWarnings.push("HEDGE_RECOMMENDATION_INTEGRITY_INVALID");
   }
+  if (raw.environment !== "paper") {
+    integrityWarnings.push("HEDGE_RECOMMENDATION_ENVIRONMENT_INVALID");
+  }
   if (raw.configurationFingerprint !== input.configurationFingerprint) {
     integrityWarnings.push("HEDGE_CONFIGURATION_FINGERPRINT_MISMATCH");
   }
@@ -475,17 +811,30 @@ const mapRecommendation = (
   if (raw.regimeModelVersion !== input.regimeModelVersion) {
     integrityWarnings.push("HEDGE_REGIME_MODEL_VERSION_MISMATCH");
   }
-  const validRisk = isCurrentRiskPayload(raw.risk) ? raw.risk : null;
+  let validRisk = isCurrentRiskPayload(raw.risk) ? raw.risk : null;
   if (!validRisk) {
     integrityWarnings.push("HEDGE_RISK_PAYLOAD_INVALID");
   } else {
+    const identityMismatch =
+      validRisk.snapshotId !== raw.sourceSnapshotId ||
+      validRisk.riskModelVersion !== raw.riskModelVersion ||
+      validRisk.configurationFingerprint !== raw.configurationFingerprint;
+    if (validRisk.snapshotId !== raw.sourceSnapshotId) {
+      integrityWarnings.push("HEDGE_RISK_SOURCE_SNAPSHOT_MISMATCH");
+    }
     if (validRisk.riskModelVersion !== raw.riskModelVersion) {
       integrityWarnings.push("HEDGE_RISK_PAYLOAD_MODEL_MISMATCH");
     }
     if (validRisk.configurationFingerprint !== raw.configurationFingerprint) {
       integrityWarnings.push("HEDGE_RISK_CONFIGURATION_FINGERPRINT_MISMATCH");
     }
-    if (hasNonCurrentGreekEvidence(validRisk)) {
+    if (identityMismatch) {
+      integrityWarnings.push("HEDGE_RISK_PAYLOAD_INVALID");
+      validRisk = null;
+    } else {
+      recomputeRiskFreshness(validRisk, input.asOf);
+    }
+    if (validRisk && hasNonCurrentGreekEvidence(validRisk)) {
       integrityWarnings.push("HEDGE_RISK_EVIDENCE_STALE");
     }
   }
@@ -497,6 +846,7 @@ const mapRecommendation = (
       : "current";
   if (
     integrityWarnings.includes("HEDGE_RECOMMENDATION_INTEGRITY_INVALID") ||
+    integrityWarnings.includes("HEDGE_RECOMMENDATION_ENVIRONMENT_INVALID") ||
     integrityWarnings.includes("HEDGE_RISK_PAYLOAD_INVALID")
   ) {
     effectiveStatus = "blocked";
@@ -515,7 +865,9 @@ const mapRecommendation = (
     recommendationId: typeof raw.recommendationId === "string" ? raw.recommendationId : row.id,
     generatedAt: typeof raw.generatedAt === "string" ? raw.generatedAt : row.created_at,
     expiresAt: typeof raw.expiresAt === "string" ? raw.expiresAt : new Date(0).toISOString(),
-    environment: "paper",
+    environment: typeof raw.environment === "string" ? raw.environment : "unknown",
+    paperOnly: raw.environment === "paper" && validRisk?.paperOnly === true,
+    liveTradingEnabled: !(raw.environment === "paper" && validRisk?.paperOnly === true),
     sourceSnapshotId: typeof raw.sourceSnapshotId === "string" ? raw.sourceSnapshotId : "",
     riskModelVersion: typeof raw.riskModelVersion === "string" ? raw.riskModelVersion : "",
     regimeModelVersion: typeof raw.regimeModelVersion === "string" ? raw.regimeModelVersion : "",

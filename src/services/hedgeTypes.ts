@@ -109,7 +109,10 @@ export interface HedgeRecommendationRecord {
 }
 
 export interface PersistedHedgeRecommendation
-  extends Omit<HedgeRecommendationRecord, "risk"> {
+  extends Omit<HedgeRecommendationRecord, "risk" | "environment"> {
+  environment: string;
+  paperOnly: boolean;
+  liveTradingEnabled: boolean;
   risk: PortfolioRiskSnapshot | null;
   effectiveStatus: HedgeRecommendationStatus;
   integrityWarnings: string[];

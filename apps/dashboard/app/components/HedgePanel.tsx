@@ -18,6 +18,10 @@ type PartialGreekGroup = DeepPartial<
   NonNullable<PortfolioRiskSnapshot["options"]["groupings"]>["byUnderlying"][string]
 >;
 
+type PartialMetricCoverage = DeepPartial<
+  NonNullable<PortfolioRiskSnapshot["options"]["coverage"]>["delta"]
+>;
+
 export interface HedgeDashboardRecommendation {
   recommendationId?: string;
   effectiveStatus: HedgeDashboardStatus;
@@ -25,6 +29,8 @@ export interface HedgeDashboardRecommendation {
   generatedAt?: string;
   expiresAt?: string;
   environment?: string;
+  paperOnly?: boolean;
+  liveTradingEnabled?: boolean;
   sourceSnapshotId?: string;
   riskModelVersion?: string;
   regimeModelVersion?: string;
@@ -109,9 +115,38 @@ const statusCopy = (status: HedgeDashboardStatus) => {
 
 const freshnessCopy = (
   freshness: DeepPartial<PortfolioRiskSnapshot["options"]["freshness"]> | undefined
-) => freshness
-  ? `current ${freshness.current ?? 0}; stale ${freshness.stale ?? 0}; expired ${freshness.expired ?? 0}; malformed ${freshness.malformed ?? 0}`
-  : "Unavailable";
+) => {
+  if (
+    !freshness ||
+    !["current", "stale", "expired", "malformed", "total"].every(
+      (key) => Number.isInteger(freshness[key as keyof typeof freshness])
+    )
+  ) {
+    return "Unavailable";
+  }
+  return `current ${freshness.current}; stale ${freshness.stale}; expired ${freshness.expired}; malformed ${freshness.malformed}`;
+};
+
+const coverageRows = (
+  label: string,
+  coverage: PartialMetricCoverage | undefined
+) => (
+  <div>
+    {metric(`${label} positions total`, numeric(coverage?.positions?.total))}
+    {metric(`${label} positions measured`, numeric(coverage?.positions?.measured))}
+    {metric(`${label} positions unmeasured`, numeric(coverage?.positions?.unmeasured))}
+    {metric(`${label} position coverage`, percent(coverage?.positions?.coverageRatio))}
+    {metric(`${label} contracts total`, numeric(coverage?.absoluteContracts?.total))}
+    {metric(`${label} contracts measured`, numeric(coverage?.absoluteContracts?.measured))}
+    {metric(`${label} contracts unmeasured`, numeric(coverage?.absoluteContracts?.unmeasured))}
+    {metric(`${label} contract coverage`, percent(coverage?.absoluteContracts?.coverageRatio))}
+    {metric(`${label} market value total`, money(coverage?.absoluteMarketValue?.total))}
+    {metric(`${label} market value measured`, money(coverage?.absoluteMarketValue?.measured))}
+    {metric(`${label} market value unmeasured`, money(coverage?.absoluteMarketValue?.unmeasured))}
+    {metric(`${label} market-value coverage`, percent(coverage?.absoluteMarketValue?.coverageRatio))}
+    {metric(`${label} freshness`, freshnessCopy(coverage?.freshness))}
+  </div>
+);
 
 const groupingRows = (
   title: string,
@@ -133,6 +168,15 @@ const groupingRows = (
             <span className="mono">Theta {money(group?.thetaDollarsPerDay)}/day</span>
             <span className="mono">Vega {money(group?.vegaDollarsPerVolPoint)}/vol point</span>
             <span className="mono">Rho {money(group?.rhoDollarsPerRatePoint)}/rate point</span>
+            <span className="mono">
+              Group IV weighted by contracts {percent(group?.impliedVolatility?.weightedByAbsoluteContracts)}
+            </span>
+            <span className="mono">
+              Group IV weighted by market value {percent(group?.impliedVolatility?.weightedByAbsoluteMarketValue)}
+            </span>
+            <span className="mono">
+              Group IV weighted by vega {percent(group?.impliedVolatility?.weightedByAbsoluteVega)}
+            </span>
           </div>
         ))}
         {!entries.length ? <p className="subtle">No grouping evidence available.</p> : null}
@@ -183,7 +227,9 @@ export const HedgePanel = ({
   const coverage = optionRisk?.coverage;
   const groupings = optionRisk?.groupings;
   const tradingState =
-    recommendation.environment === "paper"
+    recommendation.paperOnly === true &&
+    recommendation.environment === "paper" &&
+    recommendation.liveTradingEnabled === false
       ? "Paper only — Live trading disabled"
       : "Unavailable";
 
@@ -291,17 +337,9 @@ export const HedgePanel = ({
             ["Rho", "rho"],
             ["IV", "impliedVolatility"]
           ] as const).map(([label, key]) => (
-            <div key={key}>
-              {metric(
-                `${label} contract coverage`,
-                percent(coverage?.[key]?.absoluteContracts?.coverageRatio)
-              )}
-              {metric(
-                `${label} market-value coverage`,
-                percent(coverage?.[key]?.absoluteMarketValue?.coverageRatio)
-              )}
-              {metric(`${label} freshness`, freshnessCopy(coverage?.[key]?.freshness))}
-            </div>
+            <React.Fragment key={key}>
+              {coverageRows(label, coverage?.[key])}
+            </React.Fragment>
           ))}
         </div>
       </section>

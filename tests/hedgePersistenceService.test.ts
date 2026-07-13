@@ -46,6 +46,13 @@ const coverageBasis = {
   coverageRatio: 1
 };
 
+const marketValueCoverageBasis = {
+  total: 10_000,
+  measured: 10_000,
+  unmeasured: 0,
+  coverageRatio: 1
+};
+
 const currentFreshness = {
   current: 1,
   stale: 0,
@@ -53,6 +60,79 @@ const currentFreshness = {
   malformed: 0,
   total: 1
 };
+
+const completeGroup = {
+  positionCount: 1,
+  absoluteContracts: 1,
+  absoluteMarketValue: 10_000,
+  deltaShares: 60,
+  deltaDollars: 36_000,
+  gammaSharesPerDollar: 2,
+  thetaDollarsPerDay: -20,
+  vegaDollarsPerVolPoint: 80,
+  rhoDollarsPerRatePoint: 10,
+  impliedVolatility: {
+    weightedByAbsoluteContracts: 0.3,
+    weightedByAbsoluteMarketValue: 0.3,
+    weightedByAbsoluteVega: 0.3
+  },
+  quality: "complete" as const,
+  missingMetrics: []
+};
+
+const optionPosition = (): PortfolioRiskSnapshot["positions"][number] => ({
+  symbol: "SPY260918C00600000",
+  underlying: "SPY",
+  assetClass: "option",
+  optionType: "call",
+  quantity: 1,
+  marketValue: 10_000,
+  currentPrice: 100,
+  underlyingPrice: 600,
+  costBasis: 8_000,
+  unrealizedPl: 2_000,
+  unrealizedPlPct: 0.25,
+  sector: "unknown",
+  beta: 1,
+  betaStatus: "calculated",
+  multiplier: 100,
+  delta: 0.6,
+  gamma: 0.02,
+  theta: -0.2,
+  vega: 0.8,
+  rho: 0.1,
+  expirationDate: "2026-09-18",
+  strikePrice: 600,
+  daysToExpiration: 70,
+  moneynessPct: 0,
+  deltaEquivalentShares: 60,
+  deltaAdjustedExposure: 36_000,
+  deltaShares: 60,
+  deltaDollars: 36_000,
+  betaExposure: 36_000,
+  gammaExposure: 2,
+  thetaExposure: -20,
+  vegaExposure: 80,
+  rhoExposure: 10,
+  gammaSharesPerDollar: 2,
+  thetaDollarsPerDay: -20,
+  vegaDollarsPerVolPoint: 80,
+  rhoDollarsPerRatePoint: 10,
+  impliedVolatility: 0.3,
+  greekObservationTimestamp: "2026-07-10T14:04:30.000Z",
+  greekObservationFreshness: "current",
+  underlyingPriceTimestamp: "2026-07-10T14:04:30.000Z",
+  bid: 99,
+  ask: 101,
+  midpoint: 100,
+  bidSize: 10,
+  askSize: 12,
+  bidAskSpreadPct: 0.02,
+  quoteTimestamp: "2026-07-10T14:04:30.000Z",
+  inverseExposure: false,
+  warnings: [],
+  blockers: []
+});
 
 const validRiskSnapshot = (): PortfolioRiskSnapshot => ({
   paperOnly: true,
@@ -69,7 +149,7 @@ const validRiskSnapshot = (): PortfolioRiskSnapshot => ({
     highWaterMark: 105_000,
     drawdownPct: 0.0476
   },
-  positions: [],
+  positions: [optionPosition()],
   exposures: {
     grossExposure: 120_000,
     netExposure: 90_000,
@@ -114,17 +194,17 @@ const validRiskSnapshot = (): PortfolioRiskSnapshot => ({
         {
           positions: { ...coverageBasis },
           absoluteContracts: { ...coverageBasis },
-          absoluteMarketValue: { ...coverageBasis },
+          absoluteMarketValue: { ...marketValueCoverageBasis },
           freshness: { ...currentFreshness }
         }
       ])
     ) as PortfolioRiskSnapshot["options"]["coverage"],
     freshness: { ...currentFreshness },
     groupings: {
-      byUnderlying: {},
-      byExpiration: {},
-      byOptionType: {},
-      byDteBucket: {}
+      byUnderlying: { SPY: { ...completeGroup } },
+      byExpiration: { "2026-09-18": { ...completeGroup } },
+      byOptionType: { call: { ...completeGroup } },
+      byDteBucket: { "61-90": { ...completeGroup } }
     },
     executionEligible: true
   },
@@ -260,7 +340,7 @@ test("persisted recommendation retains integrity fields and derives freshness", 
   persistHedgeRecommendation(recommendation());
 
   const current = latestHedgeRecommendation({
-    asOf: "2026-07-10T14:10:00.000Z",
+    asOf: "2026-07-10T14:05:00.000Z",
     freshnessMinutes: 15,
     configurationFingerprint: "config_hash",
     riskModelVersion: "portfolio-risk-v1",
@@ -356,6 +436,26 @@ test("malformed persisted records fail closed", () => {
   assert.ok(result?.integrityWarnings.includes("HEDGE_RECOMMENDATION_INTEGRITY_INVALID"));
 });
 
+test("non-paper persisted recommendations are not relabeled as paper-safe", () => {
+  const record = recommendation() as unknown as { environment: string };
+  record.environment = "live";
+  persistHedgeRecommendation(record as unknown as HedgeRecommendationRecord);
+
+  const result = latestHedgeRecommendation({
+    asOf: "2026-07-10T14:05:00.000Z",
+    freshnessMinutes: 15,
+    configurationFingerprint: "config_hash",
+    riskModelVersion: "portfolio-risk-v1",
+    regimeModelVersion: "market-regime-v1"
+  });
+
+  assert.equal(result?.effectiveStatus, "blocked");
+  assert.equal(result?.environment, "live");
+  assert.equal(result?.paperOnly, false);
+  assert.equal(result?.liveTradingEnabled, true);
+  assert.ok(result?.integrityWarnings.includes("HEDGE_RECOMMENDATION_ENVIRONMENT_INVALID"));
+});
+
 test("missing or malformed persisted Greek payloads fail closed", () => {
   const record = recommendation();
   const risk = validRiskSnapshot();
@@ -378,7 +478,7 @@ test("missing or malformed persisted Greek payloads fail closed", () => {
   assert.ok(result?.integrityWarnings.includes("HEDGE_RISK_PAYLOAD_INVALID"));
 });
 
-test("nested risk model mismatch is never treated as current", () => {
+test("nested risk model mismatch fails closed", () => {
   const risk = validRiskSnapshot();
   risk.riskModelVersion = "portfolio-risk-v0";
   persistHedgeRecommendation({
@@ -395,11 +495,12 @@ test("nested risk model mismatch is never treated as current", () => {
     regimeModelVersion: "market-regime-v1"
   });
 
-  assert.equal(result?.effectiveStatus, "stale");
+  assert.equal(result?.effectiveStatus, "blocked");
+  assert.equal(result?.risk, null);
   assert.ok(result?.integrityWarnings.includes("HEDGE_RISK_PAYLOAD_MODEL_MISMATCH"));
 });
 
-test("fresh recommendation with stale nested Greek evidence is stale", () => {
+test("stored freshness counters cannot make current position evidence stale", () => {
   const risk = validRiskSnapshot();
   risk.options.freshness = {
     current: 0,
@@ -422,6 +523,117 @@ test("fresh recommendation with stale nested Greek evidence is stale", () => {
     regimeModelVersion: "market-regime-v1"
   });
 
-  assert.equal(result?.effectiveStatus, "stale");
-  assert.ok(result?.integrityWarnings.includes("HEDGE_RISK_EVIDENCE_STALE"));
+  assert.equal(result?.effectiveStatus, "current");
+  assert.deepEqual(result?.risk?.options.freshness, currentFreshness);
+  assert.ok(!result?.integrityWarnings.includes("HEDGE_RISK_EVIDENCE_STALE"));
+});
+
+test("persisted Greek freshness is recomputed from position timestamps and current policy", () => {
+  const previousCurrentAge = process.env.OPTION_GREEKS_CURRENT_MAX_AGE_SECONDS;
+  const previousStaleAge = process.env.OPTION_GREEKS_STALE_MAX_AGE_SECONDS;
+  process.env.OPTION_GREEKS_CURRENT_MAX_AGE_SECONDS = "60";
+  process.env.OPTION_GREEKS_STALE_MAX_AGE_SECONDS = "900";
+  try {
+    const risk = validRiskSnapshot();
+    risk.positions[0].greekObservationTimestamp = "2026-07-10T14:00:00.000Z";
+    persistHedgeRecommendation({
+      ...recommendation(),
+      recommendationId: "hedge_rec_recomputed_freshness",
+      risk
+    });
+
+    const result = latestHedgeRecommendation({
+      asOf: "2026-07-10T14:05:00.000Z",
+      freshnessMinutes: 15,
+      configurationFingerprint: "config_hash",
+      riskModelVersion: "portfolio-risk-v1",
+      regimeModelVersion: "market-regime-v1"
+    });
+
+    assert.equal(result?.effectiveStatus, "stale");
+    assert.equal(result?.risk?.positions[0].greekObservationFreshness, "stale");
+    assert.deepEqual(result?.risk?.options.freshness, {
+      current: 0,
+      stale: 1,
+      expired: 0,
+      malformed: 0,
+      total: 1
+    });
+    assert.deepEqual(result?.risk?.options.coverage?.impliedVolatility.freshness, {
+      current: 0,
+      stale: 1,
+      expired: 0,
+      malformed: 0,
+      total: 1
+    });
+  } finally {
+    if (previousCurrentAge === undefined) delete process.env.OPTION_GREEKS_CURRENT_MAX_AGE_SECONDS;
+    else process.env.OPTION_GREEKS_CURRENT_MAX_AGE_SECONDS = previousCurrentAge;
+    if (previousStaleAge === undefined) delete process.env.OPTION_GREEKS_STALE_MAX_AGE_SECONDS;
+    else process.env.OPTION_GREEKS_STALE_MAX_AGE_SECONDS = previousStaleAge;
+  }
+});
+
+test("expired and malformed position timestamps cannot remain current", () => {
+  for (const [suffix, timestamp, expected] of [
+    ["expired", "2026-07-10T13:00:00.000Z", "expired"],
+    ["malformed", "not-an-iso-time", "malformed"]
+  ] as const) {
+    const risk = validRiskSnapshot();
+    risk.positions[0].greekObservationTimestamp = timestamp;
+    persistHedgeRecommendation({
+      ...recommendation(),
+      recommendationId: `hedge_rec_${suffix}_timestamp`,
+      generatedAt: suffix === "expired" ? now : "2026-07-10T14:00:01.000Z",
+      risk
+    });
+    const result = latestHedgeRecommendation({
+      asOf: "2026-07-10T14:05:00.000Z",
+      freshnessMinutes: 15,
+      configurationFingerprint: "config_hash",
+      riskModelVersion: "portfolio-risk-v1",
+      regimeModelVersion: "market-regime-v1"
+    });
+    assert.equal(result?.effectiveStatus, "stale");
+    assert.equal(result?.risk?.positions[0].greekObservationFreshness, expected);
+  }
+});
+
+test("runtime decoder rejects incomplete, inconsistent, or mismatched risk snapshots", () => {
+  const invalidRisks: Array<[string, (risk: PortfolioRiskSnapshot) => void]> = [
+    ["paper identity", (risk) => { (risk as { paperOnly: boolean }).paperOnly = false; }],
+    ["environment", (risk) => { (risk as { environment: string }).environment = "live"; }],
+    ["source identity", (risk) => { risk.snapshotId = "different_snapshot"; }],
+    ["model identity", (risk) => { risk.riskModelVersion = "portfolio-risk-v0"; }],
+    ["config identity", (risk) => { risk.configurationFingerprint = "different_config"; }],
+    ["account structure", (risk) => { delete (risk as { account?: unknown }).account; }],
+    ["finite numeric", (risk) => { (risk.account as { equity: unknown }).equity = "NaN"; }],
+    ["position enum", (risk) => { (risk.positions[0] as { assetClass: string }).assetClass = "crypto"; }],
+    ["coverage arithmetic", (risk) => { risk.options.coverage!.delta.positions.unmeasured = 1; }],
+    ["coverage ratio", (risk) => { risk.options.coverage!.delta.absoluteContracts.coverageRatio = 0.5; }],
+    ["group consistency", (risk) => { risk.options.groupings!.byUnderlying.SPY.positionCount = 2; }],
+    ["scenario enum", (risk) => { risk.scenarios = [{ benchmarkDeclinePct: 7 } as never]; }],
+    ["quality enum", (risk) => { (risk as { dataQualityStatus: string }).dataQualityStatus = "unknown"; }]
+  ];
+
+  for (const [label, corrupt] of invalidRisks) {
+    const risk = validRiskSnapshot();
+    corrupt(risk);
+    persistHedgeRecommendation({
+      ...recommendation(),
+      recommendationId: `invalid_${label.replace(/\s+/g, "_")}`,
+      generatedAt: new Date(Date.parse(now) + invalidRisks.indexOf(invalidRisks.find((entry) => entry[0] === label)!) * 1000).toISOString(),
+      risk
+    });
+    const result = latestHedgeRecommendation({
+      asOf: "2026-07-10T14:05:00.000Z",
+      freshnessMinutes: 15,
+      configurationFingerprint: "config_hash",
+      riskModelVersion: "portfolio-risk-v1",
+      regimeModelVersion: "market-regime-v1"
+    });
+    assert.equal(result?.effectiveStatus, "blocked", label);
+    assert.equal(result?.risk, null, label);
+    assert.ok(result?.integrityWarnings.includes("HEDGE_RISK_PAYLOAD_INVALID"), label);
+  }
 });
