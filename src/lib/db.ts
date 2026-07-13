@@ -2,6 +2,7 @@ import { DatabaseSync, type DatabaseSync as DbHandle } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { isVercelRuntime } from "./runtime.js";
+import { runZeroDteMigrations } from "./zeroDteSchema.js";
 
 export const LOCAL_SQLITE_UNAVAILABLE_ON_VERCEL =
   "LOCAL_SQLITE_UNAVAILABLE_ON_VERCEL";
@@ -605,6 +606,7 @@ const initialize = (): DbHandle => {
   db.exec("PRAGMA busy_timeout = 5000;");
   db.exec(tableSchema);
   runMigrations(db);
+  runZeroDteMigrations(db);
   database = db;
   return db;
 };

@@ -1,5 +1,6 @@
 import { config as loadDotenv } from "dotenv";
 import { buildHedgeConfig } from "./services/hedgeConfigService.js";
+import { loadZeroDteConfig } from "./services/zeroDte/zeroDteConfigService.js";
 
 loadDotenv();
 loadDotenv({ path: ".env.txt", override: false });
@@ -79,6 +80,8 @@ const paperLeapsMaxOrderNotional = parseNumber(
   firstEnv("PAPER_LEAPS_MAX_ORDER_NOTIONAL", "PAPER_LEAPS_MAX_PREMIUM_PER_TRADE"),
   1500
 );
+
+export const zeroDteConfig = loadZeroDteConfig();
 
 export const paperLeapsExitConfig = () => ({
   minDteAtEntry: Math.max(1, parseInteger(process.env.LEAPS_MIN_DTE_AT_ENTRY, 270)),
@@ -188,6 +191,7 @@ export const config = {
     )
   },
   paperLeapsExit: paperLeapsExitConfig(),
+  zeroDte: zeroDteConfig,
   hedge: buildHedgeConfig(),
   enableAggressivePaperStrategies:
     process.env.ENABLE_AGGRESSIVE_PAPER_STRATEGIES === "true",
