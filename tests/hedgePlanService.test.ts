@@ -191,7 +191,7 @@ test("plan persistence writes reviewed hash back to recommendation", () => {
   assert.equal(latestHedgePlan()?.planId, artifact.planId);
 });
 
-test("future execution gate remains blocked when every future gate passes", () => {
+test("execution gate allows the fully validated paper single-leg hedge", () => {
   const result = evaluateHedgeExecutionGate({
     environment: "paper",
     paperOnlyIntent: true,
@@ -205,8 +205,8 @@ test("future execution gate remains blocked when every future gate passes", () =
     runtimePreflightPassed: true
   });
 
-  assert.equal(result.allowed, false);
-  assert.ok(result.blockers.includes("HEDGE_EXECUTION_NOT_IMPLEMENTED"));
+  assert.equal(result.allowed, true);
+  assert.deepEqual(result.blockers, []);
 });
 
 test("hedge gate source has no broker or order submission dependency", () => {

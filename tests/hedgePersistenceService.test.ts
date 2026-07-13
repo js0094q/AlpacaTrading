@@ -425,7 +425,7 @@ test("malformed persisted records fail closed", () => {
       JSON.stringify({ recordType: "hedge_recommendation", generatedAt: now }),
       "pending",
       0,
-      "HEDGE_EXECUTION_NOT_IMPLEMENTED"
+      "HEDGE_PLAN_REQUIRES_EXECUTION_REVIEW"
     );
 
   const result = latestHedgeRecommendation({

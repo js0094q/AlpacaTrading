@@ -144,7 +144,7 @@ VPS_RESEARCH_REQUEST_TIMEOUT_MS=10000
 VPS_RESEARCH_MAX_RETRIES=0
 VPS_CONTROL_TOKEN=
 DASHBOARD_ADMIN_TOKEN=
-AUTOMATED_PAPER_EXECUTION_ENABLED=false
+AUTOMATED_PAPER_EXECUTION_ENABLED=true
 PAPER_0DTE_DISCOVERY_ENABLED=true
 PAPER_OPTION_EXIT_REVIEW_ENABLED=true
 PAPER_EQUITY_SCALE_IN_ENABLED=false
@@ -315,7 +315,7 @@ Systemd timers in `server/systemd/` implement the VPS automation schedule:
 - `paper-ops-midday.timer`: weekdays around 12:00 PM ET.
 - `paper-ops-late-day.timer`: weekdays around 3:15 PM ET.
 
-Those `paper-ops-*` timers are review-only and set `AUTOMATED_PAPER_EXECUTION_ENABLED=false`.
+Those legacy `paper-ops-*` timers are review-only and override `AUTOMATED_PAPER_EXECUTION_ENABLED=false`; bounded paper execution tasks use the checked-in target value `true` only with their own confirmation and paper-runtime gates.
 The continuous paper monitor is installed separately with `scripts/install-paper-monitoring-systemd.sh`:
 
 - `alpaca-paper-review.timer`: wakes every 30 minutes during weekday market-hour windows and runs the existing paper research/review workflow.
@@ -729,9 +729,9 @@ npm run hedge:review -- --format=json
 npm run hedge:plan -- --paperOnly --format=json
 ```
 
-`hedge:plan` creates a signed, expiring planning artifact only. It does not create a broker order payload or add a section to the reviewed paper executor. There is no `hedge:execute` script or HTTP route. Put spreads are analyzed with `MULTI_LEG_EXECUTION_UNSUPPORTED`; SH and PSQ are secondary tactical alternatives with daily-reset and tracking-risk warnings.
+`hedge:plan` creates a signed, expiring paper planning artifact. `hedge:execute`, `hedge:exit:review`, and `hedge:exit:execute` are separate signed, authenticated paper-only lifecycle commands; execution is limited to one long put or one sell-to-close long put. Put spreads are analyzed with `MULTI_LEG_EXECUTION_UNSUPPORTED`; SH and PSQ are secondary tactical alternatives with daily-reset and tracking-risk warnings.
 
-`HEDGE_PAPER_EXECUTION_ENABLED=false` is the required default and must remain false for this phase. Missing prices, Greeks, beta history, sector mappings, or regime evidence remain null and produce quality warnings, monitoring, or blockers.
+The checked-in paper target enables `HEDGE_PAPER_EXECUTION_ENABLED`, `HEDGE_AUTOMATED_PAPER_EXECUTION_ENABLED`, `HEDGE_EXIT_MANAGEMENT_ENABLED`, `HEDGE_LEARNING_ENABLED`, and `HEDGE_DASHBOARD_MUTATIONS_ENABLED`. `HEDGE_LIVE_EXECUTION_ENABLED=false` and `MULTI_LEG_HEDGE_EXECUTION_ENABLED=false` remain hard gates. `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, and `LIVE_TRADING_ENABLED=false` are the canonical paper/live boundary; no duplicate `PAPER_TRADING_ENABLED` flag is used. Missing prices, Greeks, beta history, sector mappings, or regime evidence remain null and produce quality warnings, monitoring, or blockers.
 
 Option delta completeness is measured by absolute held contract quantity and absolute option market value. Defaults require 80% coverage on each basis and treat 10% of account equity as material (`HEDGE_MIN_OPTION_DELTA_CONTRACT_COVERAGE_PCT=80`, `HEDGE_MIN_OPTION_DELTA_MARKET_VALUE_COVERAGE_PCT=80`, and `HEDGE_MATERIAL_UNMEASURED_OPTION_EXPOSURE_PCT=10`). When the material gate fails, beta and unsupported option exposure remain null, the calculated score is retained for audit, the effective risk band is `indeterminate`, and hedge sizing stops at monitoring.
 
@@ -758,6 +758,8 @@ Local/VPS persistence uses `data/research.db` by default with the following coll
 - api_request_log
 - paper_recommendation_snapshots
 - paper_execution_ledger
+- hedge_execution_reviews
+- hedge_learning_events
 - paper_learning_records
 - paper_operation_log
 - paper_review_artifacts
@@ -778,7 +780,7 @@ On Vercel, API request logging does not write to local SQLite. Historical dashbo
 - Paper mode remains default (`ALPACA_LIVE_TRADE=false`).
 - Any future live execution path must add explicit opt-in gates.
 - Default provider behavior remains paper-only; do not add live-order code in this phase.
-- Hedge analysis and planning remain non-executable; keep `HEDGE_PAPER_EXECUTION_ENABLED=false`.
+- Hedge execution remains paper-only and single-leg; keep `HEDGE_LIVE_EXECUTION_ENABLED=false` and `MULTI_LEG_HEDGE_EXECUTION_ENABLED=false`.
 
 ## Resume commands
 

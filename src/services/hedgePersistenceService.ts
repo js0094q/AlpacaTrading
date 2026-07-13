@@ -764,7 +764,7 @@ export const persistHedgeRecommendation = (record: HedgeRecommendationRecord) =>
       `Portfolio hedge recommendation: ${record.decision}`,
       payload,
       canonicalJson(record.score),
-      "HEDGE_EXECUTION_NOT_IMPLEMENTED",
+      "HEDGE_PLAN_REQUIRES_EXECUTION_REVIEW",
       record.sourceSnapshotId,
       record.generatedAt
     );
@@ -1047,7 +1047,7 @@ export const persistHedgePlanRecord = (artifact: HedgePlanArtifact) => {
       artifact.status === "blocked" ? artifact.blockers[0] ?? "HEDGE_PLAN_BLOCKED" : null,
       `Non-executable hedge plan for ${artifact.sourceSnapshotId}`,
       canonicalJson(artifact),
-      "HEDGE_EXECUTION_NOT_IMPLEMENTED",
+      "HEDGE_PLAN_REQUIRES_EXECUTION_REVIEW",
       artifact.sourceSnapshotId,
       artifact.createdAt
     );

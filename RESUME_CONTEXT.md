@@ -74,12 +74,12 @@
   - `paper:execute:reviewed -- --confirmPaper` refuses missing, stale, empty, or payload-signature-mismatched review artifacts before paper submission.
   - `paper:execute:reviewed` now supports `--sections=` so scheduler entry execution is limited to `equityBuys,equityAdds,optionBuys` and scheduler exit execution is limited to `equitySells,optionSellToCloseExits`.
   - Reviewed LEAPS sell-to-close execution also fails closed unless `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, `LIVE_TRADING_ENABLED=false`, `PAPER_ORDER_EXECUTION_ENABLED=true`, `PAPER_OPTIONS_EXECUTION_ENABLED=true`, `AUTOMATED_PAPER_EXECUTION_ENABLED=true`, and `--confirmPaper` are all present.
-  - `AUTOMATED_PAPER_EXECUTION_ENABLED=false` remains the default for review-only `paper-ops-*` timers.
+  - Review-only `paper-ops-*` timers intentionally override `AUTOMATED_PAPER_EXECUTION_ENABLED=false`; bounded paper execution tasks use the checked-in target value `true` only with confirmation and paper-runtime gates.
   - Continuous monitor timers are installed from `scripts/install-paper-monitoring-systemd.sh` and run through `npm run paper:monitor`, which gates market hours/holidays, paper runtime, live-off flags, execution flags, and per-task locks.
 - Portfolio risk and hedge-management layer added on `paper-ops-layer` (not deployed in this task):
   - Canonical OCC parsing now feeds asset identity, LEAPS exit review, portfolio review, and paper dry-run DTE logic.
-  - Read-only commands are `hedge:risk`, `hedge:regime`, `hedge:review`, and `hedge:plan -- --paperOnly`; no `hedge:execute` command exists.
-  - `HEDGE_PAPER_EXECUTION_ENABLED=false` remains the fail-closed default.
+  - Hedge analysis commands are `hedge:risk`, `hedge:regime`, `hedge:review`, and `hedge:plan -- --paperOnly`; reviewed paper entry and exit execution use `hedge:execute` and `hedge:exit:execute` only after explicit confirmation.
+  - The checked-in paper hedge target enables `HEDGE_PAPER_EXECUTION_ENABLED`, `HEDGE_AUTOMATED_PAPER_EXECUTION_ENABLED`, `HEDGE_EXIT_MANAGEMENT_ENABLED`, `HEDGE_LEARNING_ENABLED`, and `HEDGE_DASHBOARD_MUTATIONS_ENABLED`; live hedge execution and multi-leg execution remain false.
   - Portfolio risk uses observed option Greeks, signed-exposure beta, grouped concentration, persisted paper high-water marks, and 5/8/10/15 percent benchmark-decline scenarios.
   - Option delta coverage is reported by absolute contract quantity and absolute market value. Defaults are 80% on each basis with 10% of account equity as the materiality threshold; material gaps keep beta/scenario precision null, mark the effective risk band `indeterminate`, and force monitoring without hedge candidates.
   - A 2026-07-10 read-only runtime check found valid complete Greeks for `SPY270115C00805000` and `QQQ270115C00840000`. Alpaca returned camelCase snapshot keys while the parser expected legacy-shaped aliases; ingestion now accepts both shapes. The observed issue was parser compatibility, not symbol, entitlement, batching, or snapshot availability for those samples.
@@ -89,6 +89,7 @@
   - Signed plans are stored in `paper_learning_records`, expire, retain configuration/model/snapshot integrity, and are not recognized by the reviewed order executor.
   - Existing paper-ops moments refresh persisted hedge reviews but cannot submit hedge orders and do not alter reviewed order sections.
   - Cached GET routes are `/api/v1/hedge/risk`, `/api/v1/hedge/regime`, and `/api/v1/hedge/recommendation`, with matching Vercel `/api/paper/hedge/*` routes.
+  - Authenticated hedge mutation routes are `/api/v1/hedge/review`, `/api/v1/hedge/execute`, `/api/v1/hedge/exit/review`, and `/api/v1/hedge/exit/execute`; status and learning reads are `/api/v1/hedge/execution` and `/api/v1/hedge/learning`.
   - The dashboard marks `stale` and `expired` recommendations as not current and displays model versions, quality, scenarios, LEAPS logic, candidates, warnings, and blockers.
 
 ## Token/env coordination
@@ -134,5 +135,5 @@
 - Do not relax paper-only gates without an explicit request.
 - Do not run `npm run paper:execute:reviewed -- --confirmPaper` or `npm run paper:execute -- --confirmPaper` unless the user explicitly requests paper execution.
 - No live execution route exists in the dashboard operations layer.
-- No hedge execution route or command exists; do not add or run `hedge:execute`.
+- Hedge execution is available only through explicit paper review IDs, paper confirmation, dashboard/VPS authentication, and the single-long-put gates; do not run `hedge:execute` or `hedge:exit:execute` during validation unless paper execution is explicitly requested.
 - Automated paper execution is only allowed through the `alpaca-paper-*` monitor timers, reviewed artifacts, section filters, and paper-only/live-off runner guards.
