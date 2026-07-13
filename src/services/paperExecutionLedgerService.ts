@@ -369,6 +369,35 @@ export const updatePaperExecutionLedgerEntry = (
     );
 };
 
+export const linkPaperExecutionPositionLifecycle = (input: {
+  ledgerId: number;
+  positionLifecycleId: PositionLifecycleId;
+}) => {
+  const existing = queryOne<{ position_lifecycle_id: PositionLifecycleId | null }>(
+    "SELECT position_lifecycle_id FROM paper_execution_ledger WHERE id = ? LIMIT 1",
+    [input.ledgerId]
+  );
+  if (!existing) {
+    throw new Error("PAPER_EXECUTION_LEDGER_NOT_FOUND");
+  }
+  if (
+    existing.position_lifecycle_id &&
+    existing.position_lifecycle_id !== input.positionLifecycleId
+  ) {
+    throw new Error("PAPER_EXECUTION_LIFECYCLE_MISMATCH");
+  }
+  getDb().prepare(`
+    UPDATE paper_execution_ledger
+    SET position_lifecycle_id = ?, updated_at = ?
+    WHERE id = ? AND (position_lifecycle_id IS NULL OR position_lifecycle_id = ?)
+  `).run(
+    input.positionLifecycleId,
+    new Date().toISOString(),
+    input.ledgerId,
+    input.positionLifecycleId
+  );
+};
+
 export const reservePaperExecutionAttempt = (input: {
   reviewId: string;
   clientOrderId: string;

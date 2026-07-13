@@ -50,6 +50,7 @@ export interface AlpacaSubmittedOrder {
   submitted_at?: string;
   filled_qty?: string;
   filled_avg_price?: string;
+  filled_at?: string;
 }
 
 export interface AlpacaAccountRaw {

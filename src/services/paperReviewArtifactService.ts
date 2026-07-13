@@ -125,9 +125,27 @@ const persistArtifactDecisionLinks = (input: {
       const rawAssetClass =
         stringValue(payload.assetClass) ?? stringValue(payload.asset_class);
       const optionSymbol = rawAssetClass === "option" ? symbol : null;
-      const positionLifecycleId =
+      const providedPositionLifecycleId =
         stringValue(payload.positionLifecycleId) ??
         stringValue(payload.position_lifecycle_id);
+      const exactExitPositions =
+        role === "exit" && !providedPositionLifecycleId && symbol
+          ? queryAll<{ position_lifecycle_id: PositionLifecycleId }>(
+              `
+              SELECT position_lifecycle_id
+              FROM paper_positions
+              WHERE status = 'OPEN'
+                AND UPPER(COALESCE(option_symbol, symbol)) = UPPER(?)
+              ORDER BY opened_at, position_lifecycle_id
+              `,
+              [symbol]
+            )
+          : [];
+      const positionLifecycleId =
+        providedPositionLifecycleId ??
+        (exactExitPositions.length === 1
+          ? exactExitPositions[0].position_lifecycle_id
+          : null);
       const requestId =
         stringValue(payload.requestId) ?? stringValue(payload.request_id);
       const sourceTimestamp =
@@ -325,12 +343,17 @@ export const findPaperReviewPayloadDecision = (input: {
   section: ReviewedPayloadSectionName;
   payloadIndex: number;
 }) =>
-  queryOne<{ decision_id: DecisionId; decision_role: DecisionRole }>(
+  queryOne<{
+    decision_id: DecisionId;
+    decision_role: DecisionRole;
+    position_lifecycle_id: PositionLifecycleId | null;
+  }>(
     `
-    SELECT decision_id, decision_role
-    FROM paper_review_decisions
-    WHERE artifact_id = ? AND section = ? AND payload_index = ?
-    ORDER BY decision_id
+    SELECT prd.decision_id, prd.decision_role, ds.position_lifecycle_id
+    FROM paper_review_decisions prd
+    JOIN decision_snapshots ds ON ds.decision_id = prd.decision_id
+    WHERE prd.artifact_id = ? AND prd.section = ? AND prd.payload_index = ?
+    ORDER BY prd.decision_id
     LIMIT 1
     `,
     [input.artifactId, input.section, input.payloadIndex]
