@@ -48,6 +48,8 @@ export interface AlpacaSubmittedOrder {
   limit_price?: string;
   status?: string;
   submitted_at?: string;
+  filled_qty?: string;
+  filled_avg_price?: string;
 }
 
 export interface AlpacaAccountRaw {
@@ -282,6 +284,36 @@ export const submitPaperOrder = async (
     method: "POST",
     body: JSON.stringify(payload)
   });
+};
+
+export const getPaperOrder = async (
+  orderId: string
+): Promise<AlpacaApiResponse<AlpacaSubmittedOrder>> => {
+  return requestPaperTradingJson<AlpacaSubmittedOrder>(
+    `/v2/orders/${encodeURIComponent(orderId)}`
+  );
+};
+
+export const replacePaperOrder = async (
+  orderId: string,
+  payload: { qty?: string; limit_price?: string }
+): Promise<AlpacaApiResponse<AlpacaSubmittedOrder>> => {
+  return requestPaperTradingJson<AlpacaSubmittedOrder>(
+    `/v2/orders/${encodeURIComponent(orderId)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify(payload)
+    }
+  );
+};
+
+export const cancelPaperOrder = async (
+  orderId: string
+): Promise<AlpacaApiResponse<null>> => {
+  return requestPaperTradingJson<null>(
+    `/v2/orders/${encodeURIComponent(orderId)}`,
+    { method: "DELETE" }
+  );
 };
 
 export const listRecentPaperOrders = async (

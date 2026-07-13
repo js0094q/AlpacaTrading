@@ -91,6 +91,7 @@ import {
   buildAndPersistHedgePlan,
   buildAndPersistHedgeReview
 } from "./services/hedgeLearningService.js";
+import { executeReviewedPaperHedge } from "./services/hedgeExecutionService.js";
 
 const parseArg = (input: string): Record<string, string> | null => {
   const [rawKey, rawValue] = input.split("=", 2);
@@ -1081,6 +1082,15 @@ const run = async () => {
       `Blockers: ${result.blockers.join(", ") || "none"}`,
       "Planning artifact only. Execution is not implemented. No orders were submitted."
     ].join("\n"));
+    return;
+  }
+
+  if (command === "hedge:execute") {
+    const result = await executeReviewedPaperHedge({
+      reviewId: String(args.reviewId || ""),
+      confirmPaper: flagArg(args.confirmPaper)
+    });
+    print(result);
     return;
   }
 

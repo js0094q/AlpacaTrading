@@ -10,7 +10,11 @@ export type PaperExecutionLedgerStatus =
   | "duplicate_blocked"
   | "attempted"
   | "reserved"
-  | "released";
+  | "released"
+  | "filled"
+  | "canceled"
+  | "expired"
+  | "partial";
 
 export interface PaperExecutionLedgerEntry {
   id: number;

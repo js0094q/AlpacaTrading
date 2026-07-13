@@ -45,6 +45,7 @@
     "hedge:regime": "tsx src/cli.ts hedge:regime",
     "hedge:review": "tsx src/cli.ts hedge:review",
     "hedge:plan": "tsx src/cli.ts hedge:plan",
+    "hedge:execute": "tsx src/cli.ts hedge:execute",
     "paper:execute": "tsx src/cli.ts paper:execute",
     "paper:execute:confirmed": "tsx src/cli.ts paper:execute --confirmPaper",
     "paper:execute:confirmed-paper-only": "tsx src/cli.ts paper:execute --confirmPaper",
