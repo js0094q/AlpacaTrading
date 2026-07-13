@@ -9,6 +9,9 @@ process.env.ALPACA_ENV = "paper";
 process.env.TRADING_MODE = "paper";
 process.env.ALPACA_LIVE_TRADE = "false";
 process.env.LIVE_TRADING_ENABLED = "false";
+process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
+process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
+process.env.HEDGE_PAPER_EXECUTION_ENABLED = "true";
 process.env.HEDGE_EXIT_MANAGEMENT_ENABLED = "true";
 process.env.HEDGE_LIVE_EXECUTION_ENABLED = "false";
 process.env.HEDGE_REVIEW_SIGNING_KEY = "exit-test-key";
@@ -86,6 +89,7 @@ test("executes only the current paper hedge quantity for a sell-to-close exit", 
       review: built.review,
       account: { id: "paper-account", status: "ACTIVE", buying_power: "10000", equity: "100000", options_approved_level: 3 },
       currentPositionQuantity: 1,
+      now: () => input.asOf,
       refreshQuote: async () => ({ bid: 7.4, ask: 7.6, midpoint: 7.5, quoteTimestamp: input.asOf }),
       submitPaperOrder: async (payload) => {
         submitted = payload;

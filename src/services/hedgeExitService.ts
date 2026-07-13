@@ -214,9 +214,10 @@ export const executeReviewedPaperHedgeExit = async (
     ...(!process.env.HEDGE_REVIEW_SIGNING_KEY?.trim() ? ["HEDGE_REVIEW_SIGNING_KEY_REQUIRED"] : [])
   ];
   if (blockers.length > 0) return executionBlocked(input.reviewId, blockers);
-  const review = deps.review ?? readHedgeExecutionReview({ reviewId: input.reviewId, signingKey: process.env.HEDGE_REVIEW_SIGNING_KEY! }).review;
+  const asOf = deps.now?.() ?? new Date().toISOString();
+  const review = deps.review ?? readHedgeExecutionReview({ reviewId: input.reviewId, signingKey: process.env.HEDGE_REVIEW_SIGNING_KEY!, asOf }).review;
   if (!review) return executionBlocked(input.reviewId, ["HEDGE_REVIEW_NOT_FOUND"]);
-  const verification = verifyHedgeExecutionReview({ review, signingKey: process.env.HEDGE_REVIEW_SIGNING_KEY! });
+  const verification = verifyHedgeExecutionReview({ review, signingKey: process.env.HEDGE_REVIEW_SIGNING_KEY!, asOf });
   if (!verification.valid || review.reviewType !== "exit" || review.orderIntent.side !== "sell_to_close") {
     return { ...executionBlocked(input.reviewId, [...verification.blockers, "HEDGE_EXIT_REVIEW_INVALID"]), verification };
   }
