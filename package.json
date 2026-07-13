@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "start": "tsx src/cli.ts",
+    "test:zero-dte": "tsx --test tests/zeroDteConfig.test.ts && tsx --test tests/zeroDteIdentity.test.ts && tsx --test tests/zeroDteSignal.test.ts && tsx --test tests/zeroDteRanking.test.ts && tsx --test tests/zeroDtePlaybook.test.ts && tsx --test tests/zeroDteMarketData.test.ts && tsx --test tests/zeroDteProvider.test.ts",
+    "pretest": "npm run test:zero-dte",
     "universe:seed": "tsx src/cli.ts universe seed",
     "universe:get": "tsx src/cli.ts universe get",
     "universe:add": "tsx src/cli.ts universe add",
