@@ -21,6 +21,11 @@ import type {
 } from "./portfolioRiskService.js";
 import type { HedgePlanArtifact } from "./hedgePlanService.js";
 import {
+  verifyHedgeExecutionReview,
+  type HedgeExecutionReview,
+  type HedgeExecutionReviewVerification
+} from "./hedgeExecutionReviewService.js";
+import {
   buildHedgeConfig,
   hedgeConfigurationFingerprint
 } from "./hedgeConfigService.js";
@@ -1065,4 +1070,95 @@ export const latestHedgePlan = (): HedgePlanArtifact | null => {
   if (!row) return null;
   const raw = safeParse(row.signal_inputs_json);
   return raw?.recordType === "hedge_plan" ? (raw as unknown as HedgePlanArtifact) : null;
+};
+
+export const persistHedgeExecutionReview = (review: HedgeExecutionReview) => {
+  getDb()
+    .prepare(
+      `
+      INSERT INTO hedge_execution_reviews(
+        review_id, created_at, expires_at, review_type, client_order_id,
+        account_hash, source_recommendation_id, source_snapshot_id,
+        payload_hash, signature, status, review_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(review_id) DO UPDATE SET
+        expires_at = excluded.expires_at,
+        status = excluded.status,
+        review_json = excluded.review_json
+      `
+    )
+    .run(
+      review.reviewId,
+      review.createdAt,
+      review.expiresAt,
+      review.reviewType,
+      review.clientOrderId,
+      review.accountHash,
+      review.sourceRecommendationId,
+      review.sourceSnapshotId,
+      review.payloadHash,
+      review.signature,
+      "reviewed",
+      canonicalJson(review)
+    );
+  return review;
+};
+
+export const readHedgeExecutionReview = (input: {
+  reviewId: string;
+  signingKey: string;
+  asOf?: string;
+  accountHash?: string;
+  configurationFingerprint?: string;
+  sourceSnapshotId?: string;
+}): {
+  review: HedgeExecutionReview | null;
+  verification: HedgeExecutionReviewVerification;
+} => {
+  const row = getDb()
+    .prepare(
+      `SELECT review_json FROM hedge_execution_reviews WHERE review_id = ? LIMIT 1`
+    )
+    .get(input.reviewId) as { review_json?: string } | undefined;
+  if (!row?.review_json) {
+    return {
+      review: null,
+      verification: {
+        valid: false,
+        blockers: ["HEDGE_REVIEW_NOT_FOUND"],
+        calculatedPayloadHash: ""
+      }
+    };
+  }
+  let review: HedgeExecutionReview;
+  try {
+    review = JSON.parse(row.review_json) as HedgeExecutionReview;
+  } catch {
+    return {
+      review: null,
+      verification: {
+        valid: false,
+        blockers: ["HEDGE_REVIEW_SCHEMA_INVALID"],
+        calculatedPayloadHash: ""
+      }
+    };
+  }
+  const verification = verifyHedgeExecutionReview({
+    review,
+    signingKey: input.signingKey,
+    asOf: input.asOf,
+    accountHash: input.accountHash,
+    configurationFingerprint: input.configurationFingerprint,
+    sourceSnapshotId: input.sourceSnapshotId
+  });
+  return { review, verification };
+};
+
+export const markHedgeExecutionReviewConsumed = (reviewId: string) => {
+  const result = getDb()
+    .prepare(
+      `UPDATE hedge_execution_reviews SET status = 'consumed' WHERE review_id = ? AND status = 'reviewed'`
+    )
+    .run(reviewId);
+  return Number(result.changes) === 1;
 };

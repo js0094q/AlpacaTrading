@@ -71,7 +71,7 @@ export interface HedgeCandidate {
   instrumentType: "protective_put" | "put_spread" | "inverse_etf";
   symbol: string;
   underlying: string;
-  executable: false;
+  executable: boolean;
   expectedProtection: number | null;
   estimatedCost: number | null;
   units: number | null;

@@ -20,9 +20,12 @@ import {
   latestHedgeRecommendation,
   observePortfolioHighWaterMark,
   persistHedgeRecommendation,
+  persistHedgeExecutionReview,
+  readHedgeExecutionReview,
   readCompatibleBetaCache,
   writeBetaCache
 } from "../src/services/hedgePersistenceService.js";
+import { createHedgeExecutionReview } from "../src/services/hedgeExecutionReviewService.js";
 import type { HedgeRecommendationRecord } from "../src/services/hedgeTypes.js";
 import type { PortfolioRiskSnapshot } from "../src/services/portfolioRiskService.js";
 
@@ -636,4 +639,53 @@ test("runtime decoder rejects incomplete, inconsistent, or mismatched risk snaps
     assert.equal(result?.risk, null, label);
     assert.ok(result?.integrityWarnings.includes("HEDGE_RISK_PAYLOAD_INVALID"), label);
   }
+});
+
+test("persists and verifies an HMAC hedge review on every read", () => {
+  const review = createHedgeExecutionReview({
+    accountHash: "account-hash",
+    sourceRecommendationId: "recommendation-1",
+    sourceSnapshotId: "snapshot-1",
+    sourceRegimeId: "regime-1",
+    riskModelVersion: "portfolio-risk-v1",
+    regimeModelVersion: "market-regime-v1",
+    configurationFingerprint: "config_hash",
+    generatedAt: now,
+    signingKey: "persistence-test-key",
+    candidate: {
+      candidateId: "candidate-1",
+      rank: 1,
+      instrumentType: "protective_put",
+      symbol: "SPY260918P00500000",
+      underlying: "SPY",
+      executable: true,
+      expectedProtection: 1_000,
+      estimatedCost: 500,
+      units: 1,
+      rationale: [],
+      warnings: [],
+      blockers: [],
+      details: { midpoint: 5, multiplier: 100 }
+    }
+  });
+  persistHedgeExecutionReview(review);
+
+  const valid = readHedgeExecutionReview({
+    reviewId: review.reviewId,
+    signingKey: "persistence-test-key",
+    accountHash: "account-hash",
+    configurationFingerprint: "config_hash",
+    sourceSnapshotId: "snapshot-1",
+    asOf: "2026-07-10T14:00:01.000Z"
+  });
+  assert.equal(valid.verification.valid, true);
+  assert.equal(valid.review?.clientOrderId, review.clientOrderId);
+
+  const invalid = readHedgeExecutionReview({
+    reviewId: review.reviewId,
+    signingKey: "wrong-key",
+    asOf: "2026-07-10T14:00:01.000Z"
+  });
+  assert.equal(invalid.verification.valid, false);
+  assert.ok(invalid.verification.blockers.includes("HEDGE_REVIEW_SIGNATURE_INVALID"));
 });

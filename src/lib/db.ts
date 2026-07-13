@@ -455,6 +455,24 @@ CREATE TABLE IF NOT EXISTS paper_review_artifacts (
 CREATE INDEX IF NOT EXISTS idx_paper_review_artifacts_created_at
   ON paper_review_artifacts(created_at);
 
+CREATE TABLE IF NOT EXISTS hedge_execution_reviews (
+  review_id TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  review_type TEXT NOT NULL,
+  client_order_id TEXT NOT NULL UNIQUE,
+  account_hash TEXT NOT NULL,
+  source_recommendation_id TEXT NOT NULL,
+  source_snapshot_id TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
+  signature TEXT NOT NULL,
+  status TEXT NOT NULL,
+  review_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_hedge_execution_reviews_expires_at
+  ON hedge_execution_reviews(expires_at);
+
 CREATE TABLE IF NOT EXISTS portfolio_high_water_marks (
   environment TEXT PRIMARY KEY,
   equity REAL NOT NULL,
