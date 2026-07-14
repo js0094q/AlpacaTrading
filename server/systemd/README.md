@@ -21,6 +21,13 @@ The repository now includes a paper control service template for the VPS dashboa
   during the final hour.
 - `alpaca-paper-exit-execute.service` / `.timer` — runs reviewed exit execution through
   `npm run paper:monitor -- --task=exit-execute`.
+- `alpaca-zero-dte-engine.service` / `.timer` — runs the independent guarded 0DTE Level 2
+  engine every minute during the configured entry window.
+- `alpaca-zero-dte-exit-review.service` / `.timer` — reviews 0DTE exits every minute during
+  market hours without enabling execution.
+- `alpaca-zero-dte-reconcile.service` / `.timer` — marks paper/shadow positions and captures
+  forward outcomes every five minutes.
+- `alpaca-zero-dte-eod.service` / `.timer` — records the 0DTE end-of-day summary after force exit.
 
 ## Installing and enabling the control API service
 
@@ -68,11 +75,12 @@ Timer services set `AUTOMATED_PAPER_EXECUTION_ENABLED=false`, so scheduled workf
 
 ## Installing continuous paper monitor timers
 
-The continuous monitor uses reviewed artifacts only and separates entry execution from exit execution by payload section.
+The continuous monitor installs both the reviewed paper-ops timers and the independent 0DTE Level 2 timers. The 0DTE engine uses its own candidate, decision, paper-trade, shadow, and lifecycle persistence; it does not require the Market Observatory cycle.
 
 ```bash
 sudo bash /home/alpaca/Alpaca-Trading/scripts/install-paper-monitoring-systemd.sh
 systemctl list-timers 'alpaca-paper-*' --no-pager
+systemctl list-timers 'alpaca-zero-dte-*' --no-pager
 ```
 
 Disable:
@@ -83,7 +91,9 @@ sudo bash /home/alpaca/Alpaca-Trading/scripts/disable-paper-monitoring-systemd.s
 
 The monitor runner fails closed unless the runtime env remains paper-only and live-off. Execution services set
 `AUTOMATED_PAPER_EXECUTION_ENABLED=true`, but the runner also requires `PAPER_ORDER_EXECUTION_ENABLED=true`,
-`PAPER_OPTIONS_EXECUTION_ENABLED=true`, and the reviewed executor's `--confirmPaper` boundary.
+`PAPER_OPTIONS_EXECUTION_ENABLED=true`, and the relevant executor's `--confirmPaper` boundary. The 0DTE
+engine additionally requires `ZERO_DTE_ENGINE_ENABLED=true` and `ZERO_DTE_PAPER_EXECUTION_ENABLED=true`;
+its exit-review, reconciliation, and end-of-day services set `AUTOMATED_PAPER_EXECUTION_ENABLED=false`.
 
 ## Service operating guidance
 
