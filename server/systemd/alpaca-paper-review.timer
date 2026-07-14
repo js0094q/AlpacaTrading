@@ -2,11 +2,10 @@
 Description=Run Alpaca Paper Monitor Review every 30 minutes during weekday market hours
 
 [Timer]
-OnCalendar=Mon..Fri *-*-* 09..15:0/30:00
+OnCalendar=Mon..Fri *-*-* 09..15:3/30:00
 Persistent=false
 RandomizedDelaySec=30
 Unit=alpaca-paper-review.service
 
 [Install]
 WantedBy=timers.target
-

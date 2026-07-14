@@ -80,6 +80,8 @@ Timer services set `AUTOMATED_PAPER_EXECUTION_ENABLED=false`, so scheduled workf
 
 The continuous monitor includes the non-executing market observatory collector, the reviewed paper-ops timers, and the independent 0DTE Level 2 timers. The 0DTE engine uses its own candidate, decision, paper-trade, shadow, and lifecycle persistence; it does not require the Market Observatory cycle. Reviewed entry and exit execution remain separated by payload section.
 
+Database-heavy timers use deliberate offsets from the quarter-hour observatory write: paper exit review begins on minute 1, paper review on minute 3, the 0DTE engine near second 45, 0DTE exit review near second 55, and 0DTE reconciliation on minute 1 modulo 5 near second 30. The runner permits only the read-only 0DTE EOD task after a valid weekday session has closed; all other tasks retain the regular-session gate.
+
 ```bash
 sudo bash /home/alpaca/Alpaca-Trading/scripts/install-paper-monitoring-systemd.sh
 systemctl list-timers 'alpaca-*' --no-pager

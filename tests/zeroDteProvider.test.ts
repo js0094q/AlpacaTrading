@@ -136,6 +136,31 @@ test("concrete 0DTE provider uses paper endpoints and preserves request IDs", as
   );
 });
 
+test("stock snapshot provider accepts Alpaca top-level symbol maps", async () => {
+  await withMockedResponses(
+    [
+      {
+        body: {
+          SPY: {
+            latestTrade: { p: 601.25, t: "2026-07-14T14:00:00.000Z" },
+            latestQuote: { bp: 601.2, ap: 601.3, t: "2026-07-14T14:00:00.000Z" }
+          }
+        },
+        requestId: "stock-snapshot-request-1"
+      }
+    ],
+    async () => {
+      const provider = createAlpacaZeroDteMarketDataProvider();
+      const snapshots = await provider.getStockSnapshot(["SPY"]);
+
+      assert.equal(snapshots.SPY?.symbol, "SPY");
+      assert.equal(snapshots.SPY?.latestTrade?.price, 601.25);
+      assert.equal(snapshots.SPY?.latestQuote?.bid, 601.2);
+      assert.equal(snapshots.SPY?.requestId, "stock-snapshot-request-1");
+    }
+  );
+});
+
 test("contract pagination stops at the requested limit and keeps page request IDs", async () => {
   await withMockedResponses(
     [

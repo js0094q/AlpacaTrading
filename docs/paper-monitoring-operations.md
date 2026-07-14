@@ -34,8 +34,10 @@ Do not print `/opt/alpaca-investing/secrets/alpaca.env`.
 - `alpaca-paper-exit-review.timer`: wakes every 15 minutes during regular windows and every 5 minutes in the final hour. It evaluates equity exits, generic option exits, LEAPS sell discipline, and in the final hour uses `paper:ops:late-day` so 0DTE late-day exit review is active.
 - `alpaca-paper-exit-execute.timer`: wakes after exit review windows. Runs reviewed exit execution only for `equitySells` and `optionSellToCloseExits`.
 
-All monitor tasks no-op with `MARKET_CLOSED` outside regular market hours,
-weekends, and configured US market holidays. Observatory validation must account
+The database-heavy timers are offset from the quarter-hour observatory write: exit review starts on minute 1, review on minute 3, the 0DTE engine near second 45, 0DTE exit review near second 55, and 0DTE reconciliation on minute 1 modulo 5 near second 30. SQLite connections use a 60-second busy timeout for residual transient writer contention.
+
+Monitor tasks no-op with `MARKET_CLOSED` outside regular market hours,
+weekends, and configured US market holidays, except that the read-only `zero-dte-eod` task may run after a valid weekday session closes. Observatory validation must account
 for all 51 symbols. Bounded symbol failures produce `PARTIAL` with structured
 reasons; silent omissions or systemic failures are deployment failures.
 

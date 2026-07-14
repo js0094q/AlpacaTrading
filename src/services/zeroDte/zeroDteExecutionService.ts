@@ -306,7 +306,12 @@ export const evaluateZeroDteExecutionEligibility = (
   const estimatedPremium = limitPrice === null ? null : roundMoney(limitPrice * 100 * quantity);
   const existingLedger = input.existingLedgerEntries ?? [];
 
-  if (!candidate.eligible || candidate.state !== "eligible") blockers.push("CANDIDATE_NOT_ELIGIBLE");
+  if (
+    !candidate.eligible ||
+    (candidate.state !== "eligible" && candidate.state !== "selected")
+  ) {
+    blockers.push("CANDIDATE_NOT_ELIGIBLE");
+  }
   if (!candidate.executable) blockers.push("CANDIDATE_NOT_EXECUTABLE");
   if (candidate.direction === "neutral") blockers.push("NEUTRAL_DIRECTION");
   blockers.push(...candidate.blockers.filter((code) => code && code !== "NONE"));
@@ -366,7 +371,12 @@ export const evaluateZeroDteExecutionEligibility = (
     blockers.push("DAILY_LOSS_LIMIT");
   }
   const openPositions = account.openPositions ?? [];
-  if (openPositions.filter((position) => position.quantity > 0).length >= config.maxOpenPositions) {
+  const openSameDayOptionPositions = openPositions.filter((position) => {
+    if (position.quantity <= 0) return false;
+    const openContract = parseOptionSymbol(normalizedSymbol(position.symbol));
+    return openContract.ok && openContract.expirationDate === candidate.tradingDate;
+  });
+  if (openSameDayOptionPositions.length >= config.maxOpenPositions) {
     blockers.push("MAX_OPEN_0DTE_POSITIONS");
   }
   if (openPositions.some((position) => normalizedSymbol(position.symbol) === symbol && position.quantity > 0)) {

@@ -183,6 +183,39 @@ test("eligibility fails closed for non-paper, stale, crossed, duplicate, and cap
   assert.ok(result.blockers.includes("DUPLICATE_ORDER"));
 });
 
+test("selected engine candidates remain eligible for the guarded execution step", () => {
+  const result = evaluateZeroDteExecutionEligibility({
+    candidate: { ...candidate(), state: "selected" },
+    config,
+    runtime: runtime(),
+    account: account(),
+    now
+  });
+
+  assert.equal(result.eligible, true);
+  assert.doesNotMatch(result.blockers.join(","), /CANDIDATE_NOT_ELIGIBLE/);
+});
+
+test("unrelated equity and long-dated option positions do not consume the 0DTE position cap", () => {
+  const result = evaluateZeroDteExecutionEligibility({
+    candidate: candidate(),
+    config,
+    runtime: runtime(),
+    account: account({
+      openPositions: [
+        { symbol: "CVS", quantity: 30 },
+        { symbol: "RSP", quantity: 15 },
+        { symbol: "SPY270115C00805000", quantity: 1 },
+        { symbol: "QQQ270115C00825000", quantity: 1 }
+      ]
+    }),
+    now
+  });
+
+  assert.equal(result.eligible, true);
+  assert.doesNotMatch(result.blockers.join(","), /MAX_OPEN_0DTE_POSITIONS/);
+});
+
 test("blocked runtime records no order mutation", async () => {
   seed();
   let brokerCalls = 0;

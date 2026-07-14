@@ -77,7 +77,8 @@ const TASKS = {
   "zero-dte-eod": {
     command: ["npm", ["run", "zero-dte:eod", "--", "--format=json"]],
     lockFile: "/tmp/alpaca-zero-dte-eod.lock",
-    requireExecution: false
+    requireExecution: false,
+    allowAfterMarketClose: true
   }
 };
 
@@ -193,12 +194,15 @@ const marketWindowStatus = (date = new Date()) => {
   const weekend = parts.weekday === "Sat" || parts.weekday === "Sun";
   const holiday = marketHolidayKeys(parts.year).has(key);
   const minutes = parts.hour * 60 + parts.minute;
-  const open = !weekend && !holiday && minutes >= 9 * 60 + 30 && minutes < 16 * 60;
+  const sessionDay = !weekend && !holiday;
+  const open = sessionDay && minutes >= 9 * 60 + 30 && minutes < 16 * 60;
   return {
     open,
     reason: open ? null : "MARKET_CLOSED",
     holiday,
     weekend,
+    sessionDay,
+    afterMarketClose: sessionDay && minutes >= 16 * 60,
     finalHour: open && minutes >= 15 * 60,
     nowEt: `${key} ${String(parts.hour).padStart(2, "0")}:${String(parts.minute).padStart(2, "0")}:${String(parts.second).padStart(2, "0")}`
   };
@@ -283,7 +287,7 @@ if (!loadPackageScripts().includes(scriptName)) {
   process.exit(1);
 }
 
-if (!market.open) {
+if (!market.open && !(task.allowAfterMarketClose && market.afterMarketClose)) {
   jsonLine({
     ok: true,
     status: "no_op",

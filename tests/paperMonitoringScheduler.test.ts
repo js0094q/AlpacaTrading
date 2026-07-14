@@ -32,6 +32,7 @@ const monitorUnits = [
 const marketOpenIso = "2026-07-08T14:00:00-04:00";
 const marketClosedIso = "2026-07-11T14:00:00-04:00";
 const finalHourIso = "2026-07-08T15:10:00-04:00";
+const afterCloseIso = "2026-07-08T16:05:00-04:00";
 
 const baseEnv = {
   ...process.env,
@@ -178,6 +179,15 @@ describe("paper monitoring scheduler", () => {
     assert.equal(body.reason, "MARKET_CLOSED");
   });
 
+  test("0DTE end-of-day processing runs after a valid weekday session closes", () => {
+    const result = runMonitor("zero-dte-eod", { now: afterCloseIso });
+    const body = parseStdout(result);
+
+    assert.equal(result.status, 0);
+    assert.equal(body.status, "dry_run");
+    assert.match(body.command, /zero-dte:eod/);
+  });
+
   test("exit monitor command exists and switches to late-day review in the final hour", () => {
     const normal = parseStdout(runMonitor("exit-review"));
     const finalHour = parseStdout(runMonitor("exit-review", { now: finalHourIso }));
@@ -197,6 +207,32 @@ describe("paper monitoring scheduler", () => {
     assert.doesNotMatch(body.command, /execute|confirmPaper|orders/);
     assert.match(timer, /OnCalendar=Mon\.\.Fri \*-\*-\* 09\.\.15:0\/15:00/);
     assert.match(timer, /Persistent=false/);
+  });
+
+  test("database-heavy timers are staggered away from observatory collection", () => {
+    const readTimer = (name: string) =>
+      readFileSync(join(repoRoot, "server/systemd", name), "utf8");
+
+    assert.match(
+      readTimer("alpaca-paper-review.timer"),
+      /OnCalendar=Mon\.\.Fri \*-\*-\* 09\.\.15:3\/30:00/
+    );
+    assert.match(
+      readTimer("alpaca-paper-exit-review.timer"),
+      /OnCalendar=Mon\.\.Fri \*-\*-\* 09\.\.14:1\/15:00/
+    );
+    assert.match(
+      readTimer("alpaca-zero-dte-engine.timer"),
+      /OnCalendar=Mon\.\.Fri \*-\*-\* 10\.\.14:\*:45/
+    );
+    assert.match(
+      readTimer("alpaca-zero-dte-exit-review.timer"),
+      /OnCalendar=Mon\.\.Fri \*-\*-\* 09\.\.15:\*:55/
+    );
+    assert.match(
+      readTimer("alpaca-zero-dte-reconcile.timer"),
+      /OnCalendar=Mon\.\.Fri \*-\*-\* 09\.\.15:1\/5:30/
+    );
   });
 
   test("market-hours gate no-ops outside market hours", () => {

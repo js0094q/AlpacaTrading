@@ -2,7 +2,7 @@
 Description=Run the paper 0DTE Level 2 exit review every minute during market hours
 
 [Timer]
-OnCalendar=Mon..Fri *-*-* 09..15:*:00
+OnCalendar=Mon..Fri *-*-* 09..15:*:55
 Persistent=false
 RandomizedDelaySec=5
 AccuracySec=1s

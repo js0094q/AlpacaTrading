@@ -1085,7 +1085,7 @@ const runMigrations = (db: DbHandle) => {
 };
 
 export const initializeDatabaseHandle = (db: DbHandle): DbHandle => {
-  db.exec("PRAGMA busy_timeout = 5000;");
+  db.exec("PRAGMA busy_timeout = 60000;");
   db.exec(tableSchema);
   runMigrations(db);
   runPhase1BMigrations(db);
