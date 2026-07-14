@@ -55,7 +55,9 @@ import {
 } from "./zeroDteOutcomeService.js";
 import {
   executeZeroDteCandidate,
+  reconcileZeroDtePaperOrders,
   type ZeroDteExecutionResult,
+  type ZeroDteOrderReconciliationResult,
   type ZeroDtePaperMutationProvider
 } from "./zeroDteExecutionService.js";
 import type {
@@ -108,6 +110,7 @@ export interface ZeroDteReconciliationResult {
   generatedAt: string;
   mutationAttempted: false;
   contexts: number;
+  paperOrders: ZeroDteOrderReconciliationResult;
   paperMarks: ZeroDtePaperMarkResult;
   shadowMarks: ZeroDteMarkResult;
   outcomes: ZeroDteOutcomeResult;
@@ -977,6 +980,7 @@ export const createZeroDteEngineMutationProvider = (
     getAccount: provider.getAccount?.bind(provider),
     listPositions: provider.listPositions?.bind(provider),
     listOrders: provider.listOrders?.bind(provider),
+    getOrder: provider.getOrder?.bind(provider),
     submitPaperOrder: provider.submitPaperOrder?.bind(provider)
   };
 };
@@ -1284,6 +1288,11 @@ export const runZeroDteReconciliation = async (input: {
   const tradingDate = tradingDateFor(generatedAt);
   const config = loadZeroDteConfig();
   const errors: Array<{ code: string; message: string }> = [];
+  const paperOrders = await reconcileZeroDtePaperOrders({
+    now: generatedAt,
+    provider: input.provider?.mutationProvider
+  });
+  errors.push(...paperOrders.errors.map(({ code, message }) => ({ code, message })));
   const contexts = await getMarketContexts({ now: generatedAt, config, provider: input.provider, errors });
   const quotes = quoteMapFor(contexts);
   const paperMarks = markZeroDtePaperTrades(generatedAt, quotes);
@@ -1301,6 +1310,7 @@ export const runZeroDteReconciliation = async (input: {
     generatedAt,
     mutationAttempted: false,
     contexts: contexts.length,
+    paperOrders,
     paperMarks,
     shadowMarks,
     outcomes,

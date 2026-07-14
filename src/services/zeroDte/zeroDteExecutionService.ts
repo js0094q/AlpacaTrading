@@ -1,7 +1,9 @@
 import { canonicalJsonHash } from "../../lib/canonicalJson.js";
 import { getDb } from "../../lib/db.js";
+import { redactSensitiveText } from "../../lib/securityRedaction.js";
 import {
   getAccount,
+  getPaperOrder,
   listPaperPositions,
   listRecentPaperOrders,
   submitPaperOrder,
@@ -33,7 +35,10 @@ import type {
   ZeroDteConfig,
   ZeroDteRuntimeSnapshot
 } from "./zeroDteTypes.js";
-import type { ZeroDteQueueCandidate } from "./zeroDtePersistenceService.js";
+import {
+  runInZeroDtePersistenceTransaction,
+  type ZeroDteQueueCandidate
+} from "./zeroDtePersistenceService.js";
 
 export type {
   ZeroDteAccountSnapshot,
@@ -75,7 +80,18 @@ export interface ZeroDtePaperMutationProvider {
   getAccount?: typeof getAccount;
   listPositions?: typeof listPaperPositions;
   listOrders?: typeof listRecentPaperOrders;
+  getOrder?: typeof getPaperOrder;
   submitPaperOrder?: typeof submitPaperOrder;
+}
+
+export interface ZeroDteOrderReconciliationResult {
+  paperOnly: true;
+  checked: number;
+  updated: number;
+  filled: number;
+  partial: number;
+  linkageUpdated: number;
+  errors: Array<{ code: string; message: string; paperTradeId?: string }>;
 }
 
 export type ZeroDteExecutionStatus =
@@ -485,6 +501,176 @@ const appendPaperLifecycleEvent = (input: {
   });
 };
 
+const ensureZeroDteLedgerDecisionLink = (input: {
+  ledgerId: number;
+  decisionId: string;
+  now: string;
+}) => {
+  const db = getDb();
+  const current = db.prepare(
+    `SELECT decision_id, decision_linkage_status
+     FROM paper_execution_ledger
+     WHERE id = ?`
+  ).get(input.ledgerId) as {
+    decision_id: string | null;
+    decision_linkage_status: string;
+  } | undefined;
+  if (!current) throw new Error("ZERO_DTE_LEDGER_NOT_FOUND");
+  if (current.decision_id && current.decision_id !== input.decisionId) {
+    throw new Error("ZERO_DTE_LEDGER_DECISION_MISMATCH");
+  }
+  if (current.decision_id === input.decisionId && current.decision_linkage_status === "EXACT") {
+    return false;
+  }
+  db.prepare(
+    `UPDATE paper_execution_ledger
+     SET decision_id = ?, decision_linkage_status = 'EXACT', updated_at = ?
+     WHERE id = ?`
+  ).run(input.decisionId, input.now, input.ledgerId);
+  return true;
+};
+
+export const reconcileZeroDtePaperOrders = async (input: {
+  now?: string;
+  provider?: ZeroDtePaperMutationProvider;
+} = {}): Promise<ZeroDteOrderReconciliationResult> => {
+  const now = new Date(input.now ?? nowIso()).toISOString();
+  const provider = input.provider ?? {};
+  const runtime = runtimeValue(provider.runtime);
+  const result: ZeroDteOrderReconciliationResult = {
+    paperOnly: true,
+    checked: 0,
+    updated: 0,
+    filled: 0,
+    partial: 0,
+    linkageUpdated: 0,
+    errors: []
+  };
+  const rows = getDb().prepare(
+    `SELECT t.paper_trade_id, t.decision_id, t.status, t.entry_premium,
+            t.broker_order_id, t.source_ledger_id
+     FROM zero_dte_paper_trades AS t
+     WHERE t.status IN ('intended', 'submitted', 'partially_filled')
+       AND t.broker_order_id IS NOT NULL
+       AND t.source_ledger_id IS NOT NULL
+     ORDER BY t.requested_at`
+  ).all() as Array<{
+    paper_trade_id: string;
+    decision_id: string;
+    status: string;
+    entry_premium: number | null;
+    broker_order_id: string;
+    source_ledger_id: number;
+  }>;
+  if (!rows.length) return result;
+  if (!runtime.paperOnly || runtime.environment !== "paper" || runtime.tradingMode !== "paper" || runtime.liveTradingEnabled) {
+    result.errors.push({
+      code: "ACCOUNT_NOT_PAPER",
+      message: "0DTE paper-order reconciliation is disabled outside the paper-only runtime."
+    });
+    return result;
+  }
+
+  const getOrder = provider.getOrder?.bind(provider) ?? getPaperOrder;
+  for (const row of rows) {
+    result.checked += 1;
+    try {
+      const response = await getOrder(row.broker_order_id);
+      const brokerStatus = normalizedStatus(response.data?.status);
+      const decision = decisionRow(row.decision_id);
+      if (!decision) throw new Error("ZERO_DTE_RECONCILIATION_DECISION_NOT_FOUND");
+      const fillPrice = positive(response.data?.filled_avg_price);
+      const filledQuantity = positive(response.data?.filled_qty);
+      const filledAt = text(response.data?.filled_at) ?? now;
+      const partial = brokerStatus === "partially_filled" || brokerStatus === "partial";
+      const filled = brokerStatus === "filled";
+      let linkageChanged = false;
+
+      runInZeroDtePersistenceTransaction(() => {
+        if (ensureZeroDteLedgerDecisionLink({
+          ledgerId: row.source_ledger_id,
+          decisionId: row.decision_id,
+          now
+        })) {
+          linkageChanged = true;
+        }
+        updatePaperExecutionLedgerEntry(row.source_ledger_id, {
+          status: filled
+            ? "filled"
+            : partial || normalizedStatus(row.status) === "partially_filled"
+              ? "partial"
+              : "submitted",
+          alpacaOrderId: row.broker_order_id,
+          alpacaStatus: brokerStatus || null,
+          requestId: response.requestId ?? null,
+          rawResponse: response.data
+        });
+        if (filled) {
+          getDb().prepare(
+            `UPDATE zero_dte_paper_trades
+             SET status = 'open', entry_premium = COALESCE(?, entry_premium),
+                 quantity = COALESCE(?, quantity), filled_at = ?, updated_at = ?
+             WHERE paper_trade_id = ?`
+          ).run(fillPrice, filledQuantity, filledAt, now, row.paper_trade_id);
+          appendPaperLifecycleEvent({
+            eventType: "paper_order_filled",
+            decision,
+            paperTradeId: row.paper_trade_id,
+            occurredAt: filledAt,
+            details: {
+              brokerOrderId: row.broker_order_id,
+              brokerStatus,
+              filledQuantity,
+              filledAveragePrice: fillPrice,
+              requestId: response.requestId ?? null
+            }
+          });
+          appendPaperLifecycleEvent({
+            eventType: "position_opened",
+            decision,
+            paperTradeId: row.paper_trade_id,
+            occurredAt: filledAt,
+            details: { brokerOrderId: row.broker_order_id, filledAveragePrice: fillPrice }
+          });
+        } else if (partial) {
+          getDb().prepare(
+            `UPDATE zero_dte_paper_trades
+             SET status = 'partially_filled', entry_premium = COALESCE(?, entry_premium),
+                 quantity = COALESCE(?, quantity),
+                 filled_at = COALESCE(filled_at, ?), updated_at = ?
+             WHERE paper_trade_id = ?`
+          ).run(fillPrice, filledQuantity, text(response.data?.filled_at), now, row.paper_trade_id);
+          appendPaperLifecycleEvent({
+            eventType: "paper_order_partially_filled",
+            decision,
+            paperTradeId: row.paper_trade_id,
+            occurredAt: filledAt,
+            details: {
+              brokerOrderId: row.broker_order_id,
+              filledQuantity,
+              filledAveragePrice: fillPrice,
+              requestId: response.requestId ?? null
+            }
+          });
+        }
+      });
+      if (linkageChanged) result.linkageUpdated += 1;
+      if (filled || partial) {
+        result.updated += 1;
+        if (filled) result.filled += 1;
+        if (partial) result.partial += 1;
+      }
+    } catch (error) {
+      result.errors.push({
+        code: "PAPER_ORDER_RECONCILIATION_FAILED",
+        message: redactSensitiveText(error instanceof Error ? error.message : String(error)).slice(0, 500),
+        paperTradeId: row.paper_trade_id
+      });
+    }
+  }
+  return result;
+};
+
 const createBlockedLedgerEntry = (input: {
   candidate: ZeroDteQueueCandidate;
   eligibility: ZeroDteEligibilityResult;
@@ -752,6 +938,11 @@ export const executeZeroDteCandidate = async (input: {
         }
       });
     }
+    ensureZeroDteLedgerDecisionLink({
+      ledgerId: ledger.id,
+      decisionId: input.decisionId,
+      now
+    });
   } catch {
     const duplicate = findPaperExecutionByDedupeKey(eligibility.reservationKey);
     return baseResult({

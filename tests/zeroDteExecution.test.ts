@@ -12,6 +12,7 @@ import { loadZeroDteConfig } from "../src/services/zeroDte/zeroDteConfigService.
 import {
   executeZeroDteCandidate,
   evaluateZeroDteExecutionEligibility,
+  reconcileZeroDtePaperOrders,
   type ZeroDteAccountSnapshot,
   type ZeroDtePaperMutationProvider,
   type ZeroDteRuntimeSnapshot
@@ -247,7 +248,7 @@ test("blocked runtime records no order mutation", async () => {
   );
 });
 
-test("qualified paper entry reserves, submits once, and is idempotent", async () => {
+test("qualified paper entry links its decision, reconciles a fill, and is idempotent", async () => {
   seed();
   const submitted: AlpacaPaperOrderRequest[] = [];
   const provider: ZeroDtePaperMutationProvider = {
@@ -288,4 +289,115 @@ test("qualified paper entry reserves, submits once, and is idempotent", async ()
   assert.ok(
     (getDb().prepare("SELECT COUNT(*) AS count FROM zero_dte_lifecycle_events WHERE event_type = 'paper_order_requested'").get() as { count: number }).count >= 1
   );
+
+  const linkedLedger = getDb().prepare(
+    `SELECT decision_id, decision_linkage_status
+     FROM paper_execution_ledger
+     WHERE source_candidate_id = ?`
+  ).get(candidateId) as { decision_id: string | null; decision_linkage_status: string };
+  assert.equal(linkedLedger.decision_id, decisionId);
+  assert.equal(linkedLedger.decision_linkage_status, "EXACT");
+
+  let nonPaperBrokerCalls = 0;
+  const nonPaper = await reconcileZeroDtePaperOrders({
+    now,
+    provider: {
+      runtime: runtime({
+        environment: "live",
+        tradingMode: "live",
+        paperOnly: false,
+        liveTradingEnabled: true
+      }),
+      getOrder: async () => {
+        nonPaperBrokerCalls += 1;
+        throw new Error("must not query a live order");
+      }
+    }
+  });
+  assert.equal(nonPaperBrokerCalls, 0);
+  assert.equal(nonPaper.checked, 0);
+  assert.deepEqual(nonPaper.errors.map((error) => error.code), ["ACCOUNT_NOT_PAPER"]);
+
+  const filledAt = "2026-07-13T14:30:05.000Z";
+  const reconciliation = await reconcileZeroDtePaperOrders({
+    now: filledAt,
+    provider: {
+      runtime: runtime(),
+      getOrder: async (orderId) => {
+        assert.equal(orderId, "paper-order-1");
+        return {
+          data: {
+            id: orderId,
+            client_order_id: first.clientOrderId,
+            symbol: optionSymbol,
+            status: "filled",
+            filled_qty: "1",
+            filled_avg_price: "1.21",
+            filled_at: filledAt
+          },
+          requestId: "paper-fill-request-1",
+          status: 200,
+          url: "paper"
+        };
+      }
+    }
+  });
+
+  assert.deepEqual(
+    {
+      checked: reconciliation.checked,
+      updated: reconciliation.updated,
+      filled: reconciliation.filled,
+      errors: reconciliation.errors
+    },
+    { checked: 1, updated: 1, filled: 1, errors: [] }
+  );
+  assert.deepEqual(
+    { ...getDb().prepare(
+      `SELECT status, quantity, entry_premium, filled_at, terminal_state
+       FROM zero_dte_paper_trades
+       WHERE paper_trade_id = ?`
+    ).get(first.paperTradeId) as Record<string, unknown> },
+    {
+      status: "open",
+      quantity: 1,
+      entry_premium: 1.21,
+      filled_at: filledAt,
+      terminal_state: null
+    }
+  );
+  assert.deepEqual(
+    { ...getDb().prepare(
+      `SELECT status, alpaca_status, decision_id, decision_linkage_status
+       FROM paper_execution_ledger
+       WHERE source_candidate_id = ?`
+    ).get(candidateId) as Record<string, unknown> },
+    {
+      status: "filled",
+      alpaca_status: "filled",
+      decision_id: decisionId,
+      decision_linkage_status: "EXACT"
+    }
+  );
+  assert.equal(
+    (getDb().prepare(
+      `SELECT COUNT(*) AS count
+       FROM zero_dte_lifecycle_events
+       WHERE paper_trade_id = ?
+         AND event_type IN ('paper_order_filled', 'position_opened')`
+    ).get(first.paperTradeId) as { count: number }).count,
+    2
+  );
+
+  const repeated = await reconcileZeroDtePaperOrders({
+    now: "2026-07-13T14:30:10.000Z",
+    provider: {
+      runtime: runtime(),
+      getOrder: async () => {
+        throw new Error("an open trade must not be reconciled twice");
+      }
+    }
+  });
+  assert.equal(repeated.checked, 0);
+  assert.equal(repeated.updated, 0);
 });

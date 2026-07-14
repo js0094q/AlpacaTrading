@@ -284,6 +284,8 @@ Add CLI entry points following existing repository conventions:
 - `zero-dte:eod` for the persisted daily learning summary;
 - `zero-dte:summary` for a sanitized queue/health read model.
 
+Reconciliation must read non-terminal Level 2 paper orders back from the paper broker, persist filled or partially filled state and actual fill premium, append the corresponding lifecycle events once, and backfill an exact decision link on the shared execution-ledger row. It must not submit, replace, or cancel an order.
+
 Add existing-pattern systemd services/timers for:
 
 - primary engine every 60 seconds during configured weekday/session windows;
