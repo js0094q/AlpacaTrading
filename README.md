@@ -993,6 +993,11 @@ VPS, `alpaca-universe-lifecycle.timer` runs on weekdays at 16:30 America/New_Yor
 with `Persistent=false`; a missed run waits for the next scheduled window rather
 than replaying an unbounded backlog.
 
+If a service run is interrupted, the next lifecycle start preserves the partial
+audit trail and marks the interrupted run failed before continuing. Alpaca
+request timeouts cover both response headers and response-body parsing, keeping
+the bounded worker inside its configured request deadline.
+
 ## Resume commands
 
 Fast checks when resuming:

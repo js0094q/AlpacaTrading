@@ -480,6 +480,13 @@ const finishRun = (input: {
   );
 };
 
+const recoverIncompleteRuns = (recoveredAt: string) => {
+  getDb().prepare(
+    "UPDATE universe_lifecycle_runs SET status = 'failed', completed_at = COALESCE(completed_at, ?), " +
+      "error_summary = COALESCE(error_summary, 'RECOVERED_INCOMPLETE_RUN') WHERE status = 'running'"
+  ).run(recoveredAt);
+};
+
 const latestCursor = () =>
   queryOne<{ discovery_cursor_end: string | null }>(
     "SELECT discovery_cursor_end FROM universe_lifecycle_runs " +
@@ -895,6 +902,7 @@ export const runAutonomousUniverseLifecycle = async (
   let symbolsAssessed = 0;
   let historicalRefreshSymbols: string[] = [];
 
+  recoverIncompleteRuns(startedAt);
   createRun({
     id: runId,
     startedAt,

@@ -518,24 +518,26 @@ const requestJson = async <T>(
   let lastError: unknown = null;
 
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
-    let response: Response;
     try {
-      response = await executeWithTimeout(timeoutMs, (signal) =>
-        fetch(url, {
-          method: "GET",
-          headers: {
-            "APCA-API-KEY-ID": credentials.apiKey,
-            "APCA-API-SECRET-KEY": credentials.secretKey,
-            "User-Agent": config.alpaca.userAgent,
-            "Content-Type": "application/json"
-          },
-          signal
-        })
+      const { response, parsedBody } = await executeWithTimeout(
+        timeoutMs,
+        async (signal) => {
+          const response = await fetch(url, {
+            method: "GET",
+            headers: {
+              "APCA-API-KEY-ID": credentials.apiKey,
+              "APCA-API-SECRET-KEY": credentials.secretKey,
+              "User-Agent": config.alpaca.userAgent,
+              "Content-Type": "application/json"
+            },
+            signal
+          });
+          return { response, parsedBody: await parseResponseBody(response) };
+        }
       );
 
       const requestId = response.headers.get("x-request-id") || undefined;
       const status = response.status;
-      const parsedBody = await parseResponseBody(response);
 
       recordApiRequest({
         provider: "alpaca",

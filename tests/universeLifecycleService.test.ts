@@ -266,6 +266,22 @@ describe("autonomous universe lifecycle", () => {
     assert.equal(getObservableSymbols().includes("RECOVER"), true);
   });
 
+  test("recovers an interrupted lifecycle run before continuing", async () => {
+    getDb().prepare(
+      "INSERT INTO universe_lifecycle_runs(" +
+        "id, started_at, status, git_sha, config_version, config_hash" +
+      ") VALUES ('interrupted-run', ?, 'running', 'prior-git', 'prior-v1', 'prior-hash')"
+    ).run(nowIso);
+
+    await runLifecycle([]);
+
+    const recovered = getDb().prepare(
+      "SELECT status, error_summary FROM universe_lifecycle_runs WHERE id = 'interrupted-run'"
+    ).get() as { status: string; error_summary: string | null };
+    assert.equal(recovered.status, "failed");
+    assert.equal(recovered.error_summary, "RECOVERED_INCOMPLETE_RUN");
+  });
+
   test("retires a persistent suspended symbol that remains outside the active Alpaca inventory", async () => {
     insertUniverse("RETIRED", "suspended", "2026-06-01T20:30:00.000Z");
 
