@@ -588,7 +588,8 @@ const candidateToUpsertInput = (
   candidate: ZeroDteQueueCandidate,
   state: ZeroDteCandidate["state"],
   reasonCode: string,
-  lifecycleContext: Parameters<typeof upsertZeroDteCandidate>[0]["lifecycleContext"]
+  lifecycleContext: Parameters<typeof upsertZeroDteCandidate>[0]["lifecycleContext"],
+  stateChangedAt: string
 ) => ({
   candidateId: candidate.candidateId,
   tradingDate: candidate.tradingDate,
@@ -630,7 +631,7 @@ const candidateToUpsertInput = (
   marketTimestamp: candidate.quote.marketTimestamp,
   firstSeenAt: candidate.firstSeenAt,
   lastSeenAt: candidate.lastSeenAt,
-  stateChangedAt: new Date().toISOString(),
+  stateChangedAt,
   stateReasonCode: reasonCode,
   stateReason: { reasonCode },
   blockerCodes: candidate.blockers,
@@ -911,27 +912,6 @@ export const runZeroDteEngine = async (input: {
   const runId = engineRunIdFor(tradingDate, asOf, config, mode);
   const errors: Array<{ code: string; message: string; underlying?: string }> = [];
   ensureEngineRun({ runId, tradingDate, mode, accountMode, config, asOf });
-  const prior = existingRun(runId);
-  if (prior?.status === "completed" || prior?.status === "closed" || prior?.status === "blocked") {
-    return {
-      paperOnly: true,
-      environment: environmentName(),
-      status: prior.status,
-      runId,
-      tradingDate: prior.trading_date,
-      accountMode: prior.account_mode,
-      configurationVersionId: prior.configuration_version_id,
-      contexts: 0,
-      candidatesDiscovered: prior.candidates_discovered,
-      candidatesEvaluated: prior.candidates_evaluated,
-      candidatesEligible: prior.candidates_eligible,
-      selectedCount: prior.selected_count,
-      executedCount: prior.executed_count,
-      shadowCount: prior.shadow_count,
-      errors: [],
-      executionResults: []
-    };
-  }
   if (!isPaperRuntime()) {
     errors.push({ code: "ACCOUNT_NOT_PAPER", message: "0DTE engine requires a paper Alpaca runtime." });
     finishEngineRun({ runId, status: "blocked", completedAt: asOf, counts: { discovered: 0, evaluated: 0, eligible: 0, selected: 0, executed: 0, shadow: 0 }, errors });
@@ -951,6 +931,27 @@ export const runZeroDteEngine = async (input: {
       executedCount: 0,
       shadowCount: 0,
       errors,
+      executionResults: []
+    };
+  }
+  const prior = existingRun(runId);
+  if (prior?.status === "completed" || prior?.status === "closed" || prior?.status === "blocked") {
+    return {
+      paperOnly: true,
+      environment: "paper",
+      status: prior.status,
+      runId,
+      tradingDate: prior.trading_date,
+      accountMode: prior.account_mode,
+      configurationVersionId: prior.configuration_version_id,
+      contexts: 0,
+      candidatesDiscovered: prior.candidates_discovered,
+      candidatesEvaluated: prior.candidates_evaluated,
+      candidatesEligible: prior.candidates_eligible,
+      selectedCount: prior.selected_count,
+      executedCount: prior.executed_count,
+      shadowCount: prior.shadow_count,
+      errors: [],
       executionResults: []
     };
   }
@@ -1047,7 +1048,7 @@ export const runZeroDteEngine = async (input: {
       occurredAt: asOf,
       decisionId,
       decisionGroupId
-    }));
+    }, asOf));
     const shadowCandidate = { ...candidate, ...updated, state, eligible: true, blockers: candidate.blockers } as unknown as ZeroDteQueueCandidate;
     if (isSelected && confirmPaper) {
       const result = await executeZeroDteCandidate({

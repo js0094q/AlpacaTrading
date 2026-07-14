@@ -161,6 +161,22 @@ const quoteAgeMs = (timestamp: string | null, now: string) => {
   return asOf - observed;
 };
 
+const etMinuteOf = (timestamp: string) => {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  }).formatToParts(new Date(timestamp));
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return Number(values.hour) * 60 + Number(values.minute);
+};
+
+const configuredMinute = (value: string) => {
+  const [hour, minute] = value.split(":").map(Number);
+  return hour * 60 + minute;
+};
+
 const accountPosition = (value: unknown): ZeroDteAccountPositionSnapshot | null => {
   if (!value || typeof value !== "object") return null;
   const row = value as Record<string, unknown>;
@@ -270,6 +286,12 @@ export const evaluateZeroDteExecutionEligibility = (
   const { candidate, config, runtime, account, now } = input;
   const blockers = runtimeBlockers(config, runtime);
   const warnings: string[] = [];
+  const currentEtMinute = etMinuteOf(now);
+  if (currentEtMinute < configuredMinute(config.discoveryStartEt)) {
+    blockers.push("DISCOVERY_WINDOW_NOT_OPEN");
+  } else if (currentEtMinute >= configuredMinute(config.newEntryCutoffEt)) {
+    blockers.push("ENTRY_CUTOFF");
+  }
   const reservationKey = reservationKeyFor(candidate);
   const clientOrderId = clientOrderIdFor(candidate);
   const symbol = normalizedSymbol(candidate.optionSymbol);
