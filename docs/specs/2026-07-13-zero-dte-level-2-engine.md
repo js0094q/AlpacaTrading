@@ -165,10 +165,12 @@ The market-data adapter must:
 
 - validate the exchange session using the existing market-clock/calendar conventions;
 - determine same-session expiration from an explicit trading date;
-- load only configured underlyings and a narrow strike band;
+- read a bounded same-day contract chain and then load only configured underlyings and the nearest narrow strike band;
 - normalize bid/ask/midpoint, volume, open interest, IV, and available Greeks;
 - preserve source timestamps separately from ingestion timestamps;
 - mark missing, stale, crossed, or incomplete data explicitly.
+
+Alpaca session volume is read from the option snapshot daily bar. Open interest is read from the option contract record when the snapshot omits it. Missing values remain null and continue to fail the existing liquidity gates.
 
 Default discovery settings are configurable and paper-safe:
 

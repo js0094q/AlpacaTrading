@@ -40,6 +40,7 @@ export interface ZeroDteContract {
   type: "call" | "put";
   strike: number;
   tradable: boolean;
+  openInterest?: number | null;
   requestId?: string | null;
 }
 
@@ -129,6 +130,7 @@ export interface ZeroDteMarketContext {
 
 const TIMEFRAMES = ["1Min", "5Min", "15Min"] as const;
 const ALL_SESSION_START_ET = "09:30:00";
+const CONTRACT_DISCOVERY_LIMIT = 1000;
 const ALL_PLAYBOOK_BLOCKERS = new Set(["quote_timestamp_missing", "quote_unavailable"]);
 
 const finiteNumber = (value: unknown): number | null => {
@@ -251,6 +253,7 @@ export const normalizeZeroDteContract = (raw: OptionContractRaw): ZeroDteContrac
     type: parsed.optionType,
     strike: parsed.strikePrice,
     tradable: raw.tradable === true || raw.tradeable === true || raw.status === "active",
+    openInterest: finiteNumber(raw.open_interest ?? raw.openInterest),
     requestId: raw.requestId ?? null
   };
 };
@@ -386,11 +389,12 @@ export const createAlpacaZeroDteMarketDataProvider = (): ZeroDteMarketDataProvid
     for (const [symbol, raw] of Object.entries(response.data)) {
       const canonical = normalizeOptionSnapshot(symbol, raw as AlpacaOptionSnapshotRaw);
       const rawRecord = raw as Record<string, unknown>;
+      const dailyBar = raw.dailyBar ?? raw.daily_bar;
       result[canonical.symbol] = {
         symbol: canonical.symbol,
         bid: canonical.latestQuote?.bidPrice ?? null,
         ask: canonical.latestQuote?.askPrice ?? null,
-        volume: finiteNumber(rawRecord.volume),
+        volume: finiteNumber(rawRecord.volume ?? dailyBar?.v),
         openInterest: finiteNumber(rawRecord.openInterest ?? rawRecord.open_interest),
         gamma: canonical.greeks.gamma,
         delta: canonical.greeks.delta,
@@ -478,7 +482,7 @@ export const collectZeroDteMarketContexts = async (input: {
     const contracts = await input.provider.listContracts({
       underlying,
       expirationDate: tradingDate,
-      limit: Math.max(input.config.maxStrikesEachSide * 4, 20)
+      limit: CONTRACT_DISCOVERY_LIMIT
     });
     const selectedContracts = selectStrikeBand(
       contracts.filter(
@@ -520,7 +524,7 @@ export const collectZeroDteMarketContexts = async (input: {
         normalizedQuote.midpoint
       );
       const volume = finiteNumber(sourceOption.volume);
-      const openInterest = finiteNumber(sourceOption.openInterest);
+      const openInterest = finiteNumber(sourceOption.openInterest ?? contract.openInterest);
       if (!meetsLiquidityAndPriceFilters({
         volume,
         openInterest,

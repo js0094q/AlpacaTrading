@@ -190,6 +190,8 @@ export interface OptionContractRaw {
   strike_price?: number | string;
   multiplier?: number | string;
   size?: number | string;
+  open_interest?: number | string | null;
+  openInterest?: number | string | null;
   tradable?: boolean;
   tradeable?: boolean;
   status?: string;

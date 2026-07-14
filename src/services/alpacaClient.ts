@@ -87,6 +87,8 @@ export interface AlpacaOptionContractRaw {
   style?: string;
   strike_price?: string | number;
   multiplier?: string | number;
+  open_interest?: string | number | null;
+  openInterest?: string | number | null;
 }
 
 export interface AlpacaPositionRaw {
@@ -125,6 +127,12 @@ export interface AlpacaStockSnapshotRaw {
 }
 
 export interface AlpacaOptionSnapshotRaw {
+  dailyBar?: {
+    v?: number | string | null;
+  };
+  daily_bar?: {
+    v?: number | string | null;
+  };
   latest_quote?: {
     t?: string | null;
     bp?: number | string | null;
