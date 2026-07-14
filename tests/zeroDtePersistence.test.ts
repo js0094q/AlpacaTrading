@@ -14,6 +14,7 @@ import {
   insertZeroDtePlaybookEvaluation,
   listZeroDteQueue,
   readZeroDteSummary,
+  runInZeroDtePersistenceTransaction,
   upsertZeroDteCandidate
 } from "../src/services/zeroDte/zeroDtePersistenceService.js";
 import { configureSqliteTestDb } from "./helpers/sqliteTestDb.js";
@@ -1338,4 +1339,38 @@ test("queue and summary reads expose typed components and sanitize evidence", ()
   assert.equal(summary.counts.candidates, 2);
   assert.equal(summary.counts.byState.eligible, 2);
   assert.equal(summary.lifecycle.counts.candidate_discovered, 2);
+});
+
+test("persistence batches roll back nested candidate writes atomically", () => {
+  seedTaskFiveRunFixtures();
+  const optionSymbol = "SPY260713C00506000";
+
+  assert.throws(
+    () => runInZeroDtePersistenceTransaction(() => {
+      const candidate = upsertZeroDteCandidate(taskFiveCandidateInput({ optionSymbol }));
+      appendZeroDteCandidateObservation({
+        observationId: "task5-rollback-observation",
+        candidateId: candidate.candidateId,
+        engineRunId: taskFiveRunIds[0],
+        observedAt: taskFiveTimestamp,
+        state: "watching",
+        totalScore: 42
+      });
+      throw new Error("ROLL_BACK_BATCH");
+    }),
+    /ROLL_BACK_BATCH/
+  );
+
+  assert.equal(
+    (getDb().prepare(
+      "SELECT COUNT(*) AS count FROM zero_dte_candidates WHERE option_symbol = ?"
+    ).get(optionSymbol) as { count: number }).count,
+    0
+  );
+  assert.equal(
+    (getDb().prepare(
+      "SELECT COUNT(*) AS count FROM zero_dte_candidate_observations WHERE observation_id = ?"
+    ).get("task5-rollback-observation") as { count: number }).count,
+    0
+  );
 });

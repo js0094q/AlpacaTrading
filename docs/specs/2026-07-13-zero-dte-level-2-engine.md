@@ -102,6 +102,8 @@ trading date + underlying + option symbol + playbook + direction + expiration + 
 
 The canonical identity string is hashed into a stable `candidate_id`. Repeated minute-level observations update the same candidate. Different playbooks remain separately attributable even when they select the same contract and direction.
 
+Each engine cycle persists its candidate, observation, evaluation, and queue-rank writes in one local SQLite transaction after market-data collection. This keeps the minute-level cycle bounded on durable VPS storage while preserving atomic rollback; broker reads and mutations remain outside that transaction.
+
 ### Configuration identity
 
 Each engine run stores:

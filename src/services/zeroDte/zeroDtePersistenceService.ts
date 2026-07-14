@@ -338,6 +338,7 @@ const stringArrayJson = (value: unknown): string[] => {
 };
 
 const withTransaction = <T>(db: DatabaseSync, operation: () => T): T => {
+  if (db.isTransaction) return operation();
   db.exec("BEGIN IMMEDIATE;");
   try {
     const result = operation();
@@ -352,6 +353,9 @@ const withTransaction = <T>(db: DatabaseSync, operation: () => T): T => {
     throw error;
   }
 };
+
+export const runInZeroDtePersistenceTransaction = <T>(operation: () => T): T =>
+  withTransaction(getDb(), operation);
 
 const validateCandidateIdentity = (input: ZeroDteCandidateUpsert) => {
   const tradingDate = requiredText(input.tradingDate, "trading date");

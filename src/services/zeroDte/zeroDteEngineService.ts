@@ -24,9 +24,9 @@ import { loadZeroDteConfig } from "./zeroDteConfigService.js";
 import {
   appendZeroDteCandidateObservation,
   insertZeroDtePlaybookEvaluation,
-  insertZeroDteDecision,
   listZeroDteQueue,
   readZeroDteSummary,
+  runInZeroDtePersistenceTransaction,
   upsertZeroDteCandidate,
   type ZeroDteCandidate,
   type ZeroDteQueueCandidate
@@ -36,6 +36,7 @@ import {
   buildZeroDteDecisionId
 } from "./zeroDteIdentityService.js";
 import {
+  insertZeroDteDecisionRow,
   insertZeroDteLifecycleEventRow
 } from "./zeroDteLifecycleService.js";
 import {
@@ -713,7 +714,7 @@ const ensureDecision = (input: {
 }) => {
   const decisionId = buildZeroDteDecisionId(input.runId, input.candidate.candidateId);
   if (!getDb().prepare("SELECT decision_id FROM zero_dte_decisions WHERE decision_id = ?").get(decisionId)) {
-    insertZeroDteDecision({
+    insertZeroDteDecisionRow(getDb(), {
       decisionId,
       decisionGroupId: input.decisionGroupId,
       engineRunId: input.runId,
@@ -960,6 +961,33 @@ const clockFor = async (provider?: ZeroDteEngineProvider) => {
   return provider.getClock();
 };
 
+export const createZeroDteEngineMutationProvider = (
+  config: ZeroDteConfig,
+  provider?: ZeroDtePaperMutationProvider,
+  executionClock: () => string = nowIso
+): ZeroDtePaperMutationProvider => {
+  if (!provider) return { config, now: executionClock };
+  return {
+    config: provider.config ?? config,
+    runtime: typeof provider.runtime === "function"
+      ? provider.runtime.bind(provider)
+      : provider.runtime,
+    account: provider.account,
+    now: provider.now?.bind(provider) ?? executionClock,
+    getAccount: provider.getAccount?.bind(provider),
+    listPositions: provider.listPositions?.bind(provider),
+    listOrders: provider.listOrders?.bind(provider),
+    submitPaperOrder: provider.submitPaperOrder?.bind(provider)
+  };
+};
+
+export const isActionableZeroDteCandidate = (
+  candidate: Pick<ZeroDteQueueCandidate, "state" | "eligible" | "executable">
+) =>
+  candidate.state === "eligible" &&
+  candidate.eligible === true &&
+  candidate.executable === true;
+
 export const runZeroDteEngine = async (input: {
   now?: string;
   dryRun?: boolean;
@@ -1069,67 +1097,147 @@ export const runZeroDteEngine = async (input: {
   }
 
   const contexts = await getMarketContexts({ now: asOf, config, provider: input.provider, errors });
-  const persisted: Array<{ candidate: ZeroDteCandidate; eligible: boolean }> = [];
+  const evaluatedContexts: Array<{
+    context: ExtendedMarketContext;
+    evaluations: PlaybookEvaluation[];
+  }> = [];
   let evaluatedCount = 0;
-  let eligibleCount = 0;
   for (const rawContext of contexts) {
     const context = rawContext as ExtendedMarketContext;
     try {
       const evaluations = evaluateZeroDtePlaybooks(playbookContextFor(context));
-      for (const evaluation of evaluations) {
-        evaluatedCount += 1;
-        const result = persistEvaluation({ context, evaluation, engineRunId: runId, config, accountMode, asOf });
-        persisted.push(result);
-        if (result.eligible) eligibleCount += 1;
-      }
+      evaluatedCount += evaluations.length;
+      evaluatedContexts.push({ context, evaluations });
     } catch (error) {
-      errors.push({ code: "PLAYBOOK_EVALUATION_FAILED", message: normalizeError(error), underlying: context.underlying });
+      errors.push({
+        code: "PLAYBOOK_EVALUATION_FAILED",
+        message: normalizeError(error),
+        underlying: context.underlying
+      });
     }
   }
 
-  const queue = listZeroDteQueue({ tradingDate, limit: config.queueTopN });
-  queue.forEach((candidate, index) => {
-    getDb().prepare("UPDATE zero_dte_candidates SET rank = ? WHERE candidate_id = ?").run(index + 1, candidate.candidateId);
-  });
-  const actionable = queue.filter((candidate) => candidate.state === "eligible" && candidate.eligible);
-  const selected = actionable.slice(0, config.executionTopN);
-  const displaced = actionable.slice(config.executionTopN);
   const decisionGroupId = decisionGroupIdFor(runId);
+  let batch: {
+    persisted: Array<{ candidate: ZeroDteCandidate; eligible: boolean }>;
+    eligibleCount: number;
+    selected: ZeroDteQueueCandidate[];
+    preparedActions: Array<{
+      candidate: ZeroDteQueueCandidate;
+      decisionId: string;
+      isSelected: boolean;
+    }>;
+  };
+  try {
+    batch = runInZeroDtePersistenceTransaction(() => {
+      const persistedRows: Array<{ candidate: ZeroDteCandidate; eligible: boolean }> = [];
+      let eligibleRows = 0;
+      for (const { context, evaluations } of evaluatedContexts) {
+        for (const evaluation of evaluations) {
+          const result = persistEvaluation({ context, evaluation, engineRunId: runId, config, accountMode, asOf });
+          persistedRows.push(result);
+          if (result.eligible) eligibleRows += 1;
+        }
+      }
+
+      const rankedQueue = listZeroDteQueue({ tradingDate, limit: config.queueTopN });
+      const rankCandidate = getDb().prepare(
+        "UPDATE zero_dte_candidates SET rank = ? WHERE candidate_id = ?"
+      );
+      rankedQueue.forEach((candidate, index) => {
+        rankCandidate.run(index + 1, candidate.candidateId);
+      });
+      const actionable = rankedQueue.filter(isActionableZeroDteCandidate);
+      const selected = actionable.slice(0, config.executionTopN);
+      const selectedIds = new Set(selected.map((candidate) => candidate.candidateId));
+      const preparedActions = actionable.map((candidate) => {
+        const isSelected = selectedIds.has(candidate.candidateId);
+        const action = isSelected ? "select" : "skip";
+        const decisionId = ensureDecision({ candidate, runId, decisionGroupId, accountMode, config, action, asOf });
+        const state = isSelected ? "selected" : "skipped";
+        const reasonCode = isSelected ? "CANDIDATE_SELECTED" : "HIGHER_RANKED_CANDIDATE";
+        const updated = upsertZeroDteCandidate(candidateToUpsertInput(candidate, state, reasonCode, {
+          engineRunId: runId,
+          accountMode,
+          strategyVersion: config.strategyVersion,
+          configurationVersionId: config.configurationVersionId,
+          marketTimestamp: candidate.quote.marketTimestamp,
+          occurredAt: asOf,
+          decisionId,
+          decisionGroupId
+        }, asOf));
+        return {
+          candidate: {
+            ...candidate,
+            ...updated,
+            state,
+            eligible: true,
+            blockers: candidate.blockers
+          } as unknown as ZeroDteQueueCandidate,
+          decisionId,
+          isSelected
+        };
+      });
+      return {
+        persisted: persistedRows,
+        eligibleCount: eligibleRows,
+        selected,
+        preparedActions
+      };
+    });
+  } catch (error) {
+    errors.push({ code: "PERSISTENCE_BATCH_FAILED", message: normalizeError(error) });
+    finishEngineRun({
+      runId,
+      status: "failed",
+      completedAt: asOf,
+      counts: {
+        discovered: 0,
+        evaluated: evaluatedCount,
+        eligible: 0,
+        selected: 0,
+        executed: 0,
+        shadow: 0
+      },
+      errors
+    });
+    return {
+      paperOnly: true,
+      environment: "paper",
+      status: "failed",
+      runId,
+      tradingDate,
+      accountMode,
+      configurationVersionId: config.configurationVersionId,
+      contexts: contexts.length,
+      candidatesDiscovered: 0,
+      candidatesEvaluated: evaluatedCount,
+      candidatesEligible: 0,
+      selectedCount: 0,
+      executedCount: 0,
+      shadowCount: 0,
+      errors,
+      executionResults: []
+    };
+  }
+
+  const { persisted, eligibleCount, selected, preparedActions } = batch;
   const executionResults: ZeroDteExecutionResult[] = [];
   let shadowCount = 0;
-  for (const candidate of actionable) {
-    const isSelected = selected.some((entry) => entry.candidateId === candidate.candidateId);
-    const action = isSelected ? "select" : "skip";
-    const decisionId = ensureDecision({ candidate, runId, decisionGroupId, accountMode, config, action, asOf });
-    const state = isSelected ? "selected" : "skipped";
-    const reasonCode = isSelected ? "CANDIDATE_SELECTED" : "HIGHER_RANKED_CANDIDATE";
-    const updated = upsertZeroDteCandidate(candidateToUpsertInput(candidate, state, reasonCode, {
-      engineRunId: runId,
-      accountMode,
-      strategyVersion: config.strategyVersion,
-      configurationVersionId: config.configurationVersionId,
-      marketTimestamp: candidate.quote.marketTimestamp,
-      occurredAt: asOf,
-      decisionId,
-      decisionGroupId
-    }, asOf));
-    const shadowCandidate = { ...candidate, ...updated, state, eligible: true, blockers: candidate.blockers } as unknown as ZeroDteQueueCandidate;
+  for (const { candidate, decisionId, isSelected } of preparedActions) {
     if (isSelected && confirmPaper) {
       const result = await executeZeroDteCandidate({
-        candidate: shadowCandidate,
+        candidate,
         decisionId,
         confirmPaper: true,
-        provider: input.provider?.mutationProvider ?? {
-          config,
-          now: () => asOf
-        }
+        provider: createZeroDteEngineMutationProvider(config, input.provider?.mutationProvider)
       });
       executionResults.push(result);
       if (result.status === "blocked" && config.shadowEnabled) {
-        if (createZeroDteShadowTrade({ candidate: shadowCandidate, decisionGroupId, reasonCode: result.blockers[0] ?? "EXECUTION_DISABLED", asOf })) shadowCount += 1;
+        if (createZeroDteShadowTrade({ candidate, decisionGroupId, reasonCode: result.blockers[0] ?? "EXECUTION_DISABLED", asOf })) shadowCount += 1;
       }
     } else if (config.shadowEnabled) {
-      if (createZeroDteShadowTrade({ candidate: shadowCandidate, decisionGroupId, reasonCode: isSelected ? "PAPER_CONFIRMATION_REQUIRED" : "HIGHER_RANKED_CANDIDATE", asOf })) shadowCount += 1;
+      if (createZeroDteShadowTrade({ candidate, decisionGroupId, reasonCode: isSelected ? "PAPER_CONFIRMATION_REQUIRED" : "HIGHER_RANKED_CANDIDATE", asOf })) shadowCount += 1;
     }
   }
   const executedCount = executionResults.filter((result) => ["submitted", "partial", "filled"].includes(result.status)).length;

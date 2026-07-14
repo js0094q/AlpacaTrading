@@ -5,17 +5,21 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 const dbDir = mkdtempSync(join(tmpdir(), "zero-dte-level-2-engine-"));
-process.env.RESEARCH_DB_PATH = join(dbDir, "research.db");
+const researchDbPath = join(dbDir, "research.db");
+process.env.RESEARCH_DB_PATH = researchDbPath;
 
 import { closeDbForTests, getDb } from "../src/lib/db.js";
 import {
   buildZeroDteSummary,
+  createZeroDteEngineMutationProvider,
+  isActionableZeroDteCandidate,
   runZeroDteEodSummary,
   runZeroDteEngine,
   runZeroDteReconciliation,
   type ZeroDteEngineProvider
 } from "../src/services/zeroDte/zeroDteEngineService.js";
 import type { ZeroDteMarketContext } from "../src/services/zeroDte/zeroDteMarketDataService.js";
+import type { ZeroDtePaperMutationProvider } from "../src/services/zeroDte/zeroDteExecutionService.js";
 
 const now = "2026-07-13T14:30:00.000Z";
 const optionSymbol = "SPY260713C00500000";
@@ -120,4 +124,169 @@ test("reconciliation and eod remain bounded when no broker mutation is requested
   assert.equal(reconciliation.mutationAttempted, false);
   assert.equal(eod.paperOnly, true);
   assert.equal(eod.tradingDate, "2026-07-13");
+});
+
+test("engine mutation fallback preserves prototype provider methods and execution clock", async () => {
+  const executionTime = "2026-07-13T14:30:08.000Z";
+  class PrototypeMutationProvider {
+    calls = 0;
+
+    now() {
+      return now;
+    }
+
+    async submitPaperOrder() {
+      this.calls += 1;
+      return { data: { id: "prototype-paper-order" } };
+    }
+  }
+  const original = new PrototypeMutationProvider();
+  const fallback = createZeroDteEngineMutationProvider(
+    {} as Parameters<typeof createZeroDteEngineMutationProvider>[0],
+    undefined,
+    () => executionTime
+  );
+  const override = createZeroDteEngineMutationProvider(
+    {} as Parameters<typeof createZeroDteEngineMutationProvider>[0],
+    original as unknown as ZeroDtePaperMutationProvider,
+    () => executionTime
+  );
+
+  assert.equal(fallback.now?.(), executionTime);
+  assert.equal(override.now?.(), now);
+  assert.equal(typeof override.submitPaperOrder, "function");
+  await override.submitPaperOrder?.({} as never);
+  assert.equal(original.calls, 1);
+});
+
+test("engine selection rejects eligible candidates with execution blockers", () => {
+  assert.equal(isActionableZeroDteCandidate({
+    state: "eligible",
+    eligible: true,
+    executable: false
+  }), false);
+  assert.equal(isActionableZeroDteCandidate({
+    state: "eligible",
+    eligible: true,
+    executable: true
+  }), true);
+});
+
+test("engine persistence failures roll back the full cycle before broker handling", async () => {
+  const failureDir = mkdtempSync(join(tmpdir(), "zero-dte-engine-failure-"));
+  const environmentKeys = [
+    "ALPACA_ENV",
+    "TRADING_MODE",
+    "LIVE_TRADING_ENABLED",
+    "ALPACA_LIVE_TRADE",
+    "ZERO_DTE_ENGINE_ENABLED",
+    "ZERO_DTE_MIN_CONFIRMATION_OBSERVATIONS",
+    "ZERO_DTE_PAPER_EXECUTION_ENABLED",
+    "PAPER_ORDER_EXECUTION_ENABLED",
+    "PAPER_OPTIONS_EXECUTION_ENABLED",
+    "AUTOMATED_PAPER_EXECUTION_ENABLED"
+  ] as const;
+  const savedEnvironment = Object.fromEntries(
+    environmentKeys.map((key) => [key, process.env[key]])
+  );
+  closeDbForTests();
+  process.env.RESEARCH_DB_PATH = join(failureDir, "research.db");
+  Object.assign(process.env, {
+    ALPACA_ENV: "paper",
+    TRADING_MODE: "paper",
+    LIVE_TRADING_ENABLED: "false",
+    ALPACA_LIVE_TRADE: "false",
+    ZERO_DTE_ENGINE_ENABLED: "true",
+    ZERO_DTE_MIN_CONFIRMATION_OBSERVATIONS: "1",
+    ZERO_DTE_PAPER_EXECUTION_ENABLED: "true",
+    PAPER_ORDER_EXECUTION_ENABLED: "true",
+    PAPER_OPTIONS_EXECUTION_ENABLED: "true",
+    AUTOMATED_PAPER_EXECUTION_ENABLED: "true"
+  });
+
+  try {
+    getDb().exec(`
+      CREATE TRIGGER test_abort_zero_dte_observation
+      BEFORE INSERT ON zero_dte_candidate_observations
+      BEGIN
+        SELECT RAISE(ABORT, 'forced observation failure');
+      END;
+    `);
+    let brokerCalls = 0;
+    const result = await runZeroDteEngine({
+      now,
+      confirmPaper: true,
+      provider: {
+        getClock: async () => ({
+          timestamp: now,
+          isOpen: true,
+          nextClose: "2026-07-13T20:00:00.000Z",
+          requestId: "clock-failure"
+        }),
+        collectContexts: async () => [context()],
+        mutationProvider: {
+          runtime: {
+            environment: "paper",
+            tradingMode: "paper",
+            paperOnly: true,
+            liveTradingEnabled: false,
+            engineEnabled: true,
+            paperExecutionEnabled: true,
+            paperOptionsExecutionEnabled: true,
+            automatedPaperExecutionEnabled: true,
+            marketOpen: true
+          },
+          account: {
+            environment: "paper",
+            paperVerified: true,
+            status: "ACTIVE",
+            buyingPower: 10_000,
+            optionsBuyingPower: 10_000,
+            equity: 100_000,
+            optionApprovalLevel: 3,
+            openPositions: [],
+            openOrders: []
+          },
+          now: () => now,
+          submitPaperOrder: async () => {
+            brokerCalls += 1;
+            throw new Error("broker must not be called");
+          }
+        }
+      }
+    });
+
+    assert.equal(result.status, "failed");
+    assert.ok(result.errors.some((error) => error.code === "PERSISTENCE_BATCH_FAILED"));
+    assert.equal(result.candidatesDiscovered, 0);
+    assert.equal(result.candidatesEligible, 0);
+    assert.equal(result.selectedCount, 0);
+    assert.equal(result.shadowCount, 0);
+    assert.equal(result.executionResults.length, 0);
+    assert.equal(brokerCalls, 0);
+    for (const table of [
+      "zero_dte_candidates",
+      "zero_dte_candidate_observations",
+      "zero_dte_playbook_evaluations",
+      "zero_dte_decisions",
+      "zero_dte_lifecycle_events",
+      "zero_dte_shadow_trades",
+      "paper_execution_ledger"
+    ]) {
+      assert.equal(
+        (getDb().prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count,
+        0,
+        table
+      );
+    }
+  } finally {
+    closeDbForTests();
+    rmSync(failureDir, { recursive: true, force: true });
+    for (const key of environmentKeys) {
+      const value = savedEnvironment[key];
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    process.env.RESEARCH_DB_PATH = researchDbPath;
+  }
 });
