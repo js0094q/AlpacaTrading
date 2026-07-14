@@ -8,7 +8,6 @@ import {
   listAlpacaAssets,
   type AlpacaAssetSnapshot
 } from "./alpacaAssetService.js";
-import { ingestBars } from "./marketDataIngest.js";
 import {
   assertLiveTradingDisabled,
   assertReadOnlyAlpacaAccessAllowed
@@ -50,7 +49,6 @@ export interface UniverseLifecyclePolicy {
   discoveryScanLimit: number;
   discoveryMaxNewSymbols: number;
   assessmentMaxSymbols: number;
-  historicalRefreshMaxSymbols: number;
   approvedExchanges: string[];
   minimumPrice: number;
   minimumDailyDollarVolume: number;
@@ -71,7 +69,6 @@ export interface UniverseLifecyclePolicy {
 
 export interface UniverseLifecycleRunInput {
   listAssets?: typeof listAlpacaAssets;
-  ingestBars?: typeof ingestBars;
   now?: () => Date;
   getGitSha?: () => string;
   policy?: Partial<UniverseLifecyclePolicy>;
@@ -91,7 +88,7 @@ export interface UniverseLifecycleRunResult {
     discovered: number;
   };
   symbolsAssessed: number;
-  historicalRefreshSymbols: string[];
+  historicalCoveragePendingSymbols: string[];
   transitionsApplied: number;
   stateCounts: Record<UniverseLifecycleState, number>;
   gitSha: string;
@@ -900,7 +897,7 @@ export const runAutonomousUniverseLifecycle = async (
   let assetsScanned = 0;
   let assetsDiscovered = 0;
   let symbolsAssessed = 0;
-  let historicalRefreshSymbols: string[] = [];
+  let historicalCoveragePendingSymbols: string[] = [];
 
   recoverIncompleteRuns(startedAt);
   createRun({
@@ -961,7 +958,7 @@ export const runAutonomousUniverseLifecycle = async (
           left.symbol.localeCompare(right.symbol)
       )
       .slice(0, policy.assessmentMaxSymbols);
-    const historyCandidates = assessable
+    historicalCoveragePendingSymbols = assessable
       .filter((row) => row.lifecycleState === "observe_only")
       .filter((row) => assetIssue(assetBySymbol.get(row.symbol), policy) === null)
       .filter(
@@ -971,17 +968,7 @@ export const runAutonomousUniverseLifecycle = async (
             [row.symbol]
           ) < policy.minimumHistoryBars
       )
-      .slice(0, policy.historicalRefreshMaxSymbols)
       .map((row) => row.symbol);
-    historicalRefreshSymbols = historyCandidates;
-    if (historyCandidates.length) {
-      const ingest = input.ingestBars ?? ingestBars;
-      await ingest({
-        symbols: historyCandidates,
-        timeframe: "1Day",
-        start: isoDaysAgo(now(), Math.max(policy.minimumHistoryBars * 2, 90))
-      });
-    }
 
     for (const row of assessable) {
       assessSymbol({
@@ -1020,7 +1007,7 @@ export const runAutonomousUniverseLifecycle = async (
         discovered: assetsDiscovered
       },
       symbolsAssessed,
-      historicalRefreshSymbols,
+      historicalCoveragePendingSymbols,
       transitionsApplied: context.transitionsApplied,
       stateCounts: counts,
       gitSha,

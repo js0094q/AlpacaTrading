@@ -37,7 +37,6 @@ const basePolicy = {
   discoveryScanLimit: 5,
   discoveryMaxNewSymbols: 2,
   assessmentMaxSymbols: 80,
-  historicalRefreshMaxSymbols: 0,
   approvedExchanges: ["NASDAQ", "NYSE"],
   minimumPrice: 5,
   minimumDailyDollarVolume: 1_000,
@@ -72,7 +71,6 @@ const runLifecycle = async (
 ) =>
   runAutonomousUniverseLifecycle({
     listAssets: async () => assets,
-    ingestBars: async () => ({ runId: 1, rowsIngested: 0 }),
     now,
     getGitSha: () => "test-git-sha",
     policy: { ...basePolicy, ...policy }
@@ -200,6 +198,9 @@ describe("autonomous universe lifecycle", () => {
     });
 
     const row = getUniverseSymbol("LIFE");
+    const barIngestionRuns = getDb()
+      .prepare("SELECT COUNT(*) AS count FROM ingestion_runs WHERE run_type = 'bars'")
+      .get() as { count: number };
     const events = getDb().prepare(
       "SELECT to_state, reason_code, git_sha, config_version, config_hash " +
         "FROM universe_lifecycle_events WHERE symbol = ? ORDER BY occurred_at, id"
@@ -211,6 +212,8 @@ describe("autonomous universe lifecycle", () => {
     assert.equal(row?.enabled, 0);
     assert.equal(getObservableSymbols().includes("LIFE"), true);
     assert.equal(getActiveSymbols().includes("LIFE"), false);
+    assert.deepEqual(result.historicalCoveragePendingSymbols, ["LIFE"]);
+    assert.equal(barIngestionRuns.count, 0);
     assert.deepEqual(events.map((event) => event.to_state), ["discovered", "observe_only"]);
     assert.equal(events[0]?.reason_code, "DISCOVERED_FROM_ALPACA");
     assert.equal(events[0]?.git_sha, "test-git-sha");

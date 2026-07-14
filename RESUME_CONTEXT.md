@@ -10,15 +10,19 @@
   inventory and local evidence only; existing review, execution, reconciliation,
   monitoring, exit, and learning gates remain unchanged.
 - `observe_only` symbols are included in the existing 15-minute observatory
-  collector. Research consumes only lifecycle-eligible active symbols.
+  collector, which owns their historical-bar collection. The lifecycle evaluates
+  persisted historical coverage but never invokes a data-ingestion run. Research
+  consumes only lifecycle-eligible active symbols.
 - The change adds SQLite run/event provenance, `universe:lifecycle` and
   `universe:lifecycle:status` commands, and a bounded 16:30 ET
-  `alpaca-universe-lifecycle.timer`. A missed run is not replayed
-  automatically.
+  `alpaca-universe-lifecycle.timer`. The unit has a 120-second start deadline,
+  30-second stop deadline, and control-group termination. A missed run is not
+  replayed automatically.
 - Request timeouts cover the complete Alpaca response read, including the body.
-  If systemd interrupts a run, the next pass marks its persisted `running`
-  record failed with `RECOVERED_INCOMPLETE_RUN` before resuming. This
-  preserves provenance without replaying or bypassing any execution gate.
+  If a lower-level network operation remains blocked, the service-level timeout
+  contains the run. The next pass marks its persisted `running` record failed
+  with `RECOVERED_INCOMPLETE_RUN` before resuming. This preserves provenance
+  without replaying or bypassing any execution gate.
 
 ## 0DTE operational acceptance follow-up (2026-07-14)
 

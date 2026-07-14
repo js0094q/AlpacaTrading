@@ -49,8 +49,9 @@ workflow without spending effort on accepted subsystems.
 
 - Existing static members retain research eligibility through a baseline event.
 - New members have a conservative observation period before they enter research.
-- The lifecycle worker adds bounded Alpaca asset reads and bounded historical-bar
-  ingestion, but no order calls.
+- The lifecycle worker adds bounded Alpaca asset reads, while the existing
+  15-minute observatory owns historical-bar collection. The lifecycle evaluates
+  persisted coverage only and makes no order calls.
 - Lifecycle state and reason become inspectable through the CLI and database.
 - Strategy-family promotion and platform-wide self-healing remain deliberately
   separate follow-on subsystems.

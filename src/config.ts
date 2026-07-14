@@ -211,10 +211,6 @@ export const config = {
       1,
       parseInteger(process.env.UNIVERSE_LIFECYCLE_MAX_ASSESSED_SYMBOLS, 80)
     ),
-    historicalRefreshMaxSymbols: parseInteger(
-      process.env.UNIVERSE_LIFECYCLE_HISTORY_REFRESH_MAX_SYMBOLS,
-      25
-    ),
     approvedExchanges: parseSymbolList(
       process.env.UNIVERSE_LIFECYCLE_APPROVED_EXCHANGES,
       ["AMEX", "ARCA", "BATS", "NASDAQ", "NYSE", "NYSEARCA"]

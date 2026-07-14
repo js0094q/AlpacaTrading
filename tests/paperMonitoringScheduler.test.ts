@@ -111,6 +111,9 @@ describe("paper monitoring scheduler", () => {
     assert.match(service, /AUTOMATED_PAPER_EXECUTION_ENABLED=false/);
     assert.match(service, /npm run universe:lifecycle/);
     assert.match(service, /After=network-online\.target/);
+    assert.match(service, /TimeoutStartSec=120/);
+    assert.match(service, /TimeoutStopSec=30/);
+    assert.match(service, /KillMode=control-group/);
     assert.doesNotMatch(service, /paper:monitor|paper:execute|confirmPaper|orders/i);
     assert.match(timer, /OnCalendar=Mon\.\.Fri \*-\*-\* 16:30:00/);
     assert.match(timer, /Persistent=false/);

@@ -982,8 +982,10 @@ worker. It moves bounded U.S. equities through
 `paper_active`, `suspended`, and `retired`, recording every transition with
 reason code, evidence, timestamp, Git SHA, and configuration version.
 
-The worker does not submit, modify, or cancel broker orders. `observe_only`
-symbols feed the existing 15-minute observatory collector; only
+The worker does not submit, modify, or cancel broker orders or request
+historical-bar ingestion. `observe_only` symbols feed the existing 15-minute
+observatory collector, which accumulates the history the lifecycle later
+evaluates; only
 `research_eligible`, `paper_eligible`, and `paper_active` symbols are supplied
 to the active research universe. Existing review and execution gates remain
 authoritative.
@@ -993,10 +995,12 @@ VPS, `alpaca-universe-lifecycle.timer` runs on weekdays at 16:30 America/New_Yor
 with `Persistent=false`; a missed run waits for the next scheduled window rather
 than replaying an unbounded backlog.
 
-If a service run is interrupted, the next lifecycle start preserves the partial
-audit trail and marks the interrupted run failed before continuing. Alpaca
-request timeouts cover both response headers and response-body parsing, keeping
-the bounded worker inside its configured request deadline.
+The systemd unit has a 120-second start deadline and 30-second stop deadline
+with control-group termination. If a service run is interrupted, the next
+lifecycle start preserves the partial audit trail and marks the interrupted run
+failed before continuing. Alpaca request timeouts cover both response headers
+and response-body parsing; the service-level deadline remains the recovery
+boundary if a lower-level network operation does not return.
 
 ## Resume commands
 
