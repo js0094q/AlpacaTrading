@@ -14,6 +14,7 @@ process.env.LIVE_TRADING_ENABLED = "false";
 process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
 process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
 process.env.AUTOMATED_PAPER_EXECUTION_ENABLED = "true";
+process.env.PAPER_REVIEW_SIGNING_KEY = "paper-reviewed-execution-test-key";
 
 import { closeDbForTests, getDb } from "../src/lib/db.js";
 import { createPaperReviewArtifact } from "../src/services/paperReviewArtifactService.js";
@@ -42,6 +43,7 @@ beforeEach(() => {
   process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
   process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
   process.env.AUTOMATED_PAPER_EXECUTION_ENABLED = "true";
+  process.env.PAPER_REVIEW_SIGNING_KEY = "paper-reviewed-execution-test-key";
   resetDatabase();
 });
 

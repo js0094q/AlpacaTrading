@@ -11,6 +11,7 @@ process.env.TRADING_MODE = "paper";
 process.env.ALPACA_LIVE_TRADE = "false";
 process.env.LIVE_TRADING_ENABLED = "false";
 process.env.ALPACA_ENV = "paper";
+process.env.PAPER_REVIEW_SIGNING_KEY = "paper-ops-workflow-test-key";
 
 import { closeDbForTests, getDb } from "../src/lib/db.js";
 import {
@@ -72,6 +73,7 @@ const hedgeReview = async () => ({
 
 beforeEach(() => {
   process.env.AUTOMATED_PAPER_EXECUTION_ENABLED = "false";
+  process.env.PAPER_REVIEW_SIGNING_KEY = "paper-ops-workflow-test-key";
   resetDatabase();
 });
 
