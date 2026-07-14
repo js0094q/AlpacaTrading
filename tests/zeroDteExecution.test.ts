@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 
 const dbDir = mkdtempSync(join(tmpdir(), "zero-dte-level-2-execution-"));
 process.env.RESEARCH_DB_PATH = join(dbDir, "research.db");
+process.env.PAPER_REVIEW_SIGNING_KEY = "zero-dte-execution-test-signing-key";
 
 import { closeDbForTests, getDb } from "../src/lib/db.js";
 import { loadZeroDteConfig } from "../src/services/zeroDte/zeroDteConfigService.js";
@@ -47,12 +48,16 @@ const runtime = (overrides: Partial<ZeroDteRuntimeSnapshot> = {}): ZeroDteRuntim
 });
 
 const account = (overrides: Partial<ZeroDteAccountSnapshot> = {}): ZeroDteAccountSnapshot => ({
+  accountIdentityHash: "test-paper-account-hash",
   environment: "paper",
   paperVerified: true,
   status: "ACTIVE",
+  cash: 10_000,
   buyingPower: 10_000,
   optionsBuyingPower: 10_000,
   optionApprovalLevel: 3,
+  tradingBlocked: false,
+  accountBlocked: false,
   dailyTradeCount: 0,
   dailyPremium: 0,
   dailyRealizedLoss: 0,
@@ -376,10 +381,13 @@ test("execution derives complete daily counters from broker and persisted eviden
       getAccount: async () => emptyResponse({
         id: "paper-account",
         status: "ACTIVE",
+        cash: "10000",
         buying_power: "10000",
         options_buying_power: "10000",
         equity: "10000",
-        options_approved_level: 3
+        options_approved_level: 3,
+        trading_blocked: false,
+        account_blocked: false
       }),
       listPositions: async () => emptyResponse([]),
       listOrders: async () => emptyResponse([]),
@@ -397,6 +405,17 @@ test("execution derives complete daily counters from broker and persisted eviden
     }
   });
 
+  const attestationEvents = getDb().prepare(
+    `SELECT details_json
+     FROM zero_dte_lifecycle_events
+     WHERE candidate_id = ? AND event_type = 'execution_attested'`
+  ).all(evidenceCandidate.candidateId) as Array<{ details_json: string }>;
+  const ledgerLink = result.ledgerId
+    ? getDb().prepare(
+      "SELECT source_plan_id FROM paper_execution_ledger WHERE id = ?"
+    ).get(result.ledgerId) as { source_plan_id: string | null } | undefined
+    : undefined;
+
   if (result.paperTradeId) {
     getDb().prepare("DELETE FROM zero_dte_lifecycle_events WHERE paper_trade_id = ?").run(result.paperTradeId);
     getDb().prepare("DELETE FROM zero_dte_paper_trades WHERE paper_trade_id = ?").run(result.paperTradeId);
@@ -407,12 +426,208 @@ test("execution derives complete daily counters from broker and persisted eviden
 
   assert.equal(result.status, "submitted");
   assert.equal(brokerCalls, 1);
+  assert.match(String(result.attestationId), /^zero_dte_attest_[a-f0-9]{24}$/);
+  assert.equal(attestationEvents.length, 1);
+  assert.equal(
+    (JSON.parse(attestationEvents[0].details_json) as { attestationId: string }).attestationId,
+    result.attestationId
+  );
+  assert.equal(ledgerLink?.source_plan_id, result.attestationId);
   assert.equal(result.eligibility?.evidence.activityEvidenceComplete, true);
   assert.equal(result.eligibility?.evidence.dailyTradeCount, 0);
   assert.match(
     String(result.eligibility?.evidence.activityEvidenceFingerprint),
     /^[a-f0-9]{64}$/
   );
+});
+
+test("fresh 0DTE account drift blocks before reservation or broker mutation", async () => {
+  const driftCandidate = scenarioCandidate({
+    candidateId: "execution-candidate-submit-drift",
+    optionSymbol: "SPY260713C00589000",
+    strike: 589
+  });
+  const driftDecisionId = "execution-decision-submit-drift";
+  seed({ candidate: driftCandidate, decisionId: driftDecisionId });
+  let accountReads = 0;
+  let brokerCalls = 0;
+  const emptyResponse = <T>(data: T) => ({ data, status: 200, url: "paper" });
+
+  const result = await executeZeroDteCandidate({
+    candidate: driftCandidate,
+    decisionId: driftDecisionId,
+    confirmPaper: true,
+    provider: {
+      config,
+      runtime: runtime(),
+      now: () => now,
+      getAccount: async () => {
+        accountReads += 1;
+        return emptyResponse({
+          id: "paper-account-drift",
+          status: "ACTIVE",
+          cash: accountReads === 1 ? "10000" : "9000",
+          buying_power: accountReads === 1 ? "10000" : "9000",
+          options_buying_power: accountReads === 1 ? "10000" : "9000",
+          equity: "10000",
+          options_approved_level: 3,
+          trading_blocked: false,
+          account_blocked: false
+        });
+      },
+      listPositions: async () => emptyResponse([]),
+      listOrders: async () => emptyResponse([]),
+      submitPaperOrder: async (payload) => {
+        brokerCalls += 1;
+        return emptyResponse({
+          id: "must-not-submit-drift",
+          client_order_id: payload.client_order_id,
+          symbol: payload.symbol,
+          status: "accepted"
+        });
+      }
+    }
+  });
+
+  if (result.paperTradeId) {
+    getDb().prepare("DELETE FROM zero_dte_lifecycle_events WHERE paper_trade_id = ?").run(result.paperTradeId);
+    getDb().prepare("DELETE FROM zero_dte_paper_trades WHERE paper_trade_id = ?").run(result.paperTradeId);
+  }
+  getDb().prepare("DELETE FROM zero_dte_lifecycle_events WHERE candidate_id = ?").run(driftCandidate.candidateId);
+  if (result.ledgerId) getDb().prepare("DELETE FROM paper_execution_ledger WHERE id = ?").run(result.ledgerId);
+
+  assert.equal(accountReads, 2);
+  assert.equal(brokerCalls, 0);
+  assert.equal(result.status, "blocked");
+  assert.ok(result.blockers.includes("ZERO_DTE_ACCOUNT_STATE_DRIFT"));
+  assert.ok(result.blockers.includes("FRESH_REVIEW_REQUIRED"));
+  assert.match(String(result.attestationId), /^zero_dte_attest_[a-f0-9]{24}$/);
+});
+
+test("missing review signing key blocks 0DTE execution before broker mutation", async () => {
+  const unsignedCandidate = scenarioCandidate({
+    candidateId: "execution-candidate-missing-signing-key",
+    optionSymbol: "SPY260713C00588000",
+    strike: 588
+  });
+  const unsignedDecisionId = "execution-decision-missing-signing-key";
+  seed({ candidate: unsignedCandidate, decisionId: unsignedDecisionId });
+  const originalKey = process.env.PAPER_REVIEW_SIGNING_KEY;
+  delete process.env.PAPER_REVIEW_SIGNING_KEY;
+  let brokerCalls = 0;
+  let result;
+  try {
+    result = await executeZeroDteCandidate({
+      candidate: unsignedCandidate,
+      decisionId: unsignedDecisionId,
+      confirmPaper: true,
+      provider: {
+        config,
+        runtime: runtime(),
+        account: account(),
+        now: () => now,
+        submitPaperOrder: async (payload) => {
+          brokerCalls += 1;
+          return {
+            data: {
+              id: "must-not-submit-unsigned",
+              client_order_id: payload.client_order_id,
+              symbol: payload.symbol,
+              status: "accepted"
+            },
+            status: 200,
+            url: "paper"
+          };
+        }
+      }
+    });
+  } finally {
+    if (originalKey === undefined) delete process.env.PAPER_REVIEW_SIGNING_KEY;
+    else process.env.PAPER_REVIEW_SIGNING_KEY = originalKey;
+  }
+  if (result.paperTradeId) {
+    getDb().prepare("DELETE FROM zero_dte_lifecycle_events WHERE paper_trade_id = ?").run(result.paperTradeId);
+    getDb().prepare("DELETE FROM zero_dte_paper_trades WHERE paper_trade_id = ?").run(result.paperTradeId);
+  }
+  if (result.ledgerId) getDb().prepare("DELETE FROM paper_execution_ledger WHERE id = ?").run(result.ledgerId);
+
+  assert.equal(brokerCalls, 0);
+  assert.equal(result.status, "blocked");
+  assert.ok(result.blockers.includes("ZERO_DTE_SUBMIT_ATTESTATION_INVALID"));
+  assert.ok(result.blockers.includes("PAPER_REVIEW_SIGNING_KEY_REQUIRED"));
+});
+
+test("persisted decision configuration and quote identity must match the submit intent", async () => {
+  const configurationCandidate = scenarioCandidate({
+    candidateId: "execution-candidate-config-mismatch",
+    optionSymbol: "SPY260713C00587000",
+    strike: 587
+  });
+  const configurationDecisionId = "execution-decision-config-mismatch";
+  seed({ candidate: configurationCandidate, decisionId: configurationDecisionId });
+  const changedConfig = loadZeroDteConfig({
+    ZERO_DTE_MAX_CONTRACTS_PER_TRADE: "1",
+    ZERO_DTE_MAX_PREMIUM_PER_TRADE: "249",
+    ZERO_DTE_MAX_DAILY_PREMIUM: "750"
+  });
+  let brokerCalls = 0;
+  const configurationResult = await executeZeroDteCandidate({
+    candidate: configurationCandidate,
+    decisionId: configurationDecisionId,
+    confirmPaper: true,
+    provider: {
+      config: changedConfig,
+      runtime: runtime(),
+      account: account(),
+      now: () => now,
+      submitPaperOrder: async () => {
+        brokerCalls += 1;
+        throw new Error("must not submit");
+      }
+    }
+  });
+
+  const quoteCandidate = scenarioCandidate({
+    candidateId: "execution-candidate-quote-mismatch",
+    optionSymbol: "SPY260713C00586000",
+    strike: 586
+  });
+  const quoteDecisionId = "execution-decision-quote-mismatch";
+  seed({ candidate: quoteCandidate, decisionId: quoteDecisionId });
+  const quoteResult = await executeZeroDteCandidate({
+    candidate: {
+      ...quoteCandidate,
+      quote: {
+        ...quoteCandidate.quote,
+        marketTimestamp: "2026-07-13T14:29:59.000Z"
+      }
+    },
+    decisionId: quoteDecisionId,
+    confirmPaper: true,
+    provider: {
+      config,
+      runtime: runtime(),
+      account: account(),
+      now: () => now,
+      submitPaperOrder: async () => {
+        brokerCalls += 1;
+        throw new Error("must not submit");
+      }
+    }
+  });
+
+  if (configurationResult.ledgerId) {
+    getDb().prepare("DELETE FROM paper_execution_ledger WHERE id = ?").run(configurationResult.ledgerId);
+  }
+  if (quoteResult.ledgerId) {
+    getDb().prepare("DELETE FROM paper_execution_ledger WHERE id = ?").run(quoteResult.ledgerId);
+  }
+
+  assert.equal(brokerCalls, 0);
+  assert.equal(configurationResult.status, "blocked");
+  assert.ok(configurationResult.blockers.includes("DECISION_CONFIGURATION_MISMATCH"));
+  assert.equal(quoteResult.status, "blocked");
+  assert.ok(quoteResult.blockers.includes("DECISION_ORDER_INTENT_MISMATCH"));
 });
 
 test("blocked runtime records no order mutation", async () => {

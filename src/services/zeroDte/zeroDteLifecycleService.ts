@@ -18,6 +18,7 @@ export const ZERO_DTE_LIFECYCLE_EVENT_TYPES = [
   "candidate_rejected",
   "candidate_expired",
   "candidate_invalidated",
+  "execution_attested",
   "paper_order_requested",
   "paper_order_accepted",
   "paper_order_rejected",
