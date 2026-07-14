@@ -210,7 +210,7 @@ export interface PaperPlanReport {
   diagnostics: PaperPlanDiagnostics;
 }
 
-interface PaperPlanInput {
+export interface PaperPlanInput {
   riskProfile?: RiskProfile;
   optionsEnabled?: boolean;
   maxCandidates?: number;
@@ -485,7 +485,9 @@ const pickEnvNumber = (fallback: number, ...names: string[]) => {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 };
 
-const toConfig = (input: PaperPlanInput): Required<PaperPlanConfig> => {
+export const loadPaperPlanConfig = (
+  input: PaperPlanInput = {}
+): Required<PaperPlanConfig> => {
   const maxCandidates = toPositiveNumber(
     input.maxCandidates,
     pickEnvInt(DEFAULTS.maxCandidates, "PAPER_PLAN_MAX_CANDIDATES")
@@ -1481,7 +1483,7 @@ const parseSymbolListEnv = (name: string, fallback: string[]): string[] => {
   );
 };
 
-const paperOptionsConfig = () => {
+export const paperOptionsConfig = () => {
   const quoteCfg = optionsQuoteConfig();
   const hardSpreadCapEnabled = parseBooleanEnv("PAPER_OPTIONS_HARD_SPREAD_CAP_ENABLED", false);
   const maxPremiumPerContract = parseNumberEnvAny(
@@ -3073,7 +3075,7 @@ const evaluateCandidate = (input: CandidateEvaluationContext): PaperPlanCandidat
 export const buildPaperPlanReport = async (
   input: PaperPlanInput = {}
 ): Promise<PaperPlanReport> => {
-  const config = toConfig(input);
+  const config = loadPaperPlanConfig(input);
   assertPlanGuards(config.riskProfile);
 
   const generatedAt = now();

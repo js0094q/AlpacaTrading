@@ -427,6 +427,131 @@ export const linkPaperExecutionPositionLifecycle = (input: {
   );
 };
 
+export const ACTIVE_NEW_RISK_RESERVATION_STATUSES = new Set<string>([
+  "reserved",
+  "attempted",
+  "submitted",
+  "accepted",
+  "partial",
+  "partially_filled"
+]);
+
+export const listActivePaperNewRiskReservations = (): PaperExecutionLedgerEntry[] =>
+  queryAll<LedgerRow>(
+    `
+    SELECT *
+    FROM paper_execution_ledger
+    WHERE LOWER(COALESCE(side, '')) = 'buy'
+      AND status IN (
+        'reserved',
+        'attempted',
+        'submitted',
+        'accepted',
+        'partial',
+        'partially_filled'
+      )
+    ORDER BY created_at, id
+    `
+  ).map(mapRow);
+
+export interface ReviewedPaperExecutionReservationInput {
+  assetClass: "equity" | "option";
+  symbol: string;
+  side: "buy";
+  orderType: "market" | "limit";
+  timeInForce: "day";
+  qty?: string | null;
+  notional?: string | null;
+  limitPrice?: string | null;
+  estimatedPremium?: number | null;
+  maxRisk?: number | null;
+  dedupeKey: string;
+  clientOrderId: string;
+  sourcePlanId: string;
+  sourceCandidateId: string;
+  decisionId: DecisionId;
+  section: string;
+  payloadIndex: number;
+  payload: unknown;
+  rawPayload: unknown;
+}
+
+const withImmediateLedgerTransaction = <T>(operation: () => T): T => {
+  const db = getDb();
+  db.exec("BEGIN IMMEDIATE;");
+  try {
+    const result = operation();
+    db.exec("COMMIT;");
+    return result;
+  } catch (error) {
+    try {
+      db.exec("ROLLBACK;");
+    } catch {
+      // Preserve the original reservation error.
+    }
+    throw error;
+  }
+};
+
+export const reserveReviewedPaperExecution = (
+  input: ReviewedPaperExecutionReservationInput
+) => {
+  try {
+    return withImmediateLedgerTransaction(() => {
+      const existingByClient = findPaperExecutionByClientOrderId(input.clientOrderId);
+      const existingByDedupe = findPaperExecutionByDedupeKey(input.dedupeKey);
+      if (existingByClient || existingByDedupe) {
+        return {
+          reserved: false as const,
+          entry: existingByClient ?? existingByDedupe,
+          blockers: ["SUBMIT_DUPLICATE_ORDER_OR_RESERVATION"]
+        };
+      }
+      const entry = insertPaperExecutionLedgerEntry({
+        mode: "reviewedConfirmPaper",
+        assetClass: input.assetClass,
+        symbol: input.symbol,
+        side: input.side,
+        orderType: input.orderType,
+        timeInForce: input.timeInForce,
+        qty: input.qty ?? null,
+        notional: input.notional ?? null,
+        limitPrice: input.limitPrice ?? null,
+        estimatedPremium: input.estimatedPremium ?? null,
+        maxRisk: input.maxRisk ?? null,
+        dedupeKey: input.dedupeKey,
+        clientOrderId: input.clientOrderId,
+        status: "reserved",
+        sourcePlanId: input.sourcePlanId,
+        sourceCandidateId: input.sourceCandidateId,
+        decisionId: input.decisionId,
+        decisionLinkageStatus: "EXACT",
+        payload: {
+          artifactId: input.sourcePlanId,
+          section: input.section,
+          payloadIndex: input.payloadIndex,
+          reviewedPayload: input.payload
+        },
+        rawPayload: input.rawPayload
+      });
+      return { reserved: true as const, entry, blockers: [] as string[] };
+    });
+  } catch (error) {
+    let existing: PaperExecutionLedgerEntry | null = null;
+    try {
+      existing = findPaperExecutionByClientOrderId(input.clientOrderId);
+    } catch {
+      // The reservation failure remains authoritative when the ledger is unavailable.
+    }
+    return {
+      reserved: false as const,
+      entry: existing,
+      blockers: ["SUBMIT_RESERVATION_FAILED"],
+      error: error instanceof Error ? error.message : "Paper reservation failed."
+    };
+  }
+};
+
 export const reservePaperExecutionAttempt = (input: {
   reviewId: string;
   clientOrderId: string;
