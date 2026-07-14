@@ -1,0 +1,12 @@
+[Unit]
+Description=Reconcile paper 0DTE Level 2 state every five minutes during market hours
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09..15:0/5:00
+Persistent=false
+RandomizedDelaySec=5
+AccuracySec=1s
+Unit=alpaca-zero-dte-reconcile.service
+
+[Install]
+WantedBy=timers.target

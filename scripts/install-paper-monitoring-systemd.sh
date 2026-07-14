@@ -20,6 +20,14 @@ units=(
   alpaca-paper-exit-review.timer
   alpaca-paper-exit-execute.service
   alpaca-paper-exit-execute.timer
+  alpaca-zero-dte-engine.service
+  alpaca-zero-dte-engine.timer
+  alpaca-zero-dte-exit-review.service
+  alpaca-zero-dte-exit-review.timer
+  alpaca-zero-dte-reconcile.service
+  alpaca-zero-dte-reconcile.timer
+  alpaca-zero-dte-eod.service
+  alpaca-zero-dte-eod.timer
 )
 
 if [[ ! -d "${REPO_DIR}" ]]; then
@@ -43,7 +51,10 @@ systemctl enable --now \
   alpaca-paper-review.timer \
   alpaca-paper-execute.timer \
   alpaca-paper-exit-review.timer \
-  alpaca-paper-exit-execute.timer
+  alpaca-paper-exit-execute.timer \
+  alpaca-zero-dte-engine.timer \
+  alpaca-zero-dte-exit-review.timer \
+  alpaca-zero-dte-reconcile.timer \
+  alpaca-zero-dte-eod.timer
 
 systemctl list-timers 'alpaca-paper-*' --no-pager
-
