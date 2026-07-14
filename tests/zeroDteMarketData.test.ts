@@ -152,6 +152,7 @@ test("normalizes contracts from canonical OCC identity and rejects conflicting m
     expiration_date: "2026-07-13",
     type: "call",
     strike_price: "600",
+    open_interest: "1000",
     tradable: true,
     requestId: "contract-request-1"
   });
@@ -163,6 +164,7 @@ test("normalizes contracts from canonical OCC identity and rejects conflicting m
     type: "call",
     strike: 600,
     tradable: true,
+    openInterest: 1_000,
     requestId: "contract-request-1"
   });
   assert.equal(
@@ -247,7 +249,7 @@ test("uses the explicit ET session date, stages underlying calls, and filters a 
   assert.equal(calls[0], "clock");
   assert.equal(calls[1], "stock:SPY");
   assert.ok(calls.slice(2, 5).every((call) => call.startsWith("bars:SPY:")));
-  assert.ok(calls[5]?.startsWith("contracts:SPY:2026-07-13:"));
+  assert.equal(calls[5], "contracts:SPY:2026-07-13:1000");
   assert.ok(calls[6]?.startsWith("options:"));
   assert.ok(!calls[6]?.includes("SPY260713C00620000"));
   assert.equal(contexts.length, 4);
@@ -264,6 +266,37 @@ test("uses the explicit ET session date, stages underlying calls, and filters a 
   assert.ok(contexts.every((context) => context.option.spreadPct !== null));
   assert.deepEqual(contexts[0]?.requestIds.bars, ["bar-request-1"]);
   assert.deepEqual(contexts[0]?.requestIds.contracts, ["contract-request-1"]);
+});
+
+test("uses contract open interest when the option snapshot omits it", async () => {
+  const contexts = await collectZeroDteMarketContexts({
+    now: sessionNow,
+    config,
+    provider: makeProvider({
+      contracts: [{
+        symbol: "SPY260713C00600000",
+        underlying: "SPY",
+        expirationDate: "2026-07-13",
+        type: "call",
+        strike: 600,
+        tradable: true,
+        openInterest: 1_000
+      }],
+      snapshots: {
+        SPY260713C00600000: {
+          latestQuote: {
+            bidPrice: 1,
+            askPrice: 1.1,
+            timestamp: "2026-07-13T13:59:56.000Z"
+          },
+          volume: 500
+        }
+      }
+    })
+  });
+
+  assert.equal(contexts.length, 1);
+  assert.equal(contexts[0]?.option.openInterest, 1_000);
 });
 
 test("filters otherwise liquid valid quotes outside the configured spread and premium caps", async () => {

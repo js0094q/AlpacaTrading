@@ -162,6 +162,38 @@ test("stock snapshot provider accepts Alpaca top-level symbol maps", async () =>
   );
 });
 
+test("option snapshot provider reads session volume from the daily bar", async () => {
+  await withMockedResponses(
+    [
+      {
+        body: {
+          snapshots: {
+            SPY260713C00600000: {
+              latestQuote: {
+                bp: 1,
+                ap: 1.1,
+                t: "2026-07-13T13:59:56.000Z"
+              },
+              dailyBar: { v: 321 },
+              greeks: { delta: 0.51, gamma: 0.03 }
+            }
+          }
+        },
+        requestId: "option-snapshot-request-1"
+      }
+    ],
+    async () => {
+      const provider = createAlpacaZeroDteMarketDataProvider();
+      const snapshots = await provider.getOptionSnapshots(["SPY260713C00600000"]);
+
+      assert.equal(snapshots.SPY260713C00600000?.volume, 321);
+      assert.equal(snapshots.SPY260713C00600000?.delta, 0.51);
+      assert.equal(snapshots.SPY260713C00600000?.gamma, 0.03);
+      assert.equal(snapshots.SPY260713C00600000?.requestId, "option-snapshot-request-1");
+    }
+  );
+});
+
 test("contract pagination stops at the requested limit and keeps page request IDs", async () => {
   await withMockedResponses(
     [

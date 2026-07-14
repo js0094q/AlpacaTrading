@@ -419,7 +419,7 @@ Each 0DTE monitor task has a dedicated lock (`/tmp/alpaca-zero-dte-engine.lock`,
 
 ## 0DTE Level 2 Engine
 
-The 0DTE Level 2 engine is an independent paper-only workflow. It obtains its own underlying and same-day option market data, maintains a ranked candidate queue, evaluates separate playbooks, records shadow alternatives, and feeds the dedicated dashboard panel. Its batched snapshot adapter accepts both Alpaca's wrapped snapshot payloads and the top-level symbol map returned by the stock snapshot endpoint, and its intraday stock-bar requests explicitly use Alpaca's paper-compatible `iex` feed. It does not require the Market Observatory cycle to complete first.
+The 0DTE Level 2 engine is an independent paper-only workflow. It obtains its own underlying and same-day option market data, maintains a ranked candidate queue, evaluates separate playbooks, records shadow alternatives, and feeds the dedicated dashboard panel. Its batched snapshot adapter accepts both Alpaca's wrapped snapshot payloads and the top-level symbol map returned by the stock snapshot endpoint, and its intraday stock-bar requests explicitly use Alpaca's paper-compatible `iex` feed. Contract discovery reads a bounded same-day chain before selecting the configured nearest strikes; session volume comes from the option snapshot daily bar and open interest from the contract record when the snapshot omits it. It does not require the Market Observatory cycle to complete first.
 
 Run the engine and lifecycle workers directly from the CLI:
 
