@@ -1,7 +1,7 @@
 import { nowIso, dedupeSymbols, normalizeSymbol } from "../lib/utils.js";
 import { queryAll, queryOne, getDb } from "../lib/db.js";
 import { seedUniverse } from "../config/universe.seed.js";
-import type { UniverseSymbolRow } from "../types.js";
+import type { UniverseLifecycleState, UniverseSymbolRow } from "../types.js";
 import * as alpacaProvider from "./providers/alpaca.js";
 import {
   getAlpacaAsset,
@@ -27,7 +27,12 @@ const universeSelect = `
   options_enabled,
   asset_attributes_json,
   asset_validated_at,
-  asset_request_id
+  asset_request_id,
+  lifecycle_state,
+  lifecycle_reason_code,
+  lifecycle_entered_at,
+  lifecycle_updated_at,
+  lifecycle_config_version
 `;
 
 const nullableFlag = (value: unknown): 0 | 1 | null =>
@@ -45,6 +50,21 @@ const parseAttributes = (value: unknown): string[] => {
   } catch {
     return [];
   }
+};
+
+const lifecycleStates: UniverseLifecycleState[] = [
+  "discovered",
+  "observe_only",
+  "research_eligible",
+  "paper_eligible",
+  "paper_active",
+  "suspended",
+  "retired"
+];
+
+const parseLifecycleState = (value: unknown): UniverseLifecycleState => {
+  const candidate = String(value ?? "research_eligible") as UniverseLifecycleState;
+  return lifecycleStates.includes(candidate) ? candidate : "research_eligible";
 };
 
 const parseUniverseRow = (row: Record<string, unknown>): UniverseSymbolRow => ({
@@ -70,7 +90,19 @@ const parseUniverseRow = (row: Record<string, unknown>): UniverseSymbolRow => ({
     : String(row.asset_validated_at),
   assetRequestId: row.asset_request_id === null || row.asset_request_id === undefined
     ? null
-    : String(row.asset_request_id)
+    : String(row.asset_request_id),
+  lifecycleState: parseLifecycleState(row.lifecycle_state),
+  lifecycleReasonCode: String(row.lifecycle_reason_code ?? "LEGACY_SEED"),
+  lifecycleEnteredAt: row.lifecycle_entered_at === null || row.lifecycle_entered_at === undefined
+    ? null
+    : String(row.lifecycle_entered_at),
+  lifecycleUpdatedAt: row.lifecycle_updated_at === null || row.lifecycle_updated_at === undefined
+    ? null
+    : String(row.lifecycle_updated_at),
+  lifecycleConfigVersion:
+    row.lifecycle_config_version === null || row.lifecycle_config_version === undefined
+      ? null
+      : String(row.lifecycle_config_version)
 });
 
 export const getAllUniverse = (): UniverseSymbolRow[] =>
@@ -78,13 +110,38 @@ export const getAllUniverse = (): UniverseSymbolRow[] =>
     `SELECT ${universeSelect} FROM universe_symbols ORDER BY symbol ASC`
   ).map(parseUniverseRow);
 
+const activeLifecycleStates = "'research_eligible', 'paper_eligible', 'paper_active'";
+const observableLifecycleStates =
+  "'observe_only', 'research_eligible', 'paper_eligible', 'paper_active'";
+const activeAssetClause = "tradable = 1 AND (asset_status IS NULL OR asset_status = 'active')";
+
 export const getActiveUniverse = (): UniverseSymbolRow[] =>
   queryAll<Record<string, unknown>>(
-    `SELECT ${universeSelect} FROM universe_symbols WHERE enabled = 1 AND tradable = 1 ORDER BY symbol ASC`
+    "SELECT " +
+      universeSelect +
+      " FROM universe_symbols WHERE enabled = 1 AND " +
+      activeAssetClause +
+      " AND lifecycle_state IN (" +
+      activeLifecycleStates +
+      ") ORDER BY symbol ASC"
   ).map(parseUniverseRow);
 
 export const getActiveSymbols = (): string[] =>
   getActiveUniverse().map((row) => row.symbol);
+
+export const getObservableUniverse = (): UniverseSymbolRow[] =>
+  queryAll<Record<string, unknown>>(
+    "SELECT " +
+      universeSelect +
+      " FROM universe_symbols WHERE " +
+      activeAssetClause +
+      " AND lifecycle_state IN (" +
+      observableLifecycleStates +
+      ") ORDER BY symbol ASC"
+  ).map(parseUniverseRow);
+
+export const getObservableSymbols = (): string[] =>
+  getObservableUniverse().map((row) => row.symbol);
 
 export const addTicker = async (symbol: string, assetClass = "stock", source = "manual_seed_2026_07_02") => {
   const normalized = normalizeSymbol(symbol);
@@ -241,7 +298,7 @@ export const refreshUniverseAssetMetadata = async (input: {
           WHERE symbol = ?
         `)
         .run(
-          active ? 1 : 0,
+          active && existing.enabled === 1 ? 1 : 0,
           asset.tradable === true ? 1 : 0,
           asset.id ?? null,
           status,

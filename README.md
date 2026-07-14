@@ -933,6 +933,8 @@ The bounded beta cache is compatible only when symbol, benchmark, lookback, inte
 Local/VPS persistence uses `data/research.db` by default with the following collections/tables:
 
 - universe_symbols
+- universe_lifecycle_runs
+- universe_lifecycle_events
 - market_bars
 - option_contracts
 - option_snapshots
@@ -971,6 +973,25 @@ On Vercel, API request logging does not write to local SQLite. Historical dashbo
 - Any future live execution path must add explicit opt-in gates.
 - Default provider behavior remains paper-only; do not add live-order code in this phase.
 - Hedge execution remains paper-only and single-leg; keep `HEDGE_LIVE_EXECUTION_ENABLED=false` and `MULTI_LEG_HEDGE_EXECUTION_ENABLED=false`.
+
+## Autonomous Universe Lifecycle Service
+
+`npm run universe:lifecycle` is a daily, read-only-Alpaca discovery and governance
+worker. It moves bounded U.S. equities through
+`discovered`, `observe_only`, `research_eligible`, `paper_eligible`,
+`paper_active`, `suspended`, and `retired`, recording every transition with
+reason code, evidence, timestamp, Git SHA, and configuration version.
+
+The worker does not submit, modify, or cancel broker orders. `observe_only`
+symbols feed the existing 15-minute observatory collector; only
+`research_eligible`, `paper_eligible`, and `paper_active` symbols are supplied
+to the active research universe. Existing review and execution gates remain
+authoritative.
+
+Use `npm run universe:lifecycle:status` for a read-only status summary. On the
+VPS, `alpaca-universe-lifecycle.timer` runs on weekdays at 16:30 America/New_York
+with `Persistent=false`; a missed run waits for the next scheduled window rather
+than replaying an unbounded backlog.
 
 ## Resume commands
 

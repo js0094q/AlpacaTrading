@@ -1,5 +1,22 @@
 # Resume Context: Alpaca Trading Research Infra
 
+## Autonomous universe lifecycle implementation checkpoint (2026-07-14, not deployed)
+
+- Branch `feat/autonomous-universe-lifecycle` adds the first incomplete
+  autonomous subsystem: daily bounded Alpaca-asset discovery and lifecycle
+  governance for `discovered -> observe_only -> research_eligible ->
+  paper_eligible -> paper_active -> suspended -> retired`.
+- The service is intentionally non-broker-mutating. It uses read-only asset
+  inventory and local evidence only; existing review, execution, reconciliation,
+  monitoring, exit, and learning gates remain unchanged.
+- `observe_only` symbols are included in the existing 15-minute observatory
+  collector. Research consumes only lifecycle-eligible active symbols.
+- The change adds SQLite run/event provenance, `universe:lifecycle` and
+  `universe:lifecycle:status` commands, and a bounded 16:30 ET
+  `alpaca-universe-lifecycle.timer`. The service should be installed only after
+  the feature branch is validated, merged, and deployed; a missed run is not
+  replayed automatically.
+
 ## 0DTE operational acceptance follow-up (2026-07-14)
 
 - A naturally qualified SPY Level 2 entry exposed a stale terminal-ledger reuse defect: the paper broker accepted and filled the new client order, but the local trade pointed at an older same-contract ledger row with different candidate/client identity. Entry execution now creates a fresh immutable ledger row for different candidate/client identity while preserving exact same-attempt reuse before broker submission. Read-only reconciliation may relink the affected trade only from exact paper-broker order/client/symbol/buy-to-open/limit/day/quantity/price evidence; the old row is preserved and the relink plus fill persistence are atomic.

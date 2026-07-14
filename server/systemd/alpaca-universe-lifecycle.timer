@@ -1,0 +1,12 @@
+[Unit]
+Description=Run bounded Alpaca autonomous universe lifecycle after market close
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 16:30:00
+Persistent=false
+RandomizedDelaySec=30
+AccuracySec=1s
+Unit=alpaca-universe-lifecycle.service
+
+[Install]
+WantedBy=timers.target

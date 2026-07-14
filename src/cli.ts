@@ -1,7 +1,18 @@
 import { config as loadDotenv } from "dotenv";
 loadDotenv();
 loadDotenv({ path: ".env.txt", override: false });
-import { addTicker, getActiveUniverse, getAllUniverse, removeTicker, setTickerEnabled, seedInitialUniverse } from "./services/universeService.js";
+import {
+  addTicker,
+  getActiveUniverse,
+  getAllUniverse,
+  removeTicker,
+  setTickerEnabled,
+  seedInitialUniverse
+} from "./services/universeService.js";
+import {
+  getUniverseLifecycleStatus,
+  runAutonomousUniverseLifecycle
+} from "./services/universeLifecycleService.js";
 import { ingestBars } from "./services/marketDataIngest.js";
 import { runStockObservation } from "./services/stockObservationService.js";
 import { ingestOptionContracts, ingestOptionSnapshots } from "./services/optionsService.js";
@@ -305,6 +316,14 @@ const run = async () => {
     }
     if (action === "get") {
       print({ universe: getAllUniverse() });
+      return;
+    }
+    if (action === "lifecycle") {
+      print(await runAutonomousUniverseLifecycle());
+      return;
+    }
+    if (action === "lifecycle-status") {
+      print(getUniverseLifecycleStatus());
       return;
     }
     if (action === "add") {

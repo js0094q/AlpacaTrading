@@ -99,6 +99,12 @@ The monitor runner fails closed unless the runtime env remains paper-only and li
 engine additionally requires `ZERO_DTE_ENGINE_ENABLED=true` and `ZERO_DTE_PAPER_EXECUTION_ENABLED=true`;
 its exit-review, reconciliation, and end-of-day services set `AUTOMATED_PAPER_EXECUTION_ENABLED=false`.
 
+`alpaca-universe-lifecycle.timer` is installed by the same monitoring installer.
+It runs a bounded, non-broker-mutating discovery and lifecycle pass at 16:30 ET
+on weekdays, after the intraday timer windows. The service has no execution
+command or `--confirmPaper` path. `Persistent=false` intentionally skips missed
+runs and resumes at the next daily window instead of replaying work after reboot.
+
 ## Service operating guidance
 
 - Run as `alpaca`.

@@ -3,7 +3,8 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import {
   getResearchDbPath,
-  initializeDatabaseHandle
+  initializeDatabaseHandle,
+  UNIVERSE_LIFECYCLE_MIGRATION_VERSION
 } from "../lib/db.js";
 
 export const PHASE_1B_MIGRATION_VERSION =
@@ -18,7 +19,9 @@ const requiredTables = [
   "paper_position_observations",
   "paper_position_observation_links",
   "paper_position_outcomes",
-  "paper_position_outcome_revisions"
+  "paper_position_outcome_revisions",
+  "universe_lifecycle_runs",
+  "universe_lifecycle_events"
 ] as const;
 
 const requiredColumns: Record<string, string[]> = {
@@ -50,6 +53,13 @@ const requiredColumns: Record<string, string[]> = {
     "decision_id",
     "position_lifecycle_id",
     "decision_linkage_status"
+  ],
+  universe_symbols: [
+    "lifecycle_state",
+    "lifecycle_reason_code",
+    "lifecycle_entered_at",
+    "lifecycle_updated_at",
+    "lifecycle_config_version"
   ]
 };
 
@@ -65,7 +75,10 @@ const requiredIndexes = [
   "idx_paper_learning_outcome_id",
   "idx_decision_snapshots_symbol_created",
   "idx_paper_positions_symbol_status",
-  "idx_paper_position_observations_symbol_time"
+  "idx_paper_position_observations_symbol_time",
+  "idx_universe_lifecycle_runs_completed",
+  "idx_universe_lifecycle_events_symbol_occurred",
+  "idx_universe_lifecycle_events_run"
 ] as const;
 
 const objectExists = (db: DbHandle, type: "table" | "index", name: string) =>
@@ -80,6 +93,7 @@ export interface DatabaseSchemaVerification {
   ok: boolean;
   integrity: string;
   migrationApplied: boolean;
+  universeLifecycleMigrationApplied: boolean;
   missingTables: string[];
   missingColumns: string[];
   missingIndexes: string[];
@@ -122,17 +136,30 @@ export const verifyDatabaseSchema = (input: {
           .get(PHASE_1B_MIGRATION_VERSION)
       )
     : false;
+  const universeLifecycleMigrationApplied = objectExists(
+    input.db,
+    "table",
+    "schema_migrations"
+  )
+    ? Boolean(
+        input.db
+          .prepare("SELECT 1 FROM schema_migrations WHERE version = ?")
+          .get(UNIVERSE_LIFECYCLE_MIGRATION_VERSION)
+      )
+    : false;
   const integrity = integrityRow?.integrity_check ?? "unavailable";
   return {
     databasePath: input.databasePath,
     ok:
       integrity === "ok" &&
       migrationApplied &&
+      universeLifecycleMigrationApplied &&
       missingTables.length === 0 &&
       missingColumns.length === 0 &&
       missingIndexes.length === 0,
     integrity,
     migrationApplied,
+    universeLifecycleMigrationApplied,
     missingTables: [...missingTables],
     missingColumns,
     missingIndexes: [...missingIndexes]

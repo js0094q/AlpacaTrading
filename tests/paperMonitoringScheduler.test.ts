@@ -93,6 +93,30 @@ describe("paper monitoring scheduler", () => {
     }
   });
 
+  test("universe lifecycle is a bounded daily non-mutating worker", () => {
+    const service = readFileSync(
+      join(repoRoot, "server/systemd/alpaca-universe-lifecycle.service"),
+      "utf8"
+    );
+    const timer = readFileSync(
+      join(repoRoot, "server/systemd/alpaca-universe-lifecycle.timer"),
+      "utf8"
+    );
+
+    assert.match(service, /User=alpaca/);
+    assert.match(
+      service,
+      /EnvironmentFile=\/opt\/alpaca-investing\/secrets\/alpaca\.env/
+    );
+    assert.match(service, /AUTOMATED_PAPER_EXECUTION_ENABLED=false/);
+    assert.match(service, /npm run universe:lifecycle/);
+    assert.match(service, /After=network-online\.target/);
+    assert.doesNotMatch(service, /paper:monitor|paper:execute|confirmPaper|orders/i);
+    assert.match(timer, /OnCalendar=Mon\.\.Fri \*-\*-\* 16:30:00/);
+    assert.match(timer, /Persistent=false/);
+    assert.match(timer, /Unit=alpaca-universe-lifecycle\.service/);
+  });
+
   test("oneshot monitor services remove their own transient lock after forced stop", () => {
     for (const [unit, lockFile] of Object.entries(monitorServiceLocks)) {
       const body = readFileSync(join(repoRoot, "server/systemd", unit), "utf8");
@@ -255,6 +279,10 @@ describe("paper monitoring scheduler", () => {
     assert.match(
       readTimer("alpaca-zero-dte-reconcile.timer"),
       /OnCalendar=Mon\.\.Fri \*-\*-\* 09\.\.15:1\/5:30/
+    );
+    assert.match(
+      readTimer("alpaca-universe-lifecycle.timer"),
+      /OnCalendar=Mon\.\.Fri \*-\*-\* 16:30:00/
     );
   });
 
