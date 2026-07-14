@@ -11,6 +11,7 @@ import { closeDbForTests, getDb } from "../src/lib/db.js";
 import {
   buildZeroDteSummary,
   createZeroDteEngineMutationProvider,
+  isActionableZeroDteCandidate,
   runZeroDteEodSummary,
   runZeroDteEngine,
   runZeroDteReconciliation,
@@ -138,4 +139,17 @@ test("engine mutation fallback evaluates quote age against the execution clock",
 
   assert.equal(fallback.now?.(), executionTime);
   assert.equal(override.now?.(), now);
+});
+
+test("engine selection rejects eligible candidates with execution blockers", () => {
+  assert.equal(isActionableZeroDteCandidate({
+    state: "eligible",
+    eligible: true,
+    executable: false
+  }), false);
+  assert.equal(isActionableZeroDteCandidate({
+    state: "eligible",
+    eligible: true,
+    executable: true
+  }), true);
 });

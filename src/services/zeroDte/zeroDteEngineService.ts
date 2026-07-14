@@ -971,6 +971,13 @@ export const createZeroDteEngineMutationProvider = (
   now: provider?.now ?? executionClock
 });
 
+export const isActionableZeroDteCandidate = (
+  candidate: Pick<ZeroDteQueueCandidate, "state" | "eligible" | "executable">
+) =>
+  candidate.state === "eligible" &&
+  candidate.eligible === true &&
+  candidate.executable === true;
+
 export const runZeroDteEngine = async (input: {
   now?: string;
   dryRun?: boolean;
@@ -1118,7 +1125,7 @@ export const runZeroDteEngine = async (input: {
       queue: rankedQueue
     };
   });
-  const actionable = queue.filter((candidate) => candidate.state === "eligible" && candidate.eligible);
+  const actionable = queue.filter(isActionableZeroDteCandidate);
   const selected = actionable.slice(0, config.executionTopN);
   const displaced = actionable.slice(config.executionTopN);
   const decisionGroupId = decisionGroupIdFor(runId);
