@@ -10,6 +10,7 @@ process.env.RESEARCH_DB_PATH = researchDbPath;
 
 import { closeDbForTests, getDb } from "../src/lib/db.js";
 import {
+  buildZeroDteDashboardSummary,
   buildZeroDteSummary,
   createZeroDteEngineMutationProvider,
   isActionableZeroDteCandidate,
@@ -20,6 +21,8 @@ import {
 } from "../src/services/zeroDte/zeroDteEngineService.js";
 import type { ZeroDteMarketContext } from "../src/services/zeroDte/zeroDteMarketDataService.js";
 import type { ZeroDtePaperMutationProvider } from "../src/services/zeroDte/zeroDteExecutionService.js";
+import { loadZeroDteConfig } from "../src/services/zeroDte/zeroDteConfigService.js";
+import { insertZeroDteDecision } from "../src/services/zeroDte/zeroDteLifecycleService.js";
 
 const now = "2026-07-13T14:30:00.000Z";
 const optionSymbol = "SPY260713C00500000";
@@ -122,8 +125,107 @@ test("reconciliation and eod remain bounded when no broker mutation is requested
   const eod = await runZeroDteEodSummary({ now, provider: provider() });
   assert.equal(reconciliation.paperOnly, true);
   assert.equal(reconciliation.mutationAttempted, false);
+  assert.equal(reconciliation.paperOrders.checked, 0);
   assert.equal(eod.paperOnly, true);
   assert.equal(eod.tradingDate, "2026-07-13");
+});
+
+test("accepted but unfilled entries are not marked as paper positions", async () => {
+  const config = loadZeroDteConfig();
+  const runId = "engine-unfilled-mark-run";
+  const candidateId = "engine-unfilled-mark-candidate";
+  const decisionId = "engine-unfilled-mark-decision";
+  const paperTradeId = "engine-unfilled-mark-trade";
+  const markOptionSymbol = "SPY260713C00501000";
+  const markProvider = provider();
+  markProvider.collectContexts = async () => [{
+    ...context(),
+    contract: { ...context().contract, symbol: markOptionSymbol, strike: 501 },
+    option: { ...context().option, symbol: markOptionSymbol }
+  }];
+  const db = getDb();
+  db.prepare(
+    `INSERT OR IGNORE INTO zero_dte_configuration_versions
+      (configuration_version_id, strategy_version, configuration_hash,
+       configuration_json, created_at)
+     VALUES (?, ?, ?, '{}', ?)`
+  ).run(config.configurationVersionId, config.strategyVersion, config.configurationVersionId, now);
+  db.prepare(
+    `INSERT INTO zero_dte_engine_runs
+      (run_id, trading_date, mode, account_mode, status, strategy_version,
+       configuration_version_id, started_at, created_at)
+     VALUES (?, '2026-07-13', 'test', 'paper', 'running', ?, ?, ?, ?)`
+  ).run(runId, config.strategyVersion, config.configurationVersionId, now, now);
+  db.prepare(
+    `INSERT INTO zero_dte_candidates
+      (candidate_id, trading_date, underlying_symbol, option_symbol, playbook,
+       direction, expiration_date, strike, state, score, quote_bid, quote_ask,
+       quote_midpoint, premium, spread_pct, volume, open_interest,
+       market_timestamp, first_seen_at, last_seen_at, state_changed_at,
+       created_at, updated_at)
+     VALUES (?, '2026-07-13', 'SPY', ?, 'trend_continuation', 'bullish',
+             '2026-07-13', 501, 'selected', 86, 1.2, 1.3, 1.25, 1.25,
+             8, 500, 900, ?, ?, ?, ?, ?, ?)`
+  ).run(candidateId, markOptionSymbol, now, now, now, now, now, now);
+  insertZeroDteDecision({
+    decisionId,
+    decisionGroupId: "engine-unfilled-mark-group",
+    engineRunId: runId,
+    candidateId,
+    tradingDate: "2026-07-13",
+    action: "select",
+    accountMode: "paper",
+    strategyVersion: config.strategyVersion,
+    configurationVersionId: config.configurationVersionId,
+    marketTimestamp: now,
+    decidedAt: now,
+    score: 86,
+    scoreThreshold: 70,
+    reasonCodes: ["QUALIFIED"]
+  });
+  db.prepare(
+    `INSERT INTO zero_dte_paper_trades
+      (paper_trade_id, decision_id, candidate_id, trading_date,
+       underlying_symbol, option_symbol, playbook, direction, status,
+       quantity, entry_premium, fees, slippage, requested_at, submitted_at,
+       created_at, updated_at)
+     VALUES (?, ?, ?, '2026-07-13', 'SPY', ?, 'trend_continuation',
+             'bullish', 'submitted', 1, 1.25, 0, 0, ?, ?, ?, ?)`
+  ).run(paperTradeId, decisionId, candidateId, markOptionSymbol, now, now, now, now);
+
+  const unfilled = await runZeroDteReconciliation({ now, provider: markProvider });
+  assert.deepEqual(unfilled.paperMarks, { paperOnly: true, marked: 0, blocked: 0 });
+  assert.equal(
+    (db.prepare("SELECT COUNT(*) AS count FROM zero_dte_position_marks WHERE paper_trade_id = ?").get(paperTradeId) as { count: number }).count,
+    0
+  );
+  assert.equal(
+    buildZeroDteDashboardSummary({ tradingDate: "2026-07-13" }).paperPositions
+      .some((position) => position.paperTradeId === paperTradeId),
+    false
+  );
+
+  const partiallyFilledAt = "2026-07-13T14:30:30.000Z";
+  db.prepare(
+    `UPDATE zero_dte_paper_trades
+     SET status = 'partially_filled', quantity = 1, entry_premium = 1.21,
+         filled_at = ?, updated_at = ?
+     WHERE paper_trade_id = ?`
+  ).run(partiallyFilledAt, partiallyFilledAt, paperTradeId);
+  const filledEvidence = await runZeroDteReconciliation({
+    now: "2026-07-13T14:31:00.000Z",
+    provider: markProvider
+  });
+  assert.equal(filledEvidence.paperMarks.marked, 1);
+  assert.equal(
+    (db.prepare("SELECT COUNT(*) AS count FROM zero_dte_position_marks WHERE paper_trade_id = ?").get(paperTradeId) as { count: number }).count,
+    1
+  );
+  assert.equal(
+    buildZeroDteDashboardSummary({ tradingDate: "2026-07-13" }).paperPositions
+      .some((position) => position.paperTradeId === paperTradeId),
+    true
+  );
 });
 
 test("engine mutation fallback preserves prototype provider methods and execution clock", async () => {

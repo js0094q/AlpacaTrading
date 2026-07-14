@@ -1,7 +1,9 @@
 import { canonicalJsonHash } from "../../lib/canonicalJson.js";
 import { getDb } from "../../lib/db.js";
+import { redactSensitiveText } from "../../lib/securityRedaction.js";
 import {
   getAccount,
+  getPaperOrder,
   listPaperPositions,
   listRecentPaperOrders,
   submitPaperOrder,
@@ -33,7 +35,10 @@ import type {
   ZeroDteConfig,
   ZeroDteRuntimeSnapshot
 } from "./zeroDteTypes.js";
-import type { ZeroDteQueueCandidate } from "./zeroDtePersistenceService.js";
+import {
+  runInZeroDtePersistenceTransaction,
+  type ZeroDteQueueCandidate
+} from "./zeroDtePersistenceService.js";
 
 export type {
   ZeroDteAccountSnapshot,
@@ -75,7 +80,20 @@ export interface ZeroDtePaperMutationProvider {
   getAccount?: typeof getAccount;
   listPositions?: typeof listPaperPositions;
   listOrders?: typeof listRecentPaperOrders;
+  getOrder?: typeof getPaperOrder;
   submitPaperOrder?: typeof submitPaperOrder;
+}
+
+export interface ZeroDteOrderReconciliationResult {
+  paperOnly: true;
+  checked: number;
+  updated: number;
+  filled: number;
+  partial: number;
+  terminal: number;
+  partialTerminal: number;
+  linkageUpdated: number;
+  errors: Array<{ code: string; message: string; paperTradeId?: string }>;
 }
 
 export type ZeroDteExecutionStatus =
@@ -485,6 +503,558 @@ const appendPaperLifecycleEvent = (input: {
   });
 };
 
+const ensureZeroDteLedgerDecisionLink = (input: {
+  ledgerId: number;
+  decisionId: string;
+  now: string;
+}) => {
+  const db = getDb();
+  const current = db.prepare(
+    `SELECT decision_id, decision_linkage_status
+     FROM paper_execution_ledger
+     WHERE id = ?`
+  ).get(input.ledgerId) as {
+    decision_id: string | null;
+    decision_linkage_status: string;
+  } | undefined;
+  if (!current) throw new Error("ZERO_DTE_LEDGER_NOT_FOUND");
+  if (current.decision_id && current.decision_id !== input.decisionId) {
+    throw new Error("ZERO_DTE_LEDGER_DECISION_MISMATCH");
+  }
+  if (current.decision_id === input.decisionId && current.decision_linkage_status === "EXACT") {
+    return false;
+  }
+  db.prepare(
+    `UPDATE paper_execution_ledger
+     SET decision_id = ?, decision_linkage_status = 'EXACT', updated_at = ?
+     WHERE id = ?`
+  ).run(input.decisionId, input.now, input.ledgerId);
+  return true;
+};
+
+interface ZeroDtePaperOrderRow {
+  paper_trade_id: string;
+  decision_id: string;
+  status: string;
+  option_symbol: string;
+  client_order_id: string | null;
+  broker_order_id: string | null;
+  source_ledger_id: number;
+  ledger_id: number | null;
+  ledger_symbol: string | null;
+  ledger_quantity: string | null;
+  ledger_client_order_id: string | null;
+  ledger_broker_order_id: string | null;
+}
+
+type ZeroDteBrokerOrderKind = "pending" | "filled" | "partial" | "terminal";
+
+interface ZeroDteTerminalOrderState {
+  tradeStatus: string;
+  ledgerStatus: PaperExecutionLedgerStatus;
+  reasonCode: string;
+  eventType: "paper_order_rejected" | "paper_order_canceled";
+}
+
+interface ValidatedZeroDteBrokerOrderState {
+  kind: ZeroDteBrokerOrderKind;
+  brokerStatus: string;
+  requestedQuantity: number;
+  filledQuantity: number;
+  fillPrice: number | null;
+  filledAt: string | null;
+  terminal: ZeroDteTerminalOrderState | null;
+}
+
+const PENDING_BROKER_ORDER_STATUSES = new Set([
+  "new",
+  "accepted",
+  "pending_new",
+  "accepted_for_bidding",
+  "held",
+  "pending_cancel",
+  "pending_replace"
+]);
+
+const TERMINAL_BROKER_ORDER_STATUSES: Record<string, ZeroDteTerminalOrderState> = {
+  canceled: {
+    tradeStatus: "canceled",
+    ledgerStatus: "canceled",
+    reasonCode: "ORDER_CANCELED",
+    eventType: "paper_order_canceled"
+  },
+  cancelled: {
+    tradeStatus: "canceled",
+    ledgerStatus: "canceled",
+    reasonCode: "ORDER_CANCELED",
+    eventType: "paper_order_canceled"
+  },
+  expired: {
+    tradeStatus: "expired",
+    ledgerStatus: "expired",
+    reasonCode: "ORDER_EXPIRED",
+    eventType: "paper_order_canceled"
+  },
+  rejected: {
+    tradeStatus: "rejected",
+    ledgerStatus: "rejected",
+    reasonCode: "ORDER_REJECTED",
+    eventType: "paper_order_rejected"
+  },
+  replaced: {
+    tradeStatus: "replaced",
+    ledgerStatus: "canceled",
+    reasonCode: "ORDER_REPLACED",
+    eventType: "paper_order_canceled"
+  },
+  done_for_day: {
+    tradeStatus: "done_for_day",
+    ledgerStatus: "canceled",
+    reasonCode: "ORDER_DONE_FOR_DAY",
+    eventType: "paper_order_canceled"
+  },
+  stopped: {
+    tradeStatus: "stopped",
+    ledgerStatus: "canceled",
+    reasonCode: "ORDER_STOPPED",
+    eventType: "paper_order_canceled"
+  },
+  suspended: {
+    tradeStatus: "suspended",
+    ledgerStatus: "canceled",
+    reasonCode: "ORDER_SUSPENDED",
+    eventType: "paper_order_canceled"
+  },
+  calculated: {
+    tradeStatus: "calculated",
+    ledgerStatus: "canceled",
+    reasonCode: "ORDER_CALCULATED",
+    eventType: "paper_order_canceled"
+  }
+};
+
+const zeroDtePaperOrderRowForTrade = (paperTradeId: string) => getDb().prepare(
+  `SELECT t.paper_trade_id, t.decision_id, t.status, t.option_symbol,
+          t.client_order_id, t.broker_order_id, t.source_ledger_id,
+          l.id AS ledger_id, l.symbol AS ledger_symbol, l.qty AS ledger_quantity,
+          l.client_order_id AS ledger_client_order_id,
+          l.alpaca_order_id AS ledger_broker_order_id
+   FROM zero_dte_paper_trades AS t
+   LEFT JOIN paper_execution_ledger AS l ON l.id = t.source_ledger_id
+   WHERE t.paper_trade_id = ?`
+).get(paperTradeId) as ZeroDtePaperOrderRow | undefined;
+
+const exactBrokerFillTime = (value: unknown) => {
+  const timestamp = text(value);
+  if (timestamp === null || !Number.isFinite(Date.parse(timestamp))) {
+    throw new Error("BROKER_FILL_TIME_INVALID");
+  }
+  return new Date(timestamp).toISOString();
+};
+
+const validateZeroDteBrokerOrderState = (input: {
+  row: ZeroDtePaperOrderRow;
+  response: AlpacaApiResponse<AlpacaSubmittedOrder>;
+}): ValidatedZeroDteBrokerOrderState => {
+  const { row, response } = input;
+  if (row.ledger_id === null || row.ledger_id !== row.source_ledger_id) {
+    throw new Error("ZERO_DTE_LEDGER_NOT_FOUND");
+  }
+  const brokerOrderId = text(row.broker_order_id);
+  const responseOrderId = text(response.data?.id);
+  if (brokerOrderId === null || responseOrderId !== brokerOrderId) {
+    throw new Error("BROKER_ORDER_ID_MISMATCH");
+  }
+  const tradeClientOrderId = text(row.client_order_id);
+  const ledgerClientOrderId = text(row.ledger_client_order_id);
+  const responseClientOrderId = text(response.data?.client_order_id);
+  if (
+    tradeClientOrderId === null ||
+    ledgerClientOrderId === null ||
+    tradeClientOrderId !== ledgerClientOrderId ||
+    responseClientOrderId !== tradeClientOrderId
+  ) {
+    throw new Error("BROKER_CLIENT_ORDER_ID_MISMATCH");
+  }
+  const optionSymbol = normalizedSymbol(row.option_symbol);
+  if (
+    !optionSymbol ||
+    normalizedSymbol(row.ledger_symbol) !== optionSymbol ||
+    normalizedSymbol(response.data?.symbol) !== optionSymbol
+  ) {
+    throw new Error("BROKER_ORDER_SYMBOL_MISMATCH");
+  }
+  const ledgerBrokerOrderId = text(row.ledger_broker_order_id);
+  if (ledgerBrokerOrderId !== null && ledgerBrokerOrderId !== brokerOrderId) {
+    throw new Error("BROKER_LEDGER_ORDER_ID_MISMATCH");
+  }
+
+  const requestedQuantity = finite(row.ledger_quantity);
+  if (requestedQuantity === null || !Number.isInteger(requestedQuantity) || requestedQuantity <= 0) {
+    throw new Error("BROKER_REQUESTED_QUANTITY_INVALID");
+  }
+  if (response.data?.qty !== undefined && response.data.qty !== null && response.data.qty !== "") {
+    const responseQuantity = finite(response.data.qty);
+    if (
+      responseQuantity === null ||
+      !Number.isInteger(responseQuantity) ||
+      responseQuantity !== requestedQuantity
+    ) {
+      throw new Error("BROKER_ORDER_QUANTITY_MISMATCH");
+    }
+  }
+
+  const brokerStatus = normalizedStatus(response.data?.status);
+  if (!brokerStatus) throw new Error("BROKER_ORDER_STATUS_MISSING");
+  const rawFilledQuantity = response.data?.filled_qty;
+  const hasFilledQuantity = rawFilledQuantity !== undefined && rawFilledQuantity !== null && rawFilledQuantity !== "";
+  const parsedFilledQuantity = hasFilledQuantity ? finite(rawFilledQuantity) : 0;
+  if (
+    parsedFilledQuantity === null ||
+    !Number.isInteger(parsedFilledQuantity) ||
+    parsedFilledQuantity < 0 ||
+    parsedFilledQuantity > requestedQuantity
+  ) {
+    throw new Error("BROKER_FILLED_QUANTITY_INVALID");
+  }
+  const filledQuantity = parsedFilledQuantity;
+
+  let kind: ZeroDteBrokerOrderKind;
+  let terminal: ZeroDteTerminalOrderState | null = null;
+  if (brokerStatus === "filled") {
+    kind = "filled";
+    if (!hasFilledQuantity || filledQuantity !== requestedQuantity) {
+      throw new Error("BROKER_FILLED_QUANTITY_INCOMPLETE");
+    }
+  } else if (brokerStatus === "partially_filled" || brokerStatus === "partial") {
+    kind = "partial";
+    if (!hasFilledQuantity || filledQuantity <= 0 || filledQuantity >= requestedQuantity) {
+      throw new Error("BROKER_PARTIAL_QUANTITY_INVALID");
+    }
+  } else if (PENDING_BROKER_ORDER_STATUSES.has(brokerStatus)) {
+    kind = "pending";
+    if (filledQuantity !== 0) throw new Error("BROKER_PENDING_ORDER_HAS_FILL");
+  } else {
+    terminal = TERMINAL_BROKER_ORDER_STATUSES[brokerStatus] ?? null;
+    if (terminal === null) throw new Error("BROKER_ORDER_STATUS_UNSUPPORTED");
+    if (!hasFilledQuantity) throw new Error("BROKER_TERMINAL_FILLED_QUANTITY_MISSING");
+    kind = "terminal";
+  }
+
+  let fillPrice: number | null = null;
+  let filledAt: string | null = null;
+  if (filledQuantity > 0) {
+    fillPrice = positive(response.data?.filled_avg_price);
+    if (fillPrice === null) throw new Error("BROKER_FILL_PRICE_INVALID");
+    filledAt = exactBrokerFillTime(response.data?.filled_at);
+  }
+  return {
+    kind,
+    brokerStatus,
+    requestedQuantity,
+    filledQuantity,
+    fillPrice,
+    filledAt,
+    terminal
+  };
+};
+
+interface CurrentZeroDtePaperOrderState {
+  trade_status: string;
+  quantity: number;
+  filled_at: string | null;
+  ledger_status: string;
+}
+
+const TERMINAL_LOCAL_TRADE_STATUSES = new Set([
+  "canceled",
+  "expired",
+  "rejected",
+  "replaced",
+  "done_for_day",
+  "stopped",
+  "suspended",
+  "calculated",
+  "closed"
+]);
+
+const localBrokerStateStrength = (current: CurrentZeroDtePaperOrderState) => {
+  const tradeStatus = normalizedStatus(current.trade_status);
+  const ledgerStatus = normalizedStatus(current.ledger_status);
+  if (
+    ledgerStatus === "filled" ||
+    ["open", "exit_requested"].includes(tradeStatus)
+  ) return 3;
+  if (tradeStatus === "partially_filled" || ledgerStatus === "partial") return 1;
+  if (current.filled_at !== null) return 3;
+  if (
+    TERMINAL_LOCAL_TRADE_STATUSES.has(tradeStatus) ||
+    ["canceled", "expired", "rejected"].includes(ledgerStatus)
+  ) return 2;
+  return 0;
+};
+
+const brokerStateStrength = (state: ValidatedZeroDteBrokerOrderState) => {
+  if (state.kind === "filled") return 3;
+  if (state.kind === "terminal") return 2;
+  if (state.kind === "partial") return 1;
+  return 0;
+};
+
+const verifiedLocalFilledQuantity = (current: CurrentZeroDtePaperOrderState) => {
+  const tradeStatus = normalizedStatus(current.trade_status);
+  const ledgerStatus = normalizedStatus(current.ledger_status);
+  const hasVerifiedFill =
+    current.filled_at !== null ||
+    ["partially_filled", "open", "exit_requested"].includes(tradeStatus) ||
+    ["partial", "filled"].includes(ledgerStatus);
+  return hasVerifiedFill ? positive(current.quantity) ?? 0 : 0;
+};
+
+const shouldApplyBrokerState = (
+  current: CurrentZeroDtePaperOrderState,
+  state: ValidatedZeroDteBrokerOrderState
+) => {
+  const currentFilledQuantity = verifiedLocalFilledQuantity(current);
+  if (state.filledQuantity < currentFilledQuantity) return false;
+  const currentStrength = localBrokerStateStrength(current);
+  const incomingStrength = brokerStateStrength(state);
+  if (incomingStrength > currentStrength) return true;
+  if (incomingStrength < currentStrength) return false;
+  if (state.kind === "pending") return currentStrength === 0;
+  if (state.kind === "partial") {
+    return state.filledQuantity > currentFilledQuantity;
+  }
+  return false;
+};
+
+const applyZeroDteBrokerOrderState = (input: {
+  row: ZeroDtePaperOrderRow;
+  state: ValidatedZeroDteBrokerOrderState;
+  response: AlpacaApiResponse<AlpacaSubmittedOrder>;
+  now: string;
+}) => {
+  const { row, state, response, now } = input;
+  const brokerOrderId = text(row.broker_order_id);
+  if (brokerOrderId === null) throw new Error("BROKER_ORDER_ID_MISSING");
+  const decision = decisionRow(row.decision_id);
+  if (!decision) throw new Error("ZERO_DTE_RECONCILIATION_DECISION_NOT_FOUND");
+  const terminalWithFill = state.kind === "terminal" && state.filledQuantity > 0;
+  const ledgerStatus: PaperExecutionLedgerStatus = state.kind === "filled"
+    ? "filled"
+    : state.kind === "partial"
+      ? "partial"
+      : state.kind === "terminal"
+        ? state.terminal?.ledgerStatus ?? "failed"
+        : "submitted";
+  let linkageChanged = false;
+  let stateApplied = false;
+
+  runInZeroDtePersistenceTransaction(() => {
+    const current = getDb().prepare(
+      `SELECT t.status AS trade_status, t.quantity, t.filled_at,
+              l.status AS ledger_status
+       FROM zero_dte_paper_trades AS t
+       JOIN paper_execution_ledger AS l ON l.id = t.source_ledger_id
+       WHERE t.paper_trade_id = ? AND l.id = ?`
+    ).get(row.paper_trade_id, row.source_ledger_id) as CurrentZeroDtePaperOrderState | undefined;
+    if (!current) throw new Error("ZERO_DTE_CURRENT_ORDER_STATE_NOT_FOUND");
+    if (!shouldApplyBrokerState(current, state)) return;
+    stateApplied = true;
+    linkageChanged = ensureZeroDteLedgerDecisionLink({
+      ledgerId: row.source_ledger_id,
+      decisionId: row.decision_id,
+      now
+    });
+    updatePaperExecutionLedgerEntry(row.source_ledger_id, {
+      status: ledgerStatus,
+      alpacaOrderId: brokerOrderId,
+      alpacaStatus: state.brokerStatus,
+      requestId: response.requestId ?? null,
+      reason: state.terminal?.reasonCode ?? null,
+      blockedReason: state.terminal?.reasonCode ?? null,
+      rawResponse: response.data
+    });
+
+    if (state.kind === "pending") {
+      getDb().prepare(
+        `UPDATE zero_dte_paper_trades
+         SET status = 'submitted', broker_order_id = ?,
+             submitted_at = COALESCE(submitted_at, ?), updated_at = ?
+         WHERE paper_trade_id = ?`
+      ).run(brokerOrderId, now, now, row.paper_trade_id);
+    } else if (state.kind === "filled" || state.kind === "partial" || terminalWithFill) {
+      if (state.fillPrice === null || state.filledAt === null) {
+        throw new Error("BROKER_FILL_EVIDENCE_MISSING");
+      }
+      const tradeStatus = state.kind === "partial" ? "partially_filled" : "open";
+      getDb().prepare(
+        `UPDATE zero_dte_paper_trades
+         SET status = ?, broker_order_id = ?,
+             submitted_at = COALESCE(submitted_at, ?),
+             quantity = ?, entry_premium = ?, filled_at = ?,
+             terminal_state = NULL, exit_reason_code = NULL, updated_at = ?
+         WHERE paper_trade_id = ?`
+      ).run(
+        tradeStatus,
+        brokerOrderId,
+        now,
+        state.filledQuantity,
+        state.fillPrice,
+        state.filledAt,
+        now,
+        row.paper_trade_id
+      );
+    } else {
+      if (state.terminal === null) throw new Error("BROKER_TERMINAL_STATE_MISSING");
+      getDb().prepare(
+        `UPDATE zero_dte_paper_trades
+         SET status = ?, broker_order_id = ?,
+             submitted_at = COALESCE(submitted_at, ?),
+             terminal_state = ?, exit_reason_code = ?, updated_at = ?
+         WHERE paper_trade_id = ?`
+      ).run(
+        state.terminal.tradeStatus,
+        brokerOrderId,
+        now,
+        state.terminal.tradeStatus,
+        state.terminal.reasonCode,
+        now,
+        row.paper_trade_id
+      );
+    }
+
+    if (state.brokerStatus !== "rejected") {
+      appendPaperLifecycleEvent({
+        eventType: "paper_order_accepted",
+        decision,
+        paperTradeId: row.paper_trade_id,
+        occurredAt: now,
+        details: { brokerOrderId, brokerStatus: state.brokerStatus, requestId: response.requestId ?? null }
+      });
+    }
+    if (state.kind === "filled" || state.kind === "partial" || terminalWithFill) {
+      if (state.fillPrice === null || state.filledAt === null) {
+        throw new Error("BROKER_FILL_EVIDENCE_MISSING");
+      }
+      const fillEventType = state.kind === "filled" || state.filledQuantity === state.requestedQuantity
+        ? "paper_order_filled"
+        : "paper_order_partially_filled";
+      appendPaperLifecycleEvent({
+        eventType: fillEventType,
+        decision,
+        paperTradeId: row.paper_trade_id,
+        occurredAt: state.filledAt,
+        details: {
+          brokerOrderId,
+          brokerStatus: state.brokerStatus,
+          filledQuantity: state.filledQuantity,
+          filledAveragePrice: state.fillPrice,
+          requestId: response.requestId ?? null
+        }
+      });
+      appendPaperLifecycleEvent({
+        eventType: "position_opened",
+        decision,
+        paperTradeId: row.paper_trade_id,
+        occurredAt: state.filledAt,
+        details: {
+          brokerOrderId,
+          filledQuantity: state.filledQuantity,
+          filledAveragePrice: state.fillPrice
+        }
+      });
+    }
+    if (state.kind === "terminal" && state.terminal !== null) {
+      appendPaperLifecycleEvent({
+        eventType: state.terminal.eventType,
+        decision,
+        paperTradeId: row.paper_trade_id,
+        occurredAt: now,
+        reasonCode: state.terminal.reasonCode,
+        details: {
+          brokerOrderId,
+          brokerStatus: state.brokerStatus,
+          filledQuantity: state.filledQuantity,
+          requestId: response.requestId ?? null
+        }
+      });
+    }
+  });
+
+  return {
+    linkageChanged,
+    stateApplied,
+    updated: stateApplied && state.kind !== "pending",
+    terminalWithFill: stateApplied && terminalWithFill
+  };
+};
+
+export const reconcileZeroDtePaperOrders = async (input: {
+  now?: string;
+  provider?: ZeroDtePaperMutationProvider;
+} = {}): Promise<ZeroDteOrderReconciliationResult> => {
+  const now = new Date(input.now ?? nowIso()).toISOString();
+  const provider = input.provider ?? {};
+  const runtime = runtimeValue(provider.runtime);
+  const result: ZeroDteOrderReconciliationResult = {
+    paperOnly: true,
+    checked: 0,
+    updated: 0,
+    filled: 0,
+    partial: 0,
+    terminal: 0,
+    partialTerminal: 0,
+    linkageUpdated: 0,
+    errors: []
+  };
+  const rows = getDb().prepare(
+    `SELECT t.paper_trade_id, t.decision_id, t.status, t.option_symbol,
+            t.client_order_id, t.broker_order_id, t.source_ledger_id,
+            l.id AS ledger_id, l.symbol AS ledger_symbol, l.qty AS ledger_quantity,
+            l.client_order_id AS ledger_client_order_id,
+            l.alpaca_order_id AS ledger_broker_order_id
+     FROM zero_dte_paper_trades AS t
+     LEFT JOIN paper_execution_ledger AS l ON l.id = t.source_ledger_id
+     WHERE t.status IN ('intended', 'submitted', 'partially_filled')
+       AND t.broker_order_id IS NOT NULL
+       AND t.source_ledger_id IS NOT NULL
+     ORDER BY t.requested_at`
+  ).all() as unknown as ZeroDtePaperOrderRow[];
+  if (!rows.length) return result;
+  if (!runtime.paperOnly || runtime.environment !== "paper" || runtime.tradingMode !== "paper" || runtime.liveTradingEnabled) {
+    result.errors.push({
+      code: "ACCOUNT_NOT_PAPER",
+      message: "0DTE paper-order reconciliation is disabled outside the paper-only runtime."
+    });
+    return result;
+  }
+
+  const getOrder = provider.getOrder?.bind(provider) ?? getPaperOrder;
+  for (const row of rows) {
+    result.checked += 1;
+    try {
+      if (row.broker_order_id === null) throw new Error("BROKER_ORDER_ID_MISSING");
+      const response = await getOrder(row.broker_order_id);
+      const state = validateZeroDteBrokerOrderState({ row, response });
+      const applied = applyZeroDteBrokerOrderState({ row, state, response, now });
+      if (applied.linkageChanged) result.linkageUpdated += 1;
+      if (applied.updated) result.updated += 1;
+      if (applied.stateApplied && state.kind === "filled") result.filled += 1;
+      if (applied.stateApplied && state.kind === "partial") result.partial += 1;
+      if (applied.stateApplied && state.kind === "terminal") result.terminal += 1;
+      if (applied.terminalWithFill) result.partialTerminal += 1;
+    } catch (error) {
+      result.errors.push({
+        code: "PAPER_ORDER_RECONCILIATION_FAILED",
+        message: redactSensitiveText(error instanceof Error ? error.message : String(error)).slice(0, 500),
+        paperTradeId: row.paper_trade_id
+      });
+    }
+  }
+  return result;
+};
+
 const createBlockedLedgerEntry = (input: {
   candidate: ZeroDteQueueCandidate;
   eligibility: ZeroDteEligibilityResult;
@@ -752,6 +1322,11 @@ export const executeZeroDteCandidate = async (input: {
         }
       });
     }
+    ensureZeroDteLedgerDecisionLink({
+      ledgerId: ledger.id,
+      decisionId: input.decisionId,
+      now
+    });
   } catch {
     const duplicate = findPaperExecutionByDedupeKey(eligibility.reservationKey);
     return baseResult({
@@ -840,53 +1415,107 @@ export const executeZeroDteCandidate = async (input: {
   }
 
   const brokerOrderId = text(response.data?.id);
-  const brokerStatus = normalizedStatus(response.data?.status) || "submitted";
-  const executionStatus: ZeroDteExecutionStatus = brokerStatus === "filled"
-    ? "filled"
-    : brokerStatus === "partially_filled" || brokerStatus === "partial"
-      ? "partial"
-      : "submitted";
-  updatePaperExecutionLedgerEntry(ledger.id, {
-    status: executionStatus === "filled" ? "filled" : executionStatus === "partial" ? "partial" : "submitted",
-    alpacaOrderId: brokerOrderId,
-    alpacaStatus: brokerStatus,
-    requestId: response.requestId
-  });
+  const brokerStatus = normalizedStatus(response.data?.status);
   if (!brokerOrderId) {
-    updatePaperExecutionLedgerEntry(ledger.id, {
-      status: "failed",
-      reason: "ORDER_ID_MISSING",
-      blockedReason: "ORDER_ID_MISSING",
-      requestId: response.requestId
+    runInZeroDtePersistenceTransaction(() => {
+      updatePaperExecutionLedgerEntry(ledger.id, {
+        status: "failed",
+        reason: "ORDER_ID_MISSING",
+        blockedReason: "ORDER_ID_MISSING",
+        requestId: response.requestId,
+        alpacaStatus: brokerStatus || null,
+        rawResponse: response.data
+      });
+      db.prepare(
+        `UPDATE zero_dte_paper_trades
+         SET status = 'rejected', terminal_state = 'rejected',
+             exit_reason_code = 'ORDER_ID_MISSING', updated_at = ?
+         WHERE paper_trade_id = ?`
+      ).run(now, paperTradeId);
+      appendPaperLifecycleEvent({
+        eventType: "paper_order_rejected",
+        decision,
+        paperTradeId,
+        occurredAt: now,
+        reasonCode: "ORDER_ID_MISSING"
+      });
     });
-    appendPaperLifecycleEvent({ eventType: "paper_order_rejected", decision, paperTradeId, occurredAt: now, reasonCode: "ORDER_ID_MISSING" });
     return baseResult({ candidate: input.candidate, decisionId: input.decisionId, status: "failed", mutationAttempted: true, ledgerId: ledger.id, paperTradeId, requestId: response.requestId ?? null, blockers: ["ORDER_ID_MISSING"], payload, eligibility });
   }
 
-  db.prepare(
-    `UPDATE zero_dte_paper_trades
-     SET status = ?, broker_order_id = ?, submitted_at = ?,
-         filled_at = CASE WHEN ? IN ('filled', 'partially_filled', 'partial') THEN ? ELSE filled_at END,
-         updated_at = ?
-     WHERE paper_trade_id = ?`
-  ).run(executionStatus === "filled" ? "open" : executionStatus === "partial" ? "partially_filled" : "submitted", brokerOrderId, now, brokerStatus, now, now, paperTradeId);
-  recordCandidateExecutionState(input.candidate.candidateId, "executed", now);
-  appendPaperLifecycleEvent({ eventType: "paper_order_accepted", decision, paperTradeId, occurredAt: now, details: { brokerOrderId, brokerStatus, requestId: response.requestId ?? null } });
-  if (executionStatus === "partial") appendPaperLifecycleEvent({ eventType: "paper_order_partially_filled", decision, paperTradeId, occurredAt: now, details: { brokerOrderId } });
-  if (executionStatus === "filled") {
-    appendPaperLifecycleEvent({ eventType: "paper_order_filled", decision, paperTradeId, occurredAt: now, details: { brokerOrderId } });
-    appendPaperLifecycleEvent({ eventType: "position_opened", decision, paperTradeId, occurredAt: now, details: { brokerOrderId } });
-  }
-  return baseResult({
-    candidate: input.candidate,
-    decisionId: input.decisionId,
-    status: executionStatus,
-    mutationAttempted: true,
-    ledgerId: ledger.id,
-    paperTradeId,
-    brokerOrderId,
-    requestId: response.requestId ?? null,
-    payload,
-    eligibility
+  runInZeroDtePersistenceTransaction(() => {
+    db.prepare(
+      `UPDATE zero_dte_paper_trades
+       SET status = 'submitted', broker_order_id = ?,
+           submitted_at = COALESCE(submitted_at, ?), updated_at = ?
+       WHERE paper_trade_id = ?`
+    ).run(brokerOrderId, now, now, paperTradeId);
+    updatePaperExecutionLedgerEntry(ledger.id, {
+      status: "submitted",
+      alpacaOrderId: brokerOrderId,
+      alpacaStatus: brokerStatus || null,
+      requestId: response.requestId,
+      rawResponse: response.data
+    });
   });
+
+  const row = zeroDtePaperOrderRowForTrade(paperTradeId);
+  try {
+    if (!row) throw new Error("ZERO_DTE_PAPER_TRADE_NOT_FOUND");
+    const state = validateZeroDteBrokerOrderState({ row, response });
+    applyZeroDteBrokerOrderState({ row, state, response, now });
+    recordCandidateExecutionState(input.candidate.candidateId, "executed", now);
+    const executionStatus: ZeroDteExecutionStatus = state.kind === "filled"
+      ? "filled"
+      : state.kind === "partial" || (state.kind === "terminal" && state.filledQuantity > 0)
+        ? "partial"
+        : state.kind === "terminal"
+          ? "failed"
+          : "submitted";
+    return baseResult({
+      candidate: input.candidate,
+      decisionId: input.decisionId,
+      status: executionStatus,
+      mutationAttempted: true,
+      ledgerId: ledger.id,
+      paperTradeId,
+      brokerOrderId,
+      requestId: response.requestId ?? null,
+      blockers: state.kind === "terminal" && state.filledQuantity === 0
+        ? [state.terminal?.reasonCode ?? "BROKER_ORDER_TERMINAL"]
+        : [],
+      warnings: state.kind === "terminal" && state.filledQuantity > 0
+        ? [state.terminal?.reasonCode ?? "BROKER_ORDER_PARTIAL_TERMINAL"]
+        : [],
+      payload,
+      eligibility
+    });
+  } catch (error) {
+    const message = redactSensitiveText(error instanceof Error ? error.message : String(error)).slice(0, 500);
+    updatePaperExecutionLedgerEntry(ledger.id, {
+      status: "failed",
+      alpacaOrderId: brokerOrderId,
+      alpacaStatus: brokerStatus || null,
+      requestId: response.requestId,
+      reason: "BROKER_ORDER_EVIDENCE_INVALID",
+      blockedReason: "BROKER_ORDER_EVIDENCE_INVALID",
+      errorMessage: message,
+      rawResponse: response.data
+    });
+    recordCandidateExecutionState(input.candidate.candidateId, "executed", now);
+    return baseResult({
+      candidate: input.candidate,
+      decisionId: input.decisionId,
+      status: "failed",
+      mutationAttempted: true,
+      ledgerId: ledger.id,
+      paperTradeId,
+      brokerOrderId,
+      requestId: response.requestId ?? null,
+      blockers: ["BROKER_ORDER_EVIDENCE_INVALID"],
+      warnings: [message],
+      payload,
+      eligibility
+    });
+  }
 };

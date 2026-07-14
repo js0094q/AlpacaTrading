@@ -284,6 +284,8 @@ Add CLI entry points following existing repository conventions:
 - `zero-dte:eod` for the persisted daily learning summary;
 - `zero-dte:summary` for a sanitized queue/health read model.
 
+Immediate submission responses and reconciliation must use the same exact broker-order, client-order, option-symbol, quantity, average-price, and fill-time validation. Reconciliation must read non-terminal Level 2 paper orders back from the paper broker; persist filled, partially filled, and zero-fill or partial-fill terminal states from validated evidence; append the corresponding lifecycle events once; and backfill an exact decision link on the shared execution-ledger row. The transactional write must re-read current local state and enforce monotonic fill progress so a stale pending or lower-quantity partial response cannot regress a confirmed fill. Invalid or incomplete broker evidence must leave the order recoverable for a later exact reconciliation and must not fabricate fill values. Position marks and active paper-position read models must exclude intended or submitted orders until a partial or full fill is verified. Reconciliation must not submit, replace, or cancel an order.
+
 Add existing-pattern systemd services/timers for:
 
 - primary engine every 60 seconds during configured weekday/session windows;
