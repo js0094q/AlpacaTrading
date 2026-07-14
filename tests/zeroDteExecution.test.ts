@@ -119,20 +119,28 @@ const candidate = (): ZeroDteQueueCandidate => ({
   lastSeenAt: now
 });
 
-const seed = () => {
+const seed = (input: {
+  candidate?: ZeroDteQueueCandidate;
+  decisionId?: string;
+  configuration?: typeof config;
+} = {}) => {
+  const seededCandidate = input.candidate ?? candidate();
+  const seededDecisionId = input.decisionId ?? decisionId;
+  const seededConfig = input.configuration ?? config;
+  const runId = `execution-run-${seededCandidate.candidateId}`;
   const db = getDb();
   db.prepare(
     `INSERT OR IGNORE INTO zero_dte_configuration_versions
       (configuration_version_id, strategy_version, configuration_hash,
        configuration_json, created_at)
      VALUES (?, ?, ?, ?, ?)`
-  ).run(config.configurationVersionId, config.strategyVersion, config.configurationVersionId, "{}", now);
+  ).run(seededConfig.configurationVersionId, seededConfig.strategyVersion, seededConfig.configurationVersionId, "{}", now);
   db.prepare(
     `INSERT OR IGNORE INTO zero_dte_engine_runs
       (run_id, trading_date, mode, account_mode, status, strategy_version,
        configuration_version_id, started_at, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run("execution-run-1", "2026-07-13", "test", "paper", "running", config.strategyVersion, config.configurationVersionId, now, now);
+  ).run(runId, seededCandidate.tradingDate, "test", "paper", "running", seededConfig.strategyVersion, seededConfig.configurationVersionId, now, now);
   db.prepare(
     `INSERT OR IGNORE INTO zero_dte_candidates
       (candidate_id, trading_date, underlying_symbol, option_symbol, playbook,
@@ -141,25 +149,99 @@ const seed = () => {
        market_timestamp, first_seen_at, last_seen_at, state_changed_at,
        created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(candidateId, "2026-07-13", "SPY", optionSymbol, "trend_continuation", "bullish", "2026-07-13", 500, "eligible", 86, 1.2, 1.3, 1.25, 1.25, 8, 500, 900, now, now, now, now, now, now);
-  if (!db.prepare("SELECT decision_id FROM zero_dte_decisions WHERE decision_id = ?").get(decisionId)) {
+  ).run(
+    seededCandidate.candidateId,
+    seededCandidate.tradingDate,
+    seededCandidate.underlyingSymbol,
+    seededCandidate.optionSymbol,
+    seededCandidate.playbook,
+    seededCandidate.direction,
+    seededCandidate.expirationDate,
+    seededCandidate.strike,
+    seededCandidate.state,
+    seededCandidate.totalScore,
+    seededCandidate.quote.bid,
+    seededCandidate.quote.ask,
+    seededCandidate.quote.midpoint,
+    seededCandidate.quote.premium,
+    seededCandidate.quote.spreadPct,
+    seededCandidate.quote.volume,
+    seededCandidate.quote.openInterest,
+    seededCandidate.quote.marketTimestamp,
+    seededCandidate.firstSeenAt,
+    seededCandidate.lastSeenAt,
+    seededCandidate.lastSeenAt,
+    seededCandidate.firstSeenAt,
+    seededCandidate.lastSeenAt
+  );
+  if (!db.prepare("SELECT decision_id FROM zero_dte_decisions WHERE decision_id = ?").get(seededDecisionId)) {
     insertZeroDteDecision({
-      decisionId,
-      decisionGroupId: "execution-group-1",
-      engineRunId: "execution-run-1",
-      candidateId,
-      tradingDate: "2026-07-13",
+      decisionId: seededDecisionId,
+      decisionGroupId: `execution-group-${seededCandidate.candidateId}`,
+      engineRunId: runId,
+      candidateId: seededCandidate.candidateId,
+      tradingDate: seededCandidate.tradingDate,
       action: "select",
       accountMode: "paper",
-      strategyVersion: config.strategyVersion,
-      configurationVersionId: config.configurationVersionId,
+      strategyVersion: seededConfig.strategyVersion,
+      configurationVersionId: seededConfig.configurationVersionId,
       marketTimestamp: now,
       decidedAt: now,
-      score: 86,
+      score: seededCandidate.totalScore,
       scoreThreshold: 70,
       reasonCodes: ["QUALIFIED"]
     });
   }
+  return { candidate: seededCandidate, decisionId: seededDecisionId, configuration: seededConfig };
+};
+
+const scenarioCandidate = (input: {
+  candidateId: string;
+  optionSymbol: string;
+  strike: number;
+  quantity?: number;
+}): ZeroDteQueueCandidate => ({
+  ...candidate(),
+  candidateId: input.candidateId,
+  optionSymbol: input.optionSymbol,
+  strike: input.strike,
+  ...(input.quantity === undefined ? {} : { quantity: input.quantity })
+});
+
+const createPendingEntry = async (input: {
+  candidate: ZeroDteQueueCandidate;
+  decisionId: string;
+  brokerOrderId: string;
+  configuration?: typeof config;
+}) => {
+  const configuration = input.configuration ?? config;
+  seed({ candidate: input.candidate, decisionId: input.decisionId, configuration });
+  const result = await executeZeroDteCandidate({
+    candidate: input.candidate,
+    decisionId: input.decisionId,
+    confirmPaper: true,
+    provider: {
+      config: configuration,
+      runtime: runtime(),
+      account: account(),
+      now: () => now,
+      submitPaperOrder: async (payload) => ({
+        data: {
+          id: input.brokerOrderId,
+          client_order_id: payload.client_order_id,
+          symbol: payload.symbol,
+          qty: payload.qty,
+          status: "accepted",
+          filled_qty: "0"
+        },
+        requestId: `request-${input.brokerOrderId}`,
+        status: 200,
+        url: "paper"
+      })
+    }
+  });
+  assert.equal(result.status, "submitted");
+  return result;
 };
 
 after(() => {
@@ -400,4 +482,266 @@ test("qualified paper entry links its decision, reconciles a fill, and is idempo
   });
   assert.equal(repeated.checked, 0);
   assert.equal(repeated.updated, 0);
+});
+
+test("immediate broker fills persist verified actual quantity, premium, and time", async () => {
+  const immediateCandidate = scenarioCandidate({
+    candidateId: "execution-candidate-immediate-fill",
+    optionSymbol: "SPY260713C00501000",
+    strike: 501
+  });
+  const immediateDecisionId = "execution-decision-immediate-fill";
+  const filledAt = "2026-07-13T14:30:01.000Z";
+  seed({ candidate: immediateCandidate, decisionId: immediateDecisionId });
+
+  const result = await executeZeroDteCandidate({
+    candidate: immediateCandidate,
+    decisionId: immediateDecisionId,
+    confirmPaper: true,
+    provider: {
+      config,
+      runtime: runtime(),
+      account: account(),
+      now: () => now,
+      submitPaperOrder: async (payload) => ({
+        data: {
+          id: "paper-order-immediate-fill",
+          client_order_id: payload.client_order_id,
+          symbol: payload.symbol,
+          qty: payload.qty,
+          status: "filled",
+          filled_qty: "1",
+          filled_avg_price: "1.19",
+          filled_at: filledAt
+        },
+        requestId: "paper-request-immediate-fill",
+        status: 200,
+        url: "paper"
+      })
+    }
+  });
+
+  assert.equal(result.status, "filled");
+  assert.deepEqual(
+    { ...getDb().prepare(
+      `SELECT status, quantity, entry_premium, filled_at
+       FROM zero_dte_paper_trades
+       WHERE paper_trade_id = ?`
+    ).get(result.paperTradeId) as Record<string, unknown> },
+    { status: "open", quantity: 1, entry_premium: 1.19, filled_at: filledAt }
+  );
+  const reconciliation = await reconcileZeroDtePaperOrders({
+    now: "2026-07-13T14:30:10.000Z",
+    provider: {
+      runtime: runtime(),
+      getOrder: async () => {
+        throw new Error("an immediate fill must already be terminalized locally");
+      }
+    }
+  });
+  assert.equal(reconciliation.checked, 0);
+});
+
+test("invalid immediate fill evidence stays recoverable through exact reconciliation", async () => {
+  const recoverableCandidate = scenarioCandidate({
+    candidateId: "execution-candidate-recoverable-fill",
+    optionSymbol: "SPY260713C00508000",
+    strike: 508
+  });
+  const recoverableDecisionId = "execution-decision-recoverable-fill";
+  const brokerOrderId = "paper-order-recoverable-fill";
+  seed({ candidate: recoverableCandidate, decisionId: recoverableDecisionId });
+
+  const result = await executeZeroDteCandidate({
+    candidate: recoverableCandidate,
+    decisionId: recoverableDecisionId,
+    confirmPaper: true,
+    provider: {
+      config,
+      runtime: runtime(),
+      account: account(),
+      now: () => now,
+      submitPaperOrder: async (payload) => ({
+        data: {
+          id: brokerOrderId,
+          client_order_id: payload.client_order_id,
+          symbol: payload.symbol,
+          qty: payload.qty,
+          status: "filled",
+          filled_qty: "1",
+          filled_at: "2026-07-13T14:30:02.000Z"
+        },
+        requestId: "paper-request-recoverable-invalid",
+        status: 200,
+        url: "paper"
+      })
+    }
+  });
+
+  assert.equal(result.status, "failed");
+  assert.deepEqual(result.blockers, ["BROKER_ORDER_EVIDENCE_INVALID"]);
+  assert.ok(result.paperTradeId);
+  assert.deepEqual(
+    { ...getDb().prepare(
+      `SELECT status, broker_order_id, entry_premium, filled_at
+       FROM zero_dte_paper_trades
+       WHERE paper_trade_id = ?`
+    ).get(result.paperTradeId) as Record<string, unknown> },
+    { status: "submitted", broker_order_id: brokerOrderId, entry_premium: 1.25, filled_at: null }
+  );
+  assert.equal(
+    (getDb().prepare("SELECT status FROM paper_execution_ledger WHERE id = ?").get(result.ledgerId) as { status: string }).status,
+    "failed"
+  );
+
+  const filledAt = "2026-07-13T14:30:03.000Z";
+  const reconciliation = await reconcileZeroDtePaperOrders({
+    now: filledAt,
+    provider: {
+      runtime: runtime(),
+      getOrder: async () => ({
+        data: {
+          id: brokerOrderId,
+          client_order_id: result.clientOrderId,
+          symbol: recoverableCandidate.optionSymbol,
+          qty: "1",
+          status: "filled",
+          filled_qty: "1",
+          filled_avg_price: "1.18",
+          filled_at: filledAt
+        },
+        requestId: "paper-request-recoverable-valid",
+        status: 200,
+        url: "paper"
+      })
+    }
+  });
+  assert.equal(reconciliation.filled, 1);
+  assert.deepEqual(reconciliation.errors, []);
+  assert.deepEqual(
+    { ...getDb().prepare(
+      `SELECT status, quantity, entry_premium, filled_at
+       FROM zero_dte_paper_trades
+       WHERE paper_trade_id = ?`
+    ).get(result.paperTradeId) as Record<string, unknown> },
+    { status: "open", quantity: 1, entry_premium: 1.18, filled_at: filledAt }
+  );
+});
+
+test("reconciliation fails closed on invalid fill evidence and handles terminal orders", async () => {
+  const scenarios = [
+    ["missing-price", "SPY260713C00502000", 502],
+    ["zero-quantity", "SPY260713C00503000", 503],
+    ["malformed-time", "SPY260713C00504000", 504],
+    ["identity-mismatch", "SPY260713C00505000", 505],
+    ["canceled", "SPY260713C00506000", 506]
+  ] as const;
+  const pending = new Map<string, Awaited<ReturnType<typeof createPendingEntry>>>();
+  for (const [name, symbol, strike] of scenarios) {
+    pending.set(name, await createPendingEntry({
+      candidate: scenarioCandidate({
+        candidateId: `execution-candidate-${name}`,
+        optionSymbol: symbol,
+        strike
+      }),
+      decisionId: `execution-decision-${name}`,
+      brokerOrderId: `paper-order-${name}`
+    }));
+  }
+
+  const twoContractConfig = loadZeroDteConfig({
+    ZERO_DTE_MAX_CONTRACTS_PER_TRADE: "2",
+    ZERO_DTE_MAX_PREMIUM_PER_TRADE: "500",
+    ZERO_DTE_MAX_DAILY_PREMIUM: "1000"
+  });
+  const partialTerminal = await createPendingEntry({
+    candidate: scenarioCandidate({
+      candidateId: "execution-candidate-partial-terminal",
+      optionSymbol: "SPY260713C00507000",
+      strike: 507,
+      quantity: 2
+    }),
+    decisionId: "execution-decision-partial-terminal",
+    brokerOrderId: "paper-order-partial-terminal",
+    configuration: twoContractConfig
+  });
+
+  const filledAt = "2026-07-13T14:31:00.000Z";
+  const reconciliation = await reconcileZeroDtePaperOrders({
+    now: filledAt,
+    provider: {
+      runtime: runtime(),
+      getOrder: async (orderId) => {
+        const name = orderId.replace("paper-order-", "");
+        const result = name === "partial-terminal" ? partialTerminal : pending.get(name);
+        assert.ok(result);
+        const base = {
+          id: orderId,
+          client_order_id: result.clientOrderId,
+          symbol: name === "partial-terminal"
+            ? "SPY260713C00507000"
+            : scenarios.find(([scenario]) => scenario === name)?.[1],
+          filled_qty: "1",
+          filled_avg_price: "1.11",
+          filled_at: filledAt
+        };
+        if (name === "missing-price") return { data: { ...base, filled_avg_price: undefined, status: "filled" }, status: 200, url: "paper" };
+        if (name === "zero-quantity") return { data: { ...base, filled_qty: "0", status: "filled" }, status: 200, url: "paper" };
+        if (name === "malformed-time") return { data: { ...base, filled_at: "not-a-time", status: "filled" }, status: 200, url: "paper" };
+        if (name === "identity-mismatch") return { data: { ...base, id: "paper-order-other", status: "filled" }, status: 200, url: "paper" };
+        if (name === "canceled") return { data: { ...base, filled_qty: "0", filled_avg_price: undefined, filled_at: undefined, status: "canceled" }, status: 200, url: "paper" };
+        return { data: { ...base, status: "expired" }, status: 200, url: "paper" };
+      }
+    }
+  });
+
+  assert.equal(reconciliation.checked, 6);
+  assert.equal(reconciliation.updated, 2);
+  assert.equal(reconciliation.terminal, 2);
+  assert.equal(reconciliation.partialTerminal, 1);
+  assert.equal(reconciliation.errors.length, 4);
+  assert.ok(reconciliation.errors.every((error) => error.code === "PAPER_ORDER_RECONCILIATION_FAILED"));
+  for (const name of ["missing-price", "zero-quantity", "malformed-time", "identity-mismatch"]) {
+    const result = pending.get(name);
+    assert.ok(result?.paperTradeId);
+    assert.equal(
+      (getDb().prepare("SELECT status FROM zero_dte_paper_trades WHERE paper_trade_id = ?").get(result.paperTradeId) as { status: string }).status,
+      "submitted"
+    );
+  }
+  const canceled = pending.get("canceled");
+  assert.ok(canceled?.paperTradeId);
+  assert.deepEqual(
+    { ...getDb().prepare(
+      `SELECT status, terminal_state, exit_reason_code
+       FROM zero_dte_paper_trades
+       WHERE paper_trade_id = ?`
+    ).get(canceled.paperTradeId) as Record<string, unknown> },
+    { status: "canceled", terminal_state: "canceled", exit_reason_code: "ORDER_CANCELED" }
+  );
+  assert.deepEqual(
+    { ...getDb().prepare(
+      `SELECT status, quantity, entry_premium, filled_at, terminal_state
+       FROM zero_dte_paper_trades
+       WHERE paper_trade_id = ?`
+    ).get(partialTerminal.paperTradeId) as Record<string, unknown> },
+    { status: "open", quantity: 1, entry_premium: 1.11, filled_at: filledAt, terminal_state: null }
+  );
+  assert.deepEqual(
+    { ...getDb().prepare(
+      `SELECT status, alpaca_status
+       FROM paper_execution_ledger
+       WHERE id = ?`
+    ).get(partialTerminal.ledgerId) as Record<string, unknown> },
+    { status: "expired", alpaca_status: "expired" }
+  );
+  assert.equal(
+    (getDb().prepare(
+      `SELECT COUNT(*) AS count
+       FROM zero_dte_lifecycle_events
+       WHERE paper_trade_id = ?
+         AND event_type IN ('paper_order_partially_filled', 'position_opened', 'paper_order_canceled')`
+    ).get(partialTerminal.paperTradeId) as { count: number }).count,
+    3
+  );
 });
