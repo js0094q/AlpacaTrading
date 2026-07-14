@@ -41,6 +41,8 @@ import {
 import {
   createZeroDteShadowTrade,
   markZeroDteShadowTrades,
+  readZeroDteShadowTrades,
+  type ZeroDteShadowTrade,
   type ZeroDteMarkResult
 } from "./zeroDteShadowService.js";
 import {
@@ -123,6 +125,68 @@ export interface ZeroDteSummary extends ReturnType<typeof readZeroDteSummary> {
 
 export interface ZeroDteEodSummary extends ZeroDteDailyOutcomeSummary {
   reconciliation: ZeroDteReconciliationResult;
+}
+
+export interface ZeroDtePaperPosition {
+  paperTradeId: string;
+  candidateId: string;
+  optionSymbol: string;
+  playbook: string;
+  direction: string;
+  status: string;
+  quantity: number;
+  entryPremium: number | null;
+  currentMark: number | null;
+  unrealizedPnl: number | null;
+  mfe: number | null;
+  mae: number | null;
+  exitReasonCode: string | null;
+  brokerOrderId: string | null;
+}
+
+export interface ZeroDteDashboardSummary {
+  paperOnly: true;
+  generatedAt: string;
+  tradingDate: string | null;
+  engine: {
+    enabled: boolean;
+    lastRunAt: string | null;
+    status: string;
+    queueSize: number;
+    staleDataCount: number;
+  };
+  queue: ZeroDteQueueCandidate[];
+  paperPositions: ZeroDtePaperPosition[];
+  shadowTrades: Array<Pick<ZeroDteShadowTrade,
+    | "shadowTradeId"
+    | "decisionGroupId"
+    | "decisionId"
+    | "candidateId"
+    | "tradingDate"
+    | "underlyingSymbol"
+    | "optionSymbol"
+    | "playbook"
+    | "direction"
+    | "alternativeType"
+    | "status"
+    | "quantity"
+    | "entryPremium"
+    | "exitPremium"
+    | "fees"
+    | "slippage"
+    | "mfe"
+    | "mae"
+    | "realizedPnl"
+    | "returnPct"
+    | "terminalState"
+    | "exitReasonCode"
+    | "openedAt"
+    | "closedAt"
+    | "updatedAt"
+  > & { simulated: true }>;
+  lifecycle: ReturnType<typeof readZeroDteSummary>["lifecycle"];
+  learning: ZeroDteDailyOutcomeSummary | null;
+  blockers: string[];
 }
 
 type ExtendedMarketContext = ZeroDteMarketContext & Record<string, unknown>;
@@ -1175,5 +1239,133 @@ export const buildZeroDteSummary = (input: {
     outcomes: summary.tradingDate
       ? readZeroDteDailyOutcomeSummary(summary.tradingDate)
       : null
+  };
+};
+
+const nullableNumber = (value: unknown) =>
+  value === null || value === undefined ? null : finite(value);
+
+const readZeroDtePaperPositions = (tradingDate: string | null, limit: number) => {
+  if (!tradingDate || limit === 0) return [];
+  const rows = queryAll<{
+    paper_trade_id: string;
+    candidate_id: string;
+    option_symbol: string;
+    playbook: string;
+    direction: string;
+    status: string;
+    quantity: number;
+    entry_premium: number | null;
+    current_mark: number | null;
+    unrealized_pnl: number | null;
+    mfe: number | null;
+    mae: number | null;
+    exit_reason_code: string | null;
+    broker_order_id: string | null;
+  }>(
+    `SELECT t.paper_trade_id, t.candidate_id, t.option_symbol, t.playbook,
+            t.direction, t.status, t.quantity, t.entry_premium,
+            m.mark_price AS current_mark, m.unrealized_pnl,
+            COALESCE(m.mfe, t.mfe) AS mfe, COALESCE(m.mae, t.mae) AS mae,
+            t.exit_reason_code, t.broker_order_id
+     FROM zero_dte_paper_trades AS t
+     LEFT JOIN zero_dte_position_marks AS m
+       ON m.paper_trade_id = t.paper_trade_id
+      AND m.marked_at = (
+        SELECT MAX(marked_at)
+        FROM zero_dte_position_marks
+        WHERE paper_trade_id = t.paper_trade_id
+      )
+     WHERE t.trading_date = ?
+       AND t.status IN ('intended', 'submitted', 'partially_filled', 'open', 'exit_requested')
+     ORDER BY t.updated_at DESC, t.paper_trade_id DESC
+     LIMIT ?`,
+    [tradingDate, limit]
+  );
+  return rows.map((row) => ({
+    paperTradeId: row.paper_trade_id,
+    candidateId: row.candidate_id,
+    optionSymbol: row.option_symbol,
+    playbook: row.playbook,
+    direction: row.direction,
+    status: row.status,
+    quantity: Number(row.quantity),
+    entryPremium: nullableNumber(row.entry_premium),
+    currentMark: nullableNumber(row.current_mark),
+    unrealizedPnl: nullableNumber(row.unrealized_pnl),
+    mfe: nullableNumber(row.mfe),
+    mae: nullableNumber(row.mae),
+    exitReasonCode: row.exit_reason_code,
+    brokerOrderId: row.broker_order_id
+  }));
+};
+
+export const buildZeroDteDashboardSummary = (input: {
+  tradingDate?: string;
+  limit?: number;
+} = {}): ZeroDteDashboardSummary => {
+  const limit = Math.min(100, Math.max(0, Math.floor(input.limit ?? 25)));
+  const config = loadZeroDteConfig();
+  const summary = buildZeroDteSummary({ tradingDate: input.tradingDate, limit });
+  const paperPositions = readZeroDtePaperPositions(summary.tradingDate, limit);
+  const shadowTrades = summary.tradingDate
+    ? readZeroDteShadowTrades({ tradingDate: summary.tradingDate, limit })
+      .map((trade) => ({
+        shadowTradeId: trade.shadowTradeId,
+        decisionGroupId: trade.decisionGroupId,
+        decisionId: trade.decisionId,
+        candidateId: trade.candidateId,
+        tradingDate: trade.tradingDate,
+        underlyingSymbol: trade.underlyingSymbol,
+        optionSymbol: trade.optionSymbol,
+        playbook: trade.playbook,
+        direction: trade.direction,
+        alternativeType: trade.alternativeType,
+        status: trade.status,
+        quantity: trade.quantity,
+        entryPremium: trade.entryPremium,
+        exitPremium: trade.exitPremium,
+        fees: trade.fees,
+        slippage: trade.slippage,
+        mfe: trade.mfe,
+        mae: trade.mae,
+        realizedPnl: trade.realizedPnl,
+        returnPct: trade.returnPct,
+        terminalState: trade.terminalState,
+        exitReasonCode: trade.exitReasonCode,
+        openedAt: trade.openedAt,
+        closedAt: trade.closedAt,
+        updatedAt: trade.updatedAt,
+        simulated: true as const
+      }))
+    : [];
+  const lastRunError = getDb().prepare(
+    `SELECT error_code
+     FROM zero_dte_engine_runs
+     ORDER BY started_at DESC, run_id DESC
+     LIMIT 1`
+  ).get() as { error_code: string | null } | undefined;
+  const blockers = unique([
+    ...(config.enabled ? [] : ["ENGINE_DISABLED"]),
+    ...(lastRunError?.error_code ? [lastRunError.error_code] : []),
+    ...summary.queue.flatMap((candidate) => candidate.blockers)
+  ]);
+  return {
+    paperOnly: true,
+    generatedAt: summary.generatedAt,
+    tradingDate: summary.tradingDate,
+    engine: {
+      enabled: config.enabled,
+      lastRunAt: summary.engine.lastCompletedAt,
+      status: summary.engine.lastStatus ?? "never_run",
+      queueSize: summary.queue.length,
+      staleDataCount: summary.engine.staleDataCount
+    },
+    queue: summary.queue,
+    paperPositions,
+    shadowTrades,
+    lifecycle: summary.lifecycle,
+    learning: summary.outcomes,
+    blockers
   };
 };

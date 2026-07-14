@@ -242,6 +242,60 @@ const getPaperBridgeSummary = async () => {
   return bridgeSummaryPromise;
 };
 
+export interface ZeroDteDashboardSummary {
+  paperOnly: true;
+  generatedAt: string;
+  tradingDate: string | null;
+  engine: {
+    enabled: boolean;
+    lastRunAt: string | null;
+    status: string;
+    queueSize: number;
+    staleDataCount: number;
+  };
+  queue: Array<Record<string, unknown>>;
+  paperPositions: Array<Record<string, unknown>>;
+  shadowTrades: Array<Record<string, unknown>>;
+  lifecycle: {
+    counts: Record<string, number>;
+    recent: Array<Record<string, unknown>>;
+  };
+  learning: Record<string, unknown> | null;
+  blockers: string[];
+}
+
+const unavailableZeroDteSummary = (): ZeroDteDashboardSummary => ({
+  paperOnly: true,
+  generatedAt: new Date().toISOString(),
+  tradingDate: null,
+  engine: {
+    enabled: false,
+    lastRunAt: null,
+    status: "unavailable",
+    queueSize: 0,
+    staleDataCount: 0
+  },
+  queue: [],
+  paperPositions: [],
+  shadowTrades: [],
+  lifecycle: { counts: {}, recent: [] },
+  learning: null,
+  blockers: ["ZERO_DTE_VPS_SUMMARY_UNAVAILABLE"]
+});
+
+export const latestZeroDteSummary = async (limit = 25): Promise<ZeroDteDashboardSummary> => {
+  if (isPaperDashboardBridgeEnabled()) {
+    return fetchPaperBridgePayload<ZeroDteDashboardSummary>("api/v1/zero-dte/summary");
+  }
+  if (shouldUseVercelReadOnlyFallback()) {
+    return unavailableZeroDteSummary();
+  }
+  const { buildZeroDteDashboardSummary } = await import(
+    "../../../src/services/zeroDte/zeroDteEngineService"
+  );
+  return buildZeroDteDashboardSummary({ limit }) as unknown as ZeroDteDashboardSummary;
+};
+
 const normalizeRiskProfile = (value: unknown): RiskProfileInput => {
   return value === "aggressive" || value === "conservative" || value === "moderate"
     ? value
