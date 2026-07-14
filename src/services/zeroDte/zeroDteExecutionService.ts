@@ -801,17 +801,28 @@ const brokerStateStrength = (state: ValidatedZeroDteBrokerOrderState) => {
   return 0;
 };
 
+const verifiedLocalFilledQuantity = (current: CurrentZeroDtePaperOrderState) => {
+  const tradeStatus = normalizedStatus(current.trade_status);
+  const ledgerStatus = normalizedStatus(current.ledger_status);
+  const hasVerifiedFill =
+    current.filled_at !== null ||
+    ["partially_filled", "open", "exit_requested"].includes(tradeStatus) ||
+    ["partial", "filled"].includes(ledgerStatus);
+  return hasVerifiedFill ? positive(current.quantity) ?? 0 : 0;
+};
+
 const shouldApplyBrokerState = (
   current: CurrentZeroDtePaperOrderState,
   state: ValidatedZeroDteBrokerOrderState
 ) => {
+  const currentFilledQuantity = verifiedLocalFilledQuantity(current);
+  if (state.filledQuantity < currentFilledQuantity) return false;
   const currentStrength = localBrokerStateStrength(current);
   const incomingStrength = brokerStateStrength(state);
   if (incomingStrength > currentStrength) return true;
   if (incomingStrength < currentStrength) return false;
   if (state.kind === "pending") return currentStrength === 0;
   if (state.kind === "partial") {
-    const currentFilledQuantity = positive(current.quantity) ?? 0;
     return state.filledQuantity > currentFilledQuantity;
   }
   return false;

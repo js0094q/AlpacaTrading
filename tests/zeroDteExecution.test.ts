@@ -741,6 +741,105 @@ test("stale concurrent pending and partial responses cannot regress a confirmed 
       0
     );
   }
+
+  const terminalRegressionSymbol = "SPY260713C00511000";
+  const threeContractConfig = loadZeroDteConfig({
+    ZERO_DTE_MAX_CONTRACTS_PER_TRADE: "3",
+    ZERO_DTE_MAX_PREMIUM_PER_TRADE: "750",
+    ZERO_DTE_MAX_DAILY_PREMIUM: "1500"
+  });
+  const terminalRegression = await createPendingEntry({
+    candidate: scenarioCandidate({
+      candidateId: "execution-candidate-terminal-regression",
+      optionSymbol: terminalRegressionSymbol,
+      strike: 511,
+      quantity: 3
+    }),
+    decisionId: "execution-decision-terminal-regression",
+    brokerOrderId: "paper-order-terminal-regression",
+    configuration: threeContractConfig
+  });
+  assert.ok(terminalRegression.paperTradeId);
+  assert.ok(terminalRegression.ledgerId);
+  const partialAt = "2026-07-13T14:30:07.000Z";
+  const partial = await reconcileZeroDtePaperOrders({
+    now: partialAt,
+    provider: {
+      runtime: runtime(),
+      getOrder: async () => ({
+        data: {
+          id: terminalRegression.brokerOrderId ?? undefined,
+          client_order_id: terminalRegression.clientOrderId,
+          symbol: terminalRegressionSymbol,
+          qty: "3",
+          status: "partially_filled",
+          filled_qty: "2",
+          filled_avg_price: "1.15",
+          filled_at: partialAt
+        },
+        status: 200,
+        url: "paper"
+      })
+    }
+  });
+  assert.equal(partial.partial, 1);
+  const lowerFillTerminal = await reconcileZeroDtePaperOrders({
+    now: "2026-07-13T14:30:08.000Z",
+    provider: {
+      runtime: runtime(),
+      getOrder: async () => ({
+        data: {
+          id: terminalRegression.brokerOrderId ?? undefined,
+          client_order_id: terminalRegression.clientOrderId,
+          symbol: terminalRegressionSymbol,
+          qty: "3",
+          status: "expired",
+          filled_qty: "1",
+          filled_avg_price: "1.14",
+          filled_at: partialAt
+        },
+        status: 200,
+        url: "paper"
+      })
+    }
+  });
+  assert.equal(lowerFillTerminal.updated, 0);
+  assert.deepEqual(lowerFillTerminal.errors, []);
+  const zeroFillTerminal = await reconcileZeroDtePaperOrders({
+    now: "2026-07-13T14:30:09.000Z",
+    provider: {
+      runtime: runtime(),
+      getOrder: async () => ({
+        data: {
+          id: terminalRegression.brokerOrderId ?? undefined,
+          client_order_id: terminalRegression.clientOrderId,
+          symbol: terminalRegressionSymbol,
+          qty: "3",
+          status: "canceled",
+          filled_qty: "0"
+        },
+        status: 200,
+        url: "paper"
+      })
+    }
+  });
+  assert.equal(zeroFillTerminal.updated, 0);
+  assert.deepEqual(zeroFillTerminal.errors, []);
+  assert.deepEqual(
+    { ...getDb().prepare(
+      `SELECT status, quantity, entry_premium, filled_at
+       FROM zero_dte_paper_trades
+       WHERE paper_trade_id = ?`
+    ).get(terminalRegression.paperTradeId) as Record<string, unknown> },
+    { status: "partially_filled", quantity: 2, entry_premium: 1.15, filled_at: partialAt }
+  );
+  assert.equal(
+    (getDb().prepare("SELECT status FROM paper_execution_ledger WHERE id = ?").get(terminalRegression.ledgerId) as { status: string }).status,
+    "partial"
+  );
+  getDb().prepare(
+    "UPDATE zero_dte_paper_trades SET status = 'open' WHERE paper_trade_id = ?"
+  ).run(terminalRegression.paperTradeId);
 });
 
 test("reconciliation fails closed on invalid fill evidence and handles terminal orders", async () => {
