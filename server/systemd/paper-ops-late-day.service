@@ -1,6 +1,6 @@
 [Unit]
 Description=Alpaca Paper Ops Late-Day Portfolio and 0DTE Exit Review
-After=network-online.target
+After=network-online.target alpaca-market-observatory.service alpaca-autonomous-recovery.service
 Wants=network-online.target
 
 [Service]

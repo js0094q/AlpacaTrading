@@ -8,6 +8,9 @@ fi
 
 systemctl disable --now \
   alpaca-market-observatory.timer \
+  paper-ops-morning.timer \
+  paper-ops-midday.timer \
+  paper-ops-late-day.timer \
   alpaca-universe-lifecycle.timer \
   alpaca-autonomous-recovery.timer \
   alpaca-paper-review.timer \

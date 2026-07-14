@@ -1,8 +1,8 @@
 [Unit]
-Description=Run Alpaca Paper Ops Midday Portfolio Review at 12:00 PM ET on weekdays
+Description=Run Alpaca Paper Ops Midday Portfolio Review at 12:10 PM ET on weekdays
 
 [Timer]
-OnCalendar=Mon..Fri *-*-* 12:00:00
+OnCalendar=Mon..Fri *-*-* 12:10:00
 Persistent=false
 Unit=paper-ops-midday.service
 
