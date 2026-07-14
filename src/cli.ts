@@ -105,6 +105,13 @@ import {
   executeReviewedPaperHedgeExit
 } from "./services/hedgeExitService.js";
 import { evaluateHedgeLearning } from "./services/hedgeLearningLifecycleService.js";
+import {
+  buildZeroDteSummary,
+  runZeroDteEodSummary,
+  runZeroDteEngine,
+  runZeroDteReconciliation
+} from "./services/zeroDte/zeroDteEngineService.js";
+import { reviewZeroDteExits } from "./services/zeroDte/zeroDteExitService.js";
 
 const parseArg = (input: string): Record<string, string> | null => {
   const [rawKey, rawValue] = input.split("=", 2);
@@ -1017,6 +1024,57 @@ const run = async () => {
     return;
   }
 
+  if (command === "zero-dte:engine") {
+    const result = await runZeroDteEngine({
+      now: args.now,
+      dryRun: flagArg(args.dryRun) || flagArg(args["dry-run"]),
+      confirmPaper: flagArg(args.confirmPaper)
+    });
+    print(result);
+    if (result.status === "blocked" || result.status === "failed") {
+      process.exitCode = 1;
+    }
+    return;
+  }
+
+  if (command === "zero-dte:exit:review") {
+    const result = await reviewZeroDteExits({
+      now: args.now,
+      confirmPaper: flagArg(args.confirmPaper)
+    });
+    print(result);
+    if (result.status === "blocked" || result.status === "error") {
+      process.exitCode = 1;
+    }
+    return;
+  }
+
+  if (command === "zero-dte:reconcile") {
+    const result = await runZeroDteReconciliation({ now: args.now });
+    print(result);
+    if (result.errors.length > 0) {
+      process.exitCode = 1;
+    }
+    return;
+  }
+
+  if (command === "zero-dte:eod") {
+    const result = await runZeroDteEodSummary({ now: args.now });
+    print(result);
+    if (result.reconciliation.errors.length > 0) {
+      process.exitCode = 1;
+    }
+    return;
+  }
+
+  if (command === "zero-dte:summary") {
+    print(buildZeroDteSummary({
+      tradingDate: args.tradingDate,
+      limit: toInt(args.limit, 20)
+    }));
+    return;
+  }
+
   if (command === "hedge:risk") {
     const result = await buildPortfolioRiskSnapshot();
     if (args.format === "json") {
@@ -1452,7 +1510,7 @@ const run = async () => {
 
   print({
     error:
-      "Unknown command. See README for available commands including db:migrate/db:verify/universe/data/options/features/targets/backtest/learn/research/alpaca:config/paper (including paper:analytics, paper:learn, paper:execute, paper:execute:reviewed, paper:review, paper:plan, paper:portfolio:review, paper:exit:review, paper:exit:execute, paper:options:discover, paper:ops:morning, paper:ops:midday, paper:ops:late-day, paper:snapshots, paper:trends, paper:runtime, paper:intel).",
+      "Unknown command. See README for available commands including db:migrate/db:verify/universe/data/options/features/targets/backtest/learn/research/alpaca:config/paper/zero-dte (including zero-dte:engine, zero-dte:exit:review, zero-dte:reconcile, zero-dte:eod, zero-dte:summary).",
     command,
     action,
     config
