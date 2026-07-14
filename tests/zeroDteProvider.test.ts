@@ -126,6 +126,7 @@ test("concrete 0DTE provider uses paper endpoints and preserves request IDs", as
       assert.equal(contracts[0]?.requestId, "contracts-request-1");
 
       assert.equal(new URL(calls[0]!.url).origin, "https://data-test.example");
+      assert.equal(new URL(calls[0]!.url).searchParams.get("feed"), "iex");
       assert.equal(new URL(calls[1]!.url).origin, "https://paper-test.example");
       for (const call of calls) {
         const headers = call.init?.headers as Record<string, string>;

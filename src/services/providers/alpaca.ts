@@ -163,6 +163,7 @@ export interface ProviderOptions {
   timeframe?: Timeframe;
   start?: string;
   end?: string;
+  feed?: string;
   pageToken?: string | null;
 }
 
@@ -410,6 +411,7 @@ export const fetchBars = async (options: ProviderOptions): Promise<{ symbol: str
     timeframe,
     start: options.start,
     end: options.end,
+    feed: options.feed,
     page_token: options.pageToken,
     limit: 1000
   });
@@ -451,6 +453,7 @@ export const fetchAllBars = async (
       timeframe: options.timeframe || "1Day",
       start: options.start,
       end: options.end,
+      feed: options.feed,
       page_token: pageToken ?? undefined,
       limit: 1000
     });

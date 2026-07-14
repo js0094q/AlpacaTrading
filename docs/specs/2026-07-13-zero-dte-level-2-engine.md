@@ -1,7 +1,7 @@
 # 0DTE Level 2 Engine
 
 Date: 2026-07-13
-Status: approved design; implementation pending
+Status: implemented; paper-only operational acceptance in progress
 Initial design checkpoint: branch `0DTE` at `a9d8e60`
 Implementation baseline after the resolved paper-exit cherry-pick: `main` at `d4431f9`
 
@@ -85,6 +85,8 @@ Expected modules:
 - `zeroDteEngineService.ts`: cycle orchestration and non-overlap handling.
 
 Direct snapshot adapters must normalize both wrapped Alpaca snapshot objects and top-level symbol maps before applying freshness or liquidity filters. A valid response shape must not be silently interpreted as an empty underlying universe.
+
+Intraday underlying bar requests must explicitly select Alpaca's paper-compatible `iex` feed instead of relying on an account-dependent default feed.
 
 Pure scoring and ranking functions must be usable without a broker or database so focused tests can use deterministic fixtures.
 
