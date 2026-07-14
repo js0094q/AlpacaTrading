@@ -102,8 +102,11 @@ its exit-review, reconciliation, and end-of-day services set `AUTOMATED_PAPER_EX
 `alpaca-universe-lifecycle.timer` is installed by the same monitoring installer.
 It runs a bounded, non-broker-mutating discovery and lifecycle pass at 16:30 ET
 on weekdays, after the intraday timer windows. The service has no execution
-command or `--confirmPaper` path. `Persistent=false` intentionally skips missed
-runs and resumes at the next daily window instead of replaying work after reboot.
+command or `--confirmPaper` path. It delegates historical-bar collection to
+the 15-minute observatory, has a 120-second start deadline and 30-second stop
+deadline, and uses control-group termination. `Persistent=false` intentionally
+skips missed runs and resumes at the next daily window instead of replaying work
+after reboot.
 
 ## Service operating guidance
 

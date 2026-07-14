@@ -127,7 +127,6 @@ hash. Defaults are intentionally bounded:
 | discovery scan window | 250 assets |
 | new symbols per run | 10 |
 | assessed symbols per run | 80 |
-| historical refresh symbols per run | 25 |
 | approved exchanges | AMEX, ARCA, BATS, NASDAQ, NYSE, NYSEARCA |
 | minimum price | 5 USD |
 | minimum daily dollar volume | 5,000,000 USD |
@@ -142,6 +141,10 @@ hash. Defaults are intentionally bounded:
 
 The existing execution gates remain authoritative even when a symbol reaches
 paper_eligible. A lifecycle state is not an order authorization.
+
+The lifecycle worker evaluates persisted historical coverage only. The existing
+15-minute observatory is the sole automatic collector for `observe_only`
+symbols; the lifecycle never invokes market-data ingestion inline.
 
 ## Interfaces and persistence
 
@@ -170,8 +173,7 @@ The new universeLifecycleService exports:
 
 - runAutonomousUniverseLifecycle for the daily worker.
 - getUniverseLifecycleStatus for read-only CLI and operational inspection.
-- dependency injection points for assets, historical-bar ingestion, clock, and
-  Git SHA in focused tests.
+- dependency injection points for assets, clock, and Git SHA in focused tests.
 
 universeService exports getObservableUniverse and getObservableSymbols in
 addition to the existing active-universe API. Existing getActiveSymbols retains
@@ -203,10 +205,12 @@ credentials, raw broker payloads, account values, or full request headers.
   after the 16:05 0DTE end-of-day worker and outside the 15-minute observatory
   and paper review windows.
 - The daily service is a systemd oneshot. Systemd does not run concurrent
-  instances of the same active unit.
+  instances of the same active unit. It has a 120-second start deadline,
+  30-second stop deadline, and control-group termination.
 - A failed run is recorded as failed and returns nonzero. The timer does not
   replay a missed run on boot. The next normal run is idempotent, resumes from
-  the persisted discovery cursor, and re-evaluates local evidence.
+  the persisted discovery cursor, re-evaluates local evidence, and marks any
+  interrupted `running` lifecycle record failed before continuing.
 - No timer command includes confirmPaper or an execution command.
 
 ## Acceptance criteria
@@ -223,8 +227,13 @@ credentials, raw broker payloads, account values, or full request headers.
    retires it; qualified recovery returns a suspended symbol to observe_only.
 6. Events include reason code, evidence, timestamp, Git SHA, configuration
    version, and configuration hash.
-7. The observatory collects observe_only symbols, while research does not.
-8. The systemd unit is non-executing, offset from database-heavy jobs, and
+7. A symbol without sufficient persisted history remains `observe_only` and is
+   collected by the observatory without the lifecycle initiating a bar-ingestion
+   run.
+8. The daily unit has a 120-second start deadline and 30-second stop deadline,
+   preventing an interrupted run from overlapping the next lifecycle window.
+9. The observatory collects observe_only symbols, while research does not.
+10. The systemd unit is non-executing, offset from database-heavy jobs, and
    installed and disabled by the existing scripts.
 9. No existing paper execution, live-trading, review, exit, reconciliation, or
    0DTE behavior changes.

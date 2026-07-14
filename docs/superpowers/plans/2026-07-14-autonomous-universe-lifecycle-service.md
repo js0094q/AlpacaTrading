@@ -84,8 +84,8 @@ systemd oneshot/timer units, node:test.
    versioned policy fingerprint.
 2. Add a read-only Alpaca active-US-equity list function using GET /v2/assets.
 3. Implement a deterministic rotating discovery cursor, metadata admission,
-   bounded historical-bar refresh, evidence aggregation, and local transition
-   persistence.
+   persisted historical-coverage evaluation delegated to the observatory,
+   evidence aggregation, and local transition persistence.
 4. Persist Git SHA, config version, and config hash on every event and run.
 5. Use injected dependencies in tests and never import an order-submit client.
 6. Run the focused lifecycle tests and confirm green behavior.
@@ -124,7 +124,7 @@ systemd oneshot/timer units, node:test.
    database-heavy work.
 3. Install and disable the timer through the existing systemd scripts.
 4. Add scheduler tests for the non-executing command, post-close cadence,
-   bounded timeout, and non-overlap rationale.
+   120-second start and 30-second stop deadlines, and non-overlap rationale.
 5. Run the scheduler test, bash -n on both scripts, and systemd-analyze verify.
 
 ### Task 7: Synchronize operator documentation and validate the release
