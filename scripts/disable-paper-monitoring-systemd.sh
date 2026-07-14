@@ -7,6 +7,7 @@ if [[ "${EUID}" -ne 0 ]]; then
 fi
 
 systemctl disable --now \
+  alpaca-market-observatory.timer \
   alpaca-paper-review.timer \
   alpaca-paper-execute.timer \
   alpaca-paper-exit-review.timer \
@@ -17,4 +18,4 @@ systemctl disable --now \
   alpaca-zero-dte-eod.timer
 
 systemctl daemon-reload
-systemctl list-timers 'alpaca-paper-*' --no-pager || true
+systemctl list-timers 'alpaca-*' --no-pager || true

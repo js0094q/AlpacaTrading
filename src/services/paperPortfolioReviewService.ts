@@ -10,6 +10,7 @@ import {
 } from "./leapsExitReviewService.js";
 import { parseOptionSymbol } from "./optionSymbolService.js";
 import { getTradingSafetyState } from "./tradingSafetyService.js";
+import { capturePaperPositionObservation } from "./paperPositionLifecycleService.js";
 
 export type PaperPortfolioRecommendationType =
   | "BUY_NEW_EQUITY"
@@ -199,17 +200,21 @@ const latestCandidates = () =>
       LIMIT 1
     ) latest
       ON latest.id = c.research_run_id
+    WHERE c.decision = 'selected'
     ORDER BY c.rank ASC
     LIMIT 50
     `
   );
 
-const optionSymbolMetadata = (symbol: string): { expirationDate: string; side: "call" | "put" } | null => {
+const optionSymbolMetadata = (
+  symbol: string
+): { underlying: string; expirationDate: string; side: "call" | "put" } | null => {
   const parsed = parseOptionSymbol(symbol);
   if (!parsed.ok) {
     return null;
   }
   return {
+    underlying: parsed.underlying,
     expirationDate: parsed.expirationDate,
     side: parsed.optionType
   };
@@ -368,6 +373,42 @@ export const buildPaperPortfolioReviewReport = async (
     const marketValue = numeric(position.marketValue);
     const unrealizedPl = numeric(position.unrealizedPl);
     const unrealizedPlPercent = pctFromPosition(position.unrealizedPlpc);
+    const optionMetadata = optionSymbolMetadata(symbol);
+    const brokerSymbolKey = symbol;
+    const possibleLifecycles = state.paperOnly
+      ? queryAll<{ position_lifecycle_id: string }>(
+          `
+          SELECT position_lifecycle_id
+          FROM paper_positions
+          WHERE status = 'OPEN'
+            AND UPPER(COALESCE(option_symbol, symbol)) = ?
+          ORDER BY opened_at, position_lifecycle_id
+          `,
+          [brokerSymbolKey]
+        )
+      : [];
+    if (possibleLifecycles.length) {
+      capturePaperPositionObservation({
+        brokerSymbolKey,
+        symbol: optionMetadata?.underlying ?? symbol,
+        optionSymbol: optionMetadata ? symbol : null,
+        observedAt: generatedAt,
+        sourceTimestamp: generatedAt,
+        brokerRequestId: positionResult.requestId ?? null,
+        feed: "alpaca_paper_position",
+        mark: numeric(position.currentPrice),
+        quantity: qty,
+        marketValue,
+        unrealizedPnl: unrealizedPl,
+        unrealizedReturn: unrealizedPlPercent,
+        dataQualityStatus:
+          numeric(position.currentPrice) === null ? "MISSING_MARK" : "COMPLETE",
+        portfolioState: {
+          assetClass: position.assetClass ?? null,
+          side: position.side ?? null
+        }
+      });
+    }
 
     if (isOptionPosition(position)) {
       const leapsEvaluation = (deps.evaluateLeapsExit ?? evaluateLeapsExit)(position, {

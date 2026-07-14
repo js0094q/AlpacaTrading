@@ -12,6 +12,8 @@ UNIT_SRC="${REPO_DIR}/server/systemd"
 UNIT_DEST="/etc/systemd/system"
 
 units=(
+  alpaca-market-observatory.service
+  alpaca-market-observatory.timer
   alpaca-paper-review.service
   alpaca-paper-review.timer
   alpaca-paper-execute.service
@@ -48,6 +50,7 @@ done
 systemd-analyze verify "${units[@]/#/${UNIT_DEST}/}"
 systemctl daemon-reload
 systemctl enable --now \
+  alpaca-market-observatory.timer \
   alpaca-paper-review.timer \
   alpaca-paper-execute.timer \
   alpaca-paper-exit-review.timer \
@@ -57,4 +60,4 @@ systemctl enable --now \
   alpaca-zero-dte-reconcile.timer \
   alpaca-zero-dte-eod.timer
 
-systemctl list-timers 'alpaca-paper-*' --no-pager
+systemctl list-timers 'alpaca-*' --no-pager

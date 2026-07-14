@@ -23,6 +23,11 @@
   - The branch now defines cached GET-only hedge routes at `/api/v1/hedge/risk`, `/api/v1/hedge/regime`, and `/api/v1/hedge/recommendation`; this task did not deploy them.
   - Hedge routes read the latest integrity-checked `paper_learning_records` payload and never dispatch commands or order fetches.
 - Paper monitor behavior:
+  - Market Observatory Phase 1A adds `alpaca-market-observatory.service` and
+    `.timer` to the checked-in monitor installer. The read-only collector uses a
+    dedicated lock, wakes every 15 minutes during weekday market windows, checks
+    the Alpaca clock again, and cannot submit orders. This branch has not been
+    deployed, so the units are not asserted active on the VPS.
   - Exit review now evaluates LEAPS positions through the existing `optionSellToCloseExits` reviewed section; no separate LEAPS timer or execution command is required.
   - Reviewed LEAPS sell-to-close execution fails closed unless paper runtime, live-off, paper execution, paper options execution, automated execution, and `--confirmPaper` gates are all satisfied.
   - Existing paper-ops review moments may refresh hedge recommendations; authenticated hedge review/entry/exit routes are bounded by the VPS control allowlist and paper-only gates.

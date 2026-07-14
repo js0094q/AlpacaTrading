@@ -1,6 +1,15 @@
 import { getDb, queryAll, queryOne } from "../lib/db.js";
 import { normalizeSymbol, uuid } from "../lib/utils.js";
+import {
+  appendDecisionLifecycleEvent,
+  hashAllowlistedConfig,
+  persistDecisionSnapshot
+} from "./marketDecisionEvidenceService.js";
+import { createDecisionId } from "./marketDecisionIdentityService.js";
 import type {
+  CandidateDecisionRecord,
+  DecisionId,
+  DecisionStatus,
   PaperTradeCandidateRow,
   PreferredExpression,
   RiskProfile,
@@ -66,6 +75,7 @@ export interface RankedCandidate extends Omit<PaperTradeCandidateRow, "researchR
 
 export interface CandidateRankingResult {
   candidates: RankedCandidate[];
+  decisions: CandidateDecisionRecord[];
   warnings: string[];
 }
 
@@ -432,6 +442,7 @@ export const rankResearchCandidates = (input: CandidateRankingInput): CandidateR
   const warnings: string[] = [];
   const learning = parseLearningSummary();
   const backtest = parseBacktestPerformance();
+  const signalInputsByCandidate = new Map<string, Record<string, string | number | null>>();
 
   const scored = sourceFromTargets(input.targets).map((target) => {
     const optionCandidate = getOptionCandidate(target.symbol, target.as_of);
@@ -463,8 +474,10 @@ export const rankResearchCandidates = (input: CandidateRankingInput): CandidateR
       learning.directionalAccuracy === null ? null : Math.max(0, 1 - learning.directionalAccuracy);
 
     const candidatePerf = backtest?.byExpression[target.preferred_expression];
+    const id = uuid();
+    signalInputsByCandidate.set(id, featureSnapshot);
     return {
-      id: uuid(),
+      id,
       symbol: target.symbol,
       asOf: target.as_of,
       rank: 0,
@@ -501,11 +514,13 @@ export const rankResearchCandidates = (input: CandidateRankingInput): CandidateR
   const bySymbol = new Map<string, number>();
   const byDirection = new Map<CandidateDirection, number>();
   const byExpression = new Map<PreferredExpression, number>();
+  const skippedReasons = new Map<string, string>();
   const selected: RankedCandidate[] = [];
 
   for (const candidate of sorted) {
     if (selected.length >= maxCandidates) {
-      break;
+      skippedReasons.set(candidate.id, "MAX_CANDIDATES_REACHED");
+      continue;
     }
 
     const symbolCount = bySymbol.get(candidate.symbol) ?? 0;
@@ -513,12 +528,15 @@ export const rankResearchCandidates = (input: CandidateRankingInput): CandidateR
     const expressionCount = byExpression.get(candidate.preferredExpression) ?? 0;
 
     if (symbolCount >= maxPerSymbol) {
+      skippedReasons.set(candidate.id, "MAX_PER_SYMBOL_REACHED");
       continue;
     }
     if (directionCount >= maxPerDirection) {
+      skippedReasons.set(candidate.id, "MAX_PER_DIRECTION_REACHED");
       continue;
     }
     if (expressionCount >= maxPerExpression) {
+      skippedReasons.set(candidate.id, "MAX_PER_EXPRESSION_REACHED");
       continue;
     }
 
@@ -530,6 +548,7 @@ export const rankResearchCandidates = (input: CandidateRankingInput): CandidateR
 
   if (!selected.length && sorted.length && input.riskProfile === "aggressive") {
     selected.push(...sorted.slice(0, maxCandidates));
+    selected.forEach((candidate) => skippedReasons.delete(candidate.id));
     warnings.push(
       `Aggressive mode relaxed diversity constraints to avoid empty selection after strict filtering.`
     );
@@ -537,6 +556,26 @@ export const rankResearchCandidates = (input: CandidateRankingInput): CandidateR
 
   selected.forEach((candidate, index) => {
     candidate.rank = index + 1;
+  });
+  const selectedRankById = new Map(selected.map((candidate) => [candidate.id, candidate.rank]));
+  const decisions: CandidateDecisionRecord[] = sorted.map((candidate, index) => {
+    const signalInputs = signalInputsByCandidate.get(candidate.id) ?? {};
+    const selectedRank = selectedRankById.get(candidate.id);
+    return {
+      ...candidate,
+      rank: selectedRank ?? index + 1,
+      decision: selectedRank === undefined ? "skipped" : "selected",
+      decisionReason:
+        selectedRank === undefined
+          ? skippedReasons.get(candidate.id) ?? "RANKING_CONSTRAINT"
+          : "RANKED_SELECTED",
+      strategyFamily: candidate.preferredExpression,
+      signalInputs,
+      dataQualityStatus:
+        typeof signalInputs.observatoryDataQualityStatus === "string"
+          ? signalInputs.observatoryDataQualityStatus
+          : "UNOBSERVED"
+    };
   });
 
   if (selected.length >= 4) {
@@ -559,20 +598,48 @@ export const rankResearchCandidates = (input: CandidateRankingInput): CandidateR
     }
   }
 
-  return { candidates: selected, warnings };
+  return { candidates: selected, decisions, warnings };
 };
 
-export const persistRankedCandidates = (input: {
+export const persistCandidateDecisions = (input: {
   researchRunId: string;
-  candidates: Omit<PaperTradeCandidateRow, "researchRunId">[];
-}): PaperTradeCandidateRow[] => {
-  const rows = input.candidates.map((candidate): PaperTradeCandidateRow => ({
-    ...candidate,
+  decisions: CandidateDecisionRecord[];
+}) => {
+  const researchRun = queryOne<{ config_json: string }>(
+    "SELECT config_json FROM research_runs WHERE id = ?",
+    [input.researchRunId]
+  );
+  let researchConfig: Record<string, unknown> = {};
+  if (researchRun?.config_json) {
+    try {
+      const parsed = JSON.parse(researchRun.config_json) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        researchConfig = parsed as Record<string, unknown>;
+      }
+    } catch {
+      researchConfig = {};
+    }
+  }
+  const strategyConfigHash = hashAllowlistedConfig(researchConfig, [
+    "barLookbackDays",
+    "maxCandidates",
+    "maxPerDirection",
+    "maxPerExpression",
+    "maxPerSymbol",
+    "optionsEnabled",
+    "requireSectorDiversity",
+    "riskProfile",
+    "useAlpacaAssets"
+  ]);
+  const rows = input.decisions.map((decision) => ({
+    ...decision,
     researchRunId: input.researchRunId
   }));
   const insert = getDb().prepare(`
     INSERT INTO paper_trade_candidates(
       id,
+      decision_id,
+      decision_linkage_status,
       research_run_id,
       symbol,
       as_of,
@@ -600,14 +667,26 @@ export const persistRankedCandidates = (input: {
       option_outperformance_accuracy,
       option_symbol,
       strike,
-      short_strike
+      short_strike,
+      decision,
+      decision_reason,
+      strategy_family,
+      signal_inputs_json,
+      data_quality_status
     ) VALUES (
-      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-    )
+      ?, ?, 'EXACT', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+      ?, ?, ?, ?, ?, ?, ?, ?
+    ) ON CONFLICT(id) DO NOTHING
   `);
+  const persistedRows: Array<(typeof rows)[number] & { decisionId: DecisionId }> = [];
   for (const row of rows) {
+    const existing = getDb()
+      .prepare("SELECT decision_id FROM paper_trade_candidates WHERE id = ?")
+      .get(row.id) as { decision_id: string | null } | undefined;
+    const decisionId = existing?.decision_id ?? createDecisionId();
     insert.run(
       row.id,
+      decisionId,
       row.researchRunId,
       row.symbol,
       row.asOf,
@@ -635,8 +714,114 @@ export const persistRankedCandidates = (input: {
       row.optionOutperformanceAccuracy,
       row.optionSymbol ?? null,
       row.strike ?? null,
-      row.shortStrike ?? null
+      row.shortStrike ?? null,
+      row.decision,
+      row.decisionReason,
+      row.strategyFamily,
+      JSON.stringify(row.signalInputs),
+      row.dataQualityStatus
     );
+    const persisted = getDb()
+      .prepare("SELECT decision_id FROM paper_trade_candidates WHERE id = ?")
+      .get(row.id) as { decision_id: string };
+    const persistedDecisionId = persisted.decision_id as DecisionId;
+    const status = row.decision.toUpperCase() as DecisionStatus;
+    const sourceTimestamp =
+      typeof row.signalInputs.observatorySourceTimestamp === "string"
+        ? row.signalInputs.observatorySourceTimestamp
+        : null;
+    const marketDataRequestId =
+      typeof row.signalInputs.observatoryRequestId === "string"
+        ? row.signalInputs.observatoryRequestId
+        : null;
+    const feed =
+      typeof row.signalInputs.observatoryEffectiveFeed === "string"
+        ? row.signalInputs.observatoryEffectiveFeed
+        : null;
+    const close =
+      typeof row.signalInputs.close === "number" ? row.signalInputs.close : null;
+    const riskConfigHash = hashAllowlistedConfig(
+      {
+        riskProfile: row.riskProfile,
+        estimatedMaxLoss: row.estimatedMaxLoss,
+        estimatedMaxProfit: row.estimatedMaxProfit
+      },
+      ["estimatedMaxLoss", "estimatedMaxProfit", "riskProfile"]
+    );
+
+    persistDecisionSnapshot({
+      decisionId: persistedDecisionId,
+      originType: "paper_trade_candidate",
+      originId: row.id,
+      decisionRole: row.decision === "selected" ? "entry" : "non_executable",
+      candidateId: row.id,
+      createdAt: row.asOf,
+      strategyFamily: row.strategyFamily,
+      symbol: row.symbol,
+      underlyingSymbol: row.optionSymbol ? row.symbol : null,
+      optionSymbol: row.optionSymbol ?? null,
+      researchRunId: row.researchRunId,
+      candidateRank: row.rank,
+      candidateStatus: row.decision,
+      decisionStatus: status,
+      score: row.score,
+      confidence: row.confidence,
+      reasonCodes: [row.decisionReason],
+      rationale: row.rationale,
+      signalInputs: row.signalInputs,
+      marketState: { close, feed, sourceTimestamp },
+      instrumentState: {
+        optionSymbol: row.optionSymbol ?? null,
+        shortStrike: row.shortStrike ?? null,
+        strike: row.strike ?? null
+      },
+      riskState: {
+        estimatedMaxLoss: row.estimatedMaxLoss,
+        estimatedMaxProfit: row.estimatedMaxProfit,
+        riskProfile: row.riskProfile
+      },
+      dataQualityStatus: row.dataQualityStatus,
+      sourceTimestamps: {
+        candidateAsOf: row.asOf,
+        marketDataSource: sourceTimestamp
+      },
+      environment: process.env.ALPACA_ENV === "live" ? "live" : "paper",
+      configAllowlistVersion: "phase1b-v1",
+      strategyConfigHash,
+      riskConfigHash,
+      marketDataRequestId,
+      feed
+    });
+    appendDecisionLifecycleEvent({
+      decisionId: persistedDecisionId,
+      status,
+      reasonCodes: [row.decisionReason],
+      occurredAt: row.asOf,
+      sourceType: "paper_trade_candidate",
+      sourceId: row.id,
+      evidence: {
+        candidateId: row.id,
+        dataQualityStatus: row.dataQualityStatus,
+        researchRunId: row.researchRunId
+      }
+    });
+    persistedRows.push({ ...row, decisionId: persistedDecisionId });
   }
-  return rows;
+  return persistedRows;
 };
+
+export const persistRankedCandidates = (input: {
+  researchRunId: string;
+  candidates: Omit<PaperTradeCandidateRow, "researchRunId">[];
+}): PaperTradeCandidateRow[] =>
+  persistCandidateDecisions({
+    researchRunId: input.researchRunId,
+    decisions: input.candidates.map((candidate) => ({
+      ...candidate,
+      decision: "selected",
+      decisionReason: "RANKED_SELECTED",
+      strategyFamily: candidate.preferredExpression,
+      signalInputs: {},
+      dataQualityStatus: "UNOBSERVED"
+    }))
+  });

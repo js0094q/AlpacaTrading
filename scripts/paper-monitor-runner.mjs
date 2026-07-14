@@ -10,6 +10,11 @@ import {
 import { dirname } from "node:path";
 
 const TASKS = {
+  observatory: {
+    command: ["npm", ["run", "observatory:collect"]],
+    lockFile: "/tmp/alpaca-market-observatory.lock",
+    requireExecution: false
+  },
   review: {
     command: ["npm", ["run", "paper:ops:morning", "--", "--format=json"]],
     lockFile: "/tmp/alpaca-paper-monitor-review.lock",

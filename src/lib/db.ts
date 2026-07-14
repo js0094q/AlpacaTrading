@@ -33,6 +33,16 @@ CREATE TABLE IF NOT EXISTS universe_symbols (
   enabled INTEGER NOT NULL DEFAULT 1,
   source TEXT NOT NULL,
   tradable INTEGER NOT NULL DEFAULT 1,
+  asset_id TEXT,
+  asset_status TEXT,
+  exchange TEXT,
+  fractionable INTEGER,
+  shortable INTEGER,
+  marginable INTEGER,
+  options_enabled INTEGER,
+  asset_attributes_json TEXT,
+  asset_validated_at TEXT,
+  asset_request_id TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -52,6 +62,83 @@ CREATE TABLE IF NOT EXISTS market_bars (
 
 CREATE INDEX IF NOT EXISTS idx_market_bars_symbol_timeframe_timestamp
   ON market_bars(symbol, timeframe, timestamp);
+
+CREATE TABLE IF NOT EXISTS stock_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ingestion_run_id INTEGER,
+  symbol TEXT NOT NULL,
+  observed_at TEXT NOT NULL,
+  source_timestamp TEXT,
+  requested_feed TEXT NOT NULL,
+  effective_feed TEXT NOT NULL,
+  currency TEXT,
+  latest_trade_price REAL,
+  latest_trade_size REAL,
+  latest_trade_exchange TEXT,
+  latest_trade_conditions_json TEXT NOT NULL,
+  trade_timestamp TEXT,
+  bid_price REAL,
+  ask_price REAL,
+  bid_size REAL,
+  ask_size REAL,
+  bid_exchange TEXT,
+  ask_exchange TEXT,
+  quote_conditions_json TEXT NOT NULL,
+  quote_timestamp TEXT,
+  midpoint REAL,
+  spread REAL,
+  spread_pct REAL,
+  minute_timestamp TEXT,
+  minute_open REAL,
+  minute_high REAL,
+  minute_low REAL,
+  minute_close REAL,
+  minute_volume REAL,
+  minute_trade_count REAL,
+  minute_vwap REAL,
+  daily_timestamp TEXT,
+  daily_open REAL,
+  daily_high REAL,
+  daily_low REAL,
+  daily_close REAL,
+  daily_volume REAL,
+  daily_trade_count REAL,
+  daily_vwap REAL,
+  previous_daily_timestamp TEXT,
+  previous_daily_open REAL,
+  previous_daily_high REAL,
+  previous_daily_low REAL,
+  previous_daily_close REAL,
+  previous_daily_volume REAL,
+  previous_daily_trade_count REAL,
+  previous_daily_vwap REAL,
+  daily_return REAL,
+  gap_from_previous_close REAL,
+  return_from_open REAL,
+  distance_from_vwap REAL,
+  intraday_range REAL,
+  relative_current_day_volume REAL,
+  freshness_status TEXT NOT NULL,
+  data_quality_status TEXT NOT NULL,
+  source TEXT NOT NULL,
+  request_id TEXT,
+  error_summary TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_stock_snapshots_dedupe
+  ON stock_snapshots(symbol, requested_feed, source_timestamp);
+
+CREATE INDEX IF NOT EXISTS idx_stock_snapshots_symbol_observed
+  ON stock_snapshots(symbol, observed_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_stock_snapshots_freshness
+  ON stock_snapshots(freshness_status);
+
+CREATE INDEX IF NOT EXISTS idx_stock_snapshots_source_timestamp
+  ON stock_snapshots(source_timestamp);
+
+CREATE INDEX IF NOT EXISTS idx_stock_snapshots_ingestion_run
+  ON stock_snapshots(ingestion_run_id);
 
 CREATE TABLE IF NOT EXISTS option_contracts (
   underlying_symbol TEXT NOT NULL,
@@ -148,7 +235,11 @@ CREATE TABLE IF NOT EXISTS ingestion_runs (
   started_at TEXT NOT NULL,
   completed_at TEXT,
   rows_ingested INTEGER NOT NULL DEFAULT 0,
-  notes TEXT
+  notes TEXT,
+  requested_symbols INTEGER NOT NULL DEFAULT 0,
+  successful_symbols INTEGER NOT NULL DEFAULT 0,
+  failed_symbols INTEGER NOT NULL DEFAULT 0,
+  error_summary TEXT
 );
 
 CREATE TABLE IF NOT EXISTS backtest_runs (
@@ -254,6 +345,11 @@ CREATE TABLE IF NOT EXISTS paper_trade_candidates (
   option_symbol TEXT,
   strike REAL,
   short_strike REAL,
+  decision TEXT NOT NULL DEFAULT 'selected',
+  decision_reason TEXT,
+  strategy_family TEXT,
+  signal_inputs_json TEXT NOT NULL DEFAULT '{}',
+  data_quality_status TEXT NOT NULL DEFAULT 'UNOBSERVED',
   FOREIGN KEY(research_run_id) REFERENCES research_runs(id) ON DELETE CASCADE
 );
 
@@ -543,6 +639,220 @@ CREATE INDEX IF NOT EXISTS idx_portfolio_beta_cache_expires_at
   ON portfolio_beta_cache(expires_at);
 `;
 
+const phase1BSchema = `
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version TEXT PRIMARY KEY,
+  applied_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS decision_snapshots (
+  decision_id TEXT PRIMARY KEY,
+  origin_type TEXT NOT NULL,
+  origin_id TEXT NOT NULL,
+  decision_role TEXT NOT NULL,
+  candidate_id TEXT,
+  position_lifecycle_id TEXT,
+  created_at TEXT NOT NULL,
+  strategy_family TEXT,
+  symbol TEXT,
+  underlying_symbol TEXT,
+  option_symbol TEXT,
+  research_run_id TEXT,
+  candidate_rank INTEGER,
+  candidate_status TEXT,
+  decision_status TEXT NOT NULL,
+  score REAL,
+  confidence REAL,
+  reason_codes_json TEXT NOT NULL,
+  rationale TEXT,
+  signal_inputs_json TEXT NOT NULL,
+  market_state_json TEXT,
+  instrument_state_json TEXT,
+  portfolio_state_json TEXT,
+  risk_state_json TEXT,
+  data_quality_status TEXT NOT NULL,
+  source_timestamps_json TEXT NOT NULL,
+  environment TEXT NOT NULL,
+  git_sha TEXT,
+  config_allowlist_version TEXT NOT NULL,
+  strategy_config_hash TEXT,
+  risk_config_hash TEXT,
+  broker_request_id TEXT,
+  market_data_request_id TEXT,
+  feed TEXT,
+  UNIQUE(origin_type, origin_id, decision_role)
+);
+
+CREATE INDEX IF NOT EXISTS idx_decision_snapshots_candidate
+  ON decision_snapshots(candidate_id);
+CREATE INDEX IF NOT EXISTS idx_decision_snapshots_position
+  ON decision_snapshots(position_lifecycle_id);
+CREATE INDEX IF NOT EXISTS idx_decision_snapshots_symbol_created
+  ON decision_snapshots(symbol, created_at);
+CREATE INDEX IF NOT EXISTS idx_decision_snapshots_research
+  ON decision_snapshots(research_run_id);
+
+CREATE TABLE IF NOT EXISTS decision_lifecycle_events (
+  event_id TEXT PRIMARY KEY,
+  decision_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  reason_codes_json TEXT NOT NULL,
+  occurred_at TEXT NOT NULL,
+  source_type TEXT NOT NULL,
+  source_id TEXT NOT NULL,
+  evidence_json TEXT NOT NULL,
+  UNIQUE(decision_id, status, source_type, source_id),
+  FOREIGN KEY(decision_id) REFERENCES decision_snapshots(decision_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_decision_lifecycle_events_decision
+  ON decision_lifecycle_events(decision_id, occurred_at);
+
+CREATE TABLE IF NOT EXISTS paper_review_decisions (
+  artifact_id TEXT NOT NULL,
+  section TEXT NOT NULL,
+  payload_index INTEGER NOT NULL,
+  decision_id TEXT NOT NULL,
+  decision_role TEXT NOT NULL,
+  PRIMARY KEY(artifact_id, section, payload_index, decision_id),
+  FOREIGN KEY(artifact_id) REFERENCES paper_review_artifacts(id),
+  FOREIGN KEY(decision_id) REFERENCES decision_snapshots(decision_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_review_decisions_decision
+  ON paper_review_decisions(decision_id);
+
+CREATE TABLE IF NOT EXISTS paper_positions (
+  position_lifecycle_id TEXT PRIMARY KEY,
+  entry_decision_id TEXT NOT NULL,
+  terminal_exit_decision_id TEXT,
+  symbol TEXT NOT NULL,
+  option_symbol TEXT,
+  asset_class TEXT NOT NULL,
+  side TEXT NOT NULL,
+  broker_entry_order_id TEXT,
+  entry_client_order_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  opened_at TEXT NOT NULL,
+  closed_at TEXT,
+  entry_quantity REAL,
+  entry_price REAL,
+  linkage_status TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(entry_client_order_id),
+  FOREIGN KEY(entry_decision_id) REFERENCES decision_snapshots(decision_id),
+  FOREIGN KEY(terminal_exit_decision_id) REFERENCES decision_snapshots(decision_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_positions_symbol_status
+  ON paper_positions(symbol, status);
+CREATE INDEX IF NOT EXISTS idx_paper_positions_entry_decision
+  ON paper_positions(entry_decision_id);
+CREATE INDEX IF NOT EXISTS idx_paper_positions_broker_order
+  ON paper_positions(broker_entry_order_id);
+
+CREATE TABLE IF NOT EXISTS paper_position_observations (
+  observation_id TEXT PRIMARY KEY,
+  broker_symbol_key TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  option_symbol TEXT,
+  observed_at TEXT NOT NULL,
+  source_timestamp TEXT,
+  broker_request_id TEXT,
+  market_data_request_id TEXT,
+  feed TEXT,
+  underlying_price REAL,
+  bid REAL,
+  ask REAL,
+  midpoint REAL,
+  mark REAL,
+  quantity REAL,
+  average_entry_price REAL,
+  market_value REAL,
+  unrealized_pnl REAL,
+  unrealized_return REAL,
+  realized_pnl REAL,
+  delta REAL,
+  gamma REAL,
+  theta REAL,
+  vega REAL,
+  rho REAL,
+  implied_volatility REAL,
+  quote_freshness TEXT,
+  data_quality_status TEXT NOT NULL,
+  portfolio_state_json TEXT,
+  risk_state_json TEXT,
+  evidence_hash TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_position_observations_symbol_time
+  ON paper_position_observations(symbol, observed_at);
+
+CREATE TABLE IF NOT EXISTS paper_position_observation_links (
+  observation_id TEXT NOT NULL,
+  position_lifecycle_id TEXT NOT NULL,
+  decision_id TEXT,
+  linkage_status TEXT NOT NULL,
+  PRIMARY KEY(observation_id, position_lifecycle_id),
+  FOREIGN KEY(observation_id) REFERENCES paper_position_observations(observation_id),
+  FOREIGN KEY(position_lifecycle_id) REFERENCES paper_positions(position_lifecycle_id),
+  FOREIGN KEY(decision_id) REFERENCES decision_snapshots(decision_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_position_observation_links_lifecycle
+  ON paper_position_observation_links(position_lifecycle_id, observation_id);
+
+CREATE TABLE IF NOT EXISTS paper_position_outcomes (
+  outcome_id TEXT PRIMARY KEY,
+  position_lifecycle_id TEXT NOT NULL UNIQUE,
+  entry_decision_id TEXT NOT NULL,
+  exit_decision_id TEXT,
+  terminal_status TEXT NOT NULL,
+  closed_at TEXT NOT NULL,
+  entry_price REAL,
+  exit_price REAL,
+  quantity REAL,
+  realized_pnl REAL,
+  realized_return_pct REAL,
+  unrealized_return_pct REAL,
+  option_position_return_pct REAL,
+  underlying_return_pct REAL,
+  holding_duration_ms INTEGER,
+  mfe_pct REAL,
+  mae_pct REAL,
+  time_to_mfe_ms INTEGER,
+  time_to_mae_ms INTEGER,
+  time_to_first_profit_ms INTEGER,
+  maximum_runup_pct REAL,
+  maximum_drawdown_pct REAL,
+  exit_reason_code TEXT,
+  data_quality_status TEXT NOT NULL,
+  completeness_status TEXT NOT NULL,
+  evaluation_reason TEXT,
+  calculation_basis TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(position_lifecycle_id) REFERENCES paper_positions(position_lifecycle_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_position_outcomes_entry_decision
+  ON paper_position_outcomes(entry_decision_id);
+
+CREATE TABLE IF NOT EXISTS paper_position_outcome_revisions (
+  revision_id TEXT PRIMARY KEY,
+  outcome_id TEXT NOT NULL,
+  revision_number INTEGER NOT NULL,
+  supersedes_revision_id TEXT,
+  correction_reason TEXT NOT NULL,
+  corrected_fields_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(outcome_id, revision_number),
+  FOREIGN KEY(outcome_id) REFERENCES paper_position_outcomes(outcome_id),
+  FOREIGN KEY(supersedes_revision_id) REFERENCES paper_position_outcome_revisions(revision_id)
+);
+`;
+
 let database: DbHandle | null = null;
 
 const addColumnIfMissing = (db: DbHandle, table: string, column: string, ddl: string) => {
@@ -555,7 +865,190 @@ const addColumnIfMissing = (db: DbHandle, table: string, column: string, ddl: st
   db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
 };
 
+const tableExists = (db: DbHandle, table: string) =>
+  Boolean(
+    db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
+      .get(table)
+  );
+
+const addPhase1BColumn = (
+  db: DbHandle,
+  table: string,
+  column: string,
+  ddl: string
+) => {
+  if (tableExists(db, table)) {
+    addColumnIfMissing(db, table, column, ddl);
+  }
+};
+
+const exactCandidateBackfill = (
+  db: DbHandle,
+  table: string,
+  candidateColumn: string
+) => {
+  if (!tableExists(db, table) || !tableExists(db, "paper_trade_candidates")) {
+    return;
+  }
+  db.exec(`
+    UPDATE ${table}
+    SET decision_id = (
+          SELECT c.decision_id
+          FROM paper_trade_candidates c
+          WHERE c.id = ${table}.${candidateColumn}
+        ),
+        decision_linkage_status = 'EXACT_LEGACY_REUSE'
+    WHERE decision_id IS NULL
+      AND EXISTS (
+        SELECT 1
+        FROM paper_trade_candidates c
+        WHERE c.id = ${table}.${candidateColumn}
+          AND c.decision_id IS NOT NULL
+      );
+  `);
+};
+
+export const runPhase1BMigrations = (db: DbHandle) => {
+  db.exec("BEGIN IMMEDIATE;");
+  try {
+    db.exec(phase1BSchema);
+
+    addPhase1BColumn(db, "paper_trade_candidates", "decision_id", "decision_id TEXT");
+    addPhase1BColumn(
+      db,
+      "paper_trade_candidates",
+      "decision_linkage_status",
+      "decision_linkage_status TEXT NOT NULL DEFAULT 'LEGACY_UNLINKED'"
+    );
+    addPhase1BColumn(db, "paper_trade_plans", "decision_id", "decision_id TEXT");
+    addPhase1BColumn(
+      db,
+      "paper_trade_plans",
+      "decision_linkage_status",
+      "decision_linkage_status TEXT NOT NULL DEFAULT 'LEGACY_UNLINKED'"
+    );
+    addPhase1BColumn(db, "paper_trade_evaluations", "decision_id", "decision_id TEXT");
+    addPhase1BColumn(
+      db,
+      "paper_trade_evaluations",
+      "decision_linkage_status",
+      "decision_linkage_status TEXT NOT NULL DEFAULT 'LEGACY_UNLINKED'"
+    );
+    addPhase1BColumn(db, "paper_execution_ledger", "decision_id", "decision_id TEXT");
+    addPhase1BColumn(db, "paper_execution_ledger", "position_lifecycle_id", "position_lifecycle_id TEXT");
+    addPhase1BColumn(
+      db,
+      "paper_execution_ledger",
+      "decision_linkage_status",
+      "decision_linkage_status TEXT NOT NULL DEFAULT 'LEGACY_UNLINKED'"
+    );
+    addPhase1BColumn(db, "paper_learning_records", "decision_id", "decision_id TEXT");
+    addPhase1BColumn(db, "paper_learning_records", "entry_decision_id", "entry_decision_id TEXT");
+    addPhase1BColumn(db, "paper_learning_records", "exit_decision_id", "exit_decision_id TEXT");
+    addPhase1BColumn(db, "paper_learning_records", "position_lifecycle_id", "position_lifecycle_id TEXT");
+    addPhase1BColumn(db, "paper_learning_records", "outcome_id", "outcome_id TEXT");
+    addPhase1BColumn(
+      db,
+      "paper_learning_records",
+      "effective_outcome_revision_id",
+      "effective_outcome_revision_id TEXT"
+    );
+    addPhase1BColumn(
+      db,
+      "paper_learning_records",
+      "outcome_completeness_status",
+      "outcome_completeness_status TEXT"
+    );
+    addPhase1BColumn(
+      db,
+      "paper_learning_records",
+      "decision_linkage_status",
+      "decision_linkage_status TEXT NOT NULL DEFAULT 'LEGACY_UNLINKED'"
+    );
+    addPhase1BColumn(db, "hedge_execution_reviews", "decision_id", "decision_id TEXT");
+    addPhase1BColumn(db, "hedge_execution_reviews", "decision_role", "decision_role TEXT");
+    addPhase1BColumn(db, "hedge_execution_reviews", "position_lifecycle_id", "position_lifecycle_id TEXT");
+    addPhase1BColumn(
+      db,
+      "hedge_execution_reviews",
+      "decision_linkage_status",
+      "decision_linkage_status TEXT NOT NULL DEFAULT 'LEGACY_UNLINKED'"
+    );
+    addPhase1BColumn(db, "hedge_learning_events", "decision_id", "decision_id TEXT");
+    addPhase1BColumn(db, "hedge_learning_events", "position_lifecycle_id", "position_lifecycle_id TEXT");
+    addPhase1BColumn(
+      db,
+      "hedge_learning_events",
+      "decision_linkage_status",
+      "decision_linkage_status TEXT NOT NULL DEFAULT 'LEGACY_UNLINKED'"
+    );
+
+    if (tableExists(db, "paper_trade_candidates")) {
+      db.exec(`
+        UPDATE paper_trade_candidates
+        SET decision_id = id,
+            decision_linkage_status = 'EXACT_LEGACY_REUSE'
+        WHERE decision_id IS NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_trade_candidates_decision_id
+          ON paper_trade_candidates(decision_id)
+          WHERE decision_id IS NOT NULL;
+      `);
+    }
+    exactCandidateBackfill(db, "paper_trade_plans", "candidate_id");
+    exactCandidateBackfill(db, "paper_trade_evaluations", "candidate_id");
+    exactCandidateBackfill(db, "paper_execution_ledger", "source_candidate_id");
+    exactCandidateBackfill(db, "paper_learning_records", "source_candidate_id");
+
+    const indexStatements = [
+      ["paper_trade_plans", "CREATE INDEX IF NOT EXISTS idx_paper_trade_plans_decision_id ON paper_trade_plans(decision_id)"],
+      ["paper_trade_evaluations", "CREATE INDEX IF NOT EXISTS idx_paper_trade_evaluations_decision_id ON paper_trade_evaluations(decision_id)"],
+      ["paper_execution_ledger", "CREATE INDEX IF NOT EXISTS idx_paper_execution_decision_id ON paper_execution_ledger(decision_id)"],
+      ["paper_execution_ledger", "CREATE INDEX IF NOT EXISTS idx_paper_execution_position_lifecycle ON paper_execution_ledger(position_lifecycle_id)"],
+      ["paper_learning_records", "CREATE INDEX IF NOT EXISTS idx_paper_learning_decision_id ON paper_learning_records(decision_id)"],
+      ["paper_learning_records", "CREATE INDEX IF NOT EXISTS idx_paper_learning_entry_decision_id ON paper_learning_records(entry_decision_id)"],
+      ["paper_learning_records", "CREATE INDEX IF NOT EXISTS idx_paper_learning_position_lifecycle ON paper_learning_records(position_lifecycle_id)"],
+      ["paper_learning_records", "CREATE INDEX IF NOT EXISTS idx_paper_learning_outcome_id ON paper_learning_records(outcome_id)"],
+      ["hedge_execution_reviews", "CREATE INDEX IF NOT EXISTS idx_hedge_execution_reviews_decision_id ON hedge_execution_reviews(decision_id)"],
+      ["hedge_learning_events", "CREATE INDEX IF NOT EXISTS idx_hedge_learning_events_decision_id ON hedge_learning_events(decision_id)"]
+    ] as const;
+    for (const [table, sql] of indexStatements) {
+      if (tableExists(db, table)) {
+        db.exec(sql);
+      }
+    }
+
+    db.prepare(`
+      INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+      VALUES ('2026-07-13-market-observatory-phase-1b', ?)
+    `).run(new Date().toISOString());
+    db.exec("COMMIT;");
+  } catch (error) {
+    db.exec("ROLLBACK;");
+    throw error;
+  }
+};
+
 const runMigrations = (db: DbHandle) => {
+  addColumnIfMissing(db, "universe_symbols", "asset_id", "asset_id TEXT");
+  addColumnIfMissing(db, "universe_symbols", "asset_status", "asset_status TEXT");
+  addColumnIfMissing(db, "universe_symbols", "exchange", "exchange TEXT");
+  addColumnIfMissing(db, "universe_symbols", "fractionable", "fractionable INTEGER");
+  addColumnIfMissing(db, "universe_symbols", "shortable", "shortable INTEGER");
+  addColumnIfMissing(db, "universe_symbols", "marginable", "marginable INTEGER");
+  addColumnIfMissing(db, "universe_symbols", "options_enabled", "options_enabled INTEGER");
+  addColumnIfMissing(db, "universe_symbols", "asset_attributes_json", "asset_attributes_json TEXT");
+  addColumnIfMissing(db, "universe_symbols", "asset_validated_at", "asset_validated_at TEXT");
+  addColumnIfMissing(db, "universe_symbols", "asset_request_id", "asset_request_id TEXT");
+  addColumnIfMissing(db, "ingestion_runs", "requested_symbols", "requested_symbols INTEGER NOT NULL DEFAULT 0");
+  addColumnIfMissing(db, "ingestion_runs", "successful_symbols", "successful_symbols INTEGER NOT NULL DEFAULT 0");
+  addColumnIfMissing(db, "ingestion_runs", "failed_symbols", "failed_symbols INTEGER NOT NULL DEFAULT 0");
+  addColumnIfMissing(db, "ingestion_runs", "error_summary", "error_summary TEXT");
+  addColumnIfMissing(db, "paper_trade_candidates", "decision", "decision TEXT NOT NULL DEFAULT 'selected'");
+  addColumnIfMissing(db, "paper_trade_candidates", "decision_reason", "decision_reason TEXT");
+  addColumnIfMissing(db, "paper_trade_candidates", "strategy_family", "strategy_family TEXT");
+  addColumnIfMissing(db, "paper_trade_candidates", "signal_inputs_json", "signal_inputs_json TEXT NOT NULL DEFAULT '{}'");
+  addColumnIfMissing(db, "paper_trade_candidates", "data_quality_status", "data_quality_status TEXT NOT NULL DEFAULT 'UNOBSERVED'");
   addColumnIfMissing(db, "option_snapshots", "quote_status", "quote_status TEXT");
   addColumnIfMissing(db, "option_snapshots", "executable", "executable INTEGER NOT NULL DEFAULT 0");
   addColumnIfMissing(db, "option_snapshots", "executable_price", "executable_price REAL");
@@ -591,6 +1084,15 @@ const runMigrations = (db: DbHandle) => {
   addColumnIfMissing(db, "paper_learning_records", "source_plan_timestamp", "source_plan_timestamp TEXT");
 };
 
+export const initializeDatabaseHandle = (db: DbHandle): DbHandle => {
+  db.exec("PRAGMA busy_timeout = 5000;");
+  db.exec(tableSchema);
+  runMigrations(db);
+  runPhase1BMigrations(db);
+  runZeroDteMigrations(db);
+  return db;
+};
+
 const initialize = (): DbHandle => {
   if (database) {
     return database;
@@ -602,11 +1104,7 @@ const initialize = (): DbHandle => {
   }
 
   mkdirSync(dirname(dbPath), { recursive: true });
-  const db = new DatabaseSync(dbPath);
-  db.exec("PRAGMA busy_timeout = 5000;");
-  db.exec(tableSchema);
-  runMigrations(db);
-  runZeroDteMigrations(db);
+  const db = initializeDatabaseHandle(new DatabaseSync(dbPath));
   database = db;
   return db;
 };

@@ -2,6 +2,7 @@ import { recordApiRequest } from "../apiLog.js";
 import { config } from "../../config.js";
 import { assertReadOnlyAlpacaAccessAllowed } from "../tradingSafetyService.js";
 import type { Timeframe } from "../../types.js";
+import type { StockSnapshotRaw } from "../stockSnapshotNormalizer.js";
 
 export interface RawBar {
   t: string;
@@ -304,6 +305,22 @@ const parseOptionQuotePayload = (
   return result;
 };
 
+const parseStockSnapshotPayload = (payload: unknown): Record<string, StockSnapshotRaw> => {
+  if (!payload || typeof payload !== "object") {
+    return {};
+  }
+  const value = payload as {
+    snapshots?: Record<string, StockSnapshotRaw>;
+    data?: Record<string, StockSnapshotRaw>;
+  };
+  const map = value.snapshots ?? value.data ?? payload as Record<string, StockSnapshotRaw>;
+  return Object.fromEntries(
+    Object.entries(map)
+      .filter(([symbol, snapshot]) => symbol.trim().length > 0 && snapshot && typeof snapshot === "object")
+      .map(([symbol, snapshot]) => [symbol.trim().toUpperCase(), snapshot])
+  );
+};
+
 const dateOnly = (value: Date = new Date()) => value.toISOString().slice(0, 10);
 
 const dateOnlyFromDays = (days: number) => {
@@ -594,6 +611,69 @@ export const fetchOptionQuotes = async (
       }))
     );
   }
+  return results;
+};
+
+export interface FetchedStockSnapshot {
+  symbol: string;
+  raw: StockSnapshotRaw | null;
+  requestedFeed: string;
+  effectiveFeed: string;
+  currency: string | null;
+  requestId: string | null;
+  error?: "SOURCE_SYMBOL_MISSING" | "STOCK_SNAPSHOT_REQUEST_FAILED";
+}
+
+export const fetchStockSnapshots = async (input: {
+  symbols: string[];
+  feed: string;
+  currency?: string;
+}): Promise<FetchedStockSnapshot[]> => {
+  const symbols = Array.from(
+    new Set(input.symbols.map((symbol) => symbol.trim().toUpperCase()).filter(Boolean))
+  );
+  const requestedFeed = input.feed.trim().toLowerCase();
+  const currency = input.currency?.trim().toUpperCase() || null;
+  const results: FetchedStockSnapshot[] = [];
+  const chunkSize = 100;
+
+  for (let index = 0; index < symbols.length; index += chunkSize) {
+    const chunk = symbols.slice(index, index + chunkSize);
+    const endpoint = `/v2/stocks/snapshots?${toSearchParams({
+      symbols: chunk.join(","),
+      feed: requestedFeed,
+      currency
+    })}`;
+    try {
+      const response = await requestJson<unknown>(endpoint, { method: "GET" });
+      const snapshots = parseStockSnapshotPayload(response.data);
+      for (const symbol of chunk) {
+        const raw = snapshots[symbol] ?? null;
+        results.push({
+          symbol,
+          raw,
+          requestedFeed,
+          effectiveFeed: requestedFeed,
+          currency,
+          requestId: response.requestId,
+          ...(raw ? {} : { error: "SOURCE_SYMBOL_MISSING" as const })
+        });
+      }
+    } catch {
+      for (const symbol of chunk) {
+        results.push({
+          symbol,
+          raw: null,
+          requestedFeed,
+          effectiveFeed: requestedFeed,
+          currency,
+          requestId: null,
+          error: "STOCK_SNAPSHOT_REQUEST_FAILED"
+        });
+      }
+    }
+  }
+
   return results;
 };
 

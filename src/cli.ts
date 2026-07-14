@@ -3,6 +3,7 @@ loadDotenv();
 loadDotenv({ path: ".env.txt", override: false });
 import { addTicker, getActiveUniverse, getAllUniverse, removeTicker, setTickerEnabled, seedInitialUniverse } from "./services/universeService.js";
 import { ingestBars } from "./services/marketDataIngest.js";
+import { runStockObservation } from "./services/stockObservationService.js";
 import { ingestOptionContracts, ingestOptionSnapshots } from "./services/optionsService.js";
 import { buildFeatures } from "./services/featureService.js";
 import { generateTargets, getTargets } from "./services/targetService.js";
@@ -106,6 +107,11 @@ import {
 } from "./services/hedgeExitService.js";
 import { evaluateHedgeLearning } from "./services/hedgeLearningLifecycleService.js";
 import {
+  migrateDatabaseFile,
+  verifyDatabaseFile
+} from "./services/databaseMaintenanceService.js";
+import { buildMarketDecisionTrace } from "./services/marketDecisionTraceService.js";
+import {
   buildZeroDteSummary,
   runZeroDteEodSummary,
   runZeroDteEngine,
@@ -123,13 +129,14 @@ const parseArg = (input: string): Record<string, string> | null => {
 
 const parseArgs = (argv: string[]) => {
   const output: Record<string, string | undefined> = {};
-  argv.forEach((item) => {
+  argv.forEach((item, index) => {
     const parsed = parseArg(item);
     if (!parsed) {
       return;
     }
     const [key, value] = Object.entries(parsed)[0]!;
-    output[key] = value;
+    const following = argv[index + 1];
+    output[key] = value || (following && !following.startsWith("--") ? following : value);
   });
   return output;
 };
@@ -272,6 +279,24 @@ const formatPadded = (
 const buildSafeBoolean = (value?: boolean) => (value ? "true" : "false");
 
 const run = async () => {
+  if (command === "db:migrate") {
+    print(migrateDatabaseFile(args.database || undefined));
+    return;
+  }
+
+  if (command === "db:verify") {
+    print(verifyDatabaseFile(args.database || undefined));
+    return;
+  }
+
+  if (command === "paper:trace") {
+    if (!args.decisionId) {
+      throw new Error("PAPER_TRACE_DECISION_ID_REQUIRED");
+    }
+    print(buildMarketDecisionTrace(args.decisionId));
+    return;
+  }
+
   if (command === "universe") {
     if (action === "seed") {
       const result = await seedInitialUniverse();
@@ -313,6 +338,19 @@ const run = async () => {
       end: args.end
     });
     print(result);
+    return;
+  }
+
+  if (command === "observatory" && action === "collect") {
+    const result = await runStockObservation({
+      symbols: parseList(args.symbols),
+      feed: args.feed,
+      currency: args.currency
+    });
+    print(result);
+    if (result.status === "failed") {
+      process.exitCode = 1;
+    }
     return;
   }
 
@@ -1510,7 +1548,7 @@ const run = async () => {
 
   print({
     error:
-      "Unknown command. See README for available commands including db:migrate/db:verify/universe/data/options/features/targets/backtest/learn/research/alpaca:config/paper/zero-dte (including zero-dte:engine, zero-dte:exit:review, zero-dte:reconcile, zero-dte:eod, zero-dte:summary).",
+      "Unknown command. See README for available commands including db:migrate/db:verify/universe/data/options/features/targets/backtest/learn/research/alpaca:config/paper/zero-dte (including paper:analytics, paper:learn, paper:trace, paper:execute, paper:execute:reviewed, paper:review, paper:plan, paper:portfolio:review, paper:exit:review, paper:exit:execute, paper:options:discover, paper:ops:morning, paper:ops:midday, paper:ops:late-day, paper:snapshots, paper:trends, paper:runtime, paper:intel, zero-dte:engine, zero-dte:exit:review, zero-dte:reconcile, zero-dte:eod, zero-dte:summary).",
     command,
     action,
     config

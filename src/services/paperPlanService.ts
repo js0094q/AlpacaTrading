@@ -606,7 +606,7 @@ const pickCandidates = (runId: string, maxCandidates: number): CandidateRow[] =>
       strike,
       short_strike
     FROM paper_trade_candidates
-    WHERE research_run_id = ?
+    WHERE research_run_id = ? AND decision = 'selected'
     ORDER BY rank ASC
     LIMIT ?
     `,

@@ -21,6 +21,14 @@ import { buildPaperReviewedPayloadExecutionReport } from "../src/services/paperR
 
 const resetDatabase = () => {
   resetSqliteTestDb(getDb(), `
+    DELETE FROM paper_position_outcome_revisions;
+    DELETE FROM paper_position_outcomes;
+    DELETE FROM paper_position_observation_links;
+    DELETE FROM paper_position_observations;
+    DELETE FROM paper_positions;
+    DELETE FROM paper_review_decisions;
+    DELETE FROM decision_lifecycle_events;
+    DELETE FROM decision_snapshots;
     DELETE FROM paper_review_artifacts;
     DELETE FROM paper_execution_ledger;
   `);
@@ -151,6 +159,74 @@ describe("reviewed payload execution", () => {
     assert.equal(report.summary.reviewedPayloads, 1);
     assert.deepEqual(submittedSymbols, ["MSFT"]);
     assert.equal(report.submitted[0]?.section, "equitySells");
+  });
+
+  test("creates an analytical lifecycle from an immediate exact entry fill", async () => {
+    createPaperReviewArtifact({
+      id: "review-filled-entry",
+      sourceAction: "paper.ops.review",
+      status: "success",
+      createdAt: "2026-07-08T14:00:00.000Z",
+      maxAgeMinutes: 60,
+      payloadSections: {
+        equityBuys: [
+          {
+            assetClass: "equity",
+            symbol: "AAPL",
+            side: "buy",
+            type: "market",
+            time_in_force: "day",
+            qty: "2",
+            client_order_id: "filled-entry-aapl",
+            dedupeKey: "filled-entry-aapl"
+          }
+        ],
+        equityAdds: [],
+        equitySells: [],
+        optionBuys: [],
+        optionSellToCloseExits: []
+      },
+      summary: {}
+    });
+
+    const report = await buildPaperReviewedPayloadExecutionReport(
+      { confirmPaper: true, sections: ["equityBuys"] },
+      {
+        now: () => "2026-07-08T14:05:00.000Z",
+        getAccount: async () => ({
+          data: { status: "ACTIVE" },
+          status: 200,
+          url: "https://paper-api.alpaca.markets/v2/account"
+        }),
+        submitPaperOrder: async () => ({
+          data: {
+            id: "broker-filled-entry",
+            status: "filled",
+            filled_qty: "2",
+            filled_avg_price: "201.25",
+            filled_at: "2026-07-08T14:05:01.000Z"
+          },
+          requestId: "fill-request-1",
+          status: 200,
+          url: "https://paper-api.alpaca.markets/v2/orders"
+        })
+      }
+    );
+
+    assert.equal(report.status, "submitted");
+    const lifecycle = getDb().prepare(`
+      SELECT p.entry_decision_id, p.entry_quantity, p.entry_price,
+             l.position_lifecycle_id, p.linkage_status
+      FROM paper_positions p
+      JOIN paper_execution_ledger l
+        ON l.position_lifecycle_id = p.position_lifecycle_id
+      WHERE p.entry_client_order_id = 'filled-entry-aapl'
+    `).get() as Record<string, unknown>;
+    assert.equal(lifecycle.entry_quantity, 2);
+    assert.equal(lifecycle.entry_price, 201.25);
+    assert.equal(lifecycle.linkage_status, "EXACT");
+    assert.equal(lifecycle.position_lifecycle_id !== null, true);
+    assert.equal(lifecycle.entry_decision_id !== null, true);
   });
 
   test("live trading enabled blocks reviewed LEAPS execution", async () => {

@@ -25,12 +25,19 @@ Do not print `/opt/alpaca-investing/secrets/alpaca.env`.
 
 ## Monitor Timers
 
+- `alpaca-market-observatory.timer`: wakes every 15 minutes on weekdays during
+  regular market-hour windows. It runs `npm run paper:monitor -- --task=observatory`
+  through a dedicated lock, performs a second Alpaca market-clock check, and is
+  broker-read-only.
 - `alpaca-paper-review.timer`: wakes every 30 minutes on weekdays during regular market-hour windows. Runs `npm run paper:monitor -- --task=review`, which executes `paper:ops:morning` after market-hours gating.
 - `alpaca-paper-execute.timer`: wakes five minutes after review windows. Runs reviewed entry execution only for `equityBuys`, `equityAdds`, and `optionBuys`.
 - `alpaca-paper-exit-review.timer`: wakes every 15 minutes during regular windows and every 5 minutes in the final hour. It evaluates equity exits, generic option exits, LEAPS sell discipline, and in the final hour uses `paper:ops:late-day` so 0DTE late-day exit review is active.
 - `alpaca-paper-exit-execute.timer`: wakes after exit review windows. Runs reviewed exit execution only for `equitySells` and `optionSellToCloseExits`.
 
-All monitor tasks no-op with `MARKET_CLOSED` outside regular market hours, weekends, and configured US market holidays.
+All monitor tasks no-op with `MARKET_CLOSED` outside regular market hours,
+weekends, and configured US market holidays. Observatory validation must account
+for all 51 symbols. Bounded symbol failures produce `PARTIAL` with structured
+reasons; silent omissions or systemic failures are deployment failures.
 
 ## Guardrails
 
@@ -70,11 +77,17 @@ sudo bash scripts/disable-paper-monitoring-systemd.sh
 Manual safe validation:
 
 ```bash
+npm run paper:monitor -- --task=observatory --dry-run
 npm run paper:monitor -- --task=review --dry-run
 npm run paper:monitor -- --task=execute --dry-run
 npm run paper:monitor -- --task=exit-review --dry-run
 npm run paper:monitor -- --task=exit-execute --dry-run
 npm run paper:review -- --riskProfile=aggressive --optionsEnabled=true --format=json
+npm run db:verify -- --database /path/to/research.db
 ```
+
+When a naturally filled position has exact lineage, inspect it with
+`npm run paper:trace -- --decisionId <uuid>`. Do not submit a paper order merely to
+create trace evidence.
 
 Do not manually run `paper:execute:reviewed -- --confirmPaper` or `paper:execute -- --confirmPaper` unless paper execution is explicitly approved.

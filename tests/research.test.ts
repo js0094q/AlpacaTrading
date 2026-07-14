@@ -926,11 +926,15 @@ describe("Research orchestration", () => {
     const candidateCount = readCount(
       `SELECT COUNT(*) AS count FROM paper_trade_candidates WHERE research_run_id = '${result.runId}'`
     );
+    const selectedCandidateCount = readCount(
+      `SELECT COUNT(*) AS count FROM paper_trade_candidates WHERE research_run_id = '${result.runId}' AND decision = 'selected'`
+    );
     const planCount = readCount(
       `SELECT COUNT(*) AS count FROM paper_trade_plans WHERE research_run_id = '${result.runId}'`
     );
-    assert.equal(candidateCount, result.candidatesSelected);
-    assert.equal(planCount, candidateCount);
+    assert.equal(selectedCandidateCount, result.candidatesSelected);
+    assert.equal(planCount, selectedCandidateCount);
+    assert.equal(candidateCount >= selectedCandidateCount, true);
     assert.ok(planCount > 0);
   });
 

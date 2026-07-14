@@ -24,7 +24,9 @@ const monitorUnits = [
   "alpaca-zero-dte-reconcile.service",
   "alpaca-zero-dte-reconcile.timer",
   "alpaca-zero-dte-eod.service",
-  "alpaca-zero-dte-eod.timer"
+  "alpaca-zero-dte-eod.timer",
+  "alpaca-market-observatory.service",
+  "alpaca-market-observatory.timer"
 ];
 
 const marketOpenIso = "2026-07-08T14:00:00-04:00";
@@ -184,6 +186,19 @@ describe("paper monitoring scheduler", () => {
     assert.match(finalHour.command, /paper:ops:late-day/);
   });
 
+  test("market observatory uses the read-only collector on a 15-minute weekday cadence", () => {
+    const body = parseStdout(runMonitor("observatory"));
+    const timer = readFileSync(
+      join(repoRoot, "server/systemd/alpaca-market-observatory.timer"),
+      "utf8"
+    );
+
+    assert.match(body.command, /observatory:collect/);
+    assert.doesNotMatch(body.command, /execute|confirmPaper|orders/);
+    assert.match(timer, /OnCalendar=Mon\.\.Fri \*-\*-\* 09\.\.15:0\/15:00/);
+    assert.match(timer, /Persistent=false/);
+  });
+
   test("market-hours gate no-ops outside market hours", () => {
     const result = runMonitor("review", { now: marketClosedIso });
     const body = parseStdout(result);
@@ -198,6 +213,19 @@ describe("paper monitoring scheduler", () => {
     writeFileSync(lockFile, "existing\n");
     try {
       const result = runMonitor("execute");
+      const body = parseStdout(result);
+      assert.equal(result.status, 0);
+      assert.equal(body.reason, "LOCK_BUSY");
+    } finally {
+      unlinkSync(lockFile);
+    }
+  });
+
+  test("market observatory collection cannot overlap", () => {
+    const lockFile = "/tmp/alpaca-market-observatory.lock";
+    writeFileSync(lockFile, "existing\n");
+    try {
+      const result = runMonitor("observatory");
       const body = parseStdout(result);
       assert.equal(result.status, 0);
       assert.equal(body.reason, "LOCK_BUSY");

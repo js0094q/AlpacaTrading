@@ -29,6 +29,16 @@ export interface UniverseSymbolRow {
   createdAt: string;
   updatedAt: string;
   tradable: 0 | 1;
+  assetId: string | null;
+  assetStatus: string | null;
+  exchange: string | null;
+  fractionable: 0 | 1 | null;
+  shortable: 0 | 1 | null;
+  marginable: 0 | 1 | null;
+  optionsEnabled: 0 | 1 | null;
+  assetAttributes: string[];
+  assetValidatedAt: string | null;
+  assetRequestId: string | null;
 }
 
 export interface MarketBarRow {
@@ -41,6 +51,75 @@ export interface MarketBarRow {
   close: number;
   volume: number;
   source: "alpaca";
+}
+
+export type StockSnapshotFreshnessStatus = "FRESH" | "STALE" | "UNKNOWN";
+export type StockSnapshotDataQualityStatus =
+  | "COMPLETE"
+  | "PARTIAL"
+  | "MISSING_QUOTE"
+  | "MISSING_TRADE"
+  | "MISSING_MINUTE_BAR"
+  | "SOURCE_ERROR";
+
+export interface StockSnapshotRow {
+  symbol: string;
+  observedAt: string;
+  sourceTimestamp: string | null;
+  requestedFeed: string;
+  effectiveFeed: string;
+  currency: string | null;
+  latestTradePrice: number | null;
+  latestTradeSize: number | null;
+  latestTradeExchange: string | null;
+  latestTradeConditions: string[];
+  tradeTimestamp: string | null;
+  bidPrice: number | null;
+  askPrice: number | null;
+  bidSize: number | null;
+  askSize: number | null;
+  bidExchange: string | null;
+  askExchange: string | null;
+  quoteConditions: string[];
+  quoteTimestamp: string | null;
+  midpoint: number | null;
+  spread: number | null;
+  spreadPct: number | null;
+  minuteTimestamp: string | null;
+  minuteOpen: number | null;
+  minuteHigh: number | null;
+  minuteLow: number | null;
+  minuteClose: number | null;
+  minuteVolume: number | null;
+  minuteTradeCount: number | null;
+  minuteVwap: number | null;
+  dailyTimestamp: string | null;
+  dailyOpen: number | null;
+  dailyHigh: number | null;
+  dailyLow: number | null;
+  dailyClose: number | null;
+  dailyVolume: number | null;
+  dailyTradeCount: number | null;
+  dailyVwap: number | null;
+  previousDailyTimestamp: string | null;
+  previousDailyOpen: number | null;
+  previousDailyHigh: number | null;
+  previousDailyLow: number | null;
+  previousDailyClose: number | null;
+  previousDailyVolume: number | null;
+  previousDailyTradeCount: number | null;
+  previousDailyVwap: number | null;
+  dailyReturn: number | null;
+  gapFromPreviousClose: number | null;
+  returnFromOpen: number | null;
+  distanceFromVwap: number | null;
+  intradayRange: number | null;
+  relativeCurrentDayVolume: number | null;
+  freshnessStatus: StockSnapshotFreshnessStatus;
+  dataQualityStatus: StockSnapshotDataQualityStatus;
+  source: "alpaca";
+  requestId: string | null;
+  errorSummary: string | null;
 }
 
 export interface OptionContractRow {
@@ -113,8 +192,56 @@ export interface ResearchRunRow {
   summaryJson: string | null;
 }
 
+declare const decisionIdBrand: unique symbol;
+declare const positionLifecycleIdBrand: unique symbol;
+
+export type DecisionId = string & { readonly [decisionIdBrand]: true };
+export type PositionLifecycleId = string & {
+  readonly [positionLifecycleIdBrand]: true;
+};
+
+export type DecisionRole = "entry" | "exit" | "non_executable";
+export type DecisionStatus =
+  | "DISCOVERED"
+  | "DATA_INCOMPLETE"
+  | "SCORED"
+  | "REJECTED"
+  | "SKIPPED"
+  | "SELECTED"
+  | "REVIEWED"
+  | "BLOCKED"
+  | "PAPER_ELIGIBLE"
+  | "SUBMITTED"
+  | "FILLED"
+  | "OPEN"
+  | "CLOSED"
+  | "EXPIRED";
+declare const decisionReasonCodeBrand: unique symbol;
+declare const exitReasonCodeBrand: unique symbol;
+declare const dataQualityStatusBrand: unique symbol;
+export type DecisionReasonCode = string & {
+  readonly [decisionReasonCodeBrand]: true;
+};
+export type ExitReasonCode = string & { readonly [exitReasonCodeBrand]: true };
+export type DataQualityStatus = string & {
+  readonly [dataQualityStatusBrand]: true;
+};
+export type OutcomeCompletenessStatus =
+  | "COMPLETE"
+  | "PARTIAL"
+  | "INSUFFICIENT_OBSERVATIONS"
+  | "LEGACY_UNAVAILABLE"
+  | "AMBIGUOUS_LINEAGE";
+export type LinkageStatus =
+  | "EXACT"
+  | "EXACT_LEGACY_REUSE"
+  | "AMBIGUOUS_NETTED_POSITION"
+  | "LEGACY_UNLINKED"
+  | "PARTIAL_BROKER_RECONCILIATION";
+
 export interface PaperTradeCandidateRow {
   id: string;
+  decisionId?: DecisionId | null;
   researchRunId: string;
   symbol: string;
   asOf: string;
@@ -146,10 +273,21 @@ export interface PaperTradeCandidateRow {
   estimatedExitValue?: number | null;
 }
 
+export type CandidateDecision = "selected" | "rejected" | "skipped" | "blocked";
+
+export interface CandidateDecisionRecord extends Omit<PaperTradeCandidateRow, "researchRunId"> {
+  decision: CandidateDecision;
+  decisionReason: string;
+  strategyFamily: string;
+  signalInputs: Record<string, string | number | null>;
+  dataQualityStatus: string;
+}
+
 export interface PaperTradePlanRow {
   id: string;
   researchRunId: string;
   candidateId: string;
+  decisionId: DecisionId | null;
   symbol: string;
   createdAt: string;
   status: "planned" | "entered" | "closed" | "expired" | "skipped";
@@ -178,6 +316,7 @@ export interface PaperTradeEvaluationRow {
   researchRunId: string;
   planId: string;
   candidateId: string;
+  decisionId: DecisionId | null;
   evaluatedAt: string;
   markPrice: number | null;
   estimatedExitValue: number | null;
@@ -219,14 +358,18 @@ export interface StrategySelectorResult {
 
 export interface IngestionRunRow {
   id: number;
-  runType: "bars" | "options_contracts" | "options_snapshots";
-  status: "running" | "completed" | "failed";
+  runType: "bars" | "options_contracts" | "options_snapshots" | "stock_snapshots";
+  status: "running" | "completed" | "partial" | "failed" | "skipped_market_closed";
   symbols: string;
   timeframe?: Timeframe | null;
   startedAt: string;
   completedAt: string | null;
   rowsIngested: number;
   notes: string | null;
+  requestedSymbols: number;
+  successfulSymbols: number;
+  failedSymbols: number;
+  errorSummary: string | null;
 }
 
 export interface BacktestTradeRow {

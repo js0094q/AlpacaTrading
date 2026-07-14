@@ -191,6 +191,7 @@ changing deployment artifacts, secrets, or security-relevant environment values:
 
 ```bash
 sudo systemctl stop alpaca-dashboard-control.service
+sudo systemctl stop alpaca-market-observatory.timer
 sudo systemctl stop paper-ops-morning.timer paper-ops-midday.timer paper-ops-late-day.timer
 sudo systemctl stop alpaca-paper-review.timer alpaca-paper-execute.timer alpaca-paper-exit-review.timer alpaca-paper-exit-execute.timer
 sudo systemctl stop alpaca-zero-dte-engine.timer alpaca-zero-dte-exit-review.timer alpaca-zero-dte-reconcile.timer alpaca-zero-dte-eod.timer

@@ -12,12 +12,20 @@ import {
   updatePaperExecutionLedgerEntry
 } from "./paperExecutionLedgerService.js";
 import {
+  findPaperReviewPayloadDecision,
   isPaperReviewArtifactFresh,
   isReviewedPayloadSectionName,
   latestPaperReviewArtifact,
   type PaperReviewArtifact,
   type ReviewedPayloadSectionName
 } from "./paperReviewArtifactService.js";
+import { appendDecisionLifecycleEvent } from "./marketDecisionEvidenceService.js";
+import {
+  closePaperPositionFromFill,
+  persistPaperPositionOutcome,
+  reconcilePaperEntryFill
+} from "./paperPositionLifecycleService.js";
+import type { DecisionId, PositionLifecycleId } from "../types.js";
 import { getTradingSafetyState } from "./tradingSafetyService.js";
 
 export type PaperReviewedExecutionStatus =
@@ -80,6 +88,9 @@ interface PaperReviewedExecutionInput {
 
 interface NormalizedReviewedPayload {
   section: ReviewedPayloadSectionName;
+  payloadIndex: number;
+  decisionId: DecisionId | null;
+  positionLifecycleId: PositionLifecycleId | null;
   assetClass: "equity" | "option";
   symbol: string;
   side: "buy" | "sell";
@@ -166,8 +177,17 @@ const normalizePayload = (
     };
   }
 
+  const reviewDecision = findPaperReviewPayloadDecision({
+    artifactId: artifact.id,
+    section,
+    payloadIndex: index
+  });
+
   return {
     section,
+    payloadIndex: index,
+    decisionId: reviewDecision?.decision_id ?? null,
+    positionLifecycleId: reviewDecision?.position_lifecycle_id ?? null,
     assetClass,
     symbol,
     side,
@@ -462,9 +482,22 @@ export const buildPaperReviewedPayloadExecutionReport = async (
       status: "attempted",
       sourcePlanId: artifact.id,
       sourceCandidateId: payload.sourceCandidateId ?? null,
+      decisionId: payload.decisionId,
+      decisionLinkageStatus: payload.decisionId ? "EXACT" : "LEGACY_UNLINKED",
       payload: payload.raw,
       rawPayload: toAlpacaPayload(payload)
     });
+
+    if (payload.decisionId) {
+      appendDecisionLifecycleEvent({
+        decisionId: payload.decisionId,
+        status: "PAPER_ELIGIBLE",
+        reasonCodes: ["REVIEWED_PAYLOAD_ELIGIBLE"],
+        sourceType: "paper_review_artifact",
+        sourceId: `${artifact.id}:${payload.section}:${payload.payloadIndex}:eligible`,
+        evidence: { artifactId: artifact.id, ledgerId: ledger.id }
+      });
+    }
 
     try {
       const response: AlpacaApiResponse<AlpacaSubmittedOrder> = await submit(toAlpacaPayload(payload));
@@ -479,6 +512,91 @@ export const buildPaperReviewedPayloadExecutionReport = async (
         reason: null,
         rawResponse: order
       });
+      if (payload.decisionId) {
+        appendDecisionLifecycleEvent({
+          decisionId: payload.decisionId,
+          status: status === "filled" ? "FILLED" : "SUBMITTED",
+          reasonCodes: [
+            status === "filled" ? "BROKER_CONFIRMED_FILL" : "BROKER_ORDER_ACCEPTED"
+          ],
+          sourceType: "paper_execution_ledger",
+          sourceId: String(ledger.id),
+          evidence: {
+            alpacaOrderId: order.id,
+            alpacaStatus: status,
+            requestId: response.requestId ?? null
+          }
+        });
+      }
+      if (["filled", "partially_filled"].includes(status)) {
+        try {
+          const brokerOrderId = stringField(order.id);
+          const filledQuantity = Number.parseFloat(order.filled_qty ?? "");
+          const filledAveragePrice = Number.parseFloat(order.filled_avg_price ?? "");
+          if (
+            !brokerOrderId ||
+            !Number.isFinite(filledQuantity) ||
+            !Number.isFinite(filledAveragePrice)
+          ) {
+            throw new Error("BROKER_FILL_EVIDENCE_INCOMPLETE");
+          }
+          const observedAt = order.filled_at ?? generatedAt;
+          if (
+            payload.section === "equitySells" ||
+            payload.section === "optionSellToCloseExits"
+          ) {
+            if (!payload.decisionId || !payload.positionLifecycleId) {
+              throw new Error("BROKER_EXIT_LINEAGE_NOT_EXACT");
+            }
+            closePaperPositionFromFill({
+              positionLifecycleId: payload.positionLifecycleId,
+              exitDecisionId: payload.decisionId,
+              brokerOrderId,
+              status,
+              filledQuantity,
+              filledAveragePrice,
+              observedAt,
+              exitReasonCode:
+                stringField(payload.raw.reason) ?? "BROKER_CONFIRMED_EXIT",
+              brokerRequestId: response.requestId ?? null,
+              underlyingPrice:
+                typeof payload.raw.underlyingPrice === "number"
+                  ? payload.raw.underlyingPrice
+                  : null
+            });
+            persistPaperPositionOutcome({
+              positionLifecycleId: payload.positionLifecycleId,
+              exitReasonCode:
+                stringField(payload.raw.reason) ?? "BROKER_CONFIRMED_EXIT"
+            });
+          } else {
+            reconcilePaperEntryFill({
+              ledgerId: ledger.id,
+              brokerOrderId,
+              clientOrderId: payload.clientOrderId,
+              status,
+              filledQuantity,
+              filledAveragePrice,
+              observedAt,
+              brokerRequestId: response.requestId ?? null,
+              underlyingPrice:
+                typeof payload.raw.underlyingPrice === "number"
+                  ? payload.raw.underlyingPrice
+                  : null
+            });
+          }
+        } catch (reconciliationError) {
+          errors.push({
+            symbol: payload.symbol,
+            reason: "ANALYTICAL_RECONCILIATION_FAILED",
+            message:
+              reconciliationError instanceof Error
+                ? reconciliationError.message
+                : "Analytical fill reconciliation failed.",
+            requestId: response.requestId
+          });
+        }
+      }
       submitted.push({
         section: payload.section,
         assetClass: payload.assetClass,
