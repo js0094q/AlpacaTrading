@@ -70,6 +70,8 @@
     "paper:evaluate": "tsx src/cli.ts paper evaluate",
     "paper:learn": "tsx src/cli.ts paper:learn",
     "paper:learning": "tsx src/cli.ts paper:learn",
+    "paper:governance": "tsx src/cli.ts paper:governance",
+    "paper:governance:status": "tsx src/cli.ts paper:governance:status",
     "paper:trace": "tsx src/cli.ts paper:trace",
     "dashboard:control": "tsx server/dashboard-control/server.ts",
     "dashboard:dev": "next dev apps/dashboard --webpack",

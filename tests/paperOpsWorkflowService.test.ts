@@ -105,7 +105,7 @@ describe("paper ops workflows", () => {
     assert.equal(evidence.decision_status, "REVIEWED");
   });
 
-  test("morning workflow runs research, learn, discover, and review", async () => {
+  test("morning workflow evaluates and governs learning before research", async () => {
     const calls: string[] = [];
     const report = await runPaperOpsMorning({}, {
       runResearch: async () => {
@@ -118,6 +118,10 @@ describe("paper ops workflows", () => {
       },
       learningSummary: () => ({ pending: 0, evaluated: 1, promoted: 0, rejected: 0 }),
       promotionReadiness: () => [],
+      applyLearningGovernance: () => {
+        calls.push("govern");
+        return { status: "completed", decisionsWritten: 1 } as any;
+      },
       buildOptionsDiscovery: async () => {
         calls.push("discover");
         return { warnings: [], blockers: [], status: "success" } as any;
@@ -134,7 +138,8 @@ describe("paper ops workflows", () => {
     });
 
     assert.equal(report.workflow, "morning");
-    assert.deepEqual(calls, ["research", "learn", "discover", "review", "hedge"]);
+    assert.deepEqual(calls, ["learn", "govern", "research", "discover", "review", "hedge"]);
+    assert.equal((report.details.learningGovernance as { status: string }).status, "completed");
   });
 
   test("midday workflow runs portfolio and exit review", async () => {

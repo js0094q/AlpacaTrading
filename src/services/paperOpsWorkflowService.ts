@@ -11,6 +11,7 @@ import {
   evaluatePaperLearningRecords,
   paperLearningSummary
 } from "./paperLearningLedgerService.js";
+import { applyPaperLearningGovernance } from "./learningGovernanceService.js";
 import {
   createPaperReviewArtifact,
   latestPaperReviewArtifact,
@@ -51,6 +52,7 @@ interface PaperOpsDeps {
   evaluateLearning?: typeof evaluatePaperLearningRecords;
   learningSummary?: typeof paperLearningSummary;
   promotionReadiness?: typeof buildPromotionReadinessAnalytics;
+  applyLearningGovernance?: typeof applyPaperLearningGovernance;
   buildHedgeReview?: typeof buildAndPersistHedgeReview;
   now?: () => string;
 }
@@ -261,6 +263,13 @@ export const runPaperOpsMorning = async (
   });
   const generatedAt = deps.now?.() || new Date().toISOString();
   try {
+    const learningEvaluation = (deps.evaluateLearning ?? evaluatePaperLearningRecords)({
+      limit: 100,
+      asOf: generatedAt
+    });
+    const learningSummary = (deps.learningSummary ?? paperLearningSummary)();
+    const promotionReadiness = (deps.promotionReadiness ?? buildPromotionReadinessAnalytics)();
+    const learningGovernance = (deps.applyLearningGovernance ?? applyPaperLearningGovernance)();
     const research = await (deps.runResearch ?? runResearchDaily)({
       riskProfile: "aggressive",
       optionsEnabled: true,
@@ -268,12 +277,6 @@ export const runPaperOpsMorning = async (
       useAlpacaAssets: true,
       barLookbackDays: 120
     });
-    const learningEvaluation = (deps.evaluateLearning ?? evaluatePaperLearningRecords)({
-      limit: 100,
-      asOf: generatedAt
-    });
-    const learningSummary = (deps.learningSummary ?? paperLearningSummary)();
-    const promotionReadiness = (deps.promotionReadiness ?? buildPromotionReadinessAnalytics)();
     const optionsDiscovery = await (deps.buildOptionsDiscovery ?? buildPaperOptionsDiscoveryReport)({
       underlying: "SPY",
       dte: 0,
@@ -292,10 +295,11 @@ export const runPaperOpsMorning = async (
       triggerSource,
       generatedAt,
       {
-        research,
         learningEvaluation,
         learningSummary,
         promotionReadiness,
+        learningGovernance,
+        research,
         optionsDiscovery,
         review
       },

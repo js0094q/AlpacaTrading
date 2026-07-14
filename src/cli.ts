@@ -101,6 +101,10 @@ import {
   evaluatePaperLearningRecords,
   paperLearningSummary
 } from "./services/paperLearningLedgerService.js";
+import {
+  applyPaperLearningGovernance,
+  getPaperLearningGovernanceStatus
+} from "./services/learningGovernanceService.js";
 import { config } from "./config.js";
 import { redactSensitiveData } from "./lib/securityRedaction.js";
 import { normalizeSymbol } from "./lib/utils.js";
@@ -867,6 +871,16 @@ const run = async () => {
       return;
     }
     print(output);
+    return;
+  }
+
+  if (command === "paper:governance:status") {
+    print(getPaperLearningGovernanceStatus());
+    return;
+  }
+
+  if (command === "paper:governance") {
+    print(applyPaperLearningGovernance());
     return;
   }
 
