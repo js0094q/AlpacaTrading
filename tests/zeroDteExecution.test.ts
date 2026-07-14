@@ -20,6 +20,7 @@ import {
 import { insertZeroDteDecision } from "../src/services/zeroDte/zeroDteLifecycleService.js";
 import type { ZeroDteQueueCandidate } from "../src/services/zeroDte/zeroDtePersistenceService.js";
 import type { AlpacaPaperOrderRequest } from "../src/services/alpacaClient.js";
+import { insertPaperExecutionLedgerEntry } from "../src/services/paperExecutionLedgerService.js";
 
 const now = "2026-07-13T14:30:00.000Z";
 const optionSymbol = "SPY260713C00500000";
@@ -327,6 +328,278 @@ test("blocked runtime records no order mutation", async () => {
   assert.equal(
     (getDb().prepare("SELECT blocked_reason FROM paper_execution_ledger WHERE source_candidate_id = ?").get(candidateId) as { blocked_reason: string }).blocked_reason,
     "EXECUTION_DISABLED"
+  );
+});
+
+test("a terminal reservation creates a fresh exact ledger for a new 0DTE candidate", async () => {
+  const retryCandidate = scenarioCandidate({
+    candidateId: "execution-candidate-fresh-ledger",
+    optionSymbol: "SPY260713C00512000",
+    strike: 512
+  });
+  const retryDecisionId = "execution-decision-fresh-ledger";
+  seed({ candidate: retryCandidate, decisionId: retryDecisionId });
+  const reservationKey = `${retryCandidate.tradingDate}:${retryCandidate.optionSymbol}:entry`;
+  const staleLedger = insertPaperExecutionLedgerEntry({
+    mode: "zero-dte-entry",
+    assetClass: "option",
+    symbol: retryCandidate.optionSymbol,
+    underlyingSymbol: retryCandidate.underlyingSymbol,
+    strategy: "zero_dte_level_2",
+    side: "buy",
+    orderType: "limit",
+    timeInForce: "day",
+    qty: "1",
+    limitPrice: "1.10",
+    estimatedPremium: 110,
+    maxRisk: 110,
+    dedupeKey: reservationKey,
+    clientOrderId: "stale-terminal-client-order-id",
+    status: "failed",
+    sourceCandidateId: "stale-terminal-candidate",
+    payload: { candidateId: "stale-terminal-candidate" }
+  });
+
+  const result = await executeZeroDteCandidate({
+    candidate: retryCandidate,
+    decisionId: retryDecisionId,
+    confirmPaper: true,
+    provider: {
+      config,
+      runtime: runtime(),
+      account: account(),
+      now: () => now,
+      submitPaperOrder: async (payload) => ({
+        data: {
+          id: "paper-order-fresh-ledger",
+          client_order_id: payload.client_order_id,
+          symbol: payload.symbol,
+          qty: payload.qty,
+          status: "accepted",
+          filled_qty: "0"
+        },
+        requestId: "paper-request-fresh-ledger",
+        status: 200,
+        url: "paper"
+      })
+    }
+  });
+
+  const resultLedger = { ...getDb().prepare(
+    `SELECT client_order_id, source_candidate_id, decision_id,
+            decision_linkage_status, status
+     FROM paper_execution_ledger
+     WHERE id = ?`
+  ).get(result.ledgerId) as Record<string, unknown> };
+  const preservedStaleLedger = { ...getDb().prepare(
+      `SELECT client_order_id, source_candidate_id, status
+       FROM paper_execution_ledger
+       WHERE id = ?`
+    ).get(staleLedger.id) as Record<string, unknown> };
+  if (result.paperTradeId) {
+    getDb().prepare("DELETE FROM zero_dte_lifecycle_events WHERE paper_trade_id = ?").run(result.paperTradeId);
+    getDb().prepare("DELETE FROM zero_dte_paper_trades WHERE paper_trade_id = ?").run(result.paperTradeId);
+  }
+  getDb().prepare("DELETE FROM paper_execution_ledger WHERE id IN (?, ?)").run(result.ledgerId, staleLedger.id);
+
+  assert.equal(result.status, "submitted");
+  assert.notEqual(result.ledgerId, staleLedger.id);
+  assert.deepEqual(resultLedger, {
+    client_order_id: result.clientOrderId,
+    source_candidate_id: retryCandidate.candidateId,
+    decision_id: retryDecisionId,
+    decision_linkage_status: "EXACT",
+    status: "submitted"
+  });
+  assert.deepEqual(
+    preservedStaleLedger,
+    {
+      client_order_id: "stale-terminal-client-order-id",
+      source_candidate_id: "stale-terminal-candidate",
+      status: "failed"
+    }
+  );
+});
+
+test("reconciliation relinks a submitted 0DTE trade only from exact broker identity", async () => {
+  const recoveryCandidate = scenarioCandidate({
+    candidateId: "execution-candidate-ledger-recovery",
+    optionSymbol: "SPY260713C00513000",
+    strike: 513
+  });
+  const recoveryDecisionId = "execution-decision-ledger-recovery";
+  const recoveryPaperTradeId = "execution-paper-trade-ledger-recovery";
+  const recoveryClientOrderId = "recovery-client-order-id";
+  const recoveryBrokerOrderId = "recovery-broker-order-id";
+  seed({ candidate: recoveryCandidate, decisionId: recoveryDecisionId });
+  const staleLedger = insertPaperExecutionLedgerEntry({
+    mode: "zero-dte-entry",
+    assetClass: "option",
+    symbol: recoveryCandidate.optionSymbol,
+    underlyingSymbol: recoveryCandidate.underlyingSymbol,
+    strategy: "zero_dte_level_2",
+    side: "buy",
+    orderType: "limit",
+    timeInForce: "day",
+    qty: "1",
+    limitPrice: "1.11",
+    estimatedPremium: 111,
+    maxRisk: 111,
+    dedupeKey: `${recoveryCandidate.tradingDate}:${recoveryCandidate.optionSymbol}:entry`,
+    clientOrderId: "stale-recovery-client-order-id",
+    status: "failed",
+    sourceCandidateId: "stale-recovery-candidate",
+    payload: { candidateId: "stale-recovery-candidate" }
+  });
+  getDb().prepare(
+    `UPDATE paper_execution_ledger
+     SET alpaca_order_id = ?, alpaca_status = 'pending_new'
+     WHERE id = ?`
+  ).run(recoveryBrokerOrderId, staleLedger.id);
+  getDb().prepare(
+    `INSERT INTO zero_dte_paper_trades
+      (paper_trade_id, decision_id, candidate_id, trading_date, underlying_symbol,
+       option_symbol, playbook, direction, status, client_order_id, broker_order_id,
+       source_ledger_id, quantity, entry_premium, fees, slippage, entry_quote_json,
+       requested_at, submitted_at, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'submitted', ?, ?, ?, 1, 1.25, 0, 0, '{}', ?, ?, ?, ?)`
+  ).run(
+    recoveryPaperTradeId,
+    recoveryDecisionId,
+    recoveryCandidate.candidateId,
+    recoveryCandidate.tradingDate,
+    recoveryCandidate.underlyingSymbol,
+    recoveryCandidate.optionSymbol,
+    recoveryCandidate.playbook,
+    recoveryCandidate.direction,
+    recoveryClientOrderId,
+    recoveryBrokerOrderId,
+    staleLedger.id,
+    now,
+    now,
+    now,
+    now
+  );
+  const filledAt = "2026-07-13T14:30:10.000Z";
+
+  const rejectedRelink = await reconcileZeroDtePaperOrders({
+    now: "2026-07-13T14:30:09.000Z",
+    provider: {
+      runtime: runtime(),
+      getOrder: async () => ({
+        data: {
+          id: recoveryBrokerOrderId,
+          client_order_id: "different-broker-client-order-id",
+          symbol: recoveryCandidate.optionSymbol,
+          side: "buy",
+          position_intent: "buy_to_open",
+          type: "limit",
+          time_in_force: "day",
+          qty: "1",
+          limit_price: "1.20",
+          status: "filled",
+          filled_qty: "1",
+          filled_avg_price: "1.20",
+          filled_at: filledAt
+        },
+        requestId: "paper-request-ledger-recovery-mismatch",
+        status: 200,
+        url: "paper"
+      })
+    }
+  });
+  assert.equal(rejectedRelink.linkageUpdated, 0);
+  assert.equal(rejectedRelink.errors[0]?.message, "BROKER_CLIENT_ORDER_ID_MISMATCH");
+  assert.equal(
+    (getDb().prepare(
+      "SELECT source_ledger_id FROM zero_dte_paper_trades WHERE paper_trade_id = ?"
+    ).get(recoveryPaperTradeId) as { source_ledger_id: number }).source_ledger_id,
+    staleLedger.id
+  );
+
+  const reconciliation = await reconcileZeroDtePaperOrders({
+    now: filledAt,
+    provider: {
+      runtime: runtime(),
+      getOrder: async () => ({
+        data: {
+          id: recoveryBrokerOrderId,
+          client_order_id: recoveryClientOrderId,
+          symbol: recoveryCandidate.optionSymbol,
+          side: "buy",
+          position_intent: "buy_to_open",
+          type: "limit",
+          time_in_force: "day",
+          qty: "1",
+          limit_price: "1.20",
+          status: "filled",
+          filled_qty: "1",
+          filled_avg_price: "1.20",
+          filled_at: filledAt
+        },
+        requestId: "paper-request-ledger-recovery",
+        status: 200,
+        url: "paper"
+      })
+    }
+  });
+
+  const repairedTrade = getDb().prepare(
+    `SELECT status, source_ledger_id, quantity, entry_premium, filled_at
+     FROM zero_dte_paper_trades
+     WHERE paper_trade_id = ?`
+  ).get(recoveryPaperTradeId) as {
+    status: string;
+    source_ledger_id: number;
+    quantity: number;
+    entry_premium: number;
+    filled_at: string;
+  };
+  const repairedLedger = { ...getDb().prepare(
+      `SELECT client_order_id, alpaca_order_id, alpaca_status,
+              source_candidate_id, decision_id, decision_linkage_status, status
+       FROM paper_execution_ledger
+       WHERE id = ?`
+    ).get(repairedTrade.source_ledger_id) as Record<string, unknown> };
+  const preservedStaleLedger = { ...getDb().prepare(
+    `SELECT client_order_id, source_candidate_id, status
+     FROM paper_execution_ledger
+     WHERE id = ?`
+  ).get(staleLedger.id) as Record<string, unknown> };
+  getDb().prepare("DELETE FROM zero_dte_lifecycle_events WHERE paper_trade_id = ?").run(recoveryPaperTradeId);
+  getDb().prepare("DELETE FROM zero_dte_paper_trades WHERE paper_trade_id = ?").run(recoveryPaperTradeId);
+  getDb().prepare("DELETE FROM paper_execution_ledger WHERE id IN (?, ?)").run(
+    repairedTrade.source_ledger_id,
+    staleLedger.id
+  );
+
+  assert.equal(reconciliation.filled, 1);
+  assert.equal(reconciliation.linkageUpdated, 1);
+  assert.deepEqual(reconciliation.errors, []);
+  assert.equal(repairedTrade.status, "open");
+  assert.notEqual(repairedTrade.source_ledger_id, staleLedger.id);
+  assert.equal(repairedTrade.quantity, 1);
+  assert.equal(repairedTrade.entry_premium, 1.2);
+  assert.equal(repairedTrade.filled_at, filledAt);
+  assert.deepEqual(
+    repairedLedger,
+    {
+      client_order_id: recoveryClientOrderId,
+      alpaca_order_id: recoveryBrokerOrderId,
+      alpaca_status: "filled",
+      source_candidate_id: recoveryCandidate.candidateId,
+      decision_id: recoveryDecisionId,
+      decision_linkage_status: "EXACT",
+      status: "filled"
+    }
+  );
+  assert.deepEqual(
+    preservedStaleLedger,
+    {
+      client_order_id: "stale-recovery-client-order-id",
+      source_candidate_id: "stale-recovery-candidate",
+      status: "failed"
+    }
   );
 });
 
