@@ -45,6 +45,7 @@ const dryRun = async () => ({
       time_in_force: "day",
       notional: "100.00",
       client_order_id: "paper-equity-aapl",
+      sourceCandidateId: "candidate-aapl",
       dedupeKey: "paper:equity:AAPL"
     }
   ]
@@ -71,6 +72,85 @@ const hedgeReview = async () => ({
   blockers: []
 });
 
+const captureSubmitState = async () => ({
+  version: "paper-submit-state-v1",
+  capturedAt: "2026-07-10T14:00:00.000Z",
+  accountIdentityHash: "paper-account-hash",
+  accountState: {
+    status: "ACTIVE",
+    cash: 100_000,
+    equity: 100_000,
+    buyingPower: 100_000,
+    optionsBuyingPower: 100_000,
+    optionsApprovalLevel: 3,
+    tradingBlocked: false,
+    accountBlocked: false
+  },
+  configuration: {
+    environment: "paper",
+    tradingMode: "paper",
+    liveTradingEnabled: false,
+    paperOrderExecutionEnabled: true,
+    paperOptionsExecutionEnabled: true,
+    maxPositionNotional: 5_000,
+    maxTotalPlanNotional: 50_000,
+    equityMaxNotionalPerOrder: 5_000,
+    equityMaxPortfolioDeployPct: 50,
+    equityMaxPositionPct: 10,
+    equityMinCashReservePct: 20,
+    optionMaxOrderNotional: 2_000,
+    optionMaxContracts: 1,
+    optionMaxPortfolioRiskPct: 20,
+    optionMaxPositionRiskPct: 5,
+    quoteMaxAgeSeconds: 600,
+    maxPriceDriftPct: 10
+  },
+  configurationFingerprint: "config-v1",
+  positions: [],
+  openOrders: [],
+  reservations: [],
+  marketEvidence: [
+    {
+      symbol: "AAPL",
+      assetClass: "equity",
+      referencePrice: 200,
+      bid: 199.9,
+      ask: 200.1,
+      timestamp: "2026-07-10T14:00:00.000Z",
+      complete: true
+    }
+  ],
+  payloadIntents: [
+    {
+      section: "equityBuys",
+      payloadIndex: 0,
+      assetClass: "equity",
+      symbol: "AAPL",
+      side: "buy",
+      orderType: "market",
+      quantity: null,
+      notional: 100,
+      limitPrice: null,
+      estimatedPremium: null,
+      positionIntent: null,
+      sourceCandidateId: "candidate-aapl",
+      sourceReviewId: null,
+      clientOrderIdHash: "client-order-hash"
+    }
+  ],
+  structuralPortfolioFingerprint: "portfolio-structure-v1",
+  portfolioFingerprint: "portfolio-v1",
+  marketEvidenceFingerprint: "market-v1",
+  allocationAttestation: {
+    mode: "baseline",
+    identity: "baseline-v1",
+    allocatorControlled: false
+  },
+  complete: true,
+  blockers: [],
+  warnings: []
+});
+
 beforeEach(() => {
   process.env.AUTOMATED_PAPER_EXECUTION_ENABLED = "false";
   process.env.PAPER_REVIEW_SIGNING_KEY = "paper-ops-workflow-test-key";
@@ -87,7 +167,8 @@ describe("paper ops workflows", () => {
     const report = await runPaperOpsReview({ triggerSource: "scheduler" }, {
       buildDryRun: dryRun as any,
       buildPortfolioReview: portfolioReview as any,
-      buildHedgeReview: hedgeReview as any
+      buildHedgeReview: hedgeReview as any,
+      captureSubmitState: captureSubmitState as any
     });
 
     assert.equal(report.status, "success");
@@ -105,6 +186,10 @@ describe("paper ops workflows", () => {
     };
     assert.equal(evidence.decision_role, "entry");
     assert.equal(evidence.decision_status, "REVIEWED");
+    assert.equal(
+      (report.details.artifact as any).artifact.submitState.version,
+      "paper-submit-state-v1"
+    );
   });
 
   test("morning workflow evaluates and governs learning before research", async () => {
@@ -136,7 +221,8 @@ describe("paper ops workflows", () => {
       buildHedgeReview: async () => {
         calls.push("hedge");
         return hedgeReview() as any;
-      }
+      },
+      captureSubmitState: captureSubmitState as any
     });
 
     assert.equal(report.workflow, "morning");

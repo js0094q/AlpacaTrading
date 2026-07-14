@@ -1109,6 +1109,16 @@ export const validatePaperSubmitState = (input: {
   const reviewedIntents = selectedIntents(input.reviewed, input.sections);
   const currentIntents = selectedIntents(input.current, input.sections);
 
+  if (!reviewedIntents.length && !currentIntents.length) {
+    return {
+      valid: true,
+      blockers: [],
+      warnings: [],
+      reviewedPortfolioFingerprint: input.reviewed.portfolioFingerprint,
+      currentPortfolioFingerprint: input.current.portfolioFingerprint
+    };
+  }
+
   if (!input.reviewed.complete || !input.current.complete) {
     blockers.push("SUBMIT_CAP_EVIDENCE_INCOMPLETE");
   }

@@ -6,6 +6,7 @@ import {
 import { canonicalJsonHash } from "../lib/canonicalJson.js";
 import { getDb, queryAll, queryOne } from "../lib/db.js";
 import type { DecisionId, DecisionRole, PositionLifecycleId } from "../types.js";
+import type { PaperSubmitStateAttestation } from "./paperSubmitStateService.js";
 import {
   appendDecisionLifecycleEvent,
   linkPaperReviewDecision,
@@ -43,7 +44,7 @@ export interface PaperReviewArtifactBody {
   status: string;
   payloadSignature: string;
   payloadSections: ReviewedPayloadSections;
-  submitState?: Record<string, unknown>;
+  submitState?: PaperSubmitStateAttestation;
   summary: Record<string, unknown>;
   warnings: string[];
   blockers: string[];
@@ -285,7 +286,7 @@ export const createPaperReviewArtifact = (input: {
   summary: Record<string, unknown>;
   warnings?: string[];
   blockers?: string[];
-  submitState?: Record<string, unknown>;
+  submitState?: PaperSubmitStateAttestation;
   details?: Record<string, unknown>;
   createdAt?: string;
   maxAgeMinutes?: number;

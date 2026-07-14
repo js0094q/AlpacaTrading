@@ -117,6 +117,33 @@ const state = (
 });
 
 describe("paper submit state validation", () => {
+  test("does not apply positive new-risk state checks when no entry section is selected", () => {
+    const empty = state({
+      accountIdentityHash: null,
+      accountState: {
+        status: null,
+        cash: null,
+        equity: null,
+        buyingPower: null,
+        optionsBuyingPower: null,
+        optionsApprovalLevel: null,
+        tradingBlocked: null,
+        accountBlocked: null
+      },
+      payloadIntents: [],
+      complete: true
+    });
+
+    const result = validatePaperSubmitState({
+      reviewed: empty,
+      current: empty,
+      sections: ["equitySells"]
+    });
+
+    assert.equal(result.valid, true);
+    assert.deepEqual(result.blockers, []);
+  });
+
   test("accepts unchanged complete state under current caps", () => {
     const reviewed = state();
     const current = state({ capturedAt: "2026-07-14T14:00:20.000Z" });

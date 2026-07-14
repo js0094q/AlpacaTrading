@@ -28,6 +28,10 @@ import {
   buildAndPersistHedgeReview,
   type HedgeReviewReport
 } from "./hedgeLearningService.js";
+import {
+  capturePaperSubmitState,
+  validatePaperSubmitState
+} from "./paperSubmitStateService.js";
 
 export interface PaperOpsWorkflowReport {
   paperOnly: true;
@@ -54,8 +58,13 @@ interface PaperOpsDeps {
   promotionReadiness?: typeof buildPromotionReadinessAnalytics;
   applyLearningGovernance?: typeof applyPaperLearningGovernance;
   buildHedgeReview?: typeof buildAndPersistHedgeReview;
+  captureSubmitState?: typeof capturePaperSubmitState;
   now?: () => string;
 }
+
+const ENTRY_SECTIONS = ["equityBuys", "equityAdds", "optionBuys"] as const;
+
+const unique = (values: string[]) => [...new Set(values)];
 
 const automatedExecutionEnabled = () =>
   process.env.AUTOMATED_PAPER_EXECUTION_ENABLED === "true" ||
@@ -136,20 +145,37 @@ export const runPaperOpsReview = async (
       correlationId: input.correlationId ?? undefined
     });
     const { sections, dryRun } = await sectionsFromReports(portfolioReview, deps);
-    const warnings = [
+    const submitState = await (deps.captureSubmitState ?? capturePaperSubmitState)({
+      capturedAt: generatedAt,
+      payloadSections: sections
+    });
+    const entrySections = ENTRY_SECTIONS.filter(
+      (section) => sections[section].length > 0
+    );
+    const submitStateValidation = validatePaperSubmitState({
+      reviewed: submitState,
+      current: submitState,
+      sections: [...entrySections]
+    });
+    const warnings = unique([
       ...dryRun.warnings,
       ...portfolioReview.warnings,
+      ...submitState.warnings,
+      ...submitStateValidation.warnings,
       ...(automatedExecutionEnabled() ? ["AUTOMATED_PAPER_EXECUTION_ENABLED_REQUIRES_EXPLICIT_CONFIRM_GATES"] : [])
-    ];
-    const blockers = [
+    ]);
+    const blockers = unique([
       ...dryRun.blockers,
-      ...portfolioReview.blockers
-    ];
+      ...portfolioReview.blockers,
+      ...submitState.blockers,
+      ...submitStateValidation.blockers
+    ]);
     const status = statusFrom(blockers, warnings);
     const artifact = createPaperReviewArtifact({
       sourceAction: "paper.ops.review",
       status,
       payloadSections: sections,
+      submitState,
       summary: {
         dryRunStatus: dryRun.status,
         dryRunWouldSubmit: dryRun.summary.wouldSubmitCount,
@@ -165,7 +191,8 @@ export const runPaperOpsReview = async (
       details: {
         dryRun,
         portfolioReview,
-        hedgeReview
+        hedgeReview,
+        submitStateValidation
       }
     });
     const summary = {
@@ -197,7 +224,9 @@ export const runPaperOpsReview = async (
         artifact,
         dryRun,
         portfolioReview,
-        hedgeReview
+        hedgeReview,
+        submitState,
+        submitStateValidation
       },
       warnings,
       blockers
