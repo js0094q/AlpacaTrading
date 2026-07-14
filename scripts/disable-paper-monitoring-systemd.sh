@@ -9,6 +9,7 @@ fi
 systemctl disable --now \
   alpaca-market-observatory.timer \
   alpaca-universe-lifecycle.timer \
+  alpaca-autonomous-recovery.timer \
   alpaca-paper-review.timer \
   alpaca-paper-execute.timer \
   alpaca-paper-exit-review.timer \
