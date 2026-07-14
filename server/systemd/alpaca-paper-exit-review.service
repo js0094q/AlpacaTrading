@@ -13,8 +13,8 @@ Environment=PATH=/usr/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=NODE_ENV=production
 Environment=AUTOMATED_PAPER_EXECUTION_ENABLED=false
 ExecStart=/usr/bin/npm run paper:monitor -- --task=exit-review
+ExecStopPost=-/usr/bin/rm -f /tmp/alpaca-paper-monitor-exit-review.lock
 TimeoutStartSec=300
 SyslogIdentifier=alpaca-paper-exit-review
 StandardOutput=journal
 StandardError=journal
-

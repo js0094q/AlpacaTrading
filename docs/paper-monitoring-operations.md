@@ -59,7 +59,7 @@ Execution commands always include `--confirmPaper` and use `paper:execute:review
 
 LEAPS sell-to-close payloads use the same `optionSellToCloseExits` section. The reviewed executor also blocks LEAPS exits unless `AUTOMATED_PAPER_EXECUTION_ENABLED=true`; review-only LEAPS warnings and liquidity-blocked LEAPS hard exits do not create executable payloads.
 
-The runner uses separate lock files under `/tmp` for review, entry execution, exit review, and exit execution. If a prior run is still active, the next wakeup no-ops with `LOCK_BUSY`.
+The runner uses separate lock files under `/tmp` for review, entry execution, exit review, and exit execution. If a prior run is still active, the next wakeup no-ops with `LOCK_BUSY`. Each systemd oneshot removes only its own transient lock in `ExecStopPost`, including after an operator stop or timeout, so a terminated run cannot permanently suppress later cycles.
 
 ## Install
 

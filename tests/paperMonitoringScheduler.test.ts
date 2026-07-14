@@ -29,6 +29,18 @@ const monitorUnits = [
   "alpaca-market-observatory.timer"
 ];
 
+const monitorServiceLocks = {
+  "alpaca-market-observatory.service": "/tmp/alpaca-market-observatory.lock",
+  "alpaca-paper-review.service": "/tmp/alpaca-paper-monitor-review.lock",
+  "alpaca-paper-execute.service": "/tmp/alpaca-paper-monitor-execute.lock",
+  "alpaca-paper-exit-review.service": "/tmp/alpaca-paper-monitor-exit-review.lock",
+  "alpaca-paper-exit-execute.service": "/tmp/alpaca-paper-monitor-exit-execute.lock",
+  "alpaca-zero-dte-engine.service": "/tmp/alpaca-zero-dte-engine.lock",
+  "alpaca-zero-dte-exit-review.service": "/tmp/alpaca-zero-dte-exit-review.lock",
+  "alpaca-zero-dte-reconcile.service": "/tmp/alpaca-zero-dte-reconcile.lock",
+  "alpaca-zero-dte-eod.service": "/tmp/alpaca-zero-dte-eod.lock"
+} as const;
+
 const marketOpenIso = "2026-07-08T14:00:00-04:00";
 const marketClosedIso = "2026-07-11T14:00:00-04:00";
 const finalHourIso = "2026-07-08T15:10:00-04:00";
@@ -78,6 +90,17 @@ describe("paper monitoring scheduler", () => {
         assert.match(body, /EnvironmentFile=\/opt\/alpaca-investing\/secrets\/alpaca\.env/);
         assert.match(body, /paper:monitor/);
       }
+    }
+  });
+
+  test("oneshot monitor services remove their own transient lock after forced stop", () => {
+    for (const [unit, lockFile] of Object.entries(monitorServiceLocks)) {
+      const body = readFileSync(join(repoRoot, "server/systemd", unit), "utf8");
+      assert.match(
+        body,
+        new RegExp(`ExecStopPost=-/usr/bin/rm -f ${lockFile.replaceAll(".", "\\.")}`),
+        `${unit} must clean ${lockFile}`
+      );
     }
   });
 
