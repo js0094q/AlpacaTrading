@@ -21,6 +21,15 @@ export type ExitReason =
   | "trailing_stop";
 export type OptionExitReason = ExitReason | "expiration";
 
+export type UniverseLifecycleState =
+  | "discovered"
+  | "observe_only"
+  | "research_eligible"
+  | "paper_eligible"
+  | "paper_active"
+  | "suspended"
+  | "retired";
+
 export interface UniverseSymbolRow {
   symbol: string;
   assetClass: string;
@@ -39,6 +48,42 @@ export interface UniverseSymbolRow {
   assetAttributes: string[];
   assetValidatedAt: string | null;
   assetRequestId: string | null;
+  lifecycleState: UniverseLifecycleState;
+  lifecycleReasonCode: string;
+  lifecycleEnteredAt: string | null;
+  lifecycleUpdatedAt: string | null;
+  lifecycleConfigVersion: string | null;
+}
+
+export interface UniverseLifecycleEventRow {
+  id: string;
+  runId: string;
+  symbol: string;
+  fromState: UniverseLifecycleState | null;
+  toState: UniverseLifecycleState;
+  reasonCode: string;
+  evidenceJson: string;
+  occurredAt: string;
+  gitSha: string;
+  configVersion: string;
+  configHash: string;
+}
+
+export interface UniverseLifecycleRunRow {
+  id: string;
+  startedAt: string;
+  completedAt: string | null;
+  status: "running" | "completed" | "failed";
+  discoveryCursorStart: string | null;
+  discoveryCursorEnd: string | null;
+  assetsScanned: number;
+  assetsDiscovered: number;
+  symbolsAssessed: number;
+  transitionsApplied: number;
+  errorSummary: string | null;
+  gitSha: string;
+  configVersion: string;
+  configHash: string;
 }
 
 export interface MarketBarRow {

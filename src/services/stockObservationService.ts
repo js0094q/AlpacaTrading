@@ -11,7 +11,7 @@ import {
   assertReadOnlyAlpacaAccessAllowed
 } from "./tradingSafetyService.js";
 import {
-  getActiveSymbols,
+  getObservableSymbols,
   refreshUniverseAssetMetadata,
   seedInitialUniverse
 } from "./universeService.js";
@@ -245,7 +245,9 @@ export const runStockObservation = async (input: {
   await seedInitialUniverse();
   const now = input.now ?? (() => new Date());
   const startedAt = now().toISOString();
-  const initialSymbols = dedupeSymbols(input.symbols?.length ? input.symbols : getActiveSymbols());
+  const initialSymbols = dedupeSymbols(
+    input.symbols?.length ? input.symbols : getObservableSymbols()
+  );
   const runId = createObservationRun(initialSymbols, startedAt);
   const feed = (input.feed || process.env.MARKET_OBSERVATORY_FEED || "iex").trim().toLowerCase();
   const currency = (input.currency || process.env.MARKET_OBSERVATORY_CURRENCY || "USD").trim().toUpperCase();
@@ -293,7 +295,7 @@ export const runStockObservation = async (input: {
         24
       ) * 60 * 60 * 1000
     });
-    const active = new Set(getActiveSymbols());
+    const active = new Set(getObservableSymbols());
     symbols = symbols.filter((symbol) => active.has(symbol));
     updateObservationRunSymbols(runId, symbols);
 

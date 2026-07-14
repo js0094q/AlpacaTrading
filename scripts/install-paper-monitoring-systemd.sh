@@ -14,6 +14,8 @@ UNIT_DEST="/etc/systemd/system"
 units=(
   alpaca-market-observatory.service
   alpaca-market-observatory.timer
+  alpaca-universe-lifecycle.service
+  alpaca-universe-lifecycle.timer
   alpaca-paper-review.service
   alpaca-paper-review.timer
   alpaca-paper-execute.service
@@ -51,6 +53,7 @@ systemd-analyze verify "${units[@]/#/${UNIT_DEST}/}"
 systemctl daemon-reload
 systemctl enable --now \
   alpaca-market-observatory.timer \
+  alpaca-universe-lifecycle.timer \
   alpaca-paper-review.timer \
   alpaca-paper-execute.timer \
   alpaca-paper-exit-review.timer \

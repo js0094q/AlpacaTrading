@@ -7,6 +7,9 @@ import { runZeroDteMigrations } from "./zeroDteSchema.js";
 export const LOCAL_SQLITE_UNAVAILABLE_ON_VERCEL =
   "LOCAL_SQLITE_UNAVAILABLE_ON_VERCEL";
 
+export const UNIVERSE_LIFECYCLE_MIGRATION_VERSION =
+  "2026-07-14-autonomous-universe-lifecycle";
+
 export class LocalSqliteUnavailableError extends Error {
   code = LOCAL_SQLITE_UNAVAILABLE_ON_VERCEL;
 
@@ -43,6 +46,11 @@ CREATE TABLE IF NOT EXISTS universe_symbols (
   asset_attributes_json TEXT,
   asset_validated_at TEXT,
   asset_request_id TEXT,
+  lifecycle_state TEXT NOT NULL DEFAULT 'research_eligible',
+  lifecycle_reason_code TEXT NOT NULL DEFAULT 'LEGACY_SEED',
+  lifecycle_entered_at TEXT,
+  lifecycle_updated_at TEXT,
+  lifecycle_config_version TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -1022,12 +1030,58 @@ export const runPhase1BMigrations = (db: DbHandle) => {
       INSERT OR IGNORE INTO schema_migrations(version, applied_at)
       VALUES ('2026-07-13-market-observatory-phase-1b', ?)
     `).run(new Date().toISOString());
+    db.prepare(`
+      INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+      VALUES (?, ?)
+    `).run(UNIVERSE_LIFECYCLE_MIGRATION_VERSION, new Date().toISOString());
     db.exec("COMMIT;");
   } catch (error) {
     db.exec("ROLLBACK;");
     throw error;
   }
 };
+
+const universeLifecycleSchema = `
+CREATE TABLE IF NOT EXISTS universe_lifecycle_runs (
+  id TEXT PRIMARY KEY,
+  started_at TEXT NOT NULL,
+  completed_at TEXT,
+  status TEXT NOT NULL,
+  discovery_cursor_start TEXT,
+  discovery_cursor_end TEXT,
+  assets_scanned INTEGER NOT NULL DEFAULT 0,
+  assets_discovered INTEGER NOT NULL DEFAULT 0,
+  symbols_assessed INTEGER NOT NULL DEFAULT 0,
+  transitions_applied INTEGER NOT NULL DEFAULT 0,
+  error_summary TEXT,
+  git_sha TEXT NOT NULL,
+  config_version TEXT NOT NULL,
+  config_hash TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_universe_lifecycle_runs_completed
+  ON universe_lifecycle_runs(completed_at);
+
+CREATE TABLE IF NOT EXISTS universe_lifecycle_events (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  from_state TEXT,
+  to_state TEXT NOT NULL,
+  reason_code TEXT NOT NULL,
+  evidence_json TEXT NOT NULL,
+  occurred_at TEXT NOT NULL,
+  git_sha TEXT NOT NULL,
+  config_version TEXT NOT NULL,
+  config_hash TEXT NOT NULL,
+  FOREIGN KEY(run_id) REFERENCES universe_lifecycle_runs(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_universe_lifecycle_events_symbol_occurred
+  ON universe_lifecycle_events(symbol, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_universe_lifecycle_events_run
+  ON universe_lifecycle_events(run_id);
+`;
 
 const runMigrations = (db: DbHandle) => {
   addColumnIfMissing(db, "universe_symbols", "asset_id", "asset_id TEXT");
@@ -1040,6 +1094,37 @@ const runMigrations = (db: DbHandle) => {
   addColumnIfMissing(db, "universe_symbols", "asset_attributes_json", "asset_attributes_json TEXT");
   addColumnIfMissing(db, "universe_symbols", "asset_validated_at", "asset_validated_at TEXT");
   addColumnIfMissing(db, "universe_symbols", "asset_request_id", "asset_request_id TEXT");
+  addColumnIfMissing(
+    db,
+    "universe_symbols",
+    "lifecycle_state",
+    "lifecycle_state TEXT NOT NULL DEFAULT 'research_eligible'"
+  );
+  addColumnIfMissing(
+    db,
+    "universe_symbols",
+    "lifecycle_reason_code",
+    "lifecycle_reason_code TEXT NOT NULL DEFAULT 'LEGACY_SEED'"
+  );
+  addColumnIfMissing(
+    db,
+    "universe_symbols",
+    "lifecycle_entered_at",
+    "lifecycle_entered_at TEXT"
+  );
+  addColumnIfMissing(
+    db,
+    "universe_symbols",
+    "lifecycle_updated_at",
+    "lifecycle_updated_at TEXT"
+  );
+  addColumnIfMissing(
+    db,
+    "universe_symbols",
+    "lifecycle_config_version",
+    "lifecycle_config_version TEXT"
+  );
+  db.exec(universeLifecycleSchema);
   addColumnIfMissing(db, "ingestion_runs", "requested_symbols", "requested_symbols INTEGER NOT NULL DEFAULT 0");
   addColumnIfMissing(db, "ingestion_runs", "successful_symbols", "successful_symbols INTEGER NOT NULL DEFAULT 0");
   addColumnIfMissing(db, "ingestion_runs", "failed_symbols", "failed_symbols INTEGER NOT NULL DEFAULT 0");
