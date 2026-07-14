@@ -105,6 +105,10 @@ import {
   applyPaperLearningGovernance,
   getPaperLearningGovernanceStatus
 } from "./services/learningGovernanceService.js";
+import {
+  applyAutonomousRecovery,
+  getAutonomousRecoveryStatus
+} from "./services/autonomousRecoveryService.js";
 import { config } from "./config.js";
 import { redactSensitiveData } from "./lib/securityRedaction.js";
 import { normalizeSymbol } from "./lib/utils.js";
@@ -881,6 +885,16 @@ const run = async () => {
 
   if (command === "paper:governance") {
     print(applyPaperLearningGovernance());
+    return;
+  }
+
+  if (command === "system:recover:status") {
+    print(getAutonomousRecoveryStatus());
+    return;
+  }
+
+  if (command === "system:recover") {
+    print(applyAutonomousRecovery());
     return;
   }
 

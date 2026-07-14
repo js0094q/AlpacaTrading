@@ -21,7 +21,9 @@ const requiredTables = [
   "paper_position_outcomes",
   "paper_position_outcome_revisions",
   "universe_lifecycle_runs",
-  "universe_lifecycle_events"
+  "universe_lifecycle_events",
+  "autonomous_recovery_runs",
+  "autonomous_recovery_events"
 ] as const;
 
 const requiredColumns: Record<string, string[]> = {
@@ -60,6 +62,14 @@ const requiredColumns: Record<string, string[]> = {
     "lifecycle_entered_at",
     "lifecycle_updated_at",
     "lifecycle_config_version"
+  ],
+  autonomous_recovery_runs: ["git_sha", "config_version", "config_hash"],
+  autonomous_recovery_events: [
+    "recovery_run_id",
+    "source_table",
+    "source_id",
+    "recovery_code",
+    "evidence_json"
   ]
 };
 
@@ -78,7 +88,10 @@ const requiredIndexes = [
   "idx_paper_position_observations_symbol_time",
   "idx_universe_lifecycle_runs_completed",
   "idx_universe_lifecycle_events_symbol_occurred",
-  "idx_universe_lifecycle_events_run"
+  "idx_universe_lifecycle_events_run",
+  "idx_autonomous_recovery_runs_started_at",
+  "idx_autonomous_recovery_events_run",
+  "idx_autonomous_recovery_events_source"
 ] as const;
 
 const objectExists = (db: DbHandle, type: "table" | "index", name: string) =>

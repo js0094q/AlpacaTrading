@@ -16,6 +16,8 @@ units=(
   alpaca-market-observatory.timer
   alpaca-universe-lifecycle.service
   alpaca-universe-lifecycle.timer
+  alpaca-autonomous-recovery.service
+  alpaca-autonomous-recovery.timer
   alpaca-paper-review.service
   alpaca-paper-review.timer
   alpaca-paper-execute.service
@@ -54,6 +56,7 @@ systemctl daemon-reload
 systemctl enable --now \
   alpaca-market-observatory.timer \
   alpaca-universe-lifecycle.timer \
+  alpaca-autonomous-recovery.timer \
   alpaca-paper-review.timer \
   alpaca-paper-execute.timer \
   alpaca-paper-exit-review.timer \

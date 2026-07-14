@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Alpaca Autonomous Recovery and Self-Healing Service
+
+[Timer]
+OnCalendar=*-*-* *:07/15:30
+Persistent=true
+Unit=alpaca-autonomous-recovery.service
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

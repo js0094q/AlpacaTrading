@@ -591,6 +591,44 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_learning_governance_decisions_curren
   ON paper_learning_governance_decisions(scope_type, scope_key)
   WHERE superseded_at IS NULL;
 
+CREATE TABLE IF NOT EXISTS autonomous_recovery_runs (
+  id TEXT PRIMARY KEY,
+  started_at TEXT NOT NULL,
+  completed_at TEXT,
+  status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
+  recovered_universe_lifecycle_runs INTEGER NOT NULL DEFAULT 0,
+  recovered_learning_governance_runs INTEGER NOT NULL DEFAULT 0,
+  recovered_paper_operations INTEGER NOT NULL DEFAULT 0,
+  git_sha TEXT NOT NULL,
+  config_version TEXT NOT NULL,
+  config_hash TEXT NOT NULL,
+  error_message TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_autonomous_recovery_runs_started_at
+  ON autonomous_recovery_runs(started_at DESC);
+
+CREATE TABLE IF NOT EXISTS autonomous_recovery_events (
+  id TEXT PRIMARY KEY,
+  recovery_run_id TEXT NOT NULL,
+  source_table TEXT NOT NULL,
+  source_id TEXT NOT NULL,
+  previous_status TEXT NOT NULL,
+  recovery_code TEXT NOT NULL,
+  recovered_at TEXT NOT NULL,
+  evidence_json TEXT NOT NULL,
+  git_sha TEXT NOT NULL,
+  config_version TEXT NOT NULL,
+  config_hash TEXT NOT NULL,
+  FOREIGN KEY(recovery_run_id) REFERENCES autonomous_recovery_runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_autonomous_recovery_events_run
+  ON autonomous_recovery_events(recovery_run_id, recovered_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_autonomous_recovery_events_source
+  ON autonomous_recovery_events(source_table, source_id, recovered_at DESC);
+
 CREATE TABLE IF NOT EXISTS paper_operation_log (
   id TEXT PRIMARY KEY,
   action_type TEXT NOT NULL,

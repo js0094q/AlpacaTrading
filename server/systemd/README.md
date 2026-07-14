@@ -108,6 +108,16 @@ deadline, and uses control-group termination. `Persistent=false` intentionally
 skips missed runs and resumes at the next daily window instead of replaying work
 after reboot.
 
+`alpaca-autonomous-recovery.timer` runs at minutes 07, 22, 37, and 52 and is
+`Persistent=true` so a reboot receives one bounded local recovery pass. It only
+marks stale local records terminal and writes immutable recovery events; it does
+not call Alpaca, retry a job, clear locks, or submit orders. It handles stale
+universe-lifecycle and learning-governance runs plus stale non-mutating
+paper-operations records. The lifecycle service also starts it through
+`OnFailure=` after a timeout or other service failure. A recovery never reruns
+the interrupted workload: the next existing scheduler window remains the
+automatic downstream consumer.
+
 ## Service operating guidance
 
 - Run as `alpaca`.
