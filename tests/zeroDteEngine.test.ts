@@ -126,6 +126,7 @@ test("reconciliation and eod remain bounded when no broker mutation is requested
   assert.equal(reconciliation.paperOnly, true);
   assert.equal(reconciliation.mutationAttempted, false);
   assert.equal(reconciliation.paperOrders.checked, 0);
+  assert.equal(reconciliation.exitOrders.checked, 0);
   assert.equal(eod.paperOnly, true);
   assert.equal(eod.tradingDate, "2026-07-13");
 });

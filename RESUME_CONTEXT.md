@@ -1,5 +1,23 @@
 # Resume Context: Alpaca Trading Research Infra
 
+## 0DTE operational acceptance follow-up (2026-07-14)
+
+- Naturally triggered Level 2 paper exits remain `exit_requested` until
+  `zero-dte:reconcile` reads the persisted exit-order identity back from Alpaca.
+- Exit reconciliation requires exact broker/client order IDs, option symbol,
+  `sell_to_close` intent, quantity, average fill price, and fill timestamp. It
+  binds those facts to the same exit-request generation, validates any existing
+  `zero-dte-exit` execution-ledger identity before updating it, and rejects fill
+  timestamps outside the entry/request/reconciliation chronology.
+- A validated full exit atomically closes the Level 2 trade, persists realized
+  result and holding time when entry evidence is complete, appends fill/close
+  lifecycle events, and records one terminal paper outcome. It never substitutes
+  a reviewed quote or mark for a broker fill, and a conflicting existing outcome
+  rolls the transaction back.
+- Pending and partial exits remain explicit. Zero-fill terminal exits return the
+  trade to `open` for a fresh review; partial terminal and identity-mismatched
+  responses remain fail-closed for operator reconciliation.
+
 ## Market Observatory Phase 1B implementation checkpoint (2026-07-13)
 
 - Phase 1B starts from Phase 1A `9bcb097` on `feat/market-observatory` and adds
