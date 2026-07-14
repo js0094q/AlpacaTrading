@@ -440,7 +440,17 @@ const parseSnapshotMap = <T>(payload: unknown): Record<string, T> => {
     snapshots?: Record<string, T>;
     data?: Record<string, T>;
   };
-  return value.snapshots || value.data || {};
+  const nested = value.snapshots || value.data;
+  if (nested) return nested;
+  return Object.fromEntries(
+    Object.entries(payload)
+      .filter(([symbol, snapshot]) =>
+        symbol.trim().length > 0 &&
+        snapshot !== null &&
+        typeof snapshot === "object" &&
+        !Array.isArray(snapshot)
+      )
+  ) as Record<string, T>;
 };
 
 const getBatchedDataSnapshots = async <T>(

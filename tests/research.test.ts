@@ -318,7 +318,7 @@ describe("Market bar persistence", () => {
 
   test("configures SQLite busy timeout for transient writer contention", () => {
     const row = getDb().prepare("PRAGMA busy_timeout").get() as Record<string, number>;
-    assert.equal(Object.values(row)[0], 5000);
+    assert.equal(Object.values(row)[0], 60_000);
   });
 
   test("stores bars without duplicate rows", () => {

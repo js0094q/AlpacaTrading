@@ -2,12 +2,11 @@
 Description=Run Alpaca Paper Monitor exit review frequently during weekday market hours
 
 [Timer]
-OnCalendar=Mon..Fri *-*-* 09..14:0/15:00
-OnCalendar=Mon..Fri *-*-* 15:0/5:00
+OnCalendar=Mon..Fri *-*-* 09..14:1/15:00
+OnCalendar=Mon..Fri *-*-* 15:1/5:00
 Persistent=false
 RandomizedDelaySec=15
 Unit=alpaca-paper-exit-review.service
 
 [Install]
 WantedBy=timers.target
-

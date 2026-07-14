@@ -84,6 +84,8 @@ Expected modules:
 - `zeroDteOutcomeService.ts`: missed-opportunity horizons, production outcomes, and daily learning summary.
 - `zeroDteEngineService.ts`: cycle orchestration and non-overlap handling.
 
+Direct snapshot adapters must normalize both wrapped Alpaca snapshot objects and top-level symbol maps before applying freshness or liquidity filters. A valid response shape must not be silently interpreted as an empty underlying universe.
+
 Pure scoring and ranking functions must be usable without a broker or database so focused tests can use deterministic fixtures.
 
 ## Identity and persistence
@@ -217,6 +219,8 @@ Minimum paper-entry eligibility requires:
 - valid market session, fresh underlying data, fresh option quote, eligible playbook, score threshold, confirmation observations, liquidity, position, daily-loss, daily-trade, and buying-power checks;
 - no equivalent open position, open order, ledger reservation, or prior same-day action.
 
+The engine may advance an eligible candidate to the persisted `selected` state before invoking execution; that state transition must not invalidate the candidate, and the execution service must reapply every runtime, account, quote, liquidity, sizing, duplicate, and risk gate. `ZERO_DTE_MAX_OPEN_POSITIONS` counts active same-day option positions, not unrelated equities or long-dated options. Exact-contract duplicate checks remain independent.
+
 The implementation must reuse existing paper execution preflight, option validation, paper-only client routing, and execution ledger behavior. New Level 2 records link to the existing ledger without exposing raw credentials or unnecessary broker payloads.
 
 New defaults are:
@@ -281,7 +285,7 @@ Add existing-pattern systemd services/timers for:
 - reconciliation every 5 minutes;
 - one end-of-day summary after the configured cutoff.
 
-The runner must use the existing non-overlap lock pattern, session gate, paper-runtime gate, and redacted structured logging. Outside market hours it records a skipped/closed-session run rather than treating the condition as an error.
+The runner must use the existing non-overlap lock pattern, session gate, paper-runtime gate, and redacted structured logging. Database-heavy timer wakeups must be staggered from the quarter-hour observatory write, and transient SQLite writer contention must use a bounded busy timeout. Outside market hours it records a skipped/closed-session run rather than treating the condition as an error; the read-only end-of-day task may run after a valid weekday session closes.
 
 ## Dashboard
 

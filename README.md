@@ -411,7 +411,7 @@ The continuous paper monitor is installed separately with `scripts/install-paper
 - `alpaca-zero-dte-reconcile.timer`: wakes every five minutes to mark paper/shadow positions and capture forward outcomes.
 - `alpaca-zero-dte-eod.timer`: writes the end-of-day 0DTE summary after the force-exit window.
 
-The monitor runner no-ops with `MARKET_CLOSED` outside regular market hours, weekends, and configured US market holidays. It fails closed unless `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, `LIVE_TRADING_ENABLED=false`, `PAPER_ORDER_EXECUTION_ENABLED=true`, `PAPER_OPTIONS_EXECUTION_ENABLED=true`, and `AUTOMATED_PAPER_EXECUTION_ENABLED=true` for execution tasks. See `docs/paper-monitoring-operations.md`.
+Database-heavy wakeups are deliberately staggered: general exit review starts on minute 1, general review on minute 3, the 0DTE engine near second 45, 0DTE exit review near second 55, and reconciliation on minute 1 modulo 5 near second 30. SQLite connections wait up to 60 seconds for transient writer contention. The monitor runner otherwise no-ops with `MARKET_CLOSED` outside regular market hours, weekends, and configured US market holidays; the read-only `zero-dte-eod` task is the sole post-close exception on a valid weekday session. It fails closed unless `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, `LIVE_TRADING_ENABLED=false`, `PAPER_ORDER_EXECUTION_ENABLED=true`, `PAPER_OPTIONS_EXECUTION_ENABLED=true`, and `AUTOMATED_PAPER_EXECUTION_ENABLED=true` for execution tasks. See `docs/paper-monitoring-operations.md`.
 
 Set the VPS timezone to `America/New_York` or adjust the timer calendar before enabling timers.
 
@@ -419,7 +419,7 @@ Each 0DTE monitor task has a dedicated lock (`/tmp/alpaca-zero-dte-engine.lock`,
 
 ## 0DTE Level 2 Engine
 
-The 0DTE Level 2 engine is an independent paper-only workflow. It obtains its own underlying and same-day option market data, maintains a ranked candidate queue, evaluates separate playbooks, records shadow alternatives, and feeds the dedicated dashboard panel. It does not require the Market Observatory cycle to complete first.
+The 0DTE Level 2 engine is an independent paper-only workflow. It obtains its own underlying and same-day option market data, maintains a ranked candidate queue, evaluates separate playbooks, records shadow alternatives, and feeds the dedicated dashboard panel. Its batched snapshot adapter accepts both Alpaca's wrapped snapshot payloads and the top-level symbol map returned by the stock snapshot endpoint. It does not require the Market Observatory cycle to complete first.
 
 Run the engine and lifecycle workers directly from the CLI:
 
@@ -433,7 +433,7 @@ npm run zero-dte:eod -- --format=json
 npm run zero-dte:summary -- --format=json
 ```
 
-`--dryRun` persists local engine, candidate, decision, and shadow evidence without submitting an order. The default engine mode is shadow-only; `--confirmPaper` is the only engine execution mode and remains paper-only. It requires `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, `LIVE_TRADING_ENABLED=false`, `ZERO_DTE_ENGINE_ENABLED=true`, `ZERO_DTE_PAPER_EXECUTION_ENABLED=true`, `PAPER_ORDER_EXECUTION_ENABLED=true`, `PAPER_OPTIONS_EXECUTION_ENABLED=true`, `AUTOMATED_PAPER_EXECUTION_ENABLED=true`, and the explicit `--confirmPaper` flag. Entry selection is blocked at or after `ZERO_DTE_NEW_ENTRY_CUTOFF_ET`; exit review continues through the force-exit window. No live endpoint or live-order path is exposed.
+`--dryRun` persists local engine, candidate, decision, and shadow evidence without submitting an order. The default engine mode is shadow-only; `--confirmPaper` is the only engine execution mode and remains paper-only. It requires `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, `LIVE_TRADING_ENABLED=false`, `ZERO_DTE_ENGINE_ENABLED=true`, `ZERO_DTE_PAPER_EXECUTION_ENABLED=true`, `PAPER_ORDER_EXECUTION_ENABLED=true`, `PAPER_OPTIONS_EXECUTION_ENABLED=true`, `AUTOMATED_PAPER_EXECUTION_ENABLED=true`, and the explicit `--confirmPaper` flag. A candidate that the engine has advanced from `eligible` to `selected` remains eligible for this guarded execution step; every other execution gate is reapplied. `ZERO_DTE_MAX_OPEN_POSITIONS` counts active same-day option positions only, while exact-symbol duplicate checks still consider positions and open orders independently. Entry selection is blocked at or after `ZERO_DTE_NEW_ENTRY_CUTOFF_ET`; exit review continues through the force-exit window. No live endpoint or live-order path is exposed.
 
 The database migrations are `2026-07-13-zero-dte-level-2` and `2026-07-13-zero-dte-level-2-hardening`. They persist engine runs, candidates, observations, playbook evaluations, decisions, lifecycle events, paper trades, shadow trades, position marks, terminal outcomes, and configuration versions. Decision groups link selected, skipped, rejected, and shadow alternatives for later learning; shadow rows are simulated and are never account exposure.
 

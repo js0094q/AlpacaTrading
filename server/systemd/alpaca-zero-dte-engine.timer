@@ -2,9 +2,9 @@
 Description=Run the paper 0DTE Level 2 engine every minute during the entry window
 
 [Timer]
-OnCalendar=Mon..Fri *-*-* 09:35/1
-OnCalendar=Mon..Fri *-*-* 10..14:*:00
-OnCalendar=Mon..Fri *-*-* 15:00..15:15
+OnCalendar=Mon..Fri *-*-* 09:35/1:45
+OnCalendar=Mon..Fri *-*-* 10..14:*:45
+OnCalendar=Mon..Fri *-*-* 15:00..15:45
 Persistent=false
 RandomizedDelaySec=5
 AccuracySec=1s
