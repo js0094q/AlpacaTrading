@@ -2,6 +2,7 @@
 
 ## 0DTE operational acceptance follow-up (2026-07-14)
 
+- A naturally qualified SPY Level 2 entry exposed a stale terminal-ledger reuse defect: the paper broker accepted and filled the new client order, but the local trade pointed at an older same-contract ledger row with different candidate/client identity. Entry execution now creates a fresh immutable ledger row for different candidate/client identity while preserving exact same-attempt reuse before broker submission. Read-only reconciliation may relink the affected trade only from exact paper-broker order/client/symbol/buy-to-open/limit/day/quantity/price evidence; the old row is preserved and the relink plus fill persistence are atomic.
 - Naturally triggered Level 2 paper exits remain `exit_requested` until
   `zero-dte:reconcile` reads the persisted exit-order identity back from Alpaca.
 - Exit reconciliation requires exact broker/client order IDs, option symbol,

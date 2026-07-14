@@ -15,6 +15,7 @@ import {
 } from "../alpacaClient.js";
 import { nowIso } from "../../lib/utils.js";
 import {
+  findPaperExecutionByClientOrderId,
   findPaperExecutionByDedupeKey,
   insertPaperExecutionLedgerEntry,
   updatePaperExecutionLedgerEntry,
@@ -535,8 +536,12 @@ const ensureZeroDteLedgerDecisionLink = (input: {
 interface ZeroDtePaperOrderRow {
   paper_trade_id: string;
   decision_id: string;
+  candidate_id: string;
+  trading_date: string;
+  underlying_symbol: string;
   status: string;
   option_symbol: string;
+  quantity: number;
   client_order_id: string | null;
   broker_order_id: string | null;
   source_ledger_id: number;
@@ -545,6 +550,8 @@ interface ZeroDtePaperOrderRow {
   ledger_quantity: string | null;
   ledger_client_order_id: string | null;
   ledger_broker_order_id: string | null;
+  ledger_dedupe_key: string | null;
+  ledger_status: string | null;
 }
 
 type ZeroDteBrokerOrderKind = "pending" | "filled" | "partial" | "terminal";
@@ -634,15 +641,162 @@ const TERMINAL_BROKER_ORDER_STATUSES: Record<string, ZeroDteTerminalOrderState> 
 };
 
 const zeroDtePaperOrderRowForTrade = (paperTradeId: string) => getDb().prepare(
-  `SELECT t.paper_trade_id, t.decision_id, t.status, t.option_symbol,
+  `SELECT t.paper_trade_id, t.decision_id, t.candidate_id, t.trading_date,
+          t.underlying_symbol, t.status, t.option_symbol, t.quantity,
           t.client_order_id, t.broker_order_id, t.source_ledger_id,
           l.id AS ledger_id, l.symbol AS ledger_symbol, l.qty AS ledger_quantity,
           l.client_order_id AS ledger_client_order_id,
-          l.alpaca_order_id AS ledger_broker_order_id
+          l.alpaca_order_id AS ledger_broker_order_id,
+          l.dedupe_key AS ledger_dedupe_key, l.status AS ledger_status
    FROM zero_dte_paper_trades AS t
    LEFT JOIN paper_execution_ledger AS l ON l.id = t.source_ledger_id
    WHERE t.paper_trade_id = ?`
 ).get(paperTradeId) as ZeroDtePaperOrderRow | undefined;
+
+const REPAIRABLE_ZERO_DTE_LEDGER_STATUSES = new Set([
+  "blocked",
+  "failed",
+  "released",
+  "expired"
+]);
+
+const repairStaleZeroDteLedgerLinkage = (input: {
+  row: ZeroDtePaperOrderRow;
+  response: AlpacaApiResponse<AlpacaSubmittedOrder>;
+  now: string;
+}): { row: ZeroDtePaperOrderRow; repaired: boolean } => {
+  const { row, response, now } = input;
+  const tradeClientOrderId = text(row.client_order_id);
+  const ledgerClientOrderId = text(row.ledger_client_order_id);
+  if (
+    tradeClientOrderId === null ||
+    ledgerClientOrderId === tradeClientOrderId ||
+    !REPAIRABLE_ZERO_DTE_LEDGER_STATUSES.has(normalizedStatus(row.ledger_status))
+  ) {
+    return { row, repaired: false };
+  }
+
+  const brokerOrderId = text(row.broker_order_id);
+  const responseOrderId = text(response.data?.id);
+  const responseClientOrderId = text(response.data?.client_order_id);
+  const optionSymbol = normalizedSymbol(row.option_symbol);
+  const requestedQuantity = finite(row.quantity);
+  const responseQuantity = finite(response.data?.qty);
+  const limitPrice = positive(response.data?.limit_price);
+  const brokerStatus = normalizedStatus(response.data?.status);
+  const dedupeKey = `${row.trading_date}:${optionSymbol}:entry`;
+  const decision = decisionRow(row.decision_id);
+
+  if (row.ledger_id === null || row.ledger_id !== row.source_ledger_id) {
+    throw new Error("ZERO_DTE_LEDGER_NOT_FOUND");
+  }
+  if (brokerOrderId === null || responseOrderId !== brokerOrderId) {
+    throw new Error("BROKER_ORDER_ID_MISMATCH");
+  }
+  if (responseClientOrderId !== tradeClientOrderId) {
+    throw new Error("BROKER_CLIENT_ORDER_ID_MISMATCH");
+  }
+  if (!optionSymbol || normalizedSymbol(response.data?.symbol) !== optionSymbol) {
+    throw new Error("BROKER_ORDER_SYMBOL_MISMATCH");
+  }
+  if (
+    normalizedStatus(response.data?.side) !== "buy" ||
+    normalizedStatus(response.data?.position_intent) !== "buy_to_open" ||
+    normalizedStatus(response.data?.type) !== "limit" ||
+    normalizedStatus(response.data?.time_in_force) !== "day"
+  ) {
+    throw new Error("BROKER_ENTRY_ORDER_SEMANTICS_MISMATCH");
+  }
+  if (
+    requestedQuantity === null ||
+    !Number.isInteger(requestedQuantity) ||
+    requestedQuantity <= 0 ||
+    responseQuantity !== requestedQuantity
+  ) {
+    throw new Error("BROKER_ORDER_QUANTITY_MISMATCH");
+  }
+  if (limitPrice === null || !brokerStatus) {
+    throw new Error("BROKER_ENTRY_ORDER_EVIDENCE_INCOMPLETE");
+  }
+  if (text(row.ledger_dedupe_key) !== dedupeKey) {
+    throw new Error("ZERO_DTE_LEDGER_DEDUPE_MISMATCH");
+  }
+  if (!decision || decision.candidate_id !== row.candidate_id) {
+    throw new Error("DECISION_CANDIDATE_MISMATCH");
+  }
+
+  let replacementLedgerId = 0;
+  runInZeroDtePersistenceTransaction(() => {
+    const existing = findPaperExecutionByClientOrderId(tradeClientOrderId);
+    if (existing) {
+      if (
+        existing.dedupeKey !== dedupeKey ||
+        normalizedSymbol(existing.symbol) !== optionSymbol ||
+        existing.sourceCandidateId !== row.candidate_id ||
+        existing.decisionId !== row.decision_id ||
+        finite(existing.qty) !== requestedQuantity ||
+        normalizedStatus(existing.side) !== "buy" ||
+        (existing.alpacaOrderId !== null && existing.alpacaOrderId !== brokerOrderId)
+      ) {
+        throw new Error("ZERO_DTE_REPAIR_LEDGER_CONFLICT");
+      }
+      replacementLedgerId = existing.id;
+    } else {
+      const estimatedPremium = roundMoney(limitPrice * requestedQuantity * 100);
+      const replacement = insertPaperExecutionLedgerEntry({
+        mode: "zero-dte-entry",
+        assetClass: "option",
+        symbol: optionSymbol,
+        underlyingSymbol: normalizedSymbol(row.underlying_symbol),
+        strategy: "zero_dte_level_2",
+        side: "buy",
+        orderType: "limit",
+        timeInForce: "day",
+        qty: String(requestedQuantity),
+        limitPrice: String(limitPrice),
+        estimatedPremium,
+        maxRisk: estimatedPremium,
+        dedupeKey,
+        clientOrderId: tradeClientOrderId,
+        requestId: response.requestId ?? null,
+        status: "submitted",
+        sourceCandidateId: row.candidate_id,
+        decisionId: row.decision_id as NonNullable<PaperExecutionLedgerEntry["decisionId"]>,
+        decisionLinkageStatus: "EXACT",
+        payload: {
+          candidateId: row.candidate_id,
+          decisionId: row.decision_id,
+          decisionGroupId: decision.decision_group_id,
+          tradingDate: row.trading_date,
+          symbol: optionSymbol,
+          quantity: requestedQuantity,
+          limitPrice,
+          positionIntent: "buy_to_open"
+        },
+        rawResponse: response.data
+      });
+      replacementLedgerId = replacement.id;
+    }
+    updatePaperExecutionLedgerEntry(replacementLedgerId, {
+      status: "submitted",
+      alpacaOrderId: brokerOrderId,
+      alpacaStatus: brokerStatus,
+      requestId: response.requestId ?? null,
+      rawResponse: response.data
+    });
+    getDb().prepare(
+      `UPDATE zero_dte_paper_trades
+       SET source_ledger_id = ?, updated_at = ?
+       WHERE paper_trade_id = ? AND source_ledger_id = ?`
+    ).run(replacementLedgerId, now, row.paper_trade_id, row.source_ledger_id);
+  });
+
+  const repaired = zeroDtePaperOrderRowForTrade(row.paper_trade_id);
+  if (!repaired || repaired.source_ledger_id !== replacementLedgerId) {
+    throw new Error("ZERO_DTE_LEDGER_RELINK_FAILED");
+  }
+  return { row: repaired, repaired: true };
+};
 
 const exactBrokerFillTime = (value: unknown) => {
   const timestamp = text(value);
@@ -1009,11 +1163,13 @@ export const reconcileZeroDtePaperOrders = async (input: {
     errors: []
   };
   const rows = getDb().prepare(
-    `SELECT t.paper_trade_id, t.decision_id, t.status, t.option_symbol,
+    `SELECT t.paper_trade_id, t.decision_id, t.candidate_id, t.trading_date,
+            t.underlying_symbol, t.status, t.option_symbol, t.quantity,
             t.client_order_id, t.broker_order_id, t.source_ledger_id,
             l.id AS ledger_id, l.symbol AS ledger_symbol, l.qty AS ledger_quantity,
             l.client_order_id AS ledger_client_order_id,
-            l.alpaca_order_id AS ledger_broker_order_id
+            l.alpaca_order_id AS ledger_broker_order_id,
+            l.dedupe_key AS ledger_dedupe_key, l.status AS ledger_status
      FROM zero_dte_paper_trades AS t
      LEFT JOIN paper_execution_ledger AS l ON l.id = t.source_ledger_id
      WHERE t.status IN ('intended', 'submitted', 'partially_filled')
@@ -1036,9 +1192,10 @@ export const reconcileZeroDtePaperOrders = async (input: {
     try {
       if (row.broker_order_id === null) throw new Error("BROKER_ORDER_ID_MISSING");
       const response = await getOrder(row.broker_order_id);
-      const state = validateZeroDteBrokerOrderState({ row, response });
-      const applied = applyZeroDteBrokerOrderState({ row, state, response, now });
-      if (applied.linkageChanged) result.linkageUpdated += 1;
+      const linkage = repairStaleZeroDteLedgerLinkage({ row, response, now });
+      const state = validateZeroDteBrokerOrderState({ row: linkage.row, response });
+      const applied = applyZeroDteBrokerOrderState({ row: linkage.row, state, response, now });
+      if (linkage.repaired || applied.linkageChanged) result.linkageUpdated += 1;
       if (applied.updated) result.updated += 1;
       if (applied.stateApplied && state.kind === "filled") result.filled += 1;
       if (applied.stateApplied && state.kind === "partial") result.partial += 1;
@@ -1277,16 +1434,23 @@ export const executeZeroDteCandidate = async (input: {
 
   let ledger: PaperExecutionLedgerEntry;
   try {
-    const reusableLedger = findPaperExecutionByDedupeKey(eligibility.reservationKey);
-    if (reusableLedger && ["blocked", "failed", "released", "expired"].includes(normalizedStatus(reusableLedger.status))) {
-      updatePaperExecutionLedgerEntry(reusableLedger.id, {
+    const exactReusableLedger = findPaperExecutionByDedupeKey(eligibility.reservationKey);
+    if (
+      exactReusableLedger &&
+      REPAIRABLE_ZERO_DTE_LEDGER_STATUSES.has(normalizedStatus(exactReusableLedger.status)) &&
+      exactReusableLedger.clientOrderId === eligibility.clientOrderId &&
+      exactReusableLedger.sourceCandidateId === input.candidate.candidateId &&
+      exactReusableLedger.alpacaOrderId === null &&
+      (exactReusableLedger.decisionId === null || exactReusableLedger.decisionId === input.decisionId)
+    ) {
+      updatePaperExecutionLedgerEntry(exactReusableLedger.id, {
         status: "reserved",
         reason: null,
         blockedReason: null,
         errorMessage: null
       });
       ledger = {
-        ...reusableLedger,
+        ...exactReusableLedger,
         status: "reserved",
         reason: null,
         blockedReason: null,
