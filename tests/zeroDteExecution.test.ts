@@ -628,6 +628,121 @@ test("invalid immediate fill evidence stays recoverable through exact reconcilia
   );
 });
 
+test("stale concurrent pending and partial responses cannot regress a confirmed fill", async () => {
+  const twoContractConfig = loadZeroDteConfig({
+    ZERO_DTE_MAX_CONTRACTS_PER_TRADE: "2",
+    ZERO_DTE_MAX_PREMIUM_PER_TRADE: "500",
+    ZERO_DTE_MAX_DAILY_PREMIUM: "1000"
+  });
+  const scenarios = [
+    { name: "stale-pending", status: "accepted", strike: 509 },
+    { name: "stale-partial", status: "partially_filled", strike: 510 }
+  ] as const;
+
+  for (const scenario of scenarios) {
+    const scenarioOptionSymbol = `SPY260713C${String(scenario.strike * 1_000).padStart(8, "0")}`;
+    const pending = await createPendingEntry({
+      candidate: scenarioCandidate({
+        candidateId: `execution-candidate-${scenario.name}`,
+        optionSymbol: scenarioOptionSymbol,
+        strike: scenario.strike,
+        quantity: 2
+      }),
+      decisionId: `execution-decision-${scenario.name}`,
+      brokerOrderId: `paper-order-${scenario.name}`,
+      configuration: twoContractConfig
+    });
+    assert.ok(pending.paperTradeId);
+    assert.ok(pending.ledgerId);
+
+    let releaseStaleResponse: (() => void) | undefined;
+    let markStaleRequestStarted: (() => void) | undefined;
+    const staleRequestStarted = new Promise<void>((resolve) => {
+      markStaleRequestStarted = resolve;
+    });
+    const staleResponseGate = new Promise<void>((resolve) => {
+      releaseStaleResponse = resolve;
+    });
+    const staleFilledAt = "2026-07-13T14:30:04.000Z";
+    const staleReconciliation = reconcileZeroDtePaperOrders({
+      now: "2026-07-13T14:30:06.000Z",
+      provider: {
+        runtime: runtime(),
+        getOrder: async () => {
+          markStaleRequestStarted?.();
+          await staleResponseGate;
+          return {
+            data: {
+              id: pending.brokerOrderId ?? undefined,
+              client_order_id: pending.clientOrderId,
+              symbol: scenarioOptionSymbol,
+              qty: "2",
+              status: scenario.status,
+              filled_qty: scenario.status === "accepted" ? "0" : "1",
+              filled_avg_price: scenario.status === "accepted" ? undefined : "1.10",
+              filled_at: scenario.status === "accepted" ? undefined : staleFilledAt
+            },
+            requestId: `request-${scenario.name}`,
+            status: 200,
+            url: "paper"
+          };
+        }
+      }
+    });
+    await staleRequestStarted;
+
+    const filledAt = "2026-07-13T14:30:05.000Z";
+    const filledReconciliation = await reconcileZeroDtePaperOrders({
+      now: filledAt,
+      provider: {
+        runtime: runtime(),
+        getOrder: async () => ({
+          data: {
+            id: pending.brokerOrderId ?? undefined,
+            client_order_id: pending.clientOrderId,
+            symbol: scenarioOptionSymbol,
+            qty: "2",
+            status: "filled",
+            filled_qty: "2",
+            filled_avg_price: "1.20",
+            filled_at: filledAt
+          },
+          requestId: `request-${scenario.name}-filled`,
+          status: 200,
+          url: "paper"
+        })
+      }
+    });
+    assert.equal(filledReconciliation.filled, 1);
+    assert.deepEqual(filledReconciliation.errors, []);
+
+    releaseStaleResponse?.();
+    const staleResult = await staleReconciliation;
+    assert.equal(staleResult.updated, 0);
+    assert.deepEqual(staleResult.errors, []);
+    assert.deepEqual(
+      { ...getDb().prepare(
+        `SELECT status, quantity, entry_premium, filled_at
+         FROM zero_dte_paper_trades
+         WHERE paper_trade_id = ?`
+      ).get(pending.paperTradeId) as Record<string, unknown> },
+      { status: "open", quantity: 2, entry_premium: 1.2, filled_at: filledAt }
+    );
+    assert.equal(
+      (getDb().prepare("SELECT status FROM paper_execution_ledger WHERE id = ?").get(pending.ledgerId) as { status: string }).status,
+      "filled"
+    );
+    assert.equal(
+      (getDb().prepare(
+        `SELECT COUNT(*) AS count
+         FROM zero_dte_lifecycle_events
+         WHERE paper_trade_id = ? AND event_type = 'paper_order_partially_filled'`
+      ).get(pending.paperTradeId) as { count: number }).count,
+      0
+    );
+  }
+});
+
 test("reconciliation fails closed on invalid fill evidence and handles terminal orders", async () => {
   const scenarios = [
     ["missing-price", "SPY260713C00502000", 502],

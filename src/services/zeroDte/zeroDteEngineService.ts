@@ -845,7 +845,7 @@ const markZeroDtePaperTrades = (
             t.entry_premium, t.fees
      FROM zero_dte_paper_trades AS t
      JOIN zero_dte_decisions AS d ON d.decision_id = t.decision_id
-     WHERE t.status IN ('intended', 'submitted', 'partially_filled', 'open')`,
+     WHERE t.status IN ('partially_filled', 'open')`,
     []
   );
   let marked = 0;
@@ -1395,7 +1395,7 @@ const readZeroDtePaperPositions = (tradingDate: string | null, limit: number) =>
         WHERE paper_trade_id = t.paper_trade_id
       )
      WHERE t.trading_date = ?
-       AND t.status IN ('intended', 'submitted', 'partially_filled', 'open', 'exit_requested')
+       AND t.status IN ('partially_filled', 'open', 'exit_requested')
      ORDER BY t.updated_at DESC, t.paper_trade_id DESC
      LIMIT ?`,
     [tradingDate, limit]

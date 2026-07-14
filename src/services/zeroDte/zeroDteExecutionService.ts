@@ -759,6 +759,64 @@ const validateZeroDteBrokerOrderState = (input: {
   };
 };
 
+interface CurrentZeroDtePaperOrderState {
+  trade_status: string;
+  quantity: number;
+  filled_at: string | null;
+  ledger_status: string;
+}
+
+const TERMINAL_LOCAL_TRADE_STATUSES = new Set([
+  "canceled",
+  "expired",
+  "rejected",
+  "replaced",
+  "done_for_day",
+  "stopped",
+  "suspended",
+  "calculated",
+  "closed"
+]);
+
+const localBrokerStateStrength = (current: CurrentZeroDtePaperOrderState) => {
+  const tradeStatus = normalizedStatus(current.trade_status);
+  const ledgerStatus = normalizedStatus(current.ledger_status);
+  if (
+    ledgerStatus === "filled" ||
+    ["open", "exit_requested"].includes(tradeStatus)
+  ) return 3;
+  if (tradeStatus === "partially_filled" || ledgerStatus === "partial") return 1;
+  if (current.filled_at !== null) return 3;
+  if (
+    TERMINAL_LOCAL_TRADE_STATUSES.has(tradeStatus) ||
+    ["canceled", "expired", "rejected"].includes(ledgerStatus)
+  ) return 2;
+  return 0;
+};
+
+const brokerStateStrength = (state: ValidatedZeroDteBrokerOrderState) => {
+  if (state.kind === "filled") return 3;
+  if (state.kind === "terminal") return 2;
+  if (state.kind === "partial") return 1;
+  return 0;
+};
+
+const shouldApplyBrokerState = (
+  current: CurrentZeroDtePaperOrderState,
+  state: ValidatedZeroDteBrokerOrderState
+) => {
+  const currentStrength = localBrokerStateStrength(current);
+  const incomingStrength = brokerStateStrength(state);
+  if (incomingStrength > currentStrength) return true;
+  if (incomingStrength < currentStrength) return false;
+  if (state.kind === "pending") return currentStrength === 0;
+  if (state.kind === "partial") {
+    const currentFilledQuantity = positive(current.quantity) ?? 0;
+    return state.filledQuantity > currentFilledQuantity;
+  }
+  return false;
+};
+
 const applyZeroDteBrokerOrderState = (input: {
   row: ZeroDtePaperOrderRow;
   state: ValidatedZeroDteBrokerOrderState;
@@ -779,8 +837,19 @@ const applyZeroDteBrokerOrderState = (input: {
         ? state.terminal?.ledgerStatus ?? "failed"
         : "submitted";
   let linkageChanged = false;
+  let stateApplied = false;
 
   runInZeroDtePersistenceTransaction(() => {
+    const current = getDb().prepare(
+      `SELECT t.status AS trade_status, t.quantity, t.filled_at,
+              l.status AS ledger_status
+       FROM zero_dte_paper_trades AS t
+       JOIN paper_execution_ledger AS l ON l.id = t.source_ledger_id
+       WHERE t.paper_trade_id = ? AND l.id = ?`
+    ).get(row.paper_trade_id, row.source_ledger_id) as CurrentZeroDtePaperOrderState | undefined;
+    if (!current) throw new Error("ZERO_DTE_CURRENT_ORDER_STATE_NOT_FOUND");
+    if (!shouldApplyBrokerState(current, state)) return;
+    stateApplied = true;
     linkageChanged = ensureZeroDteLedgerDecisionLink({
       ledgerId: row.source_ledger_id,
       decisionId: row.decision_id,
@@ -904,8 +973,9 @@ const applyZeroDteBrokerOrderState = (input: {
 
   return {
     linkageChanged,
-    updated: state.kind !== "pending",
-    terminalWithFill
+    stateApplied,
+    updated: stateApplied && state.kind !== "pending",
+    terminalWithFill: stateApplied && terminalWithFill
   };
 };
 
@@ -959,9 +1029,9 @@ export const reconcileZeroDtePaperOrders = async (input: {
       const applied = applyZeroDteBrokerOrderState({ row, state, response, now });
       if (applied.linkageChanged) result.linkageUpdated += 1;
       if (applied.updated) result.updated += 1;
-      if (state.kind === "filled") result.filled += 1;
-      if (state.kind === "partial") result.partial += 1;
-      if (state.kind === "terminal") result.terminal += 1;
+      if (applied.stateApplied && state.kind === "filled") result.filled += 1;
+      if (applied.stateApplied && state.kind === "partial") result.partial += 1;
+      if (applied.stateApplied && state.kind === "terminal") result.terminal += 1;
       if (applied.terminalWithFill) result.partialTerminal += 1;
     } catch (error) {
       result.errors.push({
