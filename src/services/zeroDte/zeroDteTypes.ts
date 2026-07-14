@@ -105,6 +105,12 @@ export interface ZeroDteAccountSnapshot {
   dailyTradeCount?: number | null;
   dailyPremium?: number | null;
   dailyRealizedLoss?: number | null;
+  activityEvidenceComplete?: boolean;
+  activityEvidenceFingerprint?: string | null;
+  activityEvidenceBlockers?: string[];
+  openPositionCount?: number | null;
+  openOrderCount?: number | null;
+  openExposureCount?: number | null;
   openPositions?: ZeroDteAccountPositionSnapshot[];
   openOrders?: ZeroDteAccountOrderSnapshot[];
 }

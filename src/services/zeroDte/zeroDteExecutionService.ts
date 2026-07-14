@@ -28,6 +28,10 @@ import {
 } from "./zeroDteLifecycleService.js";
 import { buildZeroDteClientOrderId } from "./zeroDteIdentityService.js";
 import { loadZeroDteConfig } from "./zeroDteConfigService.js";
+import {
+  buildZeroDteActivityEvidence,
+  type ZeroDteActivityEvidence
+} from "./zeroDteActivityEvidenceService.js";
 import { parseOptionSymbol } from "../optionSymbolService.js";
 import type {
   ZeroDteAccountOrderSnapshot,
@@ -222,7 +226,8 @@ const toAccountSnapshot = (
   account: AlpacaAccountRaw,
   positions: AlpacaPositionRaw[],
   orders: AlpacaSubmittedOrder[],
-  runtime: ZeroDteRuntimeSnapshot
+  runtime: ZeroDteRuntimeSnapshot,
+  activity: ZeroDteActivityEvidence
 ): ZeroDteAccountSnapshot => ({
   environment: runtime.environment,
   paperVerified: runtime.paperAccountVerified ?? runtime.environment === "paper",
@@ -231,6 +236,15 @@ const toAccountSnapshot = (
   optionsBuyingPower: finite(account.options_buying_power ?? account.buying_power),
   equity: finite(account.equity ?? account.portfolio_value),
   optionApprovalLevel: finite(account.options_approved_level ?? account.options_trading_level),
+  dailyTradeCount: activity.dailyTradeCount,
+  dailyPremium: activity.dailyPremium,
+  dailyRealizedLoss: activity.dailyRealizedLoss,
+  activityEvidenceComplete: activity.complete,
+  activityEvidenceFingerprint: activity.evidenceFingerprint,
+  activityEvidenceBlockers: activity.blockers,
+  openPositionCount: activity.openPositionCount,
+  openOrderCount: activity.openOrderCount,
+  openExposureCount: activity.openExposureCount,
   openPositions: positions.map((position) => accountPosition(position)).filter(
     (position): position is ZeroDteAccountPositionSnapshot => position !== null
   ),
@@ -378,14 +392,29 @@ export const evaluateZeroDteExecutionEligibility = (
     blockers.push("BUYING_POWER");
   }
   const dailyPremium = finite(account.dailyPremium);
+  const dailyTradeCount = finite(account.dailyTradeCount);
+  const realizedLoss = accountRealizedLoss(account.dailyRealizedLoss);
+  const openExposureCount = finite(account.openExposureCount);
+  const dailyCountersComplete =
+    account.activityEvidenceComplete === true &&
+    text(account.activityEvidenceFingerprint) !== null &&
+    dailyPremium !== null && dailyPremium >= 0 &&
+    dailyTradeCount !== null && dailyTradeCount >= 0 && Number.isInteger(dailyTradeCount) &&
+    realizedLoss !== null && realizedLoss >= 0 &&
+    openExposureCount !== null && openExposureCount >= 0 && Number.isInteger(openExposureCount);
+  if (!dailyCountersComplete) {
+    blockers.push(
+      "ZERO_DTE_DAILY_COUNTER_EVIDENCE_REQUIRED",
+      "ZERO_DTE_ACTIVITY_EVIDENCE_INCOMPLETE",
+      ...(account.activityEvidenceBlockers ?? [])
+    );
+  }
   if (estimatedPremium !== null && dailyPremium !== null && dailyPremium + estimatedPremium > config.maxDailyPremium) {
     blockers.push("DAILY_PREMIUM_LIMIT");
   }
-  const dailyTradeCount = finite(account.dailyTradeCount);
   if (dailyTradeCount !== null && dailyTradeCount >= config.maxTradesPerDay) {
     blockers.push("DAILY_TRADE_LIMIT");
   }
-  const realizedLoss = accountRealizedLoss(account.dailyRealizedLoss);
   if (realizedLoss !== null && realizedLoss >= config.maxDailyRealizedLoss) {
     blockers.push("DAILY_LOSS_LIMIT");
   }
@@ -395,7 +424,10 @@ export const evaluateZeroDteExecutionEligibility = (
     const openContract = parseOptionSymbol(normalizedSymbol(position.symbol));
     return openContract.ok && openContract.expirationDate === candidate.tradingDate;
   });
-  if (openSameDayOptionPositions.length >= config.maxOpenPositions) {
+  if (
+    (openExposureCount !== null && openExposureCount >= config.maxOpenPositions) ||
+    (openExposureCount === null && openSameDayOptionPositions.length >= config.maxOpenPositions)
+  ) {
     blockers.push("MAX_OPEN_0DTE_POSITIONS");
   }
   if (openPositions.some((position) => normalizedSymbol(position.symbol) === symbol && position.quantity > 0)) {
@@ -445,7 +477,13 @@ export const evaluateZeroDteExecutionEligibility = (
       buyingPower,
       dailyPremium,
       dailyTradeCount,
-      dailyRealizedLoss: realizedLoss
+      dailyRealizedLoss: realizedLoss,
+      activityEvidenceComplete: account.activityEvidenceComplete === true,
+      activityEvidenceFingerprint: text(account.activityEvidenceFingerprint),
+      activityEvidenceBlockers: account.activityEvidenceBlockers ?? [],
+      openPositionCount: finite(account.openPositionCount),
+      openOrderCount: finite(account.openOrderCount),
+      openExposureCount
     }
   };
 };
@@ -1289,7 +1327,9 @@ const baseResult = (input: {
 
 const accountFromProvider = async (
   provider: ZeroDtePaperMutationProvider,
-  runtime: ZeroDteRuntimeSnapshot
+  runtime: ZeroDteRuntimeSnapshot,
+  tradingDate: string,
+  asOf: string
 ): Promise<ZeroDteAccountSnapshot> => {
   if (provider.account) return provider.account;
   const accountFn = provider.getAccount ?? getAccount;
@@ -1300,11 +1340,20 @@ const accountFromProvider = async (
     positionsFn(),
     ordersFn({ limit: 500 })
   ]);
+  const positions = Array.isArray(positionsResponse.data) ? positionsResponse.data : [];
+  const orders = Array.isArray(ordersResponse.data) ? ordersResponse.data : [];
+  const activity = buildZeroDteActivityEvidence({
+    tradingDate,
+    asOf,
+    positions,
+    orders
+  });
   return toAccountSnapshot(
     accountResponse.data,
-    Array.isArray(positionsResponse.data) ? positionsResponse.data : [],
-    Array.isArray(ordersResponse.data) ? ordersResponse.data : [],
-    runtime
+    positions,
+    orders,
+    runtime,
+    activity
   );
 };
 
@@ -1362,7 +1411,12 @@ export const executeZeroDteCandidate = async (input: {
 
   let account: ZeroDteAccountSnapshot;
   try {
-    account = await accountFromProvider(provider, runtime);
+    account = await accountFromProvider(
+      provider,
+      runtime,
+      input.candidate.tradingDate,
+      now
+    );
   } catch (error) {
     const eligibility = { ...skeletonEligibility, blockers: ["ACCOUNT_RECONCILIATION_FAILED"] };
     const ledger = createBlockedLedgerEntry({ candidate: input.candidate, eligibility, reason: "ACCOUNT_RECONCILIATION_FAILED", now });

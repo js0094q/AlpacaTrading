@@ -56,6 +56,12 @@ const account = (overrides: Partial<ZeroDteAccountSnapshot> = {}): ZeroDteAccoun
   dailyTradeCount: 0,
   dailyPremium: 0,
   dailyRealizedLoss: 0,
+  activityEvidenceComplete: true,
+  activityEvidenceFingerprint: "test-activity-evidence",
+  activityEvidenceBlockers: [],
+  openPositionCount: 0,
+  openOrderCount: 0,
+  openExposureCount: 0,
   openPositions: [],
   openOrders: [],
   ...overrides
@@ -298,6 +304,115 @@ test("unrelated equity and long-dated option positions do not consume the 0DTE p
 
   assert.equal(result.eligible, true);
   assert.doesNotMatch(result.blockers.join(","), /MAX_OPEN_0DTE_POSITIONS/);
+});
+
+test("eligibility fails closed when any daily activity counter lacks complete evidence", () => {
+  const missingPremium = evaluateZeroDteExecutionEligibility({
+    candidate: candidate(),
+    config,
+    runtime: runtime(),
+    account: account({ dailyPremium: null }),
+    now
+  });
+  const incomplete = evaluateZeroDteExecutionEligibility({
+    candidate: candidate(),
+    config,
+    runtime: runtime(),
+    account: account({
+      activityEvidenceComplete: false,
+      activityEvidenceBlockers: ["ZERO_DTE_REALIZED_LOSS_EVIDENCE_REQUIRED"]
+    }),
+    now
+  });
+
+  assert.equal(missingPremium.eligible, false);
+  assert.ok(missingPremium.blockers.includes("ZERO_DTE_DAILY_COUNTER_EVIDENCE_REQUIRED"));
+  assert.equal(incomplete.eligible, false);
+  assert.ok(incomplete.blockers.includes("ZERO_DTE_ACTIVITY_EVIDENCE_INCOMPLETE"));
+  assert.ok(incomplete.blockers.includes("ZERO_DTE_REALIZED_LOSS_EVIDENCE_REQUIRED"));
+});
+
+test("active 0DTE order symbols consume the shared open-exposure cap", () => {
+  const result = evaluateZeroDteExecutionEligibility({
+    candidate: candidate(),
+    config: { ...config, maxOpenPositions: 2 },
+    runtime: runtime(),
+    account: account({
+      openPositionCount: 1,
+      openOrderCount: 2,
+      openExposureCount: 2,
+      openPositions: [{ symbol: "QQQ260713C00500000", quantity: 1 }],
+      openOrders: [
+        { symbol: "QQQ260713C00500000", status: "accepted" },
+        { symbol: "IWM260713C00200000", status: "accepted" }
+      ]
+    }),
+    now
+  });
+
+  assert.equal(result.eligible, false);
+  assert.ok(result.blockers.includes("MAX_OPEN_0DTE_POSITIONS"));
+});
+
+test("execution derives complete daily counters from broker and persisted evidence", async () => {
+  const evidenceCandidate = scenarioCandidate({
+    candidateId: "execution-candidate-activity-evidence",
+    optionSymbol: "SPY260713C00590000",
+    strike: 590
+  });
+  const evidenceDecisionId = "execution-decision-activity-evidence";
+  seed({ candidate: evidenceCandidate, decisionId: evidenceDecisionId });
+  let brokerCalls = 0;
+  const emptyResponse = <T>(data: T) => ({ data, status: 200, url: "paper" });
+
+  const result = await executeZeroDteCandidate({
+    candidate: evidenceCandidate,
+    decisionId: evidenceDecisionId,
+    confirmPaper: true,
+    provider: {
+      config,
+      runtime: runtime(),
+      now: () => now,
+      getAccount: async () => emptyResponse({
+        id: "paper-account",
+        status: "ACTIVE",
+        buying_power: "10000",
+        options_buying_power: "10000",
+        equity: "10000",
+        options_approved_level: 3
+      }),
+      listPositions: async () => emptyResponse([]),
+      listOrders: async () => emptyResponse([]),
+      submitPaperOrder: async (payload) => {
+        brokerCalls += 1;
+        return emptyResponse({
+          id: "paper-order-activity-evidence",
+          client_order_id: payload.client_order_id,
+          symbol: payload.symbol,
+          qty: payload.qty,
+          status: "accepted",
+          filled_qty: "0"
+        });
+      }
+    }
+  });
+
+  if (result.paperTradeId) {
+    getDb().prepare("DELETE FROM zero_dte_lifecycle_events WHERE paper_trade_id = ?").run(result.paperTradeId);
+    getDb().prepare("DELETE FROM zero_dte_paper_trades WHERE paper_trade_id = ?").run(result.paperTradeId);
+  }
+  if (result.ledgerId) {
+    getDb().prepare("DELETE FROM paper_execution_ledger WHERE id = ?").run(result.ledgerId);
+  }
+
+  assert.equal(result.status, "submitted");
+  assert.equal(brokerCalls, 1);
+  assert.equal(result.eligibility?.evidence.activityEvidenceComplete, true);
+  assert.equal(result.eligibility?.evidence.dailyTradeCount, 0);
+  assert.match(
+    String(result.eligibility?.evidence.activityEvidenceFingerprint),
+    /^[a-f0-9]{64}$/
+  );
 });
 
 test("blocked runtime records no order mutation", async () => {
