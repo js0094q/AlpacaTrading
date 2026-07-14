@@ -2,6 +2,7 @@ import { DatabaseSync, type DatabaseSync as DbHandle } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { isVercelRuntime } from "./runtime.js";
+import { runZeroDteMigrations } from "./zeroDteSchema.js";
 
 export const LOCAL_SQLITE_UNAVAILABLE_ON_VERCEL =
   "LOCAL_SQLITE_UNAVAILABLE_ON_VERCEL";
@@ -1088,6 +1089,7 @@ export const initializeDatabaseHandle = (db: DbHandle): DbHandle => {
   db.exec(tableSchema);
   runMigrations(db);
   runPhase1BMigrations(db);
+  runZeroDteMigrations(db);
   return db;
 };
 

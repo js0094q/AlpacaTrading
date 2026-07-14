@@ -149,6 +149,36 @@ AUTOMATED_PAPER_EXECUTION_ENABLED=true
 PAPER_0DTE_DISCOVERY_ENABLED=true
 PAPER_OPTION_EXIT_REVIEW_ENABLED=true
 PAPER_EQUITY_SCALE_IN_ENABLED=false
+ZERO_DTE_ENGINE_ENABLED=true
+ZERO_DTE_PAPER_EXECUTION_ENABLED=true
+ZERO_DTE_SHADOW_ENABLED=true
+ZERO_DTE_UNDERLYINGS=SPY,QQQ,IWM
+ZERO_DTE_DISCOVERY_START_ET=09:35
+ZERO_DTE_NEW_ENTRY_CUTOFF_ET=15:15
+ZERO_DTE_FORCE_EXIT_ET=15:50
+ZERO_DTE_ENGINE_INTERVAL_SECONDS=60
+ZERO_DTE_QUEUE_MAX_ACTIVE=100
+ZERO_DTE_QUEUE_TOP_N=20
+ZERO_DTE_EXECUTION_TOP_N=3
+ZERO_DTE_MAX_STRIKES_EACH_SIDE=5
+ZERO_DTE_UNDERLYING_MAX_AGE_MS=60000
+ZERO_DTE_MIN_OPTION_VOLUME=100
+ZERO_DTE_MIN_OPEN_INTEREST=250
+ZERO_DTE_MAX_SPREAD_PCT=15
+ZERO_DTE_MIN_PREMIUM=0.10
+ZERO_DTE_MAX_PREMIUM=5.00
+ZERO_DTE_MIN_SCORE_MOVEMENT=5
+ZERO_DTE_SIGNAL_SHORT_WINDOW=3
+ZERO_DTE_SIGNAL_MEDIUM_WINDOW=5
+ZERO_DTE_MIN_CONFIRMATION_OBSERVATIONS=2
+ZERO_DTE_MAX_CONTRACTS_PER_TRADE=1
+ZERO_DTE_MAX_OPEN_POSITIONS=3
+ZERO_DTE_MAX_TRADES_PER_DAY=3
+ZERO_DTE_MAX_PREMIUM_PER_TRADE=250
+ZERO_DTE_MAX_DAILY_PREMIUM=750
+ZERO_DTE_MAX_DAILY_REALIZED_LOSS=250
+ZERO_DTE_OUTCOME_HORIZONS_MINUTES=5,15,30,60
+ZERO_DTE_STRATEGY_VERSION=zero-dte-level-2-v1
 ```
 
 The CLI loads `.env` first, then `.env.txt` as fallback when keys are missing. If both files exist, `.env` values take precedence over `.env.txt`.
@@ -376,10 +406,39 @@ The continuous paper monitor is installed separately with `scripts/install-paper
 - `alpaca-paper-execute.timer`: wakes after review windows and can execute only reviewed entry sections (`equityBuys`, `equityAdds`, `optionBuys`).
 - `alpaca-paper-exit-review.timer`: wakes every 15 minutes during the regular window and every 5 minutes in the final hour; exit review evaluates equity exits, generic option exits, 0DTE late-day exits, and LEAPS exit discipline.
 - `alpaca-paper-exit-execute.timer`: wakes after exit-review windows and can execute only reviewed exit sections (`equitySells`, `optionSellToCloseExits`).
+- `alpaca-zero-dte-engine.timer`: wakes every minute from the configured discovery start through the new-entry cutoff and runs the guarded 0DTE engine.
+- `alpaca-zero-dte-exit-review.timer`: wakes every minute during the market window and reviews 0DTE exits without submitting orders.
+- `alpaca-zero-dte-reconcile.timer`: wakes every five minutes to mark paper/shadow positions and capture forward outcomes.
+- `alpaca-zero-dte-eod.timer`: writes the end-of-day 0DTE summary after the force-exit window.
 
 The monitor runner no-ops with `MARKET_CLOSED` outside regular market hours, weekends, and configured US market holidays. It fails closed unless `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, `LIVE_TRADING_ENABLED=false`, `PAPER_ORDER_EXECUTION_ENABLED=true`, `PAPER_OPTIONS_EXECUTION_ENABLED=true`, and `AUTOMATED_PAPER_EXECUTION_ENABLED=true` for execution tasks. See `docs/paper-monitoring-operations.md`.
 
 Set the VPS timezone to `America/New_York` or adjust the timer calendar before enabling timers.
+
+Each 0DTE monitor task has a dedicated lock (`/tmp/alpaca-zero-dte-engine.lock`, `/tmp/alpaca-zero-dte-exit-review.lock`, `/tmp/alpaca-zero-dte-reconcile.lock`, or `/tmp/alpaca-zero-dte-eod.lock`). Only the engine task is mutation-capable; exit review, reconciliation, and end-of-day summary tasks set `AUTOMATED_PAPER_EXECUTION_ENABLED=false`.
+
+## 0DTE Level 2 Engine
+
+The 0DTE Level 2 engine is an independent paper-only workflow. It obtains its own underlying and same-day option market data, maintains a ranked candidate queue, evaluates separate playbooks, records shadow alternatives, and feeds the dedicated dashboard panel. It does not require the Market Observatory cycle to complete first.
+
+Run the engine and lifecycle workers directly from the CLI:
+
+```bash
+npm run zero-dte:engine -- --dryRun --format=json
+npm run zero-dte:engine -- --format=json
+npm run zero-dte:engine -- --confirmPaper --format=json
+npm run zero-dte:exit:review -- --format=json
+npm run zero-dte:reconcile -- --format=json
+npm run zero-dte:eod -- --format=json
+npm run zero-dte:summary -- --format=json
+```
+
+`--dryRun` persists local engine, candidate, decision, and shadow evidence without submitting an order. The default engine mode is shadow-only; `--confirmPaper` is the only engine execution mode and remains paper-only. It requires `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, `LIVE_TRADING_ENABLED=false`, `ZERO_DTE_ENGINE_ENABLED=true`, `ZERO_DTE_PAPER_EXECUTION_ENABLED=true`, `PAPER_ORDER_EXECUTION_ENABLED=true`, `PAPER_OPTIONS_EXECUTION_ENABLED=true`, `AUTOMATED_PAPER_EXECUTION_ENABLED=true`, and the explicit `--confirmPaper` flag. Entry selection is blocked at or after `ZERO_DTE_NEW_ENTRY_CUTOFF_ET`; exit review continues through the force-exit window. No live endpoint or live-order path is exposed.
+
+The database migrations are `2026-07-13-zero-dte-level-2` and `2026-07-13-zero-dte-level-2-hardening`. They persist engine runs, candidates, observations, playbook evaluations, decisions, lifecycle events, paper trades, shadow trades, position marks, terminal outcomes, and configuration versions. Decision groups link selected, skipped, rejected, and shadow alternatives for later learning; shadow rows are simulated and are never account exposure.
+
+The read-only summary is available locally and through `GET /api/v1/zero-dte/summary`; the Vercel route is `GET /api/paper/zero-dte/summary`. The dashboard `0DTE Level 2` panel shows queue state, paper positions, simulated shadows, lifecycle counts, learning outcomes, blockers, and engine health without exposing secrets.
+
 ### Paper exit management
 
 Paper exit management is separate from entry planning. Review is read-only:
@@ -626,6 +685,8 @@ npm run dashboard:start
 ```
 
 The dashboard shows paper account state, buying power, equity, cash, positions, latest research candidates, latest paper plan/review/dry-run payloads, confirmed submissions, execution ledger, blocked reasons, option candidates/contracts, request IDs, stale-data warnings, outcome analytics, and a clear `PAPER ONLY` environment state.
+
+The `0DTE Level 2` panel adds the bounded live queue, active paper 0DTE positions, simulated shadow trades, lifecycle state, learning/outcome summary, blockers, and engine health. Its VPS and Vercel summary routes are read-only.
 
 On local and VPS runtimes, historical dashboard sections read the local SQLite database at `RESEARCH_DB_PATH` or `./data/research.db`. On Vercel, the dashboard does not initialize local SQLite or create app-local data directories. Vercel historical sections render a read-only fallback warning because durable runtime history and the paper execution ledger live on the VPS/local runtime.
 

@@ -1,0 +1,14 @@
+[Unit]
+Description=Run the paper 0DTE Level 2 engine every minute during the entry window
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09:35..09:59:00
+OnCalendar=Mon..Fri *-*-* 10..14:*:00
+OnCalendar=Mon..Fri *-*-* 15:00..15:15:00
+Persistent=false
+RandomizedDelaySec=5
+AccuracySec=1s
+Unit=alpaca-zero-dte-engine.service
+
+[Install]
+WantedBy=timers.target

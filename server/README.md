@@ -193,8 +193,12 @@ changing deployment artifacts, secrets, or security-relevant environment values:
 sudo systemctl stop alpaca-dashboard-control.service
 sudo systemctl stop alpaca-market-observatory.timer
 sudo systemctl stop paper-ops-morning.timer paper-ops-midday.timer paper-ops-late-day.timer
+sudo systemctl stop alpaca-paper-review.timer alpaca-paper-execute.timer alpaca-paper-exit-review.timer alpaca-paper-exit-execute.timer
+sudo systemctl stop alpaca-zero-dte-engine.timer alpaca-zero-dte-exit-review.timer alpaca-zero-dte-reconcile.timer alpaca-zero-dte-eod.timer
 docker compose -f /opt/alpaca-investing/app/docker-compose.yml down
 ```
+
+The continuous paper-monitor installer also installs the independent 0DTE Level 2 services and timers. The 0DTE engine runs every minute during the configured entry window; its exit review runs every minute, reconciliation runs every five minutes, and the end-of-day summary runs after the force-exit window. Only `alpaca-zero-dte-engine.service` sets `AUTOMATED_PAPER_EXECUTION_ENABLED=true`, and it still requires the CLI `--confirmPaper` and paper-runtime gates. The other 0DTE services are read-only or mark/summarize local paper and shadow state. See `server/systemd/README.md` for the install/disable commands.
 
 ## Intentionally Not Implemented
 

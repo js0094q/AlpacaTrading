@@ -17,6 +17,14 @@ const monitorUnits = [
   "alpaca-paper-exit-review.timer",
   "alpaca-paper-exit-execute.service",
   "alpaca-paper-exit-execute.timer",
+  "alpaca-zero-dte-engine.service",
+  "alpaca-zero-dte-engine.timer",
+  "alpaca-zero-dte-exit-review.service",
+  "alpaca-zero-dte-exit-review.timer",
+  "alpaca-zero-dte-reconcile.service",
+  "alpaca-zero-dte-reconcile.timer",
+  "alpaca-zero-dte-eod.service",
+  "alpaca-zero-dte-eod.timer",
   "alpaca-market-observatory.service",
   "alpaca-market-observatory.timer"
 ];
@@ -117,6 +125,57 @@ describe("paper monitoring scheduler", () => {
 
     assert.notEqual(result.status, 0);
     assert.equal(parseStdout(result).reason, "PAPER_EXECUTION_FLAG_REQUIRED");
+  });
+
+  test("0DTE scheduler tasks use dedicated paper commands and locks", () => {
+    for (const task of [
+      "zero-dte-engine",
+      "zero-dte-exit-review",
+      "zero-dte-reconcile",
+      "zero-dte-eod"
+    ]) {
+      const result = runMonitor(task);
+      const body = parseStdout(result);
+      assert.equal(result.status, 0);
+      assert.equal(body.status, "dry_run");
+      assert.match(body.command, new RegExp(`zero-dte[:\\-]`));
+      assert.match(body.command, /--format=json/);
+      assert.match(body.command, /npm run/);
+      assert.match(body.task, /^zero-dte-/);
+    }
+
+    const engine = parseStdout(runMonitor("zero-dte-engine"));
+    assert.match(engine.command, /--confirmPaper/);
+
+    for (const lockFile of [
+      "/tmp/alpaca-zero-dte-engine.lock",
+      "/tmp/alpaca-zero-dte-exit-review.lock",
+      "/tmp/alpaca-zero-dte-reconcile.lock",
+      "/tmp/alpaca-zero-dte-eod.lock"
+    ]) {
+      assert.match(lockFile, /alpaca-zero-dte-/);
+    }
+  });
+
+  test("0DTE engine scheduler fails closed outside paper runtime", () => {
+    const result = runMonitor("zero-dte-engine", {
+      env: {
+        ...baseEnv,
+        ALPACA_ENV: "live"
+      }
+    });
+
+    assert.notEqual(result.status, 0);
+    assert.equal(parseStdout(result).reason, "PAPER_RUNTIME_REQUIRED");
+  });
+
+  test("0DTE scheduler no-ops when the market session is closed", () => {
+    const result = runMonitor("zero-dte-reconcile", { now: marketClosedIso });
+    const body = parseStdout(result);
+
+    assert.equal(result.status, 0);
+    assert.equal(body.status, "no_op");
+    assert.equal(body.reason, "MARKET_CLOSED");
   });
 
   test("exit monitor command exists and switches to late-day review in the final hour", () => {

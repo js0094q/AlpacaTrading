@@ -22,6 +22,7 @@ import {
 } from "../../src/services/hedgePersistenceService.js";
 import { listPaperExecutionLedgerEntries } from "../../src/services/paperExecutionLedgerService.js";
 import { evaluateHedgeLearning, listRecentHedgeLearningEvents } from "../../src/services/hedgeLearningLifecycleService.js";
+import { buildZeroDteDashboardSummary } from "../../src/services/zeroDte/zeroDteEngineService.js";
 import { safeTokenEquals } from "../../src/lib/safeToken.js";
 import { redactSensitiveData, redactSensitiveText } from "../../src/lib/securityRedaction.js";
 import {
@@ -1146,6 +1147,14 @@ const actionHandlers: Record<string, ActionConfig> = {
     },
     action: "execute.confirm",
     handler: executeConfirmHandler
+  },
+  "/api/v1/zero-dte/summary": {
+    method: "GET",
+    timeoutMs: 30_000,
+    requireAdminToken: false,
+    requireMutationPrecheck: false,
+    action: "zero-dte.summary",
+    handler: async () => buildZeroDteDashboardSummary({ limit: 25 })
   },
   "/api/v1/summary": {
     method: "GET",

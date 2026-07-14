@@ -127,6 +127,13 @@
   - Reviewed LEAPS sell-to-close execution also fails closed unless `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, `LIVE_TRADING_ENABLED=false`, `PAPER_ORDER_EXECUTION_ENABLED=true`, `PAPER_OPTIONS_EXECUTION_ENABLED=true`, `AUTOMATED_PAPER_EXECUTION_ENABLED=true`, and `--confirmPaper` are all present.
   - Review-only `paper-ops-*` timers intentionally override `AUTOMATED_PAPER_EXECUTION_ENABLED=false`; bounded paper execution tasks use the checked-in target value `true` only with confirmation and paper-runtime gates.
   - Continuous monitor timers are installed from `scripts/install-paper-monitoring-systemd.sh` and run through `npm run paper:monitor`, which gates market hours/holidays, paper runtime, live-off flags, execution flags, and per-task locks.
+- 0DTE Level 2 engine implementation:
+  - The standalone engine is independent of the Market Observatory and persists engine runs, ranked candidates, signal observations, five playbook evaluations, decisions, lifecycle events, paper trades, shadow trades, position marks, terminal outcomes, and configuration versions.
+  - Migrations are `2026-07-13-zero-dte-level-2` and `2026-07-13-zero-dte-level-2-hardening`.
+  - Direct commands are `npm run zero-dte:engine -- --dryRun --format=json`, `npm run zero-dte:engine -- --confirmPaper --format=json`, `npm run zero-dte:exit:review -- --format=json`, `npm run zero-dte:reconcile -- --format=json`, `npm run zero-dte:eod -- --format=json`, and `npm run zero-dte:summary -- --format=json`.
+  - Scheduler units are `alpaca-zero-dte-engine.timer`, `alpaca-zero-dte-exit-review.timer`, `alpaca-zero-dte-reconcile.timer`, and `alpaca-zero-dte-eod.timer`; each uses a dedicated `/tmp/alpaca-zero-dte-*.lock`.
+  - The summary routes are `GET /api/v1/zero-dte/summary` on the VPS and `GET /api/paper/zero-dte/summary` on Vercel. The dashboard panel is `0DTE Level 2` and labels shadow positions as simulated.
+  - Paper execution remains fail-closed on `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, `LIVE_TRADING_ENABLED=false`, `PAPER_ORDER_EXECUTION_ENABLED=true`, `PAPER_OPTIONS_EXECUTION_ENABLED=true`, `AUTOMATED_PAPER_EXECUTION_ENABLED=true`, `ZERO_DTE_ENGINE_ENABLED=true`, `ZERO_DTE_PAPER_EXECUTION_ENABLED=true`, and `--confirmPaper`. No live endpoint is used.
 - Portfolio risk and hedge-management layer added on `paper-ops-layer` (not deployed in this task):
   - Canonical OCC parsing now feeds asset identity, LEAPS exit review, portfolio review, and paper dry-run DTE logic.
   - Hedge analysis commands are `hedge:risk`, `hedge:regime`, `hedge:review`, and `hedge:plan -- --paperOnly`; reviewed paper entry and exit execution use `hedge:execute` and `hedge:exit:execute` only after explicit confirmation.
@@ -198,4 +205,4 @@
 - Do not run `npm run paper:execute:reviewed -- --confirmPaper` or `npm run paper:execute -- --confirmPaper` unless the user explicitly requests paper execution.
 - No live execution route exists in the dashboard operations layer.
 - Hedge execution is available only through explicit paper review IDs, paper confirmation, dashboard/VPS authentication, and the single-long-put gates; do not run `hedge:execute` or `hedge:exit:execute` during validation unless paper execution is explicitly requested.
-- Automated paper execution is only allowed through the `alpaca-paper-*` monitor timers, reviewed artifacts, section filters, and paper-only/live-off runner guards.
+- Automated paper execution is only allowed through the `alpaca-paper-*` and `alpaca-zero-dte-*` monitor timers, their reviewed/engine guards, section filters where applicable, and paper-only/live-off runner gates.

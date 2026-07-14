@@ -55,6 +55,29 @@ const TASKS = {
     ],
     lockFile: "/tmp/alpaca-paper-monitor-exit-execute.lock",
     requireExecution: true
+  },
+  "zero-dte-engine": {
+    command: [
+      "npm",
+      ["run", "zero-dte:engine", "--", "--confirmPaper", "--format=json"]
+    ],
+    lockFile: "/tmp/alpaca-zero-dte-engine.lock",
+    requireExecution: true
+  },
+  "zero-dte-exit-review": {
+    command: ["npm", ["run", "zero-dte:exit:review", "--", "--format=json"]],
+    lockFile: "/tmp/alpaca-zero-dte-exit-review.lock",
+    requireExecution: false
+  },
+  "zero-dte-reconcile": {
+    command: ["npm", ["run", "zero-dte:reconcile", "--", "--format=json"]],
+    lockFile: "/tmp/alpaca-zero-dte-reconcile.lock",
+    requireExecution: false
+  },
+  "zero-dte-eod": {
+    command: ["npm", ["run", "zero-dte:eod", "--", "--format=json"]],
+    lockFile: "/tmp/alpaca-zero-dte-eod.lock",
+    requireExecution: false
   }
 };
 

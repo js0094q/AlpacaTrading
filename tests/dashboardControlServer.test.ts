@@ -238,6 +238,7 @@ describe("VPS dashboard control API", () => {
       "/api/v1/review/latest",
       "/api/v1/review/run",
       "/api/v1/summary",
+      "/api/v1/zero-dte/summary",
       "/api/v1/executions"
     ].sort();
 
