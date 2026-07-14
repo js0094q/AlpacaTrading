@@ -549,6 +549,48 @@ CREATE INDEX IF NOT EXISTS idx_paper_learning_records_strategy_status
 CREATE INDEX IF NOT EXISTS idx_paper_learning_records_option_symbol
   ON paper_learning_records(option_symbol);
 
+CREATE TABLE IF NOT EXISTS paper_learning_governance_runs (
+  id TEXT PRIMARY KEY,
+  started_at TEXT NOT NULL,
+  completed_at TEXT,
+  status TEXT NOT NULL,
+  scanned_records INTEGER NOT NULL DEFAULT 0,
+  valid_outcomes INTEGER NOT NULL DEFAULT 0,
+  decisions_written INTEGER NOT NULL DEFAULT 0,
+  git_sha TEXT NOT NULL,
+  config_version TEXT NOT NULL,
+  config_hash TEXT NOT NULL,
+  summary_json TEXT,
+  error_message TEXT
+);
+
+CREATE TABLE IF NOT EXISTS paper_learning_governance_decisions (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  scope_type TEXT NOT NULL CHECK (scope_type IN ('strategy_family', 'symbol')),
+  scope_key TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('observe', 'prioritized', 'suspended')),
+  priority_multiplier REAL NOT NULL,
+  reason_code TEXT NOT NULL,
+  evidence_json TEXT NOT NULL,
+  effective_at TEXT NOT NULL,
+  superseded_at TEXT,
+  git_sha TEXT NOT NULL,
+  config_version TEXT NOT NULL,
+  config_hash TEXT NOT NULL,
+  FOREIGN KEY(run_id) REFERENCES paper_learning_governance_runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_learning_governance_runs_started_at
+  ON paper_learning_governance_runs(started_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_paper_learning_governance_decisions_scope
+  ON paper_learning_governance_decisions(scope_type, scope_key, effective_at DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_learning_governance_decisions_current
+  ON paper_learning_governance_decisions(scope_type, scope_key)
+  WHERE superseded_at IS NULL;
+
 CREATE TABLE IF NOT EXISTS paper_operation_log (
   id TEXT PRIMARY KEY,
   action_type TEXT NOT NULL,

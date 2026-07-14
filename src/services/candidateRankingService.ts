@@ -6,6 +6,10 @@ import {
   persistDecisionSnapshot
 } from "./marketDecisionEvidenceService.js";
 import { createDecisionId } from "./marketDecisionIdentityService.js";
+import {
+  getCurrentPaperLearningGovernance,
+  resolveCandidateLearningGovernance
+} from "./learningGovernanceService.js";
 import type {
   CandidateDecisionRecord,
   DecisionId,
@@ -442,7 +446,9 @@ export const rankResearchCandidates = (input: CandidateRankingInput): CandidateR
   const warnings: string[] = [];
   const learning = parseLearningSummary();
   const backtest = parseBacktestPerformance();
+  const learningGovernance = getCurrentPaperLearningGovernance();
   const signalInputsByCandidate = new Map<string, Record<string, string | number | null>>();
+  const governanceByCandidate = new Map<string, ReturnType<typeof resolveCandidateLearningGovernance>>();
 
   const scored = sourceFromTargets(input.targets).map((target) => {
     const optionCandidate = getOptionCandidate(target.symbol, target.as_of);
@@ -475,7 +481,15 @@ export const rankResearchCandidates = (input: CandidateRankingInput): CandidateR
 
     const candidatePerf = backtest?.byExpression[target.preferred_expression];
     const id = uuid();
+    const governance = resolveCandidateLearningGovernance(
+      {
+        symbol: target.symbol,
+        strategyFamily: target.preferred_expression === "shares" ? "equity" : "standard_option"
+      },
+      learningGovernance
+    );
     signalInputsByCandidate.set(id, featureSnapshot);
+    governanceByCandidate.set(id, governance);
     return {
       id,
       symbol: target.symbol,
@@ -485,12 +499,12 @@ export const rankResearchCandidates = (input: CandidateRankingInput): CandidateR
       horizon: target.horizon,
       riskProfile: input.riskProfile,
       preferredExpression: target.preferred_expression,
-      score: scoring.score,
+      score: clamp(scoring.score * governance.priorityMultiplier, 0, 100),
       confidence: target.confidence,
       expectedReturn: target.expected_return,
       estimatedMaxLoss: pnl.estimatedMaxLoss,
       estimatedMaxProfit: pnl.estimatedMaxProfit,
-      rationale,
+      rationale: [...rationale, ...governance.rationale],
       relevantBacktestRunId: backtest?.runId ?? null,
       historicalWinRate: candidatePerf ? candidatePerf.winRate : null,
       historicalAvgReturn: candidatePerf ? candidatePerf.avgReturn : null,
@@ -518,6 +532,10 @@ export const rankResearchCandidates = (input: CandidateRankingInput): CandidateR
   const selected: RankedCandidate[] = [];
 
   for (const candidate of sorted) {
+    if (governanceByCandidate.get(candidate.id)?.suspended) {
+      skippedReasons.set(candidate.id, "LEARNING_GOVERNANCE_SUSPENDED");
+      continue;
+    }
     if (selected.length >= maxCandidates) {
       skippedReasons.set(candidate.id, "MAX_CANDIDATES_REACHED");
       continue;
@@ -546,12 +564,18 @@ export const rankResearchCandidates = (input: CandidateRankingInput): CandidateR
     selected.push(candidate);
   }
 
-  if (!selected.length && sorted.length && input.riskProfile === "aggressive") {
-    selected.push(...sorted.slice(0, maxCandidates));
+  const eligibleForFallback = sorted.filter(
+    (candidate) => !governanceByCandidate.get(candidate.id)?.suspended
+  );
+  if (!selected.length && eligibleForFallback.length && input.riskProfile === "aggressive") {
+    selected.push(...eligibleForFallback.slice(0, maxCandidates));
     selected.forEach((candidate) => skippedReasons.delete(candidate.id));
     warnings.push(
       `Aggressive mode relaxed diversity constraints to avoid empty selection after strict filtering.`
     );
+  }
+  if (!selected.length && sorted.length && !eligibleForFallback.length) {
+    warnings.push("All ranked candidates were suspended by bounded learning governance.");
   }
 
   selected.forEach((candidate, index) => {
