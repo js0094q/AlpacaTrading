@@ -60,6 +60,10 @@ import {
   type ZeroDteOrderReconciliationResult,
   type ZeroDtePaperMutationProvider
 } from "./zeroDteExecutionService.js";
+import {
+  reconcileZeroDteExitOrders,
+  type ZeroDteExitReconciliationResult
+} from "./zeroDteExitService.js";
 import type {
   ZeroDteConfig,
   ZeroDteDirection,
@@ -111,6 +115,7 @@ export interface ZeroDteReconciliationResult {
   mutationAttempted: false;
   contexts: number;
   paperOrders: ZeroDteOrderReconciliationResult;
+  exitOrders: ZeroDteExitReconciliationResult;
   paperMarks: ZeroDtePaperMarkResult;
   shadowMarks: ZeroDteMarkResult;
   outcomes: ZeroDteOutcomeResult;
@@ -1293,6 +1298,11 @@ export const runZeroDteReconciliation = async (input: {
     provider: input.provider?.mutationProvider
   });
   errors.push(...paperOrders.errors.map(({ code, message }) => ({ code, message })));
+  const exitOrders = await reconcileZeroDteExitOrders({
+    now: generatedAt,
+    provider: input.provider?.mutationProvider
+  });
+  errors.push(...exitOrders.errors.map(({ code, message }) => ({ code, message })));
   const contexts = await getMarketContexts({ now: generatedAt, config, provider: input.provider, errors });
   const quotes = quoteMapFor(contexts);
   const paperMarks = markZeroDtePaperTrades(generatedAt, quotes);
@@ -1311,6 +1321,7 @@ export const runZeroDteReconciliation = async (input: {
     mutationAttempted: false,
     contexts: contexts.length,
     paperOrders,
+    exitOrders,
     paperMarks,
     shadowMarks,
     outcomes,
