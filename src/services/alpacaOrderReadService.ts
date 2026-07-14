@@ -7,6 +7,7 @@ export interface AlpacaOpenOrderSnapshot {
   assetClass?: string;
   qty?: string;
   notional?: string;
+  limitPrice?: string;
   side?: string;
   type?: string;
   timeInForce?: string;
@@ -23,6 +24,7 @@ type ApiOrderPayload = {
   asset_class?: string;
   qty?: string;
   notional?: string;
+  limit_price?: string;
   side?: string;
   type?: string;
   time_in_force?: string;
@@ -39,6 +41,7 @@ const mapOrder = (row: ApiOrderPayload): AlpacaOpenOrderSnapshot => ({
   assetClass: row.asset_class,
   qty: row.qty,
   notional: row.notional,
+  limitPrice: row.limit_price,
   side: row.side,
   type: row.type,
   timeInForce: row.time_in_force,

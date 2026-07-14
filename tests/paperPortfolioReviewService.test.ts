@@ -10,10 +10,64 @@ import { buildPaperPortfolioReviewReport } from "../src/services/paperPortfolioR
 import type { LeapsExitEvaluation } from "../src/services/leapsExitReviewService.js";
 
 const account = {
+  id: "paper-account-1",
   status: "ACTIVE",
   equity: "100000",
   cash: "50000",
-  buyingPower: "50000"
+  buyingPower: "50000",
+  tradingBlocked: false,
+  accountBlocked: false
+};
+
+const candidate = {
+  id: "candidate-aapl",
+  symbol: "AAPL",
+  rank: 1,
+  confidence: 0.9,
+  score: 2,
+  risk_profile: "aggressive",
+  preferred_expression: "shares",
+  research_run_id: "run-1"
+};
+
+const scaleInReport = async (input: {
+  positions?: Array<Record<string, unknown>>;
+  account?: Record<string, unknown>;
+  orders?: Array<Record<string, unknown>>;
+  reservations?: Array<Record<string, unknown>>;
+  ordersUnavailable?: boolean;
+  reservationsUnavailable?: boolean;
+}) => {
+  process.env.PAPER_EQUITY_SCALE_IN_ENABLED = "true";
+  return buildPaperPortfolioReviewReport(
+    {},
+    {
+      listPositions: async () => ({
+        positions: (input.positions ?? [
+          {
+            symbol: "AAPL",
+            assetClass: "us_equity",
+            qty: "2",
+            marketValue: "1000",
+            currentPrice: "500",
+            unrealizedPl: "10",
+            unrealizedPlpc: "0.01"
+          }
+        ]) as any
+      }),
+      getAccount: async () => ({ ...account, ...input.account }) as any,
+      getCandidates: () => [candidate],
+      listOpenOrders: async () => {
+        if (input.ordersUnavailable) throw new Error("orders unavailable");
+        return { orders: input.orders ?? [] };
+      },
+      listReservations: () => {
+        if (input.reservationsUnavailable) throw new Error("reservations unavailable");
+        return input.reservations ?? [];
+      },
+      now: () => "2026-07-07T16:00:00.000Z"
+    } as any
+  );
 };
 
 beforeEach(() => {
@@ -21,6 +75,12 @@ beforeEach(() => {
   process.env.PAPER_OPTION_EXIT_REVIEW_ENABLED = "true";
   process.env.PAPER_OPTION_EXIT_STOP_LOSS_PCT = "50";
   process.env.PAPER_OPTION_EXIT_PROFIT_TARGET_PCT = "80";
+  delete process.env.PAPER_EQUITY_MAX_NOTIONAL_PER_ORDER;
+  delete process.env.PAPER_PLAN_MAX_POSITION_NOTIONAL;
+  delete process.env.PAPER_PLAN_MAX_TOTAL_PLAN_NOTIONAL;
+  delete process.env.PAPER_EQUITY_MAX_PORTFOLIO_DEPLOY_PCT;
+  delete process.env.PAPER_EQUITY_MAX_POSITION_PCT;
+  delete process.env.PAPER_EQUITY_MIN_CASH_RESERVE_PCT;
 });
 
 describe("paper portfolio review", () => {
@@ -41,6 +101,7 @@ describe("paper portfolio review", () => {
       getAccount: async () => account,
       getCandidates: () => [
         {
+          id: "candidate-aapl",
           symbol: "AAPL",
           rank: 1,
           confidence: 0.9,
@@ -50,6 +111,8 @@ describe("paper portfolio review", () => {
           research_run_id: "run-1"
         }
       ],
+      listOpenOrders: async () => ({ orders: [] }),
+      listReservations: () => [],
       now: () => "2026-07-07T16:00:00.000Z"
     };
 
@@ -61,6 +124,157 @@ describe("paper portfolio review", () => {
     const enabled = await buildPaperPortfolioReviewReport({}, baseInput);
     assert.equal(enabled.recommendations[0]?.recommendation, "ADD_TO_EQUITY");
     assert.equal(enabled.recommendations[0]?.eligiblePayload?.orderAction, "BUY");
+    assert.equal(enabled.recommendations[0]?.eligiblePayload?.notional, "250.00");
+    assert.equal(
+      enabled.recommendations[0]?.eligiblePayload?.sourceCandidateId,
+      "candidate-aapl"
+    );
+  });
+
+  test("fails closed when scale-in position quantity or market value is missing", async () => {
+    const missingQuantity = await scaleInReport({
+      positions: [
+        {
+          symbol: "AAPL",
+          assetClass: "us_equity",
+          marketValue: "1000",
+          currentPrice: "500"
+        }
+      ]
+    });
+    const missingValue = await scaleInReport({
+      positions: [
+        {
+          symbol: "AAPL",
+          assetClass: "us_equity",
+          qty: "2",
+          currentPrice: "500"
+        }
+      ]
+    });
+
+    for (const report of [missingQuantity, missingValue]) {
+      assert.equal(report.recommendations[0]?.recommendation, "HOLD_EQUITY");
+      assert.equal(
+        report.recommendations[0]?.skippedReason,
+        "SCALE_IN_POSITION_EVIDENCE_INCOMPLETE"
+      );
+      assert.equal(report.recommendations[0]?.eligiblePayload, null);
+    }
+  });
+
+  test("fails closed when scale-in account capital evidence is incomplete", async () => {
+    for (const field of ["id", "status", "equity", "cash", "buyingPower"] as const) {
+      const report = await scaleInReport({ account: { [field]: undefined } });
+      assert.equal(report.recommendations[0]?.recommendation, "HOLD_EQUITY");
+      assert.equal(
+        report.recommendations[0]?.skippedReason,
+        "SCALE_IN_CAPITAL_EVIDENCE_INCOMPLETE"
+      );
+    }
+    for (const unavailable of [
+      { ordersUnavailable: true },
+      { reservationsUnavailable: true }
+    ]) {
+      const report = await scaleInReport(unavailable);
+      assert.equal(
+        report.recommendations[0]?.skippedReason,
+        "SCALE_IN_CAPITAL_EVIDENCE_INCOMPLETE"
+      );
+    }
+  });
+
+  test("blocks a scale-in for a same-symbol open buy or active reservation", async () => {
+    const openOrder = await scaleInReport({
+      orders: [
+        {
+          id: "open-aapl",
+          symbol: "AAPL",
+          assetClass: "us_equity",
+          side: "buy",
+          status: "accepted",
+          notional: "250"
+        }
+      ]
+    });
+    const reservation = await scaleInReport({
+      reservations: [
+        {
+          assetClass: "equity",
+          symbol: "AAPL",
+          side: "buy",
+          status: "reserved",
+          notional: "250"
+        }
+      ]
+    });
+
+    for (const report of [openOrder, reservation]) {
+      assert.equal(report.recommendations[0]?.recommendation, "HOLD_EQUITY");
+      assert.equal(
+        report.recommendations[0]?.skippedReason,
+        "SCALE_IN_DUPLICATE_ORDER_OR_RESERVATION"
+      );
+    }
+  });
+
+  test("enforces cash reserve and portfolio deployment caps for scale-ins", async () => {
+    const cashReserve = await scaleInReport({
+      account: { cash: "20000", buyingPower: "50000" }
+    });
+    const deployment = await scaleInReport({
+      positions: [
+        {
+          symbol: "AAPL",
+          assetClass: "us_equity",
+          qty: "2",
+          marketValue: "1000",
+          currentPrice: "500"
+        },
+        {
+          symbol: "MSFT",
+          assetClass: "us_equity",
+          qty: "10",
+          marketValue: "48900",
+          currentPrice: "4890"
+        }
+      ]
+    });
+
+    assert.equal(
+      cashReserve.recommendations.find((row) => row.symbol === "AAPL")?.skippedReason,
+      "SCALE_IN_CASH_RESERVE_EXCEEDED"
+    );
+    assert.equal(
+      deployment.recommendations.find((row) => row.symbol === "AAPL")?.skippedReason,
+      "SCALE_IN_PORTFOLIO_DEPLOYMENT_CAP_EXCEEDED"
+    );
+  });
+
+  test("enforces ordinary per-position and per-order caps without resizing the $250 scale-in", async () => {
+    const positionCap = await scaleInReport({
+      positions: [
+        {
+          symbol: "AAPL",
+          assetClass: "us_equity",
+          qty: "20",
+          marketValue: "9900",
+          currentPrice: "495"
+        }
+      ]
+    });
+    process.env.PAPER_EQUITY_MAX_NOTIONAL_PER_ORDER = "200";
+    const orderCap = await scaleInReport({});
+
+    assert.equal(
+      positionCap.recommendations[0]?.skippedReason,
+      "SCALE_IN_POSITION_CAP_EXCEEDED"
+    );
+    assert.equal(
+      orderCap.recommendations[0]?.skippedReason,
+      "SCALE_IN_ORDER_CAP_EXCEEDED"
+    );
+    assert.equal(orderCap.recommendations[0]?.eligiblePayload, null);
   });
 
   test("recommends sell equity when max-loss rule triggers", async () => {
