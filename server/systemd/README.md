@@ -118,6 +118,26 @@ paper-operations records. The lifecycle service also starts it through
 the interrupted workload: the next existing scheduler window remains the
 automatic downstream consumer.
 
+## Canonical autonomous scheduler graph
+
+The monitoring installer owns every non-broker autonomous handoff: the
+observatory, morning learning/research/review workflow, midday monitoring
+workflow, late-day exit-review workflow, universe lifecycle, and recovery.
+The paper-ops timers are therefore installed and disabled with the same
+canonical script as the observatory and lifecycle units.
+
+- `paper-ops-morning.timer`: 08:30 ET, before the observatory opens.
+- `alpaca-market-observatory.timer`: every 15 minutes from 09:00 through 15:45 ET.
+- `paper-ops-midday.timer`: 12:10 ET, after the 12:00 observatory deadline and
+  the 12:07 recovery window.
+- `paper-ops-late-day.timer`: 15:25 ET, after the 15:15 observatory deadline
+  and the 15:22 recovery window.
+- `alpaca-universe-lifecycle.timer`: 16:30 ET, after the intraday windows.
+
+Midday and late-day paper-ops services also order behind observatory and
+recovery when either is already active. This prevents database-heavy overlap
+without changing broker, execution, or review behavior.
+
 ## Service operating guidance
 
 - Run as `alpaca`.
