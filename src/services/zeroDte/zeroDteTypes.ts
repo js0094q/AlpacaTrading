@@ -67,3 +67,44 @@ export interface ZeroDteConfig {
   strategyVersion: string;
   configurationVersionId: string;
 }
+
+export interface ZeroDteRuntimeSnapshot {
+  environment: string;
+  tradingMode: string;
+  paperOnly: boolean;
+  liveTradingEnabled: boolean;
+  engineEnabled: boolean;
+  paperExecutionEnabled: boolean;
+  paperOptionsExecutionEnabled: boolean;
+  automatedPaperExecutionEnabled: boolean;
+  paperAccountVerified?: boolean;
+  marketOpen?: boolean;
+  tradingDate?: string | null;
+}
+
+export interface ZeroDteAccountPositionSnapshot {
+  symbol: string;
+  quantity: number;
+}
+
+export interface ZeroDteAccountOrderSnapshot {
+  symbol: string;
+  side?: string | null;
+  status?: string | null;
+  clientOrderId?: string | null;
+}
+
+export interface ZeroDteAccountSnapshot {
+  environment?: string;
+  paperVerified?: boolean;
+  status?: string | null;
+  buyingPower: number | null;
+  optionsBuyingPower?: number | null;
+  equity?: number | null;
+  optionApprovalLevel?: number | null;
+  dailyTradeCount?: number | null;
+  dailyPremium?: number | null;
+  dailyRealizedLoss?: number | null;
+  openPositions?: ZeroDteAccountPositionSnapshot[];
+  openOrders?: ZeroDteAccountOrderSnapshot[];
+}
