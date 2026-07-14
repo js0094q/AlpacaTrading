@@ -10,6 +10,7 @@ process.env.RESEARCH_DB_PATH = join(dbDir, "research.db");
 import { closeDbForTests, getDb } from "../src/lib/db.js";
 import {
   buildZeroDteSummary,
+  createZeroDteEngineMutationProvider,
   runZeroDteEodSummary,
   runZeroDteEngine,
   runZeroDteReconciliation,
@@ -120,4 +121,21 @@ test("reconciliation and eod remain bounded when no broker mutation is requested
   assert.equal(reconciliation.mutationAttempted, false);
   assert.equal(eod.paperOnly, true);
   assert.equal(eod.tradingDate, "2026-07-13");
+});
+
+test("engine mutation fallback evaluates quote age against the execution clock", () => {
+  const executionTime = "2026-07-13T14:30:08.000Z";
+  const fallback = createZeroDteEngineMutationProvider(
+    {} as Parameters<typeof createZeroDteEngineMutationProvider>[0],
+    undefined,
+    () => executionTime
+  );
+  const override = createZeroDteEngineMutationProvider(
+    {} as Parameters<typeof createZeroDteEngineMutationProvider>[0],
+    { now: () => now },
+    () => executionTime
+  );
+
+  assert.equal(fallback.now?.(), executionTime);
+  assert.equal(override.now?.(), now);
 });

@@ -27,6 +27,7 @@ import {
   insertZeroDteDecision,
   listZeroDteQueue,
   readZeroDteSummary,
+  runInZeroDtePersistenceTransaction,
   upsertZeroDteCandidate,
   type ZeroDteCandidate,
   type ZeroDteQueueCandidate
@@ -960,6 +961,16 @@ const clockFor = async (provider?: ZeroDteEngineProvider) => {
   return provider.getClock();
 };
 
+export const createZeroDteEngineMutationProvider = (
+  config: ZeroDteConfig,
+  provider?: ZeroDtePaperMutationProvider,
+  executionClock: () => string = nowIso
+): ZeroDtePaperMutationProvider => ({
+  ...provider,
+  config: provider?.config ?? config,
+  now: provider?.now ?? executionClock
+});
+
 export const runZeroDteEngine = async (input: {
   now?: string;
   dryRun?: boolean;
@@ -1069,27 +1080,43 @@ export const runZeroDteEngine = async (input: {
   }
 
   const contexts = await getMarketContexts({ now: asOf, config, provider: input.provider, errors });
-  const persisted: Array<{ candidate: ZeroDteCandidate; eligible: boolean }> = [];
-  let evaluatedCount = 0;
-  let eligibleCount = 0;
-  for (const rawContext of contexts) {
-    const context = rawContext as ExtendedMarketContext;
-    try {
-      const evaluations = evaluateZeroDtePlaybooks(playbookContextFor(context));
-      for (const evaluation of evaluations) {
-        evaluatedCount += 1;
-        const result = persistEvaluation({ context, evaluation, engineRunId: runId, config, accountMode, asOf });
-        persisted.push(result);
-        if (result.eligible) eligibleCount += 1;
+  const {
+    persisted,
+    evaluatedCount,
+    eligibleCount,
+    queue
+  } = runInZeroDtePersistenceTransaction(() => {
+    const persistedRows: Array<{ candidate: ZeroDteCandidate; eligible: boolean }> = [];
+    let evaluatedRows = 0;
+    let eligibleRows = 0;
+    for (const rawContext of contexts) {
+      const context = rawContext as ExtendedMarketContext;
+      try {
+        const evaluations = evaluateZeroDtePlaybooks(playbookContextFor(context));
+        for (const evaluation of evaluations) {
+          evaluatedRows += 1;
+          const result = persistEvaluation({ context, evaluation, engineRunId: runId, config, accountMode, asOf });
+          persistedRows.push(result);
+          if (result.eligible) eligibleRows += 1;
+        }
+      } catch (error) {
+        errors.push({ code: "PLAYBOOK_EVALUATION_FAILED", message: normalizeError(error), underlying: context.underlying });
       }
-    } catch (error) {
-      errors.push({ code: "PLAYBOOK_EVALUATION_FAILED", message: normalizeError(error), underlying: context.underlying });
     }
-  }
 
-  const queue = listZeroDteQueue({ tradingDate, limit: config.queueTopN });
-  queue.forEach((candidate, index) => {
-    getDb().prepare("UPDATE zero_dte_candidates SET rank = ? WHERE candidate_id = ?").run(index + 1, candidate.candidateId);
+    const rankedQueue = listZeroDteQueue({ tradingDate, limit: config.queueTopN });
+    const rankCandidate = getDb().prepare(
+      "UPDATE zero_dte_candidates SET rank = ? WHERE candidate_id = ?"
+    );
+    rankedQueue.forEach((candidate, index) => {
+      rankCandidate.run(index + 1, candidate.candidateId);
+    });
+    return {
+      persisted: persistedRows,
+      evaluatedCount: evaluatedRows,
+      eligibleCount: eligibleRows,
+      queue: rankedQueue
+    };
   });
   const actionable = queue.filter((candidate) => candidate.state === "eligible" && candidate.eligible);
   const selected = actionable.slice(0, config.executionTopN);
@@ -1119,10 +1146,7 @@ export const runZeroDteEngine = async (input: {
         candidate: shadowCandidate,
         decisionId,
         confirmPaper: true,
-        provider: input.provider?.mutationProvider ?? {
-          config,
-          now: () => asOf
-        }
+        provider: createZeroDteEngineMutationProvider(config, input.provider?.mutationProvider)
       });
       executionResults.push(result);
       if (result.status === "blocked" && config.shadowEnabled) {
