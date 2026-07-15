@@ -4,6 +4,11 @@
 
 Accepted 2026-07-15. Authority changes are staged and require the reconciliation gates below.
 
+Release 2 implements the non-authoritative `pg` foundation, explicit migration
+tooling, version 1 operational schema, redacted connectivity checks, and domain
+repository contracts. SQLite remains authoritative; PostgreSQL read, write,
+shadow, control-plane, and execution authority flags default off.
+
 ## Context
 
 The VPS currently runs multiple paper-only research, observatory, reconciliation,

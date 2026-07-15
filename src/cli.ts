@@ -132,6 +132,17 @@ import {
   migrateDatabaseFile,
   verifyDatabaseFile
 } from "./services/databaseMaintenanceService.js";
+import {
+  databaseConfigDiagnostics,
+  loadDatabaseConfig
+} from "./lib/database/config.js";
+import { createPostgresPool, type PostgresConnectionMode } from "./lib/database/postgres.js";
+import { checkPostgresConnectivity } from "./lib/database/postgresConnectivity.js";
+import {
+  getPostgresMigrationStatus,
+  runPostgresMigrations
+} from "./lib/database/postgresMigrations.js";
+import { verifyPostgresSchema } from "./lib/database/postgresSchema.js";
 import { buildMarketDecisionTrace } from "./services/marketDecisionTraceService.js";
 import {
   buildZeroDteSummary,
@@ -301,6 +312,83 @@ const formatPadded = (
 const buildSafeBoolean = (value?: boolean) => (value ? "true" : "false");
 
 const run = async () => {
+  if (command === "db:postgres:connectivity") {
+    const mode: PostgresConnectionMode = args.mode === "direct" ? "direct" : "pooled";
+    const purpose = mode === "direct" ? "migration" : "application";
+    const databaseConfig = loadDatabaseConfig(
+      { ...process.env, DATABASE_BACKEND: "postgres" },
+      { purpose }
+    );
+    print({
+      config: databaseConfigDiagnostics(databaseConfig),
+      connectivity: await checkPostgresConnectivity(databaseConfig, { mode })
+    });
+    return;
+  }
+
+  if (command === "db:postgres:migrate") {
+    const databaseConfig = loadDatabaseConfig(
+      { ...process.env, DATABASE_BACKEND: "postgres" },
+      { purpose: "migration" }
+    );
+    const pool = createPostgresPool(databaseConfig, "direct");
+    try {
+      print({
+        config: databaseConfigDiagnostics(databaseConfig),
+        migration: await runPostgresMigrations(pool, databaseConfig)
+      });
+    } finally {
+      await pool.end();
+    }
+    return;
+  }
+
+  if (command === "db:postgres:status") {
+    const databaseConfig = loadDatabaseConfig(
+      { ...process.env, DATABASE_BACKEND: "postgres" },
+      { purpose: "migration" }
+    );
+    const pool = createPostgresPool(databaseConfig, "direct");
+    try {
+      print({
+        config: databaseConfigDiagnostics(databaseConfig),
+        migration: await getPostgresMigrationStatus(pool)
+      });
+    } finally {
+      await pool.end();
+    }
+    return;
+  }
+
+  if (command === "db:postgres:verify") {
+    const databaseConfig = loadDatabaseConfig(
+      { ...process.env, DATABASE_BACKEND: "postgres" },
+      { purpose: "migration" }
+    );
+    const pool = createPostgresPool(databaseConfig, "direct");
+    try {
+      const [migration, schema] = await Promise.all([
+        getPostgresMigrationStatus(pool),
+        verifyPostgresSchema(pool)
+      ]);
+      const verificationPassed =
+        migration.pending.length === 0 &&
+        migration.checksumMismatches.length === 0 &&
+        migration.unexpectedAppliedVersions.length === 0 &&
+        schema.verificationPassed;
+      print({
+        config: databaseConfigDiagnostics(databaseConfig),
+        verificationPassed,
+        migration,
+        schema
+      });
+      if (!verificationPassed) process.exitCode = 1;
+    } finally {
+      await pool.end();
+    }
+    return;
+  }
+
   if (command === "db:migrate") {
     print(migrateDatabaseFile(args.database || undefined));
     return;

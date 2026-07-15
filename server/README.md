@@ -234,6 +234,16 @@ then run `db:verify`. Ordinary runtime commands intentionally do not initialize
 empty databases or apply pending production migrations and fail closed with
 `DATABASE_MIGRATION_REQUIRED`.
 
+Neon configuration is independent of Vercel and belongs in the protected VPS
+environment file. Install only canonical `DATABASE_URL` and
+`DATABASE_URL_UNPOOLED` values from a mode-`0600` transfer fragment. Use
+`scripts/manage-postgres-env.mjs merge` with an unused protected backup path; the
+script preserves unrelated lines, ownership, and mode and prints no values.
+Delete the transfer fragment after a presence-only check. Release 2 keeps
+`DATABASE_BACKEND=sqlite` and all PostgreSQL authority flags off, so restart only
+`alpaca-dashboard-control.service` to validate pooled/direct connectivity; timer
+ownership does not move until the control-plane cutover.
+
 The continuous paper-monitor installer also installs the independent 0DTE Level 2 services and timers. The 0DTE engine runs every minute during the configured entry window; its exit review runs every minute, reconciliation runs every five minutes, and the end-of-day summary runs after the force-exit window. Only `alpaca-zero-dte-engine.service` sets `AUTOMATED_PAPER_EXECUTION_ENABLED=true`, and it still requires the CLI `--confirmPaper` and paper-runtime gates. The other 0DTE services are read-only or mark/summarize local paper and shadow state. See `server/systemd/README.md` for the install/disable commands.
 
 ## Intentionally Not Implemented

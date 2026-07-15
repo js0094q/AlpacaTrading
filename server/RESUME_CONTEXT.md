@@ -1,5 +1,17 @@
 # Resume Context: Alpaca Investing Server Provisioning
 
+## Neon migration Release 2 VPS next step (2026-07-15)
+
+- Release 2 adds the non-authoritative PostgreSQL client and explicit migration
+  commands. The Neon schema was validated locally before VPS installation.
+- Install only `DATABASE_URL` and `DATABASE_URL_UNPOOLED` in the existing
+  protected environment file using `scripts/manage-postgres-env.mjs`; preserve
+  unrelated values, owner, and mode and create a mode-`0400` backup.
+- Keep `DATABASE_BACKEND=sqlite` and every PostgreSQL read/write/shadow/authority
+  flag false. Restart only `alpaca-dashboard-control.service`, run redacted
+  pooled/direct connectivity, and confirm journald contains no credential
+  material. Scheduler timers remain SQLite-owned until Release 3 passes.
+
 ## Neon migration Release 1 VPS evidence (2026-07-15)
 
 - VPS, GitHub main, and Vercel production were reverified at
