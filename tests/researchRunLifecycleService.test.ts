@@ -24,7 +24,8 @@ const {
   RESEARCH_RUN_STALE_AFTER_MS,
   recoverStaleResearchRuns,
   reserveResearchRun,
-  updateResearchRunUniverseSize
+  updateResearchRunUniverseSize,
+  withActiveResearchRunLease
 } = lifecycle;
 
 const now = new Date("2026-07-15T16:00:00.000Z");
@@ -106,6 +107,35 @@ describe("research run lifecycle", () => {
       .get() as { universe_size: number; heartbeat_at: string };
     assert.equal(row.universe_size, 42);
     assert.equal(row.heartbeat_at, heartbeatAt.toISOString());
+  });
+
+  test("refuses durable work when the persisted research lease is no longer active", () => {
+    insertRun({ id: "lost-before-persistence", startedAt: fresh, heartbeatAt: fresh });
+    getDb()
+      .prepare(`
+        UPDATE research_runs
+        SET status = 'failed', completed_at = ?, recovery_reason = 'TEST_LEASE_RECOVERY'
+        WHERE id = 'lost-before-persistence'
+      `)
+      .run(now.toISOString());
+    let operationCalled = false;
+
+    assert.throws(
+      () =>
+        withActiveResearchRunLease("lost-before-persistence", () => {
+          operationCalled = true;
+        }),
+      (error: unknown) =>
+        error instanceof Error &&
+        (error as Error & { code?: string }).code === "RESEARCH_RUN_LEASE_LOST"
+    );
+    assert.equal(operationCalled, false);
+    assert.equal(
+      (getDb()
+        .prepare("SELECT status FROM research_runs WHERE id = 'lost-before-persistence'")
+        .get() as { status: string }).status,
+      "failed"
+    );
   });
 
   test("terminalizes stale running rows with retained interruption evidence", () => {

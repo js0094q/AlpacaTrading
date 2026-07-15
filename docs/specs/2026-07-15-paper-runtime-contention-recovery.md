@@ -98,9 +98,10 @@ order during implementation or validation.
 }
 ```
 
-All output is bounded and redacted. Structured stdout failure is primary;
-stderr warnings remain secondary. Stderr-only and malformed-output failures
-retain safe fallbacks.
+Failure diagnostics are bounded and redacted. Structured stdout failure is
+primary; stderr warnings remain secondary. Stderr-only and malformed-output
+failures retain safe fallbacks. Successful structured JSON remains intact until
+it is parsed.
 
 ### Health deadline contract
 
@@ -126,6 +127,8 @@ retain safe fallbacks.
   inside the reservation or recovery transaction.
 - A worker that cannot renew its persisted `running` lease fails closed before
   candidate or plan persistence.
+- The final lease renewal and candidate/plan persistence share one SQLite write
+  transaction, so recovery cannot interleave between the check and those writes.
 
 ## Timer overlap review
 

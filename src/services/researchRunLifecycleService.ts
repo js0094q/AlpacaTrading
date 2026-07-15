@@ -16,6 +16,15 @@ export interface RecoverableResearchRun {
   correlationId: string | null;
 }
 
+export class ResearchRunLeaseLostError extends Error {
+  readonly code = "RESEARCH_RUN_LEASE_LOST";
+
+  constructor(runId: string) {
+    super(`Research run ${runId} lost its active lifecycle lease.`);
+    this.name = "ResearchRunLeaseLostError";
+  }
+}
+
 interface ResearchRunRow {
   id: string;
   started_at: string;
@@ -210,6 +219,37 @@ export const heartbeatResearchRun = (
       .run(at.toISOString(), runId).changes
   ) === 1;
 
+export const withActiveResearchRunLease = <T>(
+  runId: string,
+  operation: () => T,
+  at = new Date()
+): T => {
+  const db = getDb();
+  db.exec("BEGIN IMMEDIATE;");
+  try {
+    const renewed = Number(
+      db
+        .prepare(
+          "UPDATE research_runs SET heartbeat_at = ? WHERE id = ? AND status = 'running'"
+        )
+        .run(at.toISOString(), runId).changes
+    ) === 1;
+    if (!renewed) {
+      throw new ResearchRunLeaseLostError(runId);
+    }
+    const result = operation();
+    db.exec("COMMIT;");
+    return result;
+  } catch (error) {
+    try {
+      db.exec("ROLLBACK;");
+    } catch {
+      // Preserve the original lease or persistence failure.
+    }
+    throw error;
+  }
+};
+
 export const updateResearchRunUniverseSize = (
   runId: string,
   universeSize: number,
@@ -217,11 +257,11 @@ export const updateResearchRunUniverseSize = (
 ): boolean =>
   Number(
     getDb()
-    .prepare(`
-      UPDATE research_runs
-      SET universe_size = ?, heartbeat_at = ?
-      WHERE id = ? AND status = 'running'
-    `)
+      .prepare(`
+        UPDATE research_runs
+        SET universe_size = ?, heartbeat_at = ?
+        WHERE id = ? AND status = 'running'
+      `)
       .run(universeSize, at.toISOString(), runId).changes
   ) === 1;
 

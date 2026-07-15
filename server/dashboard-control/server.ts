@@ -189,6 +189,40 @@ const killProcessTree = (child: ReturnType<typeof spawn>) => {
   child.kill("SIGKILL");
 };
 
+export const parseControlCommandOutput = (
+  output: string,
+  durationMs: number,
+  requestId: string
+): Record<string, unknown> => {
+  const trimmed = output.trim();
+  if (!trimmed) {
+    return { _controlDurationMs: durationMs, _controlRequestId: requestId };
+  }
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return {
+        ...(parsed as Record<string, unknown>),
+        _controlDurationMs: durationMs,
+        _controlRequestId: requestId
+      };
+    }
+    return {
+      value: parsed,
+      _controlDurationMs: durationMs,
+      _controlRequestId: requestId
+    };
+  } catch {
+    const redacted = redactSensitiveText(trimmed);
+    const suffix = "...[truncated]";
+    const value =
+      redacted.length <= COMMAND_OUTPUT_LIMIT
+        ? redacted
+        : `${redacted.slice(0, COMMAND_OUTPUT_LIMIT - suffix.length)}${suffix}`;
+    return { value, _controlDurationMs: durationMs, _controlRequestId: requestId };
+  }
+};
+
 const runCommandViaSpawn = (
   script: string,
   args: string[],
@@ -220,10 +254,10 @@ const runCommandViaSpawn = (
     }, timeoutMs);
 
     child.stdout?.on("data", (chunk) => {
-      output = `${output}${String(chunk)}`.slice(-COMMAND_OUTPUT_LIMIT * 2);
+      output += String(chunk);
     });
     child.stderr?.on("data", (chunk) => {
-      errored = `${errored}${String(chunk)}`.slice(-COMMAND_OUTPUT_LIMIT * 2);
+      errored += String(chunk);
     });
     child.on("error", (error) => {
       if (settled) return;
@@ -256,22 +290,7 @@ const runCommandViaSpawn = (
         return;
       }
 
-      const trimmed = output.trim();
-      if (!trimmed) {
-        resolve({ _controlDurationMs: durationMs, _controlRequestId: requestId });
-        return;
-      }
-
-      try {
-        const parsed = JSON.parse(trimmed);
-        resolve({
-          ...parsed,
-          _controlDurationMs: durationMs,
-          _controlRequestId: requestId
-        });
-      } catch {
-        resolve({ value: trimmed, _controlDurationMs: durationMs, _controlRequestId: requestId });
-      }
+      resolve(parseControlCommandOutput(output, durationMs, requestId));
     });
   });
 };

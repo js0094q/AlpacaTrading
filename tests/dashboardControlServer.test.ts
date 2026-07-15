@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { Server } from "node:http";
 import {
+  COMMAND_OUTPUT_LIMIT,
   GuardedCommandError,
   normalizeCommandFailure
 } from "../server/dashboard-control/commandResult.js";
@@ -40,6 +41,11 @@ type ControlCommandRunner = (
 type ServerModule = {
   ACTION_HANDLERS: Record<string, ActionConfig>;
   createControlServer: () => Server;
+  parseControlCommandOutput: (
+    output: string,
+    durationMs: number,
+    requestId: string
+  ) => Record<string, unknown>;
   setControlCommandRunner: (runner: null | ControlCommandRunner) => void;
   setOpenOrdersFetcher: (fetcher: null | (() => Promise<unknown>)) => void;
   resetControlTestHooks: () => void;
@@ -251,6 +257,25 @@ after(async () => {
 });
 
 describe("VPS dashboard control API", () => {
+  test("parses successful command JSON larger than the diagnostic output limit", () => {
+    const largeValue = "x".repeat(COMMAND_OUTPUT_LIMIT * 3);
+    const result = module.parseControlCommandOutput(
+      JSON.stringify({ summary: { payloadCount: 3 }, largeValue }),
+      12,
+      "large-success"
+    ) as {
+      summary: { payloadCount: number };
+      largeValue: string;
+      _controlDurationMs: number;
+      _controlRequestId: string;
+    };
+
+    assert.equal(result.summary.payloadCount, 3);
+    assert.equal(result.largeValue, largeValue);
+    assert.equal(result._controlDurationMs, 12);
+    assert.equal(result._controlRequestId, "large-success");
+  });
+
   test("exports the expected action allowlist", () => {
     const paths = Object.keys(module.ACTION_HANDLERS).sort();
     const expected = [

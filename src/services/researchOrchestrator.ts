@@ -22,8 +22,10 @@ import type { PaperTradeCandidateRow } from "../types.js";
 import {
   finishResearchRun,
   heartbeatResearchRun,
+  ResearchRunLeaseLostError,
   reserveResearchRun,
-  updateResearchRunUniverseSize
+  updateResearchRunUniverseSize,
+  withActiveResearchRunLease
 } from "./researchRunLifecycleService.js";
 
 interface ResearchDailyInput {
@@ -77,15 +79,6 @@ interface AlreadyRunningSummary {
   barLookbackDays: number;
   barLookbackStart: string;
   warnings: string[];
-}
-
-class ResearchRunLeaseLostError extends Error {
-  readonly code = "RESEARCH_RUN_LEASE_LOST";
-
-  constructor(runId: string) {
-    super(`Research run ${runId} lost its active lifecycle lease.`);
-    this.name = "ResearchRunLeaseLostError";
-  }
 }
 
 const assertResearchRunLease = (runId: string, renewed?: boolean): void => {
@@ -368,18 +361,21 @@ export const runResearchDaily = async (
       requireSectorDiversity: input.requireSectorDiversity
     });
 
-    const persistedDecisions = persistCandidateDecisions({
-      researchRunId: runId,
-      decisions: ranked.decisions
+    persistedCandidates = withActiveResearchRunLease(runId, () => {
+      const persistedDecisions = persistCandidateDecisions({
+        researchRunId: runId,
+        decisions: ranked.decisions
+      });
+      const selectedCandidates = persistedDecisions.filter(
+        (candidate) => candidate.decision === "selected"
+      );
+      buildPaperTradePlans({
+        researchRunId: runId,
+        candidates: ranked.candidates,
+        riskProfile
+      });
+      return selectedCandidates;
     });
-    persistedCandidates = persistedDecisions.filter((candidate) => candidate.decision === "selected");
-
-    buildPaperTradePlans({
-      researchRunId: runId,
-      candidates: ranked.candidates,
-      riskProfile
-    });
-    assertResearchRunLease(runId);
 
     warnings.push(...ranked.warnings);
 
