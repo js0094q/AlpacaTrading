@@ -152,6 +152,9 @@ ENABLE_OPTIONS_RESEARCH=true
 ENABLE_AGGRESSIVE_PAPER_STRATEGIES=true
 ENABLE_SHORT_RESEARCH=true
 RESEARCH_DB_PATH=./data/research.db
+SQLITE_BUSY_TIMEOUT_MS=5000
+SQLITE_BUSY_RETRY_MAX_ATTEMPTS=4
+SQLITE_BUSY_RETRY_DELAY_MS=25
 ALPACA_REQUEST_TIMEOUT_MS=15000
 ALPACA_MAX_RETRIES=2
 VPS_RESEARCH_REQUEST_TIMEOUT_MS=10000
@@ -504,7 +507,7 @@ The continuous paper monitor is installed separately with `scripts/install-paper
 - `alpaca-zero-dte-reconcile.timer`: wakes every five minutes to mark paper/shadow positions and capture forward outcomes.
 - `alpaca-zero-dte-eod.timer`: writes the end-of-day 0DTE summary after the force-exit window.
 
-Database-heavy wakeups are deliberately staggered: general exit review starts on minute 1, general review on minute 3, the 0DTE engine near second 45, 0DTE exit review near second 55, and reconciliation on minute 1 modulo 5 near second 30. SQLite connections use a bounded 5-second busy timeout by default (`SQLITE_BUSY_TIMEOUT_MS`, capped at 30 seconds); ordinary startup no longer performs migration writes. The monitor runner otherwise no-ops with `MARKET_CLOSED` outside regular market hours, weekends, and configured US market holidays; the read-only `zero-dte-eod` task is the sole post-close exception on a valid weekday session. It fails closed unless `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, `LIVE_TRADING_ENABLED=false`, `PAPER_ORDER_EXECUTION_ENABLED=true`, `PAPER_OPTIONS_EXECUTION_ENABLED=true`, and `AUTOMATED_PAPER_EXECUTION_ENABLED=true` for execution tasks. See `docs/paper-monitoring-operations.md`.
+Database-heavy wakeups are deliberately staggered: general exit review starts on minute 1, general review on minute 3, the 0DTE engine near second 45, 0DTE exit review near second 55, and reconciliation on minute 1 modulo 5 near second 30. SQLite connections use the bounded 5-second busy timeout by default (`SQLITE_BUSY_TIMEOUT_MS`, capped at 30 seconds), plus finite retry only for explicitly idempotent lifecycle/lease/batch writes. Research option persistence and the 0DTE engine batch use the narrow `research-options-and-zero-dte-engine` lease; reads and order paths are not globally serialized. Ordinary startup no longer performs migration writes. The monitor runner otherwise no-ops with `MARKET_CLOSED` outside regular market hours, weekends, and configured US market holidays; the read-only `zero-dte-eod` task is the sole post-close exception on a valid weekday session. It fails closed unless `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, `LIVE_TRADING_ENABLED=false`, `PAPER_ORDER_EXECUTION_ENABLED=true`, `PAPER_OPTIONS_EXECUTION_ENABLED=true`, and `AUTOMATED_PAPER_EXECUTION_ENABLED=true` for execution tasks. See `docs/paper-monitoring-operations.md`.
 
 Set the VPS timezone to `America/New_York` or adjust the timer calendar before enabling timers.
 

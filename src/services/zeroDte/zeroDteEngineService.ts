@@ -1195,6 +1195,13 @@ export const runZeroDteEngine = async (input: {
         selected,
         preparedActions
       };
+    }, {
+      operation: "zero_dte.engine.persist_batch",
+      transaction: "zero_dte_engine_persistence",
+      runId,
+      correlationId: runId,
+      idempotent: true,
+      useHeavyPersistenceLease: true
     });
   } catch (error) {
     errors.push({ code: "PERSISTENCE_BATCH_FAILED", message: normalizeError(error) });

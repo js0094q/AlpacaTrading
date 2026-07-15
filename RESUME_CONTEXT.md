@@ -1,5 +1,24 @@
 # Resume Context: Alpaca Trading Research Infra
 
+## Steady-state SQLite concurrency repair (2026-07-15)
+
+- The failed research run was not a migration-startup failure. Its exact
+  failing write was the idempotent `research_runs` heartbeat update after
+  option snapshot ingestion. The closest proven competing scope was the
+  scheduled 0DTE engine's `BEGIN IMMEDIATE` persistence batch; historical logs
+  do not identify its lock-holder PID or exact duration.
+- The repair keeps the explicit migration boundary and DELETE journal mode,
+  adds the `2026-07-15-steady-state-sqlite-concurrency` migration for the
+  `runtime_write_leases` table, and keeps all 14 timers enabled. Only research
+  option persistence and the 0DTE engine persistence batch use the named heavy
+  lease. Options are normalized outside transactions and written in bounded
+  idempotent batches; bounded `SQLITE_BUSY` retry is limited to lifecycle,
+  lease-maintenance, and rollback-safe persistence writes.
+- Structured contention telemetry includes operation, transaction duration,
+  retry count, process identity, and run/correlation ID. Lost leases stop the
+  next durable write. Review, execution, exit execution, and all paper/live
+  order paths remain safety-gated and were not run during repair validation.
+
 ## Paper runtime contention and research recovery release (2026-07-15)
 
 - Production diagnosis traced Automated Paper Research failure to ordinary CLI
@@ -256,7 +275,7 @@
   - Migrations are `2026-07-13-zero-dte-level-2` and `2026-07-13-zero-dte-level-2-hardening`.
   - Direct commands are `npm run zero-dte:engine -- --dryRun --format=json`, `npm run zero-dte:engine -- --confirmPaper --format=json`, `npm run zero-dte:exit:review -- --format=json`, `npm run zero-dte:reconcile -- --format=json`, `npm run zero-dte:eod -- --format=json`, and `npm run zero-dte:summary -- --format=json`.
   - Scheduler units are `alpaca-zero-dte-engine.timer`, `alpaca-zero-dte-exit-review.timer`, `alpaca-zero-dte-reconcile.timer`, and `alpaca-zero-dte-eod.timer`; each uses a dedicated `/tmp/alpaca-zero-dte-*.lock`.
-  - Operational acceptance accepts Alpaca's top-level stock snapshot symbol map, keeps selected engine candidates inside the guarded execution path, scopes `ZERO_DTE_MAX_OPEN_POSITIONS` to active same-day option positions, permits the read-only EOD task after a valid session closes, staggers database-heavy timer wakeups, and uses a 60-second SQLite busy timeout for transient writer contention.
+  - Operational acceptance accepts Alpaca's top-level stock snapshot symbol map, keeps selected engine candidates inside the guarded execution path, scopes `ZERO_DTE_MAX_OPEN_POSITIONS` to active same-day option positions, permits the read-only EOD task after a valid session closes, staggers database-heavy timer wakeups, and uses a bounded 5-second SQLite busy timeout plus scoped finite retries for transient writer contention.
   - The summary routes are `GET /api/v1/zero-dte/summary` on the VPS and `GET /api/paper/zero-dte/summary` on Vercel. The dashboard panel is `0DTE Level 2` and labels shadow positions as simulated.
   - Paper execution remains fail-closed on `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, `LIVE_TRADING_ENABLED=false`, `PAPER_ORDER_EXECUTION_ENABLED=true`, `PAPER_OPTIONS_EXECUTION_ENABLED=true`, `AUTOMATED_PAPER_EXECUTION_ENABLED=true`, `ZERO_DTE_ENGINE_ENABLED=true`, `ZERO_DTE_PAPER_EXECUTION_ENABLED=true`, and `--confirmPaper`. No live endpoint is used.
 - Deployed paper-only portfolio risk and hedge-management layer:

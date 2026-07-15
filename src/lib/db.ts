@@ -11,6 +11,12 @@ import {
   getPendingMigrationVersions,
   runMigrationGroup
 } from "./sqliteMigrations.js";
+import {
+  runSqliteConcurrencyMigration,
+  SQLITE_CONCURRENCY_MIGRATION_VERSION
+} from "./sqliteConcurrencySchema.js";
+
+export { SQLITE_CONCURRENCY_MIGRATION_VERSION } from "./sqliteConcurrencySchema.js";
 
 export const LOCAL_SQLITE_UNAVAILABLE_ON_VERCEL =
   "LOCAL_SQLITE_UNAVAILABLE_ON_VERCEL";
@@ -27,7 +33,8 @@ export const REQUIRED_RUNTIME_MIGRATION_VERSIONS = [
   PHASE_1B_MIGRATION_VERSION,
   UNIVERSE_LIFECYCLE_MIGRATION_VERSION,
   ZERO_DTE_MIGRATION_VERSION,
-  ZERO_DTE_HARDENING_MIGRATION_VERSION
+  ZERO_DTE_HARDENING_MIGRATION_VERSION,
+  SQLITE_CONCURRENCY_MIGRATION_VERSION
 ] as const;
 
 export class DatabaseMigrationRequiredError extends Error {
@@ -1315,6 +1322,9 @@ export const initializeDatabaseHandle = (db: DbHandle): DbHandle => {
   });
   runPhase1BMigrations(db);
   runZeroDteMigrations(db);
+  runMigrationGroup(db, [SQLITE_CONCURRENCY_MIGRATION_VERSION], () => {
+    runSqliteConcurrencyMigration(db);
+  });
   return db;
 };
 

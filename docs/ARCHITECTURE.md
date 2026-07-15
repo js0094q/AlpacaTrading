@@ -124,3 +124,16 @@ and research preflight use the same 15-minute stale rule; stale rows transition 
 existing `failed` state with worker/request/correlation evidence and
 `WORKER_TERMINATED_OR_HEARTBEAT_EXPIRED`. Recovery never submits or retries an
 order or source workload.
+
+Steady-state writer contention is scoped to the two evidenced heavy persistence
+scopes: research option contracts/snapshots and the 0DTE engine persistence
+batch. They coordinate through the additive `runtime_write_leases` table and
+the finite `research-options-and-zero-dte-engine` lease. Option rows are
+normalized outside the lease and written in bounded idempotent transactions;
+the engine keeps its deterministic identities and wraps only its existing
+rollback-safe batch. Lifecycle updates, lease maintenance, and those batches
+may use bounded `SQLITE_BUSY` retry after rollback. Structured contention logs
+include operation, transaction duration, retry count, process identity, and
+run/correlation IDs. The historical lock-holder PID is unknown; the 0DTE batch
+is the closest proven competing scope. Reads, review, reconciliation, and
+execution are not globally serialized.

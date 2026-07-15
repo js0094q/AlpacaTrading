@@ -4,7 +4,7 @@
 
 **Goal:** Make guarded paper research complete under the unchanged staggered timer schedule by batching the evidenced heavy writers, coordinating only those writers, and retrying only safe SQLite busy failures.
 
-**Architecture:** Add one additive migration for a short-lived named `sqlite_write_leases` row. A synchronous retry/telemetry helper wraps only explicitly idempotent lifecycle and rollback-safe batch writes. Research options normalize outside the lease and commit in bounded chunks; the 0DTE engine wraps its existing deterministic persistence batch in the same lease. Runtime startup remains read-only for current databases and SQLite remains in DELETE rollback-journal mode.
+**Architecture:** Add one additive migration for a short-lived named `runtime_write_leases` row. A synchronous retry/telemetry helper wraps only explicitly idempotent lifecycle and rollback-safe batch writes. Research options normalize outside the lease and commit in bounded chunks; the 0DTE engine wraps its existing deterministic persistence batch in the same lease. Runtime startup remains read-only for current databases and SQLite remains in DELETE rollback-journal mode.
 
 **Tech Stack:** Node.js `node:sqlite` `DatabaseSync`, TypeScript/NodeNext, `tsx --test`, SQLite DELETE journal, systemd timers, GitHub PR, VPS SSH deployment, Vercel production deployment.
 
@@ -38,7 +38,7 @@
   the telemetry limitation, lease scope, retry boundary, safety boundaries,
   acceptance criteria, and deployment checks.
 
-- [ ] **Step 2: Run the baseline checks before editing behavior.**
+- [x] **Step 2: Run the baseline checks before editing behavior.**
 
   Run:
 
@@ -71,7 +71,7 @@
 - Produces: deterministic two-process DELETE-journal tests that fail before the
   repair and become green after Tasks 3–5.
 
-- [ ] **Step 1: Write the failing heartbeat race.**
+- [x] **Step 1: Write the failing heartbeat race.**
 
   Create a temporary on-disk database using the production migration helper,
   insert one `research_runs` row, spawn a worker that opens a second
@@ -81,7 +81,7 @@
   `heartbeatResearchRun` while the scheduled-writer worker holds the lock and
   assert the current implementation raises `database is locked`.
 
-- [ ] **Step 2: Add the terminal-state and duplicate assertions.**
+- [x] **Step 2: Add the terminal-state and duplicate assertions.**
 
   After the repaired heartbeat succeeds, call `finishResearchRun` and assert
   the row is `completed`. Repeat the idempotent persistence fixture and assert
@@ -89,21 +89,21 @@
   rows. Add a lost-lease case that proves the supplied persistence callback is
   not called after the research row changes to `failed`.
 
-- [ ] **Step 3: Add retry contract tests.**
+- [x] **Step 3: Add retry contract tests.**
 
   Use an injected sleep and telemetry collector to prove a busy operation stops
   after its configured attempt bound, a successful retry reports its retry
   count, a non-idempotent operation is attempted once, and non-busy errors are
   propagated without retry.
 
-- [ ] **Step 4: Add connection PRAGMA assertions.**
+- [x] **Step 4: Add connection PRAGMA assertions.**
 
   Assert `PRAGMA busy_timeout` and `PRAGMA foreign_keys` on the normal runtime
   handle, a second writer handle, and the read-only verification handle. Keep
   the test database in DELETE journal mode; do not use the existing in-memory
   test helper for this concurrency test.
 
-- [ ] **Step 5: Run the focused RED tests.**
+- [x] **Step 5: Run the focused RED tests.**
 
   ```bash
   npx tsx --test tests/sqliteConcurrency.test.ts
@@ -148,34 +148,34 @@
   ) => T;
   ```
 
-- [ ] **Step 1: Implement busy classification and bounded synchronous retry.**
+- [x] **Step 1: Implement busy classification and bounded synchronous retry.**
 
   Recognize SQLite primary/extended `SQLITE_BUSY` codes and the deployed
   `database is locked` representation, reject explicit `SQLITE_LOCKED`, cap
   attempts and delay, and use `Atomics.wait` only for the short injected delay.
   Rollback must be completed by transaction callers before the helper retries.
 
-- [ ] **Step 2: Emit bounded structured contention events.**
+- [x] **Step 2: Emit bounded structured contention events.**
 
   Emit JSON with `event`, `operation`, `transaction`, `outcome`,
   `transactionDurationMs`, `retryCount`, `processIdentity`, `runId`,
   `correlationId`, and a redacted SQLite error code/message. Emit no SQL values,
   credentials, request bodies, or secrets.
 
-- [ ] **Step 3: Wrap only idempotent research lifecycle writes.**
+- [x] **Step 3: Wrap only idempotent research lifecycle writes.**
 
   Apply the helper to heartbeat, universe progress, and terminal research-row
   updates. Leave reservation/recovery transactions and final candidate/plan
   persistence non-retried unless their entire operation is proven idempotent.
 
-- [ ] **Step 4: Wrap rollback-safe batch transactions.**
+- [x] **Step 4: Wrap rollback-safe batch transactions.**
 
   Add an explicit `idempotent` transaction option to the 0DTE persistence
   transaction and option batch transaction. Ensure every retry rolls back the
   failed attempt first. Keep existing standalone 0DTE callers non-retried by
   default.
 
-- [ ] **Step 5: Run the focused tests.**
+- [x] **Step 5: Run the focused tests.**
 
   ```bash
   npx tsx --test tests/sqliteConcurrency.test.ts tests/researchRunLifecycleService.test.ts
@@ -218,35 +218,35 @@
   ) => T;
   ```
 
-- [ ] **Step 1: Write the additive schema migration.**
+- [x] **Step 1: Write the additive schema migration.**
 
-  Add only `sqlite_write_leases(lease_name PRIMARY KEY, owner_id,
+  Add only `runtime_write_leases(lease_name PRIMARY KEY, owner_id,
   acquired_at, expires_at)`. Register its migration version in the required
   runtime list, but run it only through `initializeDatabaseHandle`'s existing
   explicit migration path. Do not alter `RUNTIME_SCHEMA_MIGRATION_VERSION` or
   the runtime read-only branch.
 
-- [ ] **Step 2: Write lease acquisition, renewal, ownership, and release.**
+- [x] **Step 2: Write lease acquisition, renewal, ownership, and release.**
 
   Acquire with a short compare-and-set `BEGIN IMMEDIATE` transaction, reclaim
   only expired rows, poll for a bounded maximum wait, renew after each batch,
   assert ownership before each batch, and release only the matching owner token.
   Use a finite expiry so a crashed process cannot hold the lease forever.
 
-- [ ] **Step 3: Add migration and lease-loss tests.**
+- [x] **Step 3: Add migration and lease-loss tests.**
 
   Assert current runtime startup does not write the new migration, explicit
   migration creates it exactly once, a second migration is a no-op, a held lease
   makes another participant wait then proceed after release, expiry is
   reclaimable, and ownership loss prevents the next durable write.
 
-- [ ] **Step 4: Record ADR-009.**
+- [x] **Step 4: Record ADR-009.**
 
   Document the evidence, the exact two participating persistence scopes, why a
   global lock/WAL/timer change was rejected, lease expiry/recovery, retry
   boundaries, consequences, and production-copy validation.
 
-- [ ] **Step 5: Run migration and lease tests.**
+- [x] **Step 5: Run migration and lease tests.**
 
   ```bash
   npx tsx --test tests/databaseRuntimeMigrations.test.ts tests/sqliteConcurrency.test.ts
@@ -273,25 +273,25 @@
   except for the intended new rows. Assert no duplicate option symbols or
   timestamps and that the ingestion run reaches a terminal status.
 
-- [ ] **Step 2: Normalize all fetched rows before acquiring the lease.**
+- [x] **Step 2: Normalize all fetched rows before acquiring the lease.**
 
   Preserve the existing provider calls and filters, but materialize normalized
   contract/snapshot row objects before any `BEGIN IMMEDIATE` transaction.
 
-- [ ] **Step 3: Persist bounded chunks under the lease.**
+- [x] **Step 3: Persist bounded chunks under the lease.**
 
   Use a fixed bounded batch size of 250 rows, `BEGIN IMMEDIATE` per chunk,
   existing `ON CONFLICT` semantics, explicit transaction telemetry, retry only
   after rollback, lease ownership assertion before each chunk, and lease renewal
   after each successful chunk.
 
-- [ ] **Step 4: Keep ingestion status writes idempotent and short.**
+- [x] **Step 4: Keep ingestion status writes idempotent and short.**
 
   Leave the initial run-row insert non-retried. Apply the bounded idempotent
   helper to `finishRun`, preserving the existing failure path and warning
   behavior when an option batch cannot complete.
 
-- [ ] **Step 5: Run focused option/research tests.**
+- [x] **Step 5: Run focused option/research tests.**
 
   ```bash
   npx tsx --test tests/research.test.ts tests/optionSnapshotNormalizer.test.ts tests/sqliteConcurrency.test.ts
@@ -319,19 +319,19 @@
   then completes once released. Assert one candidate/observation/evaluation/
   decision/lifecycle row per deterministic identity.
 
-- [ ] **Step 2: Add explicit transaction context options.**
+- [x] **Step 2: Add explicit transaction context options.**
 
   Keep `runInZeroDtePersistenceTransaction(operation)` behavior unchanged for
   existing callers. Add opt-in context for `operation`, `runId`,
   `correlationId`, `idempotent`, and `useHeavyPersistenceLease`.
 
-- [ ] **Step 3: Wrap only `runZeroDteEngine`'s existing persistence closure.**
+- [x] **Step 3: Wrap only `runZeroDteEngine`'s existing persistence closure.**
 
   Pass the engine run ID and `useHeavyPersistenceLease: true` from the engine.
   Do not wrap broker calls, order reservations, shadow writes, exit review, or
   reconciliation in the heavy lease.
 
-- [ ] **Step 4: Run focused 0DTE tests.**
+- [x] **Step 4: Run focused 0DTE tests.**
 
   ```bash
   npm run test:zero-dte
@@ -355,23 +355,23 @@
 - Produces: implementation-accurate documentation that preserves the
   migration boundary, timer schedule, paper-only gates, and no-order rule.
 
-- [ ] **Step 1: Document the lease and telemetry boundary.**
+- [x] **Step 1: Document the lease and telemetry boundary.**
 
   State the two participating heavy scopes, finite lease expiry, bounded retry,
   structured journal telemetry, and the fact that the historical PID is unknown.
 
-- [ ] **Step 2: Document deployment-copy validation.**
+- [x] **Step 2: Document deployment-copy validation.**
 
   Add exact commands for copied-database migration twice, integrity,
   foreign-key, journal-mode, busy-timeout, timer-health, exact-SHA alignment,
   and guarded research validation. Explicitly omit paper review/execution from
   implementation validation until successful research.
 
-- [ ] **Step 3: Run documentation checks.**
+- [x] **Step 3: Run documentation checks.**
 
   ```bash
   git diff --check
-  rg -n "sqlite_write_leases|SQLITE_BUSY|journal_mode|paper execution" docs README.md RESUME_CONTEXT.md
+  rg -n "runtime_write_leases|SQLITE_BUSY|journal_mode|paper execution" docs README.md RESUME_CONTEXT.md
   ```
 
 ### Task 8: Run complete local verification and review the diff
@@ -383,14 +383,14 @@
 - Consumes: Tasks 2–7.
 - Produces: green local evidence ready for review and publication.
 
-- [ ] **Step 1: Run focused validation.**
+- [x] **Step 1: Run focused validation.**
 
   ```bash
   npx tsx --test tests/sqliteConcurrency.test.ts tests/databaseRuntimeMigrations.test.ts tests/researchRunLifecycleService.test.ts tests/research.test.ts
   npm run test:zero-dte
   ```
 
-- [ ] **Step 2: Run full validation.**
+- [x] **Step 2: Run full validation.**
 
   ```bash
   npm test
@@ -400,7 +400,7 @@
   git diff --check
   ```
 
-- [ ] **Step 3: Inspect the diff and safety surface.**
+- [x] **Step 3: Inspect the diff and safety surface.**
 
   ```bash
   git diff --stat

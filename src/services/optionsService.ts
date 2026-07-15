@@ -1,4 +1,5 @@
 import { getDb } from "../lib/db.js";
+import { runWithSqliteBusyRetry } from "../lib/sqliteConcurrency.js";
 import { nowIso, dedupeSymbols, normalizeSymbol } from "../lib/utils.js";
 import { getActiveSymbols, seedInitialUniverse } from "./universeService.js";
 import {
@@ -14,6 +15,23 @@ import {
   optionsQuoteConfig
 } from "./optionQuoteNormalizer.js";
 import { normalizeOptionSnapshot } from "./optionSnapshotNormalizer.js";
+import { ResearchRunLeaseLostError } from "./researchRunLifecycleService.js";
+import {
+  withHeavyPersistenceLease,
+  type HeavyPersistenceLease
+} from "./sqliteWriteLeaseService.js";
+
+const OPTION_PERSISTENCE_BATCH_SIZE = 250;
+
+const assertResearchRunActive = (researchRunId?: string) => {
+  if (!researchRunId) return;
+  const row = getDb()
+    .prepare("SELECT status FROM research_runs WHERE id = ?")
+    .get(researchRunId) as { status: string } | undefined;
+  if (!row || row.status !== "running") {
+    throw new ResearchRunLeaseLostError(researchRunId);
+  }
+};
 
 const ensureRunRow = (input: {
   runType: "options_contracts" | "options_snapshots";
@@ -41,16 +59,33 @@ const ensureRunRow = (input: {
   return Number(result.lastInsertRowid);
 };
 
-const finishRun = (runId: number, rowsIngested: number, status: "completed" | "failed", notes?: string) => {
-  getDb()
-    .prepare(
-      `
-      UPDATE ingestion_runs
-      SET status = ?, completed_at = ?, rows_ingested = ?, notes = COALESCE(?, notes)
-      WHERE rowid = ?
-    `
-    )
-    .run(status, nowIso(), rowsIngested, notes || null, runId);
+const finishRun = (
+  runId: number,
+  rowsIngested: number,
+  status: "completed" | "failed",
+  notes?: string,
+  context?: { researchRunId?: string | null; correlationId?: string | null }
+) => {
+  runWithSqliteBusyRetry(
+    () => {
+      getDb()
+        .prepare(
+          `
+          UPDATE ingestion_runs
+          SET status = ?, completed_at = ?, rows_ingested = ?, notes = COALESCE(?, notes)
+          WHERE rowid = ?
+        `
+        )
+        .run(status, nowIso(), rowsIngested, notes || null, runId);
+    },
+    {
+      operation: "options_ingestion.finish",
+      transaction: "options_ingestion_finish",
+      runId: context?.researchRunId || `ingestion:${runId}`,
+      correlationId: context?.correlationId || null,
+      idempotent: true
+    }
+  );
 };
 
 export const toContractRow = (contract: OptionContractRaw) => ({
@@ -141,6 +176,8 @@ export const ingestOptionContracts = async (params?: {
   underlyingSymbols?: string[];
   minDaysToExpiration?: number;
   maxDaysToExpiration?: number;
+  researchRunId?: string;
+  correlationId?: string;
 }) => {
   await seedInitialUniverse();
   const symbols = dedupeSymbols(
@@ -172,40 +209,81 @@ export const ingestOptionContracts = async (params?: {
       minDaysToExpiration: params?.minDaysToExpiration,
       maxDaysToExpiration: params?.maxDaysToExpiration
     });
-    const db = getDb();
-    db.exec("BEGIN IMMEDIATE");
-    try {
-      for (const raw of contracts) {
-        const row = toContractRow(raw);
-        if (!row.underlyingSymbol || !row.optionSymbol || !row.expirationDate || row.strike === null) {
-          continue;
-        }
-        const result = insert.run(
-          row.underlyingSymbol,
-          row.optionSymbol,
-          row.type,
-          row.expirationDate,
-          row.strike,
-          row.multiplier,
-          row.tradable
-        );
-        if (result.changes === 1) {
-          inserted += 1;
-        }
+    const normalizedRows = contracts.flatMap((raw) => {
+      const row = toContractRow(raw);
+      if (!row.underlyingSymbol || !row.optionSymbol || !row.expirationDate || row.strike === null) {
+        return [];
       }
-      db.exec("COMMIT");
-    } catch (error) {
-      db.exec("ROLLBACK");
-      throw error;
-    }
-    finishRun(runId, inserted, "completed");
+      return [row];
+    });
+    const db = getDb();
+    const persistContracts = (lease?: HeavyPersistenceLease) => {
+      let total = 0;
+      for (let offset = 0; offset < normalizedRows.length; offset += OPTION_PERSISTENCE_BATCH_SIZE) {
+        const batch = normalizedRows.slice(offset, offset + OPTION_PERSISTENCE_BATCH_SIZE);
+        assertResearchRunActive(params?.researchRunId);
+        lease?.assertOwnership();
+        total += runWithSqliteBusyRetry(
+          () => {
+            let transactionStarted = false;
+            let rowsInserted = 0;
+            try {
+              db.exec("BEGIN IMMEDIATE");
+              transactionStarted = true;
+              for (const row of batch) {
+                const result = insert.run(
+                  row.underlyingSymbol,
+                  row.optionSymbol,
+                  row.type,
+                  row.expirationDate!,
+                  row.strike,
+                  row.multiplier,
+                  row.tradable
+                );
+                if (result.changes === 1) rowsInserted += 1;
+              }
+              db.exec("COMMIT");
+              transactionStarted = false;
+              return rowsInserted;
+            } catch (error) {
+              if (transactionStarted) {
+                try {
+                  db.exec("ROLLBACK");
+                } catch {
+                  // Preserve the original batch failure.
+                }
+              }
+              throw error;
+            }
+          },
+          {
+            operation: "options_contracts.persist_batch",
+            transaction: "options_contract_batch",
+            runId: params?.researchRunId || null,
+            correlationId: params?.correlationId || null,
+            idempotent: true
+          }
+        );
+        lease?.renew();
+      }
+      return total;
+    };
+    inserted = params?.researchRunId
+      ? withHeavyPersistenceLease({
+          runId: params.researchRunId,
+          correlationId: params.correlationId || null,
+          operation: persistContracts
+        })
+      : persistContracts();
+    finishRun(runId, inserted, "completed", undefined, params);
     return { runId, rowsIngested: inserted };
   } catch (error) {
     finishRun(
       runId,
       inserted,
       "failed",
-      error instanceof Error ? error.message : "unknown"
+      error instanceof Error ? error.message : "unknown",
+      params
     );
     throw error;
   }
@@ -216,6 +294,8 @@ const insertOptionSnapshotRows = async (
   params?: {
     minDelta?: number;
     maxDelta?: number;
+    researchRunId?: string;
+    correlationId?: string;
   }
 ) => {
   if (!optionSymbols.length) {
@@ -237,60 +317,97 @@ const insertOptionSnapshotRows = async (
     fetchOptionQuotes(optionSymbols)
   ]);
   const quotesBySymbol = new Map(quotes.map((row) => [row.symbol, row.raw]));
-  const db = getDb();
-  db.exec("BEGIN IMMEDIATE");
-  try {
-    for (const { symbol, raw } of snapshots) {
-      const row = toSnapshotRow(symbol, raw, quotesBySymbol.get(symbol));
-      if (params?.minDelta !== undefined && params.minDelta !== null) {
-        if (row.delta === null || row.delta < params.minDelta) {
-          continue;
-        }
-      }
-      if (params?.maxDelta !== undefined && params.maxDelta !== null) {
-        if (row.delta === null || row.delta > params.maxDelta) {
-          continue;
-        }
-      }
-      const result = insert.run(
-        row.optionSymbol,
-        row.underlyingSymbol,
-        row.timestamp,
-        row.bid,
-        row.ask,
-        row.midpoint,
-        row.last,
-        row.quoteStatus,
-        row.executable,
-        row.executablePrice,
-        row.executablePriceSource,
-        row.rejectionReason,
-        row.quoteTimestamp,
-        row.volume,
-        row.openInterest,
-        row.bidSize,
-        row.askSize,
-        row.tradeSize,
-        row.tradeTimestamp,
-        row.impliedVolatility,
-        row.delta,
-        row.gamma,
-        row.theta,
-        row.vega,
-        row.rho,
-        row.snapshotTimestamp,
-        row.normalizationPath
-      );
-      if (result.changes === 1) {
-        inserted += 1;
-      }
+  const normalizedRows = snapshots.flatMap(({ symbol, raw }) => {
+    const row = toSnapshotRow(symbol, raw, quotesBySymbol.get(symbol));
+    if (params?.minDelta !== undefined && params.minDelta !== null) {
+      if (row.delta === null || row.delta < params.minDelta) return [];
     }
-    db.exec("COMMIT");
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
-  }
-  return inserted;
+    if (params?.maxDelta !== undefined && params.maxDelta !== null) {
+      if (row.delta === null || row.delta > params.maxDelta) return [];
+    }
+    return [row];
+  });
+
+  const db = getDb();
+  const persistSnapshots = (lease?: HeavyPersistenceLease) => {
+    let inserted = 0;
+    for (let offset = 0; offset < normalizedRows.length; offset += OPTION_PERSISTENCE_BATCH_SIZE) {
+      const batch = normalizedRows.slice(offset, offset + OPTION_PERSISTENCE_BATCH_SIZE);
+      assertResearchRunActive(params?.researchRunId);
+      lease?.assertOwnership();
+      const batchInserted = runWithSqliteBusyRetry(
+        () => {
+          let transactionStarted = false;
+          let rowsInserted = 0;
+          try {
+            db.exec("BEGIN IMMEDIATE");
+            transactionStarted = true;
+            for (const row of batch) {
+              const result = insert.run(
+                row.optionSymbol,
+                row.underlyingSymbol,
+                row.timestamp,
+                row.bid,
+                row.ask,
+                row.midpoint,
+                row.last,
+                row.quoteStatus,
+                row.executable,
+                row.executablePrice,
+                row.executablePriceSource,
+                row.rejectionReason,
+                row.quoteTimestamp,
+                row.volume,
+                row.openInterest,
+                row.bidSize,
+                row.askSize,
+                row.tradeSize,
+                row.tradeTimestamp,
+                row.impliedVolatility,
+                row.delta,
+                row.gamma,
+                row.theta,
+                row.vega,
+                row.rho,
+                row.snapshotTimestamp,
+                row.normalizationPath
+              );
+              if (result.changes === 1) rowsInserted += 1;
+            }
+            db.exec("COMMIT");
+            transactionStarted = false;
+            return rowsInserted;
+          } catch (error) {
+            if (transactionStarted) {
+              try {
+                db.exec("ROLLBACK");
+              } catch {
+                // Preserve the original batch failure.
+              }
+            }
+            throw error;
+          }
+        },
+        {
+          operation: "options_snapshots.persist_batch",
+          transaction: "options_snapshot_batch",
+          runId: params?.researchRunId || null,
+          correlationId: params?.correlationId || null,
+          idempotent: true
+        }
+      );
+      inserted += batchInserted;
+      lease?.renew();
+    }
+    return inserted;
+  };
+  return params?.researchRunId
+    ? withHeavyPersistenceLease({
+        runId: params.researchRunId,
+        correlationId: params.correlationId || null,
+        operation: persistSnapshots
+      })
+    : persistSnapshots();
 };
 
 export const ingestOptionSnapshots = async (params?: {
@@ -299,6 +416,8 @@ export const ingestOptionSnapshots = async (params?: {
   maxDaysToExpiration?: number;
   minDelta?: number;
   maxDelta?: number;
+  researchRunId?: string;
+  correlationId?: string;
 }) => {
   await seedInitialUniverse();
   const symbols = dedupeSymbols(
@@ -325,20 +444,24 @@ export const ingestOptionSnapshots = async (params?: {
       .all(...symbols) as Array<{ option_symbol: string }>;
     const optionSymbols = options.map((row) => row.option_symbol);
     inserted = await insertOptionSnapshotRows(optionSymbols, params);
-    finishRun(runId, inserted, "completed");
+    finishRun(runId, inserted, "completed", undefined, params);
     return { runId, rowsIngested: inserted };
   } catch (error) {
     finishRun(
       runId,
       inserted,
       "failed",
-      error instanceof Error ? error.message : "unknown"
+      error instanceof Error ? error.message : "unknown",
+      params
     );
     throw error;
   }
 };
 
-export const ingestOptionSnapshotsForSymbols = async (optionSymbols: string[]) => {
+export const ingestOptionSnapshotsForSymbols = async (
+  optionSymbols: string[],
+  context?: { researchRunId?: string; correlationId?: string }
+) => {
   const symbols = dedupeSymbols(optionSymbols);
   if (!symbols.length) {
     return { runId: null, rowsIngested: 0 };
@@ -352,15 +475,16 @@ export const ingestOptionSnapshotsForSymbols = async (optionSymbols: string[]) =
 
   let inserted = 0;
   try {
-    inserted = await insertOptionSnapshotRows(symbols);
-    finishRun(runId, inserted, "completed");
+    inserted = await insertOptionSnapshotRows(symbols, context);
+    finishRun(runId, inserted, "completed", undefined, context);
     return { runId, rowsIngested: inserted };
   } catch (error) {
     finishRun(
       runId,
       inserted,
       "failed",
-      error instanceof Error ? error.message : "unknown"
+      error instanceof Error ? error.message : "unknown",
+      context
     );
     throw error;
   }

@@ -322,8 +322,16 @@ export const runResearchDaily = async (
           ...symbols,
           ...discoveryOptionUnderlyings()
         ]);
-        await ingestOptionContracts({ underlyingSymbols: optionUnderlyings });
-        await ingestOptionSnapshots({ underlyingSymbols: optionUnderlyings });
+        await ingestOptionContracts({
+          underlyingSymbols: optionUnderlyings,
+          researchRunId: runId,
+          correlationId: process.env.RESEARCH_CORRELATION_ID?.trim() || runId
+        });
+        await ingestOptionSnapshots({
+          underlyingSymbols: optionUnderlyings,
+          researchRunId: runId,
+          correlationId: process.env.RESEARCH_CORRELATION_ID?.trim() || runId
+        });
       } catch (error) {
         warnings.push(
           `Options data ingestion skipped; continuing equity candidate generation: ${safeWarningMessage(error)}`
