@@ -26,6 +26,34 @@ rebased onto the reverified `8cc9fe8` GitHub/Vercel/VPS baseline before Release
 
 All SHAs, deployment identifiers, environment scopes, and connection availability must be reverified at the stage that relies on them.
 
+## Implementation Progress
+
+- Release 1 is merged and deployed: SQLite inventory/stabilization, explicit
+  runtime migration boundary, bounded busy/locked handling, and copied-database
+  WAL evidence are complete.
+- Release 2 is merged and deployed: `pg`, pooled/direct configuration, schema
+  version 1, explicit migration/status/verify/connectivity commands, repository
+  contracts, and timeout/retry policy are complete.
+- Release 3 implementation adds schema version 2, control-plane PostgreSQL
+  repositories, scheduler leases with fencing, resumable snapshot/backfill and
+  reconciliation, shadow discrepancy reporting, and feature-flagged research
+  authority. Production authority remains off until Release 3 deployment,
+  backfill, reconciliation, and paper shadow gates pass.
+- Release 3 scheduler authority is limited to research because only its durable
+  writes validate the current fencing token. All other registered workstreams
+  remain SQLite-owned until that fail-closed write boundary is implemented.
+- Release 4 execution-state migration has not begun. Execution-state scheduler
+  workstreams remain SQLite-owned until their writes are fence-aware and their
+  financial reconciliation passes.
+
+Release 3 candidate lifecycle is sourced only from candidate-linked
+`decision_snapshots` and `decision_lifecycle_events`. Lifecycle events for
+non-candidate decisions are deferred to the corresponding Release 4 execution
+domain rather than being silently dropped or misclassified. During Release 3
+authority, an explicitly enabled SQLite audit projection may temporarily serve
+remaining Release 4 readers; PostgreSQL commits first and never falls back to
+SQLite.
+
 ## Architectural Decision
 
 Neon PostgreSQL owns state that requires concurrent access, transactional consistency, distributed scheduler ownership, or cross-workstream coordination. Local SQLite stores may retain only non-authoritative data. Workstreams synchronize through immutable, idempotent events; independently mutable trading databases are never merged.
@@ -58,6 +86,8 @@ Application services use domain repositories. PostgreSQL-specific repositories m
 - Migrate scheduler leases with fencing.
 - Migrate research-run control state, candidates and lifecycle events, idempotency records, workstream events and failures, and reconciliation checkpoints.
 - Provide resumable backfill, reconciliation, paper-only shadow comparison, discrepancy reports, and feature-flagged authority.
+- Enable scheduler authority only for research in this release; registering
+  other lease names does not grant them distributed ownership.
 - Do not expand authority while any unexplained discrepancy remains.
 
 ### Release 4: execution-state authority

@@ -10,6 +10,8 @@ export interface SchedulerLeaseRecord extends SchedulerFence {
   readonly acquiredAt: string;
   readonly heartbeatAt: string;
   readonly expiresAt: string;
+  readonly releasedAt: string | null;
+  readonly releaseReason: string | null;
   readonly status: SchedulerLeaseStatus;
   readonly version: number;
 }
@@ -21,7 +23,7 @@ export type SchedulerLeaseAcquisitionResult =
 export type SchedulerLeaseMutationResult =
   | { readonly status: "updated"; readonly lease: SchedulerLeaseRecord }
   | { readonly status: "not_found" }
-  | { readonly status: "fence_rejected"; readonly currentFencingToken: number | null };
+  | { readonly status: "fence_rejected"; readonly currentFencingToken: string | null };
 
 export interface SchedulerLeaseRepository<TTransactionScope> {
   findByJobName(
@@ -46,7 +48,7 @@ export interface SchedulerLeaseRepository<TTransactionScope> {
       readonly jobName: string;
       readonly ownerId: string;
       readonly runId: string;
-      readonly fencingToken: number;
+      readonly fencingToken: string;
       readonly heartbeatAt: string;
       readonly expiresAt: string;
     },
@@ -58,8 +60,9 @@ export interface SchedulerLeaseRepository<TTransactionScope> {
       readonly jobName: string;
       readonly ownerId: string;
       readonly runId: string;
-      readonly fencingToken: number;
+      readonly fencingToken: string;
       readonly releasedAt: string;
+      readonly releaseReason?: string;
     },
     context: TransactionScopedOperationContext<TTransactionScope>
   ): Promise<SchedulerLeaseMutationResult>;

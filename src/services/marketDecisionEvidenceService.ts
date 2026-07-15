@@ -205,6 +205,7 @@ export const persistDecisionSnapshot = (input: {
 };
 
 export const appendDecisionLifecycleEvent = (input: {
+  eventId?: string;
   decisionId: DecisionId;
   status: DecisionStatus;
   reasonCodes: readonly string[];
@@ -234,7 +235,7 @@ export const appendDecisionLifecycleEvent = (input: {
       occurredAt: existing.occurred_at
     };
   }
-  const eventId = randomUUID();
+  const eventId = input.eventId?.trim() || randomUUID();
   const occurredAt = input.occurredAt ?? new Date().toISOString();
   getDb().prepare(`
     INSERT INTO decision_lifecycle_events(

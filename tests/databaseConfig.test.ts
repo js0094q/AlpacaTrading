@@ -123,6 +123,22 @@ test("authority flags fail closed unless their prerequisite read and write flags
   );
 });
 
+test("authority cannot be enabled while SQLite remains the selected backend", () => {
+  assert.throws(
+    () =>
+      loadDatabaseConfig({
+        ...base,
+        DATABASE_BACKEND: "sqlite",
+        POSTGRES_READS_ENABLED: "true",
+        POSTGRES_WRITES_ENABLED: "true",
+        POSTGRES_CONTROL_PLANE_AUTHORITY_ENABLED: "true"
+      }),
+    (error) =>
+      error instanceof DatabaseConfigurationError &&
+      error.code === "POSTGRES_AUTHORITY_BACKEND_REQUIRED"
+  );
+});
+
 test("uses conservative runtime-specific pool and timeout defaults with bounded overrides", () => {
   const vercel = loadDatabaseConfig(
     { ...base, POSTGRES_READS_ENABLED: "true" },

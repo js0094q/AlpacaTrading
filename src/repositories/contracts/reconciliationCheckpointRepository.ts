@@ -48,7 +48,7 @@ export type ReconciliationCheckpointStartResult =
       readonly status: "source_conflict";
       readonly currentSourceChecksum: string;
     }
-  | { readonly status: "fence_rejected"; readonly currentFencingToken: number | null };
+  | { readonly status: "fence_rejected"; readonly currentFencingToken: string | null };
 
 export interface ReconciliationCheckpointRepository<TTransactionScope> {
   find(

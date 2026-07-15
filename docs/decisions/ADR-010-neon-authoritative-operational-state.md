@@ -6,8 +6,12 @@ Accepted 2026-07-15. Authority changes are staged and require the reconciliation
 
 Release 2 implements the non-authoritative `pg` foundation, explicit migration
 tooling, version 1 operational schema, redacted connectivity checks, and domain
-repository contracts. SQLite remains authoritative; PostgreSQL read, write,
-shadow, control-plane, and execution authority flags default off.
+repository contracts. Release 3 adds schema version 2, fenced scheduler leases,
+control-plane repositories, a resumable SQLite snapshot/backfill/reconciliation
+path, paper-only shadow comparison, and feature-flagged research authority.
+Defaults still preserve SQLite authority until production reconciliation and
+shadow gates pass. Execution-state authority remains explicitly disabled until
+Release 4.
 
 ## Context
 
@@ -47,6 +51,20 @@ Scheduler ownership moves from process-local lock files to PostgreSQL leases
 with atomic acquisition, expiration, heartbeat, monotonic fencing tokens,
 owner/run/workstream identity, and conditional writes. A stale token cannot
 commit after a newer owner acquires the lease.
+
+Release 3 may enable PostgreSQL scheduler authority only for workstreams whose
+control-plane writes carry and validate the current fencing token. Only
+research meets that boundary in Release 3. `zero_dte`, `observatory`,
+`reconciliation`, `exit_review`, `paper_exit`, `allocation`, and
+`market_data_refresh` stay outside PostgreSQL scheduler authority until their
+state transitions are fence-aware. This is a fail-closed cutover boundary, not
+a process-lock fallback for distributed authority.
+
+During the Release 3 research cutover, SQLite candidate/run projection may be
+enabled only as the temporary compatibility audit mirror required by remaining
+Release 4 readers. PostgreSQL commits first and remains authoritative; a failed
+PostgreSQL authoritative write never falls back to SQLite. The projection is
+removed when execution-state readers move in Release 4.
 
 Reservation and allocation decisions execute atomically under the applicable
 PostgreSQL account or portfolio lock. Broker submission is split into two

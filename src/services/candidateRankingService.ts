@@ -628,6 +628,7 @@ export const rankResearchCandidates = (input: CandidateRankingInput): CandidateR
 export const persistCandidateDecisions = (input: {
   researchRunId: string;
   decisions: CandidateDecisionRecord[];
+  lifecycleEventIds?: Readonly<Record<string, string>>;
 }) => {
   const researchRun = queryOne<{ config_json: string }>(
     "SELECT config_json FROM research_runs WHERE id = ?",
@@ -707,7 +708,7 @@ export const persistCandidateDecisions = (input: {
     const existing = getDb()
       .prepare("SELECT decision_id FROM paper_trade_candidates WHERE id = ?")
       .get(row.id) as { decision_id: string | null } | undefined;
-    const decisionId = existing?.decision_id ?? createDecisionId();
+    const decisionId = existing?.decision_id ?? row.decisionId ?? createDecisionId();
     insert.run(
       row.id,
       decisionId,
@@ -817,6 +818,7 @@ export const persistCandidateDecisions = (input: {
       feed
     });
     appendDecisionLifecycleEvent({
+      eventId: input.lifecycleEventIds?.[row.id],
       decisionId: persistedDecisionId,
       status,
       reasonCodes: [row.decisionReason],

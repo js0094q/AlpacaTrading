@@ -44,6 +44,9 @@ export interface ResearchRunRecord {
 export interface ReserveResearchRunInput {
   readonly runId: string;
   readonly startedAt: string;
+  readonly staleBefore: string;
+  readonly recoveryReason: string;
+  readonly recoverySource: string;
   readonly riskProfile: RiskProfile;
   readonly optionsEnabled: boolean;
   readonly config: JsonValue;
@@ -59,7 +62,7 @@ export type ResearchRunReservationResult =
       readonly heartbeatAt: string;
       readonly version: number;
     }
-  | { readonly status: "fence_rejected"; readonly currentFencingToken: number | null };
+  | { readonly status: "fence_rejected"; readonly currentFencingToken: string | null };
 
 export interface ResearchRunRepository<TTransactionScope> {
   findById(

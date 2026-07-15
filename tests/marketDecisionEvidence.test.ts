@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { resetSqliteTestDb } from "./helpers/sqliteTestDb.js";
-import type { PositionLifecycleId } from "../src/types.js";
+import type { DecisionId, PositionLifecycleId } from "../src/types.js";
 
 const testRoot = mkdtempSync(join(tmpdir(), "alpaca-decision-evidence-test-"));
 process.env.RESEARCH_DB_PATH = join(testRoot, "research.db");
@@ -149,9 +149,19 @@ describe("immutable decision evidence", () => {
 
   test("candidate persistence writes one immutable snapshot and initial event", () => {
     insertResearchRun("run-evidence");
+    const authorityDecisionId =
+      "ebd6cfe0-b6ce-4ecf-bf7c-1c02cf645490" as DecisionId;
     persistCandidateDecisions({
       researchRunId: "run-evidence",
-      decisions: [decisionFixture("candidate-evidence", "selected", "RANKED_SELECTED")]
+      decisions: [
+        {
+          ...decisionFixture("candidate-evidence", "selected", "RANKED_SELECTED"),
+          decisionId: authorityDecisionId
+        }
+      ],
+      lifecycleEventIds: {
+        "candidate-evidence": "candidate-authority-event-1"
+      }
     });
 
     const original = getDb().prepare(`
@@ -161,6 +171,7 @@ describe("immutable decision evidence", () => {
       SELECT decision_id FROM paper_trade_candidates WHERE id = 'candidate-evidence'
     `).get() as { decision_id: string };
 
+    assert.equal(candidate.decision_id, authorityDecisionId);
     assert.equal(original.decision_id, candidate.decision_id);
     assert.equal(original.decision_role, "entry");
     assert.equal(original.decision_status, "SELECTED");
@@ -171,6 +182,10 @@ describe("immutable decision evidence", () => {
     assert.deepEqual(JSON.parse(String(original.reason_codes_json)), ["RANKED_SELECTED"]);
     assert.match(String(original.strategy_config_hash), /^[0-9a-f]{64}$/);
     assert.match(String(original.risk_config_hash), /^[0-9a-f]{64}$/);
+    const initialEvent = getDb().prepare(`
+      SELECT event_id FROM decision_lifecycle_events WHERE decision_id = ?
+    `).get(authorityDecisionId) as { event_id: string };
+    assert.equal(initialEvent.event_id, "candidate-authority-event-1");
 
     persistCandidateDecisions({
       researchRunId: "run-evidence",
@@ -283,6 +298,7 @@ describe("immutable decision evidence", () => {
     assert.equal(exitRetry.decisionStatus, "REVIEWED");
 
     const firstEvent = appendDecisionLifecycleEvent({
+      eventId: "candidate-lifecycle-event-1",
       decisionId: entry.decisionId,
       status: "REVIEWED",
       reasonCodes: [],
@@ -291,6 +307,7 @@ describe("immutable decision evidence", () => {
       sourceId: "artifact-entry-1",
       evidence: { artifactId: "artifact-entry-1" }
     });
+    assert.equal(firstEvent.eventId, "candidate-lifecycle-event-1");
     const retryEvent = appendDecisionLifecycleEvent({
       decisionId: entry.decisionId,
       status: "REVIEWED",

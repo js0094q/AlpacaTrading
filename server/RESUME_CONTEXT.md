@@ -1,5 +1,25 @@
 # Resume Context: Alpaca Investing Server Provisioning
 
+## Neon migration Release 3 VPS next step (2026-07-15)
+
+- Deploy Release 3 code with every PostgreSQL authority flag off. Run direct
+  migration twice and verify schema version 2, 23 tables, 59 indexes, and the
+  Release 3 columns/constraints before any backfill.
+- Quiesce affected SQLite writers, verify no worker remains, and create the
+  timestamped mode-`0400` control-plane snapshot. Preserve its checksum,
+  integrity, foreign-key, and table-count report; never alter the source.
+- Backfill and reconcile through the direct Neon endpoint. Any unexplained
+  discrepancy blocks shadow and authority. Candidate lifecycle maps only
+  candidate-linked decision events; non-candidate lifecycle is Release 4.
+- Run paper-only shadow mode with SQLite authoritative before enabling
+  `POSTGRES_CONTROL_PLANE_AUTHORITY_ENABLED=true`. Keep
+  `POSTGRES_EXECUTION_STATE_AUTHORITY_ENABLED=false` throughout Release 3.
+- Only research may use PostgreSQL fencing after the Release 3 cutover.
+  Observatory, market-data-refresh, and execution-state timers remain
+  SQLite-owned until their durable writes validate the current fencing token.
+  PostgreSQL authority has no SQLite fallback; the temporary audit mirror is a
+  compatibility projection only.
+
 ## Neon migration Release 2 VPS next step (2026-07-15)
 
 - Release 2 adds the non-authoritative PostgreSQL client and explicit migration
