@@ -66,6 +66,15 @@ Release 4 readers. PostgreSQL commits first and remains authoritative; a failed
 PostgreSQL authoritative write never falls back to SQLite. The projection is
 removed when execution-state readers move in Release 4.
 
+Release 3 preserves the earlier decision-identity migration contract. A
+candidate without a `decision_snapshots` row is accepted only when its linkage
+is `EXACT_LEGACY_REUSE`, its `decision_id` equals its candidate ID, the snapshot
+is absent, and no other candidate owns that decision ID. Lifecycle records for
+`paper_review_artifact` entry decisions whose historical candidate row is no
+longer present are counted and deferred to the Release 4 review/execution
+domain. Any other absent, conflicting, or multi-decision candidate linkage
+still blocks backfill.
+
 Reservation and allocation decisions execute atomically under the applicable
 PostgreSQL account or portfolio lock. Broker submission is split into two
 transactions: the first validates evidence and commits an idempotent intent and

@@ -67,6 +67,7 @@ export interface ControlPlaneResearchRun {
 export interface ControlPlaneCandidate {
   readonly id: string;
   readonly decisionId: string | null;
+  readonly decisionLinkageStatus: string;
   readonly researchRunId: string;
   readonly candidateKey: string;
   readonly symbol: string;
@@ -484,6 +485,7 @@ export const mapSqliteCandidate = (row: SqliteRow): ControlPlaneCandidate => {
   return {
     id,
     decisionId: nullableString(row, table, "decision_id"),
+    decisionLinkageStatus: requiredString(row, table, "decision_linkage_status"),
     researchRunId: requiredString(row, table, "research_run_id"),
     candidateKey: id,
     symbol,
@@ -612,7 +614,8 @@ export const readControlPlaneSnapshot = async (
       : "NULL AS correlation_id";
     const decisionRows = database
       .prepare(
-        `SELECT decision_id, candidate_id, position_lifecycle_id,
+        `SELECT decision_id, origin_type, decision_role, candidate_id,
+                position_lifecycle_id,
                 ${requestIdExpression}, ${correlationIdExpression}
          FROM decision_snapshots
          ORDER BY decision_id`
@@ -633,6 +636,8 @@ export const readControlPlaneSnapshot = async (
     const candidateById = new Map(candidates.map((candidate) => [candidate.id, candidate]));
     const decisions = decisionRows.map((row) => ({
       decisionId: requiredString(row, "decision_snapshots", "decision_id"),
+      originType: requiredString(row, "decision_snapshots", "origin_type"),
+      decisionRole: requiredString(row, "decision_snapshots", "decision_role"),
       candidateId: nullableString(row, "decision_snapshots", "candidate_id"),
       positionLifecycleId: nullableString(
         row,
@@ -706,10 +711,15 @@ export const readControlPlaneSnapshot = async (
         decisionOwners.set(candidate.decisionId, candidate.id);
       }
       const linkedDecisionIds = decisionsByCandidate.get(candidate.id) ?? [];
-      if (
-        linkedDecisionIds.length !== 1 ||
-        linkedDecisionIds[0] !== candidate.decisionId
-      ) {
+      const exactLegacyReuseWithoutSnapshot =
+        candidate.decisionLinkageStatus === "EXACT_LEGACY_REUSE" &&
+        candidate.decisionId === candidate.id &&
+        decisionById.get(candidate.decisionId) === undefined &&
+        linkedDecisionIds.length === 0;
+      if (exactLegacyReuseWithoutSnapshot) {
+        continue;
+      }
+      if (linkedDecisionIds.length > 1) {
         sourceIssues.push(
           sourceIssue(
             "candidates",
@@ -789,6 +799,13 @@ export const readControlPlaneSnapshot = async (
       }
       const candidate = candidateById.get(decision.candidateId);
       if (candidate === undefined) {
+        if (
+          decision.originType === "paper_review_artifact" &&
+          decision.decisionRole === "entry"
+        ) {
+          deferredLifecycleEvents.push({ eventId, decisionId, status, sourceType, sourceId });
+          continue;
+        }
         sourceIssues.push(
           sourceIssue(
             "candidate_lifecycle_events",
