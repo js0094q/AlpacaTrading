@@ -10,6 +10,7 @@ import {
   findPaperExecutionByDedupeKey,
   insertPaperExecutionLedgerEntry,
   listActivePaperNewRiskReservations,
+  paperNewRiskLedgerMutationFingerprint,
   reserveReviewedPaperExecutions,
   type PaperExecutionLedgerEntry,
   updatePaperExecutionLedgerEntry
@@ -517,6 +518,7 @@ export const buildPaperReviewedPayloadExecutionReport = async (
   let eligiblePayloads = normalized;
   let submitValidation: PaperSubmitStateValidation | null = null;
   let currentSubmitState: PaperSubmitStateAttestation | null = null;
+  let expectedNewRiskLedgerFingerprint: string | null = null;
   const entryPayloads = normalized.filter(isEntryPayload);
   if (entryPayloads.length) {
     const reviewedSubmitState = artifact.artifact.submitState;
@@ -528,6 +530,7 @@ export const buildPaperReviewedPayloadExecutionReport = async (
       ];
     } else {
       try {
+        const ledgerFingerprintBefore = paperNewRiskLedgerMutationFingerprint();
         const capture =
           deps.captureSubmitState ??
           ((captureInput: Parameters<typeof capturePaperSubmitState>[0]) =>
@@ -538,6 +541,8 @@ export const buildPaperReviewedPayloadExecutionReport = async (
           capturedAt: generatedAt,
           payloadSections: artifact.artifact.payloadSections
         });
+        expectedNewRiskLedgerFingerprint =
+          paperNewRiskLedgerMutationFingerprint();
         submitValidation = validatePaperSubmitState({
           reviewed: reviewedSubmitState,
           current: currentSubmitState,
@@ -545,7 +550,12 @@ export const buildPaperReviewedPayloadExecutionReport = async (
             ...new Set(entryPayloads.map((payload) => payload.section))
           ]
         });
-        stateBlockers = submitValidation.blockers;
+        stateBlockers = [
+          ...submitValidation.blockers,
+          ...(ledgerFingerprintBefore !== expectedNewRiskLedgerFingerprint
+            ? ["SUBMIT_LEDGER_STATE_DRIFT", "FRESH_REVIEW_REQUIRED"]
+            : [])
+        ];
       } catch {
         stateBlockers = [
           "SUBMIT_STATE_CAPTURE_FAILED",
@@ -641,6 +651,9 @@ export const buildPaperReviewedPayloadExecutionReport = async (
             listActivePaperNewRiskReservations()
           );
           if (
+            !expectedNewRiskLedgerFingerprint ||
+            paperNewRiskLedgerMutationFingerprint() !==
+              expectedNewRiskLedgerFingerprint ||
             paperSubmitReservationFingerprint(currentReservations) !==
             expectedReservationFingerprint
           ) {

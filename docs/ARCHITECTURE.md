@@ -23,8 +23,11 @@ never override broker state.
    refreshes paper account/portfolio/market evidence, compares it to the signed
    state, reapplies current caps, and atomically reserves the artifact's selected
    entry batch in the execution ledger before broker submission. The transaction
-   rechecks active reservations and shared-cap headroom. It never resizes or
-   reallocates inline. Compatibility confirm routes dispatch this same executor only.
+   rechecks active reservations, shared-cap headroom, and an all-buy-side ledger
+   lifecycle fingerprint captured before fresh evidence collection. A concurrent
+   reservation-to-filled transition therefore cannot disappear between checks.
+   It never resizes or reallocates inline. Compatibility confirm routes dispatch
+   this same executor only.
 6. 0DTE derives complete New York-day activity across broker positions/orders,
    the execution ledger, Level 2 trades, and generic outcomes. Immediately
    before an order request it refreshes option price evidence, persists and
@@ -72,7 +75,9 @@ Broker order classification is centralized for new-risk evidence. `held` and
 `pending_cancel` are active. An unknown non-terminal status is conservatively
 retained as active exposure and blocks submission until it can be classified.
 A signed artifact with blocked status or signed blockers cannot authorize entry
-sections, even when its signature is valid.
+sections, even when its signature is valid. A fresh signed mixed artifact with a
+valid exit section may still reach the section-aware executor; its signed entry
+blockers remain binding while the exit retains its independent safety gates.
 
 The safety floor does not define allocator weights, an optimization objective,
 strategy budgets, an allocator mode, or allocator-owned exits. `baseline-v1`

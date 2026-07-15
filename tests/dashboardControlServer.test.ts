@@ -422,6 +422,75 @@ describe("VPS dashboard control API", () => {
     ]);
   });
 
+  test("execute.confirm dispatches a valid exit from a signed artifact with a blocked entry", async () => {
+    process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
+    const { createPaperReviewArtifact } = await import(
+      "../src/services/paperReviewArtifactService.js"
+    );
+    const artifact = createPaperReviewArtifact({
+      sourceAction: "paper.ops.review",
+      status: "blocked",
+      payloadSections: {
+        equityBuys: [{
+          assetClass: "equity",
+          symbol: "AAPL",
+          side: "buy",
+          type: "market",
+          time_in_force: "day",
+          notional: "100.00",
+          client_order_id: "dashboard-control-blocked-aapl",
+          sourceCandidateId: "dashboard-control-blocked-candidate"
+        }],
+        equityAdds: [],
+        equitySells: [{
+          assetClass: "equity",
+          symbol: "MSFT",
+          side: "sell",
+          type: "market",
+          time_in_force: "day",
+          qty: "1",
+          client_order_id: "dashboard-control-exit-msft"
+        }],
+        optionBuys: [],
+        optionSellToCloseExits: []
+      },
+      summary: {},
+      blockers: ["REVIEW_DATA_BLOCKED"],
+      createdAt: new Date().toISOString()
+    });
+    setMockCommandRunner({
+      onCommand: (script) => script === "paper:execute:reviewed"
+        ? {
+            status: "partial",
+            submitted: [{ symbol: "MSFT", side: "sell" }],
+            blocked: [{ symbol: "AAPL", reason: "REVIEW_ARTIFACT_ENTRY_BLOCKED" }],
+            summary: { eligiblePayloads: 1, submitted: 1, blocked: 1, errors: 0 }
+          }
+        : undefined
+    });
+
+    const response = await callControl("/api/v1/execute/confirm", "POST", {
+      ...defaultRequest.body,
+      confirmPaper: true
+    });
+
+    assert.equal(response.status, 200, response.text);
+    assert.equal(response.payload.ok, true);
+    assert.deepEqual(commandCalls.map((entry) => entry.script), [
+      "alpaca:health",
+      "paper:execute:reviewed"
+    ]);
+    assert.deepEqual(
+      (response.payload.data as { submitted: Array<{ symbol: string }> }).submitted,
+      [{ symbol: "MSFT", side: "sell" }]
+    );
+    assert.ok(
+      commandCalls.some((entry) =>
+        entry.args.includes(`--expectedPayloadSignature=${artifact.payloadSignature}`)
+      )
+    );
+  });
+
   test("execute.confirm requires paper-only runtime even when paper flags are enabled", async () => {
     process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
     process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";

@@ -105,18 +105,22 @@ its exit-review, reconciliation, and end-of-day services set `AUTOMATED_PAPER_EX
 
 ```bash
 test "$(stat -c '%a:%U:%G' /opt/alpaca-investing/secrets/alpaca.env)" = "600:alpaca:alpaca"
-grep -q '^PAPER_REVIEW_SIGNING_KEY=.\+' /opt/alpaca-investing/secrets/alpaca.env
-grep -q '^HEDGE_REVIEW_SIGNING_KEY=.\+' /opt/alpaca-investing/secrets/alpaca.env
+grep -Eq '^PAPER_REVIEW_SIGNING_KEY=.+$' /opt/alpaca-investing/secrets/alpaca.env
+grep -Eq '^HEDGE_REVIEW_SIGNING_KEY=.+$' /opt/alpaca-investing/secrets/alpaca.env
+! grep -Eq '^PAPER_REVIEW_SIGNING_KEY=(replace_me|replace_with_random_secret)$' /opt/alpaca-investing/secrets/alpaca.env
+! grep -Eq '^HEDGE_REVIEW_SIGNING_KEY=(replace_me|replace_with_independent_random_secret)$' /opt/alpaca-investing/secrets/alpaca.env
 ```
 
 The reviewed entry timer accepts only a fresh, successful, unblocked signed
 artifact. It refreshes account, configuration, portfolio, source, market,
 cross-path 0DTE activity, and active-order evidence, then rechecks shared cap
-headroom and reserves exact intent in one immediate transaction. Hedge execution
+headroom, active reservations, and the all-buy-side ledger-lifecycle fingerprint
+before reserving exact intent in one immediate transaction. Hedge execution
 independently consumes one exact signed review while reserving its ledger intent.
 No executor resizes or reprices upward inline; legacy unsigned records require a
-fresh review. Late-day review writes a new signed forced-exit artifact, and exit
-sections remain independent from entry capacity.
+fresh review. Late-day review writes a new signed forced-exit artifact. A fresh
+mixed artifact may reach the section-aware executor, but signed entry blockers
+remain binding while exit sections retain independent gates.
 
 Execution services and the 0DTE engine can submit paper orders when all installed
 gates are enabled. Stop affected timers during deployment and do not manually

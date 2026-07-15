@@ -32,11 +32,14 @@ the existing hedge signing key remains independently required for hedge
 reviews.
 
 General artifact entries reserve as an all-or-none batch. General, 0DTE, and
-hedge executors recheck the exact active-reservation fingerprint and cap
-headroom inside immediate transactions. Hedge reviews bind deterministic review
-and client-order identities and are consumed atomically with their one ledger
-reservation. Generic discovery-based 0DTE option entries use the same cross-path
-daily activity evidence as the Level 2 executor.
+hedge executors capture all buy-side execution-ledger lifecycle state before
+fresh evidence collection, then recheck its fingerprint, the exact active-
+reservation fingerprint, and cap headroom inside immediate transactions. This
+detects a concurrent reservation even when it transitions to `filled` before
+the transaction. Hedge reviews bind deterministic review and client-order
+identities and are consumed atomically with their one ledger reservation.
+Generic discovery-based 0DTE option entries use the same cross-path daily
+activity evidence as the Level 2 executor.
 
 Material state drift fails closed with a fresh-review requirement. Executors
 refresh option price evidence without changing the reviewed limit and do not
@@ -48,7 +51,10 @@ reconciliation remain independent from positive entry capacity.
 The compatibility CLI and HTTP direct-confirm surfaces delegate to reviewed
 execution and never implicitly supply confirmation. `baseline-v1` is the only
 allocation attestation in this release and explicitly states that no allocator
-owns the order.
+owns the order. Readiness is section-aware: a fresh signed mixed artifact may
+reach the executor when its entry section is blocked but it has an independently
+valid exit section; the executor preserves the signed entry blocker and applies
+the exit's own gates.
 
 ## Rationale
 
@@ -90,6 +96,8 @@ failure.
   authoritative evidence is incomplete.
 - Concurrent entry decisions serialize briefly while shared reservation
   headroom is validated and reserved.
+- Any concurrent buy-side ledger insert or lifecycle transition invalidates the
+  captured submit window, including an active reservation becoming `filled`.
 - A blocked signed review cannot authorize new-risk sections, while its valid
   exit sections remain independently executable.
 - Hedge premium limits are `0.0075`, `0.02`, and `0.01` of equity. Human
@@ -109,7 +117,8 @@ failure.
   drift, signed identity, one-time consumption, quote drift, unknown order
   status, atomic reservation, and total/daily cap enforcement.
 - General tests cover signed blocker status, exit independence, unknown order
-  status, and concurrent shared-cap reservation.
+  status, concurrent shared-cap reservation, active-to-filled interleaving, and
+  section-aware control dispatch for mixed artifacts.
 - CLI, control-server, and Vercel bridge tests prove direct-confirm delegation
   and explicit confirmation.
 - A redacted 2026-07-14 VPS snapshot established a clean base checkout,
@@ -118,6 +127,8 @@ failure.
   without exposing it, preserve mode `0600`, invalidate unsigned artifacts, and
   create a new signed review. The safety-floor release does not change the
   runtime-effective `$1,000`/`$5,000`/`$50,000` ordinary equity defaults.
+  Deployment must reject illustrative signer placeholders and must not copy
+  `.env.example` over the protected runtime environment.
 
 ## Conditions for reconsideration
 

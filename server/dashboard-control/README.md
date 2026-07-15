@@ -36,10 +36,12 @@ only the exact latest signed reviewed artifact. New-risk sections are rejected
 unless the signed review succeeded without blockers and fresh paper account,
 configuration, portfolio, source, market, 0DTE activity, cap, and active-order
 evidence still match. Shared cap headroom is rechecked while reservations are
-created atomically; execution does not resize or reprice inline. `held`,
-`pending_cancel`, and unknown non-terminal broker statuses are retained as active
-evidence, with unknown statuses blocking new risk. Valid exit sections remain
-independent from blocked entry capacity.
+created atomically, together with an all-buy-side ledger-lifecycle fingerprint
+captured before fresh evidence collection; execution does not resize or reprice
+inline. `held`, `pending_cancel`, and unknown non-terminal broker statuses are
+retained as active evidence, with unknown statuses blocking new risk. A fresh
+signed mixed artifact with valid exits reaches the section-aware executor, where
+signed entry blockers remain binding and exits retain independent gates.
 
 Run locally (paper-mode checks still apply):
 

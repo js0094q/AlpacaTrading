@@ -193,6 +193,27 @@ describe("paper ops workflows", () => {
     assert.equal(readiness.reason, "REVIEW_ARTIFACT_ENTRY_BLOCKED");
   });
 
+  test("readiness dispatches a signed blocked artifact when it contains a valid exit section", () => {
+    createPaperReviewArtifact({
+      id: "mixed-blocked-readiness-artifact",
+      sourceAction: "paper.ops.review",
+      status: "blocked",
+      payloadSections: {
+        ...readinessSections(),
+        equitySells: [{ symbol: "MSFT", side: "sell" }]
+      },
+      summary: {},
+      blockers: ["REVIEW_DATA_BLOCKED"],
+      createdAt: new Date().toISOString(),
+      maxAgeMinutes: 60
+    });
+
+    const readiness = latestReviewArtifactReadiness();
+    assert.equal(readiness.ready, true);
+    assert.equal(readiness.status, "warning");
+    assert.equal(readiness.reason, "REVIEW_ARTIFACT_ENTRY_BLOCKED");
+  });
+
   test("readiness verifies the stored artifact signature", () => {
     const artifact = createPaperReviewArtifact({
       id: "tampered-readiness-artifact",

@@ -80,12 +80,15 @@ The two review signers belong only in the VPS runtime secret file. Provision
 independent random values through the server's approved secret-management or
 interactive editing process; never print, log, copy into the repository, or send
 either value to Vercel. Preserve ownership `alpaca:alpaca` and mode `0600`.
-Presence-only checks are safe because they emit no value:
+Presence-only checks are safe because they emit no value. The final two checks
+also reject the checked-in illustrative placeholders:
 
 ```bash
 test "$(stat -c '%a:%U:%G' /opt/alpaca-investing/secrets/alpaca.env)" = "600:alpaca:alpaca"
-grep -q '^PAPER_REVIEW_SIGNING_KEY=.\+' /opt/alpaca-investing/secrets/alpaca.env
-grep -q '^HEDGE_REVIEW_SIGNING_KEY=.\+' /opt/alpaca-investing/secrets/alpaca.env
+grep -Eq '^PAPER_REVIEW_SIGNING_KEY=.+$' /opt/alpaca-investing/secrets/alpaca.env
+grep -Eq '^HEDGE_REVIEW_SIGNING_KEY=.+$' /opt/alpaca-investing/secrets/alpaca.env
+! grep -Eq '^PAPER_REVIEW_SIGNING_KEY=(replace_me|replace_with_random_secret)$' /opt/alpaca-investing/secrets/alpaca.env
+! grep -Eq '^HEDGE_REVIEW_SIGNING_KEY=(replace_me|replace_with_independent_random_secret)$' /opt/alpaca-investing/secrets/alpaca.env
 ```
 
 `PAPER_REVIEW_SIGNING_KEY` authenticates general review artifacts and 0DTE
@@ -150,7 +153,7 @@ Current allowlist:
 - POST `/api/v1/actions/execute`
 - GET `/api/v1/actions/history`
 
-The `/api/v1/actions/*` routes are fixed command mappings. The dashboard never sends arbitrary shell commands to the VPS. `actions.execute` requires `confirmPaper: true` and dispatches only the exact latest HMAC-signed reviewed payload. New-risk sections must have a successful signed review with no blockers, then pass fresh account, configuration, portfolio, source, market, 0DTE activity, cap, and atomic reservation checks. A stale, unsigned, blocked, empty, missing, consumed, or changed review fails closed and requires a fresh review. Exit sections remain independently eligible under their own safety gates.
+The `/api/v1/actions/*` routes are fixed command mappings. The dashboard never sends arbitrary shell commands to the VPS. `actions.execute` requires `confirmPaper: true` and dispatches only the exact latest HMAC-signed reviewed payload. New-risk sections must have a successful signed review with no blockers, then pass fresh account, configuration, portfolio, source, market, 0DTE activity, cap, and atomic reservation checks. A stale, unsigned, empty, missing, consumed, or changed review fails closed and requires a fresh review. A fresh signed mixed artifact with a blocked entry section may still be dispatched when it contains a valid exit section; the section-aware executor keeps the signed entry blockers binding and applies the exit's independent gates.
 
 On the VPS, those historical views use local SQLite at `RESEARCH_DB_PATH` or `./data/research.db`. The VPS remains the owner of the scheduler, CLI runtime, research history, execution ledger, and local persistence.
 
@@ -198,10 +201,12 @@ Vercel dashboard deployments are read-only by default. They do not create `apps/
 
 On the VPS, install dependencies, keep secrets in `/opt/alpaca-investing/secrets/alpaca.env`, and start the control API service after cloning this repo:
 
+The systemd unit reads that protected file directly. Do not copy `.env.example`
+over an existing runtime file or copy the protected secret file into the Git
+checkout.
+
 ```bash
 cd /home/alpaca/Alpaca-Trading
-cp .env.example .env
-cp /opt/alpaca-investing/secrets/alpaca.env .env
 npm ci
 cp server/systemd/dashboard-control.service /opt/alpaca-investing/systemd/alpaca-dashboard-control.service
 cp /opt/alpaca-investing/systemd/alpaca-dashboard-control.service /etc/systemd/system/alpaca-dashboard-control.service
@@ -288,11 +293,9 @@ execution is deliberately excluded; release validation must not invoke any
 
 ## Required runtime validation command set
 
-From a shell with real credentials in `.env`:
-
-```bash
-cp .env.example .env
-```
+Run these commands only from a shell that already has the real protected runtime
+environment loaded. Do not create, replace, or seed the runtime environment from
+`.env.example`; its values are illustrative placeholders.
 
 Then run:
 
@@ -408,13 +411,18 @@ to Alpaca paper endpoints only after hard gates pass:
 - an explicit `--confirmPaper`
 - the required signer and a valid, fresh, successful, unblocked artifact
 - unchanged source/account/configuration/portfolio/market/activity evidence
-- unchanged shared-cap headroom inside an atomic reservation transaction
+- unchanged shared-cap headroom, active reservations, and all-buy-side ledger-
+  lifecycle fingerprint inside an atomic reservation transaction
 
 Fresh option evidence may block on quote identity or configured review-to-submit
 price drift, but confirmation never reprices or resizes the reviewed order. Broker
 statuses such as `held` and `pending_cancel` consume exposure; an unrecognized
 non-terminal status is retained as active evidence and blocks new risk rather
 than disappearing.
+
+The ledger-lifecycle fingerprint includes terminal transitions, so a concurrent
+reservation cannot evade the submit window by becoming `filled` between fresh
+evidence collection and the atomic reservation check.
 
 ## Scheduled Paper Ops Automation
 

@@ -36,7 +36,10 @@ import {
   paperAccountIdentityHash
 } from "../src/services/hedgeExecutionService.js";
 import { persistHedgeExecutionReview } from "../src/services/hedgePersistenceService.js";
-import { insertPaperExecutionLedgerEntry } from "../src/services/paperExecutionLedgerService.js";
+import {
+  insertPaperExecutionLedgerEntry,
+  updatePaperExecutionLedgerEntry
+} from "../src/services/paperExecutionLedgerService.js";
 
 const account = {
   id: "paper-account-1",
@@ -288,14 +291,14 @@ test("fresh hedge quote drift blocks without inline repricing or submission", as
   assert.ok(result.blockers.includes("FRESH_REVIEW_REQUIRED"));
 });
 
-test("hedge reservation atomically rejects distinct shared-cap races", async () => {
+test("hedge reservation atomically rejects a distinct reservation that fills before the guard", async () => {
   const review = makeReview("shared-cap-race");
   let submitCalls = 0;
   const result = await executeReviewedPaperHedge(
     { reviewId: review.reviewId, confirmPaper: true },
     deps({
       refreshQuote: async () => {
-        insertPaperExecutionLedgerEntry({
+        const concurrent = insertPaperExecutionLedgerEntry({
           mode: "hedge-entry",
           assetClass: "option",
           symbol: "QQQ260918P00450000",
@@ -313,6 +316,11 @@ test("hedge reservation atomically rejects distinct shared-cap races", async () 
           status: "reserved",
           sourcePlanId: "other-hedge-review",
           payload: { expiresAt: "2026-07-13T14:05:00.000Z" }
+        });
+        updatePaperExecutionLedgerEntry(concurrent.id, {
+          status: "filled",
+          alpacaOrderId: "hedge-shared-cap-race-order",
+          alpacaStatus: "filled"
         });
         return {
           bid: 4.9,

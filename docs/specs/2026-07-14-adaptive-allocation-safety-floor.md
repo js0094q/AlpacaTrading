@@ -101,7 +101,8 @@ record. The signed envelope includes:
 - canonical payload sections and their SHA-256 payload hash;
 - normalized paper-account identity and status;
 - normalized configuration and its fingerprint;
-- position, open-order, reservation, and market-evidence fingerprints;
+- position, open-order, active-reservation, all-buy-side ledger-lifecycle, and
+  market-evidence fingerprints;
 - exact order intent and candidate/source identity for every new-risk payload;
 - a baseline allocation attestation identifying this release as
   `baseline-v1`, with no allocator ownership;
@@ -116,8 +117,9 @@ hash; it never trusts only the database columns or caller input.
 
 Immediately before a general new-risk entry, the executor re-fetches the
 paper account, positions, recent/open orders, current entry market evidence,
-and local active reservations. It compares that state with the signed review
-and reapplies the current normalized limits.
+and local active reservations. It also captures an all-buy-side execution-ledger
+lifecycle fingerprint before and after fresh evidence collection. It compares
+that state with the signed review and reapplies the current normalized limits.
 
 Known active broker statuses include `held` and `pending_cancel`. Unknown
 non-terminal statuses remain active evidence and block new risk instead of
@@ -130,7 +132,8 @@ Material drift includes:
 - account identity, paper/live state, account status, or blocking flags;
 - configuration or baseline allocation identity;
 - source candidate, symbol, side, quantity, notional, premium, or limit price;
-- position quantities, open orders, or active reservations;
+- position quantities, open orders, active reservations, or any intervening
+  buy-side execution-ledger insert or lifecycle mutation;
 - stale or materially changed market evidence;
 - missing account, position, price, quantity, cash, reserve, buying-power, or
   cap evidence;
@@ -153,9 +156,11 @@ evidence. Broker submission and fill reconciliation update that same row.
 
 All new-risk sections selected from one artifact reserve as an all-or-none batch
 inside an immediate transaction. The transaction recomputes the exact active
-reservation fingerprint and shared-cap headroom before inserting reservations,
-so concurrent general, 0DTE, or hedge decisions cannot each consume the same
-remaining capacity.
+reservation fingerprint, all-buy-side ledger-lifecycle fingerprint, and
+shared-cap headroom before inserting reservations. A concurrent reservation
+cannot evade the check by transitioning to `filled` between fresh evidence
+collection and the transaction, so general, 0DTE, and hedge decisions cannot
+each consume the same remaining capacity.
 
 ### Equity scale-ins
 
@@ -334,9 +339,14 @@ and authorization headers are never persisted or returned.
 11. Documentation and examples describe the signed artifact, fresh validation,
     structured blockers, and paper-only boundary accurately.
 12. General, 0DTE, and hedge cap headroom is rechecked with active reservations
-    inside immediate transactions; concurrent decisions cannot over-reserve it.
+    and the all-buy-side ledger-lifecycle fingerprint inside immediate
+    transactions; concurrent decisions cannot over-reserve it even when a
+    reservation becomes terminal before the second check.
 13. Active and unknown non-terminal broker statuses never disappear from risk
     evidence; unknown statuses fail closed.
+14. A fresh signed mixed artifact with blocked entry sections and valid exit
+    sections reaches the section-aware executor; entry blockers remain binding
+    while independently valid exits retain their own gates.
 
 ## Validation plan
 
@@ -375,6 +385,8 @@ filed as GitHub issues rather than expanded into this release.
 
 Merge only after required checks pass. Deploy the exact merged `main` SHA.
 Runtime validation is read-only and must not manufacture or submit an order.
+Deployment must never seed or replace the protected runtime environment from
+`.env.example`; presence checks reject checked-in signer placeholders.
 The final release status must be exactly one of `IMPLEMENTATION_COMPLETE`,
 `DEPLOYED_PROMOTION_PENDING`, `PROMOTION_ELIGIBLE`, `BLOCKED`, or
 `ROLLED_BACK`.

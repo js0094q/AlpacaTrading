@@ -18,7 +18,10 @@ process.env.PAPER_REVIEW_SIGNING_KEY = "paper-reviewed-execution-test-key";
 
 import { closeDbForTests, getDb } from "../src/lib/db.js";
 import { createPaperReviewArtifact } from "../src/services/paperReviewArtifactService.js";
-import { insertPaperExecutionLedgerEntry } from "../src/services/paperExecutionLedgerService.js";
+import {
+  insertPaperExecutionLedgerEntry,
+  updatePaperExecutionLedgerEntry
+} from "../src/services/paperExecutionLedgerService.js";
 import { buildPaperReviewedPayloadExecutionReport } from "../src/services/paperReviewedPayloadExecutionService.js";
 import type { PaperSubmitStateAttestation } from "../src/services/paperSubmitStateService.js";
 
@@ -719,7 +722,7 @@ describe("reviewed payload execution", () => {
     );
   });
 
-  test("atomically blocks distinct concurrent reservations that exhaust shared headroom", async () => {
+  test("atomically blocks a concurrent reservation that fills before shared-headroom validation", async () => {
     const reviewedState = entrySubmitState();
     createPaperReviewArtifact({
       id: "review-shared-headroom-race",
@@ -758,7 +761,7 @@ describe("reviewed payload execution", () => {
         captureSubmitState: async () =>
           entrySubmitState({ capturedAt: "2026-07-08T14:05:00.000Z" }),
         getAccount: async () => {
-          insertPaperExecutionLedgerEntry({
+          const concurrent = insertPaperExecutionLedgerEntry({
             mode: "concurrentPaperReservation",
             assetClass: "equity",
             symbol: "MSFT",
@@ -772,6 +775,11 @@ describe("reviewed payload execution", () => {
             sourcePlanId: "concurrent-review",
             sourceCandidateId: "candidate-msft",
             payload: {}
+          });
+          updatePaperExecutionLedgerEntry(concurrent.id, {
+            status: "filled",
+            alpacaOrderId: "shared-headroom-msft-order",
+            alpacaStatus: "filled"
           });
           return {
             data: { status: "ACTIVE" },

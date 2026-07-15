@@ -5,8 +5,10 @@
 - 2026-07-14 safety-floor branch: general reviewed payloads are HMAC signed,
   entry execution compares fresh account/portfolio/market/cap evidence, 0DTE
   submits require a persisted signed attestation, and hedge entry reviews bind
-  complete capital evidence. This is a prerequisite only; no adaptive allocator,
-  optimizer, new cap, live path, or allocator-owned exit is included.
+  complete capital evidence. All three entry paths recheck an all-buy-side
+  execution-ledger lifecycle fingerprint so a concurrent reservation cannot
+  disappear by becoming filled. This is a prerequisite only; no adaptive
+  allocator, optimizer, new cap, live path, or allocator-owned exit is included.
 - `paper:execute --confirmPaper`, `/api/v1/execute/confirm`, and the dashboard
   compatibility route now delegate only to the latest signed reviewed artifact.
   They never create confirmation implicitly. Regenerate with
@@ -399,9 +401,11 @@ artifacts. Existing unsigned artifacts are intentionally non-executable. Run
 configuration, positions, open orders, reservations, market evidence, price, or
 caps drift before an entry submit, execution returns structured blockers such as
 `FRESH_REVIEW_REQUIRED` and submits zero for that entry. Exit-only sections are
-validated independently from positive entry allocation room. The late-day
-workflow writes its own signed artifact with `sourceAction=paper.ops.late_day`
-and the normal 30-minute TTL.
+validated independently from positive entry allocation room. A fresh signed
+mixed artifact can reach the section-aware executor when its entry section is
+blocked and its exit section is valid; entry blockers remain binding. The
+late-day workflow writes its own signed artifact with
+`sourceAction=paper.ops.late_day` and the normal 30-minute TTL.
 
 Compatibility surfaces do not bypass that artifact. `paper:execute
 --confirmPaper`, `POST /api/v1/execute/confirm`, and the dashboard confirm route
@@ -649,7 +653,7 @@ npm run paper:execute -- --dryRun --riskProfile=aggressive --optionsEnabled=true
 If the plan has no eligible payloads after candidate filtering, `paper:execute --dryRun` returns `status: "no_op"` with `reason: "NO_ELIGIBLE_PAPER_PAYLOADS"` and submits zero orders. Reviewed confirmation separately requires a non-empty, fresh signed artifact.
 `paper:execute --confirmPaper` and `paper:execute:reviewed -- --confirmPaper` execute the exact payload sections in the latest signed review artifact against fresh paper state.
 Before any reviewed entry submission, execution fetches `/v2/account`, `/v2/positions`, open/recent orders, current market evidence, and active local reservations. Drift or incomplete evidence returns a structured blocker and `FRESH_REVIEW_REQUIRED`; it never resizes inline.
-A signed artifact whose review status is blocked or whose signed blocker list is non-empty cannot authorize new-risk sections; independently valid exit sections retain their own gates. Selected entry sections reserve as one all-or-none batch after shared-cap headroom and the exact active-reservation fingerprint are rechecked inside an immediate transaction.
+A signed artifact whose review status is blocked or whose signed blocker list is non-empty cannot authorize new-risk sections; independently valid exit sections retain their own gates. A fresh signed mixed artifact is dispatched to the section-aware executor only when it contains an exit section, so the entry blocker remains enforced while the exit is evaluated independently. Selected entry sections reserve as one all-or-none batch after shared-cap headroom, the exact active-reservation fingerprint, and an all-buy-side ledger-lifecycle fingerprint are rechecked inside an immediate transaction. A concurrent reservation becoming `filled` therefore invalidates the captured submit window instead of disappearing from the check.
 Broker order evidence treats `held` and `pending_cancel` as active. Unknown non-terminal statuses remain active exposure and block new risk instead of disappearing. Generic reviewed `discovery:zero_dte_spy:*` option buys use the same New York-day cross-path trade, premium, realized-loss, and open-exposure evidence as the standalone 0DTE executor.
 
 Required command forms:
@@ -1001,6 +1005,11 @@ must match the signature, and one review is consumed atomically with its one
 ledger reservation. It cannot be replayed. It never treats unknown exposure as
 zero, reprices above the reviewed limit, or shares stale cap headroom with a
 concurrent general or 0DTE reservation.
+
+All three new-risk executors compare an all-buy-side execution-ledger lifecycle
+fingerprint captured before fresh submit evidence with the value inside their
+immediate reservation transaction. Any intervening insert or lifecycle change,
+including a reservation becoming `filled`, fails closed before a broker call.
 
 The checked-in paper target enables `HEDGE_PAPER_EXECUTION_ENABLED`, `HEDGE_AUTOMATED_PAPER_EXECUTION_ENABLED`, `HEDGE_EXIT_MANAGEMENT_ENABLED`, `HEDGE_LEARNING_ENABLED`, and `HEDGE_DASHBOARD_MUTATIONS_ENABLED`. `HEDGE_LIVE_EXECUTION_ENABLED=false` and `MULTI_LEG_HEDGE_EXECUTION_ENABLED=false` remain hard gates. `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, and `LIVE_TRADING_ENABLED=false` are the canonical paper/live boundary; no duplicate `PAPER_TRADING_ENABLED` flag is used. Missing prices, Greeks, beta history, sector mappings, or regime evidence remain null and produce quality warnings, monitoring, or blockers.
 

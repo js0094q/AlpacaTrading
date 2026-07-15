@@ -17,8 +17,11 @@
   material account, configuration, portfolio, reservation, market, price, or
   cap change returns `FRESH_REVIEW_REQUIRED` and submits zero for that entry.
   A signed blocked artifact also cannot authorize entry sections, while valid
-  exits remain independent. General entries reserve as an all-or-none batch
-  after shared headroom is rechecked inside an immediate transaction.
+  exits remain independent. A fresh mixed artifact with an exit section reaches
+  the section-aware executor without weakening its signed entry blockers.
+  General, 0DTE, and hedge entries recheck an all-buy-side ledger-lifecycle
+  fingerprint inside their immediate reservation transaction, so an intervening
+  reservation-to-filled transition fails closed before any broker call.
 - `paper:execute --confirmPaper`, `/api/v1/execute/confirm`, and the dashboard
   compatibility route no longer rebuild a plan. They require explicit
   confirmation and dispatch the exact latest signed reviewed payload. The
@@ -266,7 +269,8 @@
 - `PAPER_REVIEW_SIGNING_KEY` belongs only in the VPS runtime environment. It is
   required for general and 0DTE signed review records, was absent in the
   2026-07-14 pre-deploy snapshot, and must be provisioned without printing or
-  copying it to Vercel.
+  copying it to Vercel. Deployment must not copy `.env.example` over the
+  protected environment and must reject its illustrative placeholder values.
 - `HEDGE_REVIEW_SIGNING_KEY` remains the independent VPS-only signer for hedge
   execution reviews.
 - Secrets must not be copied into repo files, client code, or Vercel frontend bundles.

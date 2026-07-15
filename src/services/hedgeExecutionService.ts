@@ -37,6 +37,7 @@ import { verifyHedgeExecutionReview } from "./hedgeExecutionReviewService.js";
 import {
   listActivePaperNewRiskReservations,
   listPaperExecutionLedgerEntries,
+  paperNewRiskLedgerMutationFingerprint,
   releaseExpiredHedgeReservations,
   reservePaperExecutionAttempt,
   updatePaperExecutionLedgerEntry,
@@ -248,6 +249,8 @@ export const executeReviewedPaperHedge = async (
   const expectedReservationFingerprint = paperSubmitReservationFingerprint(
     normalizePaperSubmitReservations(listActivePaperNewRiskReservations())
   );
+  const expectedNewRiskLedgerFingerprint =
+    paperNewRiskLedgerMutationFingerprint();
   const signingKey = process.env.HEDGE_REVIEW_SIGNING_KEY!.trim();
   const stored = (deps.readReview ?? readHedgeExecutionReview)({
     reviewId: input.reviewId,
@@ -488,6 +491,8 @@ export const executeReviewedPaperHedge = async (
         listActivePaperNewRiskReservations()
       );
       if (
+        paperNewRiskLedgerMutationFingerprint() !==
+          expectedNewRiskLedgerFingerprint ||
         paperSubmitReservationFingerprint(currentReservations) !==
         expectedReservationFingerprint
       ) {

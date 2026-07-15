@@ -1,3 +1,4 @@
+import { canonicalJsonHash } from "../lib/canonicalJson.js";
 import { getDb, queryAll, queryOne } from "../lib/db.js";
 import type {
   DecisionId,
@@ -453,6 +454,35 @@ export const listActivePaperNewRiskReservations = (): PaperExecutionLedgerEntry[
     ORDER BY created_at, id
     `
   ).map(mapRow);
+
+export const paperNewRiskLedgerMutationFingerprint = () =>
+  canonicalJsonHash(
+    queryAll<{
+      id: number;
+      created_at: string;
+      updated_at: string;
+      mode: string;
+      asset_class: string;
+      symbol: string;
+      side: string | null;
+      status: string;
+      qty: string | null;
+      notional: string | null;
+      limit_price: string | null;
+      estimated_premium: number | null;
+      max_risk: number | null;
+      client_order_id: string;
+      alpaca_order_id: string | null;
+      alpaca_status: string | null;
+    }>(
+      `SELECT id, created_at, updated_at, mode, asset_class, symbol, side,
+              status, qty, notional, limit_price, estimated_premium, max_risk,
+              client_order_id, alpaca_order_id, alpaca_status
+       FROM paper_execution_ledger
+       WHERE LOWER(COALESCE(side, '')) = 'buy'
+       ORDER BY id`
+    )
+  );
 
 export interface ReviewedPaperExecutionReservationInput {
   assetClass: "equity" | "option";

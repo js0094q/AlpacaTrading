@@ -21,6 +21,7 @@ import {
   findPaperExecutionByDedupeKey,
   insertPaperExecutionLedgerEntry,
   listActivePaperNewRiskReservations,
+  paperNewRiskLedgerMutationFingerprint,
   runAtomicPaperNewRiskReservation,
   updatePaperExecutionLedgerEntry,
   type PaperExecutionLedgerEntry,
@@ -1892,6 +1893,8 @@ export const executeZeroDteCandidate = async (input: {
   const expectedReservationFingerprint = paperSubmitReservationFingerprint(
     normalizePaperSubmitReservations(listActivePaperNewRiskReservations())
   );
+  const expectedNewRiskLedgerFingerprint =
+    paperNewRiskLedgerMutationFingerprint();
   let freshAccount: ZeroDteAccountSnapshot;
   try {
     freshAccount = await accountFromProvider(
@@ -2076,6 +2079,8 @@ export const executeZeroDteCandidate = async (input: {
         listActivePaperNewRiskReservations()
       );
       if (
+        paperNewRiskLedgerMutationFingerprint() !==
+          expectedNewRiskLedgerFingerprint ||
         paperSubmitReservationFingerprint(currentReservations) !==
         expectedReservationFingerprint
       ) {

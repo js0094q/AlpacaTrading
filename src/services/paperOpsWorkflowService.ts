@@ -465,10 +465,13 @@ export const latestReviewArtifactReadiness = () => {
       artifact
     };
   }
-  if (
+  const entryBlocked =
     !(["success", "warning"] as string[]).includes(artifact.status) ||
-    artifact.artifact.blockers.length > 0
-  ) {
+    artifact.artifact.blockers.length > 0;
+  const hasExitPayload =
+    artifact.artifact.payloadSections.equitySells.length > 0 ||
+    artifact.artifact.payloadSections.optionSellToCloseExits.length > 0;
+  if (entryBlocked && !hasExitPayload) {
     return {
       ready: false,
       status: "blocked" as const,
@@ -494,8 +497,8 @@ export const latestReviewArtifactReadiness = () => {
   }
   return {
     ready: true,
-    status: "success" as const,
-    reason: null,
+    status: entryBlocked ? "warning" as const : "success" as const,
+    reason: entryBlocked ? "REVIEW_ARTIFACT_ENTRY_BLOCKED" : null,
     artifact
   };
 };

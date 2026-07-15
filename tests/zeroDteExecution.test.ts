@@ -21,7 +21,10 @@ import {
 import { insertZeroDteDecision } from "../src/services/zeroDte/zeroDteLifecycleService.js";
 import type { ZeroDteQueueCandidate } from "../src/services/zeroDte/zeroDtePersistenceService.js";
 import type { AlpacaPaperOrderRequest } from "../src/services/alpacaClient.js";
-import { insertPaperExecutionLedgerEntry } from "../src/services/paperExecutionLedgerService.js";
+import {
+  insertPaperExecutionLedgerEntry,
+  updatePaperExecutionLedgerEntry
+} from "../src/services/paperExecutionLedgerService.js";
 
 const now = "2026-07-13T14:30:00.000Z";
 const optionSymbol = "SPY260713C00500000";
@@ -554,7 +557,7 @@ test("fresh 0DTE quote drift blocks without repricing or broker mutation", async
   assert.ok(result.blockers.includes("FRESH_REVIEW_REQUIRED"));
 });
 
-test("0DTE reservation atomically rejects distinct shared-cap races", async () => {
+test("0DTE reservation atomically rejects a distinct reservation that fills before the guard", async () => {
   const raceCandidate = scenarioCandidate({
     candidateId: "execution-candidate-shared-cap-race",
     optionSymbol: "SPY260713C00583000",
@@ -576,7 +579,7 @@ test("0DTE reservation atomically rejects distinct shared-cap races", async () =
       now: () => {
         nowReads += 1;
         if (nowReads === 2) {
-          insertPaperExecutionLedgerEntry({
+          const concurrent = insertPaperExecutionLedgerEntry({
             mode: "zero-dte-entry",
             assetClass: "option",
             symbol: "SPY260713C00582000",
@@ -596,6 +599,11 @@ test("0DTE reservation atomically rejects distinct shared-cap races", async () =
             sourceCandidateId: "other-candidate",
             payload: {}
           });
+          updatePaperExecutionLedgerEntry(concurrent.id, {
+            status: "filled",
+            alpacaOrderId: "zero-dte-shared-cap-race-order",
+            alpacaStatus: "filled"
+          });
         }
         return now;
       },
@@ -613,6 +621,9 @@ test("0DTE reservation atomically rejects distinct shared-cap races", async () =
     "DELETE FROM paper_execution_ledger WHERE client_order_id = 'zero-dte-shared-cap-race-other'"
   ).run();
   getDb().prepare("DELETE FROM zero_dte_lifecycle_events WHERE candidate_id = ?").run(
+    raceCandidate.candidateId
+  );
+  getDb().prepare("DELETE FROM zero_dte_paper_trades WHERE candidate_id = ?").run(
     raceCandidate.candidateId
   );
 
