@@ -1059,15 +1059,16 @@ export const runPaperDryRun = async (input: PaperActionInput) => {
 };
 
 export const runPaperConfirm = async (input: PaperActionInput) => {
-  const { buildPaperExecuteConfirmPaperReport } = await import(
-    "../../../src/services/paperExecuteDryRunService"
+  const { buildPaperReviewedPayloadExecutionReport } = await import(
+    "../../../src/services/paperReviewedPayloadExecutionService"
   );
-  return buildPaperExecuteConfirmPaperReport({
-    confirmPaper: true,
-    riskProfile: input.riskProfile,
-    optionsEnabled: input.optionsEnabled,
-    maxCandidates: input.maxCandidates,
-    assetClass: input.assetClass
+  const { latestPaperReviewArtifact } = await import(
+    "../../../src/services/paperReviewArtifactService"
+  );
+  const artifact = latestPaperReviewArtifact();
+  return buildPaperReviewedPayloadExecutionReport({
+    confirmPaper: input.confirmPaper === true,
+    expectedPayloadSignature: artifact?.payloadSignature
   });
 };
 

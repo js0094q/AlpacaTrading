@@ -118,6 +118,7 @@ export const runPaperOpsReview = async (
   input: {
     triggerSource?: PaperOperationTriggerSource;
     moment?: PaperPortfolioReviewMoment;
+    sourceAction?: string;
     requestId?: string | null;
     correlationId?: string | null;
   } = {},
@@ -172,7 +173,7 @@ export const runPaperOpsReview = async (
     ]);
     const status = statusFrom(blockers, warnings);
     const artifact = createPaperReviewArtifact({
-      sourceAction: "paper.ops.review",
+      sourceAction: input.sourceAction ?? "paper.ops.review",
       status,
       payloadSections: sections,
       submitState,
@@ -193,7 +194,8 @@ export const runPaperOpsReview = async (
         portfolioReview,
         hedgeReview,
         submitStateValidation
-      }
+      },
+      createdAt: generatedAt
     });
     const summary = {
       artifactId: artifact.id,
@@ -406,13 +408,16 @@ export const runPaperOpsLateDay = async (
   });
   const generatedAt = deps.now?.() || new Date().toISOString();
   try {
-    const portfolioReview = await (deps.buildPortfolioReview ?? buildPaperPortfolioReviewReport)({
-      moment: "late_day"
-    });
-    const hedgeReview = await (deps.buildHedgeReview ?? buildAndPersistHedgeReview)({
-      asOf: generatedAt,
-      triggerSource
-    });
+    const review = await runPaperOpsReview(
+      {
+        triggerSource,
+        moment: "late_day",
+        sourceAction: "paper.ops.late_day"
+      },
+      deps
+    );
+    const portfolioReview = review.details.portfolioReview as PaperPortfolioReviewReport;
+    const hedgeReview = review.details.hedgeReview as HedgeReviewReport;
     return finishWorkflow(
       operation.id,
       "late_day",
@@ -421,10 +426,12 @@ export const runPaperOpsLateDay = async (
       {
         portfolioReview,
         hedgeReview,
+        artifact: review.details.artifact,
+        review,
         forcedExitReview: true
       },
-      [...portfolioReview.warnings, ...hedgeRefreshWarnings(hedgeReview)],
-      portfolioReview.blockers
+      unique([...review.warnings, ...hedgeRefreshWarnings(hedgeReview)]),
+      unique(review.blockers)
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : "Late-day paper ops workflow failed.";

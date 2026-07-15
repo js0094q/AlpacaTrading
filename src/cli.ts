@@ -58,14 +58,13 @@ import {
   formatPaperReviewReportAsTable
 } from "./services/paperReviewService.js";
 import {
-  buildPaperExecuteConfirmPaperReport,
   buildPaperExecuteDryRunReport,
-  formatPaperExecuteConfirmReportAsTable,
   formatPaperExecuteDryRunReportAsTable
 } from "./services/paperExecuteDryRunService.js";
 import { buildPaperReviewedPayloadExecutionReport } from "./services/paperReviewedPayloadExecutionService.js";
 import {
   isReviewedPayloadSectionName,
+  latestPaperReviewArtifact,
   type ReviewedPayloadSectionName
 } from "./services/paperReviewArtifactService.js";
 import {
@@ -1390,13 +1389,27 @@ const run = async () => {
     };
 
     if (confirmPaper) {
-      const result = await buildPaperExecuteConfirmPaperReport(executeInput);
+      const artifact = latestPaperReviewArtifact();
+      const result = await buildPaperReviewedPayloadExecutionReport({
+        confirmPaper: true,
+        expectedPayloadSignature: artifact?.payloadSignature
+      });
       if (format === "json") {
         print(result);
       } else {
-        print(formatPaperExecuteConfirmReportAsTable(result));
+        print([
+          "Paper Execute Reviewed Payloads",
+          `Status: ${result.status}`,
+          `Reason: ${result.reason || "none"}`,
+          `Artifact: ${result.artifactId || "none"}`,
+          `Reviewed payloads: ${result.summary.reviewedPayloads}`,
+          `Submitted: ${result.summary.submitted}`,
+          `Blocked: ${result.summary.blocked}`,
+          `Errors: ${result.summary.errors}`,
+          "Reviewed-payload execution is paper-only and requires --confirmPaper."
+        ].join("\n"));
       }
-      if (result.errors.length > 0) {
+      if (result.status === "blocked" || result.errors.length > 0) {
         process.exitCode = 1;
       }
       return;

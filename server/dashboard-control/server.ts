@@ -577,36 +577,6 @@ const verifyPaperMutability = async (requirements: MutabilityRequirement = {}) =
 
 };
 
-const executeConfirmHandler = async (_input: ControlInput, requestId: string) => {
-  if (_input.riskProfile !== "aggressive") {
-    throw new Error("execute.confirm requires aggressive risk profile.");
-  }
-
-  if (!_input.optionsEnabled) {
-    throw new Error("execute.confirm requires optionsEnabled=true.");
-  }
-
-  if (_input.assetClass !== "all") {
-    throw new Error("execute.confirm supports assetClass=all only.");
-  }
-
-  await openOrdersFetcher();
-  return command(
-    "paper:execute",
-    [
-      "--confirmPaper",
-      "--riskProfile=aggressive",
-      "--optionsEnabled=true",
-      "--maxCandidates=10",
-      "--assetClass=all",
-      "--format=json"
-    ],
-    120_000,
-    requestId,
-    "execute.confirm"
-  );
-};
-
 const executeDryRunHandler = (input: ControlInput, requestId: string) =>
   command(
     "paper:execute",
@@ -1142,11 +1112,11 @@ const actionHandlers: Record<string, ActionConfig> = {
     requireMutationPrecheck: false,
     runtimePreflight: {
       actionType: "confirmed-paper-execution",
-      confirmPaper: true,
+      confirmPaperFromInput: true,
       requireOptionsExecution: true
     },
     action: "execute.confirm",
-    handler: executeConfirmHandler
+    handler: executeReviewedHandler
   },
   "/api/v1/zero-dte/summary": {
     method: "GET",

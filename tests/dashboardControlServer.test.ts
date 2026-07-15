@@ -1,6 +1,6 @@
 import { after, afterEach, before, beforeEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -51,6 +51,9 @@ type ControlResponse = {
 };
 
 const DASHBOARD_TOKEN = "vps-control-token";
+const controlDbDir = mkdtempSync(join(tmpdir(), "alpaca-dashboard-control-"));
+process.env.RESEARCH_DB_PATH = join(controlDbDir, "research.db");
+process.env.PAPER_REVIEW_SIGNING_KEY = "dashboard-control-review-key";
 
 const getServerModule = async (): Promise<ServerModule> => {
   const url = pathToFileURL(`${process.cwd()}/server/dashboard-control/server.ts`);
@@ -166,6 +169,34 @@ const setMockOpenOrdersFetcher = () => {
   });
 };
 
+const seedReadyReviewArtifact = async () => {
+  const { createPaperReviewArtifact } = await import(
+    "../src/services/paperReviewArtifactService.js"
+  );
+  return createPaperReviewArtifact({
+    sourceAction: "paper.ops.review",
+    status: "success",
+    payloadSections: {
+      equityBuys: [{
+        assetClass: "equity",
+        symbol: "AAPL",
+        side: "buy",
+        type: "market",
+        time_in_force: "day",
+        notional: "100.00",
+        client_order_id: "dashboard-control-aapl",
+        sourceCandidateId: "dashboard-control-candidate"
+      }],
+      equityAdds: [],
+      equitySells: [],
+      optionBuys: [],
+      optionSellToCloseExits: []
+    },
+    summary: {},
+    createdAt: new Date().toISOString()
+  });
+};
+
 before(async () => {
   process.env.DASHBOARD_CONTROL_NO_START = "1";
   module = await getServerModule();
@@ -184,8 +215,16 @@ before(async () => {
   });
 });
 
-beforeEach(() => {
+beforeEach(async () => {
   configureDefaultRuntime();
+  process.env.PAPER_REVIEW_SIGNING_KEY = "dashboard-control-review-key";
+  const { getDb } = await import("../src/lib/db.js");
+  getDb().exec(`
+    DELETE FROM paper_review_decisions;
+    DELETE FROM decision_lifecycle_events;
+    DELETE FROM decision_snapshots;
+    DELETE FROM paper_review_artifacts;
+  `);
   module.resetControlTestHooks();
   setMockOpenOrdersFetcher();
   setMockCommandRunner();
@@ -201,6 +240,9 @@ after(async () => {
     server?.close(() => resolve());
   });
   module.resetControlTestHooks();
+  const { closeDbForTests } = await import("../src/lib/db.js");
+  closeDbForTests();
+  rmSync(controlDbDir, { recursive: true, force: true });
 });
 
 describe("VPS dashboard control API", () => {
@@ -316,34 +358,36 @@ describe("VPS dashboard control API", () => {
     assert.equal(payload.error?.message, "Unknown control action.");
   });
 
-  test("execute.confirm enforces aggressive + options-enabled guardrails", async () => {
+  test("execute.confirm requires explicit confirmPaper before reviewed dispatch", async () => {
     process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
-    const responseModerate = await callControl("/api/v1/execute/confirm", "POST", {
+    const response = await callControl("/api/v1/execute/confirm", "POST", {
       ...defaultRequest.body,
-      riskProfile: "moderate"
+      confirmPaper: false
     });
 
-    assert.equal(responseModerate.status, 500);
-    assert.equal(responseModerate.payload.ok, false);
-    assert.match(responseModerate.payload.error?.message || "", /aggressive risk profile/);
-
-    const responseNoOptions = await callControl("/api/v1/execute/confirm", "POST", {
-      ...defaultRequest.body,
-      optionsEnabled: false
-    });
-
-    assert.equal(responseNoOptions.status, 500);
-    assert.equal(responseNoOptions.payload.ok, false);
-    assert.match(responseNoOptions.payload.error?.message || "", /optionsEnabled=true/);
+    assert.equal(response.status, 403);
+    assert.equal(response.payload.ok, false);
+    assert.equal(response.payload.error?.code, "RUNTIME_PREFLIGHT_FAILED");
+    assert.deepEqual(
+      (response.payload as { failedChecks?: string[] }).failedChecks,
+      ["confirmPaper"]
+    );
+    assert.equal(commandCalls.map((entry) => entry.script).includes("paper:execute"), false);
+    assert.equal(
+      commandCalls.map((entry) => entry.script).includes("paper:execute:reviewed"),
+      false
+    );
+    assert.equal(openOrderCalls, 0);
   });
 
-  test("execute.confirm uses fixed confirm-paper command and prefetches open orders", async () => {
+  test("execute.confirm dispatches reviewed execution with the latest exact signature", async () => {
     process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
-    let confirmActionArgs: string[] | null = null;
+    const artifact = await seedReadyReviewArtifact();
+    let reviewedActionArgs: string[] | null = null;
     setMockCommandRunner({
       onCommand: (_script, args) => {
-        if (_script === "paper:execute") {
-          confirmActionArgs = args;
+        if (_script === "paper:execute:reviewed") {
+          reviewedActionArgs = args;
           return {
             submitted: [],
             blocked: [],
@@ -360,9 +404,7 @@ describe("VPS dashboard control API", () => {
 
     const response = await callControl("/api/v1/execute/confirm", "POST", {
       ...defaultRequest.body,
-      maxCandidates: 17,
-      assetClass: "all",
-      riskProfile: "aggressive"
+      confirmPaper: true
     });
 
     assert.equal(response.status, 200, `unexpected response status ${response.status}: ${response.text}`);
@@ -370,15 +412,12 @@ describe("VPS dashboard control API", () => {
     assert.equal(response.payload.action, "execute.confirm");
 
     const scripts = commandCalls.map((entry) => entry.script);
-    assert.deepEqual(scripts, ["alpaca:health", "paper:execute"]);
+    assert.deepEqual(scripts, ["alpaca:health", "paper:execute:reviewed"]);
     assert.equal(openOrderCalls, 1);
-    assert.ok(confirmActionArgs !== null);
-    assert.deepEqual(confirmActionArgs, [
+    assert.ok(reviewedActionArgs !== null);
+    assert.deepEqual(reviewedActionArgs, [
       "--confirmPaper",
-      "--riskProfile=aggressive",
-      "--optionsEnabled=true",
-      "--maxCandidates=10",
-      "--assetClass=all",
+      `--expectedPayloadSignature=${artifact.payloadSignature}`,
       "--format=json"
     ]);
   });
@@ -402,6 +441,7 @@ describe("VPS dashboard control API", () => {
 
     const response = await callControl("/api/v1/execute/confirm", "POST", {
       ...defaultRequest.body,
+      confirmPaper: true,
       riskProfile: "aggressive",
       optionsEnabled: true,
       assetClass: "all"
@@ -488,6 +528,7 @@ describe("VPS dashboard control API", () => {
   test("execute.confirm returns structured paper order guard when disabled", async () => {
     const response = await callControl("/api/v1/execute/confirm", "POST", {
       ...defaultRequest.body,
+      confirmPaper: true,
       riskProfile: "aggressive",
       optionsEnabled: true,
       assetClass: "all"

@@ -1,6 +1,6 @@
 import { after, beforeEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resetSqliteTestDb } from "./helpers/sqliteTestDb.js";
@@ -20,6 +20,7 @@ import {
   runPaperOpsMorning,
   runPaperOpsReview
 } from "../src/services/paperOpsWorkflowService.js";
+import { verifyPaperReviewArtifact } from "../src/services/paperReviewArtifactService.js";
 
 const resetDatabase = () => {
   resetSqliteTestDb(getDb(), `
@@ -163,6 +164,16 @@ after(() => {
 });
 
 describe("paper ops workflows", () => {
+  test("paper execute confirmation source delegates only to reviewed execution", () => {
+    const source = readFileSync(join(process.cwd(), "src/cli.ts"), "utf8");
+
+    assert.doesNotMatch(source, /buildPaperExecuteConfirmPaperReport/);
+    assert.match(
+      source,
+      /if \(confirmPaper\)[\s\S]{0,800}buildPaperReviewedPayloadExecutionReport/
+    );
+  });
+
   test("review workflow persists separated payload artifact and defaults to review-only", async () => {
     const report = await runPaperOpsReview({ triggerSource: "scheduler" }, {
       buildDryRun: dryRun as any,
@@ -251,18 +262,59 @@ describe("paper ops workflows", () => {
     assert.equal("executeHedge" in report.details, false);
   });
 
-  test("late-day workflow runs forced 0DTE review path", async () => {
+  test("late-day workflow persists a fresh signed forced-exit review artifact", async () => {
     let moment = "";
+    const generatedAt = "2026-07-14T19:25:00.000Z";
     const report = await runPaperOpsLateDay({}, {
       buildPortfolioReview: async (input) => {
         moment = input?.moment || "";
-        return portfolioReview("late_day") as any;
+        return {
+          ...(await portfolioReview("late_day")),
+          summary: { eligiblePayloads: 1 },
+          recommendations: [{
+            recommendation: "SELL_TO_CLOSE_OPTION",
+            eligiblePayload: {
+              assetClass: "option",
+              symbol: "SPY260714P00500000",
+              side: "sell",
+              type: "limit",
+              time_in_force: "day",
+              qty: "1",
+              limit_price: "1.25",
+              position_intent: "sell_to_close",
+              client_order_id: "late-day-spy-exit",
+              sourceReviewId: "late-day-review"
+            }
+          }]
+        } as any;
       },
-      buildHedgeReview: hedgeReview as any
+      buildHedgeReview: hedgeReview as any,
+      buildDryRun: dryRun as any,
+      captureSubmitState: captureSubmitState as any,
+      now: () => generatedAt
     });
 
     assert.equal(report.workflow, "late_day");
     assert.equal(moment, "late_day");
     assert.equal(report.details.forcedExitReview, true);
+    const artifact = report.details.artifact as any;
+    assert.equal(artifact.sourceAction, "paper.ops.late_day");
+    assert.equal(artifact.createdAt, generatedAt);
+    assert.ok(Date.parse(artifact.expiresAt) > Date.parse(artifact.createdAt));
+    assert.equal(
+      artifact.artifact.payloadSections.optionSellToCloseExits.length,
+      1
+    );
+    const stored = getDb().prepare(
+      "SELECT source_action FROM paper_review_artifacts WHERE id = ?"
+    ).get(artifact.id) as { source_action: string };
+    assert.equal(stored.source_action, "paper.ops.late_day");
+    const verification = verifyPaperReviewArtifact({
+      artifact,
+      signingKey: "paper-ops-workflow-test-key",
+      asOf: "2026-07-14T19:25:01.000Z",
+      requireFresh: true
+    });
+    assert.equal(verification.valid, true);
   });
 });

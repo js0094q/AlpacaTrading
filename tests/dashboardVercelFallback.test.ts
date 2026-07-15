@@ -1,6 +1,6 @@
 import { after, afterEach, beforeEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -67,6 +67,17 @@ after(() => {
 });
 
 describe("Vercel dashboard read-only fallback", () => {
+  test("local dashboard confirm helper delegates to reviewed execution", () => {
+    const source = readFileSync(join(process.cwd(), "apps/dashboard/lib/data.ts"), "utf8");
+    const start = source.indexOf("export const runPaperConfirm");
+    const end = source.indexOf("export const runPaperLearningCommit", start);
+    const helper = source.slice(start, end);
+
+    assert.match(helper, /buildPaperReviewedPayloadExecutionReport/);
+    assert.doesNotMatch(helper, /buildPaperExecuteConfirmPaperReport/);
+    assert.match(helper, /confirmPaper:\s*input\.confirmPaper/);
+  });
+
   test("shared SQLite guard rejects Vercel app bundle paths", async () => {
     process.env.RESEARCH_DB_PATH = "/var/task/apps/dashboard/data/research.db";
 
@@ -173,7 +184,7 @@ describe("Vercel dashboard read-only fallback", () => {
       headers: {
         authorization: "Bearer dashboard-admin-secret"
       },
-      body: JSON.stringify({ assetClass: "equity" })
+      body: JSON.stringify({ assetClass: "equity", confirmPaper: true })
     }));
     const { status, body } = await readJson(response);
 
