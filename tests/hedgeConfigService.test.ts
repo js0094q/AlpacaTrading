@@ -19,6 +19,9 @@ afterEach(() => {
 
 test("hedge configuration defaults to disabled paper execution", () => {
   delete process.env.HEDGE_PAPER_EXECUTION_ENABLED;
+  delete process.env.HEDGE_MAX_NEW_HEDGE_PREMIUM_PCT_EQUITY;
+  delete process.env.HEDGE_MAX_TOTAL_HEDGE_PREMIUM_PCT_EQUITY;
+  delete process.env.HEDGE_MAX_DAILY_HEDGE_PREMIUM_PCT_EQUITY;
   const config = buildHedgeConfig();
 
   assert.equal(config.executionEnabled, false);
@@ -35,6 +38,9 @@ test("hedge configuration defaults to disabled paper execution", () => {
   assert.equal(config.leaps.minimumDte, 365);
   assert.equal(config.leaps.profitAllocation, 0.25);
   assert.equal(config.premiumNavCap, 0.01);
+  assert.equal(config.executionPolicy.maxNewHedgePremiumPctEquity, 0.0075);
+  assert.equal(config.executionPolicy.maxTotalHedgePremiumPctEquity, 0.02);
+  assert.equal(config.executionPolicy.maxDailyHedgePremiumPctEquity, 0.01);
   assert.equal(config.optionDataCoverage.minimumContractDeltaCoveragePct, 0.9);
   assert.equal(config.optionDataCoverage.minimumMarketValueDeltaCoveragePct, 0.95);
   assert.equal(config.optionDataCoverage.materialUnmeasuredOptionExposurePct, 0.1);
@@ -42,6 +48,18 @@ test("hedge configuration defaults to disabled paper execution", () => {
     currentMaxAgeSeconds: 60,
     staleMaxAgeSeconds: 900
   });
+});
+
+test("hedge execution percentages normalize to bounded equity ratios", () => {
+  process.env.HEDGE_MAX_NEW_HEDGE_PREMIUM_PCT_EQUITY = "0.75";
+  process.env.HEDGE_MAX_TOTAL_HEDGE_PREMIUM_PCT_EQUITY = "2";
+  process.env.HEDGE_MAX_DAILY_HEDGE_PREMIUM_PCT_EQUITY = "1";
+
+  const config = buildHedgeConfig();
+
+  assert.equal(config.executionPolicy.maxNewHedgePremiumPctEquity, 0.0075);
+  assert.equal(config.executionPolicy.maxTotalHedgePremiumPctEquity, 0.02);
+  assert.equal(config.executionPolicy.maxDailyHedgePremiumPctEquity, 0.01);
 });
 
 test("option delta coverage thresholds accept percentages and normalize to ratios", () => {

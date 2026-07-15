@@ -9,6 +9,7 @@ import {
 import type { MarketRegimeSnapshot } from "../src/services/marketRegimeService.js";
 import type { PortfolioRiskScore } from "../src/services/portfolioRiskScoreService.js";
 import type { PortfolioRiskSnapshot } from "../src/services/portfolioRiskService.js";
+import { buildHedgeCapitalEvidence } from "../src/services/hedgeCapitalEvidenceService.js";
 
 const now = "2026-07-10T14:00:00.000Z";
 
@@ -153,7 +154,14 @@ const evidence = (): HedgeRecommendationEvidence => ({
     }
   ],
   inversePrices: { SH: 40, PSQ: 35 },
-  existingLeapsExitRecommendations: []
+  existingLeapsExitRecommendations: [],
+  capitalEvidence: buildHedgeCapitalEvidence({
+    asOf: now,
+    allowedUnderlyings: ["SPY", "QQQ"],
+    positions: [],
+    orders: [],
+    ledger: []
+  })
 });
 
 test("blocks before selecting an instrument when the risk snapshot is blocked", () => {
@@ -208,6 +216,87 @@ test("material missing option delta forces monitoring before hedge sizing", () =
   assert.equal(result.candidates.length, 0);
   assert.ok(result.warnings.includes("MATERIAL_OPTION_GREEKS_COVERAGE_INSUFFICIENT"));
   assert.ok(result.warnings.includes("HEDGE_SIZING_EVIDENCE_INSUFFICIENT"));
+});
+
+test("incomplete hedge capital evidence forces monitoring with no executable candidate", () => {
+  const incompleteEvidence = {
+    ...evidence(),
+    capitalEvidence: buildHedgeCapitalEvidence({
+      asOf: now,
+      allowedUnderlyings: ["SPY", "QQQ"],
+      positions: [{
+        symbol: "SPY260918P00500000",
+        assetClass: "option",
+        optionType: "put",
+        quantity: 1,
+        marketValue: null,
+        costBasis: null
+      }],
+      orders: [],
+      ledger: []
+    })
+  };
+
+  const result = recommendHedgeFromEvidence(
+    risk(),
+    regime("risk-off"),
+    score("high", 70),
+    incompleteEvidence,
+    buildHedgeConfig(),
+    { generatedAt: now }
+  );
+
+  assert.equal(result.recommendationStatus, "monitoring");
+  assert.equal(result.decision, "monitor");
+  assert.equal(result.sizing.premiumBudget, 0);
+  assert.equal(result.candidates.length, 0);
+  assert.equal(result.capitalEvidence.complete, false);
+  assert.ok(result.warnings.includes("HEDGE_CAPITAL_EVIDENCE_INCOMPLETE"));
+});
+
+test("premium budget subtracts real existing, reserved, and daily hedge usage", () => {
+  const capitalEvidence = {
+    ...evidence().capitalEvidence,
+    existingHedgeExposure: 10_000,
+    existingHedgePremium: 10_000,
+    reservedHedgePremium: 2_000,
+    dailyHedgePremiumUsed: 3_000,
+    completedHedgePremium: 1_000,
+    openHedgeOrderCount: 0,
+    complete: true,
+    blockers: [],
+    fingerprint: "capital-evidence-test-fingerprint"
+  };
+  const result = recommendHedgeFromEvidence(
+    risk(),
+    regime("risk-off"),
+    score("high", 70),
+    { ...evidence(), capitalEvidence },
+    buildHedgeConfig(),
+    { generatedAt: now }
+  );
+
+  assert.equal(result.sizing.premiumBudget, 7_000);
+});
+
+test("open hedge order cap suppresses new executable candidates", () => {
+  const capitalEvidence = {
+    ...evidence().capitalEvidence,
+    openHedgeOrderCount: buildHedgeConfig().executionPolicy.maxOrdersPerRun,
+    fingerprint: "capital-evidence-open-order-cap"
+  };
+  const result = recommendHedgeFromEvidence(
+    risk(),
+    regime("risk-off"),
+    score("high", 70),
+    { ...evidence(), capitalEvidence },
+    buildHedgeConfig(),
+    { generatedAt: now }
+  );
+
+  assert.equal(result.candidates.length, 0);
+  assert.equal(result.decision, "monitor");
+  assert.ok(result.warnings.includes("HEDGE_OPEN_ORDER_CAP_REACHED"));
 });
 
 test("subtracts existing measured protection from the target", () => {

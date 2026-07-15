@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { buildHedgeConfig } from "../src/services/hedgeConfigService.js";
+import { buildHedgeCapitalEvidence } from "../src/services/hedgeCapitalEvidenceService.js";
 import { rankHedgeCandidates } from "../src/services/hedgeRecommendationService.js";
 import {
   createHedgeExecutionReview,
@@ -19,6 +20,13 @@ const baseInput = (): HedgeExecutionReviewInput => ({
   configurationFingerprint: "config-hash-1",
   generatedAt: "2026-07-13T14:00:00.000Z",
   signingKey: "unit-test-signing-key",
+  capitalEvidence: buildHedgeCapitalEvidence({
+    asOf: "2026-07-13T14:00:00.000Z",
+    allowedUnderlyings: ["SPY", "QQQ"],
+    positions: [],
+    orders: [],
+    ledger: []
+  }),
   candidate: {
     candidateId: "candidate-1",
     rank: 1,
@@ -71,6 +79,8 @@ test("creates a deterministic HMAC-reviewed single long put payload", () => {
     accountHash: "account-hash-1",
     configurationFingerprint: "config-hash-1",
     sourceSnapshotId: "snapshot-1",
+    capitalEvidenceFingerprint: first.portfolioEvidence
+      .capitalEvidenceFingerprint as string,
     asOf: "2026-07-13T14:00:01.000Z"
   });
 
@@ -118,6 +128,17 @@ test("rejects changed payloads, wrong keys, expired reviews, and account mismatc
     asOf: "2026-07-13T14:00:01.000Z"
   });
   assert.ok(accountMismatch.blockers.includes("HEDGE_ACCOUNT_IDENTITY_MISMATCH"));
+
+  const capitalEvidenceMismatch = verifyHedgeExecutionReview({
+    review,
+    signingKey: "unit-test-signing-key",
+    capitalEvidenceFingerprint: "different-capital-evidence",
+    asOf: "2026-07-13T14:00:01.000Z"
+  });
+  assert.ok(
+    capitalEvidenceMismatch.blockers.includes("HEDGE_CAPITAL_EVIDENCE_CHANGED")
+  );
+  assert.ok(capitalEvidenceMismatch.blockers.includes("FRESH_REVIEW_REQUIRED"));
 });
 
 test("requires a supported executable long put and paper-only policy defaults are explicit", () => {
@@ -127,6 +148,14 @@ test("requires a supported executable long put and paper-only policy defaults ar
   assert.equal(config.executionPolicy.minDte, 30);
   assert.equal(config.executionPolicy.targetDte, 60);
   assert.equal(config.executionPolicy.maxDte, 120);
+  assert.equal(config.executionPolicy.maxNewHedgePremiumPctEquity, 0.0075);
+  assert.equal(config.executionPolicy.maxTotalHedgePremiumPctEquity, 0.02);
+  assert.equal(config.executionPolicy.maxDailyHedgePremiumPctEquity, 0.01);
+
+  assert.throws(
+    () => createHedgeExecutionReview({ ...baseInput(), capitalEvidence: undefined }),
+    /HEDGE_CAPITAL_EVIDENCE_INCOMPLETE/
+  );
 
   assert.throws(
     () =>

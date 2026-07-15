@@ -17,8 +17,20 @@ process.env.MULTI_LEG_HEDGE_EXECUTION_ENABLED = "false";
 process.env.HEDGE_REVIEW_SIGNING_KEY = "execution-test-key";
 
 import { closeDbForTests } from "../src/lib/db.js";
+import {
+  buildHedgeConfig,
+  hedgeConfigurationFingerprint
+} from "../src/services/hedgeConfigService.js";
+import {
+  buildHedgeCapitalEvidence,
+  type HedgeCapitalEvidence,
+  type HedgeCapitalOrderInput
+} from "../src/services/hedgeCapitalEvidenceService.js";
 import { createHedgeExecutionReview } from "../src/services/hedgeExecutionReviewService.js";
-import type { AlpacaPaperOrderRequest } from "../src/services/alpacaClient.js";
+import type {
+  AlpacaPaperOrderRequest,
+  AlpacaPositionRaw
+} from "../src/services/alpacaClient.js";
 import {
   executeReviewedPaperHedge,
   paperAccountIdentityHash
@@ -33,7 +45,24 @@ const account = {
   options_approved_level: 3
 };
 
-const makeReview = (suffix: string) => {
+const capitalEvidence = (input: {
+  positions?: AlpacaPositionRaw[];
+  orders?: HedgeCapitalOrderInput[];
+} = {}) => buildHedgeCapitalEvidence({
+  asOf: "2026-07-13T14:00:00.000Z",
+  allowedUnderlyings: ["SPY", "QQQ"],
+  positions: input.positions ?? [],
+  orders: input.orders ?? [],
+  ledger: []
+});
+
+const makeReview = (
+  suffix: string,
+  options: {
+    capitalEvidence?: HedgeCapitalEvidence;
+    estimatedCost?: number;
+  } = {}
+) => {
   const accountHash = paperAccountIdentityHash(account);
   const review = createHedgeExecutionReview({
     accountHash,
@@ -42,9 +71,10 @@ const makeReview = (suffix: string) => {
     sourceRegimeId: `regime-${suffix}`,
     riskModelVersion: "portfolio-risk-v1",
     regimeModelVersion: "market-regime-v1",
-    configurationFingerprint: "config_hash",
+    configurationFingerprint: hedgeConfigurationFingerprint(buildHedgeConfig()),
     generatedAt: "2026-07-13T14:00:00.000Z",
     signingKey: "execution-test-key",
+    capitalEvidence: options.capitalEvidence ?? capitalEvidence(),
     candidate: {
       candidateId: `candidate-${suffix}`,
       rank: 1,
@@ -53,7 +83,7 @@ const makeReview = (suffix: string) => {
       underlying: "SPY",
       executable: true,
       expectedProtection: 1_000,
-      estimatedCost: 500,
+      estimatedCost: options.estimatedCost ?? 500,
       units: 1,
       rationale: [],
       warnings: [],
@@ -79,6 +109,7 @@ const deps = (overrides: Record<string, unknown> = {}) => ({
   getAccount: async () => ({ data: account, requestId: "account-request", status: 200, url: "paper" }),
   listPositions: async () => ({ positions: [], requestId: "positions-request" }),
   listOrders: async () => ({ orders: [], requestId: "orders-request" }),
+  listLedger: () => [],
   refreshQuote: async () => ({
     bid: 4.9,
     ask: 5.1,
@@ -156,6 +187,146 @@ test("does not call the broker when paper/live gates are unsafe", async () => {
   assert.ok(result.blockers.includes("HEDGE_EXECUTION_DISABLED"));
   assert.equal(brokerCalls, 0);
   process.env.HEDGE_PAPER_EXECUTION_ENABLED = "true";
+});
+
+test("capital evidence drift or incompleteness requires a fresh review and submits zero", async () => {
+  const completePosition: AlpacaPositionRaw = {
+    symbol: "QQQ260918P00400000",
+    asset_class: "us_option",
+    qty: "1",
+    market_value: "400",
+    cost_basis: "350"
+  };
+  const driftReview = makeReview("capital-drift");
+  let submitCalls = 0;
+  const driftResult = await executeReviewedPaperHedge(
+    { reviewId: driftReview.reviewId, confirmPaper: true },
+    deps({
+      listPositions: async () => ({ positions: [completePosition] }),
+      submitPaperOrder: async () => {
+        submitCalls += 1;
+        throw new Error("must not submit on capital evidence drift");
+      }
+    })
+  );
+  assert.equal(driftResult.status, "blocked");
+  assert.ok(driftResult.blockers.includes("HEDGE_CAPITAL_EVIDENCE_CHANGED"));
+  assert.ok(driftResult.blockers.includes("FRESH_REVIEW_REQUIRED"));
+
+  const incompleteReview = makeReview("capital-incomplete");
+  const incompleteResult = await executeReviewedPaperHedge(
+    { reviewId: incompleteReview.reviewId, confirmPaper: true },
+    deps({
+      listPositions: async () => ({
+        positions: [{
+          symbol: "QQQ260918P00400000",
+          asset_class: "us_option",
+          qty: "1"
+        }]
+      }),
+      submitPaperOrder: async () => {
+        submitCalls += 1;
+        throw new Error("must not submit on incomplete capital evidence");
+      }
+    })
+  );
+  assert.equal(incompleteResult.status, "blocked");
+  assert.ok(incompleteResult.blockers.includes("HEDGE_CAPITAL_EVIDENCE_INCOMPLETE"));
+  assert.ok(incompleteResult.blockers.includes("FRESH_REVIEW_REQUIRED"));
+  assert.equal(submitCalls, 0);
+});
+
+test("reapplies new, total, daily, and open-order hedge caps before reservation", async () => {
+  const totalCapPositions: AlpacaPositionRaw[] = [{
+    symbol: "QQQ260918P00400000",
+    asset_class: "us_option",
+    qty: "1",
+    market_value: "1600",
+    cost_basis: "1600"
+  }];
+  const dailyCapOrders: HedgeCapitalOrderInput[] = [{
+    id: "daily-filled-order",
+    client_order_id: "daily-filled-client",
+    symbol: "QQQ260918P00400000",
+    asset_class: "us_option",
+    side: "buy",
+    position_intent: "buy_to_open",
+    status: "filled",
+    qty: "1",
+    limit_price: "6",
+    filled_qty: "1",
+    filled_avg_price: "6",
+    created_at: "2026-07-13T13:50:00.000Z",
+    filled_at: "2026-07-13T13:51:00.000Z"
+  }];
+  const openCapOrders: HedgeCapitalOrderInput[] = [{
+    id: "open-order",
+    client_order_id: "open-client",
+    symbol: "QQQ260918P00400000",
+    asset_class: "us_option",
+    side: "buy",
+    position_intent: "buy_to_open",
+    status: "accepted",
+    qty: "1",
+    limit_price: "2",
+    filled_qty: "0",
+    created_at: "2026-07-13T13:50:00.000Z"
+  }];
+  const scenarios = [
+    {
+      suffix: "new-cap",
+      evidence: capitalEvidence(),
+      estimatedCost: 800,
+      positions: [] as AlpacaPositionRaw[],
+      orders: [] as HedgeCapitalOrderInput[],
+      blocker: "HEDGE_PREMIUM_CAP_EXCEEDED"
+    },
+    {
+      suffix: "total-cap",
+      evidence: capitalEvidence({ positions: totalCapPositions }),
+      estimatedCost: 500,
+      positions: totalCapPositions,
+      orders: [] as HedgeCapitalOrderInput[],
+      blocker: "HEDGE_TOTAL_PREMIUM_CAP_EXCEEDED"
+    },
+    {
+      suffix: "daily-cap",
+      evidence: capitalEvidence({ orders: dailyCapOrders }),
+      estimatedCost: 500,
+      positions: [] as AlpacaPositionRaw[],
+      orders: dailyCapOrders,
+      blocker: "HEDGE_DAILY_PREMIUM_CAP_EXCEEDED"
+    },
+    {
+      suffix: "open-cap",
+      evidence: capitalEvidence({ orders: openCapOrders }),
+      estimatedCost: 500,
+      positions: [] as AlpacaPositionRaw[],
+      orders: openCapOrders,
+      blocker: "HEDGE_OPEN_ORDER_CAP_REACHED"
+    }
+  ];
+  let submitCalls = 0;
+  for (const scenario of scenarios) {
+    const review = makeReview(scenario.suffix, {
+      capitalEvidence: scenario.evidence,
+      estimatedCost: scenario.estimatedCost
+    });
+    const result = await executeReviewedPaperHedge(
+      { reviewId: review.reviewId, confirmPaper: true },
+      deps({
+        listPositions: async () => ({ positions: scenario.positions }),
+        listOrders: async () => ({ orders: scenario.orders }),
+        submitPaperOrder: async () => {
+          submitCalls += 1;
+          throw new Error("must not submit when a hedge cap is exceeded");
+        }
+      })
+    );
+    assert.equal(result.status, "blocked", scenario.suffix);
+    assert.ok(result.blockers.includes(scenario.blocker), scenario.suffix);
+  }
+  assert.equal(submitCalls, 0);
 });
 
 test("retries only the reserved order and cancels after bounded timeout", async () => {

@@ -164,15 +164,15 @@ export const buildHedgeConfig = (): HedgeConfig => {
     maxNewContractsPerRun: positiveInteger(process.env.HEDGE_MAX_NEW_CONTRACTS_PER_RUN, 2),
     maxNewHedgePremiumPctEquity: percentage(
       process.env.HEDGE_MAX_NEW_HEDGE_PREMIUM_PCT_EQUITY,
-      0.75
+      0.0075
     ),
     maxTotalHedgePremiumPctEquity: percentage(
       process.env.HEDGE_MAX_TOTAL_HEDGE_PREMIUM_PCT_EQUITY,
-      2
+      0.02
     ),
     maxDailyHedgePremiumPctEquity: percentage(
       process.env.HEDGE_MAX_DAILY_HEDGE_PREMIUM_PCT_EQUITY,
-      1
+      0.01
     ),
     minOrderNotionalDollars: positiveNumber(process.env.HEDGE_MIN_ORDER_NOTIONAL_DOLLARS, 25),
     reviewTtlSeconds: positiveInteger(process.env.HEDGE_REVIEW_TTL_SECONDS, 300),

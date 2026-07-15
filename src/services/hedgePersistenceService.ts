@@ -20,6 +20,7 @@ import type {
   WeightedImpliedVolatility
 } from "./portfolioRiskService.js";
 import type { HedgePlanArtifact } from "./hedgePlanService.js";
+import type { HedgeCapitalEvidence } from "./hedgeCapitalEvidenceService.js";
 import {
   verifyHedgeExecutionReview,
   type HedgeExecutionReview,
@@ -790,6 +791,27 @@ const mandatoryRecommendationStrings = [
   "recommendationStatus"
 ] as const;
 
+const isHedgeCapitalEvidence = (value: unknown): value is HedgeCapitalEvidence => {
+  if (!value || typeof value !== "object") return false;
+  const evidence = value as Record<string, unknown>;
+  const numericOrNull = (key: string) =>
+    evidence[key] === null ||
+    (typeof evidence[key] === "number" && Number.isFinite(evidence[key]));
+  return (
+    numericOrNull("existingHedgeExposure") &&
+    numericOrNull("existingHedgePremium") &&
+    numericOrNull("reservedHedgePremium") &&
+    numericOrNull("dailyHedgePremiumUsed") &&
+    numericOrNull("completedHedgePremium") &&
+    numericOrNull("openHedgeOrderCount") &&
+    typeof evidence.complete === "boolean" &&
+    Array.isArray(evidence.blockers) &&
+    evidence.blockers.every((blocker) => typeof blocker === "string") &&
+    typeof evidence.fingerprint === "string" &&
+    evidence.fingerprint.length > 0
+  );
+};
+
 const mapRecommendation = (
   row: HedgeLearningRow,
   input: {
@@ -821,6 +843,15 @@ const mapRecommendation = (
   }
   if (raw.regimeModelVersion !== input.regimeModelVersion) {
     integrityWarnings.push("HEDGE_REGIME_MODEL_VERSION_MISMATCH");
+  }
+  const validCapitalEvidence = isHedgeCapitalEvidence(raw.capitalEvidence)
+    ? raw.capitalEvidence
+    : null;
+  if (
+    !validCapitalEvidence ||
+    (raw.recommendationStatus === "current" && !validCapitalEvidence.complete)
+  ) {
+    integrityWarnings.push("HEDGE_CAPITAL_EVIDENCE_INVALID");
   }
   let validRisk = isCurrentRiskPayload(raw.risk) ? raw.risk : null;
   if (!validRisk) {
@@ -858,6 +889,7 @@ const mapRecommendation = (
   if (
     integrityWarnings.includes("HEDGE_RECOMMENDATION_INTEGRITY_INVALID") ||
     integrityWarnings.includes("HEDGE_RECOMMENDATION_ENVIRONMENT_INVALID") ||
+    integrityWarnings.includes("HEDGE_CAPITAL_EVIDENCE_INVALID") ||
     integrityWarnings.includes("HEDGE_RISK_PAYLOAD_INVALID")
   ) {
     effectiveStatus = "blocked";
@@ -910,6 +942,17 @@ const mapRecommendation = (
       raw.regime && typeof raw.regime === "object" ? (raw.regime as Record<string, unknown>) : {},
     score: raw.score && typeof raw.score === "object" ? (raw.score as Record<string, unknown>) : {},
     sizing: raw.sizing && typeof raw.sizing === "object" ? (raw.sizing as Record<string, unknown>) : {},
+    capitalEvidence: validCapitalEvidence ?? {
+      existingHedgeExposure: null,
+      existingHedgePremium: null,
+      reservedHedgePremium: null,
+      dailyHedgePremiumUsed: null,
+      completedHedgePremium: null,
+      openHedgeOrderCount: null,
+      complete: false,
+      blockers: ["HEDGE_CAPITAL_EVIDENCE_INVALID"],
+      fingerprint: "invalid"
+    },
     leaps: raw.leaps && typeof raw.leaps === "object" ? (raw.leaps as Record<string, unknown>) : {},
     candidates: Array.isArray(raw.candidates) ? (raw.candidates as HedgeRecommendationRecord["candidates"]) : [],
     warnings: Array.isArray(raw.warnings) ? raw.warnings.map(String) : [],

@@ -26,6 +26,7 @@ import {
   writeBetaCache
 } from "../src/services/hedgePersistenceService.js";
 import { createHedgeExecutionReview } from "../src/services/hedgeExecutionReviewService.js";
+import { buildHedgeCapitalEvidence } from "../src/services/hedgeCapitalEvidenceService.js";
 import type { HedgeRecommendationRecord } from "../src/services/hedgeTypes.js";
 import type { PortfolioRiskSnapshot } from "../src/services/portfolioRiskService.js";
 
@@ -265,6 +266,13 @@ const recommendation = (): HedgeRecommendationRecord => ({
   regime: { regime: "neutral" },
   score: { total: 20, band: "low" },
   sizing: { netProtectionTarget: 0 },
+  capitalEvidence: buildHedgeCapitalEvidence({
+    asOf: now,
+    allowedUnderlyings: ["SPY", "QQQ"],
+    positions: [],
+    orders: [],
+    ledger: []
+  }),
   leaps: { trimRecommendations: [] },
   candidates: [],
   warnings: [],
@@ -652,6 +660,13 @@ test("persists and verifies an HMAC hedge review on every read", () => {
     configurationFingerprint: "config_hash",
     generatedAt: now,
     signingKey: "persistence-test-key",
+    capitalEvidence: buildHedgeCapitalEvidence({
+      asOf: now,
+      allowedUnderlyings: ["SPY", "QQQ"],
+      positions: [],
+      orders: [],
+      ledger: []
+    }),
     candidate: {
       candidateId: "candidate-1",
       rank: 1,

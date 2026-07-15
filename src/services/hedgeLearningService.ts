@@ -95,6 +95,7 @@ export const buildAndPersistHedgeReview = async (
         generatedAt,
         signingKey,
         candidate: executableCandidate,
+        capitalEvidence: recommendation.capitalEvidence,
         reviewType: "entry",
         orderSide: "buy_to_open",
         requestId: `hedge_execution_review_${recommendation.recommendationId}`,
