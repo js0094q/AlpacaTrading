@@ -132,6 +132,15 @@ idempotency and provenance, active research, candidates by run, active leases,
 and checkpoints. Any unexplained discrepancy returns a non-zero status and
 blocks authority.
 
+The source mapper recognizes one bounded legacy case: `EXACT_LEGACY_REUSE`
+with `decision_id = candidate.id`, no decision snapshot, and no duplicate
+decision owner. That is the deterministic Phase 1B identity backfill, so the
+candidate is migrated with its stored candidate status and no invented
+lifecycle event. Historical `paper_review_artifact` entry lifecycle records
+whose candidate row is absent are included in the deferred Release 4 count.
+Other missing candidate snapshots, orphan lifecycle origins, duplicate
+decisions, or non-canonical links remain blocking discrepancies.
+
 Use this progression after schema and backfill validation:
 
 1. Keep all PostgreSQL feature flags off while migration version 2 is applied

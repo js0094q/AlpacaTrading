@@ -54,6 +54,14 @@ authority, an explicitly enabled SQLite audit projection may temporarily serve
 remaining Release 4 readers; PostgreSQL commits first and never falls back to
 SQLite.
 
+Phase 1B candidates with `EXACT_LEGACY_REUSE`, `decision_id = candidate.id`,
+no decision snapshot, and no duplicate decision owner retain that exact legacy
+identity and their stored candidate status; the migration does not fabricate a
+snapshot or lifecycle event. Historical `paper_review_artifact` entry events
+whose referenced candidate row is absent are counted and deferred to Release 4.
+Every other broken candidate-decision relationship remains an unexplained
+discrepancy and blocks control-plane authority.
+
 ## Architectural Decision
 
 Neon PostgreSQL owns state that requires concurrent access, transactional consistency, distributed scheduler ownership, or cross-workstream coordination. Local SQLite stores may retain only non-authoritative data. Workstreams synchronize through immutable, idempotent events; independently mutable trading databases are never merged.

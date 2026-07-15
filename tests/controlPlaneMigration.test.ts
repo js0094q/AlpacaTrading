@@ -128,6 +128,7 @@ const createBackfillSource = (path: string) => {
     CREATE TABLE paper_trade_candidates (
       id TEXT PRIMARY KEY,
       decision_id TEXT,
+      decision_linkage_status TEXT NOT NULL DEFAULT 'EXACT',
       research_run_id TEXT NOT NULL REFERENCES research_runs(id),
       symbol TEXT NOT NULL,
       as_of TEXT NOT NULL,
@@ -170,6 +171,8 @@ const createBackfillSource = (path: string) => {
     );
     CREATE TABLE decision_snapshots (
       decision_id TEXT PRIMARY KEY,
+      origin_type TEXT NOT NULL DEFAULT 'paper_trade_candidate',
+      decision_role TEXT NOT NULL DEFAULT 'entry',
       candidate_id TEXT,
       position_lifecycle_id TEXT,
       request_id TEXT,
@@ -463,6 +466,118 @@ test("maps production decision snapshots without optional request provenance col
     assert.equal(snapshot.candidateLifecycleEvents.length, 3);
     assert.equal(snapshot.candidateLifecycleEvents[0]?.requestId, "request-1");
     assert.equal(snapshot.candidateLifecycleEvents[0]?.correlationId, "correlation-1");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("accepts deterministic exact legacy candidate identity without a decision snapshot", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "control-plane-legacy-candidate-"));
+  try {
+    const sourcePath = join(directory, "source.db");
+    createBackfillSource(sourcePath);
+    const source = new DatabaseSync(sourcePath);
+    source.exec(`
+      DELETE FROM decision_lifecycle_events WHERE decision_id = 'decision-1';
+      DELETE FROM decision_snapshots WHERE decision_id = 'decision-1';
+      UPDATE paper_trade_candidates
+      SET decision_id = id,
+          decision_linkage_status = 'EXACT_LEGACY_REUSE'
+      WHERE id = 'candidate-1';
+    `);
+    source.close();
+
+    const snapshot = await readControlPlaneSnapshot(sourcePath);
+    assert.deepEqual(snapshot.sourceIssues, []);
+    assert.equal(snapshot.candidates[0]?.decisionId, "candidate-1");
+    assert.equal(snapshot.candidates[0]?.lifecycleStatus, "selected");
+    assert.deepEqual(
+      snapshot.candidateLifecycleEvents.map((event) => event.eventId),
+      ["event-2a"]
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("defers paper review lifecycle history whose candidate row is absent", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "control-plane-orphan-review-"));
+  try {
+    const sourcePath = join(directory, "source.db");
+    createBackfillSource(sourcePath);
+    const source = new DatabaseSync(sourcePath);
+    source.exec(`
+      INSERT INTO decision_snapshots(
+        decision_id, origin_type, decision_role, candidate_id, position_lifecycle_id
+      ) VALUES (
+        'decision-orphan-review', 'paper_review_artifact', 'entry',
+        'candidate-no-longer-present', NULL
+      );
+      INSERT INTO decision_lifecycle_events(
+        event_id, decision_id, status, reason_codes_json, occurred_at,
+        source_type, source_id, evidence_json
+      ) VALUES (
+        'event-orphan-review', 'decision-orphan-review', 'REVIEWED', '[]',
+        '2026-07-15T12:15:00.000Z', 'paper_review_artifact',
+        'review-orphan', '{}'
+      );
+    `);
+    source.close();
+
+    const snapshot = await readControlPlaneSnapshot(sourcePath);
+    assert.deepEqual(snapshot.sourceIssues, []);
+    assert.equal(
+      snapshot.candidateLifecycleEvents.some(
+        (event) => event.eventId === "event-orphan-review"
+      ),
+      false
+    );
+    assert.deepEqual(snapshot.deferredLifecycleEvents.at(-1), {
+      eventId: "event-orphan-review",
+      decisionId: "decision-orphan-review",
+      status: "reviewed",
+      sourceType: "paper_review_artifact",
+      sourceId: "review-orphan"
+    });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("keeps non-legacy missing snapshots and unexpected orphan origins blocking", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "control-plane-strict-linkage-"));
+  try {
+    const sourcePath = join(directory, "source.db");
+    createBackfillSource(sourcePath);
+    const source = new DatabaseSync(sourcePath);
+    source.exec(`
+      DELETE FROM decision_lifecycle_events WHERE decision_id = 'decision-1';
+      DELETE FROM decision_snapshots WHERE decision_id = 'decision-1';
+      UPDATE paper_trade_candidates
+      SET decision_id = id,
+          decision_linkage_status = 'EXACT'
+      WHERE id = 'candidate-1';
+      INSERT INTO decision_snapshots(
+        decision_id, origin_type, decision_role, candidate_id, position_lifecycle_id
+      ) VALUES (
+        'decision-orphan-candidate', 'paper_trade_candidate', 'entry',
+        'candidate-missing-unexpectedly', NULL
+      );
+      INSERT INTO decision_lifecycle_events(
+        event_id, decision_id, status, reason_codes_json, occurred_at,
+        source_type, source_id, evidence_json
+      ) VALUES (
+        'event-orphan-candidate', 'decision-orphan-candidate', 'SELECTED', '[]',
+        '2026-07-15T12:15:00.000Z', 'paper_trade_candidate',
+        'candidate-missing-unexpectedly', '{}'
+      );
+    `);
+    source.close();
+
+    const snapshot = await readControlPlaneSnapshot(sourcePath);
+    const issueTypes = snapshot.sourceIssues.map((issue) => issue.discrepancyType);
+    assert.ok(issueTypes.includes("CANDIDATE_DECISION_LINK_CONFLICT"));
+    assert.ok(issueTypes.includes("LIFECYCLE_CANDIDATE_LINK_CONFLICT"));
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -782,6 +897,7 @@ test("maps SQLite control-plane rows without changing IDs, timestamps, or nulls"
   const candidate = mapSqliteCandidate({
     id: "candidate-1",
     decision_id: null,
+    decision_linkage_status: "LEGACY_UNLINKED",
     research_run_id: "run-1",
     symbol: "SPY",
     as_of: "2026-07-15T12:04:00.000Z",
@@ -858,6 +974,7 @@ test("rejects malformed SQLite JSON without including the value in the error", (
       mapSqliteCandidate({
         id: "candidate-json",
         decision_id: null,
+        decision_linkage_status: "LEGACY_UNLINKED",
         research_run_id: "run-json",
         symbol: "SPY",
         as_of: "2026-07-15T12:04:00.000Z",
