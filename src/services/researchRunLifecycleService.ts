@@ -214,15 +214,16 @@ export const updateResearchRunUniverseSize = (
   runId: string,
   universeSize: number,
   at = new Date()
-): void => {
-  getDb()
+): boolean =>
+  Number(
+    getDb()
     .prepare(`
       UPDATE research_runs
       SET universe_size = ?, heartbeat_at = ?
       WHERE id = ? AND status = 'running'
     `)
-    .run(universeSize, at.toISOString(), runId);
-};
+      .run(universeSize, at.toISOString(), runId).changes
+  ) === 1;
 
 export const finishResearchRun = (
   runId: string,

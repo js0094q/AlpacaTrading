@@ -79,6 +79,21 @@ interface AlreadyRunningSummary {
   warnings: string[];
 }
 
+class ResearchRunLeaseLostError extends Error {
+  readonly code = "RESEARCH_RUN_LEASE_LOST";
+
+  constructor(runId: string) {
+    super(`Research run ${runId} lost its active lifecycle lease.`);
+    this.name = "ResearchRunLeaseLostError";
+  }
+}
+
+const assertResearchRunLease = (runId: string, renewed?: boolean): void => {
+  if (!(renewed ?? heartbeatResearchRun(runId))) {
+    throw new ResearchRunLeaseLostError(runId);
+  }
+};
+
 interface PersistedRunSummary {
   warnings: string[];
   alpacaAssetFilter?: AlpacaAssetFilterSummary;
@@ -304,10 +319,10 @@ export const runResearchDaily = async (
     await seedInitialUniverse();
     universeSize = getActiveUniverse().length;
     symbols = getActiveSymbols();
-    updateResearchRunUniverseSize(runId, universeSize);
+    assertResearchRunLease(runId, updateResearchRunUniverseSize(runId, universeSize));
 
     await ingestBars({ symbols, timeframe: "1Day", start: barLookbackStart });
-    heartbeatResearchRun(runId);
+    assertResearchRunLease(runId);
     if (optionsEnabled) {
       try {
         const optionUnderlyings = dedupeSymbols([
@@ -316,21 +331,21 @@ export const runResearchDaily = async (
         ]);
         await ingestOptionContracts({ underlyingSymbols: optionUnderlyings });
         await ingestOptionSnapshots({ underlyingSymbols: optionUnderlyings });
-        heartbeatResearchRun(runId);
       } catch (error) {
         warnings.push(
           `Options data ingestion skipped; continuing equity candidate generation: ${safeWarningMessage(error)}`
         );
       }
+      assertResearchRunLease(runId);
     }
 
     await buildFeatures({ symbols, start: barLookbackStart });
-    heartbeatResearchRun(runId);
+    assertResearchRunLease(runId);
     await runLearning();
-    heartbeatResearchRun(runId);
+    assertResearchRunLease(runId);
 
     targets = parseTargetRows(await generateTargets({ riskProfile }));
-    heartbeatResearchRun(runId);
+    assertResearchRunLease(runId);
 
     const filteredTargets = await buildAlpacaFilteredTargets(targets, useAlpacaAssets);
     if (filteredTargets.warnings.length) {
@@ -339,7 +354,7 @@ export const runResearchDaily = async (
     if (filteredTargets.filterSummary) {
       alpacaAssetFilter = filteredTargets.filterSummary;
     }
-    heartbeatResearchRun(runId);
+    assertResearchRunLease(runId);
 
     const ranked = rankResearchCandidates({
       researchRunId: runId,
@@ -364,7 +379,7 @@ export const runResearchDaily = async (
       candidates: ranked.candidates,
       riskProfile
     });
-    heartbeatResearchRun(runId);
+    assertResearchRunLease(runId);
 
     warnings.push(...ranked.warnings);
 

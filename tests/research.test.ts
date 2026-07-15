@@ -911,6 +911,64 @@ describe("Research orchestration", () => {
     );
   });
 
+  test("stops before candidate writes when the research lease is lost", async () => {
+    let leaseRevoked = false;
+    globalThis.fetch = async (input: string | Request | URL) => {
+      const target = String(input);
+      if (target.includes("/v2/stocks/bars")) {
+        const activeRun = getDb()
+          .prepare("SELECT id, status FROM research_runs ORDER BY started_at DESC LIMIT 1")
+          .get() as { id: string; status: string };
+        if (!leaseRevoked) {
+          assert.equal(activeRun.status, "running");
+          getDb()
+            .prepare(`
+              UPDATE research_runs
+              SET status = 'failed', completed_at = ?, recovery_reason = 'TEST_LEASE_RECOVERY'
+              WHERE id = ? AND status = 'running'
+            `)
+            .run(new Date().toISOString(), activeRun.id);
+          leaseRevoked = true;
+        }
+
+        const endpoint = new URL(target);
+        const symbols = (endpoint.searchParams.get("symbols") || "")
+          .split(",")
+          .filter(Boolean)
+          .map((value) => value.toUpperCase());
+        return makeMockResponse({
+          bars: buildBarsPayload(symbols).barsBySymbol
+        });
+      }
+      return makeMockResponse({});
+    };
+
+    await assert.rejects(
+      () => runResearchDaily({ riskProfile: "moderate", optionsEnabled: false, maxCandidates: 4 }),
+      (error: unknown) =>
+        error instanceof Error &&
+        (error as Error & { code?: string }).code === "RESEARCH_RUN_LEASE_LOST"
+    );
+
+    const recovered = getDb()
+      .prepare("SELECT id, status, recovery_reason FROM research_runs ORDER BY started_at DESC LIMIT 1")
+      .get() as { id: string; status: string; recovery_reason: string };
+    assert.equal(recovered.status, "failed");
+    assert.equal(recovered.recovery_reason, "TEST_LEASE_RECOVERY");
+    assert.equal(
+      readCount(
+        `SELECT COUNT(*) AS count FROM paper_trade_candidates WHERE research_run_id = '${recovered.id}'`
+      ),
+      0
+    );
+    assert.equal(
+      readCount(
+        `SELECT COUNT(*) AS count FROM paper_trade_plans WHERE research_run_id = '${recovered.id}'`
+      ),
+      0
+    );
+  });
+
   test("completes when bars response includes next_page_token null", async () => {
     setMockFetchForSuccess(false, null, null);
     const result = await runResearchDaily({ riskProfile: "moderate", optionsEnabled: false, maxCandidates: 4 });
