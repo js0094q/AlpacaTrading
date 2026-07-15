@@ -1,5 +1,24 @@
 # Resume Context: Alpaca Investing Server Provisioning
 
+## Paper runtime contention deployment handoff (2026-07-15)
+
+- Stop the control service and affected SQLite writer timers before cutover;
+  record their prior enabled/active state and preserve all paper/live flags.
+- Back up the production database, run `db:migrate` twice against a copy, run
+  `db:verify`, compare legacy row counts, and check integrity/foreign keys.
+- Run production `db:migrate` exactly once before restarting affected services.
+  Ordinary commands now fail with `DATABASE_MIGRATION_REQUIRED` instead of
+  applying pending schema changes.
+- After restart, run `system:recover` first. Confirm the pre-existing stale
+  `research_runs` row is `failed` with
+  `WORKER_TERMINATED_OR_HEARTBEAT_EXPIRED` and one immutable recovery event.
+- Validate one guarded research request and one duplicate request; the duplicate
+  must return `already_running` without a second worker. Validate read-only 0DTE
+  discovery only. Do not run a confirmed executor or submit any order.
+- Health commands use a 9-second shared account/clock budget within the
+  10-second control deadline. Structured child errors remain primary over Node
+  warnings.
+
 ## Adaptive allocation safety-floor pre-deploy handoff (2026-07-14)
 
 - A redacted, read-only VPS check found `/home/alpaca/Alpaca-Trading` clean at

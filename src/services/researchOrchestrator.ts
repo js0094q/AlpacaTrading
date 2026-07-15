@@ -15,11 +15,16 @@ import { ingestOptionContracts, ingestOptionSnapshots } from "./optionsService.j
 import { buildFeatures } from "./featureService.js";
 import { runLearning } from "./learningService.js";
 import { generateTargets } from "./targetService.js";
-import { dedupeSymbols, nowIso, normalizeSymbol } from "../lib/utils.js";
-import { getDb } from "../lib/db.js";
+import { dedupeSymbols, normalizeSymbol } from "../lib/utils.js";
 import { rankResearchCandidates, persistCandidateDecisions } from "./candidateRankingService.js";
 import { buildPaperTradePlans } from "./paperTradeService.js";
 import type { PaperTradeCandidateRow } from "../types.js";
+import {
+  finishResearchRun,
+  heartbeatResearchRun,
+  reserveResearchRun,
+  updateResearchRunUniverseSize
+} from "./researchRunLifecycleService.js";
 
 interface ResearchDailyInput {
   riskProfile?: "aggressive" | "conservative" | "moderate";
@@ -58,45 +63,28 @@ interface RunSummary {
   alpacaAssetFilter?: AlpacaAssetFilterSummary;
 }
 
+interface AlreadyRunningSummary {
+  status: "already_running";
+  runId: string;
+  activeRunId: string;
+  startedAt: string;
+  heartbeatAt: string;
+  riskProfile: "aggressive" | "conservative" | "moderate";
+  optionsEnabled: boolean;
+  universeSize: number;
+  targetsGenerated: number;
+  candidatesSelected: number;
+  barLookbackDays: number;
+  barLookbackStart: string;
+  warnings: string[];
+}
+
 interface PersistedRunSummary {
   warnings: string[];
   alpacaAssetFilter?: AlpacaAssetFilterSummary;
 }
 
 const parseTargetRows = (input: Awaited<ReturnType<typeof generateTargets>>) => input.rows;
-
-const createRunRow = (input: {
-  id: string;
-  riskProfile: string;
-  optionsEnabled: boolean;
-  universeSize: number;
-  config: string;
-}) => {
-  getDb()
-    .prepare(`
-      INSERT INTO research_runs(
-        id,
-        started_at,
-        status,
-        risk_profile,
-        options_enabled,
-        universe_size,
-        targets_generated,
-        candidates_selected,
-        error_message,
-        config_json,
-        summary_json
-      ) VALUES (?, ?, 'running', ?, ?, ?, 0, 0, NULL, ?, NULL)
-    `)
-    .run(
-      input.id,
-      nowIso(),
-      input.riskProfile,
-      input.optionsEnabled ? 1 : 0,
-      input.universeSize,
-      input.config
-    );
-};
 
 const finishRun = (
   runId: string,
@@ -110,28 +98,13 @@ const finishRun = (
   }
 ) => {
   const summaryPayload = input.summary ? input.summary : { warnings: input.warnings || [] };
-
-  getDb()
-    .prepare(`
-      UPDATE research_runs
-      SET
-        status = ?,
-        completed_at = ?,
-        targets_generated = ?,
-        candidates_selected = ?,
-        error_message = COALESCE(?, error_message),
-        summary_json = COALESCE(?, summary_json)
-      WHERE id = ?
-    `)
-    .run(
-      input.status,
-      nowIso(),
-      input.targetsGenerated,
-      input.candidatesSelected,
-      input.errorMessage || null,
-      JSON.stringify(summaryPayload),
-      runId
-    );
+  finishResearchRun(runId, {
+    status: input.status,
+    targetsGenerated: input.targetsGenerated,
+    candidatesSelected: input.candidatesSelected,
+    errorMessage: input.errorMessage || null,
+    summaryJson: JSON.stringify(summaryPayload)
+  });
 };
 
 const pickDefaults = (riskProfile: "aggressive" | "moderate" | "conservative") => {
@@ -259,7 +232,7 @@ const discoveryOptionUnderlyings = () => {
 
 export const runResearchDaily = async (
   input: ResearchDailyInput = {}
-): Promise<RunSummary> => {
+): Promise<RunSummary | AlreadyRunningSummary> => {
   const runId = `research_${crypto.randomUUID()}`;
   const riskProfile = input.riskProfile || "moderate";
   const optionsEnabled = input.optionsEnabled || false;
@@ -273,14 +246,6 @@ export const runResearchDaily = async (
   if (isAggressiveMode && !config.enableAggressivePaperStrategies) {
     throw new Error("AGGRESSIVE paper mode requires ENABLE_AGGRESSIVE_PAPER_STRATEGIES=true.");
   }
-
-  if (useAlpacaAssets) {
-    getAlpacaPaperCredentials();
-  }
-
-  await seedInitialUniverse();
-  const universeSize = getActiveUniverse().length;
-  const symbols = getActiveSymbols();
 
   const configPayload = {
     riskProfile,
@@ -298,22 +263,51 @@ export const runResearchDaily = async (
     useAlpacaAssets
   };
 
-  createRunRow({
-    id: runId,
+  const reservation = reserveResearchRun({
+    runId,
     riskProfile,
     optionsEnabled,
-    universeSize,
-    config: JSON.stringify(configPayload)
+    configJson: JSON.stringify(configPayload),
+    requestId: process.env.RESEARCH_REQUEST_ID?.trim() || undefined,
+    correlationId: process.env.RESEARCH_CORRELATION_ID?.trim() || undefined
   });
+  if (reservation.status === "already_running") {
+    return {
+      status: "already_running",
+      runId: reservation.activeRunId,
+      activeRunId: reservation.activeRunId,
+      startedAt: reservation.startedAt,
+      heartbeatAt: reservation.heartbeatAt,
+      riskProfile,
+      optionsEnabled,
+      universeSize: 0,
+      targetsGenerated: 0,
+      candidatesSelected: 0,
+      barLookbackDays,
+      barLookbackStart,
+      warnings: ["RESEARCH_ALREADY_RUNNING"]
+    };
+  }
 
-  const startedAt = nowIso();
+  const startedAt = reservation.startedAt;
+  let universeSize = 0;
+  let symbols: string[] = [];
   let targets: Awaited<ReturnType<typeof parseTargetRows>> = [];
   let persistedCandidates: PaperTradeCandidateRow[] = [];
   const warnings: string[] = [];
   let alpacaAssetFilter: AlpacaAssetFilterSummary | undefined;
 
   try {
+    if (useAlpacaAssets) {
+      getAlpacaPaperCredentials();
+    }
+    await seedInitialUniverse();
+    universeSize = getActiveUniverse().length;
+    symbols = getActiveSymbols();
+    updateResearchRunUniverseSize(runId, universeSize);
+
     await ingestBars({ symbols, timeframe: "1Day", start: barLookbackStart });
+    heartbeatResearchRun(runId);
     if (optionsEnabled) {
       try {
         const optionUnderlyings = dedupeSymbols([
@@ -322,6 +316,7 @@ export const runResearchDaily = async (
         ]);
         await ingestOptionContracts({ underlyingSymbols: optionUnderlyings });
         await ingestOptionSnapshots({ underlyingSymbols: optionUnderlyings });
+        heartbeatResearchRun(runId);
       } catch (error) {
         warnings.push(
           `Options data ingestion skipped; continuing equity candidate generation: ${safeWarningMessage(error)}`
@@ -330,9 +325,12 @@ export const runResearchDaily = async (
     }
 
     await buildFeatures({ symbols, start: barLookbackStart });
+    heartbeatResearchRun(runId);
     await runLearning();
+    heartbeatResearchRun(runId);
 
     targets = parseTargetRows(await generateTargets({ riskProfile }));
+    heartbeatResearchRun(runId);
 
     const filteredTargets = await buildAlpacaFilteredTargets(targets, useAlpacaAssets);
     if (filteredTargets.warnings.length) {
@@ -341,6 +339,7 @@ export const runResearchDaily = async (
     if (filteredTargets.filterSummary) {
       alpacaAssetFilter = filteredTargets.filterSummary;
     }
+    heartbeatResearchRun(runId);
 
     const ranked = rankResearchCandidates({
       researchRunId: runId,
@@ -365,6 +364,7 @@ export const runResearchDaily = async (
       candidates: ranked.candidates,
       riskProfile
     });
+    heartbeatResearchRun(runId);
 
     warnings.push(...ranked.warnings);
 

@@ -32,6 +32,12 @@ import {
   type RuntimeMutationActionType,
   type RuntimePreflightChecks
 } from "../../src/services/runtimeMutationPreflight.js";
+import {
+  COMMAND_OUTPUT_LIMIT,
+  GuardedCommandError,
+  normalizeCommandFailure,
+  type GuardedCommandFailure
+} from "./commandResult.js";
 
 type RiskProfile = "moderate" | "aggressive" | "conservative";
 type AssetClass = "all" | "equity" | "option";
@@ -86,6 +92,7 @@ type ErrorEnvelope = {
   guard?: EnvironmentGuardState;
   checks?: RuntimePreflightChecks;
   failedChecks?: string[];
+  command?: GuardedCommandFailure;
 };
 
 type AuditEntry = {
@@ -101,7 +108,11 @@ type AuditEntry = {
   error?: string;
 };
 
-type ActionHandler = (input: ControlInput, requestId: string) => Promise<unknown>;
+type ActionHandler = (
+  input: ControlInput,
+  requestId: string,
+  correlationId: string
+) => Promise<unknown>;
 
 type ControlRuntimePreflight = {
   actionType: RuntimeMutationActionType;
@@ -191,6 +202,8 @@ const runCommandViaSpawn = (
   return new Promise((resolve, reject) => {
     let output = "";
     let errored = "";
+    let timedOut = false;
+    let settled = false;
     const started = Date.now();
     const child = spawn("npm", ["--silent", "run", script, "--", ...args], {
       detached: process.platform !== "win32",
@@ -202,32 +215,44 @@ const runCommandViaSpawn = (
     });
 
     const timeout = setTimeout(() => {
+      timedOut = true;
       killProcessTree(child);
-      reject(new Error(`Command timed out after ${timeoutMs}ms (${action}).`));
     }, timeoutMs);
 
     child.stdout?.on("data", (chunk) => {
-      output += String(chunk);
+      output = `${output}${String(chunk)}`.slice(-COMMAND_OUTPUT_LIMIT * 2);
     });
     child.stderr?.on("data", (chunk) => {
-      errored += String(chunk);
+      errored = `${errored}${String(chunk)}`.slice(-COMMAND_OUTPUT_LIMIT * 2);
     });
     child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timeout);
-      reject(error);
+      const failure = normalizeCommandFailure({
+        exitCode: null,
+        signal: null,
+        timedOut,
+        stdout: output,
+        stderr: `${errored}\n${error.message}`
+      });
+      reject(new GuardedCommandError(action, failure));
     });
     child.on("close", (code, signal) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timeout);
       const durationMs = Date.now() - started;
 
-      if (signal === "SIGKILL") {
-        reject(new Error(`Command terminated by timeout ${timeoutMs}ms`));
-        return;
-      }
-
-      if (code !== 0) {
-        const err = redactSensitiveText((errored || output || "Command execution failed").trim());
-        reject(new Error(`${action} command failed (exit ${code}): ${err}`));
+      if (code !== 0 || signal || timedOut) {
+        const failure = normalizeCommandFailure({
+          exitCode: code,
+          signal,
+          timedOut,
+          stdout: output,
+          stderr: errored
+        });
+        reject(new GuardedCommandError(action, failure));
         return;
       }
 
@@ -278,11 +303,20 @@ const command = (
   }
 ) => commandRunner(script, args, timeoutMs, requestId, action, options);
 
-const researchRunEnv = () => ({
+const researchRunEnv = (requestId: string, correlationId: string) => ({
   ALPACA_REQUEST_TIMEOUT_MS:
     process.env.VPS_RESEARCH_REQUEST_TIMEOUT_MS?.trim() || "10000",
   ALPACA_MAX_RETRIES:
-    process.env.VPS_RESEARCH_MAX_RETRIES?.trim() || "0"
+    process.env.VPS_RESEARCH_MAX_RETRIES?.trim() || "0",
+  RESEARCH_REQUEST_ID: requestId,
+  RESEARCH_CORRELATION_ID: correlationId
+});
+
+const healthRunEnv = () => ({
+  ALPACA_HEALTH_OPERATION_TIMEOUT_MS:
+    process.env.VPS_HEALTH_OPERATION_TIMEOUT_MS?.trim() || "9000",
+  ALPACA_HEALTH_COMPLETION_MARGIN_MS:
+    process.env.VPS_HEALTH_COMPLETION_MARGIN_MS?.trim() || "750"
 });
 
 const safeInteger = (value: unknown, fallback: number, min = 1, max = 50) => {
@@ -503,7 +537,8 @@ const wrapRouteError = (
   code: string,
   message: string,
   guard?: EnvironmentGuardState,
-  failedChecks: string[] = []
+  failedChecks: string[] = [],
+  commandFailure?: GuardedCommandFailure
 ): ErrorEnvelope => ({
   ok: false,
   action,
@@ -513,7 +548,8 @@ const wrapRouteError = (
     code,
     message: redactSensitiveText(message)
   },
-  ...(guard ? { guard, checks: guard, failedChecks } : {})
+  ...(guard ? { guard, checks: guard, failedChecks } : {}),
+  ...(commandFailure ? { command: commandFailure } : {})
 });
 
 type MutabilityRequirement = {
@@ -529,7 +565,8 @@ const verifyPaperMutability = async (requirements: MutabilityRequirement = {}) =
     ["--format=json"],
     TIMEOUT_DEFAULT_MS,
     randomUUID(),
-    "health"
+    "health",
+    { env: healthRunEnv() }
   );
   if (!health || typeof health !== "object") {
     throw new Error("Health check output was not parseable JSON.");
@@ -750,7 +787,9 @@ const actionHandlers: Record<string, ActionConfig> = {
     requireMutationPrecheck: false,
     action: "health",
     handler: async (_input, requestId) =>
-      command("alpaca:health", ["--format=json"], 10_000, requestId, "health")
+      command("alpaca:health", ["--format=json"], 10_000, requestId, "health", {
+        env: healthRunEnv()
+      })
   },
   "/api/v1/hedge/recommendation": {
     method: "GET",
@@ -934,7 +973,7 @@ const actionHandlers: Record<string, ActionConfig> = {
     requireMutationPrecheck: true,
     runtimePreflight: { actionType: "research" },
     action: "research.run",
-    handler: async (input, requestId) =>
+    handler: async (input, requestId, correlationId) =>
       command(
         "research:daily",
         [
@@ -949,7 +988,7 @@ const actionHandlers: Record<string, ActionConfig> = {
         requestId,
         "research.run",
         {
-          env: researchRunEnv()
+          env: researchRunEnv(requestId, correlationId)
         }
       )
   },
@@ -960,7 +999,7 @@ const actionHandlers: Record<string, ActionConfig> = {
     requireMutationPrecheck: true,
     runtimePreflight: { actionType: "research" },
     action: "paper.actions.research.run",
-    handler: async (input, requestId) =>
+    handler: async (input, requestId, correlationId) =>
       command(
         "paper:research",
         [
@@ -975,7 +1014,7 @@ const actionHandlers: Record<string, ActionConfig> = {
         requestId,
         "paper.actions.research.run",
         {
-          env: researchRunEnv()
+          env: researchRunEnv(requestId, correlationId)
         }
       )
   },
@@ -1160,7 +1199,13 @@ const actionHandlers: Record<string, ActionConfig> = {
 export const ACTION_HANDLERS = actionHandlers;
 
 const parseError = (error: unknown) =>
-  redactSensitiveText(error instanceof Error ? error.message : String(error || "Control request failed."));
+  redactSensitiveText(
+    error instanceof GuardedCommandError
+      ? error.result.error.message
+      : error instanceof Error
+        ? error.message
+        : String(error || "Control request failed.")
+  );
 
 const classifyErrorCode = (message: string) =>
   message.includes("token")
@@ -1172,7 +1217,11 @@ const classifyErrorCode = (message: string) =>
         : "CONTROL_ACTION_ERROR";
 
 const routeErrorCode = (error: unknown, message: string) =>
-  error instanceof EnvironmentGuardError ? error.code : classifyErrorCode(message);
+  error instanceof EnvironmentGuardError
+    ? error.code
+    : error instanceof GuardedCommandError
+      ? error.code
+      : classifyErrorCode(message);
 
 const routeErrorStatus = (error: unknown, code: string) =>
   error instanceof EnvironmentGuardError
@@ -1227,7 +1276,7 @@ const routeHandler = async (request: IncomingMessage, response: any, config: Act
       await verifyPaperMutability(preflight);
     }
 
-    const data = await config.handler(input, requestId);
+    const data = await config.handler(input, requestId, correlationId);
     const durationMs = Date.now() - startMs;
     const finishedAt = new Date(startMs + durationMs).toISOString();
     const payload = wrapSuccess(
@@ -1279,7 +1328,8 @@ const routeHandler = async (request: IncomingMessage, response: any, config: Act
       code,
       message,
       error instanceof EnvironmentGuardError ? error.guard : undefined,
-      error instanceof EnvironmentGuardError ? error.failedChecks : []
+      error instanceof EnvironmentGuardError ? error.failedChecks : [],
+      error instanceof GuardedCommandError ? error.result : undefined
     );
     const durationMs = Date.now() - startMs;
 

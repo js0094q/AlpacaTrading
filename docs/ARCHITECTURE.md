@@ -93,3 +93,29 @@ only a dashboard/control bridge and does not execute orders or own SQLite state.
 Late-day paper operations write a fresh signed artifact with
 `sourceAction=paper.ops.late_day` and the normal 30-minute artifact TTL before
 the separately scheduled reviewed exit executor runs.
+
+### Runtime schema and command boundaries
+
+SQLite schema mutation belongs to the explicit `db:migrate` deployment path.
+Ordinary CLI startup configures connection-local foreign keys and a bounded
+busy timeout, reads the migration ledger, and fails closed with
+`DATABASE_MIGRATION_REQUIRED` if an existing database is not current. It does
+not execute DDL or enter a migration writer transaction when all required
+versions are applied. An empty local/test database may initialize through the
+same transactional migration runner. Each pending migration group rechecks its
+ledger state after acquiring `BEGIN IMMEDIATE`, so concurrent first starters do
+not apply a migration twice.
+
+The dashboard control runner retains bounded, redacted stdout and stderr as
+separate fields. Structured stdout failures remain causal; Node warnings are
+secondary diagnostics. The 10-second Alpaca health child receives a 9-second
+monotonic operation budget with a completion margin, and its sequential account
+and clock requests share that deadline.
+
+Paper research uses a SQLite-backed single-flight reservation. A fresh
+`research_runs` lease returns `already_running` before market-data work starts.
+Heartbeats advance between major stages. Autonomous recovery and research
+preflight use the same 15-minute stale rule; stale rows transition to the
+existing `failed` state with worker/request/correlation evidence and
+`WORKER_TERMINATED_OR_HEARTBEAT_EXPIRED`. Recovery never submits or retries an
+order or source workload.

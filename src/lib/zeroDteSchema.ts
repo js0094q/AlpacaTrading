@@ -1,4 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
+import { runMigrationGroup } from "./sqliteMigrations.js";
 
 export const ZERO_DTE_MIGRATION_VERSION = "2026-07-13-zero-dte-level-2";
 export const ZERO_DTE_HARDENING_MIGRATION_VERSION =
@@ -639,40 +640,28 @@ END;
 
 export const runZeroDteMigrations = (db: DatabaseSync): void => {
   db.exec("PRAGMA foreign_keys = ON;");
-  const hasExistingZeroDteSchema = Boolean(
-    db
-      .prepare(
-        "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'zero_dte_engine_runs'"
-      )
-      .get()
-  );
-  try {
-    db.exec("BEGIN IMMEDIATE;");
-    db.exec(zeroDteSchema);
-    try {
-      db.exec(zeroDteUniqueIndexes);
-    } catch (error) {
-      if (!hasExistingZeroDteSchema) {
-        throw error;
+  runMigrationGroup(
+    db,
+    [ZERO_DTE_MIGRATION_VERSION, ZERO_DTE_HARDENING_MIGRATION_VERSION],
+    () => {
+      const hasExistingZeroDteSchema = Boolean(
+        db
+          .prepare(
+            "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'zero_dte_engine_runs'"
+          )
+          .get()
+      );
+      db.exec(zeroDteSchema);
+      try {
+        db.exec(zeroDteUniqueIndexes);
+      } catch (error) {
+        if (!hasExistingZeroDteSchema) {
+          throw error;
+        }
+        // Keep existing rows intact. The hardening triggers below still enforce
+        // uniqueness for future writes if a legacy database contains duplicates.
       }
-      // Keep existing rows intact. The hardening triggers below still enforce
-      // uniqueness for future writes if a legacy database contains duplicates.
+      db.exec(zeroDteHardeningSchema);
     }
-    db.exec(zeroDteHardeningSchema);
-    const appliedAt = new Date().toISOString();
-    db.prepare(
-      "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)"
-    ).run(ZERO_DTE_MIGRATION_VERSION, appliedAt);
-    db.prepare(
-      "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)"
-    ).run(ZERO_DTE_HARDENING_MIGRATION_VERSION, appliedAt);
-    db.exec("COMMIT;");
-  } catch (error) {
-    try {
-      db.exec("ROLLBACK;");
-    } catch {
-      // Preserve the original migration failure if rollback is unavailable.
-    }
-    throw error;
-  }
+  );
 };

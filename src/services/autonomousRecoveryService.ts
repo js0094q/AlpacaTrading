@@ -2,6 +2,12 @@ import { execFileSync } from "node:child_process"
 import { createHash, randomUUID } from "node:crypto"
 
 import { getDb } from "../lib/db.js"
+import {
+  RESEARCH_RECOVERY_REASON,
+  RESEARCH_RUN_STALE_AFTER_MS,
+  countStaleResearchRuns,
+  recoverStaleResearchRunsInTransaction
+} from "./researchRunLifecycleService.js"
 
 export const AUTONOMOUS_RECOVERY_CONFIG_VERSION = "autonomous-recovery-v1"
 
@@ -9,6 +15,7 @@ const RECOVERY_POLICY = {
   universeLifecycleStaleAfterMs: 90_000,
   learningGovernanceStaleAfterMs: 5 * 60_000,
   paperOperationStaleAfterMs: 15 * 60_000,
+  researchRunStaleAfterMs: RESEARCH_RUN_STALE_AFTER_MS,
   recoverablePaperOperationActions: [
     "paper.ops.morning",
     "paper.ops.midday",
@@ -39,6 +46,7 @@ export interface AutonomousRecoveryResult {
     universeLifecycleRuns: number
     learningGovernanceRuns: number
     paperOperations: number
+    researchRuns: number
   }
   gitSha: string
   configVersion: string
@@ -227,6 +235,11 @@ export const applyAutonomousRecovery = (now = new Date()): AutonomousRecoveryRes
     const recoveredLifecycleRows = markStaleLifecycleRunsFailed(lifecycleRows, recoveredAt)
     const recoveredLearningRows = markStaleLearningGovernanceRunsFailed(learningRows, recoveredAt)
     const recoveredPaperOperations = markStalePaperOperationsFailed(paperOperationRows, recoveredAt)
+    const recoveredResearchRuns = recoverStaleResearchRunsInTransaction({
+      db,
+      now: new Date(recoveredAt),
+      source: "autonomous_recovery"
+    })
 
     for (const row of recoveredLifecycleRows) {
       writeRecoveryEvent({
@@ -265,11 +278,30 @@ export const applyAutonomousRecovery = (now = new Date()): AutonomousRecoveryRes
         extraEvidence: { actionType: row.action_type }
       })
     }
+    for (const row of recoveredResearchRuns) {
+      writeRecoveryEvent({
+        recoveryRunId: id,
+        sourceTable: "research_runs",
+        source: { id: row.id, started_at: row.startedAt },
+        recoveredAt,
+        recoveryCode: RESEARCH_RECOVERY_REASON,
+        staleAfterMs: RECOVERY_POLICY.researchRunStaleAfterMs,
+        gitSha,
+        configHash,
+        extraEvidence: {
+          lastHeartbeatAt: row.lastHeartbeatAt,
+          workerIdentity: row.workerIdentity,
+          requestId: row.requestId,
+          correlationId: row.correlationId
+        }
+      })
+    }
 
     const recovered = {
       universeLifecycleRuns: recoveredLifecycleRows.length,
       learningGovernanceRuns: recoveredLearningRows.length,
-      paperOperations: recoveredPaperOperations.length
+      paperOperations: recoveredPaperOperations.length,
+      researchRuns: recoveredResearchRuns.length
     }
     const completedAt = new Date().toISOString()
     db.prepare(
@@ -278,13 +310,15 @@ export const applyAutonomousRecovery = (now = new Date()): AutonomousRecoveryRes
            completed_at = ?,
            recovered_universe_lifecycle_runs = ?,
            recovered_learning_governance_runs = ?,
-           recovered_paper_operations = ?
+           recovered_paper_operations = ?,
+           recovered_research_runs = ?
        WHERE id = ?`
     ).run(
       completedAt,
       recovered.universeLifecycleRuns,
       recovered.learningGovernanceRuns,
       recovered.paperOperations,
+      recovered.researchRuns,
       id
     )
     db.exec("COMMIT")
@@ -340,7 +374,8 @@ export const getAutonomousRecoveryStatus = (now = new Date()) => {
       ).length,
       paperOperations: getStalePaperOperations(
         getCutoff(now, RECOVERY_POLICY.paperOperationStaleAfterMs)
-      ).length
+      ).length,
+      researchRuns: countStaleResearchRuns(now, db)
     }
   }
 }

@@ -67,6 +67,7 @@ const resetDatabase = () => {
     DELETE FROM paper_learning_governance_decisions;
     DELETE FROM paper_learning_governance_runs;
     DELETE FROM paper_operation_log;
+    DELETE FROM research_runs;
   `)
 }
 
@@ -90,6 +91,12 @@ describe("autonomous recovery service", () => {
       action_type: "paper.ops.morning",
       trigger_source: "scheduler"
     })
+    insertRunningRow("research_runs", "stale-research", startedAt, {
+      heartbeat_at: startedAt,
+      worker_identity: "test-worker:123",
+      request_id: "test-request",
+      correlation_id: "test-correlation"
+    })
 
     const previousGitSha = process.env.GIT_SHA
     process.env.GIT_SHA = "test-recovery-sha"
@@ -108,7 +115,8 @@ describe("autonomous recovery service", () => {
     assert.deepEqual(result.recovered, {
       universeLifecycleRuns: 1,
       learningGovernanceRuns: 1,
-      paperOperations: 1
+      paperOperations: 1,
+      researchRuns: 1
     })
     assert.equal(
       (db.prepare("SELECT status FROM universe_lifecycle_runs WHERE id = ?").get("stale-lifecycle") as { status: string }).status,
@@ -122,9 +130,23 @@ describe("autonomous recovery service", () => {
       (db.prepare("SELECT error_message FROM paper_operation_log WHERE id = ?").get("stale-paper-ops") as { error_message: string }).error_message,
       "RECOVERED_INCOMPLETE_OPERATION"
     )
+    const research = db.prepare(
+      "SELECT status, recovery_reason, recovery_source, worker_identity FROM research_runs WHERE id = ?"
+    ).get("stale-research") as {
+      status: string
+      recovery_reason: string
+      recovery_source: string
+      worker_identity: string
+    }
+    assert.deepEqual({ ...research }, {
+      status: "failed",
+      recovery_reason: "WORKER_TERMINATED_OR_HEARTBEAT_EXPIRED",
+      recovery_source: "autonomous_recovery",
+      worker_identity: "test-worker:123"
+    })
     assert.equal(
       (db.prepare("SELECT COUNT(*) AS count FROM autonomous_recovery_events").get() as { count: number }).count,
-      3
+      4
     )
     assert.equal(result.gitSha, "test-recovery-sha")
     assert.equal(
@@ -142,6 +164,9 @@ describe("autonomous recovery service", () => {
       action_type: "paper.execute",
       trigger_source: "scheduler"
     })
+    insertRunningRow("research_runs", "fresh-research", freshTimestamp, {
+      heartbeat_at: freshTimestamp
+    })
 
     const first = applyAutonomousRecovery()
     const second = applyAutonomousRecovery()
@@ -150,7 +175,8 @@ describe("autonomous recovery service", () => {
     assert.deepEqual(first.recovered, {
       universeLifecycleRuns: 0,
       learningGovernanceRuns: 0,
-      paperOperations: 0
+      paperOperations: 0,
+      researchRuns: 0
     })
     assert.deepEqual(second.recovered, first.recovered)
     assert.equal(
@@ -161,7 +187,12 @@ describe("autonomous recovery service", () => {
       (db.prepare("SELECT status FROM paper_operation_log WHERE id = ?").get("execution-operation") as { status: string }).status,
       "running"
     )
+    assert.equal(
+      (db.prepare("SELECT status FROM research_runs WHERE id = ?").get("fresh-research") as { status: string }).status,
+      "running"
+    )
     assert.equal(status.staleCounts.universeLifecycleRuns, 0)
+    assert.equal(status.staleCounts.researchRuns, 0)
     assert.equal(
       (db.prepare("SELECT COUNT(*) AS count FROM autonomous_recovery_events").get() as { count: number }).count,
       0

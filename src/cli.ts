@@ -112,6 +112,10 @@ import { config } from "./config.js";
 import { redactSensitiveData } from "./lib/securityRedaction.js";
 import { normalizeSymbol } from "./lib/utils.js";
 import { AlpacaApiError } from "./services/alpacaClient.js";
+import {
+  AlpacaOperationDeadlineError,
+  createOperationDeadline
+} from "./services/operationDeadline.js";
 import { buildPortfolioRiskSnapshot } from "./services/portfolioRiskService.js";
 import { classifyMarketRegime } from "./services/marketRegimeService.js";
 import {
@@ -508,6 +512,16 @@ const run = async () => {
       });
       return;
     }
+    if (result.status === "already_running") {
+      print([
+        `Research already running: ${result.activeRunId}`,
+        `Started at: ${result.startedAt}`,
+        `Last heartbeat: ${result.heartbeatAt}`,
+        "Paper only: true",
+        "Environment: paper"
+      ].join("\n"));
+      return;
+    }
     const lines = [
       `Research run completed: ${result.runId}`,
       `Paper only: true`,
@@ -552,8 +566,27 @@ const run = async () => {
     const format = args.format;
     const state = getTradingSafetyState();
     const diagnostic = buildAlpacaConfigDiagnostic();
-    const account = await getAlpacaAccountSnapshot();
-    const clock = await getAlpacaMarketClock();
+    const configuredTimeout = Number.parseInt(
+      process.env.ALPACA_HEALTH_OPERATION_TIMEOUT_MS || "9000",
+      10
+    );
+    const configuredMargin = Number.parseInt(
+      process.env.ALPACA_HEALTH_COMPLETION_MARGIN_MS || "750",
+      10
+    );
+    const deadline = createOperationDeadline({
+      timeoutMs:
+        Number.isFinite(configuredTimeout) && configuredTimeout > 0
+          ? configuredTimeout
+          : 9000,
+      completionMarginMs:
+        Number.isFinite(configuredMargin) && configuredMargin >= 0
+          ? configuredMargin
+          : 750
+    });
+    const requestContext = { deadline };
+    const account = await getAlpacaAccountSnapshot(requestContext);
+    const clock = await getAlpacaMarketClock(requestContext);
 
     if (format === "json") {
       print({
@@ -1619,6 +1652,18 @@ const run = async () => {
 try {
   await run();
 } catch (error) {
+  if (error instanceof AlpacaOperationDeadlineError) {
+    print({
+      error: {
+        code: error.code,
+        message: error.message
+      },
+      timedOut: error.metadata.timedOut,
+      deadline: error.metadata
+    });
+    process.exit(1);
+  }
+
   if (error instanceof AlpacaApiError) {
     print({
       error: error.message,

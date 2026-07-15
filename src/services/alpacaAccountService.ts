@@ -1,4 +1,8 @@
-import { getAlpacaPaperEndpoint, type AlpacaApiResponse } from "./alpacaClient.js";
+import {
+  getAlpacaPaperEndpoint,
+  type AlpacaApiResponse,
+  type AlpacaRequestContext
+} from "./alpacaClient.js";
 
 export interface AlpacaAccountSnapshot {
   id?: string;
@@ -70,9 +74,11 @@ const mapAccount = (row: ApiAccountPayload): AlpacaAccountSnapshot => ({
   createdAt: row.created_at
 });
 
-export const getAlpacaAccountSnapshot = async (): Promise<AlpacaAccountSnapshot> => {
+export const getAlpacaAccountSnapshot = async (
+  context: AlpacaRequestContext = {}
+): Promise<AlpacaAccountSnapshot> => {
   const response: AlpacaApiResponse<ApiAccountPayload> =
-    await getAlpacaPaperEndpoint<ApiAccountPayload>("/v2/account");
+    await getAlpacaPaperEndpoint<ApiAccountPayload>("/v2/account", context);
   const account = mapAccount(response.data);
   if (response.requestId) {
     account.requestId = response.requestId;

@@ -316,9 +316,9 @@ describe("Market bar persistence", () => {
     assert.equal(runtimeConfig.alpaca.maxRetries, 0);
   });
 
-  test("configures SQLite busy timeout for transient writer contention", () => {
+  test("configures a bounded SQLite busy timeout below control-route deadlines", () => {
     const row = getDb().prepare("PRAGMA busy_timeout").get() as Record<string, number>;
-    assert.equal(Object.values(row)[0], 60_000);
+    assert.equal(Object.values(row)[0], 5_000);
   });
 
   test("stores bars without duplicate rows", () => {
@@ -867,6 +867,50 @@ describe("Alpaca provider pagination", () => {
 });
 
 describe("Research orchestration", () => {
+  test("returns already_running without network work when a fresh research lease exists", async () => {
+    const startedAt = new Date().toISOString();
+    getDb()
+      .prepare(`
+        INSERT INTO research_runs(
+          id, started_at, heartbeat_at, status, risk_profile, options_enabled,
+          universe_size, targets_generated, candidates_selected, config_json
+        ) VALUES ('active-research', ?, ?, 'running', 'moderate', 0, 0, 0, 0, '{}')
+      `)
+      .run(startedAt, startedAt);
+    let fetchCalls = 0;
+    globalThis.fetch = async () => {
+      fetchCalls += 1;
+      return makeMockResponse({});
+    };
+
+    const result = await runResearchDaily({
+      riskProfile: "moderate",
+      optionsEnabled: false,
+      maxCandidates: 4
+    });
+
+    assert.deepEqual(result, {
+      status: "already_running",
+      runId: "active-research",
+      activeRunId: "active-research",
+      startedAt,
+      heartbeatAt: startedAt,
+      riskProfile: "moderate",
+      optionsEnabled: false,
+      universeSize: 0,
+      targetsGenerated: 0,
+      candidatesSelected: 0,
+      barLookbackDays: 365,
+      barLookbackStart: result.barLookbackStart,
+      warnings: ["RESEARCH_ALREADY_RUNNING"]
+    });
+    assert.equal(fetchCalls, 0);
+    assert.equal(
+      readCount("SELECT COUNT(*) AS count FROM research_runs WHERE status = 'running'"),
+      1
+    );
+  });
+
   test("completes when bars response includes next_page_token null", async () => {
     setMockFetchForSuccess(false, null, null);
     const result = await runResearchDaily({ riskProfile: "moderate", optionsEnabled: false, maxCandidates: 4 });

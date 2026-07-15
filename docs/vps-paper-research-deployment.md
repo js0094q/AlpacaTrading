@@ -426,7 +426,7 @@ evidence collection and the atomic reservation check.
 
 ## Scheduled Paper Ops Automation
 
-### Phase 1B database and observatory deployment
+### Explicit database migration and runtime deployment
 
 Before changing runtime state, verify the merged target SHA, paper/live flags,
 active services/timers/locks, database path, disk space, broker-order baseline,
@@ -441,9 +441,13 @@ npm run db:migrate -- --database /path/to/copied-research.db
 npm run db:verify -- --database /path/to/copied-research.db
 ```
 
-After the copy passes, migrate and verify production before restoring writers.
-Confirm the named migration, required tables/columns/indexes, retained legacy row
-counts, no new exact-linkage orphans, and `PRAGMA integrity_check`. Deploy only the
+After the copy passes, migrate production exactly once and verify it before
+restoring writers. Ordinary CLI startup must not be used as a migration path;
+an existing pending database returns `DATABASE_MIGRATION_REQUIRED`. Confirm all
+required migrations, required tables/columns/indexes, retained legacy row
+counts, no new exact-linkage orphans, `PRAGMA integrity_check`,
+`PRAGMA foreign_key_check`, `PRAGMA journal_mode`, `PRAGMA busy_timeout`,
+`PRAGMA foreign_keys`, and `PRAGMA synchronous`. Deploy only the
 merged SHA with fast-forward-only Git operations, install/build, reinstall the
 checked-in units, restore the prior service/timer state, and enable:
 
@@ -459,6 +463,19 @@ reason and all successful symbols persist. Outside regular hours, verify
 `SKIPPED_MARKET_CLOSED`, service/timer/schema/migration health, universe size,
 paper-only Alpaca access, and a safe bounded probe. Record regular-session
 collection as pending; never fabricate market-open evidence or force a paper trade.
+
+After restart, run `npm run system:recover -- --format=json` before research.
+Confirm the known stale research row is terminal and audited, then invoke one
+guarded dashboard research request. A duplicate request while the first is
+active must return `already_running` without a second worker. Validate 0DTE only
+through read-only discovery. Do not invoke `--confirmPaper` or any paper/live
+executor as a deployment probe.
+
+Rollback the application to the immediately prior SHA, rebuild, and restart only
+the affected services while restoring the recorded timer state. The migration
+is additive: nullable research lifecycle columns and the recovery count coexist
+with the prior application. Do not delete migration rows or recovery evidence,
+and do not reverse the database schema during application rollback.
 
 Use systemd timers for VPS automation. Before enabling timers, set the VPS timezone to New York market time or adjust the `OnCalendar` entries:
 

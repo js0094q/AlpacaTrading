@@ -5,12 +5,28 @@ import {
   assertReadOnlyAlpacaAccessAllowed,
   getTradingSafetyState
 } from "./tradingSafetyService.js";
+import {
+  AlpacaOperationDeadlineError,
+  getRemainingNetworkBudgetMs,
+  getRequestTimeoutMs,
+  getRetryDelayMs,
+  waitForRetry,
+  type OperationDeadline
+} from "./operationDeadline.js";
 
 export interface AlpacaApiResponse<T> {
   data: T;
   requestId?: string;
   status: number;
   url: string;
+}
+
+export interface AlpacaRequestContext {
+  deadline?: OperationDeadline;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  maxRetries?: number;
+  retryBaseDelayMs?: number;
 }
 
 export class AlpacaApiError extends Error {
@@ -223,6 +239,11 @@ const parseRetryCount = (): number => {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 2;
 };
 
+const parseRetryBaseDelayMs = (): number => {
+  const parsed = Number.parseInt(process.env.ALPACA_RETRY_BASE_DELAY_MS || "250", 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.min(parsed, 5_000) : 250;
+};
+
 const parseResponseBody = async (response: Response): Promise<unknown> => {
   const raw = await response.text();
   if (!raw) {
@@ -237,9 +258,16 @@ const parseResponseBody = async (response: Response): Promise<unknown> => {
 
 const executeWithTimeout = async <T>(
   timeoutMs: number,
-  task: (signal: AbortSignal) => Promise<T>
+  task: (signal: AbortSignal) => Promise<T>,
+  parentSignal?: AbortSignal
 ): Promise<T> => {
   const controller = new AbortController();
+  const abortFromParent = () => controller.abort(parentSignal?.reason);
+  if (parentSignal?.aborted) {
+    abortFromParent();
+  } else {
+    parentSignal?.addEventListener("abort", abortFromParent, { once: true });
+  }
   const timeout = setTimeout(() => {
     controller.abort();
   }, timeoutMs);
@@ -248,15 +276,22 @@ const executeWithTimeout = async <T>(
     return await task(controller.signal);
   } finally {
     clearTimeout(timeout);
+    parentSignal?.removeEventListener("abort", abortFromParent);
   }
 };
 
-export const getAlpacaPaperEndpoint = async <T>(endpoint: string): Promise<AlpacaApiResponse<T>> => {
-  return requestJson<T>(endpoint, "trade");
+export const getAlpacaPaperEndpoint = async <T>(
+  endpoint: string,
+  context: AlpacaRequestContext = {}
+): Promise<AlpacaApiResponse<T>> => {
+  return requestJson<T>(endpoint, "trade", context);
 };
 
-export const getAlpacaDataEndpoint = async <T>(endpoint: string): Promise<AlpacaApiResponse<T>> => {
-  return requestJson<T>(endpoint, "data");
+export const getAlpacaDataEndpoint = async <T>(
+  endpoint: string,
+  context: AlpacaRequestContext = {}
+): Promise<AlpacaApiResponse<T>> => {
+  return requestJson<T>(endpoint, "data", context);
 };
 
 const assertPaperTradingEndpointAllowed = () => {
@@ -504,7 +539,8 @@ export const getLatestOptionSnapshots = async (
 
 const requestJson = async <T>(
   endpoint: string,
-  baseUrl: "trade" | "data"
+  baseUrl: "trade" | "data",
+  context: AlpacaRequestContext = {}
 ): Promise<AlpacaApiResponse<T>> => {
   assertReadOnlyAlpacaAccessAllowed();
   assertLiveTradingDisabled();
@@ -512,15 +548,28 @@ const requestJson = async <T>(
   const credentials = getAlpacaPaperCredentials();
   const rootUrl = baseUrl === "trade" ? credentials.baseUrl : credentials.dataBaseUrl;
   const url = `${rootUrl}${endpoint}`;
-  const timeoutMs = parseTimeoutMs();
-  const maxRetries = parseRetryCount();
+  const timeoutMs = context.timeoutMs ?? parseTimeoutMs();
+  const maxRetries = context.maxRetries ?? parseRetryCount();
+  const retryBaseDelayMs = context.retryBaseDelayMs ?? parseRetryBaseDelayMs();
 
   let lastError: unknown = null;
 
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    if (context.signal?.aborted && context.deadline) {
+      throw new AlpacaOperationDeadlineError(
+        "ALPACA_OPERATION_ABORTED",
+        context.deadline
+      );
+    }
+    const attemptTimeoutMs = context.deadline
+      ? getRequestTimeoutMs(context.deadline, timeoutMs)
+      : timeoutMs;
+    const deadlineBoundAttempt = context.deadline
+      ? attemptTimeoutMs >= getRemainingNetworkBudgetMs(context.deadline)
+      : false;
     try {
       const { response, parsedBody } = await executeWithTimeout(
-        timeoutMs,
+        attemptTimeoutMs,
         async (signal) => {
           const response = await fetch(url, {
             method: "GET",
@@ -533,7 +582,8 @@ const requestJson = async <T>(
             signal
           });
           return { response, parsedBody: await parseResponseBody(response) };
-        }
+        },
+        context.signal
       );
 
       const requestId = response.headers.get("x-request-id") || undefined;
@@ -565,8 +615,23 @@ const requestJson = async <T>(
         url
       };
     } catch (error) {
+      if (error instanceof AlpacaOperationDeadlineError) {
+        throw error;
+      }
       if (error instanceof DOMException && error.name === "AbortError") {
-        lastError = new Error(`Alpaca request timed out after ${timeoutMs}ms.`);
+        if (context.signal?.aborted && context.deadline) {
+          throw new AlpacaOperationDeadlineError(
+            "ALPACA_OPERATION_ABORTED",
+            context.deadline
+          );
+        }
+        if (context.deadline && deadlineBoundAttempt) {
+          throw new AlpacaOperationDeadlineError(
+            "ALPACA_OPERATION_DEADLINE_EXCEEDED",
+            context.deadline
+          );
+        }
+        lastError = new Error(`Alpaca request timed out after ${attemptTimeoutMs}ms.`);
       } else {
         lastError = error;
       }
@@ -578,6 +643,21 @@ const requestJson = async <T>(
       if (attempt >= maxRetries) {
         throw lastError;
       }
+
+      const proposedDelayMs = retryBaseDelayMs * 2 ** attempt;
+      const retryDelayMs = context.deadline
+        ? getRetryDelayMs(context.deadline, proposedDelayMs, 100)
+        : proposedDelayMs;
+      if (retryDelayMs === null && context.deadline) {
+        throw new AlpacaOperationDeadlineError(
+          "ALPACA_OPERATION_DEADLINE_EXCEEDED",
+          context.deadline
+        );
+      }
+      await waitForRetry(retryDelayMs || 0, {
+        deadline: context.deadline,
+        signal: context.signal
+      });
     }
   }
 

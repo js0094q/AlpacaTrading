@@ -264,6 +264,12 @@ npm run alpaca:health
 npm run alpaca:health -- --format=json
 ```
 
+The control route keeps its 10-second outer deadline while the CLI shares one
+9-second monotonic operation deadline across the sequential account and clock
+requests, reserving 750 ms for serialization and cleanup. Each request attempt
+and retry wait is derived from the remaining budget; deadline failures return
+structured metadata and abort in-flight fetch work.
+
 `alpaca:config` is read-only and prints only redacted configuration diagnostics: credential presence, key prefix, base URLs, loaded env files, and precedence notes. It never prints full API keys, secret keys, or authorization headers.
 
 ### Account snapshot
@@ -301,6 +307,13 @@ npm run research:daily -- --riskProfile=aggressive --optionsEnabled=true --maxCa
 ```
 
 `research:daily` defaults to a 365-day daily-bar lookback so RSI/EMA/ATR/trend features have enough history to produce rankable targets. Override with `--barLookbackDays=<days>` if a shorter or longer read-only data window is needed.
+
+Research is database single-flight across CLI processes. A valid active row
+returns `status=already_running` with its run ID and heartbeat before any new
+Alpaca work begins. Major stages update the heartbeat. A 15-minute stale row is
+terminalized as `failed` with auditable worker/request/correlation recovery
+evidence before a replacement is reserved; `system:recover` applies the same
+policy autonomously.
 
 The Alpaca asset filter only removes unsupported, inactive, or untradable symbols.
 It does not place orders.
@@ -458,6 +471,14 @@ npm run db:migrate -- --database /path/to/research.db
 npm run db:verify -- --database /path/to/research.db
 ```
 
+`db:migrate` is the only production schema-mutation path. Run it before
+restarting SQLite-backed services. Once the required versions are applied,
+ordinary CLI startup reads migration state without DDL or a migration writer
+transaction. An existing database with pending versions fails closed with
+`DATABASE_MIGRATION_REQUIRED`; `db:verify` reports pending versions, integrity,
+foreign-key violations, and current journal/busy-timeout/foreign-key/synchronous
+PRAGMAs.
+
 Terminal outcomes use persisted observations only and keep option-position and
 underlying-return bases separate. One original outcome is retained per lifecycle;
 corrections append as revisions. Trace one decision without returning raw payload
@@ -482,7 +503,7 @@ The continuous paper monitor is installed separately with `scripts/install-paper
 - `alpaca-zero-dte-reconcile.timer`: wakes every five minutes to mark paper/shadow positions and capture forward outcomes.
 - `alpaca-zero-dte-eod.timer`: writes the end-of-day 0DTE summary after the force-exit window.
 
-Database-heavy wakeups are deliberately staggered: general exit review starts on minute 1, general review on minute 3, the 0DTE engine near second 45, 0DTE exit review near second 55, and reconciliation on minute 1 modulo 5 near second 30. SQLite connections wait up to 60 seconds for transient writer contention. The monitor runner otherwise no-ops with `MARKET_CLOSED` outside regular market hours, weekends, and configured US market holidays; the read-only `zero-dte-eod` task is the sole post-close exception on a valid weekday session. It fails closed unless `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, `LIVE_TRADING_ENABLED=false`, `PAPER_ORDER_EXECUTION_ENABLED=true`, `PAPER_OPTIONS_EXECUTION_ENABLED=true`, and `AUTOMATED_PAPER_EXECUTION_ENABLED=true` for execution tasks. See `docs/paper-monitoring-operations.md`.
+Database-heavy wakeups are deliberately staggered: general exit review starts on minute 1, general review on minute 3, the 0DTE engine near second 45, 0DTE exit review near second 55, and reconciliation on minute 1 modulo 5 near second 30. SQLite connections use a bounded 5-second busy timeout by default (`SQLITE_BUSY_TIMEOUT_MS`, capped at 30 seconds); ordinary startup no longer performs migration writes. The monitor runner otherwise no-ops with `MARKET_CLOSED` outside regular market hours, weekends, and configured US market holidays; the read-only `zero-dte-eod` task is the sole post-close exception on a valid weekday session. It fails closed unless `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, `LIVE_TRADING_ENABLED=false`, `PAPER_ORDER_EXECUTION_ENABLED=true`, `PAPER_OPTIONS_EXECUTION_ENABLED=true`, and `AUTOMATED_PAPER_EXECUTION_ENABLED=true` for execution tasks. See `docs/paper-monitoring-operations.md`.
 
 Set the VPS timezone to `America/New_York` or adjust the timer calendar before enabling timers.
 
