@@ -1,5 +1,28 @@
 # Resume Context: Alpaca Trading Research Infra
 
+## Neon operational-state migration Release 3 control plane (2026-07-15)
+
+- Release 3 adds PostgreSQL schema version 2, fenced scheduler leases,
+  control-plane repositories, explicit read-only SQLite snapshot, resumable
+  backfill, reconciliation, shadow discrepancy reporting, and feature-flagged
+  research authority.
+- Defaults remain SQLite-authoritative. Deploy schema/code with all PostgreSQL
+  authority flags off, run migration twice, verify 23 tables/59 indexes, then
+  quiesce SQLite writers for the protected snapshot and backfill.
+- Reconciliation must explain every count, identifier, decision link,
+  lifecycle status/order, idempotency/provenance, active run, candidate-by-run,
+  active lease, and checkpoint difference before shadow or authority expands.
+- Only research may use Release 3 fenced scheduler authority after the gate.
+  `zero_dte`, `observatory`, `reconciliation`, `exit_review`, `paper_exit`,
+  `allocation`, and `market_data_refresh` remain SQLite-owned until their
+  durable writes validate the current fencing token.
+- In control-plane authority mode PostgreSQL commits first and never falls back
+  to SQLite. `SQLITE_AUDIT_MIRROR_ENABLED=true` is a temporary compatibility
+  projection only for remaining Release 4 readers; it is not dual authority.
+- Candidate lifecycle backfill uses candidate-linked `decision_snapshots` and
+  `decision_lifecycle_events`. Non-candidate decision lifecycle is explicitly
+  reported and deferred to Release 4.
+
 ## Neon operational-state migration Release 2 foundation (2026-07-15)
 
 - Release 2 adds `pg`, runtime-specific pooled/direct configuration, one-client

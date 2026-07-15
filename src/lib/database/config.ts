@@ -169,6 +169,15 @@ export const loadDatabaseConfig = (
       "Execution-state authority requires control-plane authority first."
     );
   }
+  if (
+    (features.controlPlaneAuthority || features.executionStateAuthority) &&
+    backendValue !== "postgres"
+  ) {
+    throw new DatabaseConfigurationError(
+      "POSTGRES_AUTHORITY_BACKEND_REQUIRED",
+      "PostgreSQL authority requires DATABASE_BACKEND=postgres."
+    );
+  }
 
   const defaults = runtimeDefaults(runtime, purpose);
   const migrationPurpose = purpose !== "application";

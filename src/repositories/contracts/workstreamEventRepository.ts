@@ -47,9 +47,11 @@ export interface WorkstreamEventFailure {
   readonly attempt: number;
   readonly errorCode: string;
   readonly errorClassification: string;
+  readonly redactedErrorMessage: string;
   readonly retryable: boolean;
   readonly failedAt: string;
   readonly nextRetryAt: string | null;
+  readonly deadLetteredAt?: string | null;
   readonly details: JsonValue | null;
 }
 
@@ -66,7 +68,7 @@ export type WorkstreamEventClaimResult =
       readonly currentEntityVersion: number | null;
     }
   | { readonly status: "not_found" }
-  | { readonly status: "fence_rejected"; readonly currentFencingToken: number | null };
+  | { readonly status: "fence_rejected"; readonly currentFencingToken: string | null };
 
 export interface WorkstreamEventRepository<TTransactionScope> {
   find(
@@ -84,6 +86,7 @@ export interface WorkstreamEventRepository<TTransactionScope> {
       readonly eventId: string;
       readonly expectedEntityVersion: number | null;
       readonly processingStartedAt: string;
+      readonly processingStaleBefore: string;
     },
     context: FencedRepositoryOperationContext<TTransactionScope>
   ): Promise<WorkstreamEventClaimResult>;
@@ -107,7 +110,11 @@ export interface WorkstreamEventRepository<TTransactionScope> {
   ): Promise<VersionedWriteResult>;
 
   listPending(
-    input: { readonly workstream: string; readonly limit: number },
+    input: {
+      readonly workstream: string;
+      readonly limit: number;
+      readonly processingStaleBefore: string;
+    },
     context: TransactionScopedOperationContext<TTransactionScope>
   ): Promise<readonly WorkstreamEventRecord[]>;
 

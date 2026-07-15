@@ -109,6 +109,7 @@ import {
   getAutonomousRecoveryStatus
 } from "./services/autonomousRecoveryService.js";
 import { config } from "./config.js";
+import { getResearchDbPath } from "./lib/db.js";
 import { redactSensitiveData } from "./lib/securityRedaction.js";
 import { normalizeSymbol } from "./lib/utils.js";
 import { AlpacaApiError } from "./services/alpacaClient.js";
@@ -143,6 +144,10 @@ import {
   runPostgresMigrations
 } from "./lib/database/postgresMigrations.js";
 import { verifyPostgresSchema } from "./lib/database/postgresSchema.js";
+import {
+  isPaperExitReviewCommand,
+  isPaperPortfolioReviewCommand
+} from "./lib/cliCommandRouting.js";
 import { buildMarketDecisionTrace } from "./services/marketDecisionTraceService.js";
 import {
   buildZeroDteSummary,
@@ -151,6 +156,12 @@ import {
   runZeroDteReconciliation
 } from "./services/zeroDte/zeroDteEngineService.js";
 import { reviewZeroDteExits } from "./services/zeroDte/zeroDteExitService.js";
+import { runPostgresScheduledCommand } from "./services/postgresScheduledCommandService.js";
+import {
+  backfillControlPlaneSnapshot,
+  createReadConsistentSqliteSnapshot,
+  reconcileControlPlaneSnapshot
+} from "./services/controlPlaneMigrationService.js";
 
 const parseArg = (input: string): Record<string, string> | null => {
   const [rawKey, rawValue] = input.split("=", 2);
@@ -383,6 +394,139 @@ const run = async () => {
         schema
       });
       if (!verificationPassed) process.exitCode = 1;
+    } finally {
+      await pool.end();
+    }
+    return;
+  }
+
+  if (command === "db:postgres:control-plane:snapshot") {
+    const timestamp = new Date().toISOString().replace(/[-:.]/g, "");
+    const destinationDirectory =
+      args.destination ||
+      process.env.RESEARCH_DB_BACKUP_DIR?.trim() ||
+      `${process.cwd()}/data/backups/control-plane-${timestamp}`;
+    const snapshot = await createReadConsistentSqliteSnapshot({
+      sourcePath: args.source || getResearchDbPath(),
+      destinationDirectory
+    });
+    print({
+      snapshot: {
+        path: snapshot.path,
+        sha256: snapshot.sha256,
+        integrityCheck: snapshot.integrityCheck,
+        foreignKeyViolationCount: snapshot.foreignKeyViolationCount,
+        tableCounts: snapshot.tableCounts,
+        readOnly: true
+      }
+    });
+    return;
+  }
+
+  if (
+    command === "db:postgres:control-plane:backfill" ||
+    command === "db:postgres:backfill"
+  ) {
+    if (!args.snapshot) throw new Error("CONTROL_PLANE_SNAPSHOT_PATH_REQUIRED");
+    const databaseConfig = loadDatabaseConfig(
+      { ...process.env, DATABASE_BACKEND: "postgres" },
+      { purpose: "migration" }
+    );
+    const pool = createPostgresPool(databaseConfig, "direct");
+    try {
+      const [migration, schema] = await Promise.all([
+        getPostgresMigrationStatus(pool),
+        verifyPostgresSchema(pool)
+      ]);
+      if (
+        migration.pending.length > 0 ||
+        migration.checksumMismatches.length > 0 ||
+        migration.unexpectedAppliedVersions.length > 0 ||
+        (migration.latestAppliedVersion ?? 0) < 2 ||
+        !schema.verificationPassed
+      ) {
+        throw new Error("CONTROL_PLANE_POSTGRES_PREFLIGHT_FAILED");
+      }
+      print({
+        config: databaseConfigDiagnostics(databaseConfig),
+        backfill: await backfillControlPlaneSnapshot({
+          snapshotPath: args.snapshot,
+          pool,
+          config: databaseConfig,
+          batchSize: toInt(args.batchSize, 250)
+        })
+      });
+    } finally {
+      await pool.end();
+    }
+    return;
+  }
+
+  if (
+    command === "db:postgres:control-plane:reconcile" ||
+    command === "db:postgres:control-plane:shadow" ||
+    command === "db:postgres:reconcile" ||
+    command === "db:postgres:shadow"
+  ) {
+    if (!args.snapshot) throw new Error("CONTROL_PLANE_SNAPSHOT_PATH_REQUIRED");
+    const databaseConfig = loadDatabaseConfig(
+      { ...process.env, DATABASE_BACKEND: "postgres" },
+      { purpose: "migration" }
+    );
+    const pool = createPostgresPool(databaseConfig, "direct");
+    try {
+      const checkpointId =
+        args.checkpointId || `control-plane-${new Date().toISOString().replace(/[-:.]/g, "")}`;
+      const result = await reconcileControlPlaneSnapshot({
+        snapshotPath: args.snapshot,
+        pool,
+        config: databaseConfig,
+        checkpointId
+      });
+      print({ config: databaseConfigDiagnostics(databaseConfig), reconciliation: result });
+      if (!result.authorityAllowed) process.exitCode = 1;
+    } finally {
+      await pool.end();
+    }
+    return;
+  }
+
+  if (command === "db:postgres:control-plane:status") {
+    const databaseConfig = loadDatabaseConfig(
+      { ...process.env, DATABASE_BACKEND: "postgres" },
+      { purpose: "application" }
+    );
+    const pool = createPostgresPool(databaseConfig, "pooled");
+    try {
+      const [checkpoint, activeLeases] = await Promise.all([
+        pool.query<{
+          id: string;
+          status: string;
+          source_checksum: string | null;
+          source_row_count: string | number | null;
+          target_row_count: string | number | null;
+          discrepancy_count: string | number;
+          completed_at: Date | string | null;
+        }>(
+          `SELECT id, status, source_checksum, source_row_count, target_row_count,
+                  discrepancy_count, completed_at
+           FROM reconciliation_checkpoints
+           WHERE workstream = 'control_plane'
+           ORDER BY completed_at DESC NULLS LAST, created_at DESC
+           LIMIT 1`
+        ),
+        pool.query<{ job_name: string; workstream: string; fencing_token: string }>(
+          `SELECT job_name, workstream, fencing_token::text AS fencing_token
+           FROM scheduler_leases
+           WHERE status = 'held' AND expires_at > statement_timestamp()
+           ORDER BY job_name`
+        )
+      ]);
+      print({
+        config: databaseConfigDiagnostics(databaseConfig),
+        latestCheckpoint: checkpoint.rows[0] || null,
+        activeSchedulerLeases: activeLeases.rows
+      });
     } finally {
       await pool.end();
     }
@@ -1122,11 +1266,7 @@ const run = async () => {
     return;
   }
 
-  if (
-    command === "paper:portfolio:review" ||
-    command === "paper:exit:review" ||
-    (command === "paper" && action === "portfolio" && subaction === "review")
-  ) {
+  if (isPaperPortfolioReviewCommand(command, action, subaction)) {
     const format = args.format;
     const result = await buildPaperPortfolioReviewReport({
       moment:
@@ -1550,7 +1690,7 @@ const run = async () => {
     return;
   }
 
-  if (command === "paper:exit:review" || (command === "paper" && action === "exit-review")) {
+  if (isPaperExitReviewCommand(command, action)) {
     const format = normalizePaperPlanFormat(args.format) || "table";
     const result = await buildPaperExitReviewResult({
       includeEquities: optionalBoolArg(args.includeEquities),
@@ -1738,7 +1878,13 @@ const run = async () => {
 };
 
 try {
-  await run();
+  await runPostgresScheduledCommand({
+    command,
+    action,
+    subaction,
+    sections: args.sections,
+    operation: run
+  });
 } catch (error) {
   if (error instanceof AlpacaOperationDeadlineError) {
     print({

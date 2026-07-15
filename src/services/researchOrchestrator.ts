@@ -16,17 +16,13 @@ import { buildFeatures } from "./featureService.js";
 import { runLearning } from "./learningService.js";
 import { generateTargets } from "./targetService.js";
 import { dedupeSymbols, normalizeSymbol } from "../lib/utils.js";
-import { rankResearchCandidates, persistCandidateDecisions } from "./candidateRankingService.js";
+import { rankResearchCandidates } from "./candidateRankingService.js";
 import { buildPaperTradePlans } from "./paperTradeService.js";
 import type { PaperTradeCandidateRow } from "../types.js";
 import {
-  finishResearchRun,
-  heartbeatResearchRun,
-  ResearchRunLeaseLostError,
-  reserveResearchRun,
-  updateResearchRunUniverseSize,
-  withActiveResearchRunLease
+  ResearchRunLeaseLostError
 } from "./researchRunLifecycleService.js";
+import { researchControlPlaneService } from "./researchControlPlaneService.js";
 
 interface ResearchDailyInput {
   riskProfile?: "aggressive" | "conservative" | "moderate";
@@ -81,8 +77,11 @@ interface AlreadyRunningSummary {
   warnings: string[];
 }
 
-const assertResearchRunLease = (runId: string, renewed?: boolean): void => {
-  if (!(renewed ?? heartbeatResearchRun(runId))) {
+const assertResearchRunLease = async (
+  runId: string,
+  renewed?: boolean
+): Promise<void> => {
+  if (!(renewed ?? await researchControlPlaneService.heartbeat(runId))) {
     throw new ResearchRunLeaseLostError(runId);
   }
 };
@@ -94,7 +93,7 @@ interface PersistedRunSummary {
 
 const parseTargetRows = (input: Awaited<ReturnType<typeof generateTargets>>) => input.rows;
 
-const finishRun = (
+const finishRun = async (
   runId: string,
   input: {
     status: "completed" | "failed";
@@ -106,7 +105,7 @@ const finishRun = (
   }
 ) => {
   const summaryPayload = input.summary ? input.summary : { warnings: input.warnings || [] };
-  finishResearchRun(runId, {
+  await researchControlPlaneService.finish(runId, {
     status: input.status,
     targetsGenerated: input.targetsGenerated,
     candidatesSelected: input.candidatesSelected,
@@ -271,8 +270,9 @@ export const runResearchDaily = async (
     useAlpacaAssets
   };
 
-  const reservation = reserveResearchRun({
+  const reservation = await researchControlPlaneService.reserve({
     runId,
+    now: new Date(),
     riskProfile,
     optionsEnabled,
     configJson: JSON.stringify(configPayload),
@@ -312,10 +312,13 @@ export const runResearchDaily = async (
     await seedInitialUniverse();
     universeSize = getActiveUniverse().length;
     symbols = getActiveSymbols();
-    assertResearchRunLease(runId, updateResearchRunUniverseSize(runId, universeSize));
+    await assertResearchRunLease(
+      runId,
+      await researchControlPlaneService.updateUniverseSize(runId, universeSize)
+    );
 
     await ingestBars({ symbols, timeframe: "1Day", start: barLookbackStart });
-    assertResearchRunLease(runId);
+    await assertResearchRunLease(runId);
     if (optionsEnabled) {
       try {
         const optionUnderlyings = dedupeSymbols([
@@ -337,16 +340,16 @@ export const runResearchDaily = async (
           `Options data ingestion skipped; continuing equity candidate generation: ${safeWarningMessage(error)}`
         );
       }
-      assertResearchRunLease(runId);
+      await assertResearchRunLease(runId);
     }
 
     await buildFeatures({ symbols, start: barLookbackStart });
-    assertResearchRunLease(runId);
+    await assertResearchRunLease(runId);
     await runLearning();
-    assertResearchRunLease(runId);
+    await assertResearchRunLease(runId);
 
     targets = parseTargetRows(await generateTargets({ riskProfile }));
-    assertResearchRunLease(runId);
+    await assertResearchRunLease(runId);
 
     const filteredTargets = await buildAlpacaFilteredTargets(targets, useAlpacaAssets);
     if (filteredTargets.warnings.length) {
@@ -355,7 +358,7 @@ export const runResearchDaily = async (
     if (filteredTargets.filterSummary) {
       alpacaAssetFilter = filteredTargets.filterSummary;
     }
-    assertResearchRunLease(runId);
+    await assertResearchRunLease(runId);
 
     const ranked = rankResearchCandidates({
       researchRunId: runId,
@@ -369,25 +372,22 @@ export const runResearchDaily = async (
       requireSectorDiversity: input.requireSectorDiversity
     });
 
-    persistedCandidates = withActiveResearchRunLease(runId, () => {
-      const persistedDecisions = persistCandidateDecisions({
-        researchRunId: runId,
-        decisions: ranked.decisions
-      });
-      const selectedCandidates = persistedDecisions.filter(
-        (candidate) => candidate.decision === "selected"
-      );
-      buildPaperTradePlans({
-        researchRunId: runId,
-        candidates: ranked.candidates,
-        riskProfile
-      });
-      return selectedCandidates;
+    const persistedDecisions = await researchControlPlaneService.persistCandidates(
+      runId,
+      ranked.decisions
+    );
+    persistedCandidates = persistedDecisions.filter(
+      (candidate) => candidate.decision === "selected"
+    );
+    buildPaperTradePlans({
+      researchRunId: runId,
+      candidates: ranked.candidates,
+      riskProfile
     });
 
     warnings.push(...ranked.warnings);
 
-    finishRun(runId, {
+    await finishRun(runId, {
       status: "completed",
       targetsGenerated: targets.length,
       candidatesSelected: persistedCandidates.length,
@@ -414,17 +414,24 @@ export const runResearchDaily = async (
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : "unknown";
-    finishRun(runId, {
-      status: "failed",
-      targetsGenerated: targets.length,
-      candidatesSelected: persistedCandidates.length,
-      warnings,
-      summary: {
+    try {
+      await finishRun(runId, {
+        status: "failed",
+        targetsGenerated: targets.length,
+        candidatesSelected: persistedCandidates.length,
         warnings,
-        ...(alpacaAssetFilter ? { alpacaAssetFilter } : {})
-      },
-      errorMessage: message
-    });
+        summary: {
+          warnings,
+          ...(alpacaAssetFilter ? { alpacaAssetFilter } : {})
+        },
+        errorMessage: message
+      });
+    } catch (finishError) {
+      throw new AggregateError(
+        [error, finishError],
+        "Research operation and terminal persistence both failed."
+      );
+    }
     throw error;
   }
 };

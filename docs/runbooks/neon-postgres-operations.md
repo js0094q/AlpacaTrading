@@ -7,8 +7,10 @@ authorizes live trading or broker mutation. Vercel and VPS validation remains
 paper-only. Do not print, copy into documentation, or commit connection values.
 Do not source an environment file into diagnostic output.
 
-Release 2 creates the schema and connection foundation only. SQLite remains
-authoritative and these defaults stay in force:
+Release 3 adds the control-plane schema, repositories, fenced scheduler,
+snapshot/backfill/reconciliation commands, shadow comparison, and authority
+routing. SQLite remains authoritative until the runtime gates below pass, and
+these defaults stay in force:
 
 ```text
 DATABASE_BACKEND=sqlite
@@ -68,15 +70,22 @@ npm run db:postgres:migrate
 npm run db:postgres:migrate
 npm run db:postgres:verify
 npm run test:postgres:integration
+npm run db:postgres:control-plane:snapshot -- --source /path/to/source.db --destination /protected/snapshot-directory
+npm run db:postgres:control-plane:backfill -- --snapshot /protected/snapshot-directory/source-snapshot.db
+npm run db:postgres:control-plane:reconcile -- --snapshot /protected/snapshot-directory/source-snapshot.db
+npm run db:postgres:control-plane:shadow -- --snapshot /protected/snapshot-directory/source-snapshot.db
+npm run db:postgres:control-plane:status
 ```
 
 Connectivity must report TLS enabled and a supported transaction timeout.
 Migration uses the direct connection, a session advisory lock, one transaction
 per version, and a checksum ledger. The second migration invocation must apply
 nothing. Verification must report no pending version, no checksum mismatch, all
-22 expected tables, all 55 named indexes, and the scheduler fencing sequence.
-The integration test creates a uniquely named isolated schema, applies the full
-migration twice, verifies its catalogs, and removes only that test schema.
+23 expected tables, all 59 named indexes, Release 3 columns and constraints,
+and the scheduler fencing sequence. The integration test creates a uniquely
+named isolated schema, applies the full migration twice, exercises concurrent
+lease acquisition/takeover and stale-fence rejection, verifies its catalogs,
+and removes only that test schema.
 
 Application, timer, service, and health startup never run migrations. The
 protected Vercel `GET /api/paper/database/health` endpoint performs one read-only
@@ -108,8 +117,37 @@ backfill, reconciliation, shadow comparison, and fencing tests. Execution-state
 authority requires the later financial reconciliation gate. Any unexplained
 discrepancy leaves SQLite authoritative for that domain.
 
-Before backfill, create a timestamped read-only SQLite snapshot, checksum it,
-record counts, and run integrity and foreign-key checks. Backfill is resumable,
-idempotent, bounded, and non-destructive. A failed Release 2 deployment rolls
-application code back while leaving additive Neon schema version 1 in place;
-do not drop tables or delete the original SQLite database.
+Before backfill, quiesce SQLite writers and create a timestamped snapshot with
+`db:postgres:control-plane:snapshot`. The command uses SQLite online backup,
+records the source checksum and table counts, runs integrity and foreign-key
+checks, and changes only the copy to mode `0400`. Preserve the original.
+
+Control-plane backfill requires migration version 2 and a clean schema
+verification. It maps candidate lifecycle only from candidate-linked
+`decision_snapshots` and `decision_lifecycle_events`; non-candidate decision
+lifecycle belongs to Release 4. It is resumable, conflict-checking,
+dependency-ordered, transactionally bounded, and non-destructive. Reconciliation
+compares row counts, identifiers, decision linkage, lifecycle status/order,
+idempotency and provenance, active research, candidates by run, active leases,
+and checkpoints. Any unexplained discrepancy returns a non-zero status and
+blocks authority.
+
+Use this progression after schema and backfill validation:
+
+1. Keep all PostgreSQL feature flags off while migration version 2 is applied
+   twice and verified.
+2. Enable reads, writes, and shadow comparison with SQLite still authoritative;
+   run overlapping paper-only workflows and require zero unexplained
+   discrepancies.
+3. Set `DATABASE_BACKEND=postgres` and enable control-plane authority only
+   after reconciliation and shadow gates pass. Keep execution-state authority
+   false. Enable the temporary SQLite audit mirror only while Release 4 readers
+   require its compatibility projection.
+4. Release 3 PostgreSQL scheduler authority is limited to `research`. Do not
+   grant it to `zero_dte`, `observatory`, `reconciliation`, `exit_review`,
+   `paper_exit`, `allocation`, or `market_data_refresh` until their durable
+   writes validate the current fencing token.
+
+In authority mode, PostgreSQL failures never fall back to SQLite. Roll back
+application flags/code while leaving additive schema version 2 in place; do
+not drop tables or delete the original SQLite database.

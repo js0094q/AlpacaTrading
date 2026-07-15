@@ -2,13 +2,14 @@
 
 ## Market Observatory and Paper Decision Lifecycle
 
-Through the PostgreSQL foundation release, the canonical universe, market
-observations, research, reviewed paper execution, broker reconciliation,
-analytical outcomes, and learning still use one SQLite database. The staged
-target established by ADR-010 moves concurrent operational authority to Neon
-PostgreSQL only after per-domain backfill, reconciliation, and paper shadow
-comparison pass. Alpaca positions/orders remain broker truth; internal records
-add attribution and never override broker state.
+The PostgreSQL control-plane release provides fenced scheduler ownership,
+research-run control, candidates and candidate lifecycle events, idempotency,
+workstream events and failures, and reconciliation checkpoints in Neon. These
+paths remain feature-gated until backfill, reconciliation, and paper shadow
+comparison pass in the target runtime. Market observations, reviewed paper
+execution, broker reconciliation, analytical outcomes, and learning remain on
+SQLite until Release 4. Alpaca positions/orders remain broker truth; internal
+records add attribution and never override broker state.
 
 ### Data flow
 
@@ -93,10 +94,11 @@ The VPS currently runs the SQLite-backed CLI/control service and systemd timers.
 observatory timer wakes every 15 minutes during weekday market windows through the
 existing locked monitor runner and performs a second market-clock check. Vercel is
 only a dashboard/control bridge and does not execute orders or own SQLite state.
-Both runtimes now have a bounded `pg` foundation. Vercel may use one pooled
-connection for a protected read-only Neon health check; the VPS uses a bounded
-long-lived pool. Neither runtime reads or writes PostgreSQL operational state
-until the corresponding feature and authority gates pass reconciliation.
+Both runtimes use bounded `pg` pools. Vercel may use one pooled connection for
+the protected read-only Neon health check; the VPS uses a bounded long-lived
+pool. Release 3 adds feature-gated control-plane reads, writes, shadow
+comparison, and authority. All are off by default and may be enabled only after
+the corresponding migration and reconciliation gate passes.
 Late-day paper operations write a fresh signed artifact with
 `sourceAction=paper.ops.late_day` and the normal 30-minute artifact TTL before
 the separately scheduled reviewed exit executor runs.
@@ -116,16 +118,34 @@ apply a migration twice.
 PostgreSQL schema mutation belongs only to `db:postgres:migrate`, using the
 direct connection and a session advisory lock. `db:postgres:status` is read-only;
 `db:postgres:verify` compares the migration checksum plus the expected tables,
-indexes, and scheduler fencing sequence. Application startup never invokes these
-commands. Ordinary traffic uses the pooled endpoint. Every transaction checks
+indexes, control-plane columns and constraints, and scheduler fencing sequence.
+Application startup never invokes these commands. Ordinary traffic uses the
+pooled endpoint. Every transaction checks
 out one `pg` client and uses that client from `BEGIN` through `COMMIT` or
 `ROLLBACK`, with statement, lock, idle-in-transaction, and transaction timeouts.
 No transaction may span broker or market-data I/O.
 
 Domain repository contracts preserve scheduler fencing, optimistic versions,
 idempotency, event order, and one transaction scope. They intentionally do not
-expose a generic backend-neutral query interface. PostgreSQL implementations and
-authority routing arrive with the reconciled control-plane release.
+expose a generic backend-neutral query interface. Release 3 PostgreSQL
+implementations require a current, unexpired fencing token in the same
+transaction as fenced control-plane writes.
+
+Scheduler acquisition and takeover use database time, row locks, expiration,
+heartbeats, and monotonically increasing decimal-string fencing tokens. A stale
+worker cannot heartbeat, release, or commit fenced control-plane state after a
+new owner takes over. Only research may use this authority in Release 3 because
+its control-plane writes validate the current token. Observatory,
+market-data-refresh, and execution-state workstreams remain outside this
+authority until their durable writes are fence-aware.
+
+Research authority never keeps a PostgreSQL transaction open while collecting
+market or Alpaca evidence. It computes first, then persists runs, candidates,
+and initial lifecycle events in bounded transactions. Shadow mode keeps SQLite
+authoritative and records sanitized discrepancies. Authority mode writes
+PostgreSQL first and has no SQLite fallback. A temporary, explicitly enabled
+SQLite audit projection supports legacy Release 4 readers and does not create
+dual authority.
 
 On command failure, the dashboard control runner retains bounded, redacted
 stdout and stderr as separate fields. Structured stdout failures remain causal;

@@ -497,7 +497,7 @@ their scratch schema automatically. `db:verify` reports pending versions, integr
 foreign-key violations, and current journal/busy-timeout/foreign-key/synchronous
 PRAGMAs.
 
-The staged Neon foundation is explicit and non-authoritative by default. Use the
+The staged Neon control plane remains non-authoritative by default. Use the
 pooled variable for normal application traffic and the direct variable only for
 controlled migration/backfill work:
 
@@ -507,14 +507,25 @@ npm run db:postgres:connectivity -- --mode=direct
 npm run db:postgres:status
 npm run db:postgres:migrate
 npm run db:postgres:verify
+npm run db:postgres:control-plane:snapshot -- --source /path/to/source.db --destination /protected/snapshot-directory
+npm run db:postgres:control-plane:backfill -- --snapshot /protected/snapshot-directory/source-snapshot.db
+npm run db:postgres:control-plane:reconcile -- --snapshot /protected/snapshot-directory/source-snapshot.db
+npm run db:postgres:control-plane:shadow -- --snapshot /protected/snapshot-directory/source-snapshot.db
+npm run db:postgres:control-plane:status
 ```
 
 Only `db:postgres:migrate` applies PostgreSQL DDL. Run it through the direct
 endpoint; running it twice must leave the second `appliedVersions` list empty.
-The status command is read-only. All output reports variable names and presence,
-never values. Keep `DATABASE_BACKEND=sqlite` and every PostgreSQL read/write,
-shadow, and authority flag false until the applicable backfill and reconciliation
-gate passes. See `docs/runbooks/neon-postgres-operations.md`.
+The control-plane snapshot uses SQLite online backup, records its checksum and
+checks, and makes the copy read-only. Backfill is bounded and idempotent;
+reconcile and shadow persist sanitized discrepancy evidence and fail closed on
+unexplained differences. All output reports variable names and presence, never
+values. Keep `DATABASE_BACKEND=sqlite` and every PostgreSQL read/write, shadow,
+and authority flag false until the applicable gate passes. Release 3 authority
+may cover research only. Observatory, market-data refresh, and execution-state
+workstreams remain SQLite-owned until their durable writes validate the current
+PostgreSQL fencing token. See
+`docs/runbooks/neon-postgres-operations.md`.
 
 Terminal outcomes use persisted observations only and keep option-position and
 underlying-return bases separate. One original outcome is retained per lifecycle;
@@ -881,11 +892,11 @@ The Vercel serverless runtime must not rely on writable SQLite persistence under
 ```
 
 The attached Neon integration supplies the staged durable operational store.
-Release 2 uses its canonical pooled connection only for the protected,
-paper-only `GET /api/paper/database/health` diagnostic; the endpoint requires the
-dashboard admin token and returns no endpoint, user, database, or credential
-value. Historical reads remain on the VPS fallback until the control-plane
-backfill and reconciliation release explicitly enables PostgreSQL reads.
+The protected, paper-only `GET /api/paper/database/health` diagnostic uses its
+canonical pooled connection, requires the dashboard admin token, and returns no
+endpoint, user, database, or credential value. Historical reads remain on the
+VPS fallback until each control-plane or execution-state authority gate
+explicitly enables PostgreSQL reads.
 
 ## Setup
 

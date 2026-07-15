@@ -39,7 +39,7 @@ const fencedContext: FencedRepositoryOperationContext<TestTransactionScope> = {
     workstream: "research",
     ownerId: "worker-1",
     runId: "run-1",
-    fencingToken: 7
+    fencingToken: "7"
   }
 };
 
@@ -53,10 +53,20 @@ test("control-plane status contracts expose only durable states", () => {
     "recovered"
   ]);
   assert.deepEqual(CANDIDATE_LIFECYCLE_STATUSES, [
+    "discovered",
+    "data_incomplete",
+    "scored",
     "selected",
     "rejected",
     "skipped",
-    "blocked"
+    "reviewed",
+    "blocked",
+    "paper_eligible",
+    "submitted",
+    "filled",
+    "open",
+    "closed",
+    "expired"
   ]);
   assert.deepEqual(SCHEDULER_LEASE_STATUSES, ["held", "released", "expired"]);
   assert.deepEqual(RECONCILIATION_CHECKPOINT_STATUSES, [
@@ -85,7 +95,7 @@ test("control-plane status contracts expose only durable states", () => {
 test("repository contracts carry one transaction scope, versions, and scheduler fencing", async () => {
   let observedClientId = "";
   let observedExpectedVersion = 0;
-  let observedFencingToken = 0;
+  let observedFencingToken = "";
 
   const researchRuns: ResearchRunRepository<TestTransactionScope> = {
     async findById() {
@@ -123,6 +133,9 @@ test("repository contracts carry one transaction scope, versions, and scheduler 
     {
       runId: "research-1",
       startedAt: "2026-07-15T20:00:00.000Z",
+      staleBefore: "2026-07-15T19:45:00.000Z",
+      recoveryReason: "WORKER_TERMINATED_OR_HEARTBEAT_EXPIRED",
+      recoverySource: "research_preflight",
       riskProfile: "aggressive",
       optionsEnabled: true,
       config: {},
@@ -143,7 +156,7 @@ test("repository contracts carry one transaction scope, versions, and scheduler 
   assert.equal(heartbeat.status, "updated");
   assert.equal(observedClientId, "client-1");
   assert.equal(observedExpectedVersion, 3);
-  assert.equal(observedFencingToken, 7);
+  assert.equal(observedFencingToken, "7");
 });
 
 test("all control-plane repositories compose without a generic query interface", () => {

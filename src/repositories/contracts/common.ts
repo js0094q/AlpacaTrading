@@ -9,7 +9,7 @@ export interface SchedulerFence {
   readonly workstream: string;
   readonly ownerId: string;
   readonly runId: string;
-  readonly fencingToken: number;
+  readonly fencingToken: string;
 }
 
 /**
@@ -33,4 +33,4 @@ export type VersionedWriteResult =
   | { readonly status: "updated"; readonly version: number }
   | { readonly status: "not_found" }
   | { readonly status: "version_conflict"; readonly currentVersion: number }
-  | { readonly status: "fence_rejected"; readonly currentFencingToken: number | null };
+  | { readonly status: "fence_rejected"; readonly currentFencingToken: string | null };
