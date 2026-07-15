@@ -219,6 +219,31 @@ describe("steady-state SQLite contention", () => {
     assert.equal(result.code, 0, result.stderr);
   });
 
+  test("duplicate reservation rejects before the writer transaction while the active lease is fresh", async () => {
+    const holder = await startHolder(500);
+    assert.deepEqual(
+      lifecycle.reserveResearchRun({
+        runId: "duplicate-while-writing",
+        now: new Date(),
+        riskProfile: "moderate",
+        optionsEnabled: true,
+        configJson: "{}"
+      }),
+      {
+        status: "already_running",
+        activeRunId: runId,
+        startedAt: (getDb()
+          .prepare("SELECT started_at FROM research_runs WHERE id = ?")
+          .get(runId) as { started_at: string }).started_at,
+        heartbeatAt: (getDb()
+          .prepare("SELECT heartbeat_at FROM research_runs WHERE id = ?")
+          .get(runId) as { heartbeat_at: string }).heartbeat_at
+      }
+    );
+    const result = await holder.done;
+    assert.equal(result.code, 0, result.stderr);
+  });
+
   test("research reaches a terminal status after the writer releases", () => {
     assert.equal(lifecycle.heartbeatResearchRun(runId), true);
     lifecycle.finishResearchRun(runId, {
