@@ -310,7 +310,8 @@ npm run research:daily -- --riskProfile=aggressive --optionsEnabled=true --maxCa
 
 Research is database single-flight across CLI processes. A valid active row
 returns `status=already_running` with its run ID and heartbeat before any new
-Alpaca work begins. Major stages update the heartbeat. A 15-minute stale row is
+Alpaca work begins. Major stages must renew the persisted heartbeat lease; a
+lost lease aborts the worker before candidate or plan writes. A 15-minute stale row is
 terminalized as `failed` with auditable worker/request/correlation recovery
 evidence before a replacement is reserved; `system:recover` applies the same
 policy autonomously.

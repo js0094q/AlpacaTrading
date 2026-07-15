@@ -114,7 +114,8 @@ and clock requests share that deadline.
 
 Paper research uses a SQLite-backed single-flight reservation. A fresh
 `research_runs` lease returns `already_running` before market-data work starts.
-Heartbeats advance between major stages. Autonomous recovery and research
+Heartbeats advance between major stages; failure to renew the persisted
+`running` lease aborts the worker before candidate or plan writes. Autonomous recovery and research
 preflight use the same 15-minute stale rule; stale rows transition to the
 existing `failed` state with worker/request/correlation evidence and
 `WORKER_TERMINATED_OR_HEARTBEAT_EXPIRED`. Recovery never submits or retries an

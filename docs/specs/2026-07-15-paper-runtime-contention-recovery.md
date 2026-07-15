@@ -124,6 +124,8 @@ retain safe fallbacks.
   the oldest valid active row or inserts exactly one new `running` row.
 - Heartbeats are written between major research stages; no network call is held
   inside the reservation or recovery transaction.
+- A worker that cannot renew its persisted `running` lease fails closed before
+  candidate or plan persistence.
 
 ## Timer overlap review
 
