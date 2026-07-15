@@ -10,11 +10,26 @@ import type { DatabaseConfig } from "../src/lib/database/config.js";
 import {
   backfillControlPlaneSnapshot,
   createReadConsistentSqliteSnapshot,
+  enableSqliteDefensiveModeIfSupported,
   mapSqliteCandidate,
   mapSqliteResearchRun,
   readControlPlaneSnapshot,
   reconcileControlPlaneSnapshot
 } from "../src/services/controlPlaneMigrationService.js";
+
+test("SQLite defensive mode is optional on the Node 22 runtime", () => {
+  assert.equal(enableSqliteDefensiveModeIfSupported({}), false);
+  let enabled = false;
+  assert.equal(
+    enableSqliteDefensiveModeIfSupported({
+      enableDefensive: (value) => {
+        enabled = value;
+      }
+    }),
+    true
+  );
+  assert.equal(enabled, true);
+});
 
 const migrationPath = new URL(
   "../src/lib/database/migrations/002_control_plane_authority.sql",
