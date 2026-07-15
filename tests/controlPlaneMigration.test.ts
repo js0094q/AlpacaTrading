@@ -445,6 +445,29 @@ test("maps exact candidate lifecycle events and reports non-candidate events as 
   }
 });
 
+test("maps production decision snapshots without optional request provenance columns", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "control-plane-production-schema-"));
+  try {
+    const sourcePath = join(directory, "source.db");
+    createBackfillSource(sourcePath);
+    const source = new DatabaseSync(sourcePath);
+    source.exec(`
+      ALTER TABLE decision_snapshots DROP COLUMN request_id;
+      ALTER TABLE decision_snapshots DROP COLUMN correlation_id;
+    `);
+    source.close();
+
+    const snapshot = await readControlPlaneSnapshot(sourcePath);
+    assert.equal(snapshot.sourceIssues.length, 0);
+    assert.equal(snapshot.candidates.length, 2);
+    assert.equal(snapshot.candidateLifecycleEvents.length, 3);
+    assert.equal(snapshot.candidateLifecycleEvents[0]?.requestId, "request-1");
+    assert.equal(snapshot.candidateLifecycleEvents[0]?.correlationId, "correlation-1");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("blocks lifecycle events linked through a non-canonical candidate decision", async () => {
   const directory = await mkdtemp(join(tmpdir(), "control-plane-decision-link-"));
   try {
