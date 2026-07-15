@@ -2,13 +2,46 @@ import { DatabaseSync, type DatabaseSync as DbHandle } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { isVercelRuntime } from "./runtime.js";
-import { runZeroDteMigrations } from "./zeroDteSchema.js";
+import {
+  runZeroDteMigrations,
+  ZERO_DTE_HARDENING_MIGRATION_VERSION,
+  ZERO_DTE_MIGRATION_VERSION
+} from "./zeroDteSchema.js";
+import {
+  getPendingMigrationVersions,
+  runMigrationGroup
+} from "./sqliteMigrations.js";
 
 export const LOCAL_SQLITE_UNAVAILABLE_ON_VERCEL =
   "LOCAL_SQLITE_UNAVAILABLE_ON_VERCEL";
 
 export const UNIVERSE_LIFECYCLE_MIGRATION_VERSION =
   "2026-07-14-autonomous-universe-lifecycle";
+export const PHASE_1B_MIGRATION_VERSION =
+  "2026-07-13-market-observatory-phase-1b";
+export const RUNTIME_SCHEMA_MIGRATION_VERSION =
+  "2026-07-15-paper-runtime-contention-recovery";
+
+export const REQUIRED_RUNTIME_MIGRATION_VERSIONS = [
+  RUNTIME_SCHEMA_MIGRATION_VERSION,
+  PHASE_1B_MIGRATION_VERSION,
+  UNIVERSE_LIFECYCLE_MIGRATION_VERSION,
+  ZERO_DTE_MIGRATION_VERSION,
+  ZERO_DTE_HARDENING_MIGRATION_VERSION
+] as const;
+
+export class DatabaseMigrationRequiredError extends Error {
+  code = "DATABASE_MIGRATION_REQUIRED";
+  pendingVersions: string[];
+
+  constructor(pendingVersions: string[]) {
+    super(
+      `DATABASE_MIGRATION_REQUIRED: run db:migrate before runtime startup. Pending: ${pendingVersions.join(", ")}`
+    );
+    this.name = "DatabaseMigrationRequiredError";
+    this.pendingVersions = pendingVersions;
+  }
+}
 
 export class LocalSqliteUnavailableError extends Error {
   code = LOCAL_SQLITE_UNAVAILABLE_ON_VERCEL;
@@ -311,6 +344,7 @@ CREATE TABLE IF NOT EXISTS learning_runs (
 CREATE TABLE IF NOT EXISTS research_runs (
   id TEXT PRIMARY KEY,
   started_at TEXT NOT NULL,
+  heartbeat_at TEXT,
   completed_at TEXT,
   status TEXT NOT NULL,
   risk_profile TEXT NOT NULL,
@@ -320,7 +354,13 @@ CREATE TABLE IF NOT EXISTS research_runs (
   candidates_selected INTEGER NOT NULL,
   error_message TEXT,
   config_json TEXT NOT NULL,
-  summary_json TEXT
+  summary_json TEXT,
+  worker_identity TEXT,
+  request_id TEXT,
+  correlation_id TEXT,
+  recovered_at TEXT,
+  recovery_reason TEXT,
+  recovery_source TEXT
 );
 
 CREATE TABLE IF NOT EXISTS paper_trade_candidates (
@@ -599,6 +639,7 @@ CREATE TABLE IF NOT EXISTS autonomous_recovery_runs (
   recovered_universe_lifecycle_runs INTEGER NOT NULL DEFAULT 0,
   recovered_learning_governance_runs INTEGER NOT NULL DEFAULT 0,
   recovered_paper_operations INTEGER NOT NULL DEFAULT 0,
+  recovered_research_runs INTEGER NOT NULL DEFAULT 0,
   git_sha TEXT NOT NULL,
   config_version TEXT NOT NULL,
   config_hash TEXT NOT NULL,
@@ -998,9 +1039,11 @@ const exactCandidateBackfill = (
 };
 
 export const runPhase1BMigrations = (db: DbHandle) => {
-  db.exec("BEGIN IMMEDIATE;");
-  try {
-    db.exec(phase1BSchema);
+  runMigrationGroup(
+    db,
+    [PHASE_1B_MIGRATION_VERSION, UNIVERSE_LIFECYCLE_MIGRATION_VERSION],
+    () => {
+      db.exec(phase1BSchema);
 
     addPhase1BColumn(db, "paper_trade_candidates", "decision_id", "decision_id TEXT");
     addPhase1BColumn(
@@ -1106,19 +1149,8 @@ export const runPhase1BMigrations = (db: DbHandle) => {
       }
     }
 
-    db.prepare(`
-      INSERT OR IGNORE INTO schema_migrations(version, applied_at)
-      VALUES ('2026-07-13-market-observatory-phase-1b', ?)
-    `).run(new Date().toISOString());
-    db.prepare(`
-      INSERT OR IGNORE INTO schema_migrations(version, applied_at)
-      VALUES (?, ?)
-    `).run(UNIVERSE_LIFECYCLE_MIGRATION_VERSION, new Date().toISOString());
-    db.exec("COMMIT;");
-  } catch (error) {
-    db.exec("ROLLBACK;");
-    throw error;
-  }
+    }
+  );
 };
 
 const universeLifecycleSchema = `
@@ -1247,14 +1279,67 @@ const runMigrations = (db: DbHandle) => {
   addColumnIfMissing(db, "paper_learning_records", "source_research_run_id", "source_research_run_id TEXT");
   addColumnIfMissing(db, "paper_learning_records", "source_candidate_id", "source_candidate_id TEXT");
   addColumnIfMissing(db, "paper_learning_records", "source_plan_timestamp", "source_plan_timestamp TEXT");
+  addColumnIfMissing(db, "research_runs", "heartbeat_at", "heartbeat_at TEXT");
+  addColumnIfMissing(db, "research_runs", "worker_identity", "worker_identity TEXT");
+  addColumnIfMissing(db, "research_runs", "request_id", "request_id TEXT");
+  addColumnIfMissing(db, "research_runs", "correlation_id", "correlation_id TEXT");
+  addColumnIfMissing(db, "research_runs", "recovered_at", "recovered_at TEXT");
+  addColumnIfMissing(db, "research_runs", "recovery_reason", "recovery_reason TEXT");
+  addColumnIfMissing(db, "research_runs", "recovery_source", "recovery_source TEXT");
+  addColumnIfMissing(
+    db,
+    "autonomous_recovery_runs",
+    "recovered_research_runs",
+    "recovered_research_runs INTEGER NOT NULL DEFAULT 0"
+  );
+};
+
+const parseBusyTimeoutMs = (): number => {
+  const parsed = Number.parseInt(process.env.SQLITE_BUSY_TIMEOUT_MS || "5000", 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return 5000;
+  }
+  return Math.min(parsed, 30_000);
+};
+
+export const configureDatabaseConnection = (db: DbHandle): void => {
+  db.exec(`PRAGMA busy_timeout = ${parseBusyTimeoutMs()};`);
+  db.exec("PRAGMA foreign_keys = ON;");
 };
 
 export const initializeDatabaseHandle = (db: DbHandle): DbHandle => {
-  db.exec("PRAGMA busy_timeout = 60000;");
-  db.exec(tableSchema);
-  runMigrations(db);
+  configureDatabaseConnection(db);
+  runMigrationGroup(db, [RUNTIME_SCHEMA_MIGRATION_VERSION], () => {
+    db.exec(tableSchema);
+    runMigrations(db);
+  });
   runPhase1BMigrations(db);
   runZeroDteMigrations(db);
+  return db;
+};
+
+const hasApplicationSchema = (db: DbHandle): boolean =>
+  Boolean(
+    db
+      .prepare(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' LIMIT 1"
+      )
+      .get()
+  );
+
+export const initializeRuntimeDatabaseHandle = (db: DbHandle): DbHandle => {
+  configureDatabaseConnection(db);
+  if (!hasApplicationSchema(db)) {
+    return initializeDatabaseHandle(db);
+  }
+
+  const pendingVersions = getPendingMigrationVersions(
+    db,
+    REQUIRED_RUNTIME_MIGRATION_VERSIONS
+  );
+  if (pendingVersions.length > 0) {
+    throw new DatabaseMigrationRequiredError(pendingVersions);
+  }
   return db;
 };
 
@@ -1269,9 +1354,14 @@ const initialize = (): DbHandle => {
   }
 
   mkdirSync(dirname(dbPath), { recursive: true });
-  const db = initializeDatabaseHandle(new DatabaseSync(dbPath));
-  database = db;
-  return db;
+  const opened = new DatabaseSync(dbPath);
+  try {
+    database = initializeRuntimeDatabaseHandle(opened);
+    return database;
+  } catch (error) {
+    opened.close();
+    throw error;
+  }
 };
 
 export const getDb = (): DbHandle => initialize();

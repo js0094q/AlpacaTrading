@@ -5,6 +5,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { Server } from "node:http";
+import {
+  COMMAND_OUTPUT_LIMIT,
+  GuardedCommandError,
+  normalizeCommandFailure
+} from "../server/dashboard-control/commandResult.js";
 
 type CommandCall = {
   script: string;
@@ -36,6 +41,11 @@ type ControlCommandRunner = (
 type ServerModule = {
   ACTION_HANDLERS: Record<string, ActionConfig>;
   createControlServer: () => Server;
+  parseControlCommandOutput: (
+    output: string,
+    durationMs: number,
+    requestId: string
+  ) => Record<string, unknown>;
   setControlCommandRunner: (runner: null | ControlCommandRunner) => void;
   setOpenOrdersFetcher: (fetcher: null | (() => Promise<unknown>)) => void;
   resetControlTestHooks: () => void;
@@ -47,6 +57,7 @@ type ControlResponse = {
   requestId?: string;
   correlationId?: string;
   error?: { code?: string; message?: string };
+  command?: ReturnType<typeof normalizeCommandFailure>;
   data?: unknown;
 };
 
@@ -246,6 +257,25 @@ after(async () => {
 });
 
 describe("VPS dashboard control API", () => {
+  test("parses successful command JSON larger than the diagnostic output limit", () => {
+    const largeValue = "x".repeat(COMMAND_OUTPUT_LIMIT * 3);
+    const result = module.parseControlCommandOutput(
+      JSON.stringify({ summary: { payloadCount: 3 }, largeValue }),
+      12,
+      "large-success"
+    ) as {
+      summary: { payloadCount: number };
+      largeValue: string;
+      _controlDurationMs: number;
+      _controlRequestId: string;
+    };
+
+    assert.equal(result.summary.payloadCount, 3);
+    assert.equal(result.largeValue, largeValue);
+    assert.equal(result._controlDurationMs, 12);
+    assert.equal(result._controlRequestId, "large-success");
+  });
+
   test("exports the expected action allowlist", () => {
     const paths = Object.keys(module.ACTION_HANDLERS).sort();
     const expected = [
@@ -674,9 +704,25 @@ describe("VPS dashboard control API", () => {
     assert.equal(finalCall.script, "research:daily");
     assert.deepEqual(finalCall.env, {
       ALPACA_REQUEST_TIMEOUT_MS: "10000",
-      ALPACA_MAX_RETRIES: "0"
+      ALPACA_MAX_RETRIES: "0",
+      RESEARCH_REQUEST_ID: finalCall.requestId,
+      RESEARCH_CORRELATION_ID: "request-correlation-1"
+    });
+    assert.deepEqual(commandCalls[0]?.env, {
+      ALPACA_HEALTH_OPERATION_TIMEOUT_MS: "9000",
+      ALPACA_HEALTH_COMPLETION_MARGIN_MS: "750"
     });
     assert.ok(finalCall.args.includes("--barLookbackDays=120"));
+  });
+
+  test("health command receives an internal budget below its outer deadline", async () => {
+    const response = await callControl("/api/v1/health", "GET");
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(commandCalls.at(-1)?.env, {
+      ALPACA_HEALTH_OPERATION_TIMEOUT_MS: "9000",
+      ALPACA_HEALTH_COMPLETION_MARGIN_MS: "750"
+    });
   });
 
   test("execute.dry-run latest endpoint is available as GET and uses fixed dry-run command", async () => {
@@ -755,6 +801,36 @@ describe("VPS dashboard control API", () => {
     assert.equal(raw.includes("sk-proj-abcdefghijklmnopqrstuvwxyz123456"), false);
     assert.equal(raw.includes("super-secret-value"), false);
     assert.equal(raw.includes("BEGIN PRIVATE KEY"), false);
+  });
+
+  test("control response preserves structured SQLite failure ahead of a Node warning", async () => {
+    const failure = normalizeCommandFailure({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      stdout: JSON.stringify({ code: "SQLITE_BUSY", error: "database is locked" }),
+      stderr: "ExperimentalWarning: SQLite is an experimental feature"
+    });
+    setMockCommandRunner({
+      onCommand: (script) => {
+        if (script === "alpaca:health") {
+          return safeHealthPayload;
+        }
+        if (script === "research:daily") {
+          throw new GuardedCommandError("research.run", failure);
+        }
+      }
+    });
+
+    const response = await callControl("/api/v1/research/run", "POST", defaultRequest.body);
+
+    assert.equal(response.status, 500);
+    assert.equal(response.payload.error?.code, "SQLITE_BUSY");
+    assert.equal(response.payload.error?.message, "database is locked");
+    assert.equal(response.payload.command?.exitCode, 1);
+    assert.deepEqual(response.payload.command?.warnings, [
+      "ExperimentalWarning: SQLite is an experimental feature"
+    ]);
   });
 
   test("mutating audit logs include request and method context", async () => {

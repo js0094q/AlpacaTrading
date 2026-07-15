@@ -1,13 +1,29 @@
-import { beforeEach, describe, test } from "node:test";
+import { after, beforeEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
+const dbDir = mkdtempSync(join(tmpdir(), "alpaca-paper-portfolio-review-"));
+process.env.RESEARCH_DB_PATH = join(dbDir, "research.db");
 process.env.TRADING_MODE = "paper";
 process.env.ALPACA_LIVE_TRADE = "false";
 process.env.LIVE_TRADING_ENABLED = "false";
 process.env.ALPACA_ENV = "paper";
 
-import { buildPaperPortfolioReviewReport } from "../src/services/paperPortfolioReviewService.js";
 import type { LeapsExitEvaluation } from "../src/services/leapsExitReviewService.js";
+
+const [portfolioReview, libDb] = await Promise.all([
+  import("../src/services/paperPortfolioReviewService.js"),
+  import("../src/lib/db.js")
+]);
+const { buildPaperPortfolioReviewReport } = portfolioReview;
+const { closeDbForTests } = libDb;
+
+after(() => {
+  closeDbForTests();
+  rmSync(dbDir, { recursive: true, force: true });
+});
 
 const account = {
   id: "paper-account-1",

@@ -227,6 +227,13 @@ sudo systemctl stop alpaca-zero-dte-engine.timer alpaca-zero-dte-exit-review.tim
 docker compose -f /opt/alpaca-investing/app/docker-compose.yml down
 ```
 
+For a schema-bearing release, record the prior timer state, stop affected SQLite
+writers, back up the database, and validate `db:migrate` twice on a copy. Run
+`db:migrate` once on production before restarting the control service or timers,
+then run `db:verify`. Ordinary runtime commands intentionally do not apply
+pending production migrations and fail closed with
+`DATABASE_MIGRATION_REQUIRED`.
+
 The continuous paper-monitor installer also installs the independent 0DTE Level 2 services and timers. The 0DTE engine runs every minute during the configured entry window; its exit review runs every minute, reconciliation runs every five minutes, and the end-of-day summary runs after the force-exit window. Only `alpaca-zero-dte-engine.service` sets `AUTOMATED_PAPER_EXECUTION_ENABLED=true`, and it still requires the CLI `--confirmPaper` and paper-runtime gates. The other 0DTE services are read-only or mark/summarize local paper and shadow state. See `server/systemd/README.md` for the install/disable commands.
 
 ## Intentionally Not Implemented

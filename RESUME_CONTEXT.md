@@ -1,5 +1,29 @@
 # Resume Context: Alpaca Trading Research Infra
 
+## Paper runtime contention and research recovery release (2026-07-15)
+
+- Production diagnosis traced Automated Paper Research failure to ordinary CLI
+  startup executing base DDL plus unconditional Phase 1B and 0DTE
+  `BEGIN IMMEDIATE` transactions while six scheduled workflows overlapped.
+- The release adds migration version
+  `2026-07-15-paper-runtime-contention-recovery`. Production must run
+  `npm run db:migrate` before SQLite-backed services restart. Ordinary startup
+  is read-only when current and fails closed on pending versions.
+- Dashboard command failures keep structured stdout primary and retain bounded,
+  redacted stderr warnings separately. `database is locked` is no longer
+  replaced by Node's SQLite `ExperimentalWarning`.
+- Alpaca health account and clock requests share a 9-second monotonic child
+  deadline inside the 10-second control timeout, with a 750 ms completion margin.
+- Research uses a database-backed single-flight reservation and stage
+  heartbeats. A fresh run returns `already_running`; stale rows older than 15
+  minutes become `failed` with
+  `WORKER_TERMINATED_OR_HEARTBEAT_EXPIRED`, recovery source, and retained
+  worker/request/correlation evidence.
+- Do not rerun research repeatedly before this migration and application SHA are
+  deployed. First run `system:recover` to terminalize the known stale row, then
+  invoke one guarded dashboard research run. Do not invoke confirmed paper or
+  live execution during release validation.
+
 ## Adaptive allocation safety-floor pre-release (2026-07-14)
 
 - Branch `feat/adaptive-allocation-safety-floor` is based on
@@ -282,9 +306,11 @@
    - `ssh njalla-vps`
    - `cd /home/alpaca/Alpaca-Trading`
    - load NVM and source `/opt/alpaca-investing/secrets/alpaca.env`.
-2. Confirm there are no stale research runs:
+2. Recover and inspect stale research state before any rerun:
+   - `npm run system:recover -- --format=json`
+   - `npm run system:recover:status -- --format=json`
    - `ps -ef | rg "tsx src/cli.ts research daily|npm run research:daily|timeout .*research:daily"`.
-3. Run bounded paper research only when a fresh research cycle is needed:
+3. Run bounded paper research once only when no valid run is active:
    - `ALPACA_REQUEST_TIMEOUT_MS=10000 ALPACA_MAX_RETRIES=0 timeout 300 npm run research:daily -- --riskProfile=aggressive --optionsEnabled=true --maxCandidates=3 --format=json --barLookbackDays=120`.
 4. Verify output and re-run readiness chain:
    - `npm run paper:snapshots -- --format=json --limit=5`

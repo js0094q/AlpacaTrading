@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
 import { after, test } from "node:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const dbDir = mkdtempSync(join(tmpdir(), "alpaca-zero-dte-provider-"));
 
 const environmentKeys = [
   "ALPACA_ENV",
@@ -10,7 +15,8 @@ const environmentKeys = [
   "ALPACA_PAPER_BASE_URL",
   "ALPACA_DATA_BASE_URL",
   "ALPACA_REQUEST_TIMEOUT_MS",
-  "ALPACA_MAX_RETRIES"
+  "ALPACA_MAX_RETRIES",
+  "RESEARCH_DB_PATH"
 ] as const;
 
 const previousEnvironment = new Map(
@@ -27,15 +33,19 @@ Object.assign(process.env, {
   ALPACA_PAPER_BASE_URL: "https://paper-test.example",
   ALPACA_DATA_BASE_URL: "https://data-test.example",
   ALPACA_REQUEST_TIMEOUT_MS: "1000",
-  ALPACA_MAX_RETRIES: "0"
+  ALPACA_MAX_RETRIES: "0",
+  RESEARCH_DB_PATH: join(dbDir, "research.db")
 });
 
 const {
   createAlpacaZeroDteMarketDataProvider
 } = await import("../src/services/zeroDte/zeroDteMarketDataService.js");
 const { fetchOptionContracts } = await import("../src/services/providers/alpaca.js");
+const { closeDbForTests } = await import("../src/lib/db.js");
 
 after(() => {
+  closeDbForTests();
+  rmSync(dbDir, { recursive: true, force: true });
   globalThis.fetch = originalFetch;
   for (const key of environmentKeys) {
     const value = previousEnvironment.get(key);

@@ -140,10 +140,35 @@ after reboot.
 marks stale local records terminal and writes immutable recovery events; it does
 not call Alpaca, retry a job, clear locks, or submit orders. It handles stale
 universe-lifecycle and learning-governance runs plus stale non-mutating
-paper-operations records. The lifecycle service also starts it through
+paper-operations records and paper research runs whose last heartbeat is at
+least 15 minutes old. Research recovery records
+`WORKER_TERMINATED_OR_HEARTBEAT_EXPIRED` plus available worker/request/correlation
+evidence. The lifecycle service also starts it through
 `OnFailure=` after a timeout or other service failure. A recovery never reruns
 the interrupted workload: the next existing scheduler window remains the
 automatic downstream consumer.
+
+Ordinary CLI startup reads applied migration versions and performs no DDL or
+migration writer transaction when current. Deployment must run `db:migrate`
+before restarting these units. The checked-in schedules remain unchanged by the
+contention repair:
+
+The duration column is the latest successful production sample observed on
+2026-07-15, not a long-run percentile; the parenthetical value is the service
+deadline.
+
+| Workflow | Schedule | Typical duration (latest sample) | SQLite writes | Alpaca calls | Can overlap research |
+| --- | --- | ---: | --- | --- | --- |
+| 0DTE engine | Every minute in entry window near `:45` | 8.5 s (300 s max) | Yes | Yes | Yes |
+| 0DTE exit review | Every minute near `:55` | 6.3 s (300 s max) | Yes | Yes | Yes |
+| 0DTE reconciliation | Every 5 minutes near `:30` | 8.9 s (300 s max) | Yes | Yes | Yes |
+| Market observatory | Every 15 minutes | 17.8 s (300 s max) | Yes | Yes | Yes |
+| Paper exit review | Every 15 minutes, then every 5 late day | 81.1 s (300 s max) | Yes | Yes | Yes |
+| Paper exit execute | Every 15 minutes, then every 5 late day | 6.9 s (300 s max) | Yes | Yes | Yes |
+| Paper review | Every 30 minutes | 298.7 s (900 s max) | Yes | Yes | Yes |
+| Paper execute | Every 30 minutes | 4.0 s (300 s max) | Yes | Yes | Yes |
+| Autonomous recovery | Minutes 07, 22, 37, 52 | 3.8 s (60 s max) | Yes | No | Yes |
+| Morning research workflow | Weekdays 08:30 | 251.3 s (600 s max) | Yes | Yes | Owner |
 
 ## Canonical autonomous scheduler graph
 
@@ -174,6 +199,10 @@ without changing broker, execution, or review behavior.
 - `research.run` defaults to bounded control-action settings: `--barLookbackDays=120`,
   `ALPACA_REQUEST_TIMEOUT_MS=10000`, and `ALPACA_MAX_RETRIES=0`. Override only with
   `VPS_RESEARCH_REQUEST_TIMEOUT_MS` and `VPS_RESEARCH_MAX_RETRIES` when the public route has been retested.
+- Every 10-second control health child receives a 9-second shared account/clock
+  budget and 750 ms completion margin. Override only with
+  `VPS_HEALTH_OPERATION_TIMEOUT_MS` and `VPS_HEALTH_COMPLETION_MARGIN_MS` while
+  keeping the child budget below the outer timeout.
 - Preserve local paper scheduling, CLI runtime, and credentials ownership on the VPS.
 - Stop the unit before changing deployment artifacts or security-relevant env values.
 
