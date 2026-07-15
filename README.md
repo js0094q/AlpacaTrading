@@ -497,6 +497,25 @@ their scratch schema automatically. `db:verify` reports pending versions, integr
 foreign-key violations, and current journal/busy-timeout/foreign-key/synchronous
 PRAGMAs.
 
+The staged Neon foundation is explicit and non-authoritative by default. Use the
+pooled variable for normal application traffic and the direct variable only for
+controlled migration/backfill work:
+
+```bash
+npm run db:postgres:connectivity
+npm run db:postgres:connectivity -- --mode=direct
+npm run db:postgres:status
+npm run db:postgres:migrate
+npm run db:postgres:verify
+```
+
+Only `db:postgres:migrate` applies PostgreSQL DDL. Run it through the direct
+endpoint; running it twice must leave the second `appliedVersions` list empty.
+The status command is read-only. All output reports variable names and presence,
+never values. Keep `DATABASE_BACKEND=sqlite` and every PostgreSQL read/write,
+shadow, and authority flag false until the applicable backfill and reconciliation
+gate passes. See `docs/runbooks/neon-postgres-operations.md`.
+
 Terminal outcomes use persisted observations only and keep option-position and
 underlying-return bases separate. One original outcome is retained per lifecycle;
 corrections append as revisions. Trace one decision without returning raw payload
@@ -861,7 +880,12 @@ The Vercel serverless runtime must not rely on writable SQLite persistence under
 }
 ```
 
-Future durable Vercel history requires an external store such as Vercel Postgres, Neon, Supabase, or Turso. `DASHBOARD_DATABASE_URL` is reserved for a future durable dashboard adapter and is not used by the current SQLite-backed local/VPS runtime.
+The attached Neon integration supplies the staged durable operational store.
+Release 2 uses its canonical pooled connection only for the protected,
+paper-only `GET /api/paper/database/health` diagnostic; the endpoint requires the
+dashboard admin token and returns no endpoint, user, database, or credential
+value. Historical reads remain on the VPS fallback until the control-plane
+backfill and reconciliation release explicitly enables PostgreSQL reads.
 
 ## Setup
 

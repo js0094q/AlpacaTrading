@@ -1,5 +1,23 @@
 # Resume Context: Alpaca Trading Research Infra
 
+## Neon operational-state migration Release 2 foundation (2026-07-15)
+
+- Release 2 adds `pg`, runtime-specific pooled/direct configuration, one-client
+  transaction helpers, bounded PostgreSQL retry classification, explicit
+  connectivity/migrate/status/verify commands, domain repository contracts, and
+  the version 1 operational schema.
+- Controlled local Neon validation used only the mode-`0600` Desktop source.
+  Pooled and direct TLS connectivity passed on PostgreSQL 17 with transaction
+  timeout support. Migration version 1 applied once, applied nothing on the
+  second run, and verified 22 tables, 55 named indexes, and the scheduler
+  fencing sequence.
+- `DATABASE_BACKEND` remains `sqlite`; PostgreSQL reads, writes, shadow,
+  control-plane authority, execution-state authority, and SQLite audit mirror
+  remain off. No backfill or authority cutover has occurred.
+- The Vercel payload includes protected `GET /api/paper/database/health`. The VPS
+  receives only `DATABASE_URL` and `DATABASE_URL_UNPOOLED` through the protected
+  merge runbook; values must never appear in output or journald.
+
 ## Neon operational-state migration Release 1 (2026-07-15)
 
 - Work is isolated on `codex/neon-postgres-operational-state` from verified

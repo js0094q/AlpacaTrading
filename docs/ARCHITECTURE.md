@@ -2,10 +2,13 @@
 
 ## Market Observatory and Paper Decision Lifecycle
 
-The canonical universe, market observations, research, reviewed paper execution,
-broker reconciliation, analytical outcomes, and learning use one SQLite database.
-Alpaca positions/orders remain broker truth; internal records add attribution and
-never override broker state.
+Through the PostgreSQL foundation release, the canonical universe, market
+observations, research, reviewed paper execution, broker reconciliation,
+analytical outcomes, and learning still use one SQLite database. The staged
+target established by ADR-010 moves concurrent operational authority to Neon
+PostgreSQL only after per-domain backfill, reconciliation, and paper shadow
+comparison pass. Alpaca positions/orders remain broker truth; internal records
+add attribution and never override broker state.
 
 ### Data flow
 
@@ -86,10 +89,14 @@ records only the absence of allocator ownership. Ordinary equity, scale-in,
 
 ### Runtime topology
 
-The VPS runs the SQLite-backed CLI/control service and systemd timers. The
+The VPS currently runs the SQLite-backed CLI/control service and systemd timers. The
 observatory timer wakes every 15 minutes during weekday market windows through the
 existing locked monitor runner and performs a second market-clock check. Vercel is
 only a dashboard/control bridge and does not execute orders or own SQLite state.
+Both runtimes now have a bounded `pg` foundation. Vercel may use one pooled
+connection for a protected read-only Neon health check; the VPS uses a bounded
+long-lived pool. Neither runtime reads or writes PostgreSQL operational state
+until the corresponding feature and authority gates pass reconciliation.
 Late-day paper operations write a fresh signed artifact with
 `sourceAction=paper.ops.late_day` and the normal 30-minute artifact TTL before
 the separately scheduled reviewed exit executor runs.
@@ -105,6 +112,20 @@ fixtures may initialize isolated scratch databases through the transactional
 migration runner. Each pending migration group rechecks its ledger state after
 acquiring `BEGIN IMMEDIATE`, so explicit concurrent migration processes do not
 apply a migration twice.
+
+PostgreSQL schema mutation belongs only to `db:postgres:migrate`, using the
+direct connection and a session advisory lock. `db:postgres:status` is read-only;
+`db:postgres:verify` compares the migration checksum plus the expected tables,
+indexes, and scheduler fencing sequence. Application startup never invokes these
+commands. Ordinary traffic uses the pooled endpoint. Every transaction checks
+out one `pg` client and uses that client from `BEGIN` through `COMMIT` or
+`ROLLBACK`, with statement, lock, idle-in-transaction, and transaction timeouts.
+No transaction may span broker or market-data I/O.
+
+Domain repository contracts preserve scheduler fencing, optimistic versions,
+idempotency, event order, and one transaction scope. They intentionally do not
+expose a generic backend-neutral query interface. PostgreSQL implementations and
+authority routing arrive with the reconciled control-plane release.
 
 On command failure, the dashboard control runner retains bounded, redacted
 stdout and stderr as separate fields. Structured stdout failures remain causal;
