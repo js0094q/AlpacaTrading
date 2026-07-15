@@ -47,8 +47,12 @@ and CPU-heavy normalization occur before both persistence transactions.
   would unnecessarily delay observatory, review, and read paths.
 - Disabling timers or changing their stagger: hides the steady-state defect and
   changes normal production behavior.
-- WAL mode: no production-copy compatibility evidence justified a journal-mode
-  migration in this repair.
+- WAL mode: a later same-filesystem Btrfs/RBD production-copy test passed WAL,
+  checkpoint, concurrent-reader, online-backup, SIGKILL-recovery, integrity,
+  foreign-key, and migration-twice checks. DELETE remains in place because the
+  deployment has no sidecar-aware backup/restore automation, and WAL would not
+  remove the single-writer or distributed-ownership limits. See the Neon
+  operational-state inventory for the evidence and decision.
 - Unbounded retries: could prolong a failed worker and obscure lease loss.
 
 ## Consequences

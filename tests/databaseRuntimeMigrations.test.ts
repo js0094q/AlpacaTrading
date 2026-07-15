@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -9,6 +9,8 @@ import { after, describe, test } from "node:test";
 import {
   DatabaseMigrationRequiredError,
   REQUIRED_RUNTIME_MIGRATION_VERSIONS,
+  closeDbForTests,
+  getDb,
   initializeDatabaseHandle,
   initializeRuntimeDatabaseHandle
 } from "../src/lib/db.js";
@@ -51,6 +53,53 @@ const spawnMigration = (path: string) =>
   });
 
 describe("runtime database migration boundary", () => {
+  test("ordinary startup does not create a missing database file", () => {
+    const path = databasePath("missing-runtime");
+    const previousPath = process.env.RESEARCH_DB_PATH;
+    const testFixtureFlag = Symbol.for("alpaca.sqlite.test-fixture-initialization");
+    const globalState = globalThis as typeof globalThis & { [key: symbol]: unknown };
+    const previousTestFixtureFlag = globalState[testFixtureFlag];
+    closeDbForTests();
+    process.env.RESEARCH_DB_PATH = path;
+    delete globalState[testFixtureFlag];
+    try {
+      assert.throws(
+        () => getDb(),
+        (error) =>
+          error instanceof DatabaseMigrationRequiredError &&
+          error.pendingVersions.length === REQUIRED_RUNTIME_MIGRATION_VERSIONS.length
+      );
+      assert.equal(existsSync(path), false);
+    } finally {
+      closeDbForTests();
+      if (previousPath === undefined) delete process.env.RESEARCH_DB_PATH;
+      else process.env.RESEARCH_DB_PATH = previousPath;
+      if (previousTestFixtureFlag === undefined) delete globalState[testFixtureFlag];
+      else globalState[testFixtureFlag] = previousTestFixtureFlag;
+    }
+  });
+
+  test("an empty runtime database fails closed without creating schema", () => {
+    const db = new DatabaseSync(databasePath("empty-runtime"));
+
+    assert.throws(
+      () => initializeRuntimeDatabaseHandle(db),
+      (error) =>
+        error instanceof DatabaseMigrationRequiredError &&
+        error.code === "DATABASE_MIGRATION_REQUIRED" &&
+        error.pendingVersions.length === REQUIRED_RUNTIME_MIGRATION_VERSIONS.length
+    );
+    assert.equal(
+      (db
+        .prepare(
+          "SELECT COUNT(*) AS count FROM sqlite_master WHERE type IN ('table', 'index', 'trigger', 'view')"
+        )
+        .get() as { count: number }).count,
+      0
+    );
+    db.close();
+  });
+
   test("a current database performs no write transaction during runtime or migration checks", () => {
     const db = new DatabaseSync(databasePath("current-read-only"));
     initializeDatabaseHandle(db);

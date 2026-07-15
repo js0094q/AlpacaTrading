@@ -1,5 +1,28 @@
 # Resume Context: Alpaca Trading Research Infra
 
+## Neon operational-state migration Release 1 (2026-07-15)
+
+- Work is isolated on `codex/neon-postgres-operational-state` from verified
+  `origin/main@8cc9fe8431e3676b96a3a904a1256d4aa2dcf21b`. Release 1 changes inventory
+  and transition safeguards only; SQLite remains authoritative and all
+  PostgreSQL authority flags remain absent/off.
+- The inventory verifies 54 application tables plus `schema_migrations`, maps
+  every direct writer, transaction family, runtime-DDL boundary, scheduled
+  owner, and target ownership, and records ADR-010's staged PostgreSQL cutover.
+- Ordinary runtime now rejects a missing/empty/pending SQLite database without
+  creating files or applying DDL. Only explicit `db:migrate` and isolated Node
+  test fixtures may initialize schema.
+- Retry-safe operations now classify both `SQLITE_BUSY` and `SQLITE_LOCKED`, use
+  bounded exponential backoff with jitter and a total deadline, and redact
+  telemetry. Validation/constraint/corruption/application errors are not retried.
+- A quiesced same-filesystem Btrfs/RBD copy passed WAL, checkpoint, concurrent
+  reader/writer, online backup, SIGKILL recovery, integrity, foreign-key, and
+  migration-twice checks. Production remains on DELETE because backup/restore
+  is not sidecar-aware; the source database was unchanged.
+- Desktop Neon configuration was secured to mode `0600`; values were not
+  printed or copied. No Neon variable has been added to the VPS yet. No paper
+  or live order was submitted.
+
 ## Steady-state SQLite concurrency repair (2026-07-15)
 
 - The failed research run was not a migration-startup failure. Its exact
@@ -27,7 +50,8 @@
 - The release adds migration version
   `2026-07-15-paper-runtime-contention-recovery`. Production must run
   `npm run db:migrate` before SQLite-backed services restart. Ordinary startup
-  is read-only when current and fails closed on pending versions.
+  is read-only when current and fails closed on empty or pending schemas; only
+  isolated Node test fixtures may initialize scratch databases automatically.
 - Dashboard command failures keep structured stdout primary and retain bounded,
   redacted stderr warnings separately. `database is locked` is no longer
   replaced by Node's SQLite `ExperimentalWarning`.

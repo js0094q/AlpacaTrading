@@ -1,5 +1,5 @@
 import { DatabaseSync, type DatabaseSync as DbHandle } from "node:sqlite";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { isVercelRuntime } from "./runtime.js";
 import {
@@ -1340,7 +1340,9 @@ const hasApplicationSchema = (db: DbHandle): boolean =>
 export const initializeRuntimeDatabaseHandle = (db: DbHandle): DbHandle => {
   configureDatabaseConnection(db);
   if (!hasApplicationSchema(db)) {
-    return initializeDatabaseHandle(db);
+    throw new DatabaseMigrationRequiredError([
+      ...REQUIRED_RUNTIME_MIGRATION_VERSIONS
+    ]);
   }
 
   const pendingVersions = getPendingMigrationVersions(
@@ -1363,10 +1365,25 @@ const initialize = (): DbHandle => {
     throw new LocalSqliteUnavailableError(dbPath);
   }
 
+  const testFixtureInitializationEnabled = (
+    globalThis as typeof globalThis & { [key: symbol]: unknown }
+  )[Symbol.for("alpaca.sqlite.test-fixture-initialization")] === true;
+
+  if (!testFixtureInitializationEnabled && !existsSync(dbPath)) {
+    throw new DatabaseMigrationRequiredError([
+      ...REQUIRED_RUNTIME_MIGRATION_VERSIONS
+    ]);
+  }
+
   mkdirSync(dirname(dbPath), { recursive: true });
   const opened = new DatabaseSync(dbPath);
   try {
-    database = initializeRuntimeDatabaseHandle(opened);
+    // Only the explicitly preloaded test-fixture helper may build a scratch
+    // schema. Every ordinary CLI, service, timer, and health-check process must
+    // use the explicit db:migrate command before startup.
+    database = testFixtureInitializationEnabled && !hasApplicationSchema(opened)
+      ? initializeDatabaseHandle(opened)
+      : initializeRuntimeDatabaseHandle(opened);
     return database;
   } catch (error) {
     opened.close();
