@@ -1,5 +1,32 @@
 # Resume Context: Alpaca Investing Server Provisioning
 
+## Adaptive allocation safety-floor pre-deploy handoff (2026-07-14)
+
+- A redacted, read-only VPS check found `/home/alpaca/Alpaca-Trading` clean at
+  `29f4a814d39cebc6f66b371571a92fe58228f6e1` before this release.
+- Runtime flags remain `ALPACA_ENV=paper`, `TRADING_MODE=paper`,
+  `ALPACA_LIVE_TRADE=false`, and `LIVE_TRADING_ENABLED=false`.
+  `PAPER_ORDER_EXECUTION_ENABLED`, `PAPER_OPTIONS_EXECUTION_ENABLED`, and
+  `AUTOMATED_PAPER_EXECUTION_ENABLED` are present, but no order was submitted
+  during implementation or pre-deploy inspection.
+- None of the selected equity, plan, scale-in, 0DTE, or hedge sizing variables
+  was installed, so checked-in defaults were runtime-effective: `$1,000`
+  ordinary equity notional, `$5,000` per-order cap, `$50,000` total-plan cap,
+  `$250` scale-in when explicitly enabled, unchanged 0DTE caps, and hedge
+  ratios `0.0075`, `0.02`, and `0.01` of equity. The objective's
+  `$100`/`$300` figures were not installed or adopted.
+- `PAPER_REVIEW_SIGNING_KEY` was absent. Provision or preserve a random value
+  in `/opt/alpaca-investing/secrets/alpaca.env` without printing it, keep
+  `alpaca:alpaca` mode `0600`, and report only presence/fingerprint before
+  restarting affected services. It must not be added to Vercel.
+- The deployed cutover invalidates unsigned general review artifacts. Generate
+  a new signed `baseline-v1` artifact with the review-only
+  `paper:ops:review`. Compatibility confirm routes then dispatch reviewed
+  execution only; `FRESH_REVIEW_REQUIRED` means regenerate the review, not
+  resize or rebuild inline.
+- The safety floor stops before adaptive-allocation Release 1. It adds no live
+  path, allocator, cap increase, public mutation route, or allocator-owned exit.
+
 ## Latest VPS provisioning handoff (2026-07-05 UTC)
 
 - Repository work after server rebuild:
@@ -59,6 +86,9 @@
 
 - Preserve paper-only guardrails (`ALPACA_ENV=paper`, `LIVE_TRADING_ENABLED=false`) on all runs.
 - Keep `HEDGE_LIVE_EXECUTION_ENABLED=false` and `MULTI_LEG_HEDGE_EXECUTION_ENABLED=false`; hedge plans remain signed and expiring, while the separate reviewed executor is paper-only and single-leg.
+- Keep `PAPER_REVIEW_SIGNING_KEY` VPS-only. General reviews and 0DTE submit
+  attestations fail closed when it is absent, and unsigned legacy artifacts
+  must never be grandfathered.
 - Keep paper execution operationally enabled only through the guarded paper path (`PAPER_ORDER_EXECUTION_ENABLED=true`, `PAPER_OPTIONS_EXECUTION_ENABLED=true`, valid control/admin auth, and CLI `--confirmPaper`).
 - Continuous paper monitor timers are installed with `scripts/install-paper-monitoring-systemd.sh`; they use `npm run paper:monitor`, reviewed payload artifacts, section filters, market-hours no-ops, and per-task locks.
 - Do not add direct shell command execution in dashboard actions; keep allowlisted control endpoints only.

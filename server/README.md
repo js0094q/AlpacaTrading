@@ -143,9 +143,38 @@ ALPACA_LIVE_SECRET=
 ALPACA_PAPER_BASE_URL=https://paper-api.alpaca.markets
 ALPACA_LIVE_BASE_URL=https://api.alpaca.markets
 LIVE_TRADING_ENABLED=false
+PAPER_REVIEW_SIGNING_KEY=
+HEDGE_REVIEW_SIGNING_KEY=
 ```
 
 Do not store Alpaca keys in shell history, README files, logs, tests, frontend code, or prompts. Rotate any live keys that were already uploaded, pasted, or exposed before future live use.
+
+### Signed-review deployment cutover
+
+`PAPER_REVIEW_SIGNING_KEY` is a VPS-only HMAC secret for general reviewed
+payloads and 0DTE submit attestations. `HEDGE_REVIEW_SIGNING_KEY` remains the
+independent hedge-review signer. Before deploying the safety floor, stop the
+affected control service and paper/0DTE timers, add or preserve a
+cryptographically random general signer without printing it, restore
+`alpaca:alpaca` ownership and mode `0600`, and report only presence or a SHA-256
+fingerprint. Never copy either signer to Vercel.
+
+After restart, all unsigned general artifacts are intentionally invalid. Create
+a new review with `npm run paper:ops:review -- --format=json`. Do not run an
+execution command as a cutover check. A later entry submit re-fetches paper
+account, position, order, reservation, market, and cap evidence; material drift
+returns `FRESH_REVIEW_REQUIRED` and requires another review. Compatibility CLI
+and HTTP confirm paths now dispatch reviewed execution only and never supply
+confirmation implicitly.
+
+The checked-in ordinary equity defaults remain `$1,000` per order, `$5,000`
+maximum per order, and `$50,000` total plan notional, with a `20%` cash reserve,
+`50%` portfolio deployment cap, and `10%` position cap. Scale-in remains
+disabled by default with a `$250` add size. A redacted 2026-07-14 pre-deploy
+inspection found no selected VPS sizing overrides, so these source defaults
+were runtime-effective; the objective's `$100`/`$300` figures were neither
+installed nor adopted. Hedge environment percentages are `0.75`, `2`, and `1`,
+which normalize to `0.0075`, `0.02`, and `0.01` of equity.
 
 ## Docker
 
