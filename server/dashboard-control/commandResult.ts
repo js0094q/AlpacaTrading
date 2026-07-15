@@ -1,6 +1,22 @@
 import { redactSensitiveText } from "../../src/lib/securityRedaction.js";
 
 export const COMMAND_OUTPUT_LIMIT = 8_192;
+export const COMMAND_STREAM_OUTPUT_LIMIT = 4 * 1_024 * 1_024;
+
+export const appendBoundedCommandOutput = (
+  current: string,
+  chunk: string,
+  limit = COMMAND_STREAM_OUTPUT_LIMIT
+): { value: string; exceeded: boolean } => {
+  const remaining = Math.max(0, limit - current.length);
+  if (chunk.length <= remaining) {
+    return { value: `${current}${chunk}`, exceeded: false };
+  }
+  return {
+    value: `${current}${chunk.slice(0, remaining)}`,
+    exceeded: true
+  };
+};
 
 export interface CommandFailureInput {
   exitCode: number | null;
@@ -8,6 +24,10 @@ export interface CommandFailureInput {
   timedOut: boolean;
   stdout: string;
   stderr: string;
+  errorOverride?: {
+    code: string;
+    message: string;
+  };
 }
 
 export interface GuardedCommandFailure {
@@ -113,7 +133,9 @@ export const normalizeCommandFailure = (
   const parsedError = structuredError(parseJsonObject(input.stdout));
 
   let error: GuardedCommandFailure["error"];
-  if (parsedError) {
+  if (input.errorOverride) {
+    error = input.errorOverride;
+  } else if (parsedError) {
     error = parsedError;
   } else if (input.timedOut) {
     error = { code: "COMMAND_TIMEOUT", message: "Command timed out." };

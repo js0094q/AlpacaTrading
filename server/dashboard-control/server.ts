@@ -33,7 +33,9 @@ import {
   type RuntimePreflightChecks
 } from "../../src/services/runtimeMutationPreflight.js";
 import {
+  appendBoundedCommandOutput,
   COMMAND_OUTPUT_LIMIT,
+  COMMAND_STREAM_OUTPUT_LIMIT,
   GuardedCommandError,
   normalizeCommandFailure,
   type GuardedCommandFailure
@@ -237,6 +239,7 @@ const runCommandViaSpawn = (
     let output = "";
     let errored = "";
     let timedOut = false;
+    let outputLimitExceeded: "stdout" | "stderr" | null = null;
     let settled = false;
     const started = Date.now();
     const child = spawn("npm", ["--silent", "run", script, "--", ...args], {
@@ -254,10 +257,22 @@ const runCommandViaSpawn = (
     }, timeoutMs);
 
     child.stdout?.on("data", (chunk) => {
-      output += String(chunk);
+      if (outputLimitExceeded) return;
+      const bounded = appendBoundedCommandOutput(output, String(chunk));
+      output = bounded.value;
+      if (bounded.exceeded) {
+        outputLimitExceeded = "stdout";
+        killProcessTree(child);
+      }
     });
     child.stderr?.on("data", (chunk) => {
-      errored += String(chunk);
+      if (outputLimitExceeded) return;
+      const bounded = appendBoundedCommandOutput(errored, String(chunk));
+      errored = bounded.value;
+      if (bounded.exceeded) {
+        outputLimitExceeded = "stderr";
+        killProcessTree(child);
+      }
     });
     child.on("error", (error) => {
       if (settled) return;
@@ -268,7 +283,15 @@ const runCommandViaSpawn = (
         signal: null,
         timedOut,
         stdout: output,
-        stderr: `${errored}\n${error.message}`
+        stderr: `${errored}\n${error.message}`,
+        ...(outputLimitExceeded
+          ? {
+              errorOverride: {
+                code: "COMMAND_OUTPUT_LIMIT_EXCEEDED",
+                message: `Command ${outputLimitExceeded} exceeded the ${COMMAND_STREAM_OUTPUT_LIMIT}-character collection limit.`
+              }
+            }
+          : {})
       });
       reject(new GuardedCommandError(action, failure));
     });
@@ -278,13 +301,21 @@ const runCommandViaSpawn = (
       clearTimeout(timeout);
       const durationMs = Date.now() - started;
 
-      if (code !== 0 || signal || timedOut) {
+      if (code !== 0 || signal || timedOut || outputLimitExceeded) {
         const failure = normalizeCommandFailure({
           exitCode: code,
           signal,
           timedOut,
           stdout: output,
-          stderr: errored
+          stderr: errored,
+          ...(outputLimitExceeded
+            ? {
+                errorOverride: {
+                  code: "COMMAND_OUTPUT_LIMIT_EXCEEDED",
+                  message: `Command ${outputLimitExceeded} exceeded the ${COMMAND_STREAM_OUTPUT_LIMIT}-character collection limit.`
+                }
+              }
+            : {})
         });
         reject(new GuardedCommandError(action, failure));
         return;

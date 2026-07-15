@@ -2,12 +2,37 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 
 import {
+  appendBoundedCommandOutput,
   COMMAND_OUTPUT_LIMIT,
   GuardedCommandError,
   normalizeCommandFailure
 } from "../server/dashboard-control/commandResult.js";
 
 describe("guarded dashboard command failures", () => {
+  test("caps child output while streaming and reports an explicit limit failure", () => {
+    const first = appendBoundedCommandOutput("", "12345678", 12);
+    const second = appendBoundedCommandOutput(first.value, "90abcdef", 12);
+
+    assert.deepEqual(first, { value: "12345678", exceeded: false });
+    assert.deepEqual(second, { value: "1234567890ab", exceeded: true });
+
+    const failure = normalizeCommandFailure({
+      exitCode: null,
+      signal: "SIGKILL",
+      timedOut: false,
+      stdout: second.value,
+      stderr: "",
+      errorOverride: {
+        code: "COMMAND_OUTPUT_LIMIT_EXCEEDED",
+        message: "Command stdout exceeded the 12-character collection limit."
+      }
+    });
+    assert.deepEqual(failure.error, {
+      code: "COMMAND_OUTPUT_LIMIT_EXCEEDED",
+      message: "Command stdout exceeded the 12-character collection limit."
+    });
+  });
+
   test("keeps structured SQLite stdout primary and records stderr warning separately", () => {
     const failure = normalizeCommandFailure({
       exitCode: 1,

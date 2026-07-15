@@ -109,7 +109,9 @@ not apply a migration twice.
 On command failure, the dashboard control runner retains bounded, redacted
 stdout and stderr as separate fields. Structured stdout failures remain causal;
 Node warnings are secondary diagnostics. Successful structured command JSON is
-kept intact through parsing. The 10-second Alpaca health child receives a 9-second
+kept intact through parsing within a 4,194,304-character per-stream collection cap;
+an over-limit child is terminated with `COMMAND_OUTPUT_LIMIT_EXCEEDED`. The
+10-second Alpaca health child receives a 9-second
 monotonic operation budget with a completion margin, and its sequential account
 and clock requests share that deadline.
 

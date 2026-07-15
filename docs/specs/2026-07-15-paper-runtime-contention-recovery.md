@@ -101,7 +101,9 @@ order during implementation or validation.
 Failure diagnostics are bounded and redacted. Structured stdout failure is
 primary; stderr warnings remain secondary. Stderr-only and malformed-output
 failures retain safe fallbacks. Successful structured JSON remains intact until
-it is parsed.
+it is parsed within a 4,194,304-character per-stream cap. A child that exceeds that
+cap is terminated and returns `COMMAND_OUTPUT_LIMIT_EXCEEDED` rather than a
+truncated success value.
 
 ### Health deadline contract
 
