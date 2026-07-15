@@ -138,6 +138,31 @@ export type ResearchRunReservation =
       heartbeatAt: string;
     };
 
+type ActiveResearchRunRow = {
+  id: string;
+  started_at: string;
+  heartbeat_at: string;
+};
+
+const activeResearchRun = (
+  db: DbHandle,
+  cutoff?: string
+): ActiveResearchRunRow | undefined => {
+  const cutoffClause = cutoff
+    ? " AND COALESCE(heartbeat_at, started_at) > ?"
+    : "";
+  const params = cutoff ? [cutoff] : [];
+  return db
+    .prepare(`
+      SELECT id, started_at, COALESCE(heartbeat_at, started_at) AS heartbeat_at
+      FROM research_runs
+      WHERE status = 'running'${cutoffClause}
+      ORDER BY started_at ASC
+      LIMIT 1
+    `)
+    .get(...params) as ActiveResearchRunRow | undefined;
+};
+
 export const reserveResearchRun = (input: {
   runId: string;
   now?: Date;
@@ -151,6 +176,18 @@ export const reserveResearchRun = (input: {
   const db = getDb();
   const now = input.now || new Date();
   const startedAt = now.toISOString();
+  const freshActive = activeResearchRun(
+    db,
+    new Date(now.getTime() - RESEARCH_RUN_STALE_AFTER_MS).toISOString()
+  );
+  if (freshActive) {
+    return {
+      status: "already_running",
+      activeRunId: freshActive.id,
+      startedAt: freshActive.started_at,
+      heartbeatAt: freshActive.heartbeat_at
+    };
+  }
   try {
     db.exec("BEGIN IMMEDIATE;");
     recoverStaleResearchRunsInTransaction({
@@ -158,17 +195,7 @@ export const reserveResearchRun = (input: {
       now,
       source: "research_preflight"
     });
-    const active = db
-      .prepare(`
-        SELECT id, started_at, COALESCE(heartbeat_at, started_at) AS heartbeat_at
-        FROM research_runs
-        WHERE status = 'running'
-        ORDER BY started_at ASC
-        LIMIT 1
-      `)
-      .get() as
-      | { id: string; started_at: string; heartbeat_at: string }
-      | undefined;
+    const active = activeResearchRun(db);
     if (active) {
       db.exec("COMMIT;");
       return {
