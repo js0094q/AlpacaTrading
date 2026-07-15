@@ -80,6 +80,7 @@ export interface HedgeExecutionPolicy {
   duplicateWindowHours: number;
   minRebalanceIntervalHours: number;
   limitPriceMaxAgeSeconds: number;
+  limitPriceMaxDriftPct: number;
   orderTimeoutSeconds: number;
   maxRepriceAttempts: number;
 }
@@ -164,15 +165,15 @@ export const buildHedgeConfig = (): HedgeConfig => {
     maxNewContractsPerRun: positiveInteger(process.env.HEDGE_MAX_NEW_CONTRACTS_PER_RUN, 2),
     maxNewHedgePremiumPctEquity: percentage(
       process.env.HEDGE_MAX_NEW_HEDGE_PREMIUM_PCT_EQUITY,
-      0.75
+      0.0075
     ),
     maxTotalHedgePremiumPctEquity: percentage(
       process.env.HEDGE_MAX_TOTAL_HEDGE_PREMIUM_PCT_EQUITY,
-      2
+      0.02
     ),
     maxDailyHedgePremiumPctEquity: percentage(
       process.env.HEDGE_MAX_DAILY_HEDGE_PREMIUM_PCT_EQUITY,
-      1
+      0.01
     ),
     minOrderNotionalDollars: positiveNumber(process.env.HEDGE_MIN_ORDER_NOTIONAL_DOLLARS, 25),
     reviewTtlSeconds: positiveInteger(process.env.HEDGE_REVIEW_TTL_SECONDS, 300),
@@ -184,6 +185,10 @@ export const buildHedgeConfig = (): HedgeConfig => {
     limitPriceMaxAgeSeconds: positiveInteger(
       process.env.HEDGE_LIMIT_PRICE_MAX_AGE_SECONDS,
       60
+    ),
+    limitPriceMaxDriftPct: percentage(
+      process.env.PAPER_SUBMIT_MAX_PRICE_DRIFT_PCT,
+      0.1
     ),
     orderTimeoutSeconds: positiveInteger(process.env.HEDGE_ORDER_TIMEOUT_SECONDS, 120),
     maxRepriceAttempts: positiveInteger(process.env.HEDGE_MAX_REPRICE_ATTEMPTS, 2)

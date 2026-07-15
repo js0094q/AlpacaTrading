@@ -19,6 +19,7 @@ import {
   buildHedgeConfig,
   hedgeConfigurationFingerprint
 } from "../src/services/hedgeConfigService.js";
+import { buildHedgeCapitalEvidence } from "../src/services/hedgeCapitalEvidenceService.js";
 import { evaluateHedgeExecutionGate } from "../src/services/hedgeExecutionGateService.js";
 import {
   buildAndPersistHedgePlan,
@@ -70,6 +71,13 @@ const recommendation = (): HedgeRecommendation => ({
     premiumBudget: 10000,
     residualUnprotectedLoss: 30000
   },
+  capitalEvidence: buildHedgeCapitalEvidence({
+    asOf: now,
+    allowedUnderlyings: ["SPY", "QQQ"],
+    positions: [],
+    orders: [],
+    ledger: []
+  }),
   leaps: {
     trimRecommendations: [],
     observedUnrealizedGain: 0,

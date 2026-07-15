@@ -353,4 +353,21 @@ describe("paper monitoring scheduler", () => {
       rmSync(temp, { recursive: true, force: true });
     }
   });
+
+  test("deployment validation preserves runtime credentials and rejects placeholder signers", () => {
+    const runbook = readFileSync(
+      join(repoRoot, "docs/vps-paper-research-deployment.md"),
+      "utf8"
+    );
+
+    assert.doesNotMatch(runbook, /cp \.env\.example \.env/);
+    assert.match(
+      runbook,
+      /! grep -Eq '\^PAPER_REVIEW_SIGNING_KEY=\(replace_me\|replace_with_random_secret\)\$'/
+    );
+    assert.match(
+      runbook,
+      /! grep -Eq '\^HEDGE_REVIEW_SIGNING_KEY=\(replace_me\|replace_with_independent_random_secret\)\$'/
+    );
+  });
 });

@@ -13,25 +13,40 @@ import {
 } from "./alpacaClient.js";
 import { fetchOptionQuotes, fetchOptionSnapshots } from "./providers/alpaca.js";
 import { normalizeOptionSnapshot } from "./optionSnapshotNormalizer.js";
-import { buildHedgeConfig } from "./hedgeConfigService.js";
+import {
+  buildHedgeConfig,
+  hedgeConfigurationFingerprint
+} from "./hedgeConfigService.js";
+import {
+  buildHedgeCapitalEvidence,
+  type HedgeCapitalEvidence,
+  type HedgeCapitalOrderInput
+} from "./hedgeCapitalEvidenceService.js";
 import {
   reconcileHedgeAccountState,
   type HedgeAccountReconciliationResult
 } from "./hedgeAccountReconciliationService.js";
 import {
-  readHedgeExecutionReview,
-  markHedgeExecutionReviewConsumed,
+  readHedgeExecutionReview
 } from "./hedgePersistenceService.js";
 import type {
   HedgeExecutionReview,
   HedgeExecutionReviewVerification
 } from "./hedgeExecutionReviewService.js";
+import { verifyHedgeExecutionReview } from "./hedgeExecutionReviewService.js";
 import {
+  listActivePaperNewRiskReservations,
   listPaperExecutionLedgerEntries,
+  paperNewRiskLedgerMutationFingerprint,
   releaseExpiredHedgeReservations,
   reservePaperExecutionAttempt,
   updatePaperExecutionLedgerEntry,
+  type PaperExecutionLedgerEntry
 } from "./paperExecutionLedgerService.js";
+import {
+  normalizePaperSubmitReservations,
+  paperSubmitReservationFingerprint
+} from "./paperSubmitStateService.js";
 import {
   validatePaperHedgeOptionOrder,
   type PaperHedgeOptionOrderValidation
@@ -66,6 +81,7 @@ export interface HedgeExecutionReport {
   verification?: HedgeExecutionReviewVerification;
   reconciliation?: HedgeAccountReconciliationResult;
   validation?: PaperHedgeOptionOrderValidation;
+  capitalEvidence?: HedgeCapitalEvidence;
 }
 
 export interface HedgeQuoteRefresh {
@@ -76,16 +92,11 @@ export interface HedgeQuoteRefresh {
   quoteTimestamp: string | null;
 }
 
-interface HedgeOpenOrderSnapshot {
-  symbol: string;
-  client_order_id?: string;
-  status?: string;
-}
-
 export interface HedgeExecutionDeps {
   getAccount?: typeof getAccount;
   listPositions?: () => Promise<{ positions: AlpacaPositionRaw[]; requestId?: string }>;
-  listOrders?: () => Promise<{ orders: HedgeOpenOrderSnapshot[]; requestId?: string }>;
+  listOrders?: () => Promise<{ orders: HedgeCapitalOrderInput[]; requestId?: string }>;
+  listLedger?: (limit?: number) => PaperExecutionLedgerEntry[];
   submitPaperOrder?: typeof submitPaperOrder;
   getPaperOrder?: typeof getPaperOrder;
   replacePaperOrder?: typeof replacePaperOrder;
@@ -101,6 +112,46 @@ const parseBoolean = (name: string) => process.env[name] === "true" || process.e
 const numberValue = (value: unknown) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+};
+
+const hedgeCapitalCapBlockers = (input: {
+  equity: number | null;
+  newPremium: number;
+  capitalEvidence: HedgeCapitalEvidence;
+  config: ReturnType<typeof buildHedgeConfig>;
+}) => {
+  const blockers: string[] = [];
+  if (input.equity === null || input.equity <= 0) {
+    blockers.push("HEDGE_ACCOUNT_EQUITY_INVALID");
+  } else {
+    if (
+      input.newPremium >
+      input.equity * input.config.executionPolicy.maxNewHedgePremiumPctEquity
+    ) {
+      blockers.push("HEDGE_PREMIUM_CAP_EXCEEDED");
+    }
+    if (
+      (input.capitalEvidence.existingHedgePremium ?? 0) +
+        (input.capitalEvidence.reservedHedgePremium ?? 0) +
+        input.newPremium >
+      input.equity * input.config.executionPolicy.maxTotalHedgePremiumPctEquity
+    ) {
+      blockers.push("HEDGE_TOTAL_PREMIUM_CAP_EXCEEDED");
+    }
+    if (
+      (input.capitalEvidence.dailyHedgePremiumUsed ?? 0) + input.newPremium >
+      input.equity * input.config.executionPolicy.maxDailyHedgePremiumPctEquity
+    ) {
+      blockers.push("HEDGE_DAILY_PREMIUM_CAP_EXCEEDED");
+    }
+  }
+  if (
+    (input.capitalEvidence.openHedgeOrderCount ?? Number.POSITIVE_INFINITY) >=
+    input.config.executionPolicy.maxOrdersPerRun
+  ) {
+    blockers.push("HEDGE_OPEN_ORDER_CAP_REACHED");
+  }
+  return [...new Set(blockers)];
 };
 
 export const paperAccountIdentityHash = (account: Partial<AlpacaAccountRaw>) =>
@@ -120,7 +171,7 @@ const defaultListPositions = async () => {
 
 const defaultListOrders = async () => {
   const { listRecentPaperOrders } = await import("./alpacaClient.js");
-  const response = await listRecentPaperOrders(100);
+  const response = await listRecentPaperOrders(500);
   return { orders: response.data, requestId: response.requestId };
 };
 
@@ -151,6 +202,7 @@ const blockedReport = (input: {
   blockers: string[];
   review?: HedgeExecutionReview | null;
   verification?: HedgeExecutionReviewVerification;
+  capitalEvidence?: HedgeCapitalEvidence;
 }) => ({
   paperOnly: true as const,
   environment: input.environment ?? "paper",
@@ -167,6 +219,7 @@ const blockedReport = (input: {
   reservationId: null,
   blockers: [...new Set(input.blockers)],
   warnings: [],
+  ...(input.capitalEvidence ? { capitalEvidence: input.capitalEvidence } : {}),
   ...(input.verification ? { verification: input.verification } : {})
 });
 
@@ -193,6 +246,11 @@ export const executeReviewedPaperHedge = async (
 
   const now = deps.now?.() ?? new Date().toISOString();
   releaseExpiredHedgeReservations(now);
+  const expectedReservationFingerprint = paperSubmitReservationFingerprint(
+    normalizePaperSubmitReservations(listActivePaperNewRiskReservations())
+  );
+  const expectedNewRiskLedgerFingerprint =
+    paperNewRiskLedgerMutationFingerprint();
   const signingKey = process.env.HEDGE_REVIEW_SIGNING_KEY!.trim();
   const stored = (deps.readReview ?? readHedgeExecutionReview)({
     reviewId: input.reviewId,
@@ -212,11 +270,109 @@ export const executeReviewedPaperHedge = async (
     return blockedReport({ reviewId: input.reviewId, blockers: ["MULTI_LEG_EXECUTION_UNSUPPORTED"], review });
   }
 
-  const accountResponse = await (deps.getAccount ?? getAccount)();
+  const config = buildHedgeConfig();
+  let accountResponse: Awaited<ReturnType<typeof getAccount>>;
+  let positionsResponse: Awaited<ReturnType<NonNullable<HedgeExecutionDeps["listPositions"]>>>;
+  let ordersResponse: Awaited<ReturnType<NonNullable<HedgeExecutionDeps["listOrders"]>>>;
+  let ledgerEntries: PaperExecutionLedgerEntry[];
+  try {
+    [accountResponse, positionsResponse, ordersResponse] = await Promise.all([
+      (deps.getAccount ?? getAccount)(),
+      (deps.listPositions ?? defaultListPositions)(),
+      (deps.listOrders ?? defaultListOrders)()
+    ]);
+    ledgerEntries = (deps.listLedger ?? listPaperExecutionLedgerEntries)(500);
+  } catch {
+    return blockedReport({
+      reviewId: input.reviewId,
+      blockers: [
+        "HEDGE_CAPITAL_SOURCE_UNAVAILABLE",
+        "HEDGE_CAPITAL_EVIDENCE_INCOMPLETE",
+        "FRESH_REVIEW_REQUIRED"
+      ],
+      review
+    });
+  }
   const account = accountResponse.data;
   const accountHash = paperAccountIdentityHash(account);
-  const positionsResponse = await (deps.listPositions ?? defaultListPositions)();
-  const ordersResponse = await (deps.listOrders ?? defaultListOrders)();
+  const capitalEvidence = buildHedgeCapitalEvidence({
+    asOf: now,
+    allowedUnderlyings: config.executionPolicy.allowedUnderlyings,
+    positions: positionsResponse.positions,
+    orders: ordersResponse.orders,
+    ledger: ledgerEntries.map((entry) => ({
+      ledgerId: entry.id,
+      mode: entry.mode,
+      strategy: entry.strategy,
+      symbol: entry.symbol,
+      side: entry.side,
+      status: entry.status,
+      quantity: entry.qty,
+      limitPrice: entry.limitPrice,
+      estimatedPremium: entry.estimatedPremium,
+      clientOrderId: entry.clientOrderId,
+      brokerOrderId: entry.alpacaOrderId,
+      createdAt: entry.createdAt,
+      rawResponseJson: entry.rawResponseJson
+    }))
+  });
+  const freshVerification = verifyHedgeExecutionReview({
+    review,
+    signingKey,
+    asOf: now,
+    accountHash,
+    configurationFingerprint: hedgeConfigurationFingerprint(config),
+    capitalEvidenceFingerprint: capitalEvidence.fingerprint
+  });
+  const verificationBlockers = [...freshVerification.blockers];
+  if (
+    verificationBlockers.some((blocker) =>
+      [
+        "HEDGE_ACCOUNT_IDENTITY_MISMATCH",
+        "HEDGE_CONFIGURATION_MISMATCH",
+        "HEDGE_CAPITAL_EVIDENCE_CHANGED"
+      ].includes(blocker)
+    )
+  ) {
+    verificationBlockers.push("FRESH_REVIEW_REQUIRED");
+  }
+  if (!capitalEvidence.complete) {
+    verificationBlockers.push(
+      ...capitalEvidence.blockers,
+      "HEDGE_CAPITAL_EVIDENCE_INCOMPLETE",
+      "FRESH_REVIEW_REQUIRED"
+    );
+  }
+  if (verificationBlockers.length) {
+    return blockedReport({
+      reviewId: input.reviewId,
+      blockers: verificationBlockers,
+      review,
+      verification: {
+        ...freshVerification,
+        valid: false,
+        blockers: [...new Set(verificationBlockers)]
+      },
+      capitalEvidence
+    });
+  }
+  const equity = numberValue(account.equity);
+  const newPremium = review.orderIntent.maxPremium;
+  const capitalCapBlockers = hedgeCapitalCapBlockers({
+    equity,
+    newPremium,
+    capitalEvidence,
+    config
+  });
+  if (capitalCapBlockers.length) {
+    return blockedReport({
+      reviewId: input.reviewId,
+      blockers: capitalCapBlockers,
+      review,
+      verification: freshVerification,
+      capitalEvidence
+    });
+  }
   const reconciliation = reconcileHedgeAccountState({
     review,
     currentAccountHash: accountHash,
@@ -231,19 +387,26 @@ export const executeReviewedPaperHedge = async (
     })),
     openOrders: ordersResponse.orders.map((order) => ({
       symbol: String(order.symbol || ""),
-      clientOrderId: order.client_order_id,
-      status: order.status
+      clientOrderId: order.client_order_id ?? undefined,
+      status: order.status ?? undefined
     })),
-    ledger: listPaperExecutionLedgerEntries(100).map((entry) => ({
+    ledger: ledgerEntries.map((entry) => ({
       clientOrderId: entry.clientOrderId,
       status: entry.status
     }))
   });
   if (!reconciliation.valid) {
-    return { ...blockedReport({ reviewId: input.reviewId, blockers: reconciliation.blockers, review }), reconciliation };
+    return {
+      ...blockedReport({
+        reviewId: input.reviewId,
+        blockers: reconciliation.blockers,
+        review,
+        capitalEvidence
+      }),
+      reconciliation
+    };
   }
 
-  const config = buildHedgeConfig();
   const quote = await (deps.refreshQuote ?? defaultRefreshQuote)(review.orderIntent.symbol);
   const validation = validatePaperHedgeOptionOrder({
     environment,
@@ -274,7 +437,42 @@ export const executeReviewedPaperHedge = async (
     maxDte: config.executionPolicy.maxDte
   });
   if (!validation.valid) {
-    return { ...blockedReport({ reviewId: input.reviewId, blockers: validation.blockers, review }), reconciliation, validation };
+    return {
+      ...blockedReport({
+        reviewId: input.reviewId,
+        blockers: validation.blockers,
+        review,
+        capitalEvidence
+      }),
+      reconciliation,
+      validation
+    };
+  }
+  const freshReferencePrice =
+    quote.midpoint ??
+    (quote.bid !== null && quote.ask !== null
+      ? (quote.bid + quote.ask) / 2
+      : null);
+  const priceDriftPct =
+    freshReferencePrice !== null && review.orderIntent.limitPrice > 0
+      ? (Math.abs(freshReferencePrice - review.orderIntent.limitPrice) /
+          review.orderIntent.limitPrice) *
+        100
+      : null;
+  if (
+    priceDriftPct === null ||
+    priceDriftPct / 100 > config.executionPolicy.limitPriceMaxDriftPct
+  ) {
+    return {
+      ...blockedReport({
+        reviewId: input.reviewId,
+        blockers: ["HEDGE_PRICE_DRIFT", "FRESH_REVIEW_REQUIRED"],
+        review,
+        capitalEvidence
+      }),
+      reconciliation,
+      validation
+    };
   }
 
   const reservation = reservePaperExecutionAttempt({
@@ -286,11 +484,42 @@ export const executeReviewedPaperHedge = async (
     limitPrice: review.orderIntent.limitPrice,
     estimatedPremium: review.orderIntent.maxPremium,
     expiresAt: review.expiresAt,
-    requestId: review.requestId
+    requestId: review.requestId,
+    consumeReview: true,
+    validateBeforeInsert: () => {
+      const currentReservations = normalizePaperSubmitReservations(
+        listActivePaperNewRiskReservations()
+      );
+      if (
+        paperNewRiskLedgerMutationFingerprint() !==
+          expectedNewRiskLedgerFingerprint ||
+        paperSubmitReservationFingerprint(currentReservations) !==
+        expectedReservationFingerprint
+      ) {
+        return [
+          "HEDGE_RESERVATION_STATE_DRIFT",
+          "FRESH_REVIEW_REQUIRED"
+        ];
+      }
+      const currentCapBlockers = hedgeCapitalCapBlockers({
+        equity,
+        newPremium,
+        capitalEvidence,
+        config
+      });
+      return currentCapBlockers.length
+        ? [...currentCapBlockers, "FRESH_REVIEW_REQUIRED"]
+        : [];
+    }
   });
   if (!reservation.reserved) {
     return {
-      ...blockedReport({ reviewId: input.reviewId, blockers: reservation.blockers, review }),
+      ...blockedReport({
+        reviewId: input.reviewId,
+        blockers: reservation.blockers,
+        review,
+        capitalEvidence
+      }),
       reconciliation,
       validation,
       reservationId: reservation.entry?.id ?? null
@@ -317,7 +546,12 @@ export const executeReviewedPaperHedge = async (
       errorMessage: error instanceof Error ? error.message : "Paper hedge submission failed."
     });
     return {
-      ...blockedReport({ reviewId: input.reviewId, blockers: ["HEDGE_ORDER_SUBMISSION_FAILED"], review }),
+      ...blockedReport({
+        reviewId: input.reviewId,
+        blockers: ["HEDGE_ORDER_SUBMISSION_FAILED"],
+        review,
+        capitalEvidence
+      }),
       reconciliation,
       validation,
       reservationId: reservation.entry.id
@@ -332,7 +566,12 @@ export const executeReviewedPaperHedge = async (
   });
   if (!brokerOrderId) {
     return {
-      ...blockedReport({ reviewId: input.reviewId, blockers: ["HEDGE_BROKER_ORDER_ID_MISSING"], review }),
+      ...blockedReport({
+        reviewId: input.reviewId,
+        blockers: ["HEDGE_BROKER_ORDER_ID_MISSING"],
+        review,
+        capitalEvidence
+      }),
       reconciliation,
       validation,
       reservationId: reservation.entry.id
@@ -353,7 +592,6 @@ export const executeReviewedPaperHedge = async (
     const filledQuantity = numberValue(latest.filled_qty) ?? 0;
     if (status === "filled") {
       updatePaperExecutionLedgerEntry(reservation.entry.id, { status: "filled", alpacaStatus: status, requestId: orderResponse.requestId });
-      markHedgeExecutionReviewConsumed(review.reviewId);
       return {
         paperOnly: true,
         environment: "paper",
@@ -370,6 +608,7 @@ export const executeReviewedPaperHedge = async (
         reservationId: reservation.entry.id,
         blockers: [],
         warnings: [],
+        capitalEvidence,
         reconciliation,
         validation
       };
@@ -377,7 +616,6 @@ export const executeReviewedPaperHedge = async (
     if (["rejected", "canceled", "expired"].includes(status)) {
       const terminal = status === "rejected" ? "rejected" : "canceled";
       updatePaperExecutionLedgerEntry(reservation.entry.id, { status: terminal, alpacaStatus: status, requestId: orderResponse.requestId });
-      markHedgeExecutionReviewConsumed(review.reviewId);
       return {
         paperOnly: true,
         environment: "paper",
@@ -394,6 +632,7 @@ export const executeReviewedPaperHedge = async (
         reservationId: reservation.entry.id,
         blockers: terminal === "rejected" ? ["HEDGE_ORDER_REJECTED"] : [],
         warnings: [],
+        capitalEvidence,
         reconciliation,
         validation
       };
@@ -414,7 +653,6 @@ export const executeReviewedPaperHedge = async (
     alpacaStatus: "canceled",
     requestId: canceled.requestId
   });
-  markHedgeExecutionReviewConsumed(review.reviewId);
   return {
     paperOnly: true,
     environment: "paper",
@@ -431,6 +669,7 @@ export const executeReviewedPaperHedge = async (
     reservationId: reservation.entry.id,
     blockers: [],
     warnings: status === "partial" ? ["HEDGE_PARTIAL_FILL_CANCELED_REMAINDER"] : [],
+    capitalEvidence,
     reconciliation,
     validation
   };

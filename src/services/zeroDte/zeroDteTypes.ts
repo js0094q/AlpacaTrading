@@ -85,6 +85,8 @@ export interface ZeroDteRuntimeSnapshot {
 export interface ZeroDteAccountPositionSnapshot {
   symbol: string;
   quantity: number;
+  marketValue?: number | null;
+  currentPrice?: number | null;
 }
 
 export interface ZeroDteAccountOrderSnapshot {
@@ -92,19 +94,32 @@ export interface ZeroDteAccountOrderSnapshot {
   side?: string | null;
   status?: string | null;
   clientOrderId?: string | null;
+  brokerOrderId?: string | null;
+  quantity?: number | null;
+  limitPrice?: number | null;
 }
 
 export interface ZeroDteAccountSnapshot {
+  accountIdentityHash?: string | null;
   environment?: string;
   paperVerified?: boolean;
   status?: string | null;
+  cash?: number | null;
   buyingPower: number | null;
   optionsBuyingPower?: number | null;
   equity?: number | null;
   optionApprovalLevel?: number | null;
+  tradingBlocked?: boolean | null;
+  accountBlocked?: boolean | null;
   dailyTradeCount?: number | null;
   dailyPremium?: number | null;
   dailyRealizedLoss?: number | null;
+  activityEvidenceComplete?: boolean;
+  activityEvidenceFingerprint?: string | null;
+  activityEvidenceBlockers?: string[];
+  openPositionCount?: number | null;
+  openOrderCount?: number | null;
+  openExposureCount?: number | null;
   openPositions?: ZeroDteAccountPositionSnapshot[];
   openOrders?: ZeroDteAccountOrderSnapshot[];
 }

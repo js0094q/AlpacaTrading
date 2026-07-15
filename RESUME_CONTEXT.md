@@ -1,5 +1,60 @@
 # Resume Context: Alpaca Trading Research Infra
 
+## Adaptive allocation safety-floor pre-release (2026-07-14)
+
+- Branch `feat/adaptive-allocation-safety-floor` is based on
+  `origin/main@29f4a814d39cebc6f66b371571a92fe58228f6e1`. The branch changes
+  authenticate general review artifacts, compare
+  fresh submit state, reserve reviewed entries, fail closed on incomplete
+  scale-in and 0DTE evidence, sign 0DTE submit attestations, enforce hedge
+  capital evidence/caps, and route compatibility confirmation through reviewed
+  execution.
+- This is a prerequisite only. It adds no allocator, optimizer, weights, mode,
+  allocator-owned exit, cap increase, live path, or public mutation route.
+- General and 0DTE review/submit records require
+  `PAPER_REVIEW_SIGNING_KEY`. Existing unsigned artifacts intentionally fail
+  closed. A new `paper:ops:review` creates a signed `baseline-v1` artifact; a
+  material account, configuration, portfolio, reservation, market, price, or
+  cap change returns `FRESH_REVIEW_REQUIRED` and submits zero for that entry.
+  A signed blocked artifact also cannot authorize entry sections, while valid
+  exits remain independent. A fresh mixed artifact with an exit section reaches
+  the section-aware executor without weakening its signed entry blockers.
+  General, 0DTE, and hedge entries recheck an all-buy-side ledger-lifecycle
+  fingerprint inside their immediate reservation transaction, so an intervening
+  reservation-to-filled transition fails closed before any broker call.
+- `paper:execute --confirmPaper`, `/api/v1/execute/confirm`, and the dashboard
+  compatibility route no longer rebuild a plan. They require explicit
+  confirmation and dispatch the exact latest signed reviewed payload. The
+  late-day workflow now persists its own signed
+  `sourceAction=paper.ops.late_day` artifact with the normal 30-minute TTL.
+- Equity scale-ins remain disabled by default and retain their `$250` add size.
+  Missing position/capital/source evidence, an open order or reservation, or an
+  ordinary cash/deployment/position/order/plan cap breach produces a hold.
+- 0DTE caps remain one contract, three combined open positions/orders, three
+  daily entries, `$250` premium per trade, `$750` daily premium, and `$250`
+  daily realized loss. All entry paths contribute New York-day evidence; a
+  missing counter blocks. This includes generic reviewed
+  `discovery:zero_dte_spy:*` option buys. Standalone 0DTE submission refreshes
+  its quote, preserves the reviewed limit, and atomically reserves capacity.
+- Hedge entry defaults are `0.0075`, `0.02`, and `0.01` of equity (`0.75%`,
+  `2%`, and `1%`). Reviews and submit-time validation require complete current
+  long-put exposure, cost, reservation, broker-order, fill, and daily-premium
+  evidence with an unchanged canonical fingerprint. Deterministic review and
+  client-order IDs are signed; the persisted row must match, fresh price drift
+  is bounded, and one review is consumed atomically with one reservation.
+- Broker statuses `held` and `pending_cancel` consume exposure across general,
+  0DTE, and hedge paths. Unknown non-terminal statuses remain active and block
+  new risk until recognized.
+- A redacted pre-deploy VPS snapshot found a clean checkout at the base SHA,
+  paper-only/live-disabled flags, no selected sizing overrides, and no
+  `PAPER_REVIEW_SIGNING_KEY`. Therefore checked-in ordinary equity defaults
+  (`$1,000` per order, `$5,000` per-order cap, `$50,000` total-plan cap, `20%`
+  reserve, `50%` deployment, `10%` position) remain runtime-effective. The
+  objective's `$100`/`$300` figures were not installed and are not adopted.
+  Provision the signer without printing it before deploying this branch.
+- No paper or live order was submitted while implementing or validating this
+  prerequisite. Stop before Release 1 unless the user separately authorizes it.
+
 ## Autonomous universe lifecycle production rollout checkpoint (2026-07-14)
 
 - The deployed lifecycle service is the first incomplete autonomous subsystem:
@@ -153,7 +208,9 @@
   - latest `paper:runtime` sees 3 equity candidates, each already held in current paper positions.
   - latest `paper:plan` finds the current research run but produces zero planned orders because those candidate symbols are already held.
   - `paper:execute` now reports this zero-payload state as `status: "no_op"` with `reason: "NO_ELIGIBLE_PAPER_PAYLOADS"` instead of a safety-review failure.
-  - `paper:execute --confirmPaper` accepts `--riskProfile` and `--optionsEnabled`; option payload submission requires `--optionsEnabled=true` plus an explicit valid `--riskProfile` on the execution command, and internally rebuilds plan/review with those supplied flags before submitting.
+  - Historical note superseded by the 2026-07-14 safety floor:
+    `paper:execute --confirmPaper` now accepts no inline planning or sizing
+    authority and delegates only to the exact latest signed reviewed artifact.
 - Current duplicate-classification behavior:
   - held/open equity positions or orders block duplicate equity candidates on the same symbol.
   - held/open equity positions or orders do not by themselves block option contracts on the same underlying.
@@ -164,8 +221,8 @@
   - New VPS allowlisted control routes live under `/api/v1/actions/*`.
   - `paper:portfolio:review` is review-only and emits `BUY_NEW_EQUITY`, `ADD_TO_EQUITY`, `SELL_EQUITY`, `HOLD_EQUITY`, `BUY_OPTION`, `SELL_TO_CLOSE_OPTION`, and `HOLD_OPTION` recommendations.
   - `paper:options:discover` is review-only and labels current-session 0DTE versus `nextSessionPreparation: true`.
-  - `paper:ops:review` persists the latest reviewed payload artifact and operation log rows.
-  - `paper:execute:reviewed -- --confirmPaper` refuses missing, stale, empty, or payload-signature-mismatched review artifacts before paper submission.
+  - `paper:ops:review` persists an HMAC-signed latest reviewed payload artifact, `baseline-v1` state evidence, and operation log rows.
+  - `paper:execute:reviewed -- --confirmPaper` refuses missing, unsigned, stale, empty, tampered, state-drifted, or payload-signature-mismatched review artifacts before paper submission.
   - `paper:execute:reviewed` now supports `--sections=` so scheduler entry execution is limited to `equityBuys,equityAdds,optionBuys` and scheduler exit execution is limited to `equitySells,optionSellToCloseExits`.
   - Reviewed LEAPS sell-to-close execution also fails closed unless `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, `LIVE_TRADING_ENABLED=false`, `PAPER_ORDER_EXECUTION_ENABLED=true`, `PAPER_OPTIONS_EXECUTION_ENABLED=true`, `AUTOMATED_PAPER_EXECUTION_ENABLED=true`, and `--confirmPaper` are all present.
   - Review-only `paper-ops-*` timers intentionally override `AUTOMATED_PAPER_EXECUTION_ENABLED=false`; bounded paper execution tasks use the checked-in target value `true` only with confirmation and paper-runtime gates.
@@ -186,7 +243,7 @@
   - Option delta coverage is reported by absolute contract quantity and absolute market value. Defaults are 80% on each basis with 10% of account equity as the materiality threshold; material gaps keep beta/scenario precision null, mark the effective risk band `indeterminate`, and force monitoring without hedge candidates.
   - A 2026-07-10 read-only runtime check found valid complete Greeks for `SPY270115C00805000` and `QQQ270115C00840000`. Alpaca returned camelCase snapshot keys while the parser expected legacy-shaped aliases; ingestion now accepts both shapes. The observed issue was parser compatibility, not symbol, entitlement, batching, or snapshot availability for those samples.
   - Beta cache identity includes symbol, benchmark, lookback, interval, minimum observations, calculation version, and latest aligned market-data date; incompatible or expired rows are ignored.
-  - Hedge recommendations prefer concentrated/profitable LEAPS trimming before paid protection, subtract existing puts/inverse exposure, and treat profit funding as an unrealized-gain proxy.
+  - Hedge recommendations prefer concentrated/profitable LEAPS trimming before paid protection. Long-put entries subtract complete existing, reserved, open-order, completed-fill, and daily-premium evidence; missing evidence blocks rather than becoming zero.
   - Put spreads remain analysis-only with `MULTI_LEG_EXECUTION_UNSUPPORTED`; SH/PSQ remain secondary alternatives.
   - Signed plans are stored in `paper_learning_records`, expire, retain configuration/model/snapshot integrity, and are not recognized by the reviewed order executor.
   - Existing paper-ops moments refresh persisted hedge reviews but cannot submit hedge orders and do not alter reviewed order sections.
@@ -198,7 +255,7 @@
   - Missing paper positions can later reappear in `/v2/positions`; do not invent sell fills or realized P/L for that gap.
   - `/v2/positions` and `/v2/account` are authoritative for current paper exposure.
   - `paper:exit:review` and `paper:exit:execute` follow the same authority model: no synthetic sells, no sell payloads for local-only missing positions, and reconciliation events are preserved.
-  - `paper:execute --confirmPaper` now performs a read-only reconciliation before any submit call and records audit events:
+  - Reviewed entry execution performs a read-only reconciliation before any submit call and records audit events:
     - `PAPER_POSITION_SYNC_PENDING` while a missing filled paper position is still inside `PAPER_POSITION_SYNC_FRESHNESS_MINUTES`.
     - `PAPER_POSITION_SYNC_RESTORED` when a previously missing symbol reappears in `/v2/positions`.
     - `PAPER_SYNC_POSITION_REMOVAL` only after the sync window expires and account math is consistent without the missing symbol.
@@ -209,6 +266,13 @@
 
 - `VPS_CONTROL_TOKEN` is configured in `/opt/alpaca-investing/secrets/alpaca.env`; Vercel must use the same value in `VPS_CONTROL_TOKEN`.
 - `DASHBOARD_ADMIN_TOKEN` belongs in Vercel production environment for dashboard mutating/admin routes.
+- `PAPER_REVIEW_SIGNING_KEY` belongs only in the VPS runtime environment. It is
+  required for general and 0DTE signed review records, was absent in the
+  2026-07-14 pre-deploy snapshot, and must be provisioned without printing or
+  copying it to Vercel. Deployment must not copy `.env.example` over the
+  protected environment and must reject its illustrative placeholder values.
+- `HEDGE_REVIEW_SIGNING_KEY` remains the independent VPS-only signer for hedge
+  execution reviews.
 - Secrets must not be copied into repo files, client code, or Vercel frontend bundles.
 - Use `npm run vercel:env:parity -- --check-vercel-presence --pull-vercel` for redacted Vercel production env checks. The utility reports presence and sha256 fingerprint match booleans only.
 

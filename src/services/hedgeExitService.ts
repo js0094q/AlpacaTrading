@@ -15,7 +15,6 @@ import {
   type HedgeExecutionReview
 } from "./hedgeExecutionReviewService.js";
 import {
-  markHedgeExecutionReviewConsumed,
   persistHedgeExecutionReview,
   readHedgeExecutionReview
 } from "./hedgePersistenceService.js";
@@ -219,9 +218,23 @@ export const executeReviewedPaperHedgeExit = async (
   ];
   if (blockers.length > 0) return executionBlocked(input.reviewId, blockers);
   const asOf = deps.now?.() ?? new Date().toISOString();
-  const review = deps.review ?? readHedgeExecutionReview({ reviewId: input.reviewId, signingKey: process.env.HEDGE_REVIEW_SIGNING_KEY!, asOf }).review;
+  const stored = deps.review
+    ? {
+        review: deps.review,
+        verification: verifyHedgeExecutionReview({
+          review: deps.review,
+          signingKey: process.env.HEDGE_REVIEW_SIGNING_KEY!,
+          asOf
+        })
+      }
+    : readHedgeExecutionReview({
+        reviewId: input.reviewId,
+        signingKey: process.env.HEDGE_REVIEW_SIGNING_KEY!,
+        asOf
+      });
+  const review = stored.review;
   if (!review) return executionBlocked(input.reviewId, ["HEDGE_REVIEW_NOT_FOUND"]);
-  const verification = verifyHedgeExecutionReview({ review, signingKey: process.env.HEDGE_REVIEW_SIGNING_KEY!, asOf });
+  const verification = stored.verification;
   if (!verification.valid || review.reviewType !== "exit" || review.orderIntent.side !== "sell_to_close") {
     return { ...executionBlocked(input.reviewId, [...verification.blockers, "HEDGE_EXIT_REVIEW_INVALID"]), verification };
   }
@@ -267,7 +280,8 @@ export const executeReviewedPaperHedgeExit = async (
     requestId: review.requestId,
     mode: "hedge-exit",
     side: "sell",
-    positionIntent: "sell_to_close"
+    positionIntent: "sell_to_close",
+    consumeReview: true
   });
   if (!reservation.reserved) return executionBlocked(input.reviewId, reservation.blockers);
   const payload: AlpacaPaperOrderRequest = {
@@ -292,13 +306,11 @@ export const executeReviewedPaperHedgeExit = async (
     const status = String(orderResponse.data.status ?? "").toLowerCase();
     if (status === "filled") {
       updatePaperExecutionLedgerEntry(reservation.entry.id, { status: "filled", alpacaOrderId: brokerOrderId, alpacaStatus: status, requestId: orderResponse.requestId });
-      markHedgeExecutionReviewConsumed(review.reviewId);
       recordHedgeLearningEvent({ eventId: `${review.reviewId}:fill`, reviewId: review.reviewId, eventType: "fill", evidence: { symbol: review.orderIntent.symbol, filledQuantity, filledAveragePrice: orderResponse.data.filled_avg_price } });
       return { paperOnly: true as const, environment: "paper" as const, status: "filled" as const, reviewId: review.reviewId, clientOrderId: review.clientOrderId, brokerOrderId, filledQuantity, averageFillPrice: finite(orderResponse.data.filled_avg_price, 0), blockers: [], warnings: [], reservationId: reservation.entry.id, verification };
     }
     await (deps.cancelPaperOrder ?? cancelPaperOrder)(brokerOrderId);
     updatePaperExecutionLedgerEntry(reservation.entry.id, { status: filledQuantity > 0 ? "partial" : "canceled", alpacaOrderId: brokerOrderId, alpacaStatus: "canceled" });
-    markHedgeExecutionReviewConsumed(review.reviewId);
     return { paperOnly: true as const, environment: "paper" as const, status: filledQuantity > 0 ? "partial" as const : "canceled" as const, reviewId: review.reviewId, clientOrderId: review.clientOrderId, brokerOrderId, filledQuantity, averageFillPrice: finite(orderResponse.data.filled_avg_price, 0), blockers: [], warnings: [], reservationId: reservation.entry.id, verification };
   } catch (error) {
     updatePaperExecutionLedgerEntry(reservation.entry.id, { status: "failed", reason: "HEDGE_EXIT_ORDER_SUBMISSION_FAILED", errorMessage: error instanceof Error ? error.message : "Paper hedge exit submission failed." });

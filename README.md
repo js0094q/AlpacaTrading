@@ -2,6 +2,19 @@
 
 ## Current continuation checkpoint (July 2026)
 
+- 2026-07-14 safety-floor branch: general reviewed payloads are HMAC signed,
+  entry execution compares fresh account/portfolio/market/cap evidence, 0DTE
+  submits require a persisted signed attestation, and hedge entry reviews bind
+  complete capital evidence. All three entry paths recheck an all-buy-side
+  execution-ledger lifecycle fingerprint so a concurrent reservation cannot
+  disappear by becoming filled. This is a prerequisite only; no adaptive
+  allocator, optimizer, new cap, live path, or allocator-owned exit is included.
+- `paper:execute --confirmPaper`, `/api/v1/execute/confirm`, and the dashboard
+  compatibility route now delegate only to the latest signed reviewed artifact.
+  They never create confirmation implicitly. Regenerate with
+  `npm run paper:ops:review -- --format=json` after any
+  `FRESH_REVIEW_REQUIRED` result.
+
 - 2026-07-05: VPS was rebuilt from scratch and re-bootstrapped using `/opt/alpaca-investing/secrets/alpaca.env` for runtime secrets.
 - Current VPS state:
   - Host alias: `njalla-vps` (target `alpaca@185.193.127.15`)
@@ -146,9 +159,16 @@ VPS_RESEARCH_MAX_RETRIES=0
 VPS_CONTROL_TOKEN=
 DASHBOARD_ADMIN_TOKEN=
 AUTOMATED_PAPER_EXECUTION_ENABLED=true
+PAPER_REVIEW_SIGNING_KEY=replace_me
+PAPER_SUBMIT_QUOTE_MAX_AGE_SECONDS=60
+PAPER_SUBMIT_MAX_PRICE_DRIFT_PCT=10
 PAPER_0DTE_DISCOVERY_ENABLED=true
 PAPER_OPTION_EXIT_REVIEW_ENABLED=true
 PAPER_EQUITY_SCALE_IN_ENABLED=false
+PAPER_EQUITY_SCALE_IN_MAX_RANK=3
+PAPER_EQUITY_SCALE_IN_NOTIONAL=250
+PAPER_PLAN_MAX_POSITION_NOTIONAL=5000
+PAPER_PLAN_MAX_TOTAL_PLAN_NOTIONAL=50000
 ZERO_DTE_ENGINE_ENABLED=true
 ZERO_DTE_PAPER_EXECUTION_ENABLED=true
 ZERO_DTE_SHADOW_ENABLED=true
@@ -177,11 +197,43 @@ ZERO_DTE_MAX_TRADES_PER_DAY=3
 ZERO_DTE_MAX_PREMIUM_PER_TRADE=250
 ZERO_DTE_MAX_DAILY_PREMIUM=750
 ZERO_DTE_MAX_DAILY_REALIZED_LOSS=250
+ZERO_DTE_REVIEW_TTL_SECONDS=300
 ZERO_DTE_OUTCOME_HORIZONS_MINUTES=5,15,30,60
 ZERO_DTE_STRATEGY_VERSION=zero-dte-level-2-v1
+HEDGE_REVIEW_SIGNING_KEY=replace_me
+HEDGE_MAX_NEW_HEDGE_PREMIUM_PCT_EQUITY=0.75
+HEDGE_MAX_TOTAL_HEDGE_PREMIUM_PCT_EQUITY=2
+HEDGE_MAX_DAILY_HEDGE_PREMIUM_PCT_EQUITY=1
 ```
 
 The CLI loads `.env` first, then `.env.txt` as fallback when keys are missing. If both files exist, `.env` values take precedence over `.env.txt`.
+
+### Safety-floor sizing provenance
+
+The safety-floor prerequisite preserves the checked-in sizing policy. Ordinary
+equity defaults are `$1,000` per order, `$5,000` maximum per order, `$50,000`
+maximum total plan notional, a `20%` minimum cash reserve, a `50%` maximum
+portfolio deployment, and a `10%` maximum position. Equity scale-ins remain
+disabled by default and retain the `$250` reviewed add size when explicitly
+enabled.
+
+The 0DTE Level 2 limits remain one contract per trade, three combined open
+positions/orders, three entries per New York trading day, `$250` premium per
+trade, `$750` daily premium, and `$250` daily realized loss. Hedge-entry limits
+normalize to `0.0075`, `0.02`, and `0.01` of equity; their environment values
+are written as human percentages `0.75`, `2`, and `1`.
+
+A redacted pre-deploy VPS inspection on 2026-07-14 found the clean runtime at
+`29f4a814d39cebc6f66b371571a92fe58228f6e1`, found none of the selected sizing
+variables installed, and therefore confirmed that the source defaults above
+were runtime-effective. It also confirmed `ALPACA_ENV=paper`,
+`TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, and
+`LIVE_TRADING_ENABLED=false`. `PAPER_REVIEW_SIGNING_KEY` was absent and must be
+provisioned before the signed-artifact deployment can create an executable
+review. The secret file remained `alpaca:alpaca` mode `0600`; no secret value
+was read or printed. The attached objective's `$100` scheduled order and `$300`
+scheduled total do not match repository or installed runtime state and are not
+adopted by this prerequisite.
 
 ## Alpaca Paper API read-only integration
 
@@ -293,7 +345,8 @@ npm run paper:plan -- --riskProfile=aggressive --optionsEnabled=true --format=js
 npm run paper:review -- --riskProfile=aggressive --optionsEnabled=true --format=json
 npm run paper:exit:review -- --format=json
 npm run paper:execute -- --dryRun --riskProfile=aggressive --optionsEnabled=true --format=json
-npm run paper:execute -- --confirmPaper --riskProfile=aggressive --optionsEnabled=true --assetClass=all --format=json
+npm run paper:ops:review -- --format=json
+npm run paper:execute -- --confirmPaper --format=json
 npm run paper:exit:execute -- --confirmPaper --format=json
 npm run paper:learn -- --format=json
 ```
@@ -341,6 +394,24 @@ npm run paper:ops:review -- --format=json
 ```
 
 `npm run paper:execute:reviewed -- --confirmPaper --format=json` is paper-only and requires `PAPER_ORDER_EXECUTION_ENABLED=true`. Option payloads also require `PAPER_OPTIONS_EXECUTION_ENABLED=true`. Reviewed LEAPS sell-to-close payloads additionally require `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, `LIVE_TRADING_ENABLED=false`, `AUTOMATED_PAPER_EXECUTION_ENABLED=true`, and `--confirmPaper`; failures use `PAPER_RUNTIME_REQUIRED`, `LIVE_TRADING_DISABLED_REQUIRED`, `PAPER_EXECUTION_FLAG_REQUIRED`, `PAPER_OPTIONS_EXECUTION_FLAG_REQUIRED`, `AUTOMATED_PAPER_EXECUTION_FLAG_REQUIRED`, or `PAPER_CONFIRMATION_REQUIRED`. Do not use execution commands during implementation or review unless the user explicitly requests paper execution.
+
+`PAPER_REVIEW_SIGNING_KEY` is required to create and execute general reviewed
+artifacts. Existing unsigned artifacts are intentionally non-executable. Run
+`paper:ops:review` to create a fresh signed `baseline-v1` artifact; if account,
+configuration, positions, open orders, reservations, market evidence, price, or
+caps drift before an entry submit, execution returns structured blockers such as
+`FRESH_REVIEW_REQUIRED` and submits zero for that entry. Exit-only sections are
+validated independently from positive entry allocation room. A fresh signed
+mixed artifact can reach the section-aware executor when its entry section is
+blocked and its exit section is valid; entry blockers remain binding. The
+late-day workflow writes its own signed artifact with
+`sourceAction=paper.ops.late_day` and the normal 30-minute TTL.
+
+Compatibility surfaces do not bypass that artifact. `paper:execute
+--confirmPaper`, `POST /api/v1/execute/confirm`, and the dashboard confirm route
+all dispatch reviewed execution only, require explicit confirmation, and bind
+the exact latest payload signature. Missing confirmation blocks before execution
+dispatch.
 
 Systemd timers in `server/systemd/` implement the VPS automation schedule:
 
@@ -500,9 +571,9 @@ Expected safety properties:
 
 - Paper environment only (`ALPACA_ENV=paper`).
 - Inspection, research, plan, review, and dry-run commands remain read-only.
-- `paper:execute --confirmPaper` is the intentional entry/planned-order submission path and submits to Alpaca paper endpoints only after hard gates pass.
+- `paper:execute --confirmPaper` is a compatibility alias for latest signed reviewed-payload execution; it never rebuilds or directly submits a plan.
 - `paper:exit:execute --confirmPaper` is paper-only and submits only generated exit candidates after review and hard gates pass.
-- `paper:execute --confirmPaper` runs a read-only account reconciliation before any submission.
+- Reviewed entries re-fetch account, position, order, reservation, and market evidence and require unchanged signed state before any submission.
 - No live trading.
 - No live account mutations.
 - Request IDs are surfaced when provided by Alpaca.
@@ -531,7 +602,7 @@ The read-only intelligence commands are explicitly non-mutating and keep paper s
 - `paper:plan` creates a dry-run-only plan using realistic paper sizing and account-relative cap rules.
 - `paper:review` evaluates the dry-run plan for freshness, buying-power risk, duplicate exposure, and execution blockers/warnings.
 - `paper:execute --dryRun` constructs would-submit Alpaca order payloads from the accepted plan/review. It does not send them.
-- `paper:execute --confirmPaper` is paper-only mutation mode and submits candidate payloads after all hard gates and option gates pass.
+- `paper:execute --confirmPaper` delegates to the latest signed reviewed artifact; it does not rebuild candidate payloads or accept inline sizing changes.
 If `paper:review` reports `NO_RUNTIME_CANDIDATES`, first confirm the latest `research:daily` run used enough bar history. The default is `--barLookbackDays=365`.
 
 Paper planning command (dry-run only):
@@ -579,17 +650,19 @@ npm run paper:execute -- --dryRun --riskProfile=aggressive --optionsEnabled=true
 
 `paper:execute --dryRun` only constructs the Alpaca order payloads that would be submitted later. It requires an explicit dry-run flag and returns `DRY_RUN_OR_CONFIRM_PAPER_REQUIRED` if omitted. It does not submit, replace, cancel, or modify Alpaca orders.
 `paper:execute --dryRun` returns `DRY_RUN_OR_CONFIRM_PAPER_REQUIRED` when neither dry-run nor confirm flags are present.
-If the plan has no eligible payloads after candidate filtering, `paper:execute --dryRun` and `paper:execute --confirmPaper` return `status: "no_op"` with `reason: "NO_ELIGIBLE_PAPER_PAYLOADS"` and submit zero orders.
-`paper:execute --confirmPaper` submits eligible equity and options payloads to Alpaca paper.
-Before any paper submission, `paper:execute --confirmPaper` fetches `/v2/account`, `/v2/positions`, `/v2/orders?status=all`, and `/v2/account/activities` over the configured reconciliation lookback.
+If the plan has no eligible payloads after candidate filtering, `paper:execute --dryRun` returns `status: "no_op"` with `reason: "NO_ELIGIBLE_PAPER_PAYLOADS"` and submits zero orders. Reviewed confirmation separately requires a non-empty, fresh signed artifact.
+`paper:execute --confirmPaper` and `paper:execute:reviewed -- --confirmPaper` execute the exact payload sections in the latest signed review artifact against fresh paper state.
+Before any reviewed entry submission, execution fetches `/v2/account`, `/v2/positions`, open/recent orders, current market evidence, and active local reservations. Drift or incomplete evidence returns a structured blocker and `FRESH_REVIEW_REQUIRED`; it never resizes inline.
+A signed artifact whose review status is blocked or whose signed blocker list is non-empty cannot authorize new-risk sections; independently valid exit sections retain their own gates. A fresh signed mixed artifact is dispatched to the section-aware executor only when it contains an exit section, so the entry blocker remains enforced while the exit is evaluated independently. Selected entry sections reserve as one all-or-none batch after shared-cap headroom, the exact active-reservation fingerprint, and an all-buy-side ledger-lifecycle fingerprint are rechecked inside an immediate transaction. A concurrent reservation becoming `filled` therefore invalidates the captured submit window instead of disappearing from the check.
+Broker order evidence treats `held` and `pending_cancel` as active. Unknown non-terminal statuses remain active exposure and block new risk instead of disappearing. Generic reviewed `discovery:zero_dte_spy:*` option buys use the same New York-day cross-path trade, premium, realized-loss, and open-exposure evidence as the standalone 0DTE executor.
 
 Required command forms:
 
 ```bash
-npm run paper:execute -- --confirmPaper --assetClass=equity
-npm run paper:execute -- --confirmPaper --assetClass=equity --format=json
-npm run paper:execute -- --confirmPaper --riskProfile=aggressive --optionsEnabled=true --assetClass=option
-npm run paper:execute -- --confirmPaper --riskProfile=aggressive --optionsEnabled=true --assetClass=all
+npm run paper:ops:review -- --format=json
+npm run paper:execute:reviewed -- --confirmPaper --format=json
+# Compatibility alias for the same reviewed execution path:
+npm run paper:execute -- --confirmPaper --format=json
 ```
 
 `--confirmPaper` hard gates:
@@ -598,13 +671,13 @@ npm run paper:execute -- --confirmPaper --riskProfile=aggressive --optionsEnable
 - `LIVE_TRADING_MUST_BE_DISABLED`: `LIVE_TRADING_ENABLED=false`
 - `PAPER_ORDER_EXECUTION_DISABLED`: `PAPER_ORDER_EXECUTION_ENABLED=true`
 - `PAPER_OPTIONS_EXECUTION_DISABLED`: `PAPER_OPTIONS_EXECUTION_ENABLED=true` for option payloads
-- `OPTIONS_EXECUTION_REQUIRES_EXPLICIT_OPTIONS_ENABLED`: `--optionsEnabled=true` on the execution command for option payloads
-- `OPTIONS_EXECUTION_REQUIRES_EXPLICIT_RISK_PROFILE`: explicit `--riskProfile=<profile>` on the execution command for option payloads
+- `PAPER_REVIEW_SIGNING_KEY_REQUIRED`: the general review signing key is absent
+- `REVIEW_ARTIFACT_SIGNATURE_INVALID`: the stored artifact is unsigned or fails HMAC verification
+- `FRESH_REVIEW_REQUIRED`: signed entry state no longer matches fresh submit-time evidence
 
 Paper endpoint-only safety note:
 
-`paper:execute --confirmPaper` submits to Alpaca paper endpoints only and includes request IDs where available.
-When option payloads are present, execution rebuilds plan/review with the supplied `--riskProfile` and `--optionsEnabled=true` flags before submission; default moderate/options-disabled execution cannot submit option payloads.
+Reviewed confirmation submits only to Alpaca paper endpoints and includes request IDs where available. It never rebuilds the review, changes sizing, or upgrades a price at submission.
 
 ### Alpaca paper reconciliation
 
@@ -907,7 +980,7 @@ Optional table options:
 
 ## Portfolio risk and hedge review
 
-The hedge layer on `paper-ops-layer` is read-only and paper-only. It normalizes equity and option exposure, uses observed Greeks when available, calculates signed-exposure portfolio beta, classifies the market regime deterministically, reports an explainable 100-point risk score, and ranks LEAPS trims or protective alternatives.
+The hedge analysis layer is read-only and paper-only. It normalizes equity and option exposure, uses observed Greeks when available, calculates signed-exposure portfolio beta, classifies the market regime deterministically, reports an explainable 100-point risk score, and ranks LEAPS trims or protective alternatives. Hedge mutation remains a separate authenticated paper-only lifecycle.
 
 Run the four supported commands with:
 
@@ -919,6 +992,24 @@ npm run hedge:plan -- --paperOnly --format=json
 ```
 
 `hedge:plan` creates a signed, expiring paper planning artifact. `hedge:execute`, `hedge:exit:review`, and `hedge:exit:execute` are separate signed, authenticated paper-only lifecycle commands; execution is limited to one long put or one sell-to-close long put. Put spreads are analyzed with `MULTI_LEG_EXECUTION_UNSUPPORTED`; SH and PSQ are secondary tactical alternatives with daily-reset and tracking-risk warnings.
+
+Hedge entry reviews bind complete capital evidence for allowed-underlying long
+puts: existing cost basis and market exposure, active ledger reservations,
+open broker orders, filled premium, daily premium used, and a canonical
+fingerprint. Missing evidence blocks. Submit-time execution refreshes and
+matches the same evidence, then reapplies the `0.75%` new, `2%` total, and `1%`
+daily equity-premium limits plus buying-power, quantity, spread, delta, DTE,
+quote-freshness, and configured review-to-submit price-drift gates. The signed
+review binds deterministic review and client-order identities, the persisted row
+must match the signature, and one review is consumed atomically with its one
+ledger reservation. It cannot be replayed. It never treats unknown exposure as
+zero, reprices above the reviewed limit, or shares stale cap headroom with a
+concurrent general or 0DTE reservation.
+
+All three new-risk executors compare an all-buy-side execution-ledger lifecycle
+fingerprint captured before fresh submit evidence with the value inside their
+immediate reservation transaction. Any intervening insert or lifecycle change,
+including a reservation becoming `filled`, fails closed before a broker call.
 
 The checked-in paper target enables `HEDGE_PAPER_EXECUTION_ENABLED`, `HEDGE_AUTOMATED_PAPER_EXECUTION_ENABLED`, `HEDGE_EXIT_MANAGEMENT_ENABLED`, `HEDGE_LEARNING_ENABLED`, and `HEDGE_DASHBOARD_MUTATIONS_ENABLED`. `HEDGE_LIVE_EXECUTION_ENABLED=false` and `MULTI_LEG_HEDGE_EXECUTION_ENABLED=false` remain hard gates. `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, and `LIVE_TRADING_ENABLED=false` are the canonical paper/live boundary; no duplicate `PAPER_TRADING_ENABLED` flag is used. Missing prices, Greeks, beta history, sector mappings, or regime evidence remain null and produce quality warnings, monitoring, or blockers.
 
@@ -1034,7 +1125,7 @@ npm run typecheck
 npm run build
 npm run dashboard:build
 npm run paper:execute -- --dryRun --format=json
-npm run paper:execute -- --confirmPaper --assetClass=equity --format=json
+npm run paper:execute:reviewed -- --format=json
 ```
 
 - Option ingestion supports optional filters:

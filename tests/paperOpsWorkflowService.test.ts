@@ -1,6 +1,6 @@
 import { after, beforeEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resetSqliteTestDb } from "./helpers/sqliteTestDb.js";
@@ -11,14 +11,20 @@ process.env.TRADING_MODE = "paper";
 process.env.ALPACA_LIVE_TRADE = "false";
 process.env.LIVE_TRADING_ENABLED = "false";
 process.env.ALPACA_ENV = "paper";
+process.env.PAPER_REVIEW_SIGNING_KEY = "paper-ops-workflow-test-key";
 
 import { closeDbForTests, getDb } from "../src/lib/db.js";
 import {
+  latestReviewArtifactReadiness,
   runPaperOpsLateDay,
   runPaperOpsMidday,
   runPaperOpsMorning,
   runPaperOpsReview
 } from "../src/services/paperOpsWorkflowService.js";
+import {
+  createPaperReviewArtifact,
+  verifyPaperReviewArtifact
+} from "../src/services/paperReviewArtifactService.js";
 
 const resetDatabase = () => {
   resetSqliteTestDb(getDb(), `
@@ -44,6 +50,7 @@ const dryRun = async () => ({
       time_in_force: "day",
       notional: "100.00",
       client_order_id: "paper-equity-aapl",
+      sourceCandidateId: "candidate-aapl",
       dedupeKey: "paper:equity:AAPL"
     }
   ]
@@ -70,8 +77,88 @@ const hedgeReview = async () => ({
   blockers: []
 });
 
+const captureSubmitState = async () => ({
+  version: "paper-submit-state-v1",
+  capturedAt: "2026-07-10T14:00:00.000Z",
+  accountIdentityHash: "paper-account-hash",
+  accountState: {
+    status: "ACTIVE",
+    cash: 100_000,
+    equity: 100_000,
+    buyingPower: 100_000,
+    optionsBuyingPower: 100_000,
+    optionsApprovalLevel: 3,
+    tradingBlocked: false,
+    accountBlocked: false
+  },
+  configuration: {
+    environment: "paper",
+    tradingMode: "paper",
+    liveTradingEnabled: false,
+    paperOrderExecutionEnabled: true,
+    paperOptionsExecutionEnabled: true,
+    maxPositionNotional: 5_000,
+    maxTotalPlanNotional: 50_000,
+    equityMaxNotionalPerOrder: 5_000,
+    equityMaxPortfolioDeployPct: 50,
+    equityMaxPositionPct: 10,
+    equityMinCashReservePct: 20,
+    optionMaxOrderNotional: 2_000,
+    optionMaxContracts: 1,
+    optionMaxPortfolioRiskPct: 20,
+    optionMaxPositionRiskPct: 5,
+    quoteMaxAgeSeconds: 600,
+    maxPriceDriftPct: 10
+  },
+  configurationFingerprint: "config-v1",
+  positions: [],
+  openOrders: [],
+  reservations: [],
+  marketEvidence: [
+    {
+      symbol: "AAPL",
+      assetClass: "equity",
+      referencePrice: 200,
+      bid: 199.9,
+      ask: 200.1,
+      timestamp: "2026-07-10T14:00:00.000Z",
+      complete: true
+    }
+  ],
+  payloadIntents: [
+    {
+      section: "equityBuys",
+      payloadIndex: 0,
+      assetClass: "equity",
+      symbol: "AAPL",
+      side: "buy",
+      orderType: "market",
+      quantity: null,
+      notional: 100,
+      limitPrice: null,
+      estimatedPremium: null,
+      positionIntent: null,
+      sourceCandidateId: "candidate-aapl",
+      sourceReviewId: null,
+      clientOrderIdHash: "client-order-hash"
+    }
+  ],
+  structuralPortfolioFingerprint: "portfolio-structure-v1",
+  portfolioFingerprint: "portfolio-v1",
+  marketEvidenceFingerprint: "market-v1",
+  allocationAttestation: {
+    mode: "baseline",
+    identity: "baseline-v1",
+    allocatorControlled: false
+  },
+  complete: true,
+  blockers: [],
+  warnings: []
+});
+
 beforeEach(() => {
   process.env.AUTOMATED_PAPER_EXECUTION_ENABLED = "false";
+  process.env.PAPER_REVIEW_SIGNING_KEY = "paper-ops-workflow-test-key";
   resetDatabase();
 });
 
@@ -81,11 +168,89 @@ after(() => {
 });
 
 describe("paper ops workflows", () => {
+  const readinessSections = () => ({
+    equityBuys: [{ symbol: "AAPL" }],
+    equityAdds: [],
+    equitySells: [],
+    optionBuys: [],
+    optionSellToCloseExits: []
+  });
+
+  test("readiness rejects signed blocked artifacts", () => {
+    createPaperReviewArtifact({
+      id: "blocked-readiness-artifact",
+      sourceAction: "paper.ops.review",
+      status: "blocked",
+      payloadSections: readinessSections(),
+      summary: {},
+      blockers: ["REVIEW_DATA_BLOCKED"],
+      createdAt: new Date().toISOString(),
+      maxAgeMinutes: 60
+    });
+
+    const readiness = latestReviewArtifactReadiness();
+    assert.equal(readiness.ready, false);
+    assert.equal(readiness.reason, "REVIEW_ARTIFACT_ENTRY_BLOCKED");
+  });
+
+  test("readiness dispatches a signed blocked artifact when it contains a valid exit section", () => {
+    createPaperReviewArtifact({
+      id: "mixed-blocked-readiness-artifact",
+      sourceAction: "paper.ops.review",
+      status: "blocked",
+      payloadSections: {
+        ...readinessSections(),
+        equitySells: [{ symbol: "MSFT", side: "sell" }]
+      },
+      summary: {},
+      blockers: ["REVIEW_DATA_BLOCKED"],
+      createdAt: new Date().toISOString(),
+      maxAgeMinutes: 60
+    });
+
+    const readiness = latestReviewArtifactReadiness();
+    assert.equal(readiness.ready, true);
+    assert.equal(readiness.status, "warning");
+    assert.equal(readiness.reason, "REVIEW_ARTIFACT_ENTRY_BLOCKED");
+  });
+
+  test("readiness verifies the stored artifact signature", () => {
+    const artifact = createPaperReviewArtifact({
+      id: "tampered-readiness-artifact",
+      sourceAction: "paper.ops.review",
+      status: "success",
+      payloadSections: readinessSections(),
+      summary: {},
+      createdAt: new Date().toISOString(),
+      maxAgeMinutes: 60
+    });
+    const tampered = structuredClone(artifact.artifact);
+    tampered.signature = "0".repeat(64);
+    getDb().prepare(
+      "UPDATE paper_review_artifacts SET artifact_json = ? WHERE id = ?"
+    ).run(JSON.stringify(tampered), artifact.id);
+
+    const readiness = latestReviewArtifactReadiness();
+    assert.equal(readiness.ready, false);
+    assert.equal(readiness.reason, "REVIEW_ARTIFACT_SIGNATURE_INVALID");
+  });
+
+  test("paper execute confirmation source delegates only to reviewed execution", () => {
+    const source = readFileSync(join(process.cwd(), "src/cli.ts"), "utf8");
+
+    assert.doesNotMatch(source, /buildPaperExecuteConfirmPaperReport/);
+    assert.match(
+      source,
+      /if \(confirmPaper\)[\s\S]{0,800}buildPaperReviewedPayloadExecutionReport/
+    );
+  });
+
   test("review workflow persists separated payload artifact and defaults to review-only", async () => {
     const report = await runPaperOpsReview({ triggerSource: "scheduler" }, {
       buildDryRun: dryRun as any,
       buildPortfolioReview: portfolioReview as any,
-      buildHedgeReview: hedgeReview as any
+      buildHedgeReview: hedgeReview as any,
+      captureSubmitState: captureSubmitState as any
     });
 
     assert.equal(report.status, "success");
@@ -103,6 +268,10 @@ describe("paper ops workflows", () => {
     };
     assert.equal(evidence.decision_role, "entry");
     assert.equal(evidence.decision_status, "REVIEWED");
+    assert.equal(
+      (report.details.artifact as any).artifact.submitState.version,
+      "paper-submit-state-v1"
+    );
   });
 
   test("morning workflow evaluates and governs learning before research", async () => {
@@ -134,7 +303,8 @@ describe("paper ops workflows", () => {
       buildHedgeReview: async () => {
         calls.push("hedge");
         return hedgeReview() as any;
-      }
+      },
+      captureSubmitState: captureSubmitState as any
     });
 
     assert.equal(report.workflow, "morning");
@@ -163,18 +333,59 @@ describe("paper ops workflows", () => {
     assert.equal("executeHedge" in report.details, false);
   });
 
-  test("late-day workflow runs forced 0DTE review path", async () => {
+  test("late-day workflow persists a fresh signed forced-exit review artifact", async () => {
     let moment = "";
+    const generatedAt = "2026-07-14T19:25:00.000Z";
     const report = await runPaperOpsLateDay({}, {
       buildPortfolioReview: async (input) => {
         moment = input?.moment || "";
-        return portfolioReview("late_day") as any;
+        return {
+          ...(await portfolioReview("late_day")),
+          summary: { eligiblePayloads: 1 },
+          recommendations: [{
+            recommendation: "SELL_TO_CLOSE_OPTION",
+            eligiblePayload: {
+              assetClass: "option",
+              symbol: "SPY260714P00500000",
+              side: "sell",
+              type: "limit",
+              time_in_force: "day",
+              qty: "1",
+              limit_price: "1.25",
+              position_intent: "sell_to_close",
+              client_order_id: "late-day-spy-exit",
+              sourceReviewId: "late-day-review"
+            }
+          }]
+        } as any;
       },
-      buildHedgeReview: hedgeReview as any
+      buildHedgeReview: hedgeReview as any,
+      buildDryRun: dryRun as any,
+      captureSubmitState: captureSubmitState as any,
+      now: () => generatedAt
     });
 
     assert.equal(report.workflow, "late_day");
     assert.equal(moment, "late_day");
     assert.equal(report.details.forcedExitReview, true);
+    const artifact = report.details.artifact as any;
+    assert.equal(artifact.sourceAction, "paper.ops.late_day");
+    assert.equal(artifact.createdAt, generatedAt);
+    assert.ok(Date.parse(artifact.expiresAt) > Date.parse(artifact.createdAt));
+    assert.equal(
+      artifact.artifact.payloadSections.optionSellToCloseExits.length,
+      1
+    );
+    const stored = getDb().prepare(
+      "SELECT source_action FROM paper_review_artifacts WHERE id = ?"
+    ).get(artifact.id) as { source_action: string };
+    assert.equal(stored.source_action, "paper.ops.late_day");
+    const verification = verifyPaperReviewArtifact({
+      artifact,
+      signingKey: "paper-ops-workflow-test-key",
+      asOf: "2026-07-14T19:25:01.000Z",
+      requireFresh: true
+    });
+    assert.equal(verification.valid, true);
   });
 });

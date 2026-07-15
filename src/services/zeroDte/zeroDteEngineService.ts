@@ -986,6 +986,8 @@ export const createZeroDteEngineMutationProvider = (
     listPositions: provider.listPositions?.bind(provider),
     listOrders: provider.listOrders?.bind(provider),
     getOrder: provider.getOrder?.bind(provider),
+    getLatestOptionSnapshots: provider.getLatestOptionSnapshots?.bind(provider),
+    refreshQuote: provider.refreshQuote?.bind(provider),
     submitPaperOrder: provider.submitPaperOrder?.bind(provider)
   };
 };

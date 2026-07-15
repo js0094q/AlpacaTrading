@@ -16,6 +16,7 @@ import {
   createPaperReviewArtifact,
   latestPaperReviewArtifact,
   isPaperReviewArtifactFresh,
+  verifyPaperReviewArtifact,
   type ReviewedPayloadSections
 } from "./paperReviewArtifactService.js";
 import {
@@ -28,6 +29,10 @@ import {
   buildAndPersistHedgeReview,
   type HedgeReviewReport
 } from "./hedgeLearningService.js";
+import {
+  capturePaperSubmitState,
+  validatePaperSubmitState
+} from "./paperSubmitStateService.js";
 
 export interface PaperOpsWorkflowReport {
   paperOnly: true;
@@ -54,8 +59,13 @@ interface PaperOpsDeps {
   promotionReadiness?: typeof buildPromotionReadinessAnalytics;
   applyLearningGovernance?: typeof applyPaperLearningGovernance;
   buildHedgeReview?: typeof buildAndPersistHedgeReview;
+  captureSubmitState?: typeof capturePaperSubmitState;
   now?: () => string;
 }
+
+const ENTRY_SECTIONS = ["equityBuys", "equityAdds", "optionBuys"] as const;
+
+const unique = (values: string[]) => [...new Set(values)];
 
 const automatedExecutionEnabled = () =>
   process.env.AUTOMATED_PAPER_EXECUTION_ENABLED === "true" ||
@@ -109,6 +119,7 @@ export const runPaperOpsReview = async (
   input: {
     triggerSource?: PaperOperationTriggerSource;
     moment?: PaperPortfolioReviewMoment;
+    sourceAction?: string;
     requestId?: string | null;
     correlationId?: string | null;
   } = {},
@@ -136,20 +147,37 @@ export const runPaperOpsReview = async (
       correlationId: input.correlationId ?? undefined
     });
     const { sections, dryRun } = await sectionsFromReports(portfolioReview, deps);
-    const warnings = [
+    const submitState = await (deps.captureSubmitState ?? capturePaperSubmitState)({
+      capturedAt: generatedAt,
+      payloadSections: sections
+    });
+    const entrySections = ENTRY_SECTIONS.filter(
+      (section) => sections[section].length > 0
+    );
+    const submitStateValidation = validatePaperSubmitState({
+      reviewed: submitState,
+      current: submitState,
+      sections: [...entrySections]
+    });
+    const warnings = unique([
       ...dryRun.warnings,
       ...portfolioReview.warnings,
+      ...submitState.warnings,
+      ...submitStateValidation.warnings,
       ...(automatedExecutionEnabled() ? ["AUTOMATED_PAPER_EXECUTION_ENABLED_REQUIRES_EXPLICIT_CONFIRM_GATES"] : [])
-    ];
-    const blockers = [
+    ]);
+    const blockers = unique([
       ...dryRun.blockers,
-      ...portfolioReview.blockers
-    ];
+      ...portfolioReview.blockers,
+      ...submitState.blockers,
+      ...submitStateValidation.blockers
+    ]);
     const status = statusFrom(blockers, warnings);
     const artifact = createPaperReviewArtifact({
-      sourceAction: "paper.ops.review",
+      sourceAction: input.sourceAction ?? "paper.ops.review",
       status,
       payloadSections: sections,
+      submitState,
       summary: {
         dryRunStatus: dryRun.status,
         dryRunWouldSubmit: dryRun.summary.wouldSubmitCount,
@@ -165,8 +193,10 @@ export const runPaperOpsReview = async (
       details: {
         dryRun,
         portfolioReview,
-        hedgeReview
-      }
+        hedgeReview,
+        submitStateValidation
+      },
+      createdAt: generatedAt
     });
     const summary = {
       artifactId: artifact.id,
@@ -197,7 +227,9 @@ export const runPaperOpsReview = async (
         artifact,
         dryRun,
         portfolioReview,
-        hedgeReview
+        hedgeReview,
+        submitState,
+        submitStateValidation
       },
       warnings,
       blockers
@@ -377,13 +409,16 @@ export const runPaperOpsLateDay = async (
   });
   const generatedAt = deps.now?.() || new Date().toISOString();
   try {
-    const portfolioReview = await (deps.buildPortfolioReview ?? buildPaperPortfolioReviewReport)({
-      moment: "late_day"
-    });
-    const hedgeReview = await (deps.buildHedgeReview ?? buildAndPersistHedgeReview)({
-      asOf: generatedAt,
-      triggerSource
-    });
+    const review = await runPaperOpsReview(
+      {
+        triggerSource,
+        moment: "late_day",
+        sourceAction: "paper.ops.late_day"
+      },
+      deps
+    );
+    const portfolioReview = review.details.portfolioReview as PaperPortfolioReviewReport;
+    const hedgeReview = review.details.hedgeReview as HedgeReviewReport;
     return finishWorkflow(
       operation.id,
       "late_day",
@@ -392,10 +427,12 @@ export const runPaperOpsLateDay = async (
       {
         portfolioReview,
         hedgeReview,
+        artifact: review.details.artifact,
+        review,
         forcedExitReview: true
       },
-      [...portfolioReview.warnings, ...hedgeRefreshWarnings(hedgeReview)],
-      portfolioReview.blockers
+      unique([...review.warnings, ...hedgeRefreshWarnings(hedgeReview)]),
+      unique(review.blockers)
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : "Late-day paper ops workflow failed.";
@@ -418,6 +455,30 @@ export const latestReviewArtifactReadiness = () => {
       reason: "NO_REVIEW_ARTIFACT"
     };
   }
+  const verification = verifyPaperReviewArtifact({ artifact });
+  if (!verification.valid) {
+    return {
+      ready: false,
+      status: "blocked" as const,
+      reason:
+        verification.blockers[0] ?? "REVIEW_ARTIFACT_SIGNATURE_INVALID",
+      artifact
+    };
+  }
+  const entryBlocked =
+    !(["success", "warning"] as string[]).includes(artifact.status) ||
+    artifact.artifact.blockers.length > 0;
+  const hasExitPayload =
+    artifact.artifact.payloadSections.equitySells.length > 0 ||
+    artifact.artifact.payloadSections.optionSellToCloseExits.length > 0;
+  if (entryBlocked && !hasExitPayload) {
+    return {
+      ready: false,
+      status: "blocked" as const,
+      reason: "REVIEW_ARTIFACT_ENTRY_BLOCKED",
+      artifact
+    };
+  }
   if (!isPaperReviewArtifactFresh(artifact)) {
     return {
       ready: false,
@@ -436,8 +497,8 @@ export const latestReviewArtifactReadiness = () => {
   }
   return {
     ready: true,
-    status: "success" as const,
-    reason: null,
+    status: entryBlocked ? "warning" as const : "success" as const,
+    reason: entryBlocked ? "REVIEW_ARTIFACT_ENTRY_BLOCKED" : null,
     artifact
   };
 };

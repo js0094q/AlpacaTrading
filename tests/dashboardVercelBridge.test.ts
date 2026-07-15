@@ -219,6 +219,39 @@ describe("Vercel dashboard VPS bridge mode", () => {
     assert.equal(calls.length, 0);
   });
 
+  test("execute confirm rejects missing explicit confirmation before bridge dispatch", async () => {
+    process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
+    process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
+    const { POST } = await importRoute<{
+      POST: (request: Request) => Promise<Response> | Response;
+    }>("apps/dashboard/app/api/paper/execute/confirm/route.ts");
+
+    const response = await POST(new Request("http://localhost/api/paper/execute/confirm", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer dashboard-admin-secret"
+      },
+      body: JSON.stringify({
+        riskProfile: "aggressive",
+        optionsEnabled: true,
+        assetClass: "all",
+        confirmPaper: false
+      })
+    }));
+    const payload = await response.json() as {
+      ok: false;
+      error: { code: string };
+      failedChecks: string[];
+    };
+
+    assert.equal(response.status, 403);
+    assert.equal(payload.ok, false);
+    assert.equal(payload.error.code, "RUNTIME_PREFLIGHT_FAILED");
+    assert.deepEqual(payload.failedChecks, ["confirmPaper"]);
+    assert.equal(calls.length, 0);
+  });
+
   test("mutating bridge call uses dashboard correlation token and does not reuse client token", async () => {
     process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
     process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
@@ -247,7 +280,8 @@ describe("Vercel dashboard VPS bridge mode", () => {
         riskProfile: "aggressive",
         optionsEnabled: true,
         maxCandidates: 10,
-        assetClass: "all"
+        assetClass: "all",
+        confirmPaper: true
       })
     }));
     const payload = (await response.json()) as {
@@ -269,6 +303,11 @@ describe("Vercel dashboard VPS bridge mode", () => {
     assert.equal(forwardedCorrelation, requestId);
     assert.equal(headerValue(calls[0].init.headers, "x-request-id"), null);
     assert.equal(calls[0].init.method, "POST");
+    assert.equal(
+      (JSON.parse(String(calls[0].init.body)) as { confirmPaper?: boolean })
+        .confirmPaper,
+      true
+    );
   });
 
   test("paper execution route fails closed before bridge when dashboard execution flag is disabled", async () => {
@@ -287,7 +326,8 @@ describe("Vercel dashboard VPS bridge mode", () => {
         riskProfile: "aggressive",
         optionsEnabled: true,
         maxCandidates: 10,
-        assetClass: "all"
+        assetClass: "all",
+        confirmPaper: true
       })
     }));
     const payload = (await response.json()) as {
@@ -430,7 +470,8 @@ describe("Vercel dashboard VPS bridge mode", () => {
         riskProfile: "aggressive",
         optionsEnabled: true,
         maxCandidates: 10,
-        assetClass: "all"
+        assetClass: "all",
+        confirmPaper: true
       })
     }));
     const payload = (await response.json()) as {

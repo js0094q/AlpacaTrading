@@ -1,7 +1,12 @@
-import { randomUUID } from "node:crypto";
+import {
+  createHmac,
+  randomUUID,
+  timingSafeEqual
+} from "node:crypto";
 import { canonicalJsonHash } from "../lib/canonicalJson.js";
 import { getDb, queryAll, queryOne } from "../lib/db.js";
 import type { DecisionId, DecisionRole, PositionLifecycleId } from "../types.js";
+import type { PaperSubmitStateAttestation } from "./paperSubmitStateService.js";
 import {
   appendDecisionLifecycleEvent,
   linkPaperReviewDecision,
@@ -30,6 +35,25 @@ export const isReviewedPayloadSectionName = (
 
 export type ReviewedPayloadSections = Record<ReviewedPayloadSectionName, unknown[]>;
 
+export interface PaperReviewArtifactBody {
+  recordType: "paper_review_artifact";
+  id: string;
+  createdAt: string;
+  expiresAt: string;
+  sourceAction: string;
+  status: string;
+  payloadSignature: string;
+  payloadSections: ReviewedPayloadSections;
+  submitState?: PaperSubmitStateAttestation;
+  summary: Record<string, unknown>;
+  warnings: string[];
+  blockers: string[];
+  details?: Record<string, unknown>;
+  signatureAlgorithm: "hmac-sha256";
+  artifactHash: string;
+  signature: string;
+}
+
 export interface PaperReviewArtifact {
   id: string;
   createdAt: string;
@@ -38,19 +62,14 @@ export interface PaperReviewArtifact {
   status: string;
   payloadSignature: string;
   payloadCount: number;
-  artifact: {
-    id: string;
-    createdAt: string;
-    expiresAt: string;
-    sourceAction: string;
-    status: string;
-    payloadSignature: string;
-    payloadSections: ReviewedPayloadSections;
-    summary: Record<string, unknown>;
-    warnings: string[];
-    blockers: string[];
-    details?: Record<string, unknown>;
-  };
+  artifact: PaperReviewArtifactBody;
+}
+
+export interface PaperReviewArtifactVerification {
+  valid: boolean;
+  blockers: string[];
+  calculatedPayloadSignature: string;
+  calculatedArtifactHash: string;
 }
 
 interface PaperReviewArtifactRow {
@@ -225,11 +244,12 @@ export const reviewedPayloadSignature = (sections: ReviewedPayloadSections) =>
 export const reviewedPayloadCount = (sections: ReviewedPayloadSections) =>
   Object.values(sections).reduce((total, entries) => total + entries.length, 0);
 
-const safeParse = (value: string) => {
+const safeParse = (value: string): PaperReviewArtifactBody => {
   try {
-    return JSON.parse(value) as PaperReviewArtifact["artifact"];
+    return JSON.parse(value) as PaperReviewArtifactBody;
   } catch {
     return {
+      recordType: "paper_review_artifact",
       id: "unparseable",
       createdAt: new Date(0).toISOString(),
       expiresAt: new Date(0).toISOString(),
@@ -239,7 +259,10 @@ const safeParse = (value: string) => {
       payloadSections: emptySections(),
       summary: {},
       warnings: ["artifact_json_unparseable"],
-      blockers: ["ARTIFACT_JSON_UNPARSEABLE"]
+      blockers: ["ARTIFACT_JSON_UNPARSEABLE"],
+      signatureAlgorithm: "hmac-sha256",
+      artifactHash: "",
+      signature: ""
     };
   }
 };
@@ -263,10 +286,15 @@ export const createPaperReviewArtifact = (input: {
   summary: Record<string, unknown>;
   warnings?: string[];
   blockers?: string[];
+  submitState?: PaperSubmitStateAttestation;
   details?: Record<string, unknown>;
   createdAt?: string;
   maxAgeMinutes?: number;
 }): PaperReviewArtifact => {
+  const signingKey = paperReviewArtifactSigningKey();
+  if (!signingKey) {
+    throw new Error("PAPER_REVIEW_SIGNING_KEY_REQUIRED");
+  }
   const id = input.id ?? `pra_${randomUUID()}`;
   const createdAt = input.createdAt ?? new Date().toISOString();
   const maxAgeMinutes =
@@ -279,7 +307,8 @@ export const createPaperReviewArtifact = (input: {
     ...input.payloadSections
   };
   const payloadSignature = reviewedPayloadSignature(payloadSections);
-  const artifact = {
+  const unsignedArtifact = {
+    recordType: "paper_review_artifact" as const,
     id,
     createdAt,
     expiresAt,
@@ -287,10 +316,18 @@ export const createPaperReviewArtifact = (input: {
     status: input.status,
     payloadSignature,
     payloadSections,
+    ...(input.submitState ? { submitState: input.submitState } : {}),
     summary: input.summary,
     warnings: input.warnings ?? [],
     blockers: input.blockers ?? [],
-    details: input.details
+    ...(input.details ? { details: input.details } : {}),
+    signatureAlgorithm: "hmac-sha256" as const
+  };
+  const artifactHash = canonicalJsonHash(unsignedArtifact);
+  const artifact: PaperReviewArtifactBody = {
+    ...unsignedArtifact,
+    artifactHash,
+    signature: signPaperReviewArtifactHash(artifactHash, signingKey)
   };
 
   getDb()
@@ -388,3 +425,97 @@ export const isPaperReviewArtifactFresh = (
   artifact: Pick<PaperReviewArtifact, "expiresAt">,
   asOf = new Date().toISOString()
 ) => new Date(artifact.expiresAt).getTime() >= new Date(asOf).getTime();
+
+export const paperReviewArtifactSigningKey = (
+  env: NodeJS.ProcessEnv = process.env
+) => env.PAPER_REVIEW_SIGNING_KEY?.trim() ?? "";
+
+const signPaperReviewArtifactHash = (artifactHash: string, signingKey: string) =>
+  createHmac("sha256", signingKey).update(artifactHash).digest("hex");
+
+const signaturesEqual = (left: string, right: string) => {
+  const leftBuffer = Buffer.from(left, "utf8");
+  const rightBuffer = Buffer.from(right, "utf8");
+  return (
+    leftBuffer.length === rightBuffer.length &&
+    timingSafeEqual(leftBuffer, rightBuffer)
+  );
+};
+
+const unsignedPaperReviewArtifact = (
+  artifact: PaperReviewArtifactBody
+) => {
+  const {
+    artifactHash: _artifactHash,
+    signature: _signature,
+    ...unsigned
+  } = artifact;
+  return unsigned;
+};
+
+export const verifyPaperReviewArtifact = (input: {
+  artifact: PaperReviewArtifact;
+  signingKey?: string;
+  asOf?: string;
+  requireFresh?: boolean;
+}): PaperReviewArtifactVerification => {
+  const blockers: string[] = [];
+  const artifact = input.artifact.artifact;
+  const calculatedPayloadSignature = reviewedPayloadSignature(
+    artifact.payloadSections ?? emptySections()
+  );
+  const calculatedArtifactHash = canonicalJsonHash(
+    unsignedPaperReviewArtifact(artifact)
+  );
+  const signingKey = input.signingKey ?? paperReviewArtifactSigningKey();
+
+  if (
+    artifact.recordType !== "paper_review_artifact" ||
+    artifact.signatureAlgorithm !== "hmac-sha256" ||
+    !artifact.artifactHash ||
+    !artifact.signature ||
+    !signingKey
+  ) {
+    blockers.push("REVIEW_ARTIFACT_SIGNATURE_INVALID");
+  }
+  if (
+    calculatedPayloadSignature !== artifact.payloadSignature ||
+    calculatedPayloadSignature !== input.artifact.payloadSignature ||
+    artifact.id !== input.artifact.id ||
+    artifact.createdAt !== input.artifact.createdAt ||
+    artifact.expiresAt !== input.artifact.expiresAt ||
+    artifact.sourceAction !== input.artifact.sourceAction ||
+    artifact.status !== input.artifact.status
+  ) {
+    blockers.push("REVIEW_ARTIFACT_PAYLOAD_CHANGED");
+  }
+  if (calculatedArtifactHash !== artifact.artifactHash) {
+    blockers.push("REVIEW_ARTIFACT_PAYLOAD_CHANGED");
+  }
+  if (
+    signingKey &&
+    artifact.signature &&
+    !signaturesEqual(
+      artifact.signature,
+      signPaperReviewArtifactHash(artifact.artifactHash, signingKey)
+    )
+  ) {
+    blockers.push("REVIEW_ARTIFACT_SIGNATURE_INVALID");
+  }
+  if (
+    input.requireFresh !== false &&
+    !isPaperReviewArtifactFresh(
+      input.artifact,
+      input.asOf ?? new Date().toISOString()
+    )
+  ) {
+    blockers.push("REVIEW_ARTIFACT_EXPIRED");
+  }
+
+  return {
+    valid: blockers.length === 0,
+    blockers: [...new Set(blockers)],
+    calculatedPayloadSignature,
+    calculatedArtifactHash
+  };
+};

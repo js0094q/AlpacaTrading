@@ -120,11 +120,9 @@ const assertDashboardMutationPreflight = (
   }
 ) => {
   const actionType = inferRuntimeActionType(options.vpsPath, options);
-  const isConfirmRoute = options.vpsPath?.includes("/execute/confirm") === true;
   const isReviewedExecutionRoute = options.vpsPath?.includes("/actions/execute") === true;
   const confirmPaper =
     actionType !== "confirmed-paper-execution" ||
-    isConfirmRoute ||
     input.confirmPaper === true;
   const requireOptionsExecution =
     actionType === "confirmed-paper-execution" &&

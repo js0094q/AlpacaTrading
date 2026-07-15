@@ -233,6 +233,8 @@ test("engine mutation fallback preserves prototype provider methods and executio
   const executionTime = "2026-07-13T14:30:08.000Z";
   class PrototypeMutationProvider {
     calls = 0;
+    quoteCalls = 0;
+    snapshotCalls = 0;
 
     now() {
       return now;
@@ -241,6 +243,16 @@ test("engine mutation fallback preserves prototype provider methods and executio
     async submitPaperOrder() {
       this.calls += 1;
       return { data: { id: "prototype-paper-order" } };
+    }
+
+    async refreshQuote() {
+      this.quoteCalls += 1;
+      return {};
+    }
+
+    async getLatestOptionSnapshots() {
+      this.snapshotCalls += 1;
+      return { data: {} };
     }
   }
   const original = new PrototypeMutationProvider();
@@ -258,8 +270,14 @@ test("engine mutation fallback preserves prototype provider methods and executio
   assert.equal(fallback.now?.(), executionTime);
   assert.equal(override.now?.(), now);
   assert.equal(typeof override.submitPaperOrder, "function");
+  assert.equal(typeof override.refreshQuote, "function");
+  assert.equal(typeof override.getLatestOptionSnapshots, "function");
   await override.submitPaperOrder?.({} as never);
+  await override.refreshQuote?.(optionSymbol);
+  await override.getLatestOptionSnapshots?.([optionSymbol]);
   assert.equal(original.calls, 1);
+  assert.equal(original.quoteCalls, 1);
+  assert.equal(original.snapshotCalls, 1);
 });
 
 test("engine selection rejects eligible candidates with execution blockers", () => {

@@ -9,13 +9,17 @@ import {
 import {
   findPaperExecutionByDedupeKey,
   insertPaperExecutionLedgerEntry,
+  listActivePaperNewRiskReservations,
+  paperNewRiskLedgerMutationFingerprint,
+  reserveReviewedPaperExecutions,
+  type PaperExecutionLedgerEntry,
   updatePaperExecutionLedgerEntry
 } from "./paperExecutionLedgerService.js";
 import {
   findPaperReviewPayloadDecision,
-  isPaperReviewArtifactFresh,
   isReviewedPayloadSectionName,
   latestPaperReviewArtifact,
+  verifyPaperReviewArtifact,
   type PaperReviewArtifact,
   type ReviewedPayloadSectionName
 } from "./paperReviewArtifactService.js";
@@ -27,6 +31,15 @@ import {
 } from "./paperPositionLifecycleService.js";
 import type { DecisionId, PositionLifecycleId } from "../types.js";
 import { getTradingSafetyState } from "./tradingSafetyService.js";
+import {
+  capturePaperSubmitState,
+  normalizePaperSubmitReservations,
+  paperSubmitReservationFingerprint,
+  validatePaperSubmitState,
+  validatePaperSubmitReservationHeadroom,
+  type PaperSubmitStateAttestation,
+  type PaperSubmitStateValidation
+} from "./paperSubmitStateService.js";
 
 export type PaperReviewedExecutionStatus =
   | "submitted"
@@ -111,8 +124,15 @@ interface PaperReviewedExecutionDeps {
   getAccount?: typeof getAccount;
   submitPaperOrder?: typeof submitPaperOrder;
   latestArtifact?: typeof latestPaperReviewArtifact;
+  captureSubmitState?: typeof capturePaperSubmitState;
   now?: () => string;
 }
+
+const ENTRY_SECTIONS = new Set<ReviewedPayloadSectionName>([
+  "equityBuys",
+  "equityAdds",
+  "optionBuys"
+]);
 
 const parseBoolean = (name: string) =>
   process.env[name] === "true" || process.env[name] === "1";
@@ -125,6 +145,29 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 
 const stringField = (value: unknown): string | undefined =>
   typeof value === "string" && value.trim() ? value.trim() : undefined;
+
+const numberField = (value: unknown): number | null => {
+  if (value === null || value === undefined || value === "") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const isPaperSubmitStateAttestation = (
+  value: unknown
+): value is PaperSubmitStateAttestation =>
+  isRecord(value) &&
+  value.version === "paper-submit-state-v1" &&
+  Array.isArray(value.payloadIntents) &&
+  Array.isArray(value.positions) &&
+  Array.isArray(value.openOrders) &&
+  Array.isArray(value.reservations) &&
+  Array.isArray(value.marketEvidence) &&
+  isRecord(value.allocationAttestation) &&
+  value.allocationAttestation.identity === "baseline-v1" &&
+  value.allocationAttestation.allocatorControlled === false;
+
+const isEntryPayload = (payload: NormalizedReviewedPayload) =>
+  ENTRY_SECTIONS.has(payload.section);
 
 const normalizeType = (value: unknown): "market" | "limit" =>
   value === "limit" ? "limit" : "market";
@@ -341,13 +384,21 @@ export const buildPaperReviewedPayloadExecutionReport = async (
       artifact
     });
   }
-  if (!isPaperReviewArtifactFresh(artifact, generatedAt)) {
+  const artifactVerification = verifyPaperReviewArtifact({
+    artifact,
+    asOf: generatedAt
+  });
+  if (!artifactVerification.valid) {
+    const verificationBlockers = artifactVerification.blockers.map((reason) => ({
+      reason
+    }));
     return emptyReport({
       generatedAt,
       environment: state.alpacaEnv,
-      status: "warning",
-      reason: "REVIEW_STALE_OR_PAYLOAD_CHANGED",
-      artifact
+      status: "blocked",
+      reason: artifactVerification.blockers[0] ?? "REVIEW_ARTIFACT_SIGNATURE_INVALID",
+      artifact,
+      blocked: verificationBlockers
     });
   }
   if (
@@ -357,9 +408,10 @@ export const buildPaperReviewedPayloadExecutionReport = async (
     return emptyReport({
       generatedAt,
       environment: state.alpacaEnv,
-      status: "warning",
+      status: "blocked",
       reason: "REVIEW_STALE_OR_PAYLOAD_CHANGED",
-      artifact
+      artifact,
+      blocked: [{ reason: "REVIEW_STALE_OR_PAYLOAD_CHANGED" }]
     });
   }
   if (artifact.payloadCount <= 0) {
@@ -418,10 +470,115 @@ export const buildPaperReviewedPayloadExecutionReport = async (
       });
       continue;
     }
+    if (
+      isEntryPayload(result) &&
+      (!(["success", "warning"] as string[]).includes(artifact.status) ||
+        artifact.artifact.blockers.length > 0)
+    ) {
+      blocked.push({
+        section: result.section,
+        symbol: result.symbol,
+        clientOrderId: result.clientOrderId,
+        reason: "REVIEW_ARTIFACT_ENTRY_BLOCKED",
+        explanation:
+          artifact.artifact.blockers.join(", ") ||
+          `Signed review artifact status is ${artifact.status}.`
+      });
+      continue;
+    }
+    if (
+      isEntryPayload(result) &&
+      (result.side !== "buy" || !result.sourceCandidateId || !result.decisionId)
+    ) {
+      blocked.push({
+        section: result.section,
+        symbol: result.symbol,
+        clientOrderId: result.clientOrderId,
+        reason: "REVIEW_ENTRY_SOURCE_IDENTITY_MISSING",
+        explanation:
+          "Reviewed new-risk payloads require exact candidate and decision linkage."
+      });
+      continue;
+    }
     normalized.push(result);
   }
 
   if (!normalized.length) {
+    return emptyReport({
+      generatedAt,
+      environment: state.alpacaEnv,
+      status: blocked.length ? "blocked" : "no_op",
+      reason: blocked[0]?.reason ?? "NO_ELIGIBLE_REVIEWED_PAYLOADS",
+      artifact,
+      blocked,
+      reviewedPayloads: reviewedPayloadRows.length
+    });
+  }
+
+  let eligiblePayloads = normalized;
+  let submitValidation: PaperSubmitStateValidation | null = null;
+  let currentSubmitState: PaperSubmitStateAttestation | null = null;
+  let expectedNewRiskLedgerFingerprint: string | null = null;
+  const entryPayloads = normalized.filter(isEntryPayload);
+  if (entryPayloads.length) {
+    const reviewedSubmitState = artifact.artifact.submitState;
+    let stateBlockers: string[] = [];
+    if (!isPaperSubmitStateAttestation(reviewedSubmitState)) {
+      stateBlockers = [
+        "REVIEW_SUBMIT_STATE_MISSING",
+        "FRESH_REVIEW_REQUIRED"
+      ];
+    } else {
+      try {
+        const ledgerFingerprintBefore = paperNewRiskLedgerMutationFingerprint();
+        const capture =
+          deps.captureSubmitState ??
+          ((captureInput: Parameters<typeof capturePaperSubmitState>[0]) =>
+            capturePaperSubmitState(captureInput, {
+              getAccount: deps.getAccount
+            }));
+        currentSubmitState = await capture({
+          capturedAt: generatedAt,
+          payloadSections: artifact.artifact.payloadSections
+        });
+        expectedNewRiskLedgerFingerprint =
+          paperNewRiskLedgerMutationFingerprint();
+        submitValidation = validatePaperSubmitState({
+          reviewed: reviewedSubmitState,
+          current: currentSubmitState,
+          sections: [
+            ...new Set(entryPayloads.map((payload) => payload.section))
+          ]
+        });
+        stateBlockers = [
+          ...submitValidation.blockers,
+          ...(ledgerFingerprintBefore !== expectedNewRiskLedgerFingerprint
+            ? ["SUBMIT_LEDGER_STATE_DRIFT", "FRESH_REVIEW_REQUIRED"]
+            : [])
+        ];
+      } catch {
+        stateBlockers = [
+          "SUBMIT_STATE_CAPTURE_FAILED",
+          "FRESH_REVIEW_REQUIRED"
+        ];
+      }
+    }
+    if (stateBlockers.length) {
+      const explanation = [...new Set(stateBlockers)].join(", ");
+      for (const payload of entryPayloads) {
+        blocked.push({
+          section: payload.section,
+          symbol: payload.symbol,
+          clientOrderId: payload.clientOrderId,
+          reason: "FRESH_REVIEW_REQUIRED",
+          explanation
+        });
+      }
+      eligiblePayloads = normalized.filter((payload) => !isEntryPayload(payload));
+    }
+  }
+
+  if (!eligiblePayloads.length) {
     return emptyReport({
       generatedAt,
       environment: state.alpacaEnv,
@@ -446,13 +603,105 @@ export const buildPaperReviewedPayloadExecutionReport = async (
     });
   }
 
+  const reservedEntriesByClient = new Map<string, PaperExecutionLedgerEntry>();
+  const entryPayloadsToReserve = eligiblePayloads.filter(isEntryPayload);
+  if (entryPayloadsToReserve.length) {
+    if (!currentSubmitState) {
+      for (const payload of entryPayloadsToReserve) {
+        blocked.push({
+          section: payload.section,
+          symbol: payload.symbol,
+          clientOrderId: payload.clientOrderId,
+          reason: "FRESH_REVIEW_REQUIRED",
+          explanation: "SUBMIT_STATE_CAPTURE_FAILED"
+        });
+      }
+      eligiblePayloads = eligiblePayloads.filter((payload) => !isEntryPayload(payload));
+    } else {
+      const expectedReservationFingerprint = paperSubmitReservationFingerprint(
+        currentSubmitState.reservations
+      );
+      const reservation = reserveReviewedPaperExecutions({
+        inputs: entryPayloadsToReserve.map((payload) => ({
+          assetClass: payload.assetClass,
+          symbol: payload.symbol,
+          side: "buy" as const,
+          orderType: payload.type,
+          timeInForce: payload.timeInForce,
+          qty: payload.qty ?? null,
+          notional: payload.notional ?? null,
+          limitPrice: payload.limitPrice ?? null,
+          estimatedPremium: numberField(payload.raw.estimatedPremium),
+          maxRisk: numberField(payload.raw.maxRisk),
+          dedupeKey: payload.dedupeKey,
+          clientOrderId: payload.clientOrderId,
+          sourcePlanId: artifact.id,
+          sourceCandidateId: payload.sourceCandidateId!,
+          decisionId: payload.decisionId!,
+          section: payload.section,
+          payloadIndex: payload.payloadIndex,
+          payload: {
+            reviewedPayload: payload.raw,
+            submitValidation
+          },
+          rawPayload: toAlpacaPayload(payload)
+        })),
+        validateBeforeInsert: () => {
+          const currentReservations = normalizePaperSubmitReservations(
+            listActivePaperNewRiskReservations()
+          );
+          if (
+            !expectedNewRiskLedgerFingerprint ||
+            paperNewRiskLedgerMutationFingerprint() !==
+              expectedNewRiskLedgerFingerprint ||
+            paperSubmitReservationFingerprint(currentReservations) !==
+            expectedReservationFingerprint
+          ) {
+            return [
+              "SUBMIT_RESERVATION_STATE_DRIFT",
+              "FRESH_REVIEW_REQUIRED"
+            ];
+          }
+          const headroomBlockers = validatePaperSubmitReservationHeadroom({
+            state: currentSubmitState!,
+            sections: [
+              ...new Set(entryPayloadsToReserve.map((payload) => payload.section))
+            ],
+            reservations: currentReservations
+          });
+          return headroomBlockers.length
+            ? [...headroomBlockers, "FRESH_REVIEW_REQUIRED"]
+            : [];
+        }
+      });
+      if (!reservation.reserved) {
+        const reason = reservation.blockers[0] ?? "SUBMIT_RESERVATION_FAILED";
+        for (const payload of entryPayloadsToReserve) {
+          blocked.push({
+            section: payload.section,
+            symbol: payload.symbol,
+            clientOrderId: payload.clientOrderId,
+            reason,
+            explanation: reservation.blockers.join(", ")
+          });
+        }
+        eligiblePayloads = eligiblePayloads.filter((payload) => !isEntryPayload(payload));
+      } else {
+        reservation.entries.forEach((entry) => {
+          reservedEntriesByClient.set(entry.clientOrderId, entry);
+        });
+      }
+    }
+  }
+
   const submitted: PaperReviewedExecutionReport["submitted"] = [];
   const errors: PaperReviewedExecutionReport["errors"] = [];
   const submit = deps.submitPaperOrder ?? submitPaperOrder;
 
-  for (const payload of normalized) {
+  for (const payload of eligiblePayloads) {
     const existingExecution = findPaperExecutionByDedupeKey(payload.dedupeKey);
     if (
+      !isEntryPayload(payload) &&
       existingExecution &&
       existingExecution.status !== "blocked" &&
       existingExecution.status !== "duplicate_blocked"
@@ -467,26 +716,52 @@ export const buildPaperReviewedPayloadExecutionReport = async (
       continue;
     }
 
-    const ledger = insertPaperExecutionLedgerEntry({
-      mode: "reviewedConfirmPaper",
-      assetClass: payload.assetClass,
-      symbol: payload.symbol,
-      side: payload.side,
-      orderType: payload.type,
-      timeInForce: payload.timeInForce,
-      qty: payload.qty ?? null,
-      notional: payload.notional ?? null,
-      limitPrice: payload.limitPrice ?? null,
-      dedupeKey: payload.dedupeKey,
-      clientOrderId: payload.clientOrderId,
-      status: "attempted",
-      sourcePlanId: artifact.id,
-      sourceCandidateId: payload.sourceCandidateId ?? null,
-      decisionId: payload.decisionId,
-      decisionLinkageStatus: payload.decisionId ? "EXACT" : "LEGACY_UNLINKED",
-      payload: payload.raw,
-      rawPayload: toAlpacaPayload(payload)
-    });
+    let ledger: PaperExecutionLedgerEntry;
+    if (isEntryPayload(payload)) {
+      const reservedEntry = reservedEntriesByClient.get(payload.clientOrderId);
+      if (!reservedEntry) {
+        blocked.push({
+          section: payload.section,
+          symbol: payload.symbol,
+          clientOrderId: payload.clientOrderId,
+          reason: "SUBMIT_RESERVATION_FAILED",
+          explanation: "Atomic reviewed reservation was not available."
+        });
+        continue;
+      }
+      ledger = reservedEntry;
+      updatePaperExecutionLedgerEntry(ledger.id, {
+        status: "attempted",
+        reason: null,
+        blockedReason: null
+      });
+    } else {
+      ledger = insertPaperExecutionLedgerEntry({
+        mode: "reviewedConfirmPaper",
+        assetClass: payload.assetClass,
+        symbol: payload.symbol,
+        side: payload.side,
+        orderType: payload.type,
+        timeInForce: payload.timeInForce,
+        qty: payload.qty ?? null,
+        notional: payload.notional ?? null,
+        limitPrice: payload.limitPrice ?? null,
+        dedupeKey: payload.dedupeKey,
+        clientOrderId: payload.clientOrderId,
+        status: "attempted",
+        sourcePlanId: artifact.id,
+        sourceCandidateId: payload.sourceCandidateId ?? null,
+        decisionId: payload.decisionId,
+        decisionLinkageStatus: payload.decisionId ? "EXACT" : "LEGACY_UNLINKED",
+        payload: {
+          artifactId: artifact.id,
+          section: payload.section,
+          payloadIndex: payload.payloadIndex,
+          reviewedPayload: payload.raw
+        },
+        rawPayload: toAlpacaPayload(payload)
+      });
+    }
 
     if (payload.decisionId) {
       appendDecisionLifecycleEvent({
@@ -657,7 +932,7 @@ export const buildPaperReviewedPayloadExecutionReport = async (
     errors,
     summary: {
       reviewedPayloads: reviewedPayloadRows.length,
-      eligiblePayloads: normalized.length,
+      eligiblePayloads: eligiblePayloads.length,
       submitted: submitted.length,
       blocked: blocked.length,
       errors: errors.length

@@ -3,12 +3,14 @@ import { getDb } from "../../lib/db.js";
 import { redactSensitiveText } from "../../lib/securityRedaction.js";
 import {
   getAccount,
+  getLatestOptionSnapshots,
   getPaperOrder,
   listPaperPositions,
   listRecentPaperOrders,
   submitPaperOrder,
   type AlpacaAccountRaw,
   type AlpacaApiResponse,
+  type AlpacaOptionSnapshotRaw,
   type AlpacaPaperOrderRequest,
   type AlpacaPositionRaw,
   type AlpacaSubmittedOrder
@@ -18,6 +20,9 @@ import {
   findPaperExecutionByClientOrderId,
   findPaperExecutionByDedupeKey,
   insertPaperExecutionLedgerEntry,
+  listActivePaperNewRiskReservations,
+  paperNewRiskLedgerMutationFingerprint,
+  runAtomicPaperNewRiskReservation,
   updatePaperExecutionLedgerEntry,
   type PaperExecutionLedgerEntry,
   type PaperExecutionLedgerStatus
@@ -28,7 +33,24 @@ import {
 } from "./zeroDteLifecycleService.js";
 import { buildZeroDteClientOrderId } from "./zeroDteIdentityService.js";
 import { loadZeroDteConfig } from "./zeroDteConfigService.js";
+import {
+  buildZeroDteActivityEvidence,
+  type ZeroDteActivityEvidence
+} from "./zeroDteActivityEvidenceService.js";
+import {
+  createZeroDteSubmitAttestation,
+  verifyZeroDteSubmitAttestation,
+  type ZeroDteSubmitAttestation,
+  type ZeroDteSubmitAttestationExpected,
+  type ZeroDteSubmitOrderIntent
+} from "./zeroDteSubmitAttestationService.js";
+import { paperReviewArtifactSigningKey } from "../paperReviewArtifactService.js";
+import {
+  normalizePaperSubmitReservations,
+  paperSubmitReservationFingerprint
+} from "../paperSubmitStateService.js";
 import { parseOptionSymbol } from "../optionSymbolService.js";
+import { isActiveBrokerOrderStatus } from "../brokerOrderStatusService.js";
 import type {
   ZeroDteAccountOrderSnapshot,
   ZeroDteAccountPositionSnapshot,
@@ -82,6 +104,10 @@ export interface ZeroDtePaperMutationProvider {
   listPositions?: typeof listPaperPositions;
   listOrders?: typeof listRecentPaperOrders;
   getOrder?: typeof getPaperOrder;
+  getLatestOptionSnapshots?: typeof getLatestOptionSnapshots;
+  refreshQuote?: (
+    symbol: string
+  ) => Promise<ZeroDteQueueCandidate["quote"]>;
   submitPaperOrder?: typeof submitPaperOrder;
 }
 
@@ -111,6 +137,7 @@ export interface ZeroDteExecutionResult {
   mutationAttempted: boolean;
   candidateId: string;
   decisionId: string;
+  attestationId: string | null;
   paperTradeId: string | null;
   ledgerId: number | null;
   clientOrderId: string;
@@ -201,7 +228,14 @@ const accountPosition = (value: unknown): ZeroDteAccountPositionSnapshot | null 
   const row = value as Record<string, unknown>;
   const symbol = normalizedSymbol(row.symbol);
   const quantity = finite(row.quantity ?? row.qty) ?? 0;
-  return symbol ? { symbol, quantity } : null;
+  return symbol
+    ? {
+        symbol,
+        quantity,
+        marketValue: finite(row.marketValue ?? row.market_value),
+        currentPrice: finite(row.currentPrice ?? row.current_price)
+      }
+    : null;
 };
 
 const accountOrder = (value: unknown): ZeroDteAccountOrderSnapshot | null => {
@@ -213,7 +247,10 @@ const accountOrder = (value: unknown): ZeroDteAccountOrderSnapshot | null => {
         symbol,
         side: text(row.side),
         status: text(row.status),
-        clientOrderId: text(row.clientOrderId ?? row.client_order_id)
+        clientOrderId: text(row.clientOrderId ?? row.client_order_id),
+        brokerOrderId: text(row.brokerOrderId ?? row.id),
+        quantity: finite(row.quantity ?? row.qty),
+        limitPrice: finite(row.limitPrice ?? row.limit_price)
       }
     : null;
 };
@@ -222,15 +259,31 @@ const toAccountSnapshot = (
   account: AlpacaAccountRaw,
   positions: AlpacaPositionRaw[],
   orders: AlpacaSubmittedOrder[],
-  runtime: ZeroDteRuntimeSnapshot
+  runtime: ZeroDteRuntimeSnapshot,
+  activity: ZeroDteActivityEvidence
 ): ZeroDteAccountSnapshot => ({
+  accountIdentityHash: text(account.id)
+    ? canonicalJsonHash({ accountId: text(account.id) })
+    : null,
   environment: runtime.environment,
   paperVerified: runtime.paperAccountVerified ?? runtime.environment === "paper",
   status: text(account.status),
+  cash: finite(account.cash),
   buyingPower: finite(account.buying_power),
   optionsBuyingPower: finite(account.options_buying_power ?? account.buying_power),
   equity: finite(account.equity ?? account.portfolio_value),
   optionApprovalLevel: finite(account.options_approved_level ?? account.options_trading_level),
+  tradingBlocked: typeof account.trading_blocked === "boolean" ? account.trading_blocked : null,
+  accountBlocked: typeof account.account_blocked === "boolean" ? account.account_blocked : null,
+  dailyTradeCount: activity.dailyTradeCount,
+  dailyPremium: activity.dailyPremium,
+  dailyRealizedLoss: activity.dailyRealizedLoss,
+  activityEvidenceComplete: activity.complete,
+  activityEvidenceFingerprint: activity.evidenceFingerprint,
+  activityEvidenceBlockers: activity.blockers,
+  openPositionCount: activity.openPositionCount,
+  openOrderCount: activity.openOrderCount,
+  openExposureCount: activity.openExposureCount,
   openPositions: positions.map((position) => accountPosition(position)).filter(
     (position): position is ZeroDteAccountPositionSnapshot => position !== null
   ),
@@ -377,15 +430,40 @@ export const evaluateZeroDteExecutionEligibility = (
   if (estimatedPremium !== null && (buyingPower === null || buyingPower < estimatedPremium)) {
     blockers.push("BUYING_POWER");
   }
+  const cash = finite(account.cash);
+  if (estimatedPremium !== null && (cash === null || cash < estimatedPremium)) {
+    blockers.push("CASH_RESERVE");
+  }
+  if (text(account.accountIdentityHash) === null) {
+    blockers.push("ZERO_DTE_ACCOUNT_IDENTITY_REQUIRED");
+  }
+  if (account.tradingBlocked !== false || account.accountBlocked !== false) {
+    blockers.push("ACCOUNT_UNAVAILABLE");
+  }
   const dailyPremium = finite(account.dailyPremium);
+  const dailyTradeCount = finite(account.dailyTradeCount);
+  const realizedLoss = accountRealizedLoss(account.dailyRealizedLoss);
+  const openExposureCount = finite(account.openExposureCount);
+  const dailyCountersComplete =
+    account.activityEvidenceComplete === true &&
+    text(account.activityEvidenceFingerprint) !== null &&
+    dailyPremium !== null && dailyPremium >= 0 &&
+    dailyTradeCount !== null && dailyTradeCount >= 0 && Number.isInteger(dailyTradeCount) &&
+    realizedLoss !== null && realizedLoss >= 0 &&
+    openExposureCount !== null && openExposureCount >= 0 && Number.isInteger(openExposureCount);
+  if (!dailyCountersComplete) {
+    blockers.push(
+      "ZERO_DTE_DAILY_COUNTER_EVIDENCE_REQUIRED",
+      "ZERO_DTE_ACTIVITY_EVIDENCE_INCOMPLETE",
+      ...(account.activityEvidenceBlockers ?? [])
+    );
+  }
   if (estimatedPremium !== null && dailyPremium !== null && dailyPremium + estimatedPremium > config.maxDailyPremium) {
     blockers.push("DAILY_PREMIUM_LIMIT");
   }
-  const dailyTradeCount = finite(account.dailyTradeCount);
   if (dailyTradeCount !== null && dailyTradeCount >= config.maxTradesPerDay) {
     blockers.push("DAILY_TRADE_LIMIT");
   }
-  const realizedLoss = accountRealizedLoss(account.dailyRealizedLoss);
   if (realizedLoss !== null && realizedLoss >= config.maxDailyRealizedLoss) {
     blockers.push("DAILY_LOSS_LIMIT");
   }
@@ -395,14 +473,17 @@ export const evaluateZeroDteExecutionEligibility = (
     const openContract = parseOptionSymbol(normalizedSymbol(position.symbol));
     return openContract.ok && openContract.expirationDate === candidate.tradingDate;
   });
-  if (openSameDayOptionPositions.length >= config.maxOpenPositions) {
+  if (
+    (openExposureCount !== null && openExposureCount >= config.maxOpenPositions) ||
+    (openExposureCount === null && openSameDayOptionPositions.length >= config.maxOpenPositions)
+  ) {
     blockers.push("MAX_OPEN_0DTE_POSITIONS");
   }
   if (openPositions.some((position) => normalizedSymbol(position.symbol) === symbol && position.quantity > 0)) {
     blockers.push("DUPLICATE_EXPOSURE");
   }
   const openOrders = account.openOrders ?? [];
-  if (openOrders.some((order) => normalizedSymbol(order.symbol) === symbol && ACTIVE_ORDER_STATUSES.has(normalizedStatus(order.status)))) {
+  if (openOrders.some((order) => normalizedSymbol(order.symbol) === symbol && isActiveBrokerOrderStatus(order.status))) {
     blockers.push("DUPLICATE_EXPOSURE");
   }
   if (account.paperVerified === false || String(account.environment || "paper").toLowerCase() !== "paper") {
@@ -442,20 +523,30 @@ export const evaluateZeroDteExecutionEligibility = (
         ageMs: age
       },
       quantity,
+      accountIdentityHash: text(account.accountIdentityHash),
+      cash,
       buyingPower,
       dailyPremium,
       dailyTradeCount,
-      dailyRealizedLoss: realizedLoss
+      dailyRealizedLoss: realizedLoss,
+      activityEvidenceComplete: account.activityEvidenceComplete === true,
+      activityEvidenceFingerprint: text(account.activityEvidenceFingerprint),
+      activityEvidenceBlockers: account.activityEvidenceBlockers ?? [],
+      openPositionCount: finite(account.openPositionCount),
+      openOrderCount: finite(account.openOrderCount),
+      openExposureCount
     }
   };
 };
 
 const decisionRow = (decisionId: string) => getDb().prepare(
-  `SELECT decision_id, decision_group_id, engine_run_id, candidate_id,
-          trading_date, strategy_version, configuration_version_id,
-          market_timestamp
-   FROM zero_dte_decisions
-   WHERE decision_id = ?`
+  `SELECT d.decision_id, d.decision_group_id, d.engine_run_id, d.candidate_id,
+          d.trading_date, d.strategy_version, d.configuration_version_id,
+          d.market_timestamp, c.underlying_symbol, c.option_symbol,
+          c.direction, c.expiration_date
+   FROM zero_dte_decisions d
+   JOIN zero_dte_candidates c ON c.candidate_id = d.candidate_id
+   WHERE d.decision_id = ?`
 ).get(decisionId) as {
   decision_id: string;
   decision_group_id: string;
@@ -465,7 +556,147 @@ const decisionRow = (decisionId: string) => getDb().prepare(
   strategy_version: string;
   configuration_version_id: string;
   market_timestamp: string | null;
+  underlying_symbol: string;
+  option_symbol: string;
+  direction: string;
+  expiration_date: string;
 } | undefined;
+
+const decisionLinkageBlockers = (input: {
+  decision: NonNullable<ReturnType<typeof decisionRow>> | undefined;
+  candidate: ZeroDteQueueCandidate;
+  config: ZeroDteConfig;
+}) => {
+  const { decision, candidate, config } = input;
+  if (!decision || decision.candidate_id !== candidate.candidateId) {
+    return ["DECISION_CANDIDATE_MISMATCH"];
+  }
+  const blockers: string[] = [];
+  if (decision.trading_date !== candidate.tradingDate || decision.expiration_date !== candidate.expirationDate) {
+    blockers.push("DECISION_TRADING_DATE_MISMATCH");
+  }
+  if (
+    decision.strategy_version !== config.strategyVersion ||
+    decision.configuration_version_id !== config.configurationVersionId
+  ) {
+    blockers.push("DECISION_CONFIGURATION_MISMATCH");
+  }
+  if (
+    normalizedSymbol(decision.option_symbol) !== normalizedSymbol(candidate.optionSymbol) ||
+    normalizedSymbol(decision.underlying_symbol) !== normalizedSymbol(candidate.underlyingSymbol) ||
+    normalizedStatus(decision.direction) !== normalizedStatus(candidate.direction) ||
+    text(decision.market_timestamp) !== text(candidate.quote.marketTimestamp)
+  ) {
+    blockers.push("DECISION_ORDER_INTENT_MISMATCH");
+  }
+  const parsed = parseOptionSymbol(normalizedSymbol(candidate.optionSymbol));
+  if (
+    parsed.ok &&
+    ((candidate.direction === "bullish" && parsed.optionType !== "call") ||
+      (candidate.direction === "bearish" && parsed.optionType !== "put"))
+  ) {
+    blockers.push("DECISION_ORDER_INTENT_MISMATCH");
+  }
+  return unique(blockers);
+};
+
+const accountStateFingerprint = (account: ZeroDteAccountSnapshot) =>
+  canonicalJsonHash({
+    accountIdentityHash: text(account.accountIdentityHash),
+    environment: text(account.environment),
+    paperVerified: account.paperVerified === true,
+    status: text(account.status),
+    cash: finite(account.cash),
+    buyingPower: finite(account.buyingPower),
+    optionsBuyingPower: finite(account.optionsBuyingPower),
+    equity: finite(account.equity),
+    optionApprovalLevel: finite(account.optionApprovalLevel),
+    tradingBlocked: account.tradingBlocked,
+    accountBlocked: account.accountBlocked,
+    dailyTradeCount: finite(account.dailyTradeCount),
+    dailyPremium: finite(account.dailyPremium),
+    dailyRealizedLoss: finite(account.dailyRealizedLoss),
+    openPositionCount: finite(account.openPositionCount),
+    openOrderCount: finite(account.openOrderCount),
+    openExposureCount: finite(account.openExposureCount),
+    positions: (account.openPositions ?? [])
+      .map((position) => ({
+        symbol: normalizedSymbol(position.symbol),
+        quantity: finite(position.quantity),
+        marketValue: finite(position.marketValue),
+        currentPrice: finite(position.currentPrice)
+      }))
+      .sort((left, right) => left.symbol.localeCompare(right.symbol)),
+    orders: (account.openOrders ?? [])
+      .map((order) => ({
+        symbol: normalizedSymbol(order.symbol),
+        side: normalizedStatus(order.side),
+        status: normalizedStatus(order.status),
+        clientOrderIdHash: text(order.clientOrderId)
+          ? canonicalJsonHash({ clientOrderId: text(order.clientOrderId) })
+          : null,
+        brokerOrderIdHash: text(order.brokerOrderId)
+          ? canonicalJsonHash({ brokerOrderId: text(order.brokerOrderId) })
+          : null,
+        quantity: finite(order.quantity),
+        limitPrice: finite(order.limitPrice)
+      }))
+      .sort((left, right) =>
+        `${left.symbol}:${left.clientOrderIdHash ?? ""}`.localeCompare(
+          `${right.symbol}:${right.clientOrderIdHash ?? ""}`
+        )
+      )
+  });
+
+const zeroDteSubmitOrderIntent = (
+  candidate: ZeroDteQueueCandidate,
+  eligibility: ZeroDteEligibilityResult
+): ZeroDteSubmitOrderIntent => {
+  if (eligibility.limitPrice === null || eligibility.estimatedPremium === null) {
+    throw new Error("ZERO_DTE_ORDER_INTENT_INCOMPLETE");
+  }
+  const quoteTimestamp = text(candidate.quote.marketTimestamp);
+  if (!quoteTimestamp) throw new Error("ZERO_DTE_ORDER_INTENT_INCOMPLETE");
+  return {
+    symbol: normalizedSymbol(candidate.optionSymbol),
+    underlying: normalizedSymbol(candidate.underlyingSymbol),
+    direction: candidate.direction,
+    side: "buy",
+    positionIntent: "buy_to_open",
+    quantity: eligibility.quantity,
+    limitPrice: eligibility.limitPrice,
+    estimatedPremium: eligibility.estimatedPremium,
+    quoteTimestamp,
+    quoteFingerprint: canonicalJsonHash(candidate.quote),
+    clientOrderId: eligibility.clientOrderId,
+    reservationKey: eligibility.reservationKey
+  };
+};
+
+const zeroDteAttestationExpected = (input: {
+  candidate: ZeroDteQueueCandidate;
+  decisionId: string;
+  config: ZeroDteConfig;
+  account: ZeroDteAccountSnapshot;
+  eligibility: ZeroDteEligibilityResult;
+}): ZeroDteSubmitAttestationExpected => ({
+  decisionId: input.decisionId,
+  candidateId: input.candidate.candidateId,
+  tradingDate: input.candidate.tradingDate,
+  strategyVersion: input.config.strategyVersion,
+  configurationVersionId: input.config.configurationVersionId,
+  accountIdentityHash: text(input.account.accountIdentityHash) ?? "",
+  accountStateFingerprint: accountStateFingerprint(input.account),
+  activityEvidenceFingerprint: text(input.account.activityEvidenceFingerprint) ?? "",
+  allocationIdentity: "baseline-v1",
+  submitPriceDriftLimitPct: submitPriceDriftLimitPct(),
+  orderIntent: zeroDteSubmitOrderIntent(input.candidate, input.eligibility)
+});
+
+const zeroDteReviewTtlSeconds = () => {
+  const parsed = Number(process.env.ZERO_DTE_REVIEW_TTL_SECONDS ?? 300);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : 300;
+};
 
 const paperTradeIdFor = (candidateId: string, decisionId: string) =>
   `zpt_${canonicalJsonHash({ candidateId, decisionId }).slice(0, 40)}`;
@@ -501,6 +732,47 @@ const appendPaperLifecycleEvent = (input: {
     marketTimestamp: input.decision.market_timestamp,
     occurredAt: input.occurredAt,
     details: input.details ?? {}
+  });
+};
+
+const appendExecutionAttestationEvent = (input: {
+  decision: NonNullable<ReturnType<typeof decisionRow>>;
+  attestation: ZeroDteSubmitAttestation;
+}) => {
+  const eventId = `zlev_${canonicalJsonHash({
+    eventType: "execution_attested",
+    attestationId: input.attestation.attestationId,
+    decisionId: input.decision.decision_id
+  }).slice(0, 40)}`;
+  const db = getDb();
+  if (db.prepare("SELECT event_id FROM zero_dte_lifecycle_events WHERE event_id = ?").get(eventId)) {
+    return;
+  }
+  insertZeroDteLifecycleEventRow(db, {
+    eventId,
+    eventType: "execution_attested",
+    reasonCode: "ZERO_DTE_SUBMIT_ATTESTED",
+    engineRunId: input.decision.engine_run_id,
+    candidateId: input.decision.candidate_id,
+    decisionId: input.decision.decision_id,
+    decisionGroupId: input.decision.decision_group_id,
+    accountMode: "paper",
+    strategyVersion: input.decision.strategy_version,
+    configurationVersionId: input.decision.configuration_version_id,
+    marketTimestamp: input.decision.market_timestamp,
+    occurredAt: input.attestation.createdAt,
+    details: {
+      attestationId: input.attestation.attestationId,
+      payloadHash: input.attestation.payloadHash,
+      signature: input.attestation.signature,
+      signatureAlgorithm: input.attestation.signatureAlgorithm,
+      expiresAt: input.attestation.expiresAt,
+      accountIdentityHash: input.attestation.accountIdentityHash,
+      accountStateFingerprint: input.attestation.accountStateFingerprint,
+      activityEvidenceFingerprint: input.attestation.activityEvidenceFingerprint,
+      allocationIdentity: input.attestation.allocationIdentity,
+      orderIntent: input.attestation.orderIntent
+    }
   });
 };
 
@@ -1217,6 +1489,7 @@ const createBlockedLedgerEntry = (input: {
   eligibility: ZeroDteEligibilityResult;
   reason: string;
   now: string;
+  attestation?: ZeroDteSubmitAttestation | null;
 }) => {
   const existing = findPaperExecutionByDedupeKey(input.eligibility.reservationKey);
   if (existing) {
@@ -1226,6 +1499,27 @@ const createBlockedLedgerEntry = (input: {
       reason: input.reason,
       blockedReason: input.reason
     });
+    if (input.attestation) {
+      const payloadJson = JSON.stringify({
+        candidateId: input.candidate.candidateId,
+        optionSymbol: normalizedSymbol(input.candidate.optionSymbol),
+        quantity: input.eligibility.quantity,
+        limitPrice: input.eligibility.limitPrice,
+        attestation: input.attestation,
+        asOf: input.now
+      });
+      getDb().prepare(
+        `UPDATE paper_execution_ledger
+         SET source_plan_id = ?, payload_json = ?, raw_payload_json = ?, updated_at = ?
+         WHERE id = ?`
+      ).run(
+        input.attestation.attestationId,
+        payloadJson,
+        payloadJson,
+        input.now,
+        existing.id
+      );
+    }
     return findPaperExecutionByDedupeKey(input.eligibility.reservationKey) ?? existing;
   }
   return insertPaperExecutionLedgerEntry({
@@ -1246,12 +1540,14 @@ const createBlockedLedgerEntry = (input: {
     status: "blocked",
     reason: input.reason,
     blockedReason: input.reason,
+    sourcePlanId: input.attestation?.attestationId ?? null,
     sourceCandidateId: input.candidate.candidateId,
     payload: {
       candidateId: input.candidate.candidateId,
       optionSymbol: normalizedSymbol(input.candidate.optionSymbol),
       quantity: input.eligibility.quantity,
       limitPrice: input.eligibility.limitPrice,
+      attestation: input.attestation ?? null,
       asOf: input.now
     }
   });
@@ -1266,6 +1562,7 @@ const baseResult = (input: {
   paperTradeId?: string | null;
   brokerOrderId?: string | null;
   requestId?: string | null;
+  attestationId?: string | null;
   blockers?: string[];
   warnings?: string[];
   payload?: AlpacaPaperOrderRequest | null;
@@ -1276,6 +1573,8 @@ const baseResult = (input: {
   mutationAttempted: input.mutationAttempted ?? false,
   candidateId: input.candidate.candidateId,
   decisionId: input.decisionId,
+  attestationId:
+    input.attestationId ?? text(input.eligibility?.evidence.attestationId) ?? null,
   paperTradeId: input.paperTradeId ?? null,
   ledgerId: input.ledgerId ?? null,
   clientOrderId: input.eligibility?.clientOrderId ?? clientOrderIdFor(input.candidate),
@@ -1289,7 +1588,9 @@ const baseResult = (input: {
 
 const accountFromProvider = async (
   provider: ZeroDtePaperMutationProvider,
-  runtime: ZeroDteRuntimeSnapshot
+  runtime: ZeroDteRuntimeSnapshot,
+  tradingDate: string,
+  asOf: string
 ): Promise<ZeroDteAccountSnapshot> => {
   if (provider.account) return provider.account;
   const accountFn = provider.getAccount ?? getAccount;
@@ -1300,12 +1601,105 @@ const accountFromProvider = async (
     positionsFn(),
     ordersFn({ limit: 500 })
   ]);
+  const positions = Array.isArray(positionsResponse.data) ? positionsResponse.data : [];
+  const orders = Array.isArray(ordersResponse.data) ? ordersResponse.data : [];
+  const activity = buildZeroDteActivityEvidence({
+    tradingDate,
+    asOf,
+    positions,
+    orders
+  });
   return toAccountSnapshot(
     accountResponse.data,
-    Array.isArray(positionsResponse.data) ? positionsResponse.data : [],
-    Array.isArray(ordersResponse.data) ? ordersResponse.data : [],
-    runtime
+    positions,
+    orders,
+    runtime,
+    activity
   );
+};
+
+const refreshZeroDteQuote = async (input: {
+  candidate: ZeroDteQueueCandidate;
+  provider: ZeroDtePaperMutationProvider;
+}) => {
+  if (input.provider.refreshQuote) {
+    return input.provider.refreshQuote(input.candidate.optionSymbol);
+  }
+  // A fully injected account snapshot is the unit-test/offline provider contract
+  // unless that provider also supplies an explicit quote source.
+  if (
+    !input.provider.getLatestOptionSnapshots &&
+    (input.provider.account ||
+      input.provider.getAccount ||
+      input.provider.listPositions ||
+      input.provider.listOrders)
+  ) {
+    return input.candidate.quote;
+  }
+  const response = await (
+    input.provider.getLatestOptionSnapshots ?? getLatestOptionSnapshots
+  )([normalizedSymbol(input.candidate.optionSymbol)]);
+  const snapshots = response.data as Record<string, AlpacaOptionSnapshotRaw>;
+  const snapshot = snapshots[normalizedSymbol(input.candidate.optionSymbol)];
+  const quote = snapshot?.latestQuote ?? snapshot?.latest_quote;
+  const trade = snapshot?.latestTrade ?? snapshot?.latest_trade;
+  const bid = positive(quote?.bp ?? quote?.b);
+  const ask = positive(quote?.ap ?? quote?.a);
+  const midpoint =
+    bid !== null && ask !== null && ask >= bid
+      ? roundMoney((bid + ask) / 2)
+      : positive(trade?.p);
+  const spreadPct =
+    bid !== null && ask !== null && midpoint !== null && midpoint > 0
+      ? ((ask - bid) / midpoint) * 100
+      : null;
+  return {
+    ...input.candidate.quote,
+    bid,
+    ask,
+    midpoint,
+    premium: midpoint,
+    spreadPct,
+    marketTimestamp: text(quote?.t) ?? text(trade?.t)
+  };
+};
+
+const submitPriceDriftLimitPct = () => {
+  const parsed = Number(process.env.PAPER_SUBMIT_MAX_PRICE_DRIFT_PCT ?? 10);
+  return Number.isFinite(parsed) ? Math.min(100, Math.max(0, parsed)) : 10;
+};
+
+const zeroDteQuoteDriftBlockers = (input: {
+  reviewed: ZeroDteQueueCandidate["quote"];
+  current: ZeroDteQueueCandidate["quote"];
+}) => {
+  const reviewedPrice = positive(input.reviewed.midpoint ?? input.reviewed.premium);
+  const currentPrice = positive(input.current.midpoint ?? input.current.premium);
+  const reviewedTimestamp = text(input.reviewed.marketTimestamp);
+  const currentTimestamp = text(input.current.marketTimestamp);
+  const blockers: string[] = [];
+  if (
+    reviewedPrice === null ||
+    currentPrice === null ||
+    !reviewedTimestamp ||
+    !currentTimestamp
+  ) {
+    blockers.push("ZERO_DTE_MARKET_EVIDENCE_UNAVAILABLE");
+  } else {
+    const driftPct =
+      (Math.abs(currentPrice - reviewedPrice) / reviewedPrice) * 100;
+    if (driftPct > submitPriceDriftLimitPct()) {
+      blockers.push("ZERO_DTE_PRICE_DRIFT");
+    }
+    if (
+      !Number.isFinite(Date.parse(reviewedTimestamp)) ||
+      !Number.isFinite(Date.parse(currentTimestamp)) ||
+      Date.parse(currentTimestamp) < Date.parse(reviewedTimestamp)
+    ) {
+      blockers.push("ZERO_DTE_QUOTE_IDENTITY_DRIFT");
+    }
+  }
+  return unique(blockers);
 };
 
 const recordCandidateExecutionState = (candidateId: string, state: "selected" | "executed", asOf: string) => {
@@ -1341,9 +1735,13 @@ export const executeZeroDteCandidate = async (input: {
     existingLedgerEntries: []
   });
 
+  const signingKey = paperReviewArtifactSigningKey();
   const preflightBlockers = unique([
     ...runtimeBlockers(config, runtime),
-    ...(input.confirmPaper ? [] : ["CONFIRM_PAPER_REQUIRED"])
+    ...(input.confirmPaper ? [] : ["CONFIRM_PAPER_REQUIRED"]),
+    ...(signingKey
+      ? []
+      : ["ZERO_DTE_SUBMIT_ATTESTATION_INVALID", "PAPER_REVIEW_SIGNING_KEY_REQUIRED"])
   ]);
   if (preflightBlockers.length > 0) {
     const eligibility = { ...skeletonEligibility, blockers: unique([...skeletonEligibility.blockers, ...preflightBlockers]) };
@@ -1360,10 +1758,15 @@ export const executeZeroDteCandidate = async (input: {
     });
   }
 
-  let account: ZeroDteAccountSnapshot;
+  let reviewedAccount: ZeroDteAccountSnapshot;
   try {
-    account = await accountFromProvider(provider, runtime);
-  } catch (error) {
+    reviewedAccount = await accountFromProvider(
+      provider,
+      runtime,
+      input.candidate.tradingDate,
+      now
+    );
+  } catch {
     const eligibility = { ...skeletonEligibility, blockers: ["ACCOUNT_RECONCILIATION_FAILED"] };
     const ledger = createBlockedLedgerEntry({ candidate: input.candidate, eligibility, reason: "ACCOUNT_RECONCILIATION_FAILED", now });
     return baseResult({
@@ -1372,42 +1775,60 @@ export const executeZeroDteCandidate = async (input: {
       status: "blocked",
       ledgerId: ledger.id,
       blockers: ["ACCOUNT_RECONCILIATION_FAILED"],
-      warnings: [error instanceof Error ? error.message : "Paper account reconciliation failed."],
+      warnings: ["Paper account reconciliation failed."],
       eligibility
     });
   }
 
-  const existingLedgerEntries: ZeroDteExistingLedgerEntry[] = [];
-  const currentLedger = findPaperExecutionByDedupeKey(skeletonEligibility.reservationKey);
-  if (currentLedger) existingLedgerEntries.push({ dedupeKey: currentLedger.dedupeKey, status: currentLedger.status });
-  const eligibility = evaluateZeroDteExecutionEligibility({
+  const reviewedLedgerEntries: ZeroDteExistingLedgerEntry[] = [];
+  const reviewedLedger = findPaperExecutionByDedupeKey(skeletonEligibility.reservationKey);
+  if (reviewedLedger) {
+    reviewedLedgerEntries.push({ dedupeKey: reviewedLedger.dedupeKey, status: reviewedLedger.status });
+  }
+  const reviewedEligibility = evaluateZeroDteExecutionEligibility({
     candidate: input.candidate,
     config,
     runtime,
-    account,
+    account: reviewedAccount,
     now,
-    existingLedgerEntries
+    existingLedgerEntries: reviewedLedgerEntries
   });
-  if (!eligibility.eligible) {
-    const duplicate = eligibility.blockers.includes("DUPLICATE_ORDER");
+  if (!reviewedEligibility.eligible) {
+    const duplicate = reviewedEligibility.blockers.includes("DUPLICATE_ORDER");
     const ledger = duplicate
-      ? currentLedger
-      : createBlockedLedgerEntry({ candidate: input.candidate, eligibility, reason: eligibility.blockers[0] ?? "EXECUTION_BLOCKED", now });
+      ? reviewedLedger
+      : createBlockedLedgerEntry({
+          candidate: input.candidate,
+          eligibility: reviewedEligibility,
+          reason: reviewedEligibility.blockers[0] ?? "EXECUTION_BLOCKED",
+          now
+        });
     return baseResult({
       candidate: input.candidate,
       decisionId: input.decisionId,
       status: duplicate ? "duplicate_blocked" : "blocked",
       ledgerId: ledger?.id ?? null,
-      blockers: eligibility.blockers,
-      warnings: eligibility.warnings,
-      eligibility
+      blockers: reviewedEligibility.blockers,
+      warnings: reviewedEligibility.warnings,
+      eligibility: reviewedEligibility
     });
   }
 
   const decision = decisionRow(input.decisionId);
-  if (!decision || decision.candidate_id !== input.candidate.candidateId) {
-    const blockedEligibility = { ...eligibility, blockers: ["DECISION_CANDIDATE_MISMATCH"] };
-    const ledger = createBlockedLedgerEntry({ candidate: input.candidate, eligibility: blockedEligibility, reason: "DECISION_CANDIDATE_MISMATCH", now });
+  const linkageBlockers = decisionLinkageBlockers({
+    decision,
+    candidate: input.candidate,
+    config
+  });
+  if (!decision || linkageBlockers.length > 0) {
+    const blockedEligibility = { ...reviewedEligibility, blockers: linkageBlockers };
+    const reason = linkageBlockers[0] ?? "DECISION_CANDIDATE_MISMATCH";
+    const ledger = createBlockedLedgerEntry({
+      candidate: input.candidate,
+      eligibility: blockedEligibility,
+      reason,
+      now
+    });
     return baseResult({
       candidate: input.candidate,
       decisionId: input.decisionId,
@@ -1428,80 +1849,365 @@ export const executeZeroDteCandidate = async (input: {
       status: "duplicate_blocked",
       paperTradeId,
       blockers: ["DUPLICATE_ORDER"],
-      eligibility
+      eligibility: reviewedEligibility
     });
   }
 
-  let ledger: PaperExecutionLedgerEntry;
+  let attestation: ZeroDteSubmitAttestation;
   try {
-    const exactReusableLedger = findPaperExecutionByDedupeKey(eligibility.reservationKey);
-    if (
-      exactReusableLedger &&
-      REPAIRABLE_ZERO_DTE_LEDGER_STATUSES.has(normalizedStatus(exactReusableLedger.status)) &&
-      exactReusableLedger.clientOrderId === eligibility.clientOrderId &&
-      exactReusableLedger.sourceCandidateId === input.candidate.candidateId &&
-      exactReusableLedger.alpacaOrderId === null &&
-      (exactReusableLedger.decisionId === null || exactReusableLedger.decisionId === input.decisionId)
-    ) {
-      updatePaperExecutionLedgerEntry(exactReusableLedger.id, {
-        status: "reserved",
-        reason: null,
-        blockedReason: null,
-        errorMessage: null
-      });
-      ledger = {
-        ...exactReusableLedger,
-        status: "reserved",
-        reason: null,
-        blockedReason: null,
-        errorMessage: null
-      };
-    } else {
-      ledger = insertPaperExecutionLedgerEntry({
-        mode: "zero-dte-entry",
-        assetClass: "option",
-        symbol: normalizedSymbol(input.candidate.optionSymbol),
-        underlyingSymbol: normalizedSymbol(input.candidate.underlyingSymbol),
-        strategy: "zero_dte_level_2",
-        side: "buy",
-        orderType: "limit",
-        timeInForce: "day",
-        qty: String(eligibility.quantity),
-        limitPrice: String(eligibility.limitPrice),
-        estimatedPremium: eligibility.estimatedPremium,
-        maxRisk: eligibility.estimatedPremium,
-        dedupeKey: eligibility.reservationKey,
-        clientOrderId: eligibility.clientOrderId,
-        status: "reserved",
-        sourceCandidateId: input.candidate.candidateId,
-        payload: {
-          candidateId: input.candidate.candidateId,
-          decisionId: input.decisionId,
-          decisionGroupId: decision.decision_group_id,
-          tradingDate: input.candidate.tradingDate,
-          symbol: normalizedSymbol(input.candidate.optionSymbol),
-          quantity: eligibility.quantity,
-          limitPrice: eligibility.limitPrice,
-          positionIntent: "buy_to_open"
-        }
-      });
-    }
-    ensureZeroDteLedgerDecisionLink({
-      ledgerId: ledger.id,
-      decisionId: input.decisionId,
+    attestation = createZeroDteSubmitAttestation({
+      ...zeroDteAttestationExpected({
+        candidate: input.candidate,
+        decisionId: input.decisionId,
+        config,
+        account: reviewedAccount,
+        eligibility: reviewedEligibility
+      }),
+      createdAt: now,
+      ttlSeconds: zeroDteReviewTtlSeconds(),
+      signingKey
+    });
+    appendExecutionAttestationEvent({ decision, attestation });
+  } catch {
+    const blockers = [
+      "ZERO_DTE_SUBMIT_ATTESTATION_INVALID",
+      "FRESH_REVIEW_REQUIRED"
+    ];
+    const blockedEligibility = { ...reviewedEligibility, blockers };
+    const ledger = createBlockedLedgerEntry({
+      candidate: input.candidate,
+      eligibility: blockedEligibility,
+      reason: blockers[0],
       now
     });
-  } catch {
-    const duplicate = findPaperExecutionByDedupeKey(eligibility.reservationKey);
     return baseResult({
       candidate: input.candidate,
       decisionId: input.decisionId,
-      status: "duplicate_blocked",
-      ledgerId: duplicate?.id ?? null,
-      blockers: ["DUPLICATE_ORDER"],
-      eligibility
+      status: "blocked",
+      ledgerId: ledger.id,
+      blockers,
+      eligibility: blockedEligibility
     });
   }
+
+  const expectedReservationFingerprint = paperSubmitReservationFingerprint(
+    normalizePaperSubmitReservations(listActivePaperNewRiskReservations())
+  );
+  const expectedNewRiskLedgerFingerprint =
+    paperNewRiskLedgerMutationFingerprint();
+  let freshAccount: ZeroDteAccountSnapshot;
+  try {
+    freshAccount = await accountFromProvider(
+      provider,
+      runtime,
+      input.candidate.tradingDate,
+      now
+    );
+  } catch {
+    const blockers = ["ACCOUNT_RECONCILIATION_FAILED", "FRESH_REVIEW_REQUIRED"];
+    const blockedEligibility = { ...reviewedEligibility, blockers };
+    const ledger = createBlockedLedgerEntry({
+      candidate: input.candidate,
+      eligibility: blockedEligibility,
+      reason: blockers[0],
+      now,
+      attestation
+    });
+    return baseResult({
+      candidate: input.candidate,
+      decisionId: input.decisionId,
+      attestationId: attestation.attestationId,
+      status: "blocked",
+      ledgerId: ledger.id,
+      blockers,
+      eligibility: blockedEligibility
+    });
+  }
+
+  const freshAsOf = provider.now?.() ?? nowIso();
+  let freshQuote: ZeroDteQueueCandidate["quote"];
+  try {
+    freshQuote = await refreshZeroDteQuote({
+      candidate: input.candidate,
+      provider
+    });
+  } catch {
+    const blockers = [
+      "ZERO_DTE_MARKET_EVIDENCE_UNAVAILABLE",
+      "FRESH_REVIEW_REQUIRED"
+    ];
+    const blockedEligibility = { ...reviewedEligibility, blockers };
+    const ledger = createBlockedLedgerEntry({
+      candidate: input.candidate,
+      eligibility: blockedEligibility,
+      reason: blockers[0],
+      now: freshAsOf,
+      attestation
+    });
+    return baseResult({
+      candidate: input.candidate,
+      decisionId: input.decisionId,
+      attestationId: attestation.attestationId,
+      status: "blocked",
+      ledgerId: ledger.id,
+      blockers,
+      eligibility: blockedEligibility
+    });
+  }
+  const freshCandidate: ZeroDteQueueCandidate = {
+    ...input.candidate,
+    quote: freshQuote
+  };
+  const quoteDriftBlockers = zeroDteQuoteDriftBlockers({
+    reviewed: input.candidate.quote,
+    current: freshQuote
+  });
+  const freshLedgerEntries: ZeroDteExistingLedgerEntry[] = [];
+  const freshLedger = findPaperExecutionByDedupeKey(reviewedEligibility.reservationKey);
+  if (freshLedger) {
+    freshLedgerEntries.push({ dedupeKey: freshLedger.dedupeKey, status: freshLedger.status });
+  }
+  const freshEligibility = evaluateZeroDteExecutionEligibility({
+    candidate: freshCandidate,
+    config,
+    runtime,
+    account: freshAccount,
+    now: freshAsOf,
+    existingLedgerEntries: freshLedgerEntries
+  });
+  const signedIntentEligibility: ZeroDteEligibilityResult = {
+    ...freshEligibility,
+    limitPrice: reviewedEligibility.limitPrice,
+    estimatedPremium: reviewedEligibility.estimatedPremium,
+    reservationKey: reviewedEligibility.reservationKey,
+    clientOrderId: reviewedEligibility.clientOrderId,
+    quantity: reviewedEligibility.quantity
+  };
+  const freshExpected = zeroDteAttestationExpected({
+    candidate: input.candidate,
+    decisionId: input.decisionId,
+    config,
+    account: freshAccount,
+    eligibility: signedIntentEligibility
+  });
+  const verification = verifyZeroDteSubmitAttestation({
+    attestation,
+    signingKey,
+    asOf: freshAsOf,
+    expected: freshExpected
+  });
+  const freshDecisionBlockers = decisionLinkageBlockers({
+    decision: decisionRow(input.decisionId),
+    candidate: input.candidate,
+    config
+  });
+  const submitBlockers = unique([
+    ...freshEligibility.blockers,
+    ...quoteDriftBlockers,
+    ...verification.blockers,
+    ...freshDecisionBlockers
+  ]);
+  if (submitBlockers.length > 0) {
+    const blockers = unique([...submitBlockers, "FRESH_REVIEW_REQUIRED"]);
+    const blockedEligibility = {
+      ...freshEligibility,
+      blockers,
+      evidence: {
+        ...freshEligibility.evidence,
+        attestationId: attestation.attestationId,
+        attestationPayloadHash: attestation.payloadHash,
+        attestationVerification: verification
+      }
+    };
+    const duplicate = blockers.includes("DUPLICATE_ORDER");
+    const ledger = duplicate
+      ? freshLedger
+      : createBlockedLedgerEntry({
+          candidate: input.candidate,
+          eligibility: blockedEligibility,
+          reason: blockers[0],
+          now: freshAsOf,
+          attestation
+        });
+    return baseResult({
+      candidate: input.candidate,
+      decisionId: input.decisionId,
+      attestationId: attestation.attestationId,
+      status: duplicate ? "duplicate_blocked" : "blocked",
+      ledgerId: ledger?.id ?? null,
+      blockers,
+      warnings: blockedEligibility.warnings,
+      eligibility: blockedEligibility
+    });
+  }
+
+  const eligibility: ZeroDteEligibilityResult = {
+    ...freshEligibility,
+    limitPrice: reviewedEligibility.limitPrice,
+    estimatedPremium: reviewedEligibility.estimatedPremium,
+    reservationKey: reviewedEligibility.reservationKey,
+    clientOrderId: reviewedEligibility.clientOrderId,
+    quantity: reviewedEligibility.quantity,
+    evidence: {
+      ...freshEligibility.evidence,
+      reviewedOrderIntent: zeroDteSubmitOrderIntent(
+        input.candidate,
+        reviewedEligibility
+      ),
+      freshQuote,
+      freshQuoteFingerprint: canonicalJsonHash(freshQuote),
+      attestationId: attestation.attestationId,
+      attestationPayloadHash: attestation.payloadHash,
+      attestationVerification: verification
+    }
+  };
+  const reservationPayload = {
+    candidateId: input.candidate.candidateId,
+    decisionId: input.decisionId,
+    decisionGroupId: decision.decision_group_id,
+    tradingDate: input.candidate.tradingDate,
+    symbol: normalizedSymbol(input.candidate.optionSymbol),
+    quantity: eligibility.quantity,
+    limitPrice: eligibility.limitPrice,
+    positionIntent: "buy_to_open",
+    attestation
+  };
+
+  const atomicReservation = runAtomicPaperNewRiskReservation({
+    validateBeforeInsert: () => {
+      const currentReservations = normalizePaperSubmitReservations(
+        listActivePaperNewRiskReservations()
+      );
+      if (
+        paperNewRiskLedgerMutationFingerprint() !==
+          expectedNewRiskLedgerFingerprint ||
+        paperSubmitReservationFingerprint(currentReservations) !==
+        expectedReservationFingerprint
+      ) {
+        return [
+          "ZERO_DTE_RESERVATION_STATE_DRIFT",
+          "FRESH_REVIEW_REQUIRED"
+        ];
+      }
+      const currentLedgerEntries: ZeroDteExistingLedgerEntry[] = [];
+      const currentLedger = findPaperExecutionByDedupeKey(
+        eligibility.reservationKey
+      );
+      if (currentLedger) {
+        currentLedgerEntries.push({
+          dedupeKey: currentLedger.dedupeKey,
+          status: currentLedger.status
+        });
+      }
+      const currentHeadroom = evaluateZeroDteExecutionEligibility({
+        candidate: freshCandidate,
+        config,
+        runtime,
+        account: freshAccount,
+        now: freshAsOf,
+        existingLedgerEntries: currentLedgerEntries
+      });
+      const blockers = unique([
+        ...currentHeadroom.blockers,
+        ...zeroDteQuoteDriftBlockers({
+          reviewed: input.candidate.quote,
+          current: freshQuote
+        })
+      ]);
+      return blockers.length
+        ? [...blockers, "FRESH_REVIEW_REQUIRED"]
+        : [];
+    },
+    insert: () => {
+      const exactReusableLedger = findPaperExecutionByDedupeKey(
+        eligibility.reservationKey
+      );
+      let reservedLedger: PaperExecutionLedgerEntry;
+      if (
+        exactReusableLedger &&
+        REPAIRABLE_ZERO_DTE_LEDGER_STATUSES.has(
+          normalizedStatus(exactReusableLedger.status)
+        ) &&
+        exactReusableLedger.clientOrderId === eligibility.clientOrderId &&
+        exactReusableLedger.sourceCandidateId === input.candidate.candidateId &&
+        exactReusableLedger.alpacaOrderId === null &&
+        (exactReusableLedger.decisionId === null ||
+          exactReusableLedger.decisionId === input.decisionId)
+      ) {
+        updatePaperExecutionLedgerEntry(exactReusableLedger.id, {
+          status: "reserved",
+          reason: null,
+          blockedReason: null,
+          errorMessage: null
+        });
+        const payloadJson = JSON.stringify(reservationPayload);
+        getDb().prepare(
+          `UPDATE paper_execution_ledger
+           SET source_plan_id = ?, payload_json = ?, raw_payload_json = ?, updated_at = ?
+           WHERE id = ?`
+        ).run(
+          attestation.attestationId,
+          payloadJson,
+          payloadJson,
+          freshAsOf,
+          exactReusableLedger.id
+        );
+        reservedLedger = {
+          ...exactReusableLedger,
+          sourcePlanId: attestation.attestationId,
+          payloadJson,
+          rawPayloadJson: payloadJson,
+          status: "reserved",
+          reason: null,
+          blockedReason: null,
+          errorMessage: null
+        };
+      } else {
+        reservedLedger = insertPaperExecutionLedgerEntry({
+          mode: "zero-dte-entry",
+          assetClass: "option",
+          symbol: normalizedSymbol(input.candidate.optionSymbol),
+          underlyingSymbol: normalizedSymbol(input.candidate.underlyingSymbol),
+          strategy: "zero_dte_level_2",
+          side: "buy",
+          orderType: "limit",
+          timeInForce: "day",
+          qty: String(eligibility.quantity),
+          limitPrice: String(eligibility.limitPrice),
+          estimatedPremium: eligibility.estimatedPremium,
+          maxRisk: eligibility.estimatedPremium,
+          dedupeKey: eligibility.reservationKey,
+          clientOrderId: eligibility.clientOrderId,
+          status: "reserved",
+          sourcePlanId: attestation.attestationId,
+          sourceCandidateId: input.candidate.candidateId,
+          payload: reservationPayload
+        });
+      }
+      ensureZeroDteLedgerDecisionLink({
+        ledgerId: reservedLedger.id,
+        decisionId: input.decisionId,
+        now: freshAsOf
+      });
+      return reservedLedger;
+    }
+  });
+  if (!atomicReservation.reserved || !atomicReservation.value) {
+    const blockers = unique([
+      ...atomicReservation.blockers,
+      "FRESH_REVIEW_REQUIRED"
+    ]);
+    const duplicate = blockers.includes("DUPLICATE_ORDER");
+    return baseResult({
+      candidate: input.candidate,
+      decisionId: input.decisionId,
+      attestationId: attestation.attestationId,
+      status: duplicate ? "duplicate_blocked" : "blocked",
+      blockers,
+      eligibility: { ...eligibility, blockers }
+    });
+  }
+  const ledger = atomicReservation.value;
 
   db.prepare(
     `INSERT OR IGNORE INTO zero_dte_paper_trades
