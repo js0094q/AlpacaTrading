@@ -1,5 +1,25 @@
 # Resume Context: Alpaca Investing Server Provisioning
 
+## Neon migration Release 1 VPS evidence (2026-07-15)
+
+- VPS, GitHub main, and Vercel production were reverified at
+  `8cc9fe8431e3676b96a3a904a1256d4aa2dcf21b` before Release 1 validation.
+- The runtime remained paper-only with live execution disabled. Five active
+  timers and dashboard control were captured, quiesced, and restored; no
+  scheduled service was active during the successful copy test.
+- A checksum-identical, mode-`0400` protected database backup was created only
+  after zero Node workers and a stable source checksum were verified. A first
+  weaker quiesce attempt failed the checksum gate and stopped before WAL
+  mutation, which is why future snapshot procedures must verify worker absence
+  and source stability rather than relying on timer state alone.
+- The Btrfs/RBD copied database passed WAL mechanics, FULL-synchronous commit,
+  checkpoint, SQLite online backup, committed/uncommitted SIGKILL recovery,
+  integrity, foreign keys, two explicit migration runs, and schema verification.
+  The source remained DELETE mode and unchanged during the successful test.
+- Keep production on DELETE for Release 1 because current deployment/backup
+  procedures are not WAL-sidecar aware. No Neon credentials have been installed
+  on the VPS yet; that is a gated Release 2/3 action.
+
 ## Paper runtime contention deployment handoff (2026-07-15)
 
 - Stop the control service and affected SQLite writer timers before cutover;

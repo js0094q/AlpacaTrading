@@ -475,11 +475,25 @@ npm run db:migrate -- --database /path/to/research.db
 npm run db:verify -- --database /path/to/research.db
 ```
 
+Test WAL only against a new copy target. The command refuses in-place use,
+preserves the source checksum, emits no row data, and leaves journal-mode policy
+unchanged for the source:
+
+```bash
+npm run db:sqlite:wal-verify -- --source /path/to/source.db --copy /path/to/new-copy.db
+```
+
+Run this only after quiescing writers, and place the copy on the same filesystem
+and storage class as the source. A passing script is necessary but not sufficient
+to adopt WAL; filesystem, sidecar-aware backup/restore, migration-twice, and
+deployment evidence must also pass.
+
 `db:migrate` is the only production schema-mutation path. Run it before
 restarting SQLite-backed services. Once the required versions are applied,
 ordinary CLI startup reads migration state without DDL or a migration writer
-transaction. An existing database with pending versions fails closed with
-`DATABASE_MIGRATION_REQUIRED`; `db:verify` reports pending versions, integrity,
+transaction. An empty database or one with pending versions fails closed with
+`DATABASE_MIGRATION_REQUIRED`; only isolated Node test fixtures may initialize
+their scratch schema automatically. `db:verify` reports pending versions, integrity,
 foreign-key violations, and current journal/busy-timeout/foreign-key/synchronous
 PRAGMAs.
 

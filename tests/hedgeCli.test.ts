@@ -3,7 +3,10 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { after, test } from "node:test";
+
+import { initializeDatabaseHandle } from "../src/lib/db.js";
 
 const tempDir = mkdtempSync(join(tmpdir(), "alpaca-hedge-cli-test-"));
 const packageJson = JSON.parse(
@@ -24,6 +27,10 @@ const safeEnv = {
   ALPACA_REQUEST_TIMEOUT_MS: "100",
   ALPACA_MAX_RETRIES: "0"
 };
+
+const fixtureDb = new DatabaseSync(safeEnv.RESEARCH_DB_PATH);
+initializeDatabaseHandle(fixtureDb);
+fixtureDb.close();
 
 const runHedgeCli = (script: string, args: string[]) => {
   const result = spawnSync("npm", ["--silent", "run", script, "--", ...args], {

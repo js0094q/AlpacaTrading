@@ -99,12 +99,12 @@ the separately scheduled reviewed exit executor runs.
 SQLite schema mutation belongs to the explicit `db:migrate` deployment path.
 Ordinary CLI startup configures connection-local foreign keys and a bounded
 busy timeout, reads the migration ledger, and fails closed with
-`DATABASE_MIGRATION_REQUIRED` if an existing database is not current. It does
-not execute DDL or enter a migration writer transaction when all required
-versions are applied. An empty local/test database may initialize through the
-same transactional migration runner. Each pending migration group rechecks its
-ledger state after acquiring `BEGIN IMMEDIATE`, so concurrent first starters do
-not apply a migration twice.
+`DATABASE_MIGRATION_REQUIRED` when the database is empty or not current. It does
+not execute DDL or enter a migration writer transaction. Node test-runner
+fixtures may initialize isolated scratch databases through the transactional
+migration runner. Each pending migration group rechecks its ledger state after
+acquiring `BEGIN IMMEDIATE`, so explicit concurrent migration processes do not
+apply a migration twice.
 
 On command failure, the dashboard control runner retains bounded, redacted
 stdout and stderr as separate fields. Structured stdout failures remain causal;

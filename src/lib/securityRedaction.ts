@@ -10,8 +10,32 @@ const SECRET_ENV_NAMES = [
   "ALPACA_PAPER_API_KEY",
   "ALPACA_PAPER_SECRET_KEY",
   "ALPACA_LIVE_KEY",
-  "ALPACA_LIVE_SECRET"
+  "ALPACA_LIVE_SECRET",
+  "DATABASE_URL",
+  "DATABASE_URL_UNPOOLED",
+  "POSTGRES_URL",
+  "POSTGRES_URL_NON_POOLING",
+  "POSTGRES_PRISMA_URL",
+  "PGPASSWORD",
+  "POSTGRES_PASSWORD"
 ];
+
+const SENSITIVE_ENV_NAMES = new Set(SECRET_ENV_NAMES);
+const COMMON_SECRET_OBJECT_KEYS = new Set([
+  "password",
+  "token",
+  "authtoken",
+  "secret",
+  "apikey",
+  "connectionstring"
+]);
+
+const isCommonSecretObjectKey = (key: string) => {
+  const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (COMMON_SECRET_OBJECT_KEYS.has(normalized)) return true;
+  return ["password", "token", "secret", "apikey", "connectionstring"]
+    .some((suffix) => normalized.endsWith(suffix));
+};
 
 const escapeRegExp = (value: string) =>
   value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -21,12 +45,20 @@ export const redactSensitiveText = (value: string): string => {
 
   for (const name of SECRET_ENV_NAMES) {
     const configured = process.env[name];
-    if (configured && configured.length >= 4) {
+    if (configured) {
       redacted = redacted.replace(new RegExp(escapeRegExp(configured), "g"), `[REDACTED:${name}]`);
     }
   }
 
   redacted = redacted
+    .replace(
+      /\bpostgres(?:ql)?:\/\/[^\s"'<>;,)\]}]+/gi,
+      "[REDACTED:POSTGRES_CONNECTION_URL]"
+    )
+    .replace(
+      /\b(password|pass|pwd)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s,;}\]]+)/gi,
+      "$1=[REDACTED]"
+    )
     .replace(
       /-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----/g,
       "[REDACTED:PRIVATE_KEY]"
@@ -56,7 +88,11 @@ export const redactSensitiveData = (value: unknown): unknown => {
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>).map(([key, entry]) => [
         key,
-        redactSensitiveData(entry)
+        SENSITIVE_ENV_NAMES.has(key.toUpperCase())
+          ? `[REDACTED:${key.toUpperCase()}]`
+          : isCommonSecretObjectKey(key)
+            ? `[REDACTED:${key}]`
+          : redactSensitiveData(entry)
       ])
     );
   }
