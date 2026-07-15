@@ -1,6 +1,8 @@
 import type { DatabaseSync } from "node:sqlite";
 
+import { canonicalJsonHash } from "../../lib/canonicalJson.js";
 import { getDb, queryAll, queryOne } from "../../lib/db.js";
+import { runWithSqliteBusyRetry } from "../../lib/sqliteConcurrency.js";
 import { nowIso, normalizeSymbol, uuid } from "../../lib/utils.js";
 import { buildZeroDteCandidateId } from "./zeroDteIdentityService.js";
 import {
@@ -11,6 +13,10 @@ import {
   type ZeroDteLifecycleEventInput
 } from "./zeroDteLifecycleService.js";
 import { rankZeroDteQueue } from "./zeroDteRankingService.js";
+import {
+  withHeavyPersistenceLease,
+  type HeavyPersistenceLease
+} from "../sqliteWriteLeaseService.js";
 import {
   ZERO_DTE_CANDIDATE_STATES,
   ZERO_DTE_PLAYBOOKS,
@@ -354,8 +360,48 @@ const withTransaction = <T>(db: DatabaseSync, operation: () => T): T => {
   }
 };
 
-export const runInZeroDtePersistenceTransaction = <T>(operation: () => T): T =>
-  withTransaction(getDb(), operation);
+export interface ZeroDtePersistenceTransactionOptions {
+  operation?: string;
+  transaction?: string;
+  runId?: string | null;
+  correlationId?: string | null;
+  idempotent?: boolean;
+  useHeavyPersistenceLease?: boolean;
+  leaseTtlMs?: number;
+  leaseMaxWaitMs?: number;
+}
+
+export const runInZeroDtePersistenceTransaction = <T>(
+  operation: () => T,
+  options: ZeroDtePersistenceTransactionOptions = {}
+): T => {
+  const execute = (lease?: HeavyPersistenceLease): T => {
+    lease?.assertOwnership();
+    const run = () => withTransaction(getDb(), operation);
+    const result = options.idempotent && !getDb().isTransaction
+      ? runWithSqliteBusyRetry(run, {
+          operation: options.operation || "zero_dte.persistence",
+          transaction: options.transaction || "zero_dte_persistence",
+          runId: options.runId || null,
+          correlationId: options.correlationId || null,
+          idempotent: true
+        })
+      : run();
+    lease?.assertOwnership();
+    return result;
+  };
+
+  if (!options.useHeavyPersistenceLease) {
+    return execute();
+  }
+  return withHeavyPersistenceLease({
+    runId: options.runId || null,
+    correlationId: options.correlationId || null,
+    leaseTtlMs: options.leaseTtlMs,
+    maxWaitMs: options.leaseMaxWaitMs,
+    operation: (lease) => execute(lease)
+  });
+};
 
 const validateCandidateIdentity = (input: ZeroDteCandidateUpsert) => {
   const tradingDate = requiredText(input.tradingDate, "trading date");
@@ -739,13 +785,28 @@ export const upsertZeroDteCandidate = (input: ZeroDteCandidateUpsert): ZeroDteCa
         insertZeroDteLifecycleEventRow(db, {
           ...eventBase,
           eventType: "candidate_reappeared",
+          eventId: lifecycleContext?.engineRunId
+            ? `zlev_${canonicalJsonHash({
+                engineRunId: lifecycleContext.engineRunId,
+                candidateId,
+                eventType: "candidate_reappeared"
+              }).slice(0, 40)}`
+            : undefined,
           reasonCode: optionalText(input.stateReasonCode) ?? "CANDIDATE_REAPPEARED"
         });
       }
       if (stateChanged) {
+        const eventType = existing ? stateEventType(input.state) : "candidate_discovered";
         insertZeroDteLifecycleEventRow(db, {
           ...eventBase,
-          eventType: existing ? stateEventType(input.state) : "candidate_discovered"
+          eventType,
+          eventId: lifecycleContext?.engineRunId
+            ? `zlev_${canonicalJsonHash({
+                engineRunId: lifecycleContext.engineRunId,
+                candidateId,
+                eventType
+              }).slice(0, 40)}`
+            : undefined
         });
       }
     }

@@ -451,6 +451,16 @@ counts, no new exact-linkage orphans, `PRAGMA integrity_check`,
 merged SHA with fast-forward-only Git operations, install/build, reinstall the
 checked-in units, restore the prior service/timer state, and enable:
 
+The steady-state concurrency repair adds the named `runtime_write_leases`
+table through the migration ledger. It leaves `journal_mode=delete` unchanged.
+Only research option persistence and the 0DTE engine persistence batch use the
+`research-options-and-zero-dte-engine` lease; option normalization and network
+work remain outside write transactions. Finite `SQLITE_BUSY` retry is limited
+to explicitly idempotent lifecycle, lease-maintenance, and rollback-safe batch
+writes. Contention logs include operation, transaction duration, retry count,
+process identity, and run/correlation ID; they do not claim a historical
+lock-holder PID.
+
 ```bash
 sudo systemctl enable --now alpaca-market-observatory.timer
 systemctl status alpaca-market-observatory.timer --no-pager
@@ -467,9 +477,12 @@ collection as pending; never fabricate market-open evidence or force a paper tra
 After restart, run `npm run system:recover -- --format=json` before research.
 Confirm the known stale research row is terminal and audited, then invoke one
 guarded dashboard research request. A duplicate request while the first is
-active must return `already_running` without a second worker. Validate 0DTE only
-through read-only discovery. Do not invoke `--confirmPaper` or any paper/live
-executor as a deployment probe.
+active must return `already_running` without a second worker. Require the
+research run to reach a successful terminal state with targets and candidates
+persisted while the normal staggered timers remain enabled. Only after that
+success may a separately authorized paper review be run; do not invoke
+`--confirmPaper`, paper execution, exit execution, or any order-producing
+command as a repair probe.
 
 Rollback the application to the immediately prior SHA, rebuild, and restart only
 the affected services while restoring the recorded timer state. The migration

@@ -27,7 +27,8 @@ const requiredTables = [
   "universe_lifecycle_events",
   "autonomous_recovery_runs",
   "autonomous_recovery_events",
-  "research_runs"
+  "research_runs",
+  "runtime_write_leases"
 ] as const;
 
 const requiredColumns: Record<string, string[]> = {

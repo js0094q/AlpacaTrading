@@ -2,6 +2,7 @@ import { hostname } from "node:os";
 import type { DatabaseSync as DbHandle } from "node:sqlite";
 
 import { getDb } from "../lib/db.js";
+import { runWithSqliteBusyRetry } from "../lib/sqliteConcurrency.js";
 
 export const RESEARCH_RUN_STALE_AFTER_MS = 15 * 60_000;
 export const RESEARCH_RECOVERY_REASON =
@@ -210,14 +211,21 @@ export const reserveResearchRun = (input: {
 export const heartbeatResearchRun = (
   runId: string,
   at = new Date()
-): boolean =>
-  Number(
+): boolean => runWithSqliteBusyRetry(
+  () => Number(
     getDb()
       .prepare(
         "UPDATE research_runs SET heartbeat_at = ? WHERE id = ? AND status = 'running'"
       )
       .run(at.toISOString(), runId).changes
-  ) === 1;
+  ) === 1,
+  {
+    operation: "research_run.heartbeat",
+    transaction: "research_run_heartbeat",
+    runId,
+    idempotent: true
+  }
+);
 
 export const withActiveResearchRunLease = <T>(
   runId: string,
@@ -254,8 +262,8 @@ export const updateResearchRunUniverseSize = (
   runId: string,
   universeSize: number,
   at = new Date()
-): boolean =>
-  Number(
+): boolean => runWithSqliteBusyRetry(
+  () => Number(
     getDb()
       .prepare(`
         UPDATE research_runs
@@ -263,7 +271,14 @@ export const updateResearchRunUniverseSize = (
         WHERE id = ? AND status = 'running'
       `)
       .run(universeSize, at.toISOString(), runId).changes
-  ) === 1;
+  ) === 1,
+  {
+    operation: "research_run.universe_progress",
+    transaction: "research_run_universe_progress",
+    runId,
+    idempotent: true
+  }
+);
 
 export const finishResearchRun = (
   runId: string,
@@ -277,26 +292,36 @@ export const finishResearchRun = (
   }
 ): void => {
   const completedAt = (input.at || new Date()).toISOString();
-  getDb()
-    .prepare(`
-      UPDATE research_runs
-      SET status = ?,
-          completed_at = ?,
-          heartbeat_at = ?,
-          targets_generated = ?,
-          candidates_selected = ?,
-          error_message = COALESCE(?, error_message),
-          summary_json = COALESCE(?, summary_json)
-      WHERE id = ? AND status = 'running'
-    `)
-    .run(
-      input.status,
-      completedAt,
-      completedAt,
-      input.targetsGenerated,
-      input.candidatesSelected,
-      input.errorMessage || null,
-      input.summaryJson,
-      runId
-    );
+  runWithSqliteBusyRetry(
+    () => {
+      getDb()
+        .prepare(`
+          UPDATE research_runs
+          SET status = ?,
+              completed_at = ?,
+              heartbeat_at = ?,
+              targets_generated = ?,
+              candidates_selected = ?,
+              error_message = COALESCE(?, error_message),
+              summary_json = COALESCE(?, summary_json)
+          WHERE id = ? AND status = 'running'
+        `)
+        .run(
+          input.status,
+          completedAt,
+          completedAt,
+          input.targetsGenerated,
+          input.candidatesSelected,
+          input.errorMessage || null,
+          input.summaryJson,
+          runId
+        );
+    },
+    {
+      operation: "research_run.finish",
+      transaction: "research_run_finish",
+      runId,
+      idempotent: true
+    }
+  );
 };
