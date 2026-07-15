@@ -600,10 +600,20 @@ export const readControlPlaneSnapshot = async (
          ORDER BY research_run_id, rank, id`
       )
       .all() as SqliteRow[];
+    const decisionColumnRows = database
+      .prepare("PRAGMA table_info(decision_snapshots)")
+      .all() as Array<{ name: string }>;
+    const decisionColumns = new Set(decisionColumnRows.map((row) => row.name));
+    const requestIdExpression = decisionColumns.has("request_id")
+      ? "request_id"
+      : "NULL AS request_id";
+    const correlationIdExpression = decisionColumns.has("correlation_id")
+      ? "correlation_id"
+      : "NULL AS correlation_id";
     const decisionRows = database
       .prepare(
         `SELECT decision_id, candidate_id, position_lifecycle_id,
-                request_id, correlation_id
+                ${requestIdExpression}, ${correlationIdExpression}
          FROM decision_snapshots
          ORDER BY decision_id`
       )
