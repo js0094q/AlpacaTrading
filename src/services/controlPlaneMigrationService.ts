@@ -228,10 +228,20 @@ const assertSnapshotSealUnchanged = async (
 const quoteSqliteIdentifier = (identifier: string) =>
   `"${identifier.replaceAll('"', '""')}"`;
 
+export const enableSqliteDefensiveModeIfSupported = (database: {
+  enableDefensive?: (enabled: boolean) => void;
+}) => {
+  if (typeof database.enableDefensive !== "function") return false;
+  database.enableDefensive(true);
+  return true;
+};
+
 const openReadOnlySqlite = (path: string) => {
   const database = new DatabaseSync(path, { readOnly: true });
-  database.enableDefensive(true);
-  database.exec("PRAGMA query_only = ON; PRAGMA foreign_keys = ON;");
+  enableSqliteDefensiveModeIfSupported(database);
+  database.exec(
+    "PRAGMA query_only = ON; PRAGMA foreign_keys = ON; PRAGMA trusted_schema = OFF;"
+  );
   return database;
 };
 
