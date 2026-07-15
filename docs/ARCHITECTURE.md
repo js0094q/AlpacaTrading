@@ -21,14 +21,19 @@ never override broker state.
    exit decisions.
 5. General entry execution verifies the artifact and exact caller payload hash,
    refreshes paper account/portfolio/market evidence, compares it to the signed
-   state, reapplies current caps, and atomically reserves exact intent in the
-   execution ledger before broker submission. It never resizes or reallocates
-   inline. Compatibility confirm routes dispatch this same executor only.
+   state, reapplies current caps, and atomically reserves the artifact's selected
+   entry batch in the execution ledger before broker submission. The transaction
+   rechecks active reservations and shared-cap headroom. It never resizes or
+   reallocates inline. Compatibility confirm routes dispatch this same executor only.
 6. 0DTE derives complete New York-day activity across broker positions/orders,
    the execution ledger, Level 2 trades, and generic outcomes. Immediately
-   before an order request it persists and rechecks an append-only signed submit
-   attestation. Hedge entry reviews independently bind complete long-put
-   exposure, reservation, fill, daily-premium, and open-order evidence.
+   before an order request it refreshes option price evidence, persists and
+   rechecks an append-only signed submit attestation, and reserves capacity in an
+   immediate transaction. Generic reviewed 0DTE discoveries share those same
+   cross-path counters. Hedge entry reviews independently bind deterministic
+   review/client-order identity and complete long-put exposure, reservation,
+   fill, daily-premium, open-order, and price-drift evidence; the review is
+   consumed atomically with its ledger reservation.
 7. A confirmed paper fill with exact execution-ledger lineage creates one
    `paper_positions` analytical lifecycle. Observations are append-only. A single
    possible lifecycle links exactly; multiple possible netted lifecycles link as
@@ -62,6 +67,12 @@ unsigned/tampered artifacts, incomplete material evidence, or material drift
 fail closed with structured blockers such as `FRESH_REVIEW_REQUIRED`. Exit,
 protection, recovery, and reconciliation sections retain their domain gates and
 do not depend on positive entry allocation room.
+
+Broker order classification is centralized for new-risk evidence. `held` and
+`pending_cancel` are active. An unknown non-terminal status is conservatively
+retained as active exposure and blocks submission until it can be classified.
+A signed artifact with blocked status or signed blockers cannot authorize entry
+sections, even when its signature is valid.
 
 The safety floor does not define allocator weights, an optimization objective,
 strategy budgets, an allocator mode, or allocator-owned exits. `baseline-v1`

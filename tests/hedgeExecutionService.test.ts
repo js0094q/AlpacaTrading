@@ -16,7 +16,7 @@ process.env.HEDGE_LIVE_EXECUTION_ENABLED = "false";
 process.env.MULTI_LEG_HEDGE_EXECUTION_ENABLED = "false";
 process.env.HEDGE_REVIEW_SIGNING_KEY = "execution-test-key";
 
-import { closeDbForTests } from "../src/lib/db.js";
+import { closeDbForTests, getDb } from "../src/lib/db.js";
 import {
   buildHedgeConfig,
   hedgeConfigurationFingerprint
@@ -36,6 +36,7 @@ import {
   paperAccountIdentityHash
 } from "../src/services/hedgeExecutionService.js";
 import { persistHedgeExecutionReview } from "../src/services/hedgePersistenceService.js";
+import { insertPaperExecutionLedgerEntry } from "../src/services/paperExecutionLedgerService.js";
 
 const account = {
   id: "paper-account-1",
@@ -189,6 +190,31 @@ test("does not call the broker when paper/live gates are unsafe", async () => {
   process.env.HEDGE_PAPER_EXECUTION_ENABLED = "true";
 });
 
+test("a consumed signed hedge review cannot be replayed", async () => {
+  const review = makeReview("consumed-replay");
+  getDb().prepare(
+    "UPDATE hedge_execution_reviews SET status = 'consumed' WHERE review_id = ?"
+  ).run(review.reviewId);
+  let brokerCalls = 0;
+  const result = await executeReviewedPaperHedge(
+    { reviewId: review.reviewId, confirmPaper: true },
+    deps({
+      getAccount: async () => {
+        brokerCalls += 1;
+        return { data: account, status: 200, url: "paper" };
+      },
+      submitPaperOrder: async () => {
+        brokerCalls += 1;
+        throw new Error("must not replay a consumed review");
+      }
+    })
+  );
+
+  assert.equal(result.status, "blocked");
+  assert.equal(brokerCalls, 0);
+  assert.ok(result.blockers.includes("HEDGE_REVIEW_ALREADY_CONSUMED"));
+});
+
 test("capital evidence drift or incompleteness requires a fresh review and submits zero", async () => {
   const completePosition: AlpacaPositionRaw = {
     symbol: "QQQ260918P00400000",
@@ -234,6 +260,82 @@ test("capital evidence drift or incompleteness requires a fresh review and submi
   assert.ok(incompleteResult.blockers.includes("HEDGE_CAPITAL_EVIDENCE_INCOMPLETE"));
   assert.ok(incompleteResult.blockers.includes("FRESH_REVIEW_REQUIRED"));
   assert.equal(submitCalls, 0);
+});
+
+test("fresh hedge quote drift blocks without inline repricing or submission", async () => {
+  const review = makeReview("quote-drift");
+  let submitCalls = 0;
+  const result = await executeReviewedPaperHedge(
+    { reviewId: review.reviewId, confirmPaper: true },
+    deps({
+      refreshQuote: async () => ({
+        bid: 5.9,
+        ask: 6.1,
+        midpoint: 6,
+        delta: -0.32,
+        quoteTimestamp: "2026-07-13T13:59:55.000Z"
+      }),
+      submitPaperOrder: async () => {
+        submitCalls += 1;
+        throw new Error("must not submit after hedge price drift");
+      }
+    })
+  );
+
+  assert.equal(result.status, "blocked");
+  assert.equal(submitCalls, 0);
+  assert.ok(result.blockers.includes("HEDGE_PRICE_DRIFT"));
+  assert.ok(result.blockers.includes("FRESH_REVIEW_REQUIRED"));
+});
+
+test("hedge reservation atomically rejects distinct shared-cap races", async () => {
+  const review = makeReview("shared-cap-race");
+  let submitCalls = 0;
+  const result = await executeReviewedPaperHedge(
+    { reviewId: review.reviewId, confirmPaper: true },
+    deps({
+      refreshQuote: async () => {
+        insertPaperExecutionLedgerEntry({
+          mode: "hedge-entry",
+          assetClass: "option",
+          symbol: "QQQ260918P00450000",
+          underlyingSymbol: "QQQ",
+          strategy: "portfolio_hedge",
+          side: "buy",
+          orderType: "limit",
+          timeInForce: "day",
+          qty: "1",
+          limitPrice: "16",
+          estimatedPremium: 1_600,
+          maxRisk: 1_600,
+          dedupeKey: "hedge-shared-cap-race-other",
+          clientOrderId: "hedge-shared-cap-race-other",
+          status: "reserved",
+          sourcePlanId: "other-hedge-review",
+          payload: { expiresAt: "2026-07-13T14:05:00.000Z" }
+        });
+        return {
+          bid: 4.9,
+          ask: 5.1,
+          midpoint: 5,
+          delta: -0.32,
+          quoteTimestamp: "2026-07-13T13:59:55.000Z"
+        };
+      },
+      submitPaperOrder: async () => {
+        submitCalls += 1;
+        throw new Error("must not submit after a concurrent hedge reservation");
+      }
+    })
+  );
+
+  getDb().prepare(
+    "DELETE FROM paper_execution_ledger WHERE client_order_id = 'hedge-shared-cap-race-other'"
+  ).run();
+  assert.equal(result.status, "blocked");
+  assert.equal(submitCalls, 0);
+  assert.ok(result.blockers.includes("HEDGE_RESERVATION_STATE_DRIFT"));
+  assert.ok(result.blockers.includes("FRESH_REVIEW_REQUIRED"));
 });
 
 test("reapplies new, total, daily, and open-order hedge caps before reservation", async () => {
@@ -352,7 +454,7 @@ test("retries only the reserved order and cancels after bounded timeout", async 
       maxRepriceAttempts: 2
     })
   );
-  assert.equal(result.status, "canceled");
+  assert.equal(result.status, "canceled", result.blockers.join(","));
   assert.ok(pollCount >= 1);
   assert.ok(replaceCount <= 2);
   assert.equal(cancelCount, 1);

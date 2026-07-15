@@ -649,6 +649,8 @@ npm run paper:execute -- --dryRun --riskProfile=aggressive --optionsEnabled=true
 If the plan has no eligible payloads after candidate filtering, `paper:execute --dryRun` returns `status: "no_op"` with `reason: "NO_ELIGIBLE_PAPER_PAYLOADS"` and submits zero orders. Reviewed confirmation separately requires a non-empty, fresh signed artifact.
 `paper:execute --confirmPaper` and `paper:execute:reviewed -- --confirmPaper` execute the exact payload sections in the latest signed review artifact against fresh paper state.
 Before any reviewed entry submission, execution fetches `/v2/account`, `/v2/positions`, open/recent orders, current market evidence, and active local reservations. Drift or incomplete evidence returns a structured blocker and `FRESH_REVIEW_REQUIRED`; it never resizes inline.
+A signed artifact whose review status is blocked or whose signed blocker list is non-empty cannot authorize new-risk sections; independently valid exit sections retain their own gates. Selected entry sections reserve as one all-or-none batch after shared-cap headroom and the exact active-reservation fingerprint are rechecked inside an immediate transaction.
+Broker order evidence treats `held` and `pending_cancel` as active. Unknown non-terminal statuses remain active exposure and block new risk instead of disappearing. Generic reviewed `discovery:zero_dte_spy:*` option buys use the same New York-day cross-path trade, premium, realized-loss, and open-exposure evidence as the standalone 0DTE executor.
 
 Required command forms:
 
@@ -993,7 +995,12 @@ open broker orders, filled premium, daily premium used, and a canonical
 fingerprint. Missing evidence blocks. Submit-time execution refreshes and
 matches the same evidence, then reapplies the `0.75%` new, `2%` total, and `1%`
 daily equity-premium limits plus buying-power, quantity, spread, delta, DTE,
-and quote-freshness gates. It never treats unknown exposure as zero.
+quote-freshness, and configured review-to-submit price-drift gates. The signed
+review binds deterministic review and client-order identities, the persisted row
+must match the signature, and one review is consumed atomically with its one
+ledger reservation. It cannot be replayed. It never treats unknown exposure as
+zero, reprices above the reviewed limit, or shares stale cap headroom with a
+concurrent general or 0DTE reservation.
 
 The checked-in paper target enables `HEDGE_PAPER_EXECUTION_ENABLED`, `HEDGE_AUTOMATED_PAPER_EXECUTION_ENABLED`, `HEDGE_EXIT_MANAGEMENT_ENABLED`, `HEDGE_LEARNING_ENABLED`, and `HEDGE_DASHBOARD_MUTATIONS_ENABLED`. `HEDGE_LIVE_EXECUTION_ENABLED=false` and `MULTI_LEG_HEDGE_EXECUTION_ENABLED=false` remain hard gates. `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, and `LIVE_TRADING_ENABLED=false` are the canonical paper/live boundary; no duplicate `PAPER_TRADING_ENABLED` flag is used. Missing prices, Greeks, beta history, sector mappings, or regime evidence remain null and produce quality warnings, monitoring, or blockers.
 

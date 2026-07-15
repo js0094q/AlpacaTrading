@@ -70,10 +70,9 @@ the release evidence.
 
 ## Implementation and pre-deploy evidence
 
-The implementation is isolated in `feat/adaptive-allocation-safety-floor` and
-the eight code commits from `0b597b4` through `e6eaf99`. It changes only the
-safety-floor prerequisite described here; Releases 1-4 remain unimplemented
-and unauthorized.
+The implementation is isolated in `feat/adaptive-allocation-safety-floor`. It
+changes only the safety-floor prerequisite described here; Releases 1-4 remain
+unimplemented and unauthorized.
 
 A redacted, read-only VPS snapshot on 2026-07-14 found:
 
@@ -120,6 +119,12 @@ paper account, positions, recent/open orders, current entry market evidence,
 and local active reservations. It compares that state with the signed review
 and reapplies the current normalized limits.
 
+Known active broker statuses include `held` and `pending_cancel`. Unknown
+non-terminal statuses remain active evidence and block new risk instead of
+being silently discarded. A signed review whose status is blocked or whose
+signed blocker list is non-empty cannot authorize entry sections; independently
+valid exit sections remain eligible.
+
 Material drift includes:
 
 - account identity, paper/live state, account status, or blocking flags;
@@ -145,6 +150,12 @@ the broker mutation. A duplicate open order or active reservation fails closed.
 The reservation carries the exact review artifact, payload section/index,
 candidate identity, decision identity, canonical intent, and validation
 evidence. Broker submission and fill reconciliation update that same row.
+
+All new-risk sections selected from one artifact reserve as an all-or-none batch
+inside an immediate transaction. The transaction recomputes the exact active
+reservation fingerprint and shared-cap headroom before inserting reservations,
+so concurrent general, 0DTE, or hedge decisions cannot each consume the same
+remaining capacity.
 
 ### Equity scale-ins
 
@@ -179,12 +190,19 @@ Open positions and active orders jointly consume the current open-exposure
 limit. Missing premium or realized-loss evidence is a hard blocker. No current
 0DTE cap is increased.
 
+Generic reviewed `optionBuys` sourced from `discovery:zero_dte_spy:*` use the
+same cross-path daily trade, premium, realized-loss, and open-exposure evidence
+as the standalone Level 2 executor. They cannot bypass those counters through
+the compatibility confirmation path.
+
 Before a 0DTE order request, the executor persists a signed canonical submit
 attestation tied to the exact decision, candidate, configuration, quote,
 account/activity snapshot, order intent, and `baseline-v1` allocation identity.
 It then performs one fresh account/activity read and compares it to that
 attestation before the broker mutation. Candidate, decision, quote, or state
-drift blocks without inline resizing.
+drift blocks without inline resizing. The standalone executor also refreshes
+the option quote immediately before reservation, preserves the reviewed limit,
+and blocks stale, identity-drifted, or over-threshold price evidence.
 
 ### Hedge accounting
 
@@ -206,7 +224,10 @@ Hedge reviews and execution use explicit capital evidence:
 Missing material evidence forces monitoring/blocked status. At submission the
 executor refreshes the same evidence, verifies the signed fingerprint, and
 reapplies new, total, daily, buying-power, deployable-capital, quantity, order,
-spread, delta, DTE, and quote-freshness gates.
+spread, delta, DTE, quote-freshness, and review-to-submit price-drift gates. The
+HMAC binds deterministic review and client-order identities. Persistence
+verifies the database row against the signed review, and one review is consumed
+atomically with its one execution-ledger reservation so it cannot be replayed.
 
 ### Direct-confirm and late-day paths
 
@@ -252,6 +273,7 @@ New or strengthened structured failure codes include:
 - `REVIEW_ARTIFACT_SIGNATURE_INVALID`
 - `REVIEW_ARTIFACT_PAYLOAD_CHANGED`
 - `REVIEW_ARTIFACT_STATE_ATTESTATION_REQUIRED`
+- `REVIEW_ARTIFACT_ENTRY_BLOCKED`
 - `REVIEW_ENTRY_SOURCE_IDENTITY_MISSING`
 - `SUBMIT_ACCOUNT_STATE_DRIFT`
 - `SUBMIT_CONFIGURATION_DRIFT`
@@ -261,16 +283,22 @@ New or strengthened structured failure codes include:
 - `SUBMIT_CAP_EVIDENCE_INCOMPLETE`
 - `SUBMIT_CAP_EXCEEDED`
 - `SUBMIT_DUPLICATE_ORDER_OR_RESERVATION`
+- `SUBMIT_ORDER_STATUS_UNRECOGNIZED`
 - `FRESH_REVIEW_REQUIRED`
 - `SCALE_IN_POSITION_EVIDENCE_INCOMPLETE`
 - `SCALE_IN_CAPITAL_EVIDENCE_INCOMPLETE`
 - `ZERO_DTE_ACTIVITY_EVIDENCE_INCOMPLETE`
 - `ZERO_DTE_DAILY_COUNTER_EVIDENCE_REQUIRED`
 - `ZERO_DTE_SUBMIT_ATTESTATION_INVALID`
+- `ZERO_DTE_ORDER_STATUS_EVIDENCE_REQUIRED`
+- `ZERO_DTE_PRICE_DRIFT`
 - `HEDGE_CAPITAL_EVIDENCE_INCOMPLETE`
 - `HEDGE_CAPITAL_EVIDENCE_CHANGED`
 - `HEDGE_TOTAL_PREMIUM_CAP_EXCEEDED`
 - `HEDGE_DAILY_PREMIUM_CAP_EXCEEDED`
+- `HEDGE_ORDER_STATUS_EVIDENCE_REQUIRED`
+- `HEDGE_PRICE_DRIFT`
+- `HEDGE_REVIEW_ALREADY_CONSUMED`
 
 All errors are sanitized. Secrets, raw environment contents, API credentials,
 and authorization headers are never persisted or returned.
@@ -289,11 +317,13 @@ and authorization headers are never persisted or returned.
    cap breach, while preserving the `$250` default.
 5. The concrete 0DTE provider always supplies complete daily counters and open
    exposure from authoritative evidence or blocks. All supported entry paths
-   deduplicate by broker/client identity and use the New York trading date.
+   deduplicate by broker/client identity and use the New York trading date;
+   generic discovery-based 0DTE option buys cannot bypass these counters.
 6. 0DTE order submission requires a valid persisted signed submit attestation
-   and an unchanged fresh account/activity snapshot.
+   and unchanged fresh account/activity/quote evidence.
 7. Hedge defaults equal `0.75%`, `2%`, and `1%`; missing capital evidence never
-   becomes zero; reviews and execution enforce current total/daily evidence.
+   becomes zero; reviews and execution enforce current total/daily evidence,
+   signed deterministic identity, one-time consumption, and fresh quote drift.
 8. `/api/v1/execute/confirm`, its Vercel bridge route, and
    `paper:execute --confirmPaper` delegate to reviewed execution and require
    explicit confirmation.
@@ -303,6 +333,10 @@ and authorization headers are never persisted or returned.
     increase or silently rewrite them.
 11. Documentation and examples describe the signed artifact, fresh validation,
     structured blockers, and paper-only boundary accurately.
+12. General, 0DTE, and hedge cap headroom is rechecked with active reservations
+    inside immediate transactions; concurrent decisions cannot over-reserve it.
+13. Active and unknown non-terminal broker statuses never disappear from risk
+    evidence; unknown statuses fail closed.
 
 ## Validation plan
 

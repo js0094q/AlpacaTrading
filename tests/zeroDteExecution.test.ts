@@ -504,6 +504,124 @@ test("fresh 0DTE account drift blocks before reservation or broker mutation", as
   assert.match(String(result.attestationId), /^zero_dte_attest_[a-f0-9]{24}$/);
 });
 
+test("fresh 0DTE quote drift blocks without repricing or broker mutation", async () => {
+  const quoteDriftCandidate = scenarioCandidate({
+    candidateId: "execution-candidate-quote-drift",
+    optionSymbol: "SPY260713C00584000",
+    strike: 584
+  });
+  const quoteDriftDecisionId = "execution-decision-quote-drift";
+  seed({ candidate: quoteDriftCandidate, decisionId: quoteDriftDecisionId });
+  let brokerCalls = 0;
+
+  const result = await executeZeroDteCandidate({
+    candidate: quoteDriftCandidate,
+    decisionId: quoteDriftDecisionId,
+    confirmPaper: true,
+    provider: {
+      config,
+      runtime: runtime(),
+      account: account(),
+      now: () => now,
+      refreshQuote: async () => ({
+        ...quoteDriftCandidate.quote,
+        bid: 1.55,
+        ask: 1.65,
+        midpoint: 1.6,
+        premium: 1.6,
+        spreadPct: 6.25,
+        marketTimestamp: now
+      }),
+      submitPaperOrder: async () => {
+        brokerCalls += 1;
+        throw new Error("must not submit after price drift");
+      }
+    } as ZeroDtePaperMutationProvider & {
+      refreshQuote: () => Promise<ZeroDteQueueCandidate["quote"]>;
+    }
+  });
+
+  if (result.ledgerId) {
+    getDb().prepare("DELETE FROM paper_execution_ledger WHERE id = ?").run(result.ledgerId);
+  }
+  getDb().prepare("DELETE FROM zero_dte_lifecycle_events WHERE candidate_id = ?").run(
+    quoteDriftCandidate.candidateId
+  );
+
+  assert.equal(result.status, "blocked");
+  assert.equal(brokerCalls, 0);
+  assert.ok(result.blockers.includes("ZERO_DTE_PRICE_DRIFT"));
+  assert.ok(result.blockers.includes("FRESH_REVIEW_REQUIRED"));
+});
+
+test("0DTE reservation atomically rejects distinct shared-cap races", async () => {
+  const raceCandidate = scenarioCandidate({
+    candidateId: "execution-candidate-shared-cap-race",
+    optionSymbol: "SPY260713C00583000",
+    strike: 583
+  });
+  const raceDecisionId = "execution-decision-shared-cap-race";
+  seed({ candidate: raceCandidate, decisionId: raceDecisionId });
+  let nowReads = 0;
+  let brokerCalls = 0;
+
+  const result = await executeZeroDteCandidate({
+    candidate: raceCandidate,
+    decisionId: raceDecisionId,
+    confirmPaper: true,
+    provider: {
+      config,
+      runtime: runtime(),
+      account: account(),
+      now: () => {
+        nowReads += 1;
+        if (nowReads === 2) {
+          insertPaperExecutionLedgerEntry({
+            mode: "zero-dte-entry",
+            assetClass: "option",
+            symbol: "SPY260713C00582000",
+            underlyingSymbol: "SPY",
+            strategy: "zero_dte_level_2",
+            side: "buy",
+            orderType: "limit",
+            timeInForce: "day",
+            qty: "1",
+            limitPrice: "7",
+            estimatedPremium: 700,
+            maxRisk: 700,
+            dedupeKey: "zero-dte-shared-cap-race-other",
+            clientOrderId: "zero-dte-shared-cap-race-other",
+            status: "reserved",
+            sourcePlanId: "other-attestation",
+            sourceCandidateId: "other-candidate",
+            payload: {}
+          });
+        }
+        return now;
+      },
+      submitPaperOrder: async () => {
+        brokerCalls += 1;
+        throw new Error("must not submit after a concurrent reservation");
+      }
+    }
+  });
+
+  if (result.ledgerId) {
+    getDb().prepare("DELETE FROM paper_execution_ledger WHERE id = ?").run(result.ledgerId);
+  }
+  getDb().prepare(
+    "DELETE FROM paper_execution_ledger WHERE client_order_id = 'zero-dte-shared-cap-race-other'"
+  ).run();
+  getDb().prepare("DELETE FROM zero_dte_lifecycle_events WHERE candidate_id = ?").run(
+    raceCandidate.candidateId
+  );
+
+  assert.equal(result.status, "blocked");
+  assert.equal(brokerCalls, 0);
+  assert.ok(result.blockers.includes("ZERO_DTE_RESERVATION_STATE_DRIFT"));
+  assert.ok(result.blockers.includes("FRESH_REVIEW_REQUIRED"));
+});
+
 test("missing review signing key blocks 0DTE execution before broker mutation", async () => {
   const unsignedCandidate = scenarioCandidate({
     candidateId: "execution-candidate-missing-signing-key",

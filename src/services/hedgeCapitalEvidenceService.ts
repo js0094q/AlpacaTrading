@@ -1,15 +1,18 @@
 import { canonicalJsonHash } from "../lib/canonicalJson.js";
 import { parseOptionSymbol } from "./optionSymbolService.js";
+import { classifyBrokerOrderStatus } from "./brokerOrderStatusService.js";
 
 const OPTION_MULTIPLIER = 100;
 
-const ACTIVE_STATUSES = new Set([
+const ACTIVE_LEDGER_STATUSES = new Set([
   "new",
   "accepted",
   "pending_new",
   "partially_filled",
   "accepted_for_bidding",
   "pending_replace",
+  "pending_cancel",
+  "held",
   "reserved",
   "attempted",
   "submitted",
@@ -228,6 +231,10 @@ const brokerFragment = (
     blockers.push("HEDGE_ORDER_STATUS_EVIDENCE_REQUIRED");
     return null;
   }
+  const statusClassification = classifyBrokerOrderStatus(status);
+  if (!statusClassification.known) {
+    blockers.push("HEDGE_ORDER_STATUS_EVIDENCE_REQUIRED");
+  }
   const quantity = positive(row.quantity ?? row.qty);
   const filledQuantity = nonNegative(row.filledQuantity ?? row.filled_qty);
   const limitPrice = positive(row.limitPrice ?? row.limit_price);
@@ -239,7 +246,7 @@ const brokerFragment = (
     filledQuantity !== null && filledQuantity > 0 && fillPrice !== null
     ? roundMoney(filledQuantity * fillPrice * OPTION_MULTIPLIER)
     : null;
-  const open = ACTIVE_STATUSES.has(status) && (
+  const open = statusClassification.active && (
     quantity === null || filledQuantity === null || filledQuantity < quantity
   );
   return {
@@ -301,7 +308,7 @@ const ledgerFragment = (
     filledQuantity !== null && filledQuantity > 0 && fillPrice !== null
     ? roundMoney(filledQuantity * fillPrice * OPTION_MULTIPLIER)
     : null;
-  const open = ACTIVE_STATUSES.has(status) && (
+  const open = ACTIVE_LEDGER_STATUSES.has(status) && (
     quantity === null || filledQuantity === null || filledQuantity < quantity
   );
   return {

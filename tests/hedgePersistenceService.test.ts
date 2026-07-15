@@ -708,6 +708,22 @@ test("persists and verifies an HMAC hedge review on every read", () => {
   assert.equal(valid.verification.valid, true);
   assert.equal(valid.review?.clientOrderId, review.clientOrderId);
 
+  getDb().prepare(
+    "UPDATE hedge_execution_reviews SET decision_linkage_status = 'AMBIGUOUS' WHERE review_id = ?"
+  ).run(review.reviewId);
+  const lineageMismatch = readHedgeExecutionReview({
+    reviewId: review.reviewId,
+    signingKey: "persistence-test-key",
+    asOf: "2026-07-10T14:00:01.000Z"
+  });
+  assert.equal(lineageMismatch.verification.valid, false);
+  assert.ok(
+    lineageMismatch.verification.blockers.includes("HEDGE_REVIEW_PERSISTENCE_MISMATCH")
+  );
+  getDb().prepare(
+    "UPDATE hedge_execution_reviews SET decision_linkage_status = 'EXACT' WHERE review_id = ?"
+  ).run(review.reviewId);
+
   const invalid = readHedgeExecutionReview({
     reviewId: review.reviewId,
     signingKey: "wrong-key",
@@ -715,4 +731,28 @@ test("persists and verifies an HMAC hedge review on every read", () => {
   });
   assert.equal(invalid.verification.valid, false);
   assert.ok(invalid.verification.blockers.includes("HEDGE_REVIEW_SIGNATURE_INVALID"));
+
+  getDb().prepare(
+    "UPDATE hedge_execution_reviews SET client_order_id = ? WHERE review_id = ?"
+  ).run("hedge-entry-row-tampered", review.reviewId);
+  const rowMismatch = readHedgeExecutionReview({
+    reviewId: review.reviewId,
+    signingKey: "persistence-test-key",
+    asOf: "2026-07-10T14:00:01.000Z"
+  });
+  assert.equal(rowMismatch.verification.valid, false);
+  assert.ok(
+    rowMismatch.verification.blockers.includes("HEDGE_REVIEW_PERSISTENCE_MISMATCH")
+  );
+
+  getDb().prepare(
+    "UPDATE hedge_execution_reviews SET client_order_id = ?, status = 'consumed' WHERE review_id = ?"
+  ).run(review.clientOrderId, review.reviewId);
+  const consumed = readHedgeExecutionReview({
+    reviewId: review.reviewId,
+    signingKey: "persistence-test-key",
+    asOf: "2026-07-10T14:00:01.000Z"
+  });
+  assert.equal(consumed.verification.valid, false);
+  assert.ok(consumed.verification.blockers.includes("HEDGE_REVIEW_ALREADY_CONSUMED"));
 });

@@ -31,8 +31,18 @@ shared signing secret is `PAPER_REVIEW_SIGNING_KEY` for general/0DTE artifacts;
 the existing hedge signing key remains independently required for hedge
 reviews.
 
+General artifact entries reserve as an all-or-none batch. General, 0DTE, and
+hedge executors recheck the exact active-reservation fingerprint and cap
+headroom inside immediate transactions. Hedge reviews bind deterministic review
+and client-order identities and are consumed atomically with their one ledger
+reservation. Generic discovery-based 0DTE option entries use the same cross-path
+daily activity evidence as the Level 2 executor.
+
 Material state drift fails closed with a fresh-review requirement. Executors
-do not resize or reallocate inline. Exit, protection, recovery, and
+refresh option price evidence without changing the reviewed limit and do not
+resize, reprice upward, or reallocate inline. Broker statuses explicitly known to be
+active, including `held` and `pending_cancel`, consume exposure. Unknown
+non-terminal statuses remain active evidence and block new risk. Exit, protection, recovery, and
 reconciliation remain independent from positive entry capacity.
 
 The compatibility CLI and HTTP direct-confirm surfaces delegate to reviewed
@@ -78,6 +88,10 @@ failure.
 - General entry submission makes additional read-only broker/data calls.
 - 0DTE accounting and hedge sizing can remain in monitoring/blocked status when
   authoritative evidence is incomplete.
+- Concurrent entry decisions serialize briefly while shared reservation
+  headroom is validated and reserved.
+- A blocked signed review cannot authorize new-risk sections, while its valid
+  exit sections remain independently executable.
 - Hedge premium limits are `0.0075`, `0.02`, and `0.01` of equity. Human
   percentage environment values are `0.75`, `2`, and `1`.
 - No allocator mode, weight, or optimization contract is created by this ADR.
@@ -89,9 +103,13 @@ failure.
   broker order.
 - Exit-only tests prove allocation-room failures do not block a valid exit.
 - 0DTE tests cover all-path deduplication, New York date boundaries, missing
-  evidence, open orders consuming exposure, signed attestation, and state drift.
+  evidence, generic-path enforcement, active/unknown broker statuses, open
+  orders consuming exposure, signed attestation, quote drift, and state drift.
 - Hedge tests cover corrected default ratios, missing evidence, fingerprint
-  drift, and total/daily cap enforcement.
+  drift, signed identity, one-time consumption, quote drift, unknown order
+  status, atomic reservation, and total/daily cap enforcement.
+- General tests cover signed blocker status, exit independence, unknown order
+  status, and concurrent shared-cap reservation.
 - CLI, control-server, and Vercel bridge tests prove direct-confirm delegation
   and explicit confirmation.
 - A redacted 2026-07-14 VPS snapshot established a clean base checkout,

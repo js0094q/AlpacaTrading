@@ -16,6 +16,7 @@ import {
   createPaperReviewArtifact,
   latestPaperReviewArtifact,
   isPaperReviewArtifactFresh,
+  verifyPaperReviewArtifact,
   type ReviewedPayloadSections
 } from "./paperReviewArtifactService.js";
 import {
@@ -452,6 +453,27 @@ export const latestReviewArtifactReadiness = () => {
       ready: false,
       status: "blocked" as const,
       reason: "NO_REVIEW_ARTIFACT"
+    };
+  }
+  const verification = verifyPaperReviewArtifact({ artifact });
+  if (!verification.valid) {
+    return {
+      ready: false,
+      status: "blocked" as const,
+      reason:
+        verification.blockers[0] ?? "REVIEW_ARTIFACT_SIGNATURE_INVALID",
+      artifact
+    };
+  }
+  if (
+    !(["success", "warning"] as string[]).includes(artifact.status) ||
+    artifact.artifact.blockers.length > 0
+  ) {
+    return {
+      ready: false,
+      status: "blocked" as const,
+      reason: "REVIEW_ARTIFACT_ENTRY_BLOCKED",
+      artifact
     };
   }
   if (!isPaperReviewArtifactFresh(artifact)) {

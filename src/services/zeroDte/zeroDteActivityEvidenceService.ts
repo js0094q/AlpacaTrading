@@ -5,16 +5,19 @@ import type {
   AlpacaSubmittedOrder
 } from "../alpacaClient.js";
 import { parseOptionSymbol } from "../optionSymbolService.js";
+import { classifyBrokerOrderStatus } from "../brokerOrderStatusService.js";
 
 const OPTION_MULTIPLIER = 100;
 
-const OPEN_ORDER_STATUSES = new Set([
+const OPEN_LEDGER_STATUSES = new Set([
   "new",
   "accepted",
   "pending_new",
   "partially_filled",
   "accepted_for_bidding",
   "pending_replace",
+  "pending_cancel",
+  "held",
   "reserved",
   "submitted",
   "partial",
@@ -23,7 +26,7 @@ const OPEN_ORDER_STATUSES = new Set([
 ]);
 
 const COUNTABLE_ENTRY_STATUSES = new Set([
-  ...OPEN_ORDER_STATUSES,
+  ...OPEN_LEDGER_STATUSES,
   "filled",
   "open",
   "closed",
@@ -327,12 +330,16 @@ const brokerOrderFragment = (
   if (side && side !== "buy") return null;
   if (intent && intent !== "buy_to_open") return null;
   const status = normalizedStatus(row.status);
+  const statusClassification = classifyBrokerOrderStatus(status);
+  if (!statusClassification.normalized || !statusClassification.known) {
+    blockers.push("ZERO_DTE_ORDER_STATUS_EVIDENCE_REQUIRED");
+  }
   const quantity = positive(row.qty);
   const filledQuantity = finite(row.filled_qty);
   const limitPrice = positive(row.limit_price);
   const fillPrice = positive(row.filled_avg_price);
   const hasFill = filledQuantity !== null && filledQuantity > 0;
-  const countEntry = COUNTABLE_ENTRY_STATUSES.has(status) || hasFill;
+  const countEntry = statusClassification.active || status === "filled" || hasFill;
   const actualPremium = hasFill && fillPrice !== null
     ? roundMoney(filledQuantity * fillPrice * OPTION_MULTIPLIER)
     : null;
@@ -352,7 +359,7 @@ const brokerOrderFragment = (
     entryAt: text(row.created_at ?? row.submitted_at ?? row.filled_at),
     closedAt: null,
     countEntry,
-    openOrder: OPEN_ORDER_STATUSES.has(status) && remaining,
+    openOrder: statusClassification.active && remaining,
     openPosition: false,
     actualPremium,
     reservedPremium,
@@ -450,7 +457,7 @@ const ledgerFragment = (
     entryAt: text(row.createdAt),
     closedAt: null,
     countEntry,
-    openOrder: OPEN_ORDER_STATUSES.has(effectiveStatus) && remaining,
+    openOrder: OPEN_LEDGER_STATUSES.has(effectiveStatus) && remaining,
     openPosition: false,
     actualPremium,
     reservedPremium,

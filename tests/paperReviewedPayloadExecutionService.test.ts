@@ -104,6 +104,55 @@ const entrySubmitState = (
   ...overrides
 });
 
+const zeroDteEntrySubmitState = (activityOverrides: Record<string, unknown> = {}) => ({
+  ...entrySubmitState({
+    marketEvidence: [
+      {
+        symbol: "SPY260708C00600000",
+        assetClass: "option",
+        referencePrice: 1,
+        bid: 0.95,
+        ask: 1.05,
+        timestamp: "2026-07-08T14:00:00.000Z",
+        complete: true
+      }
+    ],
+    payloadIntents: [
+      {
+        section: "optionBuys",
+        payloadIndex: 0,
+        assetClass: "option",
+        symbol: "SPY260708C00600000",
+        side: "buy",
+        orderType: "limit",
+        quantity: 1,
+        notional: null,
+        limitPrice: 1,
+        estimatedPremium: 100,
+        positionIntent: "buy_to_open",
+        sourceCandidateId: "discovery:zero_dte_spy:SPY260708C00600000",
+        sourceReviewId: null,
+        clientOrderIdHash: "zero-dte-client-hash"
+      }
+    ]
+  }),
+  zeroDteActivityEvidence: {
+    tradingDate: "2026-07-08",
+    asOf: "2026-07-08T14:00:00.000Z",
+    complete: true,
+    dailyTradeCount: 0,
+    dailyPremium: 0,
+    dailyRealizedLoss: 0,
+    openPositionCount: 0,
+    openOrderCount: 0,
+    openExposureCount: 0,
+    blockers: [],
+    warnings: [],
+    evidenceFingerprint: "zero-dte-activity-zero",
+    ...activityOverrides
+  }
+});
+
 const resetDatabase = () => {
   resetSqliteTestDb(getDb(), `
     DELETE FROM paper_position_outcome_revisions;
@@ -128,6 +177,10 @@ beforeEach(() => {
   process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
   process.env.AUTOMATED_PAPER_EXECUTION_ENABLED = "true";
   process.env.PAPER_REVIEW_SIGNING_KEY = "paper-reviewed-execution-test-key";
+  process.env.ZERO_DTE_MAX_TRADES_PER_DAY = "3";
+  process.env.ZERO_DTE_MAX_DAILY_PREMIUM = "750";
+  process.env.ZERO_DTE_MAX_DAILY_REALIZED_LOSS = "250";
+  process.env.ZERO_DTE_MAX_OPEN_POSITIONS = "3";
   resetDatabase();
 });
 
@@ -495,6 +548,103 @@ describe("reviewed payload execution", () => {
     assert.equal(brokerCalls, 0);
   });
 
+  for (const scenario of [
+    {
+      name: "daily trade count",
+      overrides: { dailyTradeCount: 3 },
+      blocker: "DAILY_TRADE_LIMIT"
+    },
+    {
+      name: "daily premium",
+      overrides: { dailyPremium: 700 },
+      blocker: "DAILY_PREMIUM_LIMIT"
+    },
+    {
+      name: "daily realized loss",
+      overrides: { dailyRealizedLoss: 250 },
+      blocker: "DAILY_LOSS_LIMIT"
+    },
+    {
+      name: "open exposure",
+      overrides: {
+        openPositionCount: 3,
+        openExposureCount: 3
+      },
+      blocker: "MAX_OPEN_0DTE_POSITIONS"
+    }
+  ]) {
+    test(`blocks generic direct-confirm when 0DTE ${scenario.name} reaches its cap`, async () => {
+      createPaperReviewArtifact({
+        id: `review-zero-dte-${scenario.name.replaceAll(" ", "-")}`,
+        sourceAction: "paper.ops.review",
+        status: "success",
+        createdAt: "2026-07-08T14:00:00.000Z",
+        maxAgeMinutes: 60,
+        payloadSections: {
+          equityBuys: [],
+          equityAdds: [],
+          equitySells: [],
+          optionBuys: [
+            {
+              assetClass: "option",
+              symbol: "SPY260708C00600000",
+              underlyingSymbol: "SPY",
+              side: "buy",
+              type: "limit",
+              time_in_force: "day",
+              qty: "1",
+              limit_price: "1.00",
+              estimatedPremium: 100,
+              position_intent: "buy_to_open",
+              client_order_id: `zero-dte-${scenario.name.replaceAll(" ", "-")}`,
+              sourceCandidateId: "discovery:zero_dte_spy:SPY260708C00600000",
+              dedupeKey: `zero-dte-${scenario.name.replaceAll(" ", "-")}`
+            }
+          ],
+          optionSellToCloseExits: []
+        },
+        submitState: zeroDteEntrySubmitState() as PaperSubmitStateAttestation,
+        summary: {}
+      });
+      let brokerCalls = 0;
+
+      const report = await buildPaperReviewedPayloadExecutionReport(
+        { confirmPaper: true, sections: ["optionBuys"] },
+        {
+          now: () => "2026-07-08T14:05:00.000Z",
+          captureSubmitState: async () =>
+            ({
+              ...zeroDteEntrySubmitState(scenario.overrides),
+              capturedAt: "2026-07-08T14:05:00.000Z",
+              marketEvidence: [
+                {
+                  ...zeroDteEntrySubmitState().marketEvidence[0]!,
+                  timestamp: "2026-07-08T14:05:00.000Z"
+                }
+              ]
+            }) as PaperSubmitStateAttestation,
+          getAccount: async () => ({
+            data: { status: "ACTIVE" },
+            status: 200,
+            url: "account"
+          }),
+          submitPaperOrder: async () => {
+            brokerCalls += 1;
+            throw new Error("must not submit over a 0DTE cap");
+          }
+        }
+      );
+
+      assert.equal(report.status, "blocked");
+      assert.equal(brokerCalls, 0);
+      assert.ok(
+        report.blocked.some((row) =>
+          (row.explanation ?? "").includes(scenario.blocker)
+        )
+      );
+    });
+  }
+
   test("atomically blocks a reservation collision that appears after state capture", async () => {
     const reviewedState = entrySubmitState();
     createPaperReviewArtifact({
@@ -565,6 +715,84 @@ describe("reviewed payload execution", () => {
     assert.ok(
       report.blocked.some(
         (row) => row.reason === "SUBMIT_DUPLICATE_ORDER_OR_RESERVATION"
+      )
+    );
+  });
+
+  test("atomically blocks distinct concurrent reservations that exhaust shared headroom", async () => {
+    const reviewedState = entrySubmitState();
+    createPaperReviewArtifact({
+      id: "review-shared-headroom-race",
+      sourceAction: "paper.ops.review",
+      status: "success",
+      createdAt: "2026-07-08T14:00:00.000Z",
+      maxAgeMinutes: 60,
+      payloadSections: {
+        equityBuys: [
+          {
+            assetClass: "equity",
+            symbol: "AAPL",
+            side: "buy",
+            type: "market",
+            time_in_force: "day",
+            qty: "2",
+            client_order_id: "shared-headroom-aapl",
+            sourceCandidateId: "candidate-aapl",
+            dedupeKey: "shared-headroom-aapl"
+          }
+        ],
+        equityAdds: [],
+        equitySells: [],
+        optionBuys: [],
+        optionSellToCloseExits: []
+      },
+      submitState: reviewedState,
+      summary: {}
+    });
+    let brokerCalls = 0;
+
+    const report = await buildPaperReviewedPayloadExecutionReport(
+      { confirmPaper: true },
+      {
+        now: () => "2026-07-08T14:05:00.000Z",
+        captureSubmitState: async () =>
+          entrySubmitState({ capturedAt: "2026-07-08T14:05:00.000Z" }),
+        getAccount: async () => {
+          insertPaperExecutionLedgerEntry({
+            mode: "concurrentPaperReservation",
+            assetClass: "equity",
+            symbol: "MSFT",
+            side: "buy",
+            orderType: "market",
+            timeInForce: "day",
+            notional: "79950",
+            dedupeKey: "shared-headroom-msft",
+            clientOrderId: "shared-headroom-msft",
+            status: "reserved",
+            sourcePlanId: "concurrent-review",
+            sourceCandidateId: "candidate-msft",
+            payload: {}
+          });
+          return {
+            data: { status: "ACTIVE" },
+            status: 200,
+            url: "account"
+          };
+        },
+        submitPaperOrder: async () => {
+          brokerCalls += 1;
+          throw new Error("must not submit after shared headroom changes");
+        }
+      }
+    );
+
+    assert.equal(report.status, "blocked");
+    assert.equal(brokerCalls, 0);
+    assert.ok(
+      report.blocked.some((row) =>
+        ["SUBMIT_RESERVATION_STATE_DRIFT", "FRESH_REVIEW_REQUIRED"].includes(
+          row.reason
+        )
       )
     );
   });
@@ -640,6 +868,78 @@ describe("reviewed payload execution", () => {
     assert.equal(report.status, "partial");
     assert.deepEqual(submittedSymbols, ["MSFT"]);
     assert.ok(report.blocked.some((row) => row.reason === "FRESH_REVIEW_REQUIRED"));
+  });
+
+  test("keeps exits independent while a signed blocked artifact fails closed for entries", async () => {
+    createPaperReviewArtifact({
+      id: "review-signed-blocked-entry",
+      sourceAction: "paper.ops.review",
+      status: "blocked",
+      createdAt: "2026-07-08T14:00:00.000Z",
+      maxAgeMinutes: 60,
+      payloadSections: {
+        equityBuys: [
+          {
+            assetClass: "equity",
+            symbol: "AAPL",
+            side: "buy",
+            type: "market",
+            time_in_force: "day",
+            qty: "2",
+            client_order_id: "blocked-entry-aapl",
+            sourceCandidateId: "candidate-aapl",
+            dedupeKey: "blocked-entry-aapl"
+          }
+        ],
+        equityAdds: [],
+        equitySells: [
+          {
+            assetClass: "equity",
+            symbol: "MSFT",
+            side: "sell",
+            type: "market",
+            time_in_force: "day",
+            qty: "1",
+            client_order_id: "independent-exit-msft",
+            dedupeKey: "independent-exit-msft"
+          }
+        ],
+        optionBuys: [],
+        optionSellToCloseExits: []
+      },
+      submitState: entrySubmitState(),
+      summary: {},
+      blockers: ["REVIEW_DATA_BLOCKED"]
+    });
+    const submittedSymbols: string[] = [];
+
+    const report = await buildPaperReviewedPayloadExecutionReport(
+      { confirmPaper: true },
+      {
+        now: () => "2026-07-08T14:05:00.000Z",
+        captureSubmitState: async () =>
+          entrySubmitState({ capturedAt: "2026-07-08T14:05:00.000Z" }),
+        getAccount: async () => ({
+          data: { status: "ACTIVE" },
+          status: 200,
+          url: "account"
+        }),
+        submitPaperOrder: async (payload) => {
+          submittedSymbols.push(payload.symbol);
+          return {
+            data: { id: `order-${payload.symbol}`, status: "accepted" },
+            status: 200,
+            url: "orders"
+          };
+        }
+      }
+    );
+
+    assert.equal(report.status, "partial");
+    assert.deepEqual(submittedSymbols, ["MSFT"]);
+    assert.ok(
+      report.blocked.some((row) => row.reason === "REVIEW_ARTIFACT_ENTRY_BLOCKED")
+    );
   });
 
   test("live trading enabled blocks reviewed LEAPS execution", async () => {

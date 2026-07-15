@@ -476,6 +476,11 @@ export interface ReviewedPaperExecutionReservationInput {
   rawPayload: unknown;
 }
 
+export interface ReviewedPaperExecutionReservationBatch {
+  inputs: ReviewedPaperExecutionReservationInput[];
+  validateBeforeInsert?: () => string[];
+}
+
 const withImmediateLedgerTransaction = <T>(operation: () => T): T => {
   const db = getDb();
   db.exec("BEGIN IMMEDIATE;");
@@ -493,59 +498,132 @@ const withImmediateLedgerTransaction = <T>(operation: () => T): T => {
   }
 };
 
+export const runAtomicPaperNewRiskReservation = <T>(input: {
+  validateBeforeInsert: () => string[];
+  insert: () => T;
+}) => {
+  try {
+    return withImmediateLedgerTransaction(() => {
+      const blockers = [...new Set(input.validateBeforeInsert())];
+      if (blockers.length) {
+        return {
+          reserved: false as const,
+          value: null,
+          blockers
+        };
+      }
+      return {
+        reserved: true as const,
+        value: input.insert(),
+        blockers: [] as string[]
+      };
+    });
+  } catch (error) {
+    return {
+      reserved: false as const,
+      value: null,
+      blockers: ["SUBMIT_RESERVATION_FAILED"],
+      error: error instanceof Error ? error.message : "Paper reservation failed."
+    };
+  }
+};
+
 export const reserveReviewedPaperExecution = (
   input: ReviewedPaperExecutionReservationInput
 ) => {
+  const result = reserveReviewedPaperExecutions({ inputs: [input] });
+  return {
+    reserved: result.reserved,
+    entry: result.entries[0] ?? result.existing ?? null,
+    blockers: result.blockers,
+    ...("error" in result && result.error ? { error: result.error } : {})
+  };
+};
+
+export const reserveReviewedPaperExecutions = (
+  input: ReviewedPaperExecutionReservationBatch
+) => {
   try {
     return withImmediateLedgerTransaction(() => {
-      const existingByClient = findPaperExecutionByClientOrderId(input.clientOrderId);
-      const existingByDedupe = findPaperExecutionByDedupeKey(input.dedupeKey);
-      if (existingByClient || existingByDedupe) {
+      const seenClients = new Set<string>();
+      const seenDedupeKeys = new Set<string>();
+      for (const row of input.inputs) {
+        const existingByClient = findPaperExecutionByClientOrderId(row.clientOrderId);
+        const existingByDedupe = findPaperExecutionByDedupeKey(row.dedupeKey);
+        if (
+          existingByClient ||
+          existingByDedupe ||
+          seenClients.has(row.clientOrderId) ||
+          seenDedupeKeys.has(row.dedupeKey)
+        ) {
+          return {
+            reserved: false as const,
+            entries: [] as PaperExecutionLedgerEntry[],
+            existing: existingByClient ?? existingByDedupe ?? null,
+            blockers: ["SUBMIT_DUPLICATE_ORDER_OR_RESERVATION"]
+          };
+        }
+        seenClients.add(row.clientOrderId);
+        seenDedupeKeys.add(row.dedupeKey);
+      }
+      const guardBlockers = [...new Set(input.validateBeforeInsert?.() ?? [])];
+      if (guardBlockers.length) {
         return {
           reserved: false as const,
-          entry: existingByClient ?? existingByDedupe,
-          blockers: ["SUBMIT_DUPLICATE_ORDER_OR_RESERVATION"]
+          entries: [] as PaperExecutionLedgerEntry[],
+          existing: null,
+          blockers: guardBlockers
         };
       }
-      const entry = insertPaperExecutionLedgerEntry({
-        mode: "reviewedConfirmPaper",
-        assetClass: input.assetClass,
-        symbol: input.symbol,
-        side: input.side,
-        orderType: input.orderType,
-        timeInForce: input.timeInForce,
-        qty: input.qty ?? null,
-        notional: input.notional ?? null,
-        limitPrice: input.limitPrice ?? null,
-        estimatedPremium: input.estimatedPremium ?? null,
-        maxRisk: input.maxRisk ?? null,
-        dedupeKey: input.dedupeKey,
-        clientOrderId: input.clientOrderId,
-        status: "reserved",
-        sourcePlanId: input.sourcePlanId,
-        sourceCandidateId: input.sourceCandidateId,
-        decisionId: input.decisionId,
-        decisionLinkageStatus: "EXACT",
-        payload: {
-          artifactId: input.sourcePlanId,
-          section: input.section,
-          payloadIndex: input.payloadIndex,
-          reviewedPayload: input.payload
-        },
-        rawPayload: input.rawPayload
-      });
-      return { reserved: true as const, entry, blockers: [] as string[] };
+      const entries = input.inputs.map((row) =>
+        insertPaperExecutionLedgerEntry({
+          mode: "reviewedConfirmPaper",
+          assetClass: row.assetClass,
+          symbol: row.symbol,
+          side: row.side,
+          orderType: row.orderType,
+          timeInForce: row.timeInForce,
+          qty: row.qty ?? null,
+          notional: row.notional ?? null,
+          limitPrice: row.limitPrice ?? null,
+          estimatedPremium: row.estimatedPremium ?? null,
+          maxRisk: row.maxRisk ?? null,
+          dedupeKey: row.dedupeKey,
+          clientOrderId: row.clientOrderId,
+          status: "reserved",
+          sourcePlanId: row.sourcePlanId,
+          sourceCandidateId: row.sourceCandidateId,
+          decisionId: row.decisionId,
+          decisionLinkageStatus: "EXACT",
+          payload: {
+            artifactId: row.sourcePlanId,
+            section: row.section,
+            payloadIndex: row.payloadIndex,
+            reviewedPayload: row.payload
+          },
+          rawPayload: row.rawPayload
+        })
+      );
+      return {
+        reserved: true as const,
+        entries,
+        existing: null,
+        blockers: [] as string[]
+      };
     });
   } catch (error) {
     let existing: PaperExecutionLedgerEntry | null = null;
     try {
-      existing = findPaperExecutionByClientOrderId(input.clientOrderId);
+      existing = input.inputs[0]
+        ? findPaperExecutionByClientOrderId(input.inputs[0].clientOrderId)
+        : null;
     } catch {
       // The reservation failure remains authoritative when the ledger is unavailable.
     }
     return {
       reserved: false as const,
-      entry: existing,
+      entries: [] as PaperExecutionLedgerEntry[],
+      existing,
       blockers: ["SUBMIT_RESERVATION_FAILED"],
       error: error instanceof Error ? error.message : "Paper reservation failed."
     };
@@ -565,43 +643,79 @@ export const reservePaperExecutionAttempt = (input: {
   mode?: "hedge-entry" | "hedge-exit";
   side?: "buy" | "sell";
   positionIntent?: "buy_to_open" | "sell_to_close";
+  validateBeforeInsert?: () => string[];
+  consumeReview?: boolean;
 }) => {
   const mode = input.mode ?? "hedge-entry";
   const side = input.side ?? "buy";
   const positionIntent = input.positionIntent ?? "buy_to_open";
   try {
-    const entry = insertPaperExecutionLedgerEntry({
-      mode,
-      assetClass: "option",
-      symbol: input.symbol,
-      underlyingSymbol: input.underlyingSymbol ?? null,
-      strategy: "portfolio_hedge",
-      side,
-      orderType: "limit",
-      timeInForce: "day",
-      qty: String(input.quantity),
-      limitPrice: String(input.limitPrice),
-      estimatedPremium: input.estimatedPremium,
-      maxRisk: input.estimatedPremium,
-      dedupeKey: `${mode === "hedge-exit" ? "hedge-exit" : "hedge-review"}:${input.reviewId}`,
-      clientOrderId: input.clientOrderId,
-      status: "reserved",
-      requestId: input.requestId ?? null,
-      sourcePlanId: input.reviewId,
-      payload: {
-        reviewId: input.reviewId,
-        clientOrderId: input.clientOrderId,
-        symbol: input.symbol,
-        quantity: input.quantity,
-        limitPrice: input.limitPrice,
-        estimatedPremium: input.estimatedPremium,
-        expiresAt: input.expiresAt,
-        mode,
-        side,
-        positionIntent
+    return withImmediateLedgerTransaction(() => {
+      const existing = findPaperExecutionByClientOrderId(input.clientOrderId);
+      if (existing) {
+        return {
+          reserved: false as const,
+          entry: existing,
+          blockers: ["HEDGE_DUPLICATE_ORDER"]
+        };
       }
+      const guardBlockers = [...new Set(input.validateBeforeInsert?.() ?? [])];
+      if (guardBlockers.length) {
+        return {
+          reserved: false as const,
+          entry: null,
+          blockers: guardBlockers
+        };
+      }
+      if (input.consumeReview) {
+        const consumed = getDb()
+          .prepare(
+            `UPDATE hedge_execution_reviews
+             SET status = 'consumed'
+             WHERE review_id = ? AND status = 'reviewed'`
+          )
+          .run(input.reviewId);
+        if (Number(consumed.changes) !== 1) {
+          return {
+            reserved: false as const,
+            entry: null,
+            blockers: ["HEDGE_REVIEW_ALREADY_CONSUMED"]
+          };
+        }
+      }
+      const entry = insertPaperExecutionLedgerEntry({
+        mode,
+        assetClass: "option",
+        symbol: input.symbol,
+        underlyingSymbol: input.underlyingSymbol ?? null,
+        strategy: "portfolio_hedge",
+        side,
+        orderType: "limit",
+        timeInForce: "day",
+        qty: String(input.quantity),
+        limitPrice: String(input.limitPrice),
+        estimatedPremium: input.estimatedPremium,
+        maxRisk: input.estimatedPremium,
+        dedupeKey: `${mode === "hedge-exit" ? "hedge-exit" : "hedge-review"}:${input.reviewId}`,
+        clientOrderId: input.clientOrderId,
+        status: "reserved",
+        requestId: input.requestId ?? null,
+        sourcePlanId: input.reviewId,
+        payload: {
+          reviewId: input.reviewId,
+          clientOrderId: input.clientOrderId,
+          symbol: input.symbol,
+          quantity: input.quantity,
+          limitPrice: input.limitPrice,
+          estimatedPremium: input.estimatedPremium,
+          expiresAt: input.expiresAt,
+          mode,
+          side,
+          positionIntent
+        }
+      });
+      return { reserved: true as const, entry, blockers: [] as string[] };
     });
-    return { reserved: true as const, entry, blockers: [] as string[] };
   } catch (error) {
     const existing = findPaperExecutionByClientOrderId(input.clientOrderId);
     return {

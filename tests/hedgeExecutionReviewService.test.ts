@@ -84,7 +84,7 @@ test("creates a deterministic HMAC-reviewed single long put payload", () => {
     asOf: "2026-07-13T14:00:01.000Z"
   });
 
-  assert.equal(verification.valid, true);
+  assert.equal(verification.valid, true, verification.blockers.join(","));
   assert.deepEqual(verification.blockers, []);
 });
 
@@ -141,6 +141,27 @@ test("rejects changed payloads, wrong keys, expired reviews, and account mismatc
   assert.ok(capitalEvidenceMismatch.blockers.includes("FRESH_REVIEW_REQUIRED"));
 });
 
+test("rejects tampered deterministic review and client order identifiers", () => {
+  const review = createHedgeExecutionReview(baseInput());
+  const tamperedReviewId = verifyHedgeExecutionReview({
+    review: { ...review, reviewId: "hedge_review_tampered" },
+    signingKey: "unit-test-signing-key",
+    asOf: "2026-07-13T14:00:01.000Z"
+  });
+  const tamperedClientOrderId = verifyHedgeExecutionReview({
+    review: { ...review, clientOrderId: "hedge-entry-tampered" },
+    signingKey: "unit-test-signing-key",
+    asOf: "2026-07-13T14:00:01.000Z"
+  });
+
+  assert.equal(tamperedReviewId.valid, false);
+  assert.ok(tamperedReviewId.blockers.includes("HEDGE_REVIEW_ID_MISMATCH"));
+  assert.equal(tamperedClientOrderId.valid, false);
+  assert.ok(
+    tamperedClientOrderId.blockers.includes("HEDGE_CLIENT_ORDER_ID_MISMATCH")
+  );
+});
+
 test("requires a supported executable long put and paper-only policy defaults are explicit", () => {
   const config = buildHedgeConfig();
   assert.deepEqual(config.executionPolicy.allowedStructures, ["long_put"]);
@@ -151,6 +172,7 @@ test("requires a supported executable long put and paper-only policy defaults ar
   assert.equal(config.executionPolicy.maxNewHedgePremiumPctEquity, 0.0075);
   assert.equal(config.executionPolicy.maxTotalHedgePremiumPctEquity, 0.02);
   assert.equal(config.executionPolicy.maxDailyHedgePremiumPctEquity, 0.01);
+  assert.equal(config.executionPolicy.limitPriceMaxDriftPct, 0.1);
 
   assert.throws(
     () => createHedgeExecutionReview({ ...baseInput(), capitalEvidence: undefined }),

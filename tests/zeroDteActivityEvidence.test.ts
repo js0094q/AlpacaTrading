@@ -29,6 +29,81 @@ describe("0DTE activity evidence", () => {
     assert.equal(evidence.openExposureCount, 0);
   });
 
+  test("counts held and pending-cancel broker orders as open exposure", () => {
+    const evidence = buildZeroDteActivityEvidence(
+      {
+        tradingDate,
+        asOf,
+        positions: [],
+        orders: [
+          {
+            id: "held-order",
+            client_order_id: "held-client",
+            symbol: callA,
+            asset_class: "us_option",
+            side: "buy",
+            position_intent: "buy_to_open",
+            status: "held",
+            qty: "1",
+            filled_qty: "0",
+            limit_price: "1.00",
+            created_at: "2026-07-14T14:00:00.000Z"
+          },
+          {
+            id: "pending-cancel-order",
+            client_order_id: "pending-cancel-client",
+            symbol: callB,
+            asset_class: "us_option",
+            side: "buy",
+            position_intent: "buy_to_open",
+            status: "pending_cancel",
+            qty: "1",
+            filled_qty: "0",
+            limit_price: "1.25",
+            created_at: "2026-07-14T14:01:00.000Z"
+          }
+        ]
+      },
+      sources()
+    );
+
+    assert.equal(evidence.complete, true);
+    assert.equal(evidence.openOrderCount, 2);
+    assert.equal(evidence.openExposureCount, 2);
+    assert.equal(evidence.dailyTradeCount, 2);
+    assert.equal(evidence.dailyPremium, 225);
+  });
+
+  test("fails closed on an unrecognized broker order status while retaining exposure", () => {
+    const evidence = buildZeroDteActivityEvidence(
+      {
+        tradingDate,
+        asOf,
+        positions: [],
+        orders: [
+          {
+            id: "unknown-order",
+            client_order_id: "unknown-client",
+            symbol: callA,
+            asset_class: "us_option",
+            side: "buy",
+            position_intent: "buy_to_open",
+            status: "broker_future_state",
+            qty: "1",
+            filled_qty: "0",
+            limit_price: "1.00",
+            created_at: "2026-07-14T14:00:00.000Z"
+          }
+        ]
+      },
+      sources()
+    );
+
+    assert.equal(evidence.complete, false);
+    assert.equal(evidence.openOrderCount, 1);
+    assert.ok(evidence.blockers.includes("ZERO_DTE_ORDER_STATUS_EVIDENCE_REQUIRED"));
+  });
+
   test("deduplicates broker and ledger identities and prefers actual fill premium", () => {
     const evidence = buildZeroDteActivityEvidence(
       {

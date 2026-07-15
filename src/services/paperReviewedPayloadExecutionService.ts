@@ -9,7 +9,8 @@ import {
 import {
   findPaperExecutionByDedupeKey,
   insertPaperExecutionLedgerEntry,
-  reserveReviewedPaperExecution,
+  listActivePaperNewRiskReservations,
+  reserveReviewedPaperExecutions,
   type PaperExecutionLedgerEntry,
   updatePaperExecutionLedgerEntry
 } from "./paperExecutionLedgerService.js";
@@ -31,7 +32,10 @@ import type { DecisionId, PositionLifecycleId } from "../types.js";
 import { getTradingSafetyState } from "./tradingSafetyService.js";
 import {
   capturePaperSubmitState,
+  normalizePaperSubmitReservations,
+  paperSubmitReservationFingerprint,
   validatePaperSubmitState,
+  validatePaperSubmitReservationHeadroom,
   type PaperSubmitStateAttestation,
   type PaperSubmitStateValidation
 } from "./paperSubmitStateService.js";
@@ -467,6 +471,22 @@ export const buildPaperReviewedPayloadExecutionReport = async (
     }
     if (
       isEntryPayload(result) &&
+      (!(["success", "warning"] as string[]).includes(artifact.status) ||
+        artifact.artifact.blockers.length > 0)
+    ) {
+      blocked.push({
+        section: result.section,
+        symbol: result.symbol,
+        clientOrderId: result.clientOrderId,
+        reason: "REVIEW_ARTIFACT_ENTRY_BLOCKED",
+        explanation:
+          artifact.artifact.blockers.join(", ") ||
+          `Signed review artifact status is ${artifact.status}.`
+      });
+      continue;
+    }
+    if (
+      isEntryPayload(result) &&
       (result.side !== "buy" || !result.sourceCandidateId || !result.decisionId)
     ) {
       blocked.push({
@@ -496,6 +516,7 @@ export const buildPaperReviewedPayloadExecutionReport = async (
 
   let eligiblePayloads = normalized;
   let submitValidation: PaperSubmitStateValidation | null = null;
+  let currentSubmitState: PaperSubmitStateAttestation | null = null;
   const entryPayloads = normalized.filter(isEntryPayload);
   if (entryPayloads.length) {
     const reviewedSubmitState = artifact.artifact.submitState;
@@ -513,7 +534,7 @@ export const buildPaperReviewedPayloadExecutionReport = async (
             capturePaperSubmitState(captureInput, {
               getAccount: deps.getAccount
             }));
-        const currentSubmitState = await capture({
+        currentSubmitState = await capture({
           capturedAt: generatedAt,
           payloadSections: artifact.artifact.payloadSections
         });
@@ -572,6 +593,94 @@ export const buildPaperReviewedPayloadExecutionReport = async (
     });
   }
 
+  const reservedEntriesByClient = new Map<string, PaperExecutionLedgerEntry>();
+  const entryPayloadsToReserve = eligiblePayloads.filter(isEntryPayload);
+  if (entryPayloadsToReserve.length) {
+    if (!currentSubmitState) {
+      for (const payload of entryPayloadsToReserve) {
+        blocked.push({
+          section: payload.section,
+          symbol: payload.symbol,
+          clientOrderId: payload.clientOrderId,
+          reason: "FRESH_REVIEW_REQUIRED",
+          explanation: "SUBMIT_STATE_CAPTURE_FAILED"
+        });
+      }
+      eligiblePayloads = eligiblePayloads.filter((payload) => !isEntryPayload(payload));
+    } else {
+      const expectedReservationFingerprint = paperSubmitReservationFingerprint(
+        currentSubmitState.reservations
+      );
+      const reservation = reserveReviewedPaperExecutions({
+        inputs: entryPayloadsToReserve.map((payload) => ({
+          assetClass: payload.assetClass,
+          symbol: payload.symbol,
+          side: "buy" as const,
+          orderType: payload.type,
+          timeInForce: payload.timeInForce,
+          qty: payload.qty ?? null,
+          notional: payload.notional ?? null,
+          limitPrice: payload.limitPrice ?? null,
+          estimatedPremium: numberField(payload.raw.estimatedPremium),
+          maxRisk: numberField(payload.raw.maxRisk),
+          dedupeKey: payload.dedupeKey,
+          clientOrderId: payload.clientOrderId,
+          sourcePlanId: artifact.id,
+          sourceCandidateId: payload.sourceCandidateId!,
+          decisionId: payload.decisionId!,
+          section: payload.section,
+          payloadIndex: payload.payloadIndex,
+          payload: {
+            reviewedPayload: payload.raw,
+            submitValidation
+          },
+          rawPayload: toAlpacaPayload(payload)
+        })),
+        validateBeforeInsert: () => {
+          const currentReservations = normalizePaperSubmitReservations(
+            listActivePaperNewRiskReservations()
+          );
+          if (
+            paperSubmitReservationFingerprint(currentReservations) !==
+            expectedReservationFingerprint
+          ) {
+            return [
+              "SUBMIT_RESERVATION_STATE_DRIFT",
+              "FRESH_REVIEW_REQUIRED"
+            ];
+          }
+          const headroomBlockers = validatePaperSubmitReservationHeadroom({
+            state: currentSubmitState!,
+            sections: [
+              ...new Set(entryPayloadsToReserve.map((payload) => payload.section))
+            ],
+            reservations: currentReservations
+          });
+          return headroomBlockers.length
+            ? [...headroomBlockers, "FRESH_REVIEW_REQUIRED"]
+            : [];
+        }
+      });
+      if (!reservation.reserved) {
+        const reason = reservation.blockers[0] ?? "SUBMIT_RESERVATION_FAILED";
+        for (const payload of entryPayloadsToReserve) {
+          blocked.push({
+            section: payload.section,
+            symbol: payload.symbol,
+            clientOrderId: payload.clientOrderId,
+            reason,
+            explanation: reservation.blockers.join(", ")
+          });
+        }
+        eligiblePayloads = eligiblePayloads.filter((payload) => !isEntryPayload(payload));
+      } else {
+        reservation.entries.forEach((entry) => {
+          reservedEntriesByClient.set(entry.clientOrderId, entry);
+        });
+      }
+    }
+  }
+
   const submitted: PaperReviewedExecutionReport["submitted"] = [];
   const errors: PaperReviewedExecutionReport["errors"] = [];
   const submit = deps.submitPaperOrder ?? submitPaperOrder;
@@ -596,42 +705,18 @@ export const buildPaperReviewedPayloadExecutionReport = async (
 
     let ledger: PaperExecutionLedgerEntry;
     if (isEntryPayload(payload)) {
-      const reservation = reserveReviewedPaperExecution({
-        assetClass: payload.assetClass,
-        symbol: payload.symbol,
-        side: "buy",
-        orderType: payload.type,
-        timeInForce: payload.timeInForce,
-        qty: payload.qty ?? null,
-        notional: payload.notional ?? null,
-        limitPrice: payload.limitPrice ?? null,
-        estimatedPremium: numberField(payload.raw.estimatedPremium),
-        maxRisk: numberField(payload.raw.maxRisk),
-        dedupeKey: payload.dedupeKey,
-        clientOrderId: payload.clientOrderId,
-        sourcePlanId: artifact.id,
-        sourceCandidateId: payload.sourceCandidateId!,
-        decisionId: payload.decisionId!,
-        section: payload.section,
-        payloadIndex: payload.payloadIndex,
-        payload: {
-          reviewedPayload: payload.raw,
-          submitValidation
-        },
-        rawPayload: toAlpacaPayload(payload)
-      });
-      if (!reservation.reserved || !reservation.entry) {
+      const reservedEntry = reservedEntriesByClient.get(payload.clientOrderId);
+      if (!reservedEntry) {
         blocked.push({
           section: payload.section,
           symbol: payload.symbol,
           clientOrderId: payload.clientOrderId,
-          reason:
-            reservation.blockers[0] ?? "SUBMIT_RESERVATION_FAILED",
-          explanation: reservation.blockers.join(", ")
+          reason: "SUBMIT_RESERVATION_FAILED",
+          explanation: "Atomic reviewed reservation was not available."
         });
         continue;
       }
-      ledger = reservation.entry;
+      ledger = reservedEntry;
       updatePaperExecutionLedgerEntry(ledger.id, {
         status: "attempted",
         reason: null,

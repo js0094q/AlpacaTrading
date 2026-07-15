@@ -84,6 +84,15 @@ const numberDetail = (candidate: HedgeCandidate, key: string, fallback: number |
 
 const unsignedPayload = (review: HedgeExecutionReview) => {
   const {
+    payloadHash: _payloadHash,
+    signature: _signature,
+    ...payload
+  } = review;
+  return payload;
+};
+
+const identifierPayload = (review: HedgeExecutionReview) => {
+  const {
     reviewId: _reviewId,
     clientOrderId: _clientOrderId,
     payloadHash: _payloadHash,
@@ -91,6 +100,20 @@ const unsignedPayload = (review: HedgeExecutionReview) => {
     ...payload
   } = review;
   return payload;
+};
+
+const deterministicReviewIdentifiers = (
+  payload: ReturnType<typeof identifierPayload>
+) => {
+  const identityHash = canonicalJsonHash(payload);
+  const clientOrderId = `hedge-${payload.reviewType}-${identityHash.slice(0, 24)}`;
+  return {
+    clientOrderId,
+    reviewId: `hedge_review_${canonicalJsonHash({
+      payloadHash: identityHash,
+      clientOrderId
+    }).slice(0, 24)}`
+  };
 };
 
 const signPayload = (payloadHash: string, signingKey: string) =>
@@ -194,19 +217,18 @@ export const createHedgeExecutionReview = (
     requestId: input.requestId ?? `hedge_review_${canonicalJsonHash({ input: input.sourceRecommendationId, createdAt }).slice(0, 20)}`,
     correlationId: input.correlationId ?? null
   };
-  const payloadHash = canonicalJsonHash(reviewBase);
-  const clientOrderId = `hedge-${reviewType}-${payloadHash.slice(0, 24)}`;
-  const review = {
+  const identifiers = deterministicReviewIdentifiers(reviewBase);
+  const signedPayload = {
     ...reviewBase,
-    clientOrderId,
+    ...identifiers
+  };
+  const payloadHash = canonicalJsonHash(signedPayload);
+  return {
+    ...signedPayload,
     payloadHash,
     signature: signPayload(payloadHash, input.signingKey),
     signatureAlgorithm: "hmac-sha256" as const
-  } satisfies Omit<HedgeExecutionReview, "reviewId">;
-  return {
-    ...review,
-    reviewId: `hedge_review_${canonicalJsonHash({ payloadHash, clientOrderId }).slice(0, 24)}`
-  };
+  } satisfies HedgeExecutionReview;
 };
 
 export const verifyHedgeExecutionReview = (input: {
@@ -220,10 +242,19 @@ export const verifyHedgeExecutionReview = (input: {
 }): HedgeExecutionReviewVerification => {
   const blockers: string[] = [];
   const calculatedPayloadHash = canonicalJsonHash(unsignedPayload(input.review));
+  const expectedIdentifiers = deterministicReviewIdentifiers(
+    identifierPayload(input.review)
+  );
   if (input.review.recordType !== "hedge_execution_review") blockers.push("HEDGE_REVIEW_SCHEMA_INVALID");
   if (!["entry", "exit"].includes(input.review.reviewType)) blockers.push("HEDGE_REVIEW_TYPE_INVALID");
   if (input.review.environment !== "paper" || input.review.paperOnly !== true) blockers.push("HEDGE_ENVIRONMENT_NOT_PAPER");
   if (input.review.liveTradingEnabled !== false) blockers.push("HEDGE_LIVE_TRADING_ENABLED");
+  if (input.review.reviewId !== expectedIdentifiers.reviewId) {
+    blockers.push("HEDGE_REVIEW_ID_MISMATCH");
+  }
+  if (input.review.clientOrderId !== expectedIdentifiers.clientOrderId) {
+    blockers.push("HEDGE_CLIENT_ORDER_ID_MISMATCH");
+  }
   if (calculatedPayloadHash !== input.review.payloadHash) blockers.push("HEDGE_PAYLOAD_CHANGED");
   if (!input.signingKey.trim() || !signaturesEqual(input.review.signature, signPayload(input.review.payloadHash, input.signingKey))) {
     blockers.push("HEDGE_REVIEW_SIGNATURE_INVALID");

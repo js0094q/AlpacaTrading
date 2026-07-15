@@ -549,6 +549,247 @@ describe("paper submit state validation", () => {
     });
   });
 
+  test("retains held and pending-cancel broker orders as active cap evidence", async () => {
+    const captured = await withPaperEnv(() =>
+      capturePaperSubmitState(
+        {
+          capturedAt,
+          payloadSections: {
+            equityBuys: [
+              {
+                assetClass: "equity",
+                symbol: "AAPL",
+                side: "buy",
+                type: "market",
+                time_in_force: "day",
+                notional: "100.00",
+                sourceCandidateId: "candidate-aapl",
+                client_order_id: "paper-entry-aapl"
+              }
+            ],
+            equityAdds: [],
+            equitySells: [],
+            optionBuys: [],
+            optionSellToCloseExits: []
+          }
+        },
+        {
+          getAccount: async () => ({
+            data: {
+              id: "paper-account-123",
+              status: "ACTIVE",
+              cash: "100000",
+              equity: "100000",
+              buying_power: "100000",
+              options_buying_power: "100000",
+              options_approved_level: 3,
+              trading_blocked: false,
+              account_blocked: false
+            },
+            status: 200,
+            url: "account"
+          }),
+          listPositions: async () => ({ data: [], status: 200, url: "positions" }),
+          listOrders: async () => ({
+            data: [
+              {
+                id: "held-order",
+                symbol: "MSFT",
+                asset_class: "us_equity",
+                side: "buy",
+                status: "held",
+                notional: "100",
+                client_order_id: "held-client"
+              },
+              {
+                id: "pending-cancel-order",
+                symbol: "NVDA",
+                asset_class: "us_equity",
+                side: "buy",
+                status: "pending_cancel",
+                notional: "100",
+                client_order_id: "pending-cancel-client"
+              }
+            ],
+            status: 200,
+            url: "orders"
+          }),
+          listReservations: () => [],
+          getMarketEvidence: async () => [
+            {
+              symbol: "AAPL",
+              assetClass: "equity",
+              referencePrice: 200,
+              bid: 199.9,
+              ask: 200.1,
+              timestamp: capturedAt,
+              complete: true
+            }
+          ],
+          resolveSourceCandidate: (id) => ({
+            id,
+            symbol: "AAPL",
+            optionSymbol: null
+          })
+        }
+      )
+    );
+
+    assert.equal(captured.complete, true);
+    assert.deepEqual(
+      captured.openOrders.map((order) => order.status).sort(),
+      ["held", "pending_cancel"]
+    );
+  });
+
+  test("fails closed but retains an unrecognized open broker order status", async () => {
+    const captured = await withPaperEnv(() =>
+      capturePaperSubmitState(
+        {
+          capturedAt,
+          payloadSections: {
+            equityBuys: [{
+              assetClass: "equity",
+              symbol: "AAPL",
+              side: "buy",
+              type: "market",
+              notional: "100",
+              sourceCandidateId: "candidate-aapl",
+              client_order_id: "paper-entry-aapl"
+            }],
+            equityAdds: [],
+            equitySells: [],
+            optionBuys: [],
+            optionSellToCloseExits: []
+          }
+        },
+        {
+          getAccount: async () => ({
+            data: {
+              id: "paper-account-123",
+              status: "ACTIVE",
+              cash: "100000",
+              equity: "100000",
+              buying_power: "100000",
+              options_buying_power: "100000",
+              options_approved_level: 3,
+              trading_blocked: false,
+              account_blocked: false
+            },
+            status: 200,
+            url: "account"
+          }),
+          listPositions: async () => ({ data: [], status: 200, url: "positions" }),
+          listOrders: async () => ({
+            data: [{
+              id: "unknown-order",
+              symbol: "MSFT",
+              asset_class: "us_equity",
+              side: "buy",
+              status: "broker_future_state",
+              notional: "100",
+              client_order_id: "unknown-client"
+            }],
+            status: 200,
+            url: "orders"
+          }),
+          listReservations: () => [],
+          getMarketEvidence: async () => [{
+            symbol: "AAPL",
+            assetClass: "equity",
+            referencePrice: 200,
+            bid: 199.9,
+            ask: 200.1,
+            timestamp: capturedAt,
+            complete: true
+          }],
+          resolveSourceCandidate: (id) => ({ id, symbol: "AAPL", optionSymbol: null })
+        }
+      )
+    );
+
+    assert.equal(captured.complete, false);
+    assert.equal(captured.openOrders[0]?.status, "broker_future_state");
+    assert.ok(captured.blockers.includes("SUBMIT_ORDER_STATUS_UNRECOGNIZED"));
+  });
+
+  test("captures authoritative cross-path 0DTE activity evidence", async () => {
+    const symbol = "SPY260714C00600000";
+    const captured = await withPaperEnv(() =>
+      capturePaperSubmitState(
+        {
+          capturedAt,
+          payloadSections: {
+            equityBuys: [],
+            equityAdds: [],
+            equitySells: [],
+            optionBuys: [{
+              assetClass: "option",
+              symbol,
+              side: "buy",
+              type: "limit",
+              qty: "1",
+              limit_price: "1",
+              estimatedPremium: 100,
+              position_intent: "buy_to_open",
+              sourceCandidateId: `discovery:zero_dte_spy:${symbol}`,
+              client_order_id: "zero-dte-reviewed-entry"
+            }],
+            optionSellToCloseExits: []
+          }
+        },
+        {
+          getAccount: async () => ({
+            data: {
+              id: "paper-account-123",
+              status: "ACTIVE",
+              cash: "100000",
+              equity: "100000",
+              buying_power: "100000",
+              options_buying_power: "100000",
+              options_approved_level: 3,
+              trading_blocked: false,
+              account_blocked: false
+            },
+            status: 200,
+            url: "account"
+          }),
+          listPositions: async () => ({ data: [], status: 200, url: "positions" }),
+          listOrders: async () => ({ data: [], status: 200, url: "orders" }),
+          listReservations: () => [],
+          getMarketEvidence: async () => [{
+            symbol,
+            assetClass: "option",
+            referencePrice: 1,
+            bid: 0.95,
+            ask: 1.05,
+            timestamp: capturedAt,
+            complete: true
+          }],
+          resolveSourceCandidate: (id) => ({ id, symbol: "SPY", optionSymbol: symbol }),
+          buildZeroDteActivityEvidence: (input) => ({
+            tradingDate: input.tradingDate,
+            asOf: input.asOf,
+            complete: true,
+            dailyTradeCount: 1,
+            dailyPremium: 125,
+            dailyRealizedLoss: 0,
+            openPositionCount: 0,
+            openOrderCount: 1,
+            openExposureCount: 1,
+            blockers: [],
+            warnings: [],
+            evidenceFingerprint: "activity-fingerprint"
+          })
+        }
+      )
+    );
+
+    assert.equal(captured.complete, true);
+    assert.equal(captured.zeroDteActivityEvidence?.dailyTradeCount, 1);
+    assert.equal(captured.zeroDteActivityEvidence?.openExposureCount, 1);
+  });
+
   test("fails closed when current market evidence is missing", async () => {
     const captured = await withPaperEnv(() =>
       capturePaperSubmitState(

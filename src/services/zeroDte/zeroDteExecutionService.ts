@@ -3,12 +3,14 @@ import { getDb } from "../../lib/db.js";
 import { redactSensitiveText } from "../../lib/securityRedaction.js";
 import {
   getAccount,
+  getLatestOptionSnapshots,
   getPaperOrder,
   listPaperPositions,
   listRecentPaperOrders,
   submitPaperOrder,
   type AlpacaAccountRaw,
   type AlpacaApiResponse,
+  type AlpacaOptionSnapshotRaw,
   type AlpacaPaperOrderRequest,
   type AlpacaPositionRaw,
   type AlpacaSubmittedOrder
@@ -18,6 +20,8 @@ import {
   findPaperExecutionByClientOrderId,
   findPaperExecutionByDedupeKey,
   insertPaperExecutionLedgerEntry,
+  listActivePaperNewRiskReservations,
+  runAtomicPaperNewRiskReservation,
   updatePaperExecutionLedgerEntry,
   type PaperExecutionLedgerEntry,
   type PaperExecutionLedgerStatus
@@ -40,7 +44,12 @@ import {
   type ZeroDteSubmitOrderIntent
 } from "./zeroDteSubmitAttestationService.js";
 import { paperReviewArtifactSigningKey } from "../paperReviewArtifactService.js";
+import {
+  normalizePaperSubmitReservations,
+  paperSubmitReservationFingerprint
+} from "../paperSubmitStateService.js";
 import { parseOptionSymbol } from "../optionSymbolService.js";
+import { isActiveBrokerOrderStatus } from "../brokerOrderStatusService.js";
 import type {
   ZeroDteAccountOrderSnapshot,
   ZeroDteAccountPositionSnapshot,
@@ -94,6 +103,10 @@ export interface ZeroDtePaperMutationProvider {
   listPositions?: typeof listPaperPositions;
   listOrders?: typeof listRecentPaperOrders;
   getOrder?: typeof getPaperOrder;
+  getLatestOptionSnapshots?: typeof getLatestOptionSnapshots;
+  refreshQuote?: (
+    symbol: string
+  ) => Promise<ZeroDteQueueCandidate["quote"]>;
   submitPaperOrder?: typeof submitPaperOrder;
 }
 
@@ -469,7 +482,7 @@ export const evaluateZeroDteExecutionEligibility = (
     blockers.push("DUPLICATE_EXPOSURE");
   }
   const openOrders = account.openOrders ?? [];
-  if (openOrders.some((order) => normalizedSymbol(order.symbol) === symbol && ACTIVE_ORDER_STATUSES.has(normalizedStatus(order.status)))) {
+  if (openOrders.some((order) => normalizedSymbol(order.symbol) === symbol && isActiveBrokerOrderStatus(order.status))) {
     blockers.push("DUPLICATE_EXPOSURE");
   }
   if (account.paperVerified === false || String(account.environment || "paper").toLowerCase() !== "paper") {
@@ -675,6 +688,7 @@ const zeroDteAttestationExpected = (input: {
   accountStateFingerprint: accountStateFingerprint(input.account),
   activityEvidenceFingerprint: text(input.account.activityEvidenceFingerprint) ?? "",
   allocationIdentity: "baseline-v1",
+  submitPriceDriftLimitPct: submitPriceDriftLimitPct(),
   orderIntent: zeroDteSubmitOrderIntent(input.candidate, input.eligibility)
 });
 
@@ -1603,6 +1617,90 @@ const accountFromProvider = async (
   );
 };
 
+const refreshZeroDteQuote = async (input: {
+  candidate: ZeroDteQueueCandidate;
+  provider: ZeroDtePaperMutationProvider;
+}) => {
+  if (input.provider.refreshQuote) {
+    return input.provider.refreshQuote(input.candidate.optionSymbol);
+  }
+  // A fully injected account snapshot is the unit-test/offline provider contract
+  // unless that provider also supplies an explicit quote source.
+  if (
+    !input.provider.getLatestOptionSnapshots &&
+    (input.provider.account ||
+      input.provider.getAccount ||
+      input.provider.listPositions ||
+      input.provider.listOrders)
+  ) {
+    return input.candidate.quote;
+  }
+  const response = await (
+    input.provider.getLatestOptionSnapshots ?? getLatestOptionSnapshots
+  )([normalizedSymbol(input.candidate.optionSymbol)]);
+  const snapshots = response.data as Record<string, AlpacaOptionSnapshotRaw>;
+  const snapshot = snapshots[normalizedSymbol(input.candidate.optionSymbol)];
+  const quote = snapshot?.latestQuote ?? snapshot?.latest_quote;
+  const trade = snapshot?.latestTrade ?? snapshot?.latest_trade;
+  const bid = positive(quote?.bp ?? quote?.b);
+  const ask = positive(quote?.ap ?? quote?.a);
+  const midpoint =
+    bid !== null && ask !== null && ask >= bid
+      ? roundMoney((bid + ask) / 2)
+      : positive(trade?.p);
+  const spreadPct =
+    bid !== null && ask !== null && midpoint !== null && midpoint > 0
+      ? ((ask - bid) / midpoint) * 100
+      : null;
+  return {
+    ...input.candidate.quote,
+    bid,
+    ask,
+    midpoint,
+    premium: midpoint,
+    spreadPct,
+    marketTimestamp: text(quote?.t) ?? text(trade?.t)
+  };
+};
+
+const submitPriceDriftLimitPct = () => {
+  const parsed = Number(process.env.PAPER_SUBMIT_MAX_PRICE_DRIFT_PCT ?? 10);
+  return Number.isFinite(parsed) ? Math.min(100, Math.max(0, parsed)) : 10;
+};
+
+const zeroDteQuoteDriftBlockers = (input: {
+  reviewed: ZeroDteQueueCandidate["quote"];
+  current: ZeroDteQueueCandidate["quote"];
+}) => {
+  const reviewedPrice = positive(input.reviewed.midpoint ?? input.reviewed.premium);
+  const currentPrice = positive(input.current.midpoint ?? input.current.premium);
+  const reviewedTimestamp = text(input.reviewed.marketTimestamp);
+  const currentTimestamp = text(input.current.marketTimestamp);
+  const blockers: string[] = [];
+  if (
+    reviewedPrice === null ||
+    currentPrice === null ||
+    !reviewedTimestamp ||
+    !currentTimestamp
+  ) {
+    blockers.push("ZERO_DTE_MARKET_EVIDENCE_UNAVAILABLE");
+  } else {
+    const driftPct =
+      (Math.abs(currentPrice - reviewedPrice) / reviewedPrice) * 100;
+    if (driftPct > submitPriceDriftLimitPct()) {
+      blockers.push("ZERO_DTE_PRICE_DRIFT");
+    }
+    if (
+      !Number.isFinite(Date.parse(reviewedTimestamp)) ||
+      !Number.isFinite(Date.parse(currentTimestamp)) ||
+      Date.parse(currentTimestamp) < Date.parse(reviewedTimestamp)
+    ) {
+      blockers.push("ZERO_DTE_QUOTE_IDENTITY_DRIFT");
+    }
+  }
+  return unique(blockers);
+};
+
 const recordCandidateExecutionState = (candidateId: string, state: "selected" | "executed", asOf: string) => {
   getDb().prepare(
     `UPDATE zero_dte_candidates
@@ -1791,6 +1889,9 @@ export const executeZeroDteCandidate = async (input: {
     });
   }
 
+  const expectedReservationFingerprint = paperSubmitReservationFingerprint(
+    normalizePaperSubmitReservations(listActivePaperNewRiskReservations())
+  );
   let freshAccount: ZeroDteAccountSnapshot;
   try {
     freshAccount = await accountFromProvider(
@@ -1821,25 +1922,70 @@ export const executeZeroDteCandidate = async (input: {
   }
 
   const freshAsOf = provider.now?.() ?? nowIso();
+  let freshQuote: ZeroDteQueueCandidate["quote"];
+  try {
+    freshQuote = await refreshZeroDteQuote({
+      candidate: input.candidate,
+      provider
+    });
+  } catch {
+    const blockers = [
+      "ZERO_DTE_MARKET_EVIDENCE_UNAVAILABLE",
+      "FRESH_REVIEW_REQUIRED"
+    ];
+    const blockedEligibility = { ...reviewedEligibility, blockers };
+    const ledger = createBlockedLedgerEntry({
+      candidate: input.candidate,
+      eligibility: blockedEligibility,
+      reason: blockers[0],
+      now: freshAsOf,
+      attestation
+    });
+    return baseResult({
+      candidate: input.candidate,
+      decisionId: input.decisionId,
+      attestationId: attestation.attestationId,
+      status: "blocked",
+      ledgerId: ledger.id,
+      blockers,
+      eligibility: blockedEligibility
+    });
+  }
+  const freshCandidate: ZeroDteQueueCandidate = {
+    ...input.candidate,
+    quote: freshQuote
+  };
+  const quoteDriftBlockers = zeroDteQuoteDriftBlockers({
+    reviewed: input.candidate.quote,
+    current: freshQuote
+  });
   const freshLedgerEntries: ZeroDteExistingLedgerEntry[] = [];
   const freshLedger = findPaperExecutionByDedupeKey(reviewedEligibility.reservationKey);
   if (freshLedger) {
     freshLedgerEntries.push({ dedupeKey: freshLedger.dedupeKey, status: freshLedger.status });
   }
   const freshEligibility = evaluateZeroDteExecutionEligibility({
-    candidate: input.candidate,
+    candidate: freshCandidate,
     config,
     runtime,
     account: freshAccount,
     now: freshAsOf,
     existingLedgerEntries: freshLedgerEntries
   });
+  const signedIntentEligibility: ZeroDteEligibilityResult = {
+    ...freshEligibility,
+    limitPrice: reviewedEligibility.limitPrice,
+    estimatedPremium: reviewedEligibility.estimatedPremium,
+    reservationKey: reviewedEligibility.reservationKey,
+    clientOrderId: reviewedEligibility.clientOrderId,
+    quantity: reviewedEligibility.quantity
+  };
   const freshExpected = zeroDteAttestationExpected({
     candidate: input.candidate,
     decisionId: input.decisionId,
     config,
     account: freshAccount,
-    eligibility: freshEligibility
+    eligibility: signedIntentEligibility
   });
   const verification = verifyZeroDteSubmitAttestation({
     attestation,
@@ -1854,6 +2000,7 @@ export const executeZeroDteCandidate = async (input: {
   });
   const submitBlockers = unique([
     ...freshEligibility.blockers,
+    ...quoteDriftBlockers,
     ...verification.blockers,
     ...freshDecisionBlockers
   ]);
@@ -1893,8 +2040,19 @@ export const executeZeroDteCandidate = async (input: {
 
   const eligibility: ZeroDteEligibilityResult = {
     ...freshEligibility,
+    limitPrice: reviewedEligibility.limitPrice,
+    estimatedPremium: reviewedEligibility.estimatedPremium,
+    reservationKey: reviewedEligibility.reservationKey,
+    clientOrderId: reviewedEligibility.clientOrderId,
+    quantity: reviewedEligibility.quantity,
     evidence: {
       ...freshEligibility.evidence,
+      reviewedOrderIntent: zeroDteSubmitOrderIntent(
+        input.candidate,
+        reviewedEligibility
+      ),
+      freshQuote,
+      freshQuoteFingerprint: canonicalJsonHash(freshQuote),
       attestationId: attestation.attestationId,
       attestationPayloadHash: attestation.payloadHash,
       attestationVerification: verification
@@ -1912,83 +2070,139 @@ export const executeZeroDteCandidate = async (input: {
     attestation
   };
 
-  let ledger: PaperExecutionLedgerEntry;
-  try {
-    const exactReusableLedger = findPaperExecutionByDedupeKey(eligibility.reservationKey);
-    if (
-      exactReusableLedger &&
-      REPAIRABLE_ZERO_DTE_LEDGER_STATUSES.has(normalizedStatus(exactReusableLedger.status)) &&
-      exactReusableLedger.clientOrderId === eligibility.clientOrderId &&
-      exactReusableLedger.sourceCandidateId === input.candidate.candidateId &&
-      exactReusableLedger.alpacaOrderId === null &&
-      (exactReusableLedger.decisionId === null || exactReusableLedger.decisionId === input.decisionId)
-    ) {
-      updatePaperExecutionLedgerEntry(exactReusableLedger.id, {
-        status: "reserved",
-        reason: null,
-        blockedReason: null,
-        errorMessage: null
-      });
-      const payloadJson = JSON.stringify(reservationPayload);
-      getDb().prepare(
-        `UPDATE paper_execution_ledger
-         SET source_plan_id = ?, payload_json = ?, raw_payload_json = ?, updated_at = ?
-         WHERE id = ?`
-      ).run(
-        attestation.attestationId,
-        payloadJson,
-        payloadJson,
-        freshAsOf,
-        exactReusableLedger.id
+  const atomicReservation = runAtomicPaperNewRiskReservation({
+    validateBeforeInsert: () => {
+      const currentReservations = normalizePaperSubmitReservations(
+        listActivePaperNewRiskReservations()
       );
-      ledger = {
-        ...exactReusableLedger,
-        sourcePlanId: attestation.attestationId,
-        payloadJson,
-        rawPayloadJson: payloadJson,
-        status: "reserved",
-        reason: null,
-        blockedReason: null,
-        errorMessage: null
-      };
-    } else {
-      ledger = insertPaperExecutionLedgerEntry({
-        mode: "zero-dte-entry",
-        assetClass: "option",
-        symbol: normalizedSymbol(input.candidate.optionSymbol),
-        underlyingSymbol: normalizedSymbol(input.candidate.underlyingSymbol),
-        strategy: "zero_dte_level_2",
-        side: "buy",
-        orderType: "limit",
-        timeInForce: "day",
-        qty: String(eligibility.quantity),
-        limitPrice: String(eligibility.limitPrice),
-        estimatedPremium: eligibility.estimatedPremium,
-        maxRisk: eligibility.estimatedPremium,
-        dedupeKey: eligibility.reservationKey,
-        clientOrderId: eligibility.clientOrderId,
-        status: "reserved",
-        sourcePlanId: attestation.attestationId,
-        sourceCandidateId: input.candidate.candidateId,
-        payload: reservationPayload
+      if (
+        paperSubmitReservationFingerprint(currentReservations) !==
+        expectedReservationFingerprint
+      ) {
+        return [
+          "ZERO_DTE_RESERVATION_STATE_DRIFT",
+          "FRESH_REVIEW_REQUIRED"
+        ];
+      }
+      const currentLedgerEntries: ZeroDteExistingLedgerEntry[] = [];
+      const currentLedger = findPaperExecutionByDedupeKey(
+        eligibility.reservationKey
+      );
+      if (currentLedger) {
+        currentLedgerEntries.push({
+          dedupeKey: currentLedger.dedupeKey,
+          status: currentLedger.status
+        });
+      }
+      const currentHeadroom = evaluateZeroDteExecutionEligibility({
+        candidate: freshCandidate,
+        config,
+        runtime,
+        account: freshAccount,
+        now: freshAsOf,
+        existingLedgerEntries: currentLedgerEntries
       });
+      const blockers = unique([
+        ...currentHeadroom.blockers,
+        ...zeroDteQuoteDriftBlockers({
+          reviewed: input.candidate.quote,
+          current: freshQuote
+        })
+      ]);
+      return blockers.length
+        ? [...blockers, "FRESH_REVIEW_REQUIRED"]
+        : [];
+    },
+    insert: () => {
+      const exactReusableLedger = findPaperExecutionByDedupeKey(
+        eligibility.reservationKey
+      );
+      let reservedLedger: PaperExecutionLedgerEntry;
+      if (
+        exactReusableLedger &&
+        REPAIRABLE_ZERO_DTE_LEDGER_STATUSES.has(
+          normalizedStatus(exactReusableLedger.status)
+        ) &&
+        exactReusableLedger.clientOrderId === eligibility.clientOrderId &&
+        exactReusableLedger.sourceCandidateId === input.candidate.candidateId &&
+        exactReusableLedger.alpacaOrderId === null &&
+        (exactReusableLedger.decisionId === null ||
+          exactReusableLedger.decisionId === input.decisionId)
+      ) {
+        updatePaperExecutionLedgerEntry(exactReusableLedger.id, {
+          status: "reserved",
+          reason: null,
+          blockedReason: null,
+          errorMessage: null
+        });
+        const payloadJson = JSON.stringify(reservationPayload);
+        getDb().prepare(
+          `UPDATE paper_execution_ledger
+           SET source_plan_id = ?, payload_json = ?, raw_payload_json = ?, updated_at = ?
+           WHERE id = ?`
+        ).run(
+          attestation.attestationId,
+          payloadJson,
+          payloadJson,
+          freshAsOf,
+          exactReusableLedger.id
+        );
+        reservedLedger = {
+          ...exactReusableLedger,
+          sourcePlanId: attestation.attestationId,
+          payloadJson,
+          rawPayloadJson: payloadJson,
+          status: "reserved",
+          reason: null,
+          blockedReason: null,
+          errorMessage: null
+        };
+      } else {
+        reservedLedger = insertPaperExecutionLedgerEntry({
+          mode: "zero-dte-entry",
+          assetClass: "option",
+          symbol: normalizedSymbol(input.candidate.optionSymbol),
+          underlyingSymbol: normalizedSymbol(input.candidate.underlyingSymbol),
+          strategy: "zero_dte_level_2",
+          side: "buy",
+          orderType: "limit",
+          timeInForce: "day",
+          qty: String(eligibility.quantity),
+          limitPrice: String(eligibility.limitPrice),
+          estimatedPremium: eligibility.estimatedPremium,
+          maxRisk: eligibility.estimatedPremium,
+          dedupeKey: eligibility.reservationKey,
+          clientOrderId: eligibility.clientOrderId,
+          status: "reserved",
+          sourcePlanId: attestation.attestationId,
+          sourceCandidateId: input.candidate.candidateId,
+          payload: reservationPayload
+        });
+      }
+      ensureZeroDteLedgerDecisionLink({
+        ledgerId: reservedLedger.id,
+        decisionId: input.decisionId,
+        now: freshAsOf
+      });
+      return reservedLedger;
     }
-    ensureZeroDteLedgerDecisionLink({
-      ledgerId: ledger.id,
-      decisionId: input.decisionId,
-      now: freshAsOf
-    });
-  } catch {
-    const duplicate = findPaperExecutionByDedupeKey(eligibility.reservationKey);
+  });
+  if (!atomicReservation.reserved || !atomicReservation.value) {
+    const blockers = unique([
+      ...atomicReservation.blockers,
+      "FRESH_REVIEW_REQUIRED"
+    ]);
+    const duplicate = blockers.includes("DUPLICATE_ORDER");
     return baseResult({
       candidate: input.candidate,
       decisionId: input.decisionId,
-      status: "duplicate_blocked",
-      ledgerId: duplicate?.id ?? null,
-      blockers: ["DUPLICATE_ORDER"],
-      eligibility
+      attestationId: attestation.attestationId,
+      status: duplicate ? "duplicate_blocked" : "blocked",
+      blockers,
+      eligibility: { ...eligibility, blockers }
     });
   }
+  const ledger = atomicReservation.value;
 
   db.prepare(
     `INSERT OR IGNORE INTO zero_dte_paper_trades

@@ -25,22 +25,18 @@ import type {
   ReviewedPayloadSectionName,
   ReviewedPayloadSections
 } from "./paperReviewArtifactService.js";
+import { classifyBrokerOrderStatus } from "./brokerOrderStatusService.js";
+import {
+  buildZeroDteActivityEvidence,
+  type ZeroDteActivityEvidence
+} from "./zeroDte/zeroDteActivityEvidenceService.js";
+import { loadZeroDteConfig } from "./zeroDte/zeroDteConfigService.js";
+import { parseOptionSymbol } from "./optionSymbolService.js";
 
 const ENTRY_SECTIONS = new Set<ReviewedPayloadSectionName>([
   "equityBuys",
   "equityAdds",
   "optionBuys"
-]);
-
-const ACTIVE_ORDER_STATUSES = new Set([
-  "new",
-  "accepted",
-  "pending_new",
-  "partially_filled",
-  "accepted_for_bidding",
-  "pending_replace",
-  "submitted",
-  "partial"
 ]);
 
 export interface PaperSubmitConfiguration {
@@ -61,6 +57,10 @@ export interface PaperSubmitConfiguration {
   optionMaxPositionRiskPct: number;
   quoteMaxAgeSeconds: number;
   maxPriceDriftPct: number;
+  zeroDteMaxTradesPerDay?: number;
+  zeroDteMaxDailyPremium?: number;
+  zeroDteMaxDailyRealizedLoss?: number;
+  zeroDteMaxOpenPositions?: number;
 }
 
 export interface PaperSubmitSafetyConfig extends PaperSubmitConfiguration {
@@ -151,6 +151,7 @@ export interface PaperSubmitStateAttestation {
   structuralPortfolioFingerprint: string;
   portfolioFingerprint: string;
   marketEvidenceFingerprint: string;
+  zeroDteActivityEvidence?: ZeroDteActivityEvidence | null;
   allocationAttestation: {
     mode: "baseline";
     identity: "baseline-v1";
@@ -187,6 +188,7 @@ export interface PaperSubmitStateDeps {
   resolveSourceCandidate?: (
     sourceCandidateId: string
   ) => SourceCandidateIdentity | null;
+  buildZeroDteActivityEvidence?: typeof buildZeroDteActivityEvidence;
 }
 
 const unique = (values: string[]) => [...new Set(values.filter(Boolean))];
@@ -232,6 +234,7 @@ export const loadPaperSubmitSafetyConfig = (
   const options = env === process.env ? paperOptionsConfig() : null;
   const liveTradingEnabled =
     flag(env.ALPACA_LIVE_TRADE) || flag(env.LIVE_TRADING_ENABLED);
+  const zeroDte = env === process.env ? loadZeroDteConfig() : null;
 
   return {
     environment: String(env.ALPACA_ENV || "paper").trim().toLowerCase(),
@@ -288,6 +291,17 @@ export const loadPaperSubmitSafetyConfig = (
       percent(env.PAPER_OPTIONS_MAX_POSITION_RISK_PCT, 5),
     quoteMaxAgeSeconds: positive(env.PAPER_SUBMIT_QUOTE_MAX_AGE_SECONDS, 60),
     maxPriceDriftPct: percent(env.PAPER_SUBMIT_MAX_PRICE_DRIFT_PCT, 10),
+    zeroDteMaxTradesPerDay:
+      zeroDte?.maxTradesPerDay ??
+      Math.max(1, Math.floor(positive(env.ZERO_DTE_MAX_TRADES_PER_DAY, 3))),
+    zeroDteMaxDailyPremium:
+      zeroDte?.maxDailyPremium ?? positive(env.ZERO_DTE_MAX_DAILY_PREMIUM, 750),
+    zeroDteMaxDailyRealizedLoss:
+      zeroDte?.maxDailyRealizedLoss ??
+      positive(env.ZERO_DTE_MAX_DAILY_REALIZED_LOSS, 250),
+    zeroDteMaxOpenPositions:
+      zeroDte?.maxOpenPositions ??
+      Math.max(1, Math.floor(positive(env.ZERO_DTE_MAX_OPEN_POSITIONS, 3))),
     allocationIdentity: "baseline-v1"
   };
 };
@@ -433,12 +447,15 @@ const normalizeOrders = (orders: AlpacaSubmittedOrder[]) => {
   const blockers: string[] = [];
   const normalized = orders
     .filter((order) => {
-      const status = text(order.status)?.toLowerCase();
-      if (!status) {
+      const classification = classifyBrokerOrderStatus(order.status);
+      if (!classification.normalized) {
         blockers.push("SUBMIT_ORDER_EVIDENCE_UNAVAILABLE");
         return false;
       }
-      return ACTIVE_ORDER_STATUSES.has(status);
+      if (!classification.known) {
+        blockers.push("SUBMIT_ORDER_STATUS_UNRECOGNIZED");
+      }
+      return classification.active;
     })
     .map((order): PaperSubmitOrderState => {
       const symbol = upper(order.symbol);
@@ -465,7 +482,7 @@ const normalizeOrders = (orders: AlpacaSubmittedOrder[]) => {
   return { orders: normalized, blockers: unique(blockers) };
 };
 
-const normalizeReservations = (
+export const normalizePaperSubmitReservations = (
   reservations: PaperExecutionLedgerEntry[]
 ): PaperSubmitReservationState[] =>
   reservations
@@ -485,6 +502,34 @@ const normalizeReservations = (
         `${right.symbol}:${right.clientOrderIdHash}`
       )
     );
+
+export const paperSubmitReservationFingerprint = (
+  reservations: PaperSubmitReservationState[]
+) => canonicalJsonHash(reservations);
+
+const zeroDteIntents = (intents: PaperSubmitIntent[]) =>
+  intents.filter(
+    (intent) =>
+      intent.assetClass === "option" &&
+      intent.sourceCandidateId?.startsWith("discovery:zero_dte_spy:")
+  );
+
+const zeroDteActivityStateFingerprint = (
+  evidence: ZeroDteActivityEvidence | null | undefined
+) =>
+  evidence
+    ? canonicalJsonHash({
+        tradingDate: evidence.tradingDate,
+        complete: evidence.complete,
+        dailyTradeCount: evidence.dailyTradeCount,
+        dailyPremium: evidence.dailyPremium,
+        dailyRealizedLoss: evidence.dailyRealizedLoss,
+        openPositionCount: evidence.openPositionCount,
+        openOrderCount: evidence.openOrderCount,
+        openExposureCount: evidence.openExposureCount,
+        blockers: [...evidence.blockers].sort()
+      })
+    : null;
 
 const quoteParts = (quote: Record<string, unknown> | undefined) => ({
   bid: finite(quote?.bp ?? quote?.b),
@@ -691,6 +736,7 @@ export const capturePaperSubmitState = async (
       structuralPortfolioFingerprint: canonicalJsonHash([]),
       portfolioFingerprint: canonicalJsonHash([]),
       marketEvidenceFingerprint: canonicalJsonHash([]),
+      zeroDteActivityEvidence: null,
       allocationAttestation: {
         mode: "baseline",
         identity: "baseline-v1",
@@ -728,10 +774,12 @@ export const capturePaperSubmitState = async (
   }
 
   let positions: PaperSubmitPositionState[] = [];
+  let rawPositions: AlpacaPositionRaw[] = [];
   if (positionsResult.status === "fulfilled") {
-    const normalized = normalizePositions(
-      Array.isArray(positionsResult.value.data) ? positionsResult.value.data : []
-    );
+    rawPositions = Array.isArray(positionsResult.value.data)
+      ? positionsResult.value.data
+      : [];
+    const normalized = normalizePositions(rawPositions);
     positions = normalized.positions;
     blockers.push(...normalized.blockers);
   } else {
@@ -739,10 +787,12 @@ export const capturePaperSubmitState = async (
   }
 
   let openOrders: PaperSubmitOrderState[] = [];
+  let rawOrders: AlpacaSubmittedOrder[] = [];
   if (ordersResult.status === "fulfilled") {
-    const normalized = normalizeOrders(
-      Array.isArray(ordersResult.value.data) ? ordersResult.value.data : []
-    );
+    rawOrders = Array.isArray(ordersResult.value.data)
+      ? ordersResult.value.data
+      : [];
+    const normalized = normalizeOrders(rawOrders);
     openOrders = normalized.orders;
     blockers.push(...normalized.blockers);
   } else {
@@ -751,7 +801,7 @@ export const capturePaperSubmitState = async (
 
   let reservations: PaperSubmitReservationState[] = [];
   try {
-    reservations = normalizeReservations(
+    reservations = normalizePaperSubmitReservations(
       (deps.listReservations ?? listActivePaperNewRiskReservations)()
     );
   } catch {
@@ -771,6 +821,44 @@ export const capturePaperSubmitState = async (
       quoteMaxAgeSeconds: config.quoteMaxAgeSeconds
     })
   );
+
+  let zeroDteActivityEvidence: ZeroDteActivityEvidence | null = null;
+  const zeroDteEntries = zeroDteIntents(normalizedIntents.intents);
+  if (zeroDteEntries.length) {
+    const tradingDates = unique(
+      zeroDteEntries
+        .map((intent) => parseOptionSymbol(intent.symbol))
+        .map((parsed) => (parsed.ok ? parsed.expirationDate : ""))
+        .filter(Boolean)
+    );
+    if (
+      tradingDates.length !== 1 ||
+      positionsResult.status !== "fulfilled" ||
+      ordersResult.status !== "fulfilled"
+    ) {
+      blockers.push(
+        "ZERO_DTE_ACTIVITY_SOURCE_UNAVAILABLE",
+        "ZERO_DTE_ACTIVITY_EVIDENCE_INCOMPLETE"
+      );
+    } else {
+      try {
+        zeroDteActivityEvidence = (
+          deps.buildZeroDteActivityEvidence ?? buildZeroDteActivityEvidence
+        )({
+          tradingDate: tradingDates[0]!,
+          asOf: input.capturedAt,
+          positions: rawPositions,
+          orders: rawOrders
+        });
+        blockers.push(...zeroDteActivityEvidence.blockers);
+      } catch {
+        blockers.push(
+          "ZERO_DTE_ACTIVITY_SOURCE_UNAVAILABLE",
+          "ZERO_DTE_ACTIVITY_EVIDENCE_INCOMPLETE"
+        );
+      }
+    }
+  }
   blockers.push(
     ...sourceIdentityBlockers({
       intents: normalizedIntents.intents,
@@ -820,6 +908,7 @@ export const capturePaperSubmitState = async (
     structuralPortfolioFingerprint: canonicalJsonHash(structuralState),
     portfolioFingerprint: canonicalJsonHash(portfolioState),
     marketEvidenceFingerprint: canonicalJsonHash(marketEvidence),
+    zeroDteActivityEvidence,
     allocationAttestation: {
       mode: "baseline",
       identity: "baseline-v1",
@@ -1091,6 +1180,67 @@ const capBlockers = (
   return unique(blockers);
 };
 
+const zeroDteCapBlockers = (
+  state: PaperSubmitStateAttestation,
+  sections: ReviewedPayloadSectionName[]
+) => {
+  const intents = zeroDteIntents(selectedIntents(state, sections));
+  if (!intents.length) return [];
+  const blockers: string[] = [];
+  const evidence = state.zeroDteActivityEvidence;
+  if (
+    !evidence?.complete ||
+    evidence.dailyTradeCount === null ||
+    evidence.dailyPremium === null ||
+    evidence.dailyRealizedLoss === null ||
+    evidence.openExposureCount === null
+  ) {
+    return unique([
+      ...(evidence?.blockers ?? []),
+      "ZERO_DTE_DAILY_COUNTER_EVIDENCE_REQUIRED",
+      "ZERO_DTE_ACTIVITY_EVIDENCE_INCOMPLETE"
+    ]);
+  }
+  const risks = intents.map((intent) => intentRisk(intent, state));
+  if (risks.some((risk) => risk === null || !Number.isFinite(risk) || risk <= 0)) {
+    return ["ZERO_DTE_DAILY_COUNTER_EVIDENCE_REQUIRED"];
+  }
+  const requestedPremium = risks.reduce<number>(
+    (sum, risk) => sum + (risk ?? 0),
+    0
+  );
+  const config = state.configuration;
+  const maxTrades = config.zeroDteMaxTradesPerDay ?? 3;
+  const maxDailyPremium = config.zeroDteMaxDailyPremium ?? 750;
+  const maxDailyRealizedLoss = config.zeroDteMaxDailyRealizedLoss ?? 250;
+  const maxOpenPositions = config.zeroDteMaxOpenPositions ?? 3;
+  if (evidence.dailyTradeCount + intents.length > maxTrades) {
+    blockers.push("DAILY_TRADE_LIMIT");
+  }
+  if (evidence.dailyPremium + requestedPremium > maxDailyPremium) {
+    blockers.push("DAILY_PREMIUM_LIMIT");
+  }
+  if (evidence.dailyRealizedLoss >= maxDailyRealizedLoss) {
+    blockers.push("DAILY_LOSS_LIMIT");
+  }
+  if (evidence.openExposureCount + intents.length > maxOpenPositions) {
+    blockers.push("MAX_OPEN_0DTE_POSITIONS");
+  }
+  return unique(blockers);
+};
+
+export const validatePaperSubmitReservationHeadroom = (input: {
+  state: PaperSubmitStateAttestation;
+  sections: ReviewedPayloadSectionName[];
+  reservations: PaperSubmitReservationState[];
+}) => {
+  const state = { ...input.state, reservations: input.reservations };
+  return unique([
+    ...capBlockers(state, input.sections),
+    ...zeroDteCapBlockers(state, input.sections)
+  ]);
+};
+
 const evidenceForIntent = (
   state: PaperSubmitStateAttestation,
   intent: PaperSubmitIntent
@@ -1160,6 +1310,23 @@ export const validatePaperSubmitState = (input: {
   ) {
     warnings.push("SUBMIT_PORTFOLIO_MARK_CHANGED");
   }
+  const reviewedZeroDteIntents = zeroDteIntents(reviewedIntents);
+  if (reviewedZeroDteIntents.length) {
+    const reviewedActivityFingerprint = zeroDteActivityStateFingerprint(
+      input.reviewed.zeroDteActivityEvidence
+    );
+    const currentActivityFingerprint = zeroDteActivityStateFingerprint(
+      input.current.zeroDteActivityEvidence
+    );
+    if (!reviewedActivityFingerprint || !currentActivityFingerprint) {
+      blockers.push(
+        "ZERO_DTE_DAILY_COUNTER_EVIDENCE_REQUIRED",
+        "ZERO_DTE_ACTIVITY_EVIDENCE_INCOMPLETE"
+      );
+    } else if (reviewedActivityFingerprint !== currentActivityFingerprint) {
+      blockers.push("ZERO_DTE_ACTIVITY_EVIDENCE_CHANGED");
+    }
+  }
 
   blockers.push(
     ...marketEvidenceBlockers({
@@ -1197,6 +1364,7 @@ export const validatePaperSubmitState = (input: {
   }
 
   blockers.push(...capBlockers(input.current, input.sections));
+  blockers.push(...zeroDteCapBlockers(input.current, input.sections));
   blockers.push(...input.current.blockers);
   const finalBlockers = unique(blockers);
   if (finalBlockers.length) finalBlockers.push("FRESH_REVIEW_REQUIRED");

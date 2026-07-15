@@ -1192,10 +1192,7 @@ export const persistHedgeExecutionReview = (review: HedgeExecutionReview) => {
         payload_hash, signature, status, review_json, decision_id,
         decision_role, position_lifecycle_id, decision_linkage_status
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'EXACT')
-      ON CONFLICT(review_id) DO UPDATE SET
-        expires_at = excluded.expires_at,
-        status = excluded.status,
-        review_json = excluded.review_json
+      ON CONFLICT(review_id) DO NOTHING
       `
     )
     .run(
@@ -1248,9 +1245,47 @@ export const readHedgeExecutionReview = (input: {
 } => {
   const row = getDb()
     .prepare(
-      `SELECT review_json FROM hedge_execution_reviews WHERE review_id = ? LIMIT 1`
+      `SELECT her.review_id, her.created_at, her.expires_at, her.review_type,
+              her.client_order_id, her.account_hash,
+              her.source_recommendation_id, her.source_snapshot_id,
+              her.payload_hash, her.signature, her.status, her.review_json,
+              her.decision_id, her.decision_role, her.position_lifecycle_id,
+              her.decision_linkage_status,
+              ds.decision_id AS linked_decision_id,
+              ds.origin_type AS linked_origin_type,
+              ds.origin_id AS linked_origin_id,
+              ds.decision_role AS linked_decision_role,
+              ds.candidate_id AS linked_candidate_id,
+              ds.position_lifecycle_id AS linked_position_lifecycle_id
+       FROM hedge_execution_reviews her
+       LEFT JOIN decision_snapshots ds ON ds.decision_id = her.decision_id
+       WHERE her.review_id = ?
+       LIMIT 1`
     )
-    .get(input.reviewId) as { review_json?: string } | undefined;
+    .get(input.reviewId) as {
+      review_id: string;
+      created_at: string;
+      expires_at: string;
+      review_type: string;
+      client_order_id: string;
+      account_hash: string;
+      source_recommendation_id: string;
+      source_snapshot_id: string;
+      payload_hash: string;
+      signature: string;
+      status: string;
+      review_json: string;
+      decision_id: string | null;
+      decision_role: string | null;
+      position_lifecycle_id: string | null;
+      decision_linkage_status: string | null;
+      linked_decision_id: string | null;
+      linked_origin_type: string | null;
+      linked_origin_id: string | null;
+      linked_decision_role: string | null;
+      linked_candidate_id: string | null;
+      linked_position_lifecycle_id: string | null;
+    } | undefined;
   if (!row?.review_json) {
     return {
       review: null,
@@ -1274,7 +1309,7 @@ export const readHedgeExecutionReview = (input: {
       }
     };
   }
-  const verification = verifyHedgeExecutionReview({
+  const verified = verifyHedgeExecutionReview({
     review,
     signingKey: input.signingKey,
     asOf: input.asOf,
@@ -1282,6 +1317,43 @@ export const readHedgeExecutionReview = (input: {
     configurationFingerprint: input.configurationFingerprint,
     sourceSnapshotId: input.sourceSnapshotId
   });
+  const persistenceBlockers: string[] = [];
+  if (row.status !== "reviewed") {
+    persistenceBlockers.push(
+      row.status === "consumed"
+        ? "HEDGE_REVIEW_ALREADY_CONSUMED"
+        : "HEDGE_REVIEW_STATUS_INVALID"
+    );
+  }
+  if (
+    row.review_id !== review.reviewId ||
+    row.created_at !== review.createdAt ||
+    row.expires_at !== review.expiresAt ||
+    row.review_type !== review.reviewType ||
+    row.client_order_id !== review.clientOrderId ||
+    row.account_hash !== review.accountHash ||
+    row.source_recommendation_id !== review.sourceRecommendationId ||
+    row.source_snapshot_id !== review.sourceSnapshotId ||
+    row.payload_hash !== review.payloadHash ||
+    row.signature !== review.signature ||
+    !row.decision_id ||
+    row.decision_role !== review.reviewType ||
+    row.decision_linkage_status !== "EXACT" ||
+    row.linked_decision_id !== row.decision_id ||
+    row.linked_origin_type !== "hedge_execution_review" ||
+    row.linked_origin_id !== review.reviewId ||
+    row.linked_decision_role !== review.reviewType ||
+    row.linked_candidate_id !== review.candidateId ||
+    row.linked_position_lifecycle_id !== row.position_lifecycle_id
+  ) {
+    persistenceBlockers.push("HEDGE_REVIEW_PERSISTENCE_MISMATCH");
+  }
+  const blockers = [...new Set([...verified.blockers, ...persistenceBlockers])];
+  const verification = {
+    ...verified,
+    valid: blockers.length === 0,
+    blockers
+  };
   return { review, verification };
 };
 

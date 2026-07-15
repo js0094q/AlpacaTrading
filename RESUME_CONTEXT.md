@@ -3,8 +3,8 @@
 ## Adaptive allocation safety-floor pre-release (2026-07-14)
 
 - Branch `feat/adaptive-allocation-safety-floor` is based on
-  `origin/main@29f4a814d39cebc6f66b371571a92fe58228f6e1`. Code commits
-  `0b597b4` through `e6eaf99` authenticate general review artifacts, compare
+  `origin/main@29f4a814d39cebc6f66b371571a92fe58228f6e1`. The branch changes
+  authenticate general review artifacts, compare
   fresh submit state, reserve reviewed entries, fail closed on incomplete
   scale-in and 0DTE evidence, sign 0DTE submit attestations, enforce hedge
   capital evidence/caps, and route compatibility confirmation through reviewed
@@ -16,6 +16,9 @@
   closed. A new `paper:ops:review` creates a signed `baseline-v1` artifact; a
   material account, configuration, portfolio, reservation, market, price, or
   cap change returns `FRESH_REVIEW_REQUIRED` and submits zero for that entry.
+  A signed blocked artifact also cannot authorize entry sections, while valid
+  exits remain independent. General entries reserve as an all-or-none batch
+  after shared headroom is rechecked inside an immediate transaction.
 - `paper:execute --confirmPaper`, `/api/v1/execute/confirm`, and the dashboard
   compatibility route no longer rebuild a plan. They require explicit
   confirmation and dispatch the exact latest signed reviewed payload. The
@@ -27,11 +30,18 @@
 - 0DTE caps remain one contract, three combined open positions/orders, three
   daily entries, `$250` premium per trade, `$750` daily premium, and `$250`
   daily realized loss. All entry paths contribute New York-day evidence; a
-  missing counter blocks.
+  missing counter blocks. This includes generic reviewed
+  `discovery:zero_dte_spy:*` option buys. Standalone 0DTE submission refreshes
+  its quote, preserves the reviewed limit, and atomically reserves capacity.
 - Hedge entry defaults are `0.0075`, `0.02`, and `0.01` of equity (`0.75%`,
   `2%`, and `1%`). Reviews and submit-time validation require complete current
   long-put exposure, cost, reservation, broker-order, fill, and daily-premium
-  evidence with an unchanged canonical fingerprint.
+  evidence with an unchanged canonical fingerprint. Deterministic review and
+  client-order IDs are signed; the persisted row must match, fresh price drift
+  is bounded, and one review is consumed atomically with one reservation.
+- Broker statuses `held` and `pending_cancel` consume exposure across general,
+  0DTE, and hedge paths. Unknown non-terminal statuses remain active and block
+  new risk until recognized.
 - A redacted pre-deploy VPS snapshot found a clean checkout at the base SHA,
   paper-only/live-disabled flags, no selected sizing overrides, and no
   `PAPER_REVIEW_SIGNING_KEY`. Therefore checked-in ordinary equity defaults

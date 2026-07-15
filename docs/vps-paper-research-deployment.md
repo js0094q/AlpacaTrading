@@ -26,11 +26,15 @@ At minimum:
 
 ```bash
 ALPACA_ENV=paper
+TRADING_MODE=paper
+ALPACA_LIVE_TRADE=false
 ALPACA_PAPER_API_KEY=replace_me
 ALPACA_PAPER_SECRET_KEY=replace_me
 ALPACA_PAPER_BASE_URL=https://paper-api.alpaca.markets
 ALPACA_DATA_BASE_URL=https://data.alpaca.markets
 LIVE_TRADING_ENABLED=false
+PAPER_REVIEW_SIGNING_KEY=replace_with_random_secret
+HEDGE_REVIEW_SIGNING_KEY=replace_with_independent_random_secret
 PAPER_ORDER_EXECUTION_ENABLED=false
 PAPER_OPTIONS_EXECUTION_ENABLED=false
 PAPER_EQUITY_NOTIONAL_PER_ORDER=1000
@@ -62,6 +66,7 @@ AUTOMATED_PAPER_EXECUTION_ENABLED=false
 PAPER_0DTE_DISCOVERY_ENABLED=true
 PAPER_OPTION_EXIT_REVIEW_ENABLED=true
 PAPER_EQUITY_SCALE_IN_ENABLED=false
+PAPER_SUBMIT_MAX_PRICE_DRIFT_PCT=10
 ALPACA_REQUEST_TIMEOUT_MS=15000
 ALPACA_MAX_RETRIES=2
 VPS_RESEARCH_REQUEST_TIMEOUT_MS=10000
@@ -70,6 +75,23 @@ ALPACA_USER_AGENT=alpaca-research-cli
 ```
 
 Keep a real `.env` file local to the VPS runtime user and exclude it from version control.
+
+The two review signers belong only in the VPS runtime secret file. Provision
+independent random values through the server's approved secret-management or
+interactive editing process; never print, log, copy into the repository, or send
+either value to Vercel. Preserve ownership `alpaca:alpaca` and mode `0600`.
+Presence-only checks are safe because they emit no value:
+
+```bash
+test "$(stat -c '%a:%U:%G' /opt/alpaca-investing/secrets/alpaca.env)" = "600:alpaca:alpaca"
+grep -q '^PAPER_REVIEW_SIGNING_KEY=.\+' /opt/alpaca-investing/secrets/alpaca.env
+grep -q '^HEDGE_REVIEW_SIGNING_KEY=.\+' /opt/alpaca-investing/secrets/alpaca.env
+```
+
+`PAPER_REVIEW_SIGNING_KEY` authenticates general review artifacts and 0DTE
+submit attestations. `HEDGE_REVIEW_SIGNING_KEY` independently authenticates
+hedge reviews. Legacy unsigned artifacts and reviews are intentionally
+non-executable and must be regenerated after signer provisioning.
 
 The CLI loads `.env` first, then `.env.txt` as fallback when keys are missing. If both files exist, `.env` values take precedence over `.env.txt`.
 
@@ -128,7 +150,7 @@ Current allowlist:
 - POST `/api/v1/actions/execute`
 - GET `/api/v1/actions/history`
 
-The `/api/v1/actions/*` routes are fixed command mappings. The dashboard never sends arbitrary shell commands to the VPS. `actions.execute` requires `confirmPaper: true`, loads the latest reviewed payload artifact, verifies it is fresh, verifies the payload signature, and refuses to run when the artifact is stale, empty, missing, or changed.
+The `/api/v1/actions/*` routes are fixed command mappings. The dashboard never sends arbitrary shell commands to the VPS. `actions.execute` requires `confirmPaper: true` and dispatches only the exact latest HMAC-signed reviewed payload. New-risk sections must have a successful signed review with no blockers, then pass fresh account, configuration, portfolio, source, market, 0DTE activity, cap, and atomic reservation checks. A stale, unsigned, blocked, empty, missing, consumed, or changed review fails closed and requires a fresh review. Exit sections remain independently eligible under their own safety gates.
 
 On the VPS, those historical views use local SQLite at `RESEARCH_DB_PATH` or `./data/research.db`. The VPS remains the owner of the scheduler, CLI runtime, research history, execution ledger, and local persistence.
 
@@ -257,9 +279,12 @@ npm run paper:exit:review -- --format=json
 npm run paper:options:discover -- --underlying=SPY --dte=0 --format=json
 npm run paper:ops:review -- --format=json
 npm run paper:execute -- --dryRun --riskProfile=aggressive --optionsEnabled=true --format=json
-npm run paper:execute -- --confirmPaper --assetClass=all --riskProfile=aggressive --optionsEnabled=true --format=json
 npm run dashboard:build
 ```
+
+This validation set is read-only with respect to broker orders. Confirmed paper
+execution is deliberately excluded; release validation must not invoke any
+`--confirmPaper` executor or an execution timer.
 
 ## Required runtime validation command set
 
@@ -290,8 +315,11 @@ npm run paper:exit:review -- --format=json
 npm run paper:options:discover -- --underlying=SPY --dte=0 --format=json
 npm run paper:ops:review -- --format=json
 npm run paper:execute -- --dryRun --riskProfile=aggressive --optionsEnabled=true --format=json
-npm run paper:execute -- --confirmPaper --assetClass=all --riskProfile=aggressive --optionsEnabled=true --format=json
 ```
+
+This runtime validation command set is also read-only. A signed review can be
+created and inspected without dispatching it; do not add a confirmed executor to
+deployment validation.
 
 ## Read-only paper intelligence checks
 
@@ -363,17 +391,30 @@ npm run paper:execute -- --dryRun --format=json
 ### Paper execute confirm-paper command
 
 ```bash
-npm run paper:execute -- --confirmPaper
-npm run paper:execute -- --confirmPaper --assetClass=equity
-npm run paper:execute -- --confirmPaper --assetClass=option --format=json
+npm run paper:execute -- --confirmPaper --format=json
 ```
 
-`paper:execute --confirmPaper` submits to Alpaca paper endpoints only after hard gates pass:
+`paper:execute --confirmPaper` is a compatibility alias for exact latest signed
+reviewed-payload execution. It does not accept asset-class, planning, candidate,
+or sizing authority at confirmation time and never rebuilds a plan. It submits
+to Alpaca paper endpoints only after hard gates pass:
 
 - `ALPACA_ENV=paper`
+- `TRADING_MODE=paper`
+- `ALPACA_LIVE_TRADE=false`
 - `LIVE_TRADING_ENABLED=false`
 - `PAPER_ORDER_EXECUTION_ENABLED=true`
 - `PAPER_OPTIONS_EXECUTION_ENABLED=true` for option payloads
+- an explicit `--confirmPaper`
+- the required signer and a valid, fresh, successful, unblocked artifact
+- unchanged source/account/configuration/portfolio/market/activity evidence
+- unchanged shared-cap headroom inside an atomic reservation transaction
+
+Fresh option evidence may block on quote identity or configured review-to-submit
+price drift, but confirmation never reprices or resizes the reviewed order. Broker
+statuses such as `held` and `pending_cancel` consume exposure; an unrecognized
+non-terminal status is retained as active evidence and blocks new risk rather
+than disappearing.
 
 ## Scheduled Paper Ops Automation
 

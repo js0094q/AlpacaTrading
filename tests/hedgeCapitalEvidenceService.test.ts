@@ -27,6 +27,75 @@ describe("hedge capital evidence", () => {
     assert.match(evidence.fingerprint, /^[a-f0-9]{64}$/);
   });
 
+  test("keeps held and pending-cancel hedge orders reserved", () => {
+    const evidence = buildHedgeCapitalEvidence({
+      asOf,
+      allowedUnderlyings: ["SPY", "QQQ"],
+      positions: [],
+      orders: [
+        {
+          brokerOrderId: "held-hedge-order",
+          clientOrderId: "held-hedge-client",
+          symbol: spyPut,
+          assetClass: "us_option",
+          side: "buy",
+          positionIntent: "buy_to_open",
+          status: "held",
+          quantity: 1,
+          limitPrice: 2,
+          filledQuantity: 0,
+          createdAt: "2026-07-14T14:00:00.000Z"
+        },
+        {
+          brokerOrderId: "pending-cancel-hedge-order",
+          clientOrderId: "pending-cancel-hedge-client",
+          symbol: qqqPut,
+          assetClass: "us_option",
+          side: "buy",
+          positionIntent: "buy_to_open",
+          status: "pending_cancel",
+          quantity: 1,
+          limitPrice: 3,
+          filledQuantity: 0,
+          createdAt: "2026-07-14T14:01:00.000Z"
+        }
+      ],
+      ledger: []
+    });
+
+    assert.equal(evidence.complete, true);
+    assert.equal(evidence.openHedgeOrderCount, 2);
+    assert.equal(evidence.reservedHedgePremium, 500);
+  });
+
+  test("fails closed on an unrecognized hedge broker status", () => {
+    const evidence = buildHedgeCapitalEvidence({
+      asOf,
+      allowedUnderlyings: ["SPY"],
+      positions: [],
+      orders: [
+        {
+          brokerOrderId: "unknown-hedge-order",
+          clientOrderId: "unknown-hedge-client",
+          symbol: spyPut,
+          assetClass: "us_option",
+          side: "buy",
+          positionIntent: "buy_to_open",
+          status: "broker_future_state",
+          quantity: 1,
+          limitPrice: 2,
+          filledQuantity: 0,
+          createdAt: "2026-07-14T14:00:00.000Z"
+        }
+      ],
+      ledger: []
+    });
+
+    assert.equal(evidence.complete, false);
+    assert.equal(evidence.openHedgeOrderCount, 1);
+    assert.ok(evidence.blockers.includes("HEDGE_ORDER_STATUS_EVIDENCE_REQUIRED"));
+  });
+
   test("sums long-put positions and deduplicates a broker order from its ledger reservation", () => {
     const evidence = buildHedgeCapitalEvidence({
       asOf,

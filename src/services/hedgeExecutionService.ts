@@ -27,8 +27,7 @@ import {
   type HedgeAccountReconciliationResult
 } from "./hedgeAccountReconciliationService.js";
 import {
-  readHedgeExecutionReview,
-  markHedgeExecutionReviewConsumed,
+  readHedgeExecutionReview
 } from "./hedgePersistenceService.js";
 import type {
   HedgeExecutionReview,
@@ -36,12 +35,17 @@ import type {
 } from "./hedgeExecutionReviewService.js";
 import { verifyHedgeExecutionReview } from "./hedgeExecutionReviewService.js";
 import {
+  listActivePaperNewRiskReservations,
   listPaperExecutionLedgerEntries,
   releaseExpiredHedgeReservations,
   reservePaperExecutionAttempt,
   updatePaperExecutionLedgerEntry,
   type PaperExecutionLedgerEntry
 } from "./paperExecutionLedgerService.js";
+import {
+  normalizePaperSubmitReservations,
+  paperSubmitReservationFingerprint
+} from "./paperSubmitStateService.js";
 import {
   validatePaperHedgeOptionOrder,
   type PaperHedgeOptionOrderValidation
@@ -107,6 +111,46 @@ const parseBoolean = (name: string) => process.env[name] === "true" || process.e
 const numberValue = (value: unknown) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+};
+
+const hedgeCapitalCapBlockers = (input: {
+  equity: number | null;
+  newPremium: number;
+  capitalEvidence: HedgeCapitalEvidence;
+  config: ReturnType<typeof buildHedgeConfig>;
+}) => {
+  const blockers: string[] = [];
+  if (input.equity === null || input.equity <= 0) {
+    blockers.push("HEDGE_ACCOUNT_EQUITY_INVALID");
+  } else {
+    if (
+      input.newPremium >
+      input.equity * input.config.executionPolicy.maxNewHedgePremiumPctEquity
+    ) {
+      blockers.push("HEDGE_PREMIUM_CAP_EXCEEDED");
+    }
+    if (
+      (input.capitalEvidence.existingHedgePremium ?? 0) +
+        (input.capitalEvidence.reservedHedgePremium ?? 0) +
+        input.newPremium >
+      input.equity * input.config.executionPolicy.maxTotalHedgePremiumPctEquity
+    ) {
+      blockers.push("HEDGE_TOTAL_PREMIUM_CAP_EXCEEDED");
+    }
+    if (
+      (input.capitalEvidence.dailyHedgePremiumUsed ?? 0) + input.newPremium >
+      input.equity * input.config.executionPolicy.maxDailyHedgePremiumPctEquity
+    ) {
+      blockers.push("HEDGE_DAILY_PREMIUM_CAP_EXCEEDED");
+    }
+  }
+  if (
+    (input.capitalEvidence.openHedgeOrderCount ?? Number.POSITIVE_INFINITY) >=
+    input.config.executionPolicy.maxOrdersPerRun
+  ) {
+    blockers.push("HEDGE_OPEN_ORDER_CAP_REACHED");
+  }
+  return [...new Set(blockers)];
 };
 
 export const paperAccountIdentityHash = (account: Partial<AlpacaAccountRaw>) =>
@@ -201,6 +245,9 @@ export const executeReviewedPaperHedge = async (
 
   const now = deps.now?.() ?? new Date().toISOString();
   releaseExpiredHedgeReservations(now);
+  const expectedReservationFingerprint = paperSubmitReservationFingerprint(
+    normalizePaperSubmitReservations(listActivePaperNewRiskReservations())
+  );
   const signingKey = process.env.HEDGE_REVIEW_SIGNING_KEY!.trim();
   const stored = (deps.readReview ?? readHedgeExecutionReview)({
     reviewId: input.reviewId,
@@ -308,34 +355,12 @@ export const executeReviewedPaperHedge = async (
   }
   const equity = numberValue(account.equity);
   const newPremium = review.orderIntent.maxPremium;
-  const capitalCapBlockers: string[] = [];
-  if (equity === null || equity <= 0) {
-    capitalCapBlockers.push("HEDGE_ACCOUNT_EQUITY_INVALID");
-  } else {
-    if (newPremium > equity * config.executionPolicy.maxNewHedgePremiumPctEquity) {
-      capitalCapBlockers.push("HEDGE_PREMIUM_CAP_EXCEEDED");
-    }
-    if (
-      (capitalEvidence.existingHedgePremium ?? 0) +
-        (capitalEvidence.reservedHedgePremium ?? 0) +
-        newPremium >
-      equity * config.executionPolicy.maxTotalHedgePremiumPctEquity
-    ) {
-      capitalCapBlockers.push("HEDGE_TOTAL_PREMIUM_CAP_EXCEEDED");
-    }
-    if (
-      (capitalEvidence.dailyHedgePremiumUsed ?? 0) + newPremium >
-      equity * config.executionPolicy.maxDailyHedgePremiumPctEquity
-    ) {
-      capitalCapBlockers.push("HEDGE_DAILY_PREMIUM_CAP_EXCEEDED");
-    }
-  }
-  if (
-    (capitalEvidence.openHedgeOrderCount ?? Number.POSITIVE_INFINITY) >=
-    config.executionPolicy.maxOrdersPerRun
-  ) {
-    capitalCapBlockers.push("HEDGE_OPEN_ORDER_CAP_REACHED");
-  }
+  const capitalCapBlockers = hedgeCapitalCapBlockers({
+    equity,
+    newPremium,
+    capitalEvidence,
+    config
+  });
   if (capitalCapBlockers.length) {
     return blockedReport({
       reviewId: input.reviewId,
@@ -420,6 +445,32 @@ export const executeReviewedPaperHedge = async (
       validation
     };
   }
+  const freshReferencePrice =
+    quote.midpoint ??
+    (quote.bid !== null && quote.ask !== null
+      ? (quote.bid + quote.ask) / 2
+      : null);
+  const priceDriftPct =
+    freshReferencePrice !== null && review.orderIntent.limitPrice > 0
+      ? (Math.abs(freshReferencePrice - review.orderIntent.limitPrice) /
+          review.orderIntent.limitPrice) *
+        100
+      : null;
+  if (
+    priceDriftPct === null ||
+    priceDriftPct / 100 > config.executionPolicy.limitPriceMaxDriftPct
+  ) {
+    return {
+      ...blockedReport({
+        reviewId: input.reviewId,
+        blockers: ["HEDGE_PRICE_DRIFT", "FRESH_REVIEW_REQUIRED"],
+        review,
+        capitalEvidence
+      }),
+      reconciliation,
+      validation
+    };
+  }
 
   const reservation = reservePaperExecutionAttempt({
     reviewId: review.reviewId,
@@ -430,7 +481,31 @@ export const executeReviewedPaperHedge = async (
     limitPrice: review.orderIntent.limitPrice,
     estimatedPremium: review.orderIntent.maxPremium,
     expiresAt: review.expiresAt,
-    requestId: review.requestId
+    requestId: review.requestId,
+    consumeReview: true,
+    validateBeforeInsert: () => {
+      const currentReservations = normalizePaperSubmitReservations(
+        listActivePaperNewRiskReservations()
+      );
+      if (
+        paperSubmitReservationFingerprint(currentReservations) !==
+        expectedReservationFingerprint
+      ) {
+        return [
+          "HEDGE_RESERVATION_STATE_DRIFT",
+          "FRESH_REVIEW_REQUIRED"
+        ];
+      }
+      const currentCapBlockers = hedgeCapitalCapBlockers({
+        equity,
+        newPremium,
+        capitalEvidence,
+        config
+      });
+      return currentCapBlockers.length
+        ? [...currentCapBlockers, "FRESH_REVIEW_REQUIRED"]
+        : [];
+    }
   });
   if (!reservation.reserved) {
     return {
@@ -512,7 +587,6 @@ export const executeReviewedPaperHedge = async (
     const filledQuantity = numberValue(latest.filled_qty) ?? 0;
     if (status === "filled") {
       updatePaperExecutionLedgerEntry(reservation.entry.id, { status: "filled", alpacaStatus: status, requestId: orderResponse.requestId });
-      markHedgeExecutionReviewConsumed(review.reviewId);
       return {
         paperOnly: true,
         environment: "paper",
@@ -537,7 +611,6 @@ export const executeReviewedPaperHedge = async (
     if (["rejected", "canceled", "expired"].includes(status)) {
       const terminal = status === "rejected" ? "rejected" : "canceled";
       updatePaperExecutionLedgerEntry(reservation.entry.id, { status: terminal, alpacaStatus: status, requestId: orderResponse.requestId });
-      markHedgeExecutionReviewConsumed(review.reviewId);
       return {
         paperOnly: true,
         environment: "paper",
@@ -575,7 +648,6 @@ export const executeReviewedPaperHedge = async (
     alpacaStatus: "canceled",
     requestId: canceled.requestId
   });
-  markHedgeExecutionReviewConsumed(review.reviewId);
   return {
     paperOnly: true,
     environment: "paper",

@@ -19,6 +19,7 @@ const input = () => ({
   accountStateFingerprint: "account-state-1",
   activityEvidenceFingerprint: "activity-1",
   allocationIdentity: "baseline-v1" as const,
+  submitPriceDriftLimitPct: 10,
   orderIntent: {
     symbol: "SPY260714C00500000",
     underlying: "SPY",
@@ -49,6 +50,7 @@ const expected = () => {
     accountStateFingerprint: value.accountStateFingerprint,
     activityEvidenceFingerprint: value.activityEvidenceFingerprint,
     allocationIdentity: value.allocationIdentity,
+    submitPriceDriftLimitPct: value.submitPriceDriftLimitPct,
     orderIntent: value.orderIntent
   };
 };

@@ -15,12 +15,16 @@ process.env.PAPER_REVIEW_SIGNING_KEY = "paper-ops-workflow-test-key";
 
 import { closeDbForTests, getDb } from "../src/lib/db.js";
 import {
+  latestReviewArtifactReadiness,
   runPaperOpsLateDay,
   runPaperOpsMidday,
   runPaperOpsMorning,
   runPaperOpsReview
 } from "../src/services/paperOpsWorkflowService.js";
-import { verifyPaperReviewArtifact } from "../src/services/paperReviewArtifactService.js";
+import {
+  createPaperReviewArtifact,
+  verifyPaperReviewArtifact
+} from "../src/services/paperReviewArtifactService.js";
 
 const resetDatabase = () => {
   resetSqliteTestDb(getDb(), `
@@ -164,6 +168,52 @@ after(() => {
 });
 
 describe("paper ops workflows", () => {
+  const readinessSections = () => ({
+    equityBuys: [{ symbol: "AAPL" }],
+    equityAdds: [],
+    equitySells: [],
+    optionBuys: [],
+    optionSellToCloseExits: []
+  });
+
+  test("readiness rejects signed blocked artifacts", () => {
+    createPaperReviewArtifact({
+      id: "blocked-readiness-artifact",
+      sourceAction: "paper.ops.review",
+      status: "blocked",
+      payloadSections: readinessSections(),
+      summary: {},
+      blockers: ["REVIEW_DATA_BLOCKED"],
+      createdAt: new Date().toISOString(),
+      maxAgeMinutes: 60
+    });
+
+    const readiness = latestReviewArtifactReadiness();
+    assert.equal(readiness.ready, false);
+    assert.equal(readiness.reason, "REVIEW_ARTIFACT_ENTRY_BLOCKED");
+  });
+
+  test("readiness verifies the stored artifact signature", () => {
+    const artifact = createPaperReviewArtifact({
+      id: "tampered-readiness-artifact",
+      sourceAction: "paper.ops.review",
+      status: "success",
+      payloadSections: readinessSections(),
+      summary: {},
+      createdAt: new Date().toISOString(),
+      maxAgeMinutes: 60
+    });
+    const tampered = structuredClone(artifact.artifact);
+    tampered.signature = "0".repeat(64);
+    getDb().prepare(
+      "UPDATE paper_review_artifacts SET artifact_json = ? WHERE id = ?"
+    ).run(JSON.stringify(tampered), artifact.id);
+
+    const readiness = latestReviewArtifactReadiness();
+    assert.equal(readiness.ready, false);
+    assert.equal(readiness.reason, "REVIEW_ARTIFACT_SIGNATURE_INVALID");
+  });
+
   test("paper execute confirmation source delegates only to reviewed execution", () => {
     const source = readFileSync(join(process.cwd(), "src/cli.ts"), "utf8");
 

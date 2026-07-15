@@ -33,6 +33,7 @@ export interface ZeroDteSubmitAttestation {
   accountStateFingerprint: string;
   activityEvidenceFingerprint: string;
   allocationIdentity: "baseline-v1";
+  submitPriceDriftLimitPct: number;
   orderIntent: ZeroDteSubmitOrderIntent;
   createdAt: string;
   expiresAt: string;
@@ -51,6 +52,7 @@ export interface ZeroDteSubmitAttestationExpected {
   accountStateFingerprint: string;
   activityEvidenceFingerprint: string;
   allocationIdentity: "baseline-v1";
+  submitPriceDriftLimitPct: number;
   orderIntent: ZeroDteSubmitOrderIntent;
 }
 
@@ -135,6 +137,7 @@ export const createZeroDteSubmitAttestation = (
       "ZERO_DTE_ACTIVITY_EVIDENCE_REQUIRED"
     ),
     allocationIdentity: input.allocationIdentity,
+    submitPriceDriftLimitPct: input.submitPriceDriftLimitPct,
     orderIntent: exactIntent(input.orderIntent),
     createdAt: new Date(createdAtMs).toISOString(),
     expiresAt: new Date(createdAtMs + ttlSeconds * 1000).toISOString(),
@@ -224,6 +227,12 @@ export const verifyZeroDteSubmitAttestation = (input: {
   }
   if (attestation.allocationIdentity !== expected.allocationIdentity) {
     blockers.push("ZERO_DTE_ALLOCATION_IDENTITY_MISMATCH", "FRESH_REVIEW_REQUIRED");
+  }
+  if (
+    attestation.submitPriceDriftLimitPct !==
+    expected.submitPriceDriftLimitPct
+  ) {
+    blockers.push("ZERO_DTE_CONFIGURATION_MISMATCH", "FRESH_REVIEW_REQUIRED");
   }
   if (canonicalJsonHash(attestation.orderIntent) !== canonicalJsonHash(expected.orderIntent)) {
     blockers.push("ZERO_DTE_ORDER_INTENT_DRIFT", "FRESH_REVIEW_REQUIRED");
