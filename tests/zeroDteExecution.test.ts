@@ -23,8 +23,10 @@ import type { ZeroDteQueueCandidate } from "../src/services/zeroDte/zeroDtePersi
 import type { AlpacaPaperOrderRequest } from "../src/services/alpacaClient.js";
 import {
   insertPaperExecutionLedgerEntry,
-  updatePaperExecutionLedgerEntry
+  updatePaperExecutionLedgerEntry,
+  type PaperExecutionLedgerEntry
 } from "../src/services/paperExecutionLedgerService.js";
+import { withExecutionAuthority } from "./helpers/executionAuthorityRuntime.js";
 
 const now = "2026-07-13T14:30:00.000Z";
 const optionSymbol = "SPY260713C00500000";
@@ -631,6 +633,202 @@ test("0DTE reservation atomically rejects a distinct reservation that fills befo
   assert.equal(brokerCalls, 0);
   assert.ok(result.blockers.includes("ZERO_DTE_RESERVATION_STATE_DRIFT"));
   assert.ok(result.blockers.includes("FRESH_REVIEW_REQUIRED"));
+});
+
+test("PostgreSQL execution authority bypasses SQLite 0DTE reservation and trade state", async () => {
+  const authorityCandidate = scenarioCandidate({
+    candidateId: "execution-candidate-postgres-authority",
+    optionSymbol: "SPY260713C00599000",
+    strike: 599
+  });
+  const authorityDecisionId = "execution-decision-postgres-authority";
+  const recordedStatuses: string[] = [];
+
+  const result = await withExecutionAuthority(() =>
+    executeZeroDteCandidate({
+      candidate: authorityCandidate,
+      decisionId: authorityDecisionId,
+      confirmPaper: true,
+      provider: {
+        config,
+        runtime: runtime(),
+        account: account(),
+        now: () => now,
+        refreshQuote: async () => {
+          insertPaperExecutionLedgerEntry({
+            mode: "zero-dte-entry",
+            assetClass: "option",
+            symbol: authorityCandidate.optionSymbol,
+            underlyingSymbol: authorityCandidate.underlyingSymbol,
+            strategy: "zero_dte_level_2",
+            side: "buy",
+            orderType: "limit",
+            timeInForce: "day",
+            qty: "1",
+            limitPrice: "1.25",
+            estimatedPremium: 125,
+            maxRisk: 125,
+            dedupeKey: `${authorityCandidate.tradingDate}:${authorityCandidate.optionSymbol}:entry`,
+            clientOrderId: "sqlite-only-zero-dte-reservation",
+            status: "reserved",
+            sourceCandidateId: "sqlite-only-zero-dte-candidate",
+            payload: { expiresAt: "2026-07-13T14:35:00.000Z" }
+          });
+          return authorityCandidate.quote;
+        },
+        storeExecutionEvidence: async () => ({ status: "authority_stored" }),
+        authorizeExecution: async () => ({
+          status: "authority_reserved",
+          brokerAllowed: true,
+          reservationId: "reservation-postgres-zero-dte",
+          orderIntentId: "intent-postgres-zero-dte"
+        }),
+        recordExecutionResult: async (ledger: PaperExecutionLedgerEntry) => {
+          recordedStatuses.push(ledger.status);
+          return { status: "authority_recorded", replay: false };
+        },
+        submitPaperOrder: async (payload) => ({
+          data: {
+            id: "broker-order-postgres-zero-dte",
+            client_order_id: payload.client_order_id,
+            symbol: payload.symbol,
+            qty: payload.qty,
+            status: "accepted",
+            filled_qty: "0"
+          },
+          requestId: "request-postgres-zero-dte",
+          status: 200,
+          url: "paper"
+        })
+      }
+    })
+  );
+
+  getDb().prepare(
+    "DELETE FROM paper_execution_ledger WHERE client_order_id = 'sqlite-only-zero-dte-reservation'"
+  ).run();
+  assert.equal(result.status, "submitted");
+  assert.deepEqual(recordedStatuses, ["submitted"]);
+  assert.equal(
+    (getDb().prepare(
+      "SELECT COUNT(*) AS count FROM paper_execution_ledger WHERE source_candidate_id = ?"
+    ).get(authorityCandidate.candidateId) as { count: number }).count,
+    0
+  );
+  assert.equal(
+    (getDb().prepare(
+      "SELECT COUNT(*) AS count FROM zero_dte_paper_trades WHERE candidate_id = ?"
+    ).get(authorityCandidate.candidateId) as { count: number }).count,
+    0
+  );
+  assert.equal(
+    (getDb().prepare(
+      `SELECT COUNT(*) AS count FROM zero_dte_lifecycle_events
+       WHERE candidate_id = ? AND event_type IN ('execution_attested', 'paper_order_requested')`
+    ).get(authorityCandidate.candidateId) as { count: number }).count,
+    0
+  );
+  assert.equal(
+    (getDb().prepare(
+      "SELECT COUNT(*) AS count FROM zero_dte_candidates WHERE candidate_id = ?"
+    ).get(authorityCandidate.candidateId) as { count: number }).count,
+    0
+  );
+  assert.equal(
+    (getDb().prepare(
+      "SELECT COUNT(*) AS count FROM zero_dte_decisions WHERE decision_id = ?"
+    ).get(authorityDecisionId) as { count: number }).count,
+    0
+  );
+});
+
+test("PostgreSQL execution authority records no SQLite ledger row for a blocked 0DTE attempt", async () => {
+  const blockedCandidate = scenarioCandidate({
+    candidateId: "execution-candidate-postgres-blocked",
+    optionSymbol: "SPY260713C00600000",
+    strike: 600
+  });
+  const result = await withExecutionAuthority(() =>
+    executeZeroDteCandidate({
+      candidate: blockedCandidate,
+      decisionId: "execution-decision-postgres-blocked",
+      confirmPaper: false,
+      provider: {
+        config,
+        runtime: runtime(),
+        account: account(),
+        now: () => now
+      }
+    })
+  );
+
+  assert.equal(result.status, "blocked");
+  assert.equal(result.ledgerId, null);
+  assert.equal(
+    (getDb().prepare(
+      "SELECT COUNT(*) AS count FROM paper_execution_ledger WHERE source_candidate_id = ?"
+    ).get(blockedCandidate.candidateId) as { count: number }).count,
+    0
+  );
+});
+
+test("PostgreSQL authority reconciles broker state without consulting or mutating SQLite execution rows", async () => {
+  seed();
+  insertPaperExecutionLedgerEntry({
+    mode: "zero-dte-entry",
+    assetClass: "option",
+    symbol: optionSymbol,
+    underlyingSymbol: "SPY",
+    strategy: "zero_dte_level_2",
+    side: "buy",
+    orderType: "limit",
+    timeInForce: "day",
+    qty: "1",
+    limitPrice: "1.20",
+    estimatedPremium: 120,
+    maxRisk: 120,
+    dedupeKey: "legacy-reconciliation-row",
+    clientOrderId: "legacy-reconciliation-client-order",
+    status: "submitted",
+    sourceCandidateId: candidateId,
+    payload: { source: "legacy" }
+  });
+  const counts = () => ({
+    ledger: (getDb().prepare("SELECT COUNT(*) AS count FROM paper_execution_ledger").get() as { count: number }).count,
+    trades: (getDb().prepare("SELECT COUNT(*) AS count FROM zero_dte_paper_trades").get() as { count: number }).count,
+    candidates: (getDb().prepare("SELECT COUNT(*) AS count FROM zero_dte_candidates").get() as { count: number }).count,
+    lifecycle: (getDb().prepare("SELECT COUNT(*) AS count FROM zero_dte_lifecycle_events").get() as { count: number }).count
+  });
+  const before = counts();
+
+  const result = await withExecutionAuthority(() => reconcileZeroDtePaperOrders({
+    now,
+    provider: {
+      runtime: runtime(),
+      getOrder: async () => {
+        throw new Error("SQLite broker-ID reconciliation must not run under PostgreSQL authority.");
+      },
+      reconcileExecutionState: async () => ({
+        status: "reconciled",
+        checked: 1,
+        recorded: 1,
+        replayed: 0,
+        filled: 1,
+        partial: 0,
+        terminal: 0,
+        errors: []
+      })
+    }
+  }));
+
+  assert.equal(result.checked, 1);
+  assert.equal(result.updated, 1);
+  assert.equal(result.filled, 1);
+  assert.deepEqual(result.errors, []);
+  assert.deepEqual(counts(), before);
+  getDb().prepare(
+    "DELETE FROM paper_execution_ledger WHERE client_order_id = 'legacy-reconciliation-client-order'"
+  ).run();
 });
 
 test("missing review signing key blocks 0DTE execution before broker mutation", async () => {

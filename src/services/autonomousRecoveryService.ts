@@ -8,6 +8,7 @@ import {
   countStaleResearchRuns,
   recoverStaleResearchRunsInTransaction
 } from "./researchRunLifecycleService.js"
+import { assertScheduledWriteFenceActive } from "./controlPlaneRuntimeContext.js"
 
 export const AUTONOMOUS_RECOVERY_CONFIG_VERSION = "autonomous-recovery-v1"
 
@@ -206,6 +207,7 @@ const markStalePaperOperationsFailed = (
 }
 
 export const applyAutonomousRecovery = (now = new Date()): AutonomousRecoveryResult => {
+  assertScheduledWriteFenceActive()
   const db = getDb()
   const startedAt = now.toISOString()
   const id = `autonomous_recovery_${randomUUID()}`
@@ -321,6 +323,7 @@ export const applyAutonomousRecovery = (now = new Date()): AutonomousRecoveryRes
       recovered.researchRuns,
       id
     )
+    assertScheduledWriteFenceActive()
     db.exec("COMMIT")
 
     return {
@@ -339,15 +342,20 @@ export const applyAutonomousRecovery = (now = new Date()): AutonomousRecoveryRes
     } catch {
       // The transaction may not have started.
     }
-    db.prepare(
-      `UPDATE autonomous_recovery_runs
-       SET status = 'failed', completed_at = ?, error_message = ?
-       WHERE id = ?`
-    ).run(
-      new Date().toISOString(),
-      error instanceof Error ? error.message.slice(0, 1000) : String(error).slice(0, 1000),
-      id
-    )
+    try {
+      assertScheduledWriteFenceActive()
+      db.prepare(
+        `UPDATE autonomous_recovery_runs
+         SET status = 'failed', completed_at = ?, error_message = ?
+         WHERE id = ?`
+      ).run(
+        new Date().toISOString(),
+        error instanceof Error ? error.message.slice(0, 1000) : String(error).slice(0, 1000),
+        id
+      )
+    } catch {
+      // A stale worker must not write even its terminal status.
+    }
     throw error
   }
 }

@@ -1,6 +1,7 @@
 import { canonicalJsonHash } from "../../lib/canonicalJson.js";
 import { getDb } from "../../lib/db.js";
 import { nowIso } from "../../lib/utils.js";
+import { assertScheduledWriteFenceActive } from "../controlPlaneRuntimeContext.js";
 import { parseOptionSymbol } from "../optionSymbolService.js";
 import {
   markZeroDteShadowTrades,
@@ -109,9 +110,11 @@ const asRecord = (value: unknown): Record<string, unknown> =>
     : {};
 
 const withTransaction = <T>(db: ReturnType<typeof getDb>, operation: () => T): T => {
+  assertScheduledWriteFenceActive();
   db.exec("BEGIN IMMEDIATE;");
   try {
     const result = operation();
+    assertScheduledWriteFenceActive();
     db.exec("COMMIT;");
     return result;
   } catch (error) {

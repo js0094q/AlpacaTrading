@@ -1,5 +1,6 @@
 import { canonicalJsonHash } from "../lib/canonicalJson.js";
 import { getDb, queryAll, queryOne } from "../lib/db.js";
+import { assertScheduledWriteFenceActive } from "./controlPlaneRuntimeContext.js";
 import type {
   DecisionId,
   LinkageStatus,
@@ -156,6 +157,16 @@ export const findPaperExecutionByClientOrderId = (
   return row ? mapRow(row) : null;
 };
 
+export const findPaperExecutionById = (
+  id: number
+): PaperExecutionLedgerEntry | null => {
+  const row = queryOne<LedgerRow>(
+    "SELECT * FROM paper_execution_ledger WHERE id = ? LIMIT 1",
+    [id]
+  );
+  return row ? mapRow(row) : null;
+};
+
 export const listPaperExecutionLedgerEntries = (
   limit = 50
 ): PaperExecutionLedgerEntry[] => {
@@ -201,7 +212,7 @@ export const listSuccessfulPaperExecutionLedgerEntriesSince = (
   return rows.map(mapRow);
 };
 
-export const insertPaperExecutionLedgerEntry = (input: {
+export interface PaperExecutionLedgerInput {
   mode: string;
   assetClass: string;
   symbol: string;
@@ -230,12 +241,92 @@ export const insertPaperExecutionLedgerEntry = (input: {
   payload: unknown;
   rawPayload?: unknown;
   rawResponse?: unknown;
-}): PaperExecutionLedgerEntry => {
-  const now = new Date().toISOString();
+}
+
+export interface PaperExecutionLedgerUpdate {
+  status: PaperExecutionLedgerStatus;
+  alpacaOrderId?: string | null;
+  alpacaStatus?: string | null;
+  requestId?: string | null;
+  reason?: string | null;
+  blockedReason?: string | null;
+  errorMessage?: string | null;
+  rawResponse?: unknown;
+}
+
+export const buildPaperExecutionLedgerEntry = (
+  input: PaperExecutionLedgerInput,
+  options: { id?: number; createdAt?: string } = {}
+): PaperExecutionLedgerEntry => {
+  const createdAt = options.createdAt ?? new Date().toISOString();
   const payloadJson = JSON.stringify(input.payload);
   const rawPayloadJson = JSON.stringify(input.rawPayload ?? input.payload);
   const rawResponseJson =
     input.rawResponse === undefined ? null : JSON.stringify(input.rawResponse);
+  const decisionId = input.decisionId ?? null;
+  const decisionLinkageStatus =
+    input.decisionLinkageStatus ?? (decisionId ? "EXACT" : "LEGACY_UNLINKED");
+  return {
+    id: options.id ?? -1,
+    createdAt,
+    updatedAt: createdAt,
+    mode: input.mode,
+    assetClass: input.assetClass,
+    symbol: input.symbol,
+    underlyingSymbol: input.underlyingSymbol ?? null,
+    strategy: input.strategy ?? null,
+    side: input.side ?? null,
+    orderType: input.orderType ?? null,
+    timeInForce: input.timeInForce ?? null,
+    qty: input.qty ?? null,
+    notional: input.notional ?? null,
+    limitPrice: input.limitPrice ?? null,
+    estimatedPremium: input.estimatedPremium ?? null,
+    maxRisk: input.maxRisk ?? null,
+    dedupeKey: input.dedupeKey,
+    clientOrderId: input.clientOrderId,
+    alpacaOrderId: null,
+    alpacaStatus: null,
+    requestId: input.requestId ?? null,
+    sourcePlanId: input.sourcePlanId ?? null,
+    sourceCandidateId: input.sourceCandidateId ?? null,
+    decisionId,
+    positionLifecycleId: input.positionLifecycleId ?? null,
+    decisionLinkageStatus,
+    status: input.status,
+    reason: input.reason ?? null,
+    blockedReason: input.blockedReason ?? input.reason ?? null,
+    errorMessage: input.errorMessage ?? null,
+    payloadJson,
+    rawPayloadJson,
+    rawResponseJson
+  };
+};
+
+export const applyPaperExecutionLedgerUpdate = (
+  entry: PaperExecutionLedgerEntry,
+  input: PaperExecutionLedgerUpdate,
+  updatedAt = new Date().toISOString()
+): PaperExecutionLedgerEntry => ({
+  ...entry,
+  updatedAt,
+  status: input.status,
+  alpacaOrderId: input.alpacaOrderId ?? entry.alpacaOrderId,
+  alpacaStatus: input.alpacaStatus ?? entry.alpacaStatus,
+  requestId: input.requestId ?? entry.requestId,
+  reason: input.reason ?? null,
+  blockedReason: input.blockedReason ?? input.reason ?? null,
+  errorMessage: input.errorMessage ?? null,
+  rawResponseJson: input.rawResponse === undefined
+    ? entry.rawResponseJson
+    : JSON.stringify(input.rawResponse)
+});
+
+export const insertPaperExecutionLedgerEntry = (
+  input: PaperExecutionLedgerInput
+): PaperExecutionLedgerEntry => {
+  assertScheduledWriteFenceActive();
+  const createdAt = new Date().toISOString();
   const exactCandidate =
     !input.decisionId && input.sourceCandidateId
       ? queryOne<{ decision_id: DecisionId | null }>(
@@ -244,8 +335,10 @@ export const insertPaperExecutionLedgerEntry = (input: {
         )
       : null;
   const decisionId = input.decisionId ?? exactCandidate?.decision_id ?? null;
-  const decisionLinkageStatus =
-    input.decisionLinkageStatus ?? (decisionId ? "EXACT" : "LEGACY_UNLINKED");
+  const entry = buildPaperExecutionLedgerEntry(
+    { ...input, decisionId },
+    { createdAt }
+  );
   const result = getDb()
     .prepare(
       `
@@ -284,88 +377,45 @@ export const insertPaperExecutionLedgerEntry = (input: {
       `
     )
     .run(
-      now,
-      now,
-      input.mode,
-      input.assetClass,
-      input.symbol,
-      input.underlyingSymbol ?? null,
-      input.strategy ?? null,
-      input.side ?? null,
-      input.orderType ?? null,
-      input.timeInForce ?? null,
-      input.qty ?? null,
-      input.notional ?? null,
-      input.limitPrice ?? null,
-      input.estimatedPremium ?? null,
-      input.maxRisk ?? null,
-      input.dedupeKey,
-      input.clientOrderId,
-      input.requestId ?? null,
-      input.status,
-      input.reason ?? null,
-      input.blockedReason ?? input.reason ?? null,
-      input.errorMessage ?? null,
-      input.sourcePlanId ?? null,
-      input.sourceCandidateId ?? null,
-      decisionId,
-      input.positionLifecycleId ?? null,
-      decisionLinkageStatus,
-      payloadJson,
-      rawPayloadJson,
-      rawResponseJson
+      entry.createdAt,
+      entry.updatedAt,
+      entry.mode,
+      entry.assetClass,
+      entry.symbol,
+      entry.underlyingSymbol,
+      entry.strategy,
+      entry.side,
+      entry.orderType,
+      entry.timeInForce,
+      entry.qty,
+      entry.notional,
+      entry.limitPrice,
+      entry.estimatedPremium,
+      entry.maxRisk,
+      entry.dedupeKey,
+      entry.clientOrderId,
+      entry.requestId,
+      entry.status,
+      entry.reason,
+      entry.blockedReason,
+      entry.errorMessage,
+      entry.sourcePlanId,
+      entry.sourceCandidateId,
+      entry.decisionId,
+      entry.positionLifecycleId,
+      entry.decisionLinkageStatus,
+      entry.payloadJson,
+      entry.rawPayloadJson,
+      entry.rawResponseJson
     );
-
-  return {
-    id: Number(result.lastInsertRowid),
-    createdAt: now,
-    updatedAt: now,
-    mode: input.mode,
-    assetClass: input.assetClass,
-    symbol: input.symbol,
-    underlyingSymbol: input.underlyingSymbol ?? null,
-    strategy: input.strategy ?? null,
-    side: input.side ?? null,
-    orderType: input.orderType ?? null,
-    timeInForce: input.timeInForce ?? null,
-    qty: input.qty ?? null,
-    notional: input.notional ?? null,
-    limitPrice: input.limitPrice ?? null,
-    estimatedPremium: input.estimatedPremium ?? null,
-    maxRisk: input.maxRisk ?? null,
-    dedupeKey: input.dedupeKey,
-    clientOrderId: input.clientOrderId,
-    alpacaOrderId: null,
-    alpacaStatus: null,
-    requestId: input.requestId ?? null,
-    sourcePlanId: input.sourcePlanId ?? null,
-    sourceCandidateId: input.sourceCandidateId ?? null,
-    decisionId,
-    positionLifecycleId: input.positionLifecycleId ?? null,
-    decisionLinkageStatus,
-    status: input.status,
-    reason: input.reason ?? null,
-    blockedReason: input.blockedReason ?? input.reason ?? null,
-    errorMessage: input.errorMessage ?? null,
-    payloadJson,
-    rawPayloadJson,
-    rawResponseJson
-  };
+  return { ...entry, id: Number(result.lastInsertRowid) };
 };
 
 export const updatePaperExecutionLedgerEntry = (
   id: number,
-  input: {
-    status: PaperExecutionLedgerStatus;
-    alpacaOrderId?: string | null;
-    alpacaStatus?: string | null;
-    requestId?: string | null;
-    reason?: string | null;
-    blockedReason?: string | null;
-    errorMessage?: string | null;
-    rawResponse?: unknown;
-  }
+  input: PaperExecutionLedgerUpdate
 ) => {
+  assertScheduledWriteFenceActive();
   const now = new Date().toISOString();
   const rawResponseJson =
     input.rawResponse === undefined ? null : JSON.stringify(input.rawResponse);
@@ -403,6 +453,7 @@ export const linkPaperExecutionPositionLifecycle = (input: {
   ledgerId: number;
   positionLifecycleId: PositionLifecycleId;
 }) => {
+  assertScheduledWriteFenceActive();
   const existing = queryOne<{ position_lifecycle_id: PositionLifecycleId | null }>(
     "SELECT position_lifecycle_id FROM paper_execution_ledger WHERE id = ? LIMIT 1",
     [input.ledgerId]
@@ -512,10 +563,12 @@ export interface ReviewedPaperExecutionReservationBatch {
 }
 
 const withImmediateLedgerTransaction = <T>(operation: () => T): T => {
+  assertScheduledWriteFenceActive();
   const db = getDb();
   db.exec("BEGIN IMMEDIATE;");
   try {
     const result = operation();
+    assertScheduledWriteFenceActive();
     db.exec("COMMIT;");
     return result;
   } catch (error) {

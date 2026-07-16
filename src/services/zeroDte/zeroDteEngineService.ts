@@ -2,6 +2,7 @@ import { canonicalJsonHash } from "../../lib/canonicalJson.js";
 import { getDb, queryAll } from "../../lib/db.js";
 import { redactSensitiveText } from "../../lib/securityRedaction.js";
 import { nowIso } from "../../lib/utils.js";
+import { assertScheduledWriteFenceActive } from "../controlPlaneRuntimeContext.js";
 import { atr, ema, rollingStd } from "../indicators.js";
 import {
   createAlpacaZeroDteMarketDataProvider,
@@ -60,6 +61,7 @@ import {
   type ZeroDteOrderReconciliationResult,
   type ZeroDtePaperMutationProvider
 } from "./zeroDteExecutionService.js";
+import { executionStateProjectionService } from "../executionStateProjectionService.js";
 import {
   reconcileZeroDteExitOrders,
   type ZeroDteExitReconciliationResult
@@ -250,6 +252,7 @@ const decisionGroupIdFor = (runId: string) =>
   `zgrp_${canonicalJsonHash({ runId }).slice(0, 40)}`;
 
 const ensureConfigurationVersion = (config: ZeroDteConfig, asOf: string) => {
+  assertScheduledWriteFenceActive();
   getDb().prepare(
     `INSERT OR IGNORE INTO zero_dte_configuration_versions
       (configuration_version_id, strategy_version, configuration_hash,
@@ -273,6 +276,7 @@ const ensureEngineRun = (input: {
   asOf: string;
 }) => {
   ensureConfigurationVersion(input.config, input.asOf);
+  assertScheduledWriteFenceActive();
   getDb().prepare(
     `INSERT OR IGNORE INTO zero_dte_engine_runs
       (run_id, trading_date, session_id, mode, account_mode, status,
@@ -327,6 +331,7 @@ const finishEngineRun = (input: {
   };
   errors: Array<{ code: string; message: string; underlying?: string }>;
 }) => {
+  assertScheduledWriteFenceActive();
   getDb().prepare(
     `UPDATE zero_dte_engine_runs
      SET status = ?, completed_at = ?, candidates_discovered = ?,
@@ -764,6 +769,7 @@ const appendPaperMark = (input: {
   entryPremium: number;
   fees: number;
 }) => {
+  assertScheduledWriteFenceActive();
   const db = getDb();
   const markId = `zmark_${canonicalJsonHash({ paperTradeId: input.paperTradeId, asOf: input.asOf }).slice(0, 40)}`;
   const existing = db.prepare("SELECT mark_id FROM zero_dte_position_marks WHERE mark_id = ?").get(markId);
@@ -1314,7 +1320,9 @@ export const runZeroDteReconciliation = async (input: {
   errors.push(...exitOrders.errors.map(({ code, message }) => ({ code, message })));
   const contexts = await getMarketContexts({ now: generatedAt, config, provider: input.provider, errors });
   const quotes = quoteMapFor(contexts);
-  const paperMarks = markZeroDtePaperTrades(generatedAt, quotes);
+  const paperMarks = executionStateProjectionService.isAuthorityActive()
+    ? { paperOnly: true as const, marked: 0, blocked: 0 }
+    : markZeroDtePaperTrades(generatedAt, quotes);
   const shadowMarks = markZeroDteShadowTrades({ asOf: generatedAt, quotes });
   const outcomes = captureZeroDteOutcomes({
     asOf: generatedAt,

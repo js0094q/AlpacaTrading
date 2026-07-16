@@ -27,7 +27,14 @@ import {
   reconcileControlPlaneSnapshot,
   readControlPlaneSnapshot
 } from "../src/services/controlPlaneMigrationService.js";
+import {
+  reconcileExecutionStateSnapshot
+} from "../src/services/executionStateMigrationService.js";
 import { createControlPlaneSnapshotFixture } from "./helpers/controlPlaneSnapshotFixture.js";
+import {
+  createExecutionStateSnapshotFixture,
+  executionStateCandidateId
+} from "./helpers/executionStateSnapshotFixture.js";
 
 const enabled = process.env.POSTGRES_INTEGRATION_TEST_ENABLED === "true";
 
@@ -81,6 +88,63 @@ const runPackagedControlPlaneCommand = (input: {
     };
   } catch {
     throw new Error("PACKAGED_CONTROL_PLANE_REPORT_INVALID");
+  }
+};
+
+const runPackagedExecutionStateCommand = (input: {
+  readonly command:
+    | "db:postgres:execution-state:backfill"
+    | "db:postgres:execution-state:reconcile";
+  readonly snapshotPath: string;
+  readonly schema: string;
+  readonly dryRun?: boolean;
+}) => {
+  const child = spawnSync(
+    "npm",
+    [
+      "run",
+      "--silent",
+      input.command,
+      "--",
+      "--snapshot",
+      input.snapshotPath,
+      ...(input.dryRun ? ["--dryRun"] : [])
+    ],
+    {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PGOPTIONS: `-c search_path=${input.schema}`,
+        DATABASE_BACKEND: "postgres",
+        POSTGRES_READS_ENABLED: "false",
+        POSTGRES_WRITES_ENABLED: "false",
+        POSTGRES_SHADOW_COMPARE_ENABLED: "false",
+        POSTGRES_CONTROL_PLANE_AUTHORITY_ENABLED: "false",
+        POSTGRES_SCHEDULER_AUTHORITY_ENABLED: "false",
+        POSTGRES_EXECUTION_STATE_SHADOW_ENABLED: "false",
+        POSTGRES_EXECUTION_STATE_AUTHORITY_ENABLED: "false",
+        SQLITE_AUDIT_MIRROR_ENABLED: "false",
+        ALPACA_ENV: "paper",
+        TRADING_MODE: "paper",
+        ALPACA_LIVE_TRADE: "false",
+        LIVE_TRADING_ENABLED: "false"
+      }
+    }
+  );
+  if (child.error || child.status === null) {
+    throw new Error("PACKAGED_EXECUTION_STATE_PROCESS_FAILED");
+  }
+  if (child.stderr !== "") {
+    throw new Error("PACKAGED_EXECUTION_STATE_STDERR_NOT_EMPTY");
+  }
+  try {
+    return {
+      exitCode: child.status,
+      report: JSON.parse(child.stdout) as Record<string, unknown>
+    };
+  } catch {
+    throw new Error("PACKAGED_EXECUTION_STATE_REPORT_INVALID");
   }
 };
 
@@ -688,4 +752,174 @@ test("actual Neon reconciles fixed-scale partial state without candidate updates
   }
 
   if (failureCode) throw new Error(`POSTGRES_RECONCILIATION_TEST_FAILED:${failureCode}`);
+});
+
+test("actual Neon backfills and reconciles Release 4 execution state idempotently", {
+  skip: !enabled
+}, async () => {
+  const config = loadDatabaseConfig(
+    {
+      ...process.env,
+      DATABASE_BACKEND: "postgres",
+      POSTGRES_APPLICATION_NAME: "alpaca-paper-neon-execution-state-test"
+    },
+    { runtime: "test", purpose: "migration" }
+  );
+  const schema = `neon_release4_execution_${Date.now()}_${randomBytes(4).toString("hex")}`;
+  const directory = await mkdtemp(join(tmpdir(), "neon-release4-execution-"));
+  const sourcePath = join(directory, "source.db");
+  const adminPool = createPostgresPool(config, "direct");
+  let schemaPool: Pool | undefined;
+  let failureCode: string | null = null;
+  let phase = "create_source";
+  try {
+    createExecutionStateSnapshotFixture(sourcePath);
+    phase = "create_schema";
+    await adminPool.query(`CREATE SCHEMA "${schema}"`);
+    schemaPool = createPostgresPool({ ...config, maxConnections: 2 }, "direct", {
+      sessionOptions: `-c search_path=${schema}`
+    });
+    phase = "migrate_twice";
+    assert.deepEqual((await runPostgresMigrations(schemaPool, config)).appliedVersions, [1, 2]);
+    assert.deepEqual((await runPostgresMigrations(schemaPool, config)).appliedVersions, []);
+    assert.deepEqual(
+      (await schemaPool.query<{ version: number }>(
+        "SELECT version FROM schema_migrations ORDER BY version"
+      )).rows.map((row) => Number(row.version)),
+      [1, 2]
+    );
+    phase = "seed_control_plane_candidate";
+    await schemaPool.query(
+      `INSERT INTO research_runs(
+         id, workstream, run_key, status, risk_profile, options_enabled,
+         config, started_at, completed_at, created_at, updated_at
+       ) VALUES (
+         'release-4-run', 'research', 'release-4-run', 'completed', 'aggressive',
+         true, '{}'::jsonb, '2026-07-16T15:00:00Z', '2026-07-16T15:30:00Z',
+         '2026-07-16T15:00:00Z', '2026-07-16T15:30:00Z'
+       )`
+    );
+    await schemaPool.query(
+      `INSERT INTO candidates(
+         id, decision_id, research_run_id, candidate_key, symbol, asset_class,
+         as_of, rank, direction, horizon, risk_profile, preferred_expression,
+         score, confidence, decision, lifecycle_status, rationale, signal_inputs,
+         data_quality_status, source_candidate_id, created_at, updated_at
+       ) VALUES (
+         $1, '11111111-1111-4111-8111-111111111111', 'release-4-run', $1,
+         'SPY', 'equity', '2026-07-16T15:30:00Z', 1, 'long', 'day',
+         'aggressive', 'equity', 0.9, 0.8, 'selected', 'selected', '[]'::jsonb,
+         '{}'::jsonb, 'COMPLETE', $1, '2026-07-16T15:30:00Z',
+         '2026-07-16T15:30:00Z'
+       )`,
+      [executionStateCandidateId]
+    );
+    phase = "packaged_backfill";
+    const firstBackfill = runPackagedExecutionStateCommand({
+      command: "db:postgres:execution-state:backfill",
+      snapshotPath: sourcePath,
+      schema
+    });
+    assert.equal(firstBackfill.exitCode, 0);
+    assert.equal(firstBackfill.report.status, "completed");
+    assert.equal(firstBackfill.report.durableBatchCheckpointsVerified, true);
+    assert.ok(Number(firstBackfill.report.rowMutationCount) > 0);
+    const orderBeforeReplay = await schemaPool.query<{ xmin: string }>(
+      "SELECT xmin::text AS xmin FROM orders"
+    );
+    phase = "packaged_backfill_replay";
+    const secondBackfill = runPackagedExecutionStateCommand({
+      command: "db:postgres:execution-state:backfill",
+      snapshotPath: sourcePath,
+      schema
+    });
+    assert.equal(secondBackfill.exitCode, 0);
+    assert.equal(secondBackfill.report.rowMutationCount, 0);
+    assert.equal(secondBackfill.report.checkpointMutationCount, 0);
+    assert.equal(secondBackfill.report.mutationCount, 0);
+    assert.equal(secondBackfill.report.idempotentReplay, true);
+    assert.deepEqual(
+      (await schemaPool.query<{ xmin: string }>(
+        "SELECT xmin::text AS xmin FROM orders"
+      )).rows,
+      orderBeforeReplay.rows
+    );
+    phase = "packaged_reconcile_dry_run";
+    const dryRun = runPackagedExecutionStateCommand({
+      command: "db:postgres:execution-state:reconcile",
+      snapshotPath: sourcePath,
+      schema,
+      dryRun: true
+    });
+    assert.equal(dryRun.exitCode, 0);
+    assert.equal(dryRun.report.status, "dry_run_passed");
+    assert.equal(dryRun.report.rowMutationCount, 0);
+    assert.equal(dryRun.report.mutationCount, 0);
+    assert.equal(dryRun.report.discrepancyCount, 0);
+    assert.equal(dryRun.report.duplicateCount, 0);
+    assert.equal(dryRun.report.orphanCount, 0);
+    phase = "packaged_reconcile";
+    const reconciliation = runPackagedExecutionStateCommand({
+      command: "db:postgres:execution-state:reconcile",
+      snapshotPath: sourcePath,
+      schema
+    });
+    assert.equal(reconciliation.exitCode, 0);
+    assert.equal(reconciliation.report.status, "passed");
+    assert.equal(reconciliation.report.rowMutationCount, 0);
+    assert.equal(reconciliation.report.checkpointMutationCount, 1);
+    assert.equal(reconciliation.report.durableCheckpointVerified, true);
+    const checkpointId = String(reconciliation.report.checkpointId);
+    const durable = await schemaPool.query<{
+      status: string;
+      source_checksum: string | null;
+      discrepancy_count: string;
+      cursor_value: Record<string, unknown>;
+    }>(
+      `SELECT status, source_checksum, discrepancy_count::text AS discrepancy_count,
+              cursor_value
+       FROM reconciliation_checkpoints WHERE id = $1`,
+      [checkpointId]
+    );
+    assert.equal(durable.rows[0]?.status, "passed");
+    assert.equal(durable.rows[0]?.discrepancy_count, "0");
+    assert.equal(durable.rows[0]?.cursor_value.postgresMigrationVersion, 2);
+    assert.equal(durable.rows[0]?.cursor_value.mappingVersion, "release-4-v1");
+    phase = "packaged_reconcile_replay";
+    const replay = runPackagedExecutionStateCommand({
+      command: "db:postgres:execution-state:reconcile",
+      snapshotPath: sourcePath,
+      schema
+    });
+    assert.equal(replay.exitCode, 0);
+    assert.equal(replay.report.status, "passed");
+    assert.equal(replay.report.idempotentReplay, true);
+    assert.equal(replay.report.mutationCount, 0);
+    assert.equal(replay.report.durableCheckpointVerified, true);
+    phase = "unexplained_target_mismatch";
+    await schemaPool.query("UPDATE orders SET status = 'unexpected-target-state'");
+    const mismatch = await reconcileExecutionStateSnapshot({
+      snapshotPath: sourcePath,
+      pool: schemaPool,
+      config,
+      dryRun: true
+    });
+    assert.equal(mismatch.status, "blocked");
+    assert.equal(mismatch.rowMutationCount, 0);
+    assert.equal(mismatch.tableComparisons.orders.mismatch, 1);
+    assert.equal(mismatch.discrepancyCategories["orders:MISMATCH"], 1);
+  } catch (error) {
+    const safe = sanitizeDatabaseError(error);
+    failureCode = `${phase}:${safe.code || "POSTGRES_EXECUTION_STATE_TEST_FAILED"}`;
+  } finally {
+    try {
+      if (schemaPool) await schemaPool.end();
+      await adminPool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch (error) {
+      failureCode ||= sanitizeDatabaseError(error).code || "POSTGRES_INTEGRATION_CLEANUP_FAILED";
+    }
+    await adminPool.end();
+    await rm(directory, { recursive: true, force: true });
+  }
+  if (failureCode) throw new Error(`POSTGRES_EXECUTION_STATE_TEST_FAILED:${failureCode}`);
 });

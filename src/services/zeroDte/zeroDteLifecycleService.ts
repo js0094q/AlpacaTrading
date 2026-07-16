@@ -3,6 +3,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { getDb } from "../../lib/db.js";
 import { redactSensitiveText } from "../../lib/securityRedaction.js";
 import { nowIso, uuid } from "../../lib/utils.js";
+import { assertScheduledWriteFenceActive } from "../controlPlaneRuntimeContext.js";
 import { buildZeroDteDecisionId } from "./zeroDteIdentityService.js";
 import type { ZeroDteDirection, ZeroDtePlaybook } from "./zeroDteTypes.js";
 
@@ -232,9 +233,11 @@ const asStringArray = (value: unknown): string[] =>
     : [];
 
 const withTransaction = <T>(db: DatabaseSync, operation: () => T): T => {
+  assertScheduledWriteFenceActive();
   db.exec("BEGIN IMMEDIATE;");
   try {
     const result = operation();
+    assertScheduledWriteFenceActive();
     db.exec("COMMIT;");
     return result;
   } catch (error) {
@@ -409,6 +412,7 @@ export const insertZeroDteDecisionRow = (
   db: DatabaseSync,
   input: ZeroDteDecisionInput
 ): ZeroDteDecision => {
+  assertScheduledWriteFenceActive();
   const decisionId = requiredText(
     input.decisionId ?? buildZeroDteDecisionId(input.engineRunId, input.candidateId),
     "decision ID"
@@ -499,6 +503,7 @@ export const insertZeroDteLifecycleEventRow = (
   db: DatabaseSync,
   input: ZeroDteLifecycleEventInput
 ): ZeroDteLifecycleEvent => {
+  assertScheduledWriteFenceActive();
   const eventId = requiredText(input.eventId ?? uuid(), "event ID");
   if (!ZERO_DTE_LIFECYCLE_EVENT_TYPES.includes(input.eventType)) {
     throw new RangeError(`Unsupported 0DTE lifecycle event type: ${input.eventType}`);

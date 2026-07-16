@@ -4,6 +4,7 @@ import { canonicalJsonHash } from "../../lib/canonicalJson.js";
 import { getDb, queryAll, queryOne } from "../../lib/db.js";
 import { runWithSqliteBusyRetry } from "../../lib/sqliteConcurrency.js";
 import { nowIso, normalizeSymbol, uuid } from "../../lib/utils.js";
+import { assertScheduledWriteFenceActive } from "../controlPlaneRuntimeContext.js";
 import { buildZeroDteCandidateId } from "./zeroDteIdentityService.js";
 import {
   insertZeroDteLifecycleEventRow,
@@ -344,10 +345,16 @@ const stringArrayJson = (value: unknown): string[] => {
 };
 
 const withTransaction = <T>(db: DatabaseSync, operation: () => T): T => {
-  if (db.isTransaction) return operation();
+  assertScheduledWriteFenceActive();
+  if (db.isTransaction) {
+    const result = operation();
+    assertScheduledWriteFenceActive();
+    return result;
+  }
   db.exec("BEGIN IMMEDIATE;");
   try {
     const result = operation();
+    assertScheduledWriteFenceActive();
     db.exec("COMMIT;");
     return result;
   } catch (error) {

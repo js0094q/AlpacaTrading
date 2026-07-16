@@ -1,5 +1,21 @@
 # Resume Context: Alpaca Trading Research Infra
 
+## Neon operational-state migration Release 4 implementation (2026-07-16)
+
+- Branch `codex/neon-authority-cutover` remains based on
+  `origin/main@624fc45372bc80fbe48664a586b135985f23c34c`; production flags and
+  services are unchanged while the implementation PR is prepared.
+- PostgreSQL fencing now covers all 14 approved timers. Release 4 adds the
+  execution-state repository, sealed-snapshot backfill, reconciliation,
+  shadow/authority routing, and fail-closed broker transaction boundaries.
+- PostgreSQL execution authority bypasses SQLite decisions and authoritative
+  mutations for reviewed entry/exit, hedge entry/exit, and zero-DTE entry/exit.
+  Exact replay makes no broker call, ambiguous results require reconciliation,
+  and no PostgreSQL transaction spans a broker or market-data request.
+- The implementation reuses PostgreSQL migrations 1 and 2; migration 3 remains
+  absent. Production cutover is a separate staged operation after merge and
+  deployment, with paper mode retained and live trading disabled.
+
 ## Neon operational-state migration Release 3 control plane (2026-07-15)
 
 - Release 3 adds PostgreSQL schema version 2, fenced scheduler leases,

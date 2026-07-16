@@ -38,8 +38,10 @@ import {
 import { persistHedgeExecutionReview } from "../src/services/hedgePersistenceService.js";
 import {
   insertPaperExecutionLedgerEntry,
-  updatePaperExecutionLedgerEntry
+  updatePaperExecutionLedgerEntry,
+  type PaperExecutionLedgerEntry
 } from "../src/services/paperExecutionLedgerService.js";
+import { withExecutionAuthority } from "./helpers/executionAuthorityRuntime.js";
 
 const account = {
   id: "paper-account-1",
@@ -218,6 +220,39 @@ test("a consumed signed hedge review cannot be replayed", async () => {
   assert.ok(result.blockers.includes("HEDGE_REVIEW_ALREADY_CONSUMED"));
 });
 
+test("PostgreSQL evidence consumption, not SQLite review status, controls authority replay", async () => {
+  const review = makeReview("postgres-consumed-status");
+  getDb().prepare(
+    "UPDATE hedge_execution_reviews SET status = 'consumed' WHERE review_id = ?"
+  ).run(review.reviewId);
+  let brokerCalls = 0;
+
+  const result = await withExecutionAuthority(() =>
+    executeReviewedPaperHedge(
+      { reviewId: review.reviewId, confirmPaper: true },
+      deps({
+        storeExecutionEvidence: async () => ({ status: "authority_stored" }),
+        authorizeExecution: async () => ({
+          status: "authority_duplicate",
+          brokerAllowed: false,
+          blockers: ["EXECUTION_INTENT_RECONCILIATION_REQUIRED"],
+          reservationId: "reservation-consumed-status",
+          orderIntentId: "intent-consumed-status"
+        }),
+        submitPaperOrder: async () => {
+          brokerCalls += 1;
+          throw new Error("PostgreSQL duplicate intent must not resubmit");
+        }
+      })
+    )
+  );
+
+  assert.equal(result.status, "blocked");
+  assert.equal(result.blockers.includes("HEDGE_REVIEW_ALREADY_CONSUMED"), false);
+  assert.ok(result.blockers.includes("EXECUTION_INTENT_RECONCILIATION_REQUIRED"));
+  assert.equal(brokerCalls, 0);
+});
+
 test("capital evidence drift or incompleteness requires a fresh review and submits zero", async () => {
   const completePosition: AlpacaPositionRaw = {
     symbol: "QQQ260918P00400000",
@@ -344,6 +379,247 @@ test("hedge reservation atomically rejects a distinct reservation that fills bef
   assert.equal(submitCalls, 0);
   assert.ok(result.blockers.includes("HEDGE_RESERVATION_STATE_DRIFT"));
   assert.ok(result.blockers.includes("FRESH_REVIEW_REQUIRED"));
+});
+
+test("PostgreSQL execution authority bypasses the SQLite hedge reservation and records broker state", async () => {
+  const review = makeReview("postgres-authority");
+  const recordedStatuses: string[] = [];
+  const result = await withExecutionAuthority(() =>
+    executeReviewedPaperHedge(
+      { reviewId: review.reviewId, confirmPaper: true },
+      deps({
+        listLedger: () => {
+          throw new Error("SQLite ledger must not be consulted under PostgreSQL authority");
+        },
+        refreshQuote: async () => {
+          insertPaperExecutionLedgerEntry({
+            mode: "hedge-entry",
+            assetClass: "option",
+            symbol: "QQQ260918P00450000",
+            underlyingSymbol: "QQQ",
+            strategy: "portfolio_hedge",
+            side: "buy",
+            orderType: "limit",
+            timeInForce: "day",
+            qty: "1",
+            limitPrice: "1",
+            estimatedPremium: 100,
+            maxRisk: 100,
+            dedupeKey: "sqlite-only-hedge-reservation",
+            clientOrderId: "sqlite-only-hedge-reservation",
+            status: "reserved",
+            sourcePlanId: "sqlite-only-hedge-review",
+            payload: { expiresAt: "2026-07-13T14:05:00.000Z" }
+          });
+          return {
+            bid: 4.9,
+            ask: 5.1,
+            midpoint: 5,
+            delta: -0.32,
+            quoteTimestamp: "2026-07-13T13:59:55.000Z"
+          };
+        },
+        storeExecutionEvidence: async () => ({ status: "authority_stored" }),
+        authorizeExecution: async () => ({
+          status: "authority_reserved",
+          brokerAllowed: true,
+          reservationId: "reservation-postgres-authority",
+          orderIntentId: "intent-postgres-authority"
+        }),
+        recordExecutionResult: async (ledger: PaperExecutionLedgerEntry) => {
+          recordedStatuses.push(ledger.status);
+          return { status: "authority_recorded", replay: false };
+        }
+      })
+    )
+  );
+
+  getDb().prepare(
+    "DELETE FROM paper_execution_ledger WHERE client_order_id = 'sqlite-only-hedge-reservation'"
+  ).run();
+  assert.equal(result.status, "filled");
+  assert.deepEqual(recordedStatuses, ["submitted", "filled"]);
+  assert.equal(
+    (getDb().prepare(
+      "SELECT COUNT(*) AS count FROM paper_execution_ledger WHERE client_order_id = ?"
+    ).get(review.clientOrderId) as { count: number }).count,
+    0
+  );
+  assert.equal(
+    (getDb().prepare(
+      "SELECT status FROM hedge_execution_reviews WHERE review_id = ?"
+    ).get(review.reviewId) as { status: string }).status,
+    "reviewed"
+  );
+});
+
+test("PostgreSQL authority denial prevents hedge replace and cancel broker mutations", async () => {
+  const review = makeReview("postgres-mutation-denied");
+  let replaceCalls = 0;
+  let cancelCalls = 0;
+  const result = await withExecutionAuthority(() =>
+    executeReviewedPaperHedge(
+      { reviewId: review.reviewId, confirmPaper: true },
+      deps({
+        storeExecutionEvidence: async () => ({ status: "authority_stored" }),
+        authorizeExecution: async () => ({
+          status: "authority_reserved",
+          brokerAllowed: true,
+          reservationId: "reservation-mutation-denied",
+          orderIntentId: "intent-mutation-denied"
+        }),
+        recordExecutionResult: async () => ({
+          status: "authority_recorded",
+          replay: false
+        }),
+        authorizeBrokerMutation: async () => ({
+          status: "authority_blocked",
+          brokerAllowed: false,
+          blockers: ["EXECUTION_BROKER_MUTATION_FENCE_REJECTED"]
+        }),
+        getPaperOrder: async () => ({
+          data: {
+            id: "broker-order-1",
+            client_order_id: review.clientOrderId,
+            symbol: review.orderIntent.symbol,
+            status: "accepted",
+            filled_qty: "0"
+          },
+          status: 200,
+          url: "paper"
+        }),
+        replacePaperOrder: async () => {
+          replaceCalls += 1;
+          throw new Error("replace must be fenced before the broker call");
+        },
+        cancelPaperOrder: async () => {
+          cancelCalls += 1;
+          throw new Error("cancel must be fenced before the broker call");
+        },
+        maxRepriceAttempts: 1
+      })
+    )
+  );
+
+  assert.equal(result.status, "blocked");
+  assert.ok(result.blockers.includes("EXECUTION_BROKER_MUTATION_FENCE_REJECTED"));
+  assert.equal(replaceCalls, 0);
+  assert.equal(cancelCalls, 0);
+});
+
+test("PostgreSQL authority persists and follows a fenced hedge replacement", async () => {
+  const review = makeReview("postgres-replacement");
+  const recorded: Array<{ status: string; brokerOrderId: string | null }> = [];
+  const mutationCalls: string[] = [];
+  const polledOrderIds: string[] = [];
+  let quoteCalls = 0;
+  let replaceCalls = 0;
+
+  const result = await withExecutionAuthority(() =>
+    executeReviewedPaperHedge(
+      { reviewId: review.reviewId, confirmPaper: true },
+      deps({
+        storeExecutionEvidence: async () => ({ status: "authority_stored" }),
+        authorizeExecution: async () => ({
+          status: "authority_reserved",
+          brokerAllowed: true,
+          reservationId: "reservation-postgres-replacement",
+          orderIntentId: "intent-postgres-replacement"
+        }),
+        authorizeBrokerMutation: async (_ledger: PaperExecutionLedgerEntry, mutation: string) => {
+          mutationCalls.push(mutation);
+          return { status: "authority_authorized", brokerAllowed: true };
+        },
+        recordExecutionResult: async (entry: PaperExecutionLedgerEntry) => {
+          recorded.push({ status: entry.status, brokerOrderId: entry.alpacaOrderId });
+          return { status: "authority_recorded", replay: false };
+        },
+        refreshQuote: async () => {
+          quoteCalls += 1;
+          return quoteCalls === 1
+            ? {
+                bid: 4.9,
+                ask: 5.1,
+                midpoint: 5,
+                delta: -0.32,
+                quoteTimestamp: "2026-07-13T13:59:55.000Z"
+              }
+            : {
+                bid: 4.7,
+                ask: 4.8,
+                midpoint: 4.75,
+                delta: -0.32,
+                quoteTimestamp: "2026-07-13T14:00:02.000Z"
+              };
+        },
+        getPaperOrder: async (orderId: string) => {
+          polledOrderIds.push(orderId);
+          if (orderId === "broker-order-1") {
+            return {
+              data: {
+                id: orderId,
+                client_order_id: review.clientOrderId,
+                symbol: review.orderIntent.symbol,
+                status: "accepted",
+                filled_qty: "0"
+              },
+              status: 200,
+              url: "paper"
+            };
+          }
+          assert.equal(orderId, "broker-order-2");
+          return {
+            data: {
+              id: orderId,
+              client_order_id: "replacement-client-order-2",
+              replaces: "broker-order-1",
+              symbol: review.orderIntent.symbol,
+              status: "filled",
+              filled_qty: "1",
+              filled_avg_price: "4.79"
+            },
+            status: 200,
+            url: "paper"
+          };
+        },
+        replacePaperOrder: async (orderId: string, payload: { limit_price?: string }) => {
+          replaceCalls += 1;
+          assert.equal(orderId, "broker-order-1");
+          assert.equal(payload.limit_price, "4.8");
+          return {
+            data: {
+              id: "broker-order-2",
+              client_order_id: "replacement-client-order-2",
+              replaces: "broker-order-1",
+              symbol: review.orderIntent.symbol,
+              status: "accepted",
+              qty: "1",
+              limit_price: "4.8",
+              filled_qty: "0"
+            },
+            requestId: "replace-request-2",
+            status: 200,
+            url: "paper"
+          };
+        },
+        cancelPaperOrder: async () => {
+          throw new Error("filled replacement must not be canceled");
+        },
+        maxRepriceAttempts: 1
+      })
+    )
+  );
+
+  assert.equal(result.status, "filled");
+  assert.equal(result.brokerOrderId, "broker-order-2");
+  assert.equal(replaceCalls, 1);
+  assert.deepEqual(mutationCalls, ["replace"]);
+  assert.deepEqual(polledOrderIds, ["broker-order-1", "broker-order-2"]);
+  assert.deepEqual(recorded, [
+    { status: "submitted", brokerOrderId: "broker-order-1" },
+    { status: "submitted", brokerOrderId: "broker-order-2" },
+    { status: "filled", brokerOrderId: "broker-order-2" }
+  ]);
 });
 
 test("reapplies new, total, daily, and open-order hedge caps before reservation", async () => {

@@ -13,7 +13,6 @@ export type PostgresSchedulerCommandInput = {
 export type PostgresSchedulerCommandRegistration = {
   readonly job: PostgresSchedulerJob;
   readonly aliases: readonly string[];
-  readonly requiresReviewedExitSections?: boolean;
 };
 
 export type PostgresSchedulerInvocationRegistration = {
@@ -33,7 +32,7 @@ export const POSTGRES_SCHEDULER_COMMAND_REGISTRY = [
   },
   {
     job: POSTGRES_SCHEDULER_JOBS.zeroDte,
-    aliases: ["zero-dte:engine"]
+    aliases: ["zero-dte:engine", "zero-dte:exit:review", "zero-dte:eod"]
   },
   {
     job: POSTGRES_SCHEDULER_JOBS.observatory,
@@ -58,20 +57,31 @@ export const POSTGRES_SCHEDULER_COMMAND_REGISTRY = [
     aliases: ["paper:exit:execute", "paper:exit-execute"]
   },
   {
-    job: POSTGRES_SCHEDULER_JOBS.paperExit,
-    aliases: ["paper:execute:reviewed"],
-    requiresReviewedExitSections: true
+    job: POSTGRES_SCHEDULER_JOBS.paperExecution,
+    aliases: ["paper:execute", "paper:execute:reviewed"]
+  },
+  {
+    job: POSTGRES_SCHEDULER_JOBS.allocation,
+    aliases: [
+      "paper:review",
+      "paper:portfolio:review",
+      "paper:ops:morning",
+      "paper:ops:midday"
+    ]
   },
   {
     job: POSTGRES_SCHEDULER_JOBS.marketDataRefresh,
     aliases: ["data:ingest", "options:ingest"]
+  },
+  {
+    job: POSTGRES_SCHEDULER_JOBS.universeLifecycle,
+    aliases: ["universe:lifecycle"]
+  },
+  {
+    job: POSTGRES_SCHEDULER_JOBS.autonomousRecovery,
+    aliases: ["system:recover"]
   }
 ] as const satisfies readonly PostgresSchedulerCommandRegistration[];
-
-const REVIEWED_EXIT_SECTIONS = new Set([
-  "equitySells",
-  "optionSellToCloseExits"
-]);
 
 const normalizedCommand = (input: PostgresSchedulerCommandInput) => {
   const command = input.command?.trim();
@@ -87,19 +97,13 @@ const normalizedCommand = (input: PostgresSchedulerCommandInput) => {
     .join(":");
 };
 
-const hasReviewedExitSections = (
-  sections: PostgresSchedulerCommandInput["sections"]
-) => {
-  const values = (
-    typeof sections === "string" ? sections.split(",") : sections ?? []
-  )
-    .map((section) => section.trim())
-    .filter(Boolean);
-
-  return (
-    values.length > 0 &&
-    values.every((section) => REVIEWED_EXIT_SECTIONS.has(section))
-  );
+const isExitOnlyReviewedExecution = (input: PostgresSchedulerCommandInput) => {
+  const sections = Array.isArray(input.sections)
+    ? input.sections
+    : String(input.sections ?? "").split(",");
+  const normalized = sections.map((section) => section.trim()).filter(Boolean);
+  const exitSections = new Set(["equitySells", "optionSellToCloseExits"]);
+  return normalized.length > 0 && normalized.every((section) => exitSections.has(section));
 };
 
 export const resolvePostgresSchedulerJob = (
@@ -107,16 +111,15 @@ export const resolvePostgresSchedulerJob = (
 ): PostgresSchedulerJob | null => {
   const command = normalizedCommand(input);
   if (!command) return null;
+  if (
+    ["paper:execute", "paper:execute:reviewed"].includes(command) &&
+    isExitOnlyReviewedExecution(input)
+  ) {
+    return POSTGRES_SCHEDULER_JOBS.paperExit;
+  }
 
   for (const registration of POSTGRES_SCHEDULER_COMMAND_REGISTRY) {
     if (!(registration.aliases as readonly string[]).includes(command)) continue;
-    if (
-      "requiresReviewedExitSections" in registration &&
-      registration.requiresReviewedExitSections &&
-      !hasReviewedExitSections(input.sections)
-    ) {
-      continue;
-    }
     return registration.job;
   }
 

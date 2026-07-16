@@ -10,6 +10,7 @@ import type {
 import { appendDecisionLifecycleEvent } from "./marketDecisionEvidenceService.js";
 import { createPositionLifecycleId } from "./marketDecisionIdentityService.js";
 import { linkPaperExecutionPositionLifecycle } from "./paperExecutionLedgerService.js";
+import { assertScheduledWriteFenceActive } from "./controlPlaneRuntimeContext.js";
 import {
   linkPaperLearningRecordsToOutcome,
   linkPaperLearningRecordsToOutcomeRevision
@@ -91,6 +92,7 @@ export const reconcilePaperEntryFill = (input: {
   brokerRequestId?: string | null;
   underlyingPrice?: number | null;
 }): ReturnType<typeof mapPosition> => {
+  assertScheduledWriteFenceActive();
   assertPaperOnly();
   if (
     !["filled", "partially_filled"].includes(input.status) ||
@@ -309,6 +311,7 @@ export const capturePaperPositionObservation = (input: {
   portfolioState?: unknown;
   riskState?: unknown;
 }) => {
+  assertScheduledWriteFenceActive();
   assertPaperOnly();
   const evidence = {
     ...input,
@@ -421,6 +424,7 @@ export const closePaperPositionFromFill = (input: {
   brokerRequestId?: string | null;
   underlyingPrice?: number | null;
 }) => {
+  assertScheduledWriteFenceActive();
   assertPaperOnly();
   if (
     input.status !== "filled" ||
@@ -580,6 +584,7 @@ export const persistPaperPositionOutcome = (input: {
   positionLifecycleId: PositionLifecycleId;
   exitReasonCode: string;
 }) => {
+  assertScheduledWriteFenceActive();
   assertPaperOnly();
   const original = queryOne<OutcomeRow>(
     "SELECT * FROM paper_position_outcomes WHERE position_lifecycle_id = ? LIMIT 1",
@@ -788,6 +793,7 @@ export const appendPaperPositionOutcomeRevision = (input: {
   correctionReason: string;
   correctedFields: Record<string, unknown>;
 }) => {
+  assertScheduledWriteFenceActive();
   const outcome = queryOne<{ outcome_id: string }>(
     "SELECT outcome_id FROM paper_position_outcomes WHERE outcome_id = ? LIMIT 1",
     [input.outcomeId]

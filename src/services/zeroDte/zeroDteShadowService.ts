@@ -3,6 +3,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { canonicalJsonHash } from "../../lib/canonicalJson.js";
 import { getDb } from "../../lib/db.js";
 import { nowIso } from "../../lib/utils.js";
+import { assertScheduledWriteFenceActive } from "../controlPlaneRuntimeContext.js";
 import { parseOptionSymbol } from "../optionSymbolService.js";
 import { loadZeroDteConfig } from "./zeroDteConfigService.js";
 import {
@@ -167,9 +168,11 @@ const parseJsonRecord = (value: unknown): Record<string, unknown> => {
 };
 
 const withTransaction = <T>(db: DatabaseSync, operation: () => T): T => {
+  assertScheduledWriteFenceActive();
   db.exec("BEGIN IMMEDIATE;");
   try {
     const result = operation();
+    assertScheduledWriteFenceActive();
     db.exec("COMMIT;");
     return result;
   } catch (error) {

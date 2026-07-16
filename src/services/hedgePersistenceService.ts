@@ -36,6 +36,7 @@ import {
   persistDecisionSnapshot
 } from "./marketDecisionEvidenceService.js";
 import type { PositionLifecycleId } from "../types.js";
+import { assertScheduledWriteFenceActive } from "./controlPlaneRuntimeContext.js";
 
 interface HighWaterRow {
   environment: "paper";
@@ -600,6 +601,7 @@ const mapHighWater = (row: HighWaterRow): PortfolioHighWaterMark => ({
 });
 
 export const observePortfolioHighWaterMark = (input: PortfolioHighWaterMark) => {
+  assertScheduledWriteFenceActive();
   if (!(Number.isFinite(input.equity) && input.equity > 0)) {
     throw new Error("PORTFOLIO_HIGH_WATER_EQUITY_INVALID");
   }
@@ -639,6 +641,7 @@ export const latestPortfolioHighWaterMark = (
 };
 
 export const writeBetaCache = (entry: BetaCacheEntry) => {
+  assertScheduledWriteFenceActive();
   getDb()
     .prepare(
       `
@@ -738,6 +741,7 @@ export const readCompatibleBetaCache = (
 };
 
 export const persistHedgeRecommendation = (record: HedgeRecommendationRecord) => {
+  assertScheduledWriteFenceActive();
   const payload = canonicalJson(record);
   getDb()
     .prepare(
@@ -1040,6 +1044,7 @@ export const attachReviewedPayloadHash = (
   reviewedPayloadHash: string,
   updatedAt = new Date().toISOString()
 ) => {
+  assertScheduledWriteFenceActive();
   const row = getDb()
     .prepare(
       `SELECT id, created_at, updated_at, signal_inputs_json
@@ -1066,6 +1071,7 @@ export const attachReviewedPayloadHash = (
 };
 
 export const persistHedgePlanRecord = (artifact: HedgePlanArtifact) => {
+  assertScheduledWriteFenceActive();
   getDb()
     .prepare(
       `
@@ -1122,6 +1128,7 @@ export const latestHedgePlan = (): HedgePlanArtifact | null => {
 };
 
 export const persistHedgeExecutionReview = (review: HedgeExecutionReview) => {
+  assertScheduledWriteFenceActive();
   const exactOpenPositions = review.reviewType === "exit"
     ? (getDb().prepare(`
         SELECT position_lifecycle_id
@@ -1239,6 +1246,7 @@ export const readHedgeExecutionReview = (input: {
   accountHash?: string;
   configurationFingerprint?: string;
   sourceSnapshotId?: string;
+  requireReviewedStatus?: boolean;
 }): {
   review: HedgeExecutionReview | null;
   verification: HedgeExecutionReviewVerification;
@@ -1318,7 +1326,7 @@ export const readHedgeExecutionReview = (input: {
     sourceSnapshotId: input.sourceSnapshotId
   });
   const persistenceBlockers: string[] = [];
-  if (row.status !== "reviewed") {
+  if (input.requireReviewedStatus !== false && row.status !== "reviewed") {
     persistenceBlockers.push(
       row.status === "consumed"
         ? "HEDGE_REVIEW_ALREADY_CONSUMED"
@@ -1358,6 +1366,7 @@ export const readHedgeExecutionReview = (input: {
 };
 
 export const markHedgeExecutionReviewConsumed = (reviewId: string) => {
+  assertScheduledWriteFenceActive();
   const result = getDb()
     .prepare(
       `UPDATE hedge_execution_reviews SET status = 'consumed' WHERE review_id = ? AND status = 'reviewed'`

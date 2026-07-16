@@ -32,9 +32,11 @@ import {
   getLatestPaperReconciliationEventForTests,
   reconcilePaperAccountBeforeExecution
 } from "../src/services/paperAccountReconciliationService.js";
+import { insertPaperExecutionLedgerEntry } from "../src/services/paperExecutionLedgerService.js";
 import { closeDbForTests, getDb } from "../src/lib/db.js";
 import type { PaperPlanCandidate, PaperPlanReport } from "../src/services/paperPlanService.js";
 import type { PaperReviewReport } from "../src/services/paperReviewService.js";
+import { withExecutionAuthority } from "./helpers/executionAuthorityRuntime.js";
 
 after(() => {
   closeDbForTests();
@@ -778,6 +780,45 @@ describe("paper execute dry-run payload construction", () => {
 });
 
 describe("paper execute confirm-paper guardrails", () => {
+  test("requires the reviewed PostgreSQL path when execution authority is active", async () => {
+    process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
+    let brokerCalls = 0;
+    let planCalls = 0;
+    const before = getDb()
+      .prepare("SELECT COUNT(*) AS count FROM paper_execution_ledger")
+      .get() as { count: number };
+
+    const report = await withExecutionAuthority(() =>
+      buildPaperExecuteConfirmPaperReport(
+        { confirmPaper: true },
+        {
+          now: () => now,
+          buildPlan: async () => {
+            planCalls += 1;
+            return basePlan();
+          },
+          submitPaperOrder: async (payload) => {
+            brokerCalls += 1;
+            return mockSubmitSuccess(payload);
+          }
+        }
+      )
+    );
+    const after = getDb()
+      .prepare("SELECT COUNT(*) AS count FROM paper_execution_ledger")
+      .get() as { count: number };
+
+    assert.equal(report.status, "blocked");
+    assert.equal(
+      report.errors.some((error) => error.reason === "POSTGRES_EXECUTION_REVIEW_REQUIRED"),
+      true
+    );
+    assert.equal(report.mutationAttempted, false);
+    assert.equal(planCalls, 0);
+    assert.equal(brokerCalls, 0);
+    assert.equal(after.count, before.count);
+  });
+
   test("requires confirmPaper flag", async () => {
     process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
     const report = await buildPaperExecuteConfirmPaperReport({}, { now: () => now });
@@ -937,6 +978,62 @@ describe("paper execute confirm-paper guardrails", () => {
     assert.equal(submitCalls, 1);
     assert.equal(report.reconciliation?.reconciliationStatus, "ok");
     assert.equal(report.reconciliation?.sumPositionsMarketValue, 100);
+  });
+
+  test("PostgreSQL authority ignores SQLite execution ledger position evidence", async () => {
+    insertPaperExecutionLedgerEntry({
+      mode: "confirmPaper",
+      assetClass: "equity",
+      symbol: "STALE",
+      side: "buy",
+      orderType: "market",
+      timeInForce: "day",
+      qty: "1",
+      dedupeKey: "stale-local-position-evidence",
+      clientOrderId: "stale-local-position-evidence",
+      status: "accepted",
+      payload: { symbol: "STALE" }
+    });
+
+    const result = await withExecutionAuthority(() =>
+      reconcilePaperAccountBeforeExecution({
+        now: () => now,
+        getAccount: async () => ({
+          data: mockAccount({
+            cash: "100000.00",
+            equity: "100000.00",
+            position_market_value: "0.00"
+          }),
+          requestId: "account-authority-id",
+          status: 200,
+          url: "https://paper-api.alpaca.markets/v2/account"
+        }),
+        listPaperPositions: async () => ({
+          data: [],
+          requestId: "positions-authority-id",
+          status: 200,
+          url: "https://paper-api.alpaca.markets/v2/positions"
+        }),
+        listRecentPaperOrders: async () => ({
+          data: [],
+          requestId: "orders-authority-id",
+          status: 200,
+          url: "https://paper-api.alpaca.markets/v2/orders?status=all"
+        }),
+        listPaperAccountActivities: async () => ({
+          data: [],
+          requestId: "activities-authority-id",
+          status: 200,
+          url: "https://paper-api.alpaca.markets/v2/account/activities"
+        })
+      })
+    );
+
+    assert.equal(result.report.status, "ok");
+    assert.equal(result.report.expectedQuantities.STALE, undefined);
+    assert.equal(result.report.missingSymbols.includes("STALE"), false);
+    assert.equal(result.report.reconciliationEvents.length, 0);
+    assert.equal(getLatestPaperReconciliationEventForTests("STALE"), null);
   });
 
   test("paper missing position within sync window returns pending warning and continues", async () => {

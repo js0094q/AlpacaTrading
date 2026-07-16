@@ -12,6 +12,7 @@ process.env.LIVE_TRADING_ENABLED = "false";
 process.env.ALPACA_ENV = "paper";
 
 import type { LeapsExitEvaluation } from "../src/services/leapsExitReviewService.js";
+import { withExecutionAuthority } from "./helpers/executionAuthorityRuntime.js";
 
 const [portfolioReview, libDb] = await Promise.all([
   import("../src/services/paperPortfolioReviewService.js"),
@@ -232,6 +233,46 @@ describe("paper portfolio review", () => {
         "SCALE_IN_DUPLICATE_ORDER_OR_RESERVATION"
       );
     }
+  });
+
+  test("uses PostgreSQL reservations and skips SQLite position observations under authority", async () => {
+    process.env.PAPER_EQUITY_SCALE_IN_ENABLED = "true";
+    const before = libDb.queryOne<{ count: number }>(
+      "SELECT COUNT(*) AS count FROM paper_position_observations"
+    )?.count ?? 0;
+
+    const report = await withExecutionAuthority(() =>
+      buildPaperPortfolioReviewReport(
+        {},
+        {
+          listPositions: async () => ({
+            positions: [{
+              symbol: "AAPL",
+              assetClass: "us_equity",
+              qty: "2",
+              marketValue: "1000",
+              currentPrice: "500",
+              unrealizedPl: "10",
+              unrealizedPlpc: "0.01"
+            }]
+          }),
+          getAccount: async () => account,
+          getCandidates: () => [candidate],
+          listOpenOrders: async () => ({ orders: [] }),
+          listReservations: () => {
+            throw new Error("SQLite reservations must not be read under PostgreSQL authority");
+          },
+          resolveReservations: async () => [],
+          now: () => "2026-07-07T16:00:00.000Z"
+        } as any
+      )
+    );
+
+    const after = libDb.queryOne<{ count: number }>(
+      "SELECT COUNT(*) AS count FROM paper_position_observations"
+    )?.count ?? 0;
+    assert.equal(report.recommendations[0]?.recommendation, "ADD_TO_EQUITY");
+    assert.equal(after, before);
   });
 
   test("enforces cash reserve and portfolio deployment caps for scale-ins", async () => {

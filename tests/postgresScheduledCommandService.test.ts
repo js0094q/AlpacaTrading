@@ -27,6 +27,8 @@ const configFor = (features: Partial<DatabaseConfig["features"]>): DatabaseConfi
     postgresWrites: true,
     shadowComparison: false,
     controlPlaneAuthority: false,
+    schedulerAuthority: false,
+    executionStateShadow: false,
     executionStateAuthority: false,
     sqliteAuditMirror: false,
     ...features
@@ -79,7 +81,11 @@ test("research authority executes inside a fenced runtime context", async () => 
       }
     },
     dependencies(
-      configFor({ controlPlaneAuthority: true, sqliteAuditMirror: true }),
+      configFor({
+        controlPlaneAuthority: true,
+        schedulerAuthority: true,
+        sqliteAuditMirror: true
+      }),
       calls
     )
   );
@@ -87,30 +93,52 @@ test("research authority executes inside a fenced runtime context", async () => 
   assert.deepEqual(calls, ["lease:research", "operation", "pool:end"]);
 });
 
-test("only fence-aware research uses PostgreSQL scheduler authority in Release 3", async () => {
-  const calls: string[] = [];
+test("every registered mutating workstream uses PostgreSQL scheduler authority", async () => {
   const config = configFor({
     controlPlaneAuthority: true,
+    schedulerAuthority: true,
     executionStateAuthority: true,
     sqliteAuditMirror: true
   });
-  for (const command of [
-    "observatory:collect",
-    "data:ingest",
-    "paper:exit:execute",
-    "zero-dte:engine"
-  ]) {
+  const workstreams = [
+    ["research:daily", "research"],
+    ["zero-dte:engine", "zero_dte"],
+    ["observatory:collect", "observatory"],
+    ["zero-dte:reconcile", "reconciliation"],
+    ["paper:exit:review", "exit_review"],
+    ["paper:exit:execute", "paper_exit"],
+    ["paper:execute:reviewed", "paper_execution"],
+    ["paper:ops:morning", "allocation"],
+    ["data:ingest", "market_data_refresh"],
+    ["universe:lifecycle", "universe_lifecycle"],
+    ["system:recover", "autonomous_recovery"]
+  ] as const;
+
+  for (const [command, workstream] of workstreams) {
+    const calls: string[] = [];
     await runPostgresScheduledCommand(
       { command, operation: async () => calls.push(`operation:${command}`) },
       dependencies(config, calls)
     );
+    assert.deepEqual(calls, [
+      `lease:${workstream}`,
+      `operation:${command}`,
+      "pool:end"
+    ]);
   }
-  assert.deepEqual(calls, [
-    "operation:observatory:collect",
-    "operation:data:ingest",
-    "operation:paper:exit:execute",
-    "operation:zero-dte:engine"
-  ]);
+});
+
+test("control-plane authority does not implicitly grant scheduler authority", async () => {
+  const calls: string[] = [];
+  const result = await runPostgresScheduledCommand(
+    { command: "research:daily", operation: async () => "control-plane-only" },
+    dependencies(
+      configFor({ controlPlaneAuthority: true, sqliteAuditMirror: true }),
+      calls
+    )
+  );
+  assert.equal(result, "control-plane-only");
+  assert.deepEqual(calls, []);
 });
 
 test("shadow lease failure is reported but cannot block the SQLite-authoritative operation", async () => {

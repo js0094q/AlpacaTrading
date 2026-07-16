@@ -40,3 +40,10 @@ export const assertControlPlaneFenceActive = () => {
   }
   return context;
 };
+
+export const assertScheduledWriteFenceActive = () => {
+  const context = currentControlPlaneRuntimeContext();
+  if (!context || !context.config.features.schedulerAuthority) return context;
+  if (context.signal.aborted) throw new ControlPlaneFenceLostError();
+  return context;
+};

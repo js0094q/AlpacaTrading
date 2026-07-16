@@ -28,6 +28,8 @@ const configFor = (features: Partial<DatabaseConfig["features"]>): DatabaseConfi
     postgresWrites: true,
     shadowComparison: false,
     controlPlaneAuthority: false,
+    schedulerAuthority: false,
+    executionStateShadow: false,
     executionStateAuthority: false,
     sqliteAuditMirror: false,
     ...features
