@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import type { Pool } from "pg";
 
@@ -132,6 +136,69 @@ test("authority writes PostgreSQL first and SQLite only as a compatibility proje
   });
   await service.reserve(reservation);
   assert.deepEqual(calls, ["postgres:reserve", "sqlite:reserve"]);
+});
+
+test("scheduler-authority paper review heartbeat bypasses a conflicting SQLite writer", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "paper-review-heartbeat-overlap-"));
+  const databasePath = join(directory, "research.db");
+  const holder = new DatabaseSync(databasePath);
+  holder.exec(`
+    CREATE TABLE research_runs (
+      id TEXT PRIMARY KEY,
+      heartbeat_at TEXT NOT NULL,
+      status TEXT NOT NULL
+    );
+    CREATE TABLE conflicting_workflow (id INTEGER PRIMARY KEY);
+    INSERT INTO research_runs(id, heartbeat_at, status)
+    VALUES ('paper-review-run', '2026-07-16T19:30:00.000Z', 'running');
+    BEGIN EXCLUSIVE;
+    INSERT INTO conflicting_workflow DEFAULT VALUES;
+  `);
+
+  const calls: string[] = [];
+  const pair = adapters(calls);
+  pair.sqlite.heartbeat = async (runId, at = new Date()) => {
+    calls.push("sqlite:heartbeat");
+    const projection = new DatabaseSync(databasePath);
+    try {
+      projection.exec("PRAGMA busy_timeout = 0;");
+      return Number(
+        projection.prepare(`
+          UPDATE research_runs
+          SET heartbeat_at = ?
+          WHERE id = ? AND status = 'running'
+        `).run(at.toISOString(), runId).changes
+      ) === 1;
+    } finally {
+      projection.close();
+    }
+  };
+  const service = createResearchControlPlaneService({
+    ...pair,
+    currentRuntime: () =>
+      runtimeFor(
+        configFor({
+          controlPlaneAuthority: true,
+          schedulerAuthority: true,
+          sqliteAuditMirror: true
+        })
+      )
+  });
+
+  try {
+    assert.equal(
+      await service.heartbeat(
+        "paper-review-run",
+        new Date("2026-07-16T19:31:00.000Z")
+      ),
+      true
+    );
+    assert.deepEqual(calls, ["postgres:heartbeat"]);
+  } finally {
+    if (holder.isTransaction) holder.exec("ROLLBACK;");
+    holder.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("authority never falls back to SQLite when PostgreSQL fails", async () => {

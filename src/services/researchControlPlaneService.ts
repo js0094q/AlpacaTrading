@@ -205,7 +205,11 @@ export const createResearchControlPlaneService = (
       }
       requireProjection(context);
       const authoritative = await dependencies.postgres.heartbeat(runId, at);
-      if (authoritative && projectToSqlite(context)) {
+      if (
+        authoritative &&
+        projectToSqlite(context) &&
+        !context.config.features.schedulerAuthority
+      ) {
         const projection = await dependencies.sqlite.heartbeat(runId, at);
         if (!projection) {
           throw new ResearchControlPlaneProjectionError(
