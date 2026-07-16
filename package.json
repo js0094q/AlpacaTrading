@@ -94,6 +94,9 @@
     "system:recover:status": "tsx src/cli.ts system:recover:status",
     "paper:trace": "tsx src/cli.ts paper:trace",
     "dashboard:control": "tsx server/dashboard-control/server.ts",
+    "smoke:alpaca-stream": "tsx scripts/smokeAlpacaStockStream.ts",
+    "test:alpaca-stream": "tsx --test tests/alpacaStockStream.test.ts",
+    "test:stock-market-data": "tsx --test tests/stockMarketDataAccessor.test.ts",
     "dashboard:dev": "next dev apps/dashboard --webpack",
     "dashboard:build": "next build apps/dashboard --webpack",
     "dashboard:start": "next start apps/dashboard",
@@ -112,6 +115,7 @@
     "@types/pg": "^8.20.0",
     "@types/react": "^19.2.7",
     "@types/react-dom": "^19.2.3",
+    "@types/ws": "^8.18.1",
     "dotenv": "^16.4.7",
     "tsx": "^4.19.2",
     "typescript": "^5.5.4"
@@ -120,6 +124,7 @@
     "next": "^16.2.10",
     "pg": "^8.22.0",
     "react": "^19.2.7",
-    "react-dom": "^19.2.7"
+    "react-dom": "^19.2.7",
+    "ws": "^8.21.1"
   }
 }

@@ -134,6 +134,11 @@
   - Public `POST /api/paper/research/run` was verified through `https://www.jlsprojects.com` with valid admin auth.
   - The branch now defines cached GET-only hedge routes at `/api/v1/hedge/risk`, `/api/v1/hedge/regime`, and `/api/v1/hedge/recommendation`; this task did not deploy them.
   - Hedge routes read the latest integrity-checked `paper_learning_records` payload and never dispatch commands or order fetches.
+- Optional stock streaming:
+  - `server/dashboard-control/server.ts` starts the singleton SIP stock stream only when `ALPACA_STOCK_STREAM_ENABLED=true` and stops it on `SIGINT`/`SIGTERM`.
+  - With no explicit `ALPACA_STOCK_STREAM_SYMBOLS`, the stream receives the current active stock universe; the configured stream URL remains `wss://stream.data.alpaca.markets/v2/sip`.
+  - `/api/v1/health` includes sanitized `data.stockStream` health, and current equity-price reads prefer fresh stream trade/quote state before falling back to SIP REST; historical bars and complete snapshots remain REST-backed.
+  - `npm run smoke:alpaca-stream` is a read-only AAPL authentication/subscription check and never submits orders.
 - Paper monitor behavior:
   - Market Observatory Phase 1A adds `alpaca-market-observatory.service` and
     `.timer` to the checked-in monitor installer. The read-only collector uses a
