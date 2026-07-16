@@ -158,6 +158,7 @@ import {
 import { reviewZeroDteExits } from "./services/zeroDte/zeroDteExitService.js";
 import { runPostgresScheduledCommand } from "./services/postgresScheduledCommandService.js";
 import {
+  assertDurableControlPlaneCheckpoint,
   backfillControlPlaneSnapshot,
   createReadConsistentSqliteSnapshot,
   reconcileControlPlaneSnapshot
@@ -323,6 +324,20 @@ const formatPadded = (
 const buildSafeBoolean = (value?: boolean) => (value ? "true" : "false");
 
 const run = async () => {
+  const packagedControlPlaneCommands = new Set([
+    "db:postgres:control-plane:snapshot",
+    "db:postgres:control-plane:backfill",
+    "db:postgres:control-plane:reconcile",
+    "db:postgres:control-plane:shadow",
+    "db:postgres:control-plane:status"
+  ]);
+  if (
+    command &&
+    packagedControlPlaneCommands.has(command) &&
+    process.env.npm_lifecycle_event !== command
+  ) {
+    throw new Error("CONTROL_PLANE_PACKAGED_CLI_REQUIRED");
+  }
   if (command === "db:postgres:connectivity") {
     const mode: PostgresConnectionMode = args.mode === "direct" ? "direct" : "pooled";
     const purpose = mode === "direct" ? "migration" : "application";
@@ -423,10 +438,7 @@ const run = async () => {
     return;
   }
 
-  if (
-    command === "db:postgres:control-plane:backfill" ||
-    command === "db:postgres:backfill"
-  ) {
+  if (command === "db:postgres:control-plane:backfill") {
     if (!args.snapshot) throw new Error("CONTROL_PLANE_SNAPSHOT_PATH_REQUIRED");
     const databaseConfig = loadDatabaseConfig(
       { ...process.env, DATABASE_BACKEND: "postgres" },
@@ -447,14 +459,23 @@ const run = async () => {
       ) {
         throw new Error("CONTROL_PLANE_POSTGRES_PREFLIGHT_FAILED");
       }
+      const backfill = await backfillControlPlaneSnapshot({
+        snapshotPath: args.snapshot,
+        pool,
+        config: databaseConfig,
+        batchSize: toInt(args.batchSize, 250)
+      });
+      const mutationCount = Object.values(backfill.insertedRows)
+        .reduce((total, count) => total + count, 0);
       print({
-        config: databaseConfigDiagnostics(databaseConfig),
-        backfill: await backfillControlPlaneSnapshot({
-          snapshotPath: args.snapshot,
-          pool,
-          config: databaseConfig,
-          batchSize: toInt(args.batchSize, 250)
-        })
+        operation: "control_plane_backfill",
+        status: "completed",
+        snapshotSha256: backfill.snapshotSha256,
+        postgresMigrationVersion: migration.latestAppliedVersion,
+        sourceRows: backfill.sourceRows,
+        insertedRows: backfill.insertedRows,
+        mutationCount,
+        idempotentReplay: mutationCount === 0
       });
     } finally {
       await pool.end();
@@ -464,9 +485,7 @@ const run = async () => {
 
   if (
     command === "db:postgres:control-plane:reconcile" ||
-    command === "db:postgres:control-plane:shadow" ||
-    command === "db:postgres:reconcile" ||
-    command === "db:postgres:shadow"
+    command === "db:postgres:control-plane:shadow"
   ) {
     if (!args.snapshot) throw new Error("CONTROL_PLANE_SNAPSHOT_PATH_REQUIRED");
     const databaseConfig = loadDatabaseConfig(
@@ -475,16 +494,62 @@ const run = async () => {
     );
     const pool = createPostgresPool(databaseConfig, "direct");
     try {
-      const checkpointId =
-        args.checkpointId || `control-plane-${new Date().toISOString().replace(/[-:.]/g, "")}`;
       const result = await reconcileControlPlaneSnapshot({
         snapshotPath: args.snapshot,
         pool,
         config: databaseConfig,
-        checkpointId
+        checkpointId: args.checkpointId,
+        dryRun: flagArg(args.dryRun) || flagArg(args["dry-run"])
       });
-      print({ config: databaseConfigDiagnostics(databaseConfig), reconciliation: result });
-      if (!result.authorityAllowed) process.exitCode = 1;
+      let durableCheckpointVerified = false;
+      if (!result.dryRun) {
+        const checkpoint = await pool.query<{
+          status: string;
+          source_checksum: string | null;
+          discrepancy_count: number | string;
+          cursor_value: Record<string, unknown> | string;
+          source_aggregates: Record<string, unknown> | string;
+          target_aggregates: Record<string, unknown> | string;
+          discrepancy_report: Record<string, unknown> | string;
+          completed_at: Date | string | null;
+        }>(
+          `SELECT status, source_checksum, discrepancy_count, cursor_value,
+                  source_aggregates, target_aggregates, discrepancy_report, completed_at
+           FROM reconciliation_checkpoints
+           WHERE id = $1`,
+          [result.checkpointId]
+        );
+        durableCheckpointVerified = assertDurableControlPlaneCheckpoint(
+          checkpoint.rows[0],
+          result
+        );
+      }
+      const discrepancyCategories = Object.fromEntries(
+        Object.entries(result.discrepancies.reduce<Record<string, number>>((counts, row) => {
+          const category = `${row.domain}:${row.discrepancyType}`;
+          counts[category] = (counts[category] ?? 0) + 1;
+          return counts;
+        }, {})).sort(([left], [right]) => left.localeCompare(right))
+      );
+      print({
+        operation: result.operation,
+        status: result.dryRun ? `dry_run_${result.status}` : result.status,
+        checkpointId: result.checkpointId,
+        snapshotSha256: result.snapshotSha256,
+        postgresMigrationVersion: result.postgresMigrationVersion,
+        mappingVersion: result.mappingVersion,
+        sourceCounts: result.sourceAggregates,
+        targetCounts: result.targetAggregates,
+        candidateNumericClassification: result.candidateNumericClassification,
+        discrepancyCount: result.discrepancyCount,
+        discrepancyCategories,
+        candidateMutationCount: result.candidateMutationCount,
+        checkpointMutationCount: result.checkpointMutationCount,
+        mutationCount: result.mutationCount,
+        idempotentReplay: result.idempotentReplay,
+        durableCheckpointVerified
+      });
+      if (result.status !== "passed") process.exitCode = 1;
     } finally {
       await pool.end();
     }
