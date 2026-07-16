@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { DatabaseSync } from "node:sqlite";
 import { resetSqliteTestDb } from "./helpers/sqliteTestDb.js";
 
 process.env.RESEARCH_DB_PATH = join(
@@ -37,7 +38,7 @@ const [
   import("../src/services/learningService.js")
 ]);
 
-const { closeDbForTests, getDb } = libDb;
+const { closeDbForTests, getDb, initializeDatabaseHandle } = libDb;
 const {
   getAllUniverse,
   getUniverseSymbol,
@@ -45,7 +46,11 @@ const {
   seedInitialUniverse
 } = universeService;
 const { normalizeStockSnapshot } = stockSnapshotNormalizer;
-const { persistStockSnapshot, runStockObservation } = stockObservationService;
+const {
+  getLatestStockObservationFeatures,
+  persistStockSnapshot,
+  runStockObservation
+} = stockObservationService;
 const { fetchStockSnapshots } = alpacaProvider;
 const { buildFeatures } = featureService;
 const { persistCandidateDecisions, rankResearchCandidates } = candidateRankingService;
@@ -382,6 +387,55 @@ describe("market observatory stock snapshots", () => {
     assert.equal(stored.length, 1);
     assert.equal(stored[0]?.source_timestamp, "2026-07-13T16:44:50.000Z");
     assert.equal(stored[0]?.observed_at, "2026-07-13T16:45:00.000Z");
+  });
+
+  test("authority-mode feature reads use the isolated observatory database", () => {
+    const researchPath = process.env.RESEARCH_DB_PATH!;
+    const observatoryPath = join(
+      researchPath.substring(0, researchPath.lastIndexOf("/")),
+      "market-observatory.db"
+    );
+    const observatory = initializeDatabaseHandle(new DatabaseSync(observatoryPath));
+    observatory.prepare(`
+      INSERT INTO stock_snapshots(
+        symbol, observed_at, source_timestamp, requested_feed, effective_feed,
+        latest_trade_conditions_json, quote_conditions_json,
+        latest_trade_price, freshness_status, data_quality_status, source
+      ) VALUES (?, ?, ?, ?, ?, '[]', '[]', ?, 'FRESH', 'COMPLETE', 'alpaca')
+    `).run(
+      "AAPL",
+      "2026-07-13T16:45:00.000Z",
+      "2026-07-13T16:44:50.000Z",
+      "iex",
+      "iex",
+      100.1
+    );
+    observatory.close();
+    const previous = {
+      backend: process.env.DATABASE_BACKEND,
+      control: process.env.POSTGRES_CONTROL_PLANE_AUTHORITY_ENABLED,
+      scheduler: process.env.POSTGRES_SCHEDULER_AUTHORITY_ENABLED,
+      path: process.env.MARKET_OBSERVATORY_DB_PATH
+    };
+    process.env.DATABASE_BACKEND = "postgres";
+    process.env.POSTGRES_CONTROL_PLANE_AUTHORITY_ENABLED = "true";
+    process.env.POSTGRES_SCHEDULER_AUTHORITY_ENABLED = "true";
+    process.env.MARKET_OBSERVATORY_DB_PATH = observatoryPath;
+    try {
+      const features = getLatestStockObservationFeatures("AAPL");
+      assert.equal(features?.observatoryLatestTradePrice, 100.1);
+      assert.equal(features?.observatoryDataQualityStatus, "COMPLETE");
+    } finally {
+      for (const [key, value] of [
+        ["DATABASE_BACKEND", previous.backend],
+        ["POSTGRES_CONTROL_PLANE_AUTHORITY_ENABLED", previous.control],
+        ["POSTGRES_SCHEDULER_AUTHORITY_ENABLED", previous.scheduler],
+        ["MARKET_OBSERVATORY_DB_PATH", previous.path]
+      ] as const) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
   });
 });
 

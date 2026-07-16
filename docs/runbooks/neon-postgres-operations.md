@@ -180,3 +180,16 @@ Use this progression after schema and backfill validation:
 In authority mode, PostgreSQL failures never fall back to SQLite. Roll back
 application flags/code while leaving additive schema version 2 in place; do
 not drop tables or delete the original SQLite database.
+
+### Market-observatory residual store
+
+Market-observatory snapshots and ingestion diagnostics remain non-authoritative,
+derived SQLite data. When control-plane or scheduler authority is enabled, the
+paper-monitor runner isolates the observatory child in
+`MARKET_OBSERVATORY_DB_PATH` (default `data/market-observatory.db`) so it never
+writes the shared operational SQLite database. Feature reads use the same
+isolated store.
+
+Create or migrate this store explicitly before enabling scheduler authority by
+running the existing `db:migrate` command with `RESEARCH_DB_PATH` set to the
+observatory path. The timer must not create or migrate the store at runtime.

@@ -5,6 +5,7 @@ import { mkdtempSync, readFileSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { DatabaseSync } from "node:sqlite";
 
 const repoRoot = process.cwd();
 const runner = join(repoRoot, "scripts/paper-monitor-runner.mjs");
@@ -257,6 +258,73 @@ describe("paper monitoring scheduler", () => {
     assert.doesNotMatch(body.command, /execute|confirmPaper|orders/);
     assert.match(timer, /OnCalendar=Mon\.\.Fri \*-\*-\* 09\.\.15:0\/15:00/);
     assert.match(timer, /Persistent=false/);
+  });
+
+  test("authority-mode observatory writes stay isolated during a shared SQLite writer overlap", () => {
+    const temp = mkdtempSync(join(tmpdir(), "alpaca-observatory-overlap-"));
+    const sharedPath = join(temp, "research.db");
+    const observatoryPath = join(temp, "market-observatory.db");
+    const fakeNpm = join(temp, "npm");
+    const shared = new DatabaseSync(sharedPath);
+    try {
+      writeFileSync(
+        join(temp, "package.json"),
+        JSON.stringify({ scripts: { "observatory:collect": "fake" } })
+      );
+      writeFileSync(
+        fakeNpm,
+        `#!/usr/bin/env node
+const { DatabaseSync } = require("node:sqlite");
+try {
+  const db = new DatabaseSync(process.env.RESEARCH_DB_PATH);
+  db.exec("CREATE TABLE IF NOT EXISTS diagnostic_observations (id INTEGER PRIMARY KEY)");
+  db.prepare("INSERT INTO diagnostic_observations DEFAULT VALUES").run();
+  db.close();
+  process.stdout.write(JSON.stringify({ status: "completed" }) + "\\n");
+} catch (error) {
+  process.stderr.write(String(error && error.message ? error.message : error) + "\\n");
+  process.exit(1);
+}
+`
+      );
+      chmodSync(fakeNpm, 0o755);
+      shared.exec("CREATE TABLE operational_state (id INTEGER PRIMARY KEY)");
+      shared.exec("BEGIN EXCLUSIVE");
+      shared.prepare("INSERT INTO operational_state DEFAULT VALUES").run();
+
+      const result = runMonitor("observatory", {
+        dryRun: false,
+        cwd: temp,
+        env: {
+          ...baseEnv,
+          PATH: `${temp}:${process.env.PATH}`,
+          DATABASE_BACKEND: "postgres",
+          POSTGRES_CONTROL_PLANE_AUTHORITY_ENABLED: "true",
+          POSTGRES_SCHEDULER_AUTHORITY_ENABLED: "true",
+          RESEARCH_DB_PATH: sharedPath,
+          MARKET_OBSERVATORY_DB_PATH: observatoryPath
+        }
+      });
+
+      assert.equal(result.status, 0, result.stderr);
+      assert.doesNotMatch(
+        `${result.stdout}\n${result.stderr}`,
+        /SQLITE_BUSY|SQLITE_LOCKED|database is locked/i
+      );
+      const isolated = new DatabaseSync(observatoryPath, { readOnly: true });
+      try {
+        const row = isolated
+          .prepare("SELECT COUNT(*) AS count FROM diagnostic_observations")
+          .get() as { count: number };
+        assert.equal(row.count, 1);
+      } finally {
+        isolated.close();
+      }
+    } finally {
+      if (shared.isTransaction) shared.exec("ROLLBACK");
+      shared.close();
+      rmSync(temp, { recursive: true, force: true });
+    }
   });
 
   test("database-heavy timers are staggered away from observatory collection", () => {
