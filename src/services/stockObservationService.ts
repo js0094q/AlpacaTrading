@@ -1,4 +1,7 @@
-import { getDb } from "../lib/db.js";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+
+import { configureDatabaseConnection, getDb } from "../lib/db.js";
 import { dedupeSymbols, normalizeSymbol } from "../lib/utils.js";
 import type { StockSnapshotRow } from "../types.js";
 import { getAlpacaMarketClock } from "./alpacaMarketClockService.js";
@@ -69,18 +72,38 @@ export const persistStockSnapshot = (
 export const getLatestStockObservationFeatures = (
   symbol: string
 ): Record<string, string | number | null> | null => {
-  const row = getDb()
-    .prepare(`
-      SELECT *
-      FROM stock_snapshots
-      WHERE symbol = ?
-      ORDER BY observed_at DESC, id DESC
-      LIMIT 1
-    `)
-    .get(normalizeSymbol(symbol)) as Record<string, string | number | null> | undefined;
-  if (!row) {
-    return null;
-  }
+  const postgresAuthorityActive =
+    process.env.DATABASE_BACKEND === "postgres" &&
+    (
+      process.env.POSTGRES_CONTROL_PLANE_AUTHORITY_ENABLED === "true" ||
+      process.env.POSTGRES_SCHEDULER_AUTHORITY_ENABLED === "true"
+    );
+  const observatoryPath =
+    process.env.MARKET_OBSERVATORY_DB_PATH?.trim() ||
+    join(process.cwd(), "data", "market-observatory.db");
+  const researchPath =
+    process.env.RESEARCH_DB_PATH?.trim() ||
+    join(process.cwd(), "data", "research.db");
+  const dedicated = postgresAuthorityActive && observatoryPath !== researchPath;
+  const database = dedicated
+    ? new DatabaseSync(observatoryPath, { readOnly: true })
+    : getDb();
+  const row = (() => {
+    try {
+      if (dedicated) configureDatabaseConnection(database);
+      return database.prepare(`
+        SELECT *
+        FROM stock_snapshots
+        WHERE symbol = ?
+        ORDER BY observed_at DESC, id DESC
+        LIMIT 1
+      `)
+        .get(normalizeSymbol(symbol)) as Record<string, string | number | null> | undefined;
+    } finally {
+      if (dedicated) database.close();
+    }
+  })();
+  if (!row) return null;
   return {
     observatoryObservedAt: row.observed_at,
     observatorySourceTimestamp: row.source_timestamp,

@@ -7,7 +7,7 @@ import {
   unlinkSync,
   writeFileSync
 } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 
 const TASKS = {
   observatory: {
@@ -323,6 +323,20 @@ if (!releaseLock) {
 }
 
 const commandSummary = `${selectedCommand[0]} ${selectedCommand[1].join(" ")}`;
+const postgresAuthorityActive =
+  process.env.DATABASE_BACKEND === "postgres" &&
+  (
+    isTrue(process.env.POSTGRES_CONTROL_PLANE_AUTHORITY_ENABLED) ||
+    isTrue(process.env.POSTGRES_SCHEDULER_AUTHORITY_ENABLED)
+  );
+const commandEnvironment = taskName === "observatory" && postgresAuthorityActive
+  ? {
+      ...process.env,
+      RESEARCH_DB_PATH:
+        process.env.MARKET_OBSERVATORY_DB_PATH?.trim() ||
+        join(process.cwd(), "data", "market-observatory.db")
+    }
+  : process.env;
 let exitCode = 0;
 
 try {
@@ -337,7 +351,7 @@ try {
     });
   } else {
     const result = spawnSync(selectedCommand[0], selectedCommand[1], {
-      env: process.env,
+      env: commandEnvironment,
       encoding: "utf8",
       maxBuffer: 50 * 1024 * 1024
     });
