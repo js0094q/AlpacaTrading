@@ -59,13 +59,16 @@
     "paper:learn": "tsx src/cli.ts paper:learn",
     "paper:learning": "tsx src/cli.ts paper:learn",
     "dashboard:control": "tsx server/dashboard-control/server.ts",
+    "smoke:alpaca-stream": "tsx scripts/smokeAlpacaStockStream.ts",
+    "test:alpaca-stream": "tsx --test tests/alpacaStockStream.test.ts",
+    "test:stock-market-data": "tsx --test tests/stockMarketDataAccessor.test.ts",
     "dashboard:dev": "next dev apps/dashboard --webpack",
     "dashboard:build": "next build apps/dashboard --webpack",
     "dashboard:start": "next start apps/dashboard",
     "vercel:env:parity": "node scripts/check-vercel-env-parity.mjs",
     "lint": "npm run typecheck",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test tests/optionSymbolService.test.ts && tsx --test tests/optionSnapshotNormalizer.test.ts && tsx --test tests/hedgeConfigService.test.ts && tsx --test tests/hedgePersistenceService.test.ts && tsx --test tests/portfolioBetaService.test.ts && tsx --test tests/marketRegimeService.test.ts && tsx --test tests/portfolioRiskEvidenceService.test.ts && tsx --test tests/portfolioRiskService.test.ts && tsx --test tests/portfolioRiskScoreService.test.ts && tsx --test tests/hedgeRecommendationService.test.ts && tsx --test tests/hedgePlanService.test.ts && tsx --test tests/hedgeCli.test.ts && tsx --test tests/hedgeDashboard.test.ts && tsx --test tests/optionQuoteNormalizer.test.ts && tsx --test tests/research.test.ts && tsx --test tests/optionsDiagnosticService.test.ts && tsx --test tests/paperOutcomeAnalytics.test.ts && tsx --test tests/paperRecommendationSnapshotService.test.ts && tsx --test tests/paperIntelligence.test.ts && tsx --test tests/paperPlanService.test.ts && tsx --test tests/paperReviewService.test.ts && tsx --test tests/paperLearningLedgerService.test.ts && tsx --test tests/paperExecuteDryRunService.test.ts && tsx --test tests/paperExitService.test.ts && tsx --test tests/leapsExitReviewService.test.ts && tsx --test tests/paperReviewedPayloadExecutionService.test.ts && tsx --test tests/paperPortfolioReviewService.test.ts && tsx --test tests/paperOptionsDiscoveryService.test.ts && tsx --test tests/paperOpsWorkflowService.test.ts && tsx --test tests/paperMonitoringScheduler.test.ts && tsx --test tests/dashboardGuard.test.ts && tsx --test tests/dashboardVercelFallback.test.ts && tsx --test tests/alpacaConfigDiagnostic.test.ts && tsx --test tests/cliRedaction.test.ts && tsx --test tests/alpacaReadOnlyIntegration.test.ts && tsx --test tests/dashboardControlServer.test.ts && tsx --test tests/dashboardVercelBridge.test.ts && tsx --test tests/vercelEnvParity.test.ts",
+    "test": "tsx --test tests/optionSymbolService.test.ts && tsx --test tests/optionSnapshotNormalizer.test.ts && tsx --test tests/hedgeConfigService.test.ts && tsx --test tests/hedgePersistenceService.test.ts && tsx --test tests/portfolioBetaService.test.ts && tsx --test tests/marketRegimeService.test.ts && tsx --test tests/portfolioRiskEvidenceService.test.ts && tsx --test tests/portfolioRiskService.test.ts && tsx --test tests/portfolioRiskScoreService.test.ts && tsx --test tests/hedgeRecommendationService.test.ts && tsx --test tests/hedgePlanService.test.ts && tsx --test tests/hedgeCli.test.ts && tsx --test tests/hedgeDashboard.test.ts && tsx --test tests/optionQuoteNormalizer.test.ts && tsx --test tests/research.test.ts && tsx --test tests/optionsDiagnosticService.test.ts && tsx --test tests/paperOutcomeAnalytics.test.ts && tsx --test tests/paperRecommendationSnapshotService.test.ts && tsx --test tests/paperIntelligence.test.ts && tsx --test tests/paperPlanService.test.ts && tsx --test tests/paperReviewService.test.ts && tsx --test tests/paperLearningLedgerService.test.ts && tsx --test tests/paperExecuteDryRunService.test.ts && tsx --test tests/paperExitService.test.ts && tsx --test tests/leapsExitReviewService.test.ts && tsx --test tests/paperReviewedPayloadExecutionService.test.ts && tsx --test tests/paperPortfolioReviewService.test.ts && tsx --test tests/paperOptionsDiscoveryService.test.ts && tsx --test tests/paperOpsWorkflowService.test.ts && tsx --test tests/paperMonitoringScheduler.test.ts && tsx --test tests/dashboardGuard.test.ts && tsx --test tests/dashboardVercelFallback.test.ts && tsx --test tests/alpacaConfigDiagnostic.test.ts && tsx --test tests/cliRedaction.test.ts && tsx --test tests/alpacaMarketDataFeed.test.ts && tsx --test tests/alpacaStockStream.test.ts && tsx --test tests/stockMarketDataAccessor.test.ts && tsx --test tests/alpacaReadOnlyIntegration.test.ts && tsx --test tests/dashboardControlServer.test.ts && tsx --test tests/dashboardVercelBridge.test.ts && tsx --test tests/vercelEnvParity.test.ts",
     "build": "tsc"
   },
   "overrides": {
@@ -75,6 +78,7 @@
     "@types/node": "^26.1.0",
     "@types/react": "^19.2.7",
     "@types/react-dom": "^19.2.3",
+    "@types/ws": "^8.18.1",
     "dotenv": "^16.4.7",
     "tsx": "^4.19.2",
     "typescript": "^5.5.4"
@@ -82,6 +86,7 @@
   "dependencies": {
     "next": "^16.2.10",
     "react": "^19.2.7",
-    "react-dom": "^19.2.7"
+    "react-dom": "^19.2.7",
+    "ws": "^8.21.1"
   }
 }

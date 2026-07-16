@@ -244,6 +244,18 @@ describe("VPS dashboard control API", () => {
     assert.deepEqual(paths, expected);
   });
 
+  test("health includes sanitized SIP stock stream status", async () => {
+    const response = await callControl("/api/v1/health", "GET");
+    const data = response.payload.data as { stockStream?: Record<string, unknown> };
+    const stockStream = data.stockStream;
+
+    assert.equal(response.status, 200);
+    assert.equal(stockStream?.feed, "sip");
+    assert.equal(typeof stockStream?.symbolCount, "number");
+    assert.equal("apiKey" in (stockStream || {}), false);
+    assert.equal("secretKey" in (stockStream || {}), false);
+  });
+
   test("hedge risk GET is cached, paper-only, and does not call commands or orders", async () => {
     const route = module.ACTION_HANDLERS["/api/v1/hedge/risk"];
     const payload = await route.handler({}, "hedge-risk-read") as {

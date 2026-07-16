@@ -21,6 +21,7 @@ import type {
   PaperAccountReconciliationReport,
   PaperReconciliationEventType
 } from "../src/services/paperAccountReconciliationService.js";
+import type { StockPriceBatchResponse } from "../src/services/stockMarketDataAccessor.js";
 
 const generatedAt = "2026-07-07T15:00:00.000Z";
 const eodAt = "2026-07-07T18:30:00.000Z";
@@ -174,6 +175,7 @@ const reviewWith = async (
     orders?: AlpacaSubmittedOrder[];
     account?: AlpacaAccountRaw;
     optionSnapshots?: Record<string, AlpacaOptionSnapshotRaw>;
+    stockPrices?: (symbols: string[]) => Promise<StockPriceBatchResponse>;
     reconcile?: ReturnType<typeof reconciliationReport>;
     knownLeapsOptionSymbols?: string[] | Set<string>;
     input?: Parameters<typeof buildPaperExitReviewResult>[0];
@@ -207,6 +209,7 @@ const reviewWith = async (
       status: 200,
       urls: []
     }),
+    ...(values.stockPrices ? { getLatestStockPrices: values.stockPrices } : {}),
     getLatestOptionSnapshots: async () => ({
       data: optionSnapshots,
       requestIds: Object.keys(optionSnapshots).length ? ["option-snapshot-request-id"] : [],
@@ -471,6 +474,30 @@ describe("paper exit review 0DTE options", () => {
 });
 
 describe("paper exit review equities", () => {
+  test("fresh SIP stream price is used for the current equity price", async () => {
+    const result = await reviewWith(
+      [equityPosition({ unrealized_plpc: "-0.06", current_price: "94.00" })],
+      {
+        stockPrices: async () => ({
+          data: {
+            AAPL: {
+              symbol: "AAPL",
+              price: 101.25,
+              timestamp: generatedAt,
+              receivedAt: generatedAt,
+              feed: "sip",
+              source: "alpaca_sip_stream",
+              sourceTimestamp: generatedAt
+            }
+          },
+          requestIds: []
+        })
+      }
+    );
+
+    assert.equal(result.exitCandidates[0]?.currentPrice, 101.25);
+  });
+
   test("equity down more than 5% creates sell payload", async () => {
     const result = await reviewWith([equityPosition({ unrealized_plpc: "-0.06" })]);
     assert.equal(result.exitCandidates[0]?.reason, "EQUITY_STOP_LOSS_5");

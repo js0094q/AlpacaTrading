@@ -73,6 +73,16 @@ ALPACA_PAPER_API_KEY=replace_me
 ALPACA_PAPER_SECRET_KEY=replace_me
 ALPACA_PAPER_BASE_URL=https://paper-api.alpaca.markets
 ALPACA_DATA_BASE_URL=https://data.alpaca.markets
+ALPACA_STOCK_DATA_FEED=sip
+ALPACA_STOCK_STREAM_URL=wss://stream.data.alpaca.markets/v2/sip
+ALPACA_OPTION_DATA_FEED=opra
+ALPACA_STOCK_STREAM_ENABLED=false
+ALPACA_STOCK_STREAM_SYMBOLS=
+ALPACA_STOCK_STREAM_TRADES=true
+ALPACA_STOCK_STREAM_QUOTES=true
+ALPACA_STOCK_STREAM_BARS=true
+ALPACA_STOCK_STREAM_RECONNECT_MS=5000
+ALPACA_STOCK_STREAM_STALE_AFTER_MS=30000
 MARKET_DATA_PROVIDER=alpaca
 TRADING_MODE=paper
 ALPACA_LIVE_TRADE=false
@@ -164,6 +174,16 @@ This integration remains paper-only and non-mutating. It does not place paper or
 ```bash
 ALPACA_PAPER_BASE_URL=https://paper-api.alpaca.markets
 ALPACA_DATA_BASE_URL=https://data.alpaca.markets
+ALPACA_STOCK_DATA_FEED=sip
+ALPACA_STOCK_STREAM_URL=wss://stream.data.alpaca.markets/v2/sip
+ALPACA_OPTION_DATA_FEED=opra
+ALPACA_STOCK_STREAM_ENABLED=false
+ALPACA_STOCK_STREAM_SYMBOLS=
+ALPACA_STOCK_STREAM_TRADES=true
+ALPACA_STOCK_STREAM_QUOTES=true
+ALPACA_STOCK_STREAM_BARS=true
+ALPACA_STOCK_STREAM_RECONNECT_MS=5000
+ALPACA_STOCK_STREAM_STALE_AFTER_MS=30000
 ALPACA_ENV=paper
 ALPACA_PAPER_API_KEY=replace_me
 ALPACA_PAPER_SECRET_KEY=replace_me
@@ -183,6 +203,22 @@ npm run alpaca:health -- --format=json
 ```
 
 `alpaca:config` is read-only and prints only redacted configuration diagnostics: credential presence, key prefix, base URLs, loaded env files, and precedence notes. It never prints full API keys, secret keys, or authorization headers.
+
+### Optional SIP stock stream
+
+The stock WebSocket service is disabled by default. Set `ALPACA_STOCK_STREAM_ENABLED=true` in the applicable local/VPS runtime environment to start one SIP stream from the long-running dashboard-control process. When no explicit symbol list is configured, it uses the active stock universe; otherwise it normalizes `ALPACA_STOCK_STREAM_SYMBOLS` by trimming, uppercasing, and deduplicating symbols. The service keeps latest trades, quotes, and minute bars in memory, and the dashboard-control health response includes its sanitized status under `data.stockStream`.
+
+For activation, preserve `ALPACA_STOCK_STREAM_URL=wss://stream.data.alpaca.markets/v2/sip` and set the non-secret stream controls documented in `.env.example`, including an explicit universe such as `ALPACA_STOCK_STREAM_SYMBOLS=AAPL,MSFT,SPY`. Do not edit or commit a local `.env` file. After changing the runtime environment, restart `alpaca-dashboard-control` and verify `enabled`, `connected`, `authenticated`, `subscribed`, and `feed: "sip"`.
+
+The shared current-market-data accessor prefers a covered, fresh SIP stream trade or quote for current price/quote reads and falls back to the existing SIP REST request when the stream is unavailable, incomplete, malformed, or stale. Historical bars, research backfills, complete snapshots, and their required fields remain REST-backed.
+
+Run the read-only stream smoke test with paper credentials:
+
+```bash
+npm run smoke:alpaca-stream
+```
+
+The smoke test subscribes to AAPL, waits for an authentication/subscription response or market-data event, prints sanitized status only, and disconnects without submitting orders.
 
 ### Account snapshot
 
@@ -345,7 +381,7 @@ npm run paper:exit:execute -- --confirmPaper
 npm run paper:exit:execute -- --confirmPaper --format=json
 ```
 
-`paper:exit:review` fetches `/v2/account`, `/v2/positions`, current-day `/v2/orders?status=all`, current-day `/v2/account/activities`, market clock data, and latest stock/option snapshots when available. It returns current sell candidates and skipped positions with Alpaca request IDs and `mutationAttempted: false`.
+`paper:exit:review` fetches `/v2/account`, `/v2/positions`, current-day `/v2/orders?status=all`, current-day `/v2/account/activities`, market clock data, and current stock/option market data when available. Its eligible current equity-price read prefers fresh SIP stream state and falls back to the existing SIP stock snapshot request; option data and complete snapshot fields remain REST-backed. It returns current sell candidates and skipped positions with Alpaca request IDs and `mutationAttempted: false`.
 
 `paper:exit:execute --confirmPaper` reruns review first and also requires the existing `PAPER_ORDER_EXECUTION_ENABLED=true` paper mutation gate. It never submits skipped positions.
 
@@ -875,6 +911,7 @@ Validate quickly with:
 ```bash
 npm run lint
 npm run test
+npm run test:stock-market-data
 npm run typecheck
 npm run build
 npm run dashboard:build

@@ -388,6 +388,7 @@ export const fetchBars = async (options: ProviderOptions): Promise<{ symbol: str
   const params = toSearchParams({
     symbols: options.symbols?.join(","),
     timeframe,
+    feed: config.alpaca.stockDataFeed,
     start: options.start,
     end: options.end,
     page_token: options.pageToken,
@@ -429,6 +430,7 @@ export const fetchAllBars = async (
     const params = toSearchParams({
       symbols: options.symbols?.join(","),
       timeframe: options.timeframe || "1Day",
+      feed: config.alpaca.stockDataFeed,
       start: options.start,
       end: options.end,
       page_token: pageToken ?? undefined,
@@ -544,7 +546,10 @@ export const fetchOptionSnapshots = async (
   const chunkSize = 100;
   for (let index = 0; index < optionSymbols.length; index += chunkSize) {
     const chunk = optionSymbols.slice(index, index + chunkSize);
-    const endpoint = `/v1beta1/options/snapshots?${toSearchParams({ symbols: chunk.join(",") })}`;
+    const endpoint = `/v1beta1/options/snapshots?${toSearchParams({
+      symbols: chunk.join(","),
+      feed: config.alpaca.optionDataFeed
+    })}`;
     const response = await requestJson<unknown>(endpoint);
     results.push(
       ...parseOptionSnapshotPayload(response.data).map((row) => ({
@@ -566,7 +571,10 @@ export const fetchOptionQuotes = async (
   const chunkSize = 100;
   for (let index = 0; index < optionSymbols.length; index += chunkSize) {
     const chunk = optionSymbols.slice(index, index + chunkSize);
-    const endpoint = `/v1beta1/options/quotes/latest?${toSearchParams({ symbols: chunk.join(",") })}`;
+    const endpoint = `/v1beta1/options/quotes/latest?${toSearchParams({
+      symbols: chunk.join(","),
+      feed: config.alpaca.optionDataFeed
+    })}`;
     const response = await requestJson<unknown>(endpoint);
     results.push(
       ...parseOptionQuotePayload(response.data).map((row) => ({

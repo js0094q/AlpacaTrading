@@ -1,12 +1,26 @@
 import { config as loadDotenv } from "dotenv";
 import { buildHedgeConfig } from "./services/hedgeConfigService.js";
+import { seedUniverse } from "./config/universe.seed.js";
 
 loadDotenv();
 loadDotenv({ path: ".env.txt", override: false });
 
+export interface AlpacaStockStreamConfig {
+  enabled: boolean;
+  url: string;
+  symbols: string[];
+  trades: boolean;
+  quotes: boolean;
+  bars: boolean;
+  reconnectMs: number;
+  staleAfterMs: number;
+}
+
 const parseBoolean = (value: string | undefined) => value === "true" || value === "1";
 const parseBooleanDefault = (value: string | undefined, fallback: boolean) =>
   value === undefined ? fallback : parseBoolean(value);
+const parseBooleanDefaultWhenBlank = (value: string | undefined, fallback: boolean) =>
+  value === undefined || value.trim() === "" ? fallback : parseBoolean(value);
 const parseNumber = (value: string | undefined, fallback: number) => {
   const parsed = Number.parseFloat(value || "");
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
@@ -39,6 +53,25 @@ const firstEnv = (...names: string[]) => {
     }
   }
   return "";
+};
+
+const stockDataFeed = process.env.ALPACA_STOCK_DATA_FEED?.trim() || "sip";
+const stockStreamUrl =
+  process.env.ALPACA_STOCK_STREAM_URL?.trim() ||
+  "wss://stream.data.alpaca.markets/v2/sip";
+const optionDataFeed = process.env.ALPACA_OPTION_DATA_FEED?.trim() || "opra";
+const stockStream: AlpacaStockStreamConfig = {
+  enabled: parseBoolean(process.env.ALPACA_STOCK_STREAM_ENABLED),
+  url: stockStreamUrl,
+  symbols: parseSymbolList(process.env.ALPACA_STOCK_STREAM_SYMBOLS, seedUniverse),
+  trades: parseBooleanDefaultWhenBlank(process.env.ALPACA_STOCK_STREAM_TRADES, true),
+  quotes: parseBooleanDefaultWhenBlank(process.env.ALPACA_STOCK_STREAM_QUOTES, true),
+  bars: parseBooleanDefaultWhenBlank(process.env.ALPACA_STOCK_STREAM_BARS, true),
+  reconnectMs: parseInteger(process.env.ALPACA_STOCK_STREAM_RECONNECT_MS, 5_000),
+  staleAfterMs: Math.max(
+    1,
+    parseInteger(process.env.ALPACA_STOCK_STREAM_STALE_AFTER_MS, 30_000)
+  )
 };
 
 const parseAlpacaEnv = (): "paper" | "live" => {
@@ -211,6 +244,10 @@ export const config = {
     liveBaseUrl:
       firstEnv("ALPACA_LIVE_BASE_URL") || "https://api.alpaca.markets",
     dataBaseUrl: firstEnv("ALPACA_DATA_BASE_URL") || "https://data.alpaca.markets",
+    stockDataFeed,
+    stockStreamUrl,
+    optionDataFeed,
+    stockStream,
     requestTimeoutMs:
       Number.parseInt(process.env.ALPACA_REQUEST_TIMEOUT_MS || "15000", 10) || 15000,
     maxRetries: parseInteger(process.env.ALPACA_MAX_RETRIES, 2),
