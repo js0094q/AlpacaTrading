@@ -512,6 +512,10 @@ npm run db:postgres:control-plane:backfill -- --snapshot /protected/snapshot-dir
 npm run db:postgres:control-plane:reconcile -- --snapshot /protected/snapshot-directory/source-snapshot.db
 npm run db:postgres:control-plane:shadow -- --snapshot /protected/snapshot-directory/source-snapshot.db
 npm run db:postgres:control-plane:status
+npm run db:postgres:execution-state:backfill -- --snapshot /protected/snapshot-directory/source-snapshot.db
+npm run db:postgres:execution-state:reconcile -- --snapshot /protected/snapshot-directory/source-snapshot.db
+npm run db:postgres:execution-state:shadow -- --snapshot /protected/snapshot-directory/source-snapshot.db
+npm run db:postgres:execution-state:status
 ```
 
 Only `db:postgres:migrate` applies PostgreSQL DDL. Run it through the direct
@@ -521,10 +525,10 @@ checks, and makes the copy read-only. Backfill is bounded and idempotent;
 reconcile and shadow persist sanitized discrepancy evidence and fail closed on
 unexplained differences. All output reports variable names and presence, never
 values. Keep `DATABASE_BACKEND=sqlite` and every PostgreSQL read/write, shadow,
-and authority flag false until the applicable gate passes. Release 3 authority
-may cover research only. Observatory, market-data refresh, and execution-state
-workstreams remain SQLite-owned until their durable writes validate the current
-PostgreSQL fencing token. See
+and authority flag false until the applicable gate passes. The Release 4 code
+routes all 14 approved scheduled workstreams through PostgreSQL fencing and adds
+execution-state backfill, reconciliation, shadow, and authority boundaries, but
+production ownership must still advance through the documented staged gates. See
 `docs/runbooks/neon-postgres-operations.md`.
 
 Terminal outcomes use persisted observations only and keep option-position and

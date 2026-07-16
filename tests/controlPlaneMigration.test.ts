@@ -191,6 +191,8 @@ const migrationConfig: DatabaseConfig = {
     postgresWrites: false,
     shadowComparison: false,
     controlPlaneAuthority: false,
+    schedulerAuthority: false,
+    executionStateShadow: false,
     executionStateAuthority: false,
     sqliteAuditMirror: false
   }

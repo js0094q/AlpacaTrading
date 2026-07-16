@@ -14,6 +14,7 @@ import {
   type ZeroDteExitProvider
 } from "../src/services/zeroDte/zeroDteExitService.js";
 import type { PaperExitExecutionResult, PaperExitReviewResult } from "../src/types/paperExit.js";
+import { withExecutionAuthority } from "./helpers/executionAuthorityRuntime.js";
 
 const now = "2026-07-13T19:00:00.000Z";
 const optionSymbol = "SPY260713C00500000";
@@ -250,6 +251,67 @@ test("confirmed exit links the submitted result to the Level 2 trade", async () 
   assert.equal(ledger.status, "accepted");
   assert.equal(ledger.decision_id, "exit-decision");
   assert.equal(ledger.decision_linkage_status, "EXACT");
+});
+
+test("PostgreSQL execution authority does not mutate SQLite 0DTE exit state", async () => {
+  seedPaperTrade();
+  const result = await withExecutionAuthority(() =>
+    reviewZeroDteExits({
+      now,
+      confirmPaper: true,
+      provider: {
+        review: async () => review(),
+        execute: async () => execution()
+      }
+    })
+  );
+
+  assert.equal(result.status, "submitted");
+  assert.equal(result.links[0]?.paperTradeId, null);
+  assert.equal(
+    (getDb().prepare(
+      "SELECT status FROM zero_dte_paper_trades WHERE paper_trade_id = 'exit-trade'"
+    ).get() as { status: string }).status,
+    "open"
+  );
+  assert.equal(
+    (getDb().prepare(
+      "SELECT COUNT(*) AS count FROM paper_execution_ledger WHERE client_order_id = 'paper-exit-0dte-1'"
+    ).get() as { count: number }).count,
+    0
+  );
+  assert.equal(
+    (getDb().prepare(
+      "SELECT COUNT(*) AS count FROM zero_dte_lifecycle_events WHERE event_type IN ('exit_triggered', 'exit_order_requested')"
+    ).get() as { count: number }).count,
+    0
+  );
+});
+
+test("PostgreSQL authority bypasses legacy SQLite exit reconciliation", async () => {
+  seedPaperTrade();
+  let brokerReads = 0;
+  const counts = () => ({
+    ledger: (getDb().prepare("SELECT COUNT(*) AS count FROM paper_execution_ledger").get() as { count: number }).count,
+    trades: (getDb().prepare("SELECT COUNT(*) AS count FROM zero_dte_paper_trades").get() as { count: number }).count,
+    lifecycle: (getDb().prepare("SELECT COUNT(*) AS count FROM zero_dte_lifecycle_events").get() as { count: number }).count
+  });
+  const before = counts();
+
+  const result = await withExecutionAuthority(() => reconcileZeroDteExitOrders({
+    now,
+    provider: {
+      runtime: paperRuntime,
+      getOrder: async () => {
+        brokerReads += 1;
+        throw new Error("Legacy exit reconciliation must be bypassed.");
+      }
+    }
+  }));
+
+  assert.equal(brokerReads, 0);
+  assert.equal(result.checked, 0);
+  assert.deepEqual(counts(), before);
 });
 
 test("an immediate filled submission remains pending exact broker reconciliation", async () => {

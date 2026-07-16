@@ -7,14 +7,19 @@ import {
   type AlpacaApiResponse
 } from "./alpacaClient.js";
 import {
+  applyPaperExecutionLedgerUpdate,
+  buildPaperExecutionLedgerEntry,
   findPaperExecutionByDedupeKey,
+  findPaperExecutionById,
   insertPaperExecutionLedgerEntry,
   listActivePaperNewRiskReservations,
   paperNewRiskLedgerMutationFingerprint,
   reserveReviewedPaperExecutions,
   type PaperExecutionLedgerEntry,
+  type PaperExecutionLedgerInput,
   updatePaperExecutionLedgerEntry
 } from "./paperExecutionLedgerService.js";
+import { executionStateProjectionService } from "./executionStateProjectionService.js";
 import {
   findPaperReviewPayloadDecision,
   isReviewedPayloadSectionName,
@@ -125,6 +130,9 @@ interface PaperReviewedExecutionDeps {
   submitPaperOrder?: typeof submitPaperOrder;
   latestArtifact?: typeof latestPaperReviewArtifact;
   captureSubmitState?: typeof capturePaperSubmitState;
+  authorizeExecution?: typeof executionStateProjectionService.reserveOrderIntent;
+  recordExecutionResult?: typeof executionStateProjectionService.recordBrokerResult;
+  storeExecutionEvidence?: typeof executionStateProjectionService.storePaperReviewEvidence;
   now?: () => string;
 }
 
@@ -516,6 +524,7 @@ export const buildPaperReviewedPayloadExecutionReport = async (
   }
 
   let eligiblePayloads = normalized;
+  const postgresAuthority = executionStateProjectionService.isAuthorityActive();
   let submitValidation: PaperSubmitStateValidation | null = null;
   let currentSubmitState: PaperSubmitStateAttestation | null = null;
   let expectedNewRiskLedgerFingerprint: string | null = null;
@@ -530,7 +539,9 @@ export const buildPaperReviewedPayloadExecutionReport = async (
       ];
     } else {
       try {
-        const ledgerFingerprintBefore = paperNewRiskLedgerMutationFingerprint();
+        const ledgerFingerprintBefore = postgresAuthority
+          ? null
+          : paperNewRiskLedgerMutationFingerprint();
         const capture =
           deps.captureSubmitState ??
           ((captureInput: Parameters<typeof capturePaperSubmitState>[0]) =>
@@ -541,8 +552,9 @@ export const buildPaperReviewedPayloadExecutionReport = async (
           capturedAt: generatedAt,
           payloadSections: artifact.artifact.payloadSections
         });
-        expectedNewRiskLedgerFingerprint =
-          paperNewRiskLedgerMutationFingerprint();
+        expectedNewRiskLedgerFingerprint = postgresAuthority
+          ? null
+          : paperNewRiskLedgerMutationFingerprint();
         submitValidation = validatePaperSubmitState({
           reviewed: reviewedSubmitState,
           current: currentSubmitState,
@@ -552,7 +564,8 @@ export const buildPaperReviewedPayloadExecutionReport = async (
         });
         stateBlockers = [
           ...submitValidation.blockers,
-          ...(ledgerFingerprintBefore !== expectedNewRiskLedgerFingerprint
+          ...(!postgresAuthority &&
+            ledgerFingerprintBefore !== expectedNewRiskLedgerFingerprint
             ? ["SUBMIT_LEDGER_STATE_DRIFT", "FRESH_REVIEW_REQUIRED"]
             : [])
         ];
@@ -603,9 +616,26 @@ export const buildPaperReviewedPayloadExecutionReport = async (
     });
   }
 
+  const reservationRiskFor = (payload: NormalizedReviewedPayload) => {
+    const explicit = numberField(payload.raw.maxRisk) ??
+      numberField(payload.raw.estimatedPremium) ??
+      numberField(payload.notional);
+    if (explicit !== null && explicit > 0) return explicit;
+    const quantity = numberField(payload.qty);
+    if (quantity === null || quantity <= 0) return null;
+    const limitPrice = numberField(payload.limitPrice);
+    const referencePrice = limitPrice ?? currentSubmitState?.marketEvidence.find(
+      (evidence) =>
+        evidence.symbol === payload.symbol &&
+        evidence.assetClass === payload.assetClass
+    )?.referencePrice ?? null;
+    if (referencePrice === null || referencePrice <= 0) return null;
+    return quantity * referencePrice * (payload.assetClass === "option" ? 100 : 1);
+  };
+
   const reservedEntriesByClient = new Map<string, PaperExecutionLedgerEntry>();
   const entryPayloadsToReserve = eligiblePayloads.filter(isEntryPayload);
-  if (entryPayloadsToReserve.length) {
+  if (entryPayloadsToReserve.length && !postgresAuthority) {
     if (!currentSubmitState) {
       for (const payload of entryPayloadsToReserve) {
         blocked.push({
@@ -632,7 +662,7 @@ export const buildPaperReviewedPayloadExecutionReport = async (
           notional: payload.notional ?? null,
           limitPrice: payload.limitPrice ?? null,
           estimatedPremium: numberField(payload.raw.estimatedPremium),
-          maxRisk: numberField(payload.raw.maxRisk),
+          maxRisk: reservationRiskFor(payload),
           dedupeKey: payload.dedupeKey,
           clientOrderId: payload.clientOrderId,
           sourcePlanId: artifact.id,
@@ -697,9 +727,49 @@ export const buildPaperReviewedPayloadExecutionReport = async (
   const submitted: PaperReviewedExecutionReport["submitted"] = [];
   const errors: PaperReviewedExecutionReport["errors"] = [];
   const submit = deps.submitPaperOrder ?? submitPaperOrder;
+  const authorizeExecution = deps.authorizeExecution ??
+    executionStateProjectionService.reserveOrderIntent;
+  const recordExecutionResult = deps.recordExecutionResult ??
+    executionStateProjectionService.recordBrokerResult;
+  const storeExecutionEvidence = deps.storeExecutionEvidence ??
+    executionStateProjectionService.storePaperReviewEvidence;
+
+  const ledgerInputFor = (
+    payload: NormalizedReviewedPayload,
+    status: "reserved" | "attempted"
+  ): PaperExecutionLedgerInput => ({
+    mode: "reviewedConfirmPaper",
+    assetClass: payload.assetClass,
+    symbol: payload.symbol,
+    side: payload.side,
+    orderType: payload.type,
+    timeInForce: payload.timeInForce,
+    qty: payload.qty ?? null,
+    notional: payload.notional ?? null,
+    limitPrice: payload.limitPrice ?? null,
+    estimatedPremium: numberField(payload.raw.estimatedPremium),
+    maxRisk: reservationRiskFor(payload),
+    dedupeKey: payload.dedupeKey,
+    clientOrderId: payload.clientOrderId,
+    status,
+    sourcePlanId: artifact.id,
+    sourceCandidateId: payload.sourceCandidateId ?? null,
+    decisionId: payload.decisionId,
+    decisionLinkageStatus: payload.decisionId ? "EXACT" : "LEGACY_UNLINKED",
+    payload: {
+      artifactId: artifact.id,
+      section: payload.section,
+      payloadIndex: payload.payloadIndex,
+      reviewedPayload: payload.raw,
+      ...(submitValidation ? { submitValidation } : {})
+    },
+    rawPayload: toAlpacaPayload(payload)
+  });
 
   for (const payload of eligiblePayloads) {
-    const existingExecution = findPaperExecutionByDedupeKey(payload.dedupeKey);
+    const existingExecution = postgresAuthority
+      ? null
+      : findPaperExecutionByDedupeKey(payload.dedupeKey);
     if (
       !isEntryPayload(payload) &&
       existingExecution &&
@@ -717,7 +787,12 @@ export const buildPaperReviewedPayloadExecutionReport = async (
     }
 
     let ledger: PaperExecutionLedgerEntry;
-    if (isEntryPayload(payload)) {
+    if (postgresAuthority) {
+      ledger = buildPaperExecutionLedgerEntry(
+        ledgerInputFor(payload, isEntryPayload(payload) ? "reserved" : "attempted"),
+        { createdAt: generatedAt }
+      );
+    } else if (isEntryPayload(payload)) {
       const reservedEntry = reservedEntriesByClient.get(payload.clientOrderId);
       if (!reservedEntry) {
         blocked.push({
@@ -736,34 +811,32 @@ export const buildPaperReviewedPayloadExecutionReport = async (
         blockedReason: null
       });
     } else {
-      ledger = insertPaperExecutionLedgerEntry({
-        mode: "reviewedConfirmPaper",
-        assetClass: payload.assetClass,
-        symbol: payload.symbol,
-        side: payload.side,
-        orderType: payload.type,
-        timeInForce: payload.timeInForce,
-        qty: payload.qty ?? null,
-        notional: payload.notional ?? null,
-        limitPrice: payload.limitPrice ?? null,
-        dedupeKey: payload.dedupeKey,
-        clientOrderId: payload.clientOrderId,
-        status: "attempted",
-        sourcePlanId: artifact.id,
-        sourceCandidateId: payload.sourceCandidateId ?? null,
-        decisionId: payload.decisionId,
-        decisionLinkageStatus: payload.decisionId ? "EXACT" : "LEGACY_UNLINKED",
-        payload: {
-          artifactId: artifact.id,
-          section: payload.section,
-          payloadIndex: payload.payloadIndex,
-          reviewedPayload: payload.raw
-        },
-        rawPayload: toAlpacaPayload(payload)
-      });
+      ledger = insertPaperExecutionLedgerEntry(ledgerInputFor(payload, "attempted"));
     }
 
-    if (payload.decisionId) {
+    await storeExecutionEvidence(artifact, ledger);
+    const postgresAuthorization = await authorizeExecution(ledger);
+    if (!postgresAuthorization.brokerAllowed) {
+      const reason = postgresAuthorization.blockers?.[0] ??
+        "POSTGRES_EXECUTION_RESERVATION_BLOCKED";
+      if (!postgresAuthority) {
+        updatePaperExecutionLedgerEntry(ledger.id, {
+          status: "released",
+          reason,
+          blockedReason: reason
+        });
+      }
+      blocked.push({
+        section: payload.section,
+        symbol: payload.symbol,
+        clientOrderId: payload.clientOrderId,
+        reason,
+        explanation: "PostgreSQL execution authority rejected the order intent."
+      });
+      continue;
+    }
+
+    if (payload.decisionId && !postgresAuthority) {
       appendDecisionLifecycleEvent({
         decisionId: payload.decisionId,
         status: "PAPER_ELIGIBLE",
@@ -774,20 +847,63 @@ export const buildPaperReviewedPayloadExecutionReport = async (
       });
     }
 
+    let response: AlpacaApiResponse<AlpacaSubmittedOrder>;
     try {
-      const response: AlpacaApiResponse<AlpacaSubmittedOrder> = await submit(toAlpacaPayload(payload));
+      response = await submit(toAlpacaPayload(payload));
+    } catch (error) {
+      const requestId = error instanceof AlpacaApiError ? error.requestId : undefined;
+      const update = {
+        status: "failed",
+        requestId,
+        reason: "ALPACA_PAPER_ORDER_SUBMISSION_FAILED",
+        errorMessage:
+          error instanceof Error ? error.message : "Alpaca paper order submission failed.",
+        rawResponse: error instanceof AlpacaApiError ? error.responseBody : undefined
+      } as const;
+      if (postgresAuthority) {
+        ledger = applyPaperExecutionLedgerUpdate(ledger, update);
+        await recordExecutionResult(ledger);
+      } else {
+        updatePaperExecutionLedgerEntry(ledger.id, update);
+        const failedLedger = findPaperExecutionById(ledger.id);
+        if (failedLedger) await recordExecutionResult(failedLedger);
+      }
+      blocked.push({
+        section: payload.section,
+        symbol: payload.symbol,
+        clientOrderId: payload.clientOrderId,
+        reason: "ALPACA_PAPER_ORDER_SUBMISSION_FAILED",
+        explanation: error instanceof Error ? error.message : "Alpaca paper order submission failed."
+      });
+      errors.push({
+        symbol: payload.symbol,
+        reason: "ALPACA_PAPER_ORDER_SUBMISSION_FAILED",
+        message: error instanceof Error ? error.message : "Alpaca paper order submission failed.",
+        requestId
+      });
+      continue;
+    }
+
       const order = response.data;
       const status = order.status || "submitted";
       const ledgerStatus = status === "accepted" ? "accepted" : status === "rejected" ? "rejected" : "submitted";
-      updatePaperExecutionLedgerEntry(ledger.id, {
+      const update = {
         status: ledgerStatus,
         alpacaOrderId: order.id,
         alpacaStatus: status,
         requestId: response.requestId,
         reason: null,
         rawResponse: order
-      });
-      if (payload.decisionId) {
+      } as const;
+      if (postgresAuthority) {
+        ledger = applyPaperExecutionLedgerUpdate(ledger, update);
+        await recordExecutionResult(ledger);
+      } else {
+        updatePaperExecutionLedgerEntry(ledger.id, update);
+        const submittedLedger = findPaperExecutionById(ledger.id);
+        if (submittedLedger) await recordExecutionResult(submittedLedger);
+      }
+      if (payload.decisionId && !postgresAuthority) {
         appendDecisionLifecycleEvent({
           decisionId: payload.decisionId,
           status: status === "filled" ? "FILLED" : "SUBMITTED",
@@ -803,7 +919,7 @@ export const buildPaperReviewedPayloadExecutionReport = async (
           }
         });
       }
-      if (["filled", "partially_filled"].includes(status)) {
+      if (!postgresAuthority && ["filled", "partially_filled"].includes(status)) {
         try {
           const brokerOrderId = stringField(order.id);
           const filledQuantity = Number.parseFloat(order.filled_qty ?? "");
@@ -886,30 +1002,6 @@ export const buildPaperReviewedPayloadExecutionReport = async (
         status,
         requestId: response.requestId
       });
-    } catch (error) {
-      const requestId = error instanceof AlpacaApiError ? error.requestId : undefined;
-      updatePaperExecutionLedgerEntry(ledger.id, {
-        status: "failed",
-        requestId,
-        reason: "ALPACA_PAPER_ORDER_SUBMISSION_FAILED",
-        errorMessage:
-          error instanceof Error ? error.message : "Alpaca paper order submission failed.",
-        rawResponse: error instanceof AlpacaApiError ? error.responseBody : undefined
-      });
-      blocked.push({
-        section: payload.section,
-        symbol: payload.symbol,
-        clientOrderId: payload.clientOrderId,
-        reason: "ALPACA_PAPER_ORDER_SUBMISSION_FAILED",
-        explanation: error instanceof Error ? error.message : "Alpaca paper order submission failed."
-      });
-      errors.push({
-        symbol: payload.symbol,
-        reason: "ALPACA_PAPER_ORDER_SUBMISSION_FAILED",
-        message: error instanceof Error ? error.message : "Alpaca paper order submission failed.",
-        requestId
-      });
-    }
   }
 
   return {

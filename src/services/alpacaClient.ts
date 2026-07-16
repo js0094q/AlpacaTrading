@@ -63,6 +63,7 @@ export interface AlpacaSubmittedOrder {
   time_in_force?: string;
   position_intent?: string;
   limit_price?: string;
+  stop_price?: string;
   status?: string;
   filled_qty?: string;
   filled_avg_price?: string;
@@ -70,6 +71,9 @@ export interface AlpacaSubmittedOrder {
   created_at?: string;
   submitted_at?: string;
   updated_at?: string;
+  replaced_at?: string;
+  replaced_by?: string;
+  replaces?: string;
 }
 
 export interface AlpacaAccountRaw {
@@ -417,6 +421,15 @@ export const getPaperOrder = async (
 ): Promise<AlpacaApiResponse<AlpacaSubmittedOrder>> => {
   return requestPaperTradingJson<AlpacaSubmittedOrder>(
     `/v2/orders/${encodeURIComponent(orderId)}`
+  );
+};
+
+export const getPaperOrderByClientOrderId = async (
+  clientOrderId: string
+): Promise<AlpacaApiResponse<AlpacaSubmittedOrder>> => {
+  const params = new URLSearchParams({ client_order_id: clientOrderId });
+  return requestPaperTradingJson<AlpacaSubmittedOrder>(
+    `/v2/orders:by_client_order_id?${params.toString()}`
   );
 };
 

@@ -7,6 +7,7 @@ import { canonicalJsonHash } from "../lib/canonicalJson.js";
 import { getDb, queryAll, queryOne } from "../lib/db.js";
 import type { DecisionId, DecisionRole, PositionLifecycleId } from "../types.js";
 import type { PaperSubmitStateAttestation } from "./paperSubmitStateService.js";
+import { assertScheduledWriteFenceActive } from "./controlPlaneRuntimeContext.js";
 import {
   appendDecisionLifecycleEvent,
   linkPaperReviewDecision,
@@ -291,6 +292,7 @@ export const createPaperReviewArtifact = (input: {
   createdAt?: string;
   maxAgeMinutes?: number;
 }): PaperReviewArtifact => {
+  assertScheduledWriteFenceActive();
   const signingKey = paperReviewArtifactSigningKey();
   if (!signingKey) {
     throw new Error("PAPER_REVIEW_SIGNING_KEY_REQUIRED");

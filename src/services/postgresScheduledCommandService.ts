@@ -53,11 +53,8 @@ export const runPostgresScheduledCommand = async <T>(
 
   const config = dependencies.loadConfig();
   const schedulerEnabled =
-    config.features.shadowComparison || config.features.controlPlaneAuthority;
+    config.features.shadowComparison || config.features.schedulerAuthority;
   if (!schedulerEnabled) return input.operation();
-  if (job.workstream !== "research") {
-    return input.operation();
-  }
 
   const pool = dependencies.createPool(config);
   const schedulerInvocationId = dependencies.invocationId();

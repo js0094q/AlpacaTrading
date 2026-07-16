@@ -7,6 +7,8 @@ export type DatabaseFeatureFlags = {
   postgresWrites: boolean;
   shadowComparison: boolean;
   controlPlaneAuthority: boolean;
+  schedulerAuthority: boolean;
+  executionStateShadow: boolean;
   executionStateAuthority: boolean;
   sqliteAuditMirror: boolean;
 };
@@ -134,6 +136,14 @@ export const loadDatabaseConfig = (
       environment,
       "POSTGRES_CONTROL_PLANE_AUTHORITY_ENABLED"
     ),
+    schedulerAuthority: strictBoolean(
+      environment,
+      "POSTGRES_SCHEDULER_AUTHORITY_ENABLED"
+    ),
+    executionStateShadow: strictBoolean(
+      environment,
+      "POSTGRES_EXECUTION_STATE_SHADOW_ENABLED"
+    ),
     executionStateAuthority: strictBoolean(
       environment,
       "POSTGRES_EXECUTION_STATE_AUTHORITY_ENABLED"
@@ -155,7 +165,18 @@ export const loadDatabaseConfig = (
     );
   }
   if (
-    (features.controlPlaneAuthority || features.executionStateAuthority) &&
+    (features.shadowComparison || features.executionStateShadow) &&
+    (!features.postgresReads || !features.postgresWrites)
+  ) {
+    throw new DatabaseConfigurationError(
+      "POSTGRES_SHADOW_PREREQUISITES_REQUIRED",
+      "PostgreSQL shadow comparison requires POSTGRES_READS_ENABLED and POSTGRES_WRITES_ENABLED."
+    );
+  }
+  if (
+    (features.controlPlaneAuthority ||
+      features.schedulerAuthority ||
+      features.executionStateAuthority) &&
     (!features.postgresReads || !features.postgresWrites)
   ) {
     throw new DatabaseConfigurationError(
@@ -163,14 +184,30 @@ export const loadDatabaseConfig = (
       "PostgreSQL authority requires POSTGRES_READS_ENABLED and POSTGRES_WRITES_ENABLED."
     );
   }
-  if (features.executionStateAuthority && !features.controlPlaneAuthority) {
+  if (
+    (features.schedulerAuthority ||
+      features.executionStateShadow ||
+      features.executionStateAuthority) &&
+    !features.controlPlaneAuthority
+  ) {
     throw new DatabaseConfigurationError(
       "CONTROL_PLANE_AUTHORITY_REQUIRED",
-      "Execution-state authority requires control-plane authority first."
+      "Scheduler and execution-state authority require control-plane authority first."
     );
   }
   if (
-    (features.controlPlaneAuthority || features.executionStateAuthority) &&
+    (features.executionStateShadow || features.executionStateAuthority) &&
+    !features.schedulerAuthority
+  ) {
+    throw new DatabaseConfigurationError(
+      "SCHEDULER_AUTHORITY_REQUIRED",
+      "Execution-state shadow and authority require scheduler authority first."
+    );
+  }
+  if (
+    (features.controlPlaneAuthority ||
+      features.schedulerAuthority ||
+      features.executionStateAuthority) &&
     backendValue !== "postgres"
   ) {
     throw new DatabaseConfigurationError(

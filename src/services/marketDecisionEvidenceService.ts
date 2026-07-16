@@ -9,6 +9,7 @@ import type {
   PositionLifecycleId
 } from "../types.js";
 import { createDecisionId } from "./marketDecisionIdentityService.js";
+import { assertScheduledWriteFenceActive } from "./controlPlaneRuntimeContext.js";
 
 const canonicalJson = (value: unknown) => JSON.stringify(canonicalizeJson(value));
 
@@ -121,6 +122,7 @@ export const persistDecisionSnapshot = (input: {
   marketDataRequestId?: string | null;
   feed?: string | null;
 }): DecisionSnapshot => {
+  assertScheduledWriteFenceActive();
   const existing = queryOne<SnapshotRow>(
     `
     SELECT decision_id, origin_type, origin_id, decision_role, candidate_id,
@@ -214,6 +216,7 @@ export const appendDecisionLifecycleEvent = (input: {
   sourceId: string;
   evidence?: unknown;
 }) => {
+  assertScheduledWriteFenceActive();
   const existing = queryOne<{
     event_id: string;
     occurred_at: string;
@@ -262,6 +265,7 @@ export const linkPaperReviewDecision = (input: {
   decisionId: DecisionId;
   decisionRole: DecisionRole;
 }) => {
+  assertScheduledWriteFenceActive();
   getDb().prepare(`
     INSERT OR IGNORE INTO paper_review_decisions(
       artifact_id, section, payload_index, decision_id, decision_role

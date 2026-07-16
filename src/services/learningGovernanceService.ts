@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { getDb, queryAll, queryOne } from "../lib/db.js";
+import { assertScheduledWriteFenceActive } from "./controlPlaneRuntimeContext.js";
 
 export type PaperLearningGovernanceState = "observe" | "prioritized" | "suspended";
 export type PaperLearningGovernanceScope = "strategy_family" | "symbol";
@@ -413,6 +414,7 @@ export const applyPaperLearningGovernance = (input: {
   now?: () => Date;
   getGitSha?: () => string;
 } = {}): PaperLearningGovernanceRunResult => {
+  assertScheduledWriteFenceActive();
   const now = input.now ?? (() => new Date());
   const startedAt = now().toISOString();
   const runId = `paper_learning_governance_${crypto.randomUUID()}`;
@@ -508,6 +510,7 @@ export const applyPaperLearningGovernance = (input: {
       }),
       runId
     );
+    assertScheduledWriteFenceActive();
     db.exec("COMMIT;");
     transactionOpen = false;
     return {
@@ -531,11 +534,16 @@ export const applyPaperLearningGovernance = (input: {
       db.exec("ROLLBACK;");
     }
     const message = error instanceof Error ? error.message : "Paper learning governance failed.";
-    db.prepare(`
-      UPDATE paper_learning_governance_runs
-      SET completed_at = ?, status = 'failed', error_message = ?
-      WHERE id = ?
-    `).run(now().toISOString(), message.slice(0, 500), runId);
+    try {
+      assertScheduledWriteFenceActive();
+      db.prepare(`
+        UPDATE paper_learning_governance_runs
+        SET completed_at = ?, status = 'failed', error_message = ?
+        WHERE id = ?
+      `).run(now().toISOString(), message.slice(0, 500), runId);
+    } catch {
+      // A stale worker must not write even its terminal status.
+    }
     throw error;
   }
 };

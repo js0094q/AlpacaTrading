@@ -7,10 +7,11 @@ authorizes live trading or broker mutation. Vercel and VPS validation remains
 paper-only. Do not print, copy into documentation, or commit connection values.
 Do not source an environment file into diagnostic output.
 
-Release 3 adds the control-plane schema, repositories, fenced scheduler,
-snapshot/backfill/reconciliation commands, shadow comparison, and authority
-routing. SQLite remains authoritative until the runtime gates below pass, and
-these defaults stay in force:
+Release 3 adds the control-plane schema and Release 4 adds execution-state
+repositories, backfill/reconciliation commands, authority routing, and fenced
+coverage for all approved scheduled workstreams. Release 4 reuses schema
+migrations 1 and 2; no migration 3 is required. SQLite remains authoritative
+until the runtime gates below pass, and these defaults stay in force:
 
 ```text
 DATABASE_BACKEND=sqlite
@@ -18,6 +19,8 @@ POSTGRES_READS_ENABLED=false
 POSTGRES_WRITES_ENABLED=false
 POSTGRES_SHADOW_COMPARE_ENABLED=false
 POSTGRES_CONTROL_PLANE_AUTHORITY_ENABLED=false
+POSTGRES_SCHEDULER_AUTHORITY_ENABLED=false
+POSTGRES_EXECUTION_STATE_SHADOW_ENABLED=false
 POSTGRES_EXECUTION_STATE_AUTHORITY_ENABLED=false
 SQLITE_AUDIT_MIRROR_ENABLED=false
 ```
@@ -75,6 +78,10 @@ npm run db:postgres:control-plane:backfill -- --snapshot /protected/snapshot-dir
 npm run db:postgres:control-plane:reconcile -- --snapshot /protected/snapshot-directory/source-snapshot.db
 npm run db:postgres:control-plane:shadow -- --snapshot /protected/snapshot-directory/source-snapshot.db
 npm run db:postgres:control-plane:status
+npm run db:postgres:execution-state:backfill -- --snapshot /protected/snapshot-directory/source-snapshot.db
+npm run db:postgres:execution-state:reconcile -- --snapshot /protected/snapshot-directory/source-snapshot.db
+npm run db:postgres:execution-state:shadow -- --snapshot /protected/snapshot-directory/source-snapshot.db
+npm run db:postgres:execution-state:status
 ```
 
 Connectivity must report TLS enabled and a supported transaction timeout.
@@ -122,7 +129,7 @@ Before backfill, quiesce SQLite writers and create a timestamped snapshot with
 records the source checksum and table counts, runs integrity and foreign-key
 checks, and changes only the copy to mode `0400`. Preserve the original.
 
-Control-plane backfill requires migration version 2 and a clean schema
+Control-plane and execution-state backfill require migration version 2 and a clean schema
 verification. It maps candidate lifecycle only from candidate-linked
 `decision_snapshots` and `decision_lifecycle_events`; non-candidate decision
 lifecycle belongs to Release 4. It is resumable, conflict-checking,
@@ -141,6 +148,13 @@ whose candidate row is absent are included in the deferred Release 4 count.
 Other missing candidate snapshots, orphan lifecycle origins, duplicate
 decisions, or non-canonical links remain blocking discrepancies.
 
+Execution-state backfill validates the same sealed snapshot, uses bounded
+insert-only batches under an advisory lock, and reconciles accounts, snapshots,
+positions, order intents, orders, broker events, reservations, allocations,
+exposure, risk limits, execution evidence, and lifecycle fingerprints. A durable
+passed checkpoint, zero unexplained discrepancies, zero duplicates/orphans, and
+an idempotent zero-mutation replay are required before execution-state authority.
+
 Use this progression after schema and backfill validation:
 
 1. Keep all PostgreSQL feature flags off while migration version 2 is applied
@@ -150,12 +164,18 @@ Use this progression after schema and backfill validation:
    discrepancies.
 3. Set `DATABASE_BACKEND=postgres` and enable control-plane authority only
    after reconciliation and shadow gates pass. Keep execution-state authority
-   false. Enable the temporary SQLite audit mirror only while Release 4 readers
-   require its compatibility projection.
-4. Release 3 PostgreSQL scheduler authority is limited to `research`. Do not
-   grant it to `zero_dte`, `observatory`, `reconciliation`, `exit_review`,
-   `paper_exit`, `allocation`, or `market_data_refresh` until their durable
-   writes validate the current fencing token.
+   false.
+4. Enable scheduler authority only after acquisition, heartbeat, release,
+   expiry recovery, monotonic fencing, and stale-write rejection pass for every
+   approved workstream. All 14 production timers resolve to a fenced workstream;
+   a mutating timer may not bypass that boundary.
+5. Run execution-state backfill and reconciliation, then enable execution-state
+   shadow comparison while SQLite remains authoritative. Any discrepancy blocks
+   further authority expansion.
+6. Enable execution-state authority only after the durable checkpoint and
+   overlapping paper-workflow gates pass. Disable authoritative concurrent
+   SQLite writes and retain SQLite only for approved audit, append-only, derived,
+   cache, diagnostic, or transient roles.
 
 In authority mode, PostgreSQL failures never fall back to SQLite. Roll back
 application flags/code while leaving additive schema version 2 in place; do

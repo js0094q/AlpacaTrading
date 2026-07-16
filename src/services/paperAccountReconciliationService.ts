@@ -15,6 +15,7 @@ import {
   listSuccessfulPaperExecutionLedgerEntriesSince,
   type PaperExecutionLedgerEntry
 } from "./paperExecutionLedgerService.js";
+import { executionStateProjectionService } from "./executionStateProjectionService.js";
 import { getTradingSafetyState } from "./tradingSafetyService.js";
 
 export type PaperAccountReconciliationStatus = "ok" | "warning" | "blocked";
@@ -162,7 +163,7 @@ const minutesBetween = (laterIso: string, earlierIso: string | null): number | n
   return Math.max(0, Math.round((later - earlier) / 60000));
 };
 
-const resolveReconciliationSince = (nowIso: string): string => {
+const resolveReconciliationSince = (nowIso: string, postgresAuthority: boolean): string => {
   const explicitAfter =
     process.env.PAPER_RECONCILIATION_AFTER ||
     process.env.PAPER_ACCOUNT_RECONCILIATION_AFTER;
@@ -175,9 +176,11 @@ const resolveReconciliationSince = (nowIso: string): string => {
     return dateMinusDays(nowIso, configuredLookback);
   }
 
-  const latestSuccessfulPaperRun = getLatestSuccessfulPaperExecutionCreatedAt();
-  if (latestSuccessfulPaperRun && !Number.isNaN(new Date(latestSuccessfulPaperRun).getTime())) {
-    return new Date(latestSuccessfulPaperRun).toISOString();
+  if (!postgresAuthority) {
+    const latestSuccessfulPaperRun = getLatestSuccessfulPaperExecutionCreatedAt();
+    if (latestSuccessfulPaperRun && !Number.isNaN(new Date(latestSuccessfulPaperRun).getTime())) {
+      return new Date(latestSuccessfulPaperRun).toISOString();
+    }
   }
 
   return dateMinusDays(nowIso, DEFAULT_LOOKBACK_DAYS);
@@ -433,7 +436,8 @@ export const reconcilePaperAccountBeforeExecution = async (
 ): Promise<PaperAccountReconciliationSnapshot> => {
   const now = deps.now?.() || new Date().toISOString();
   const state = getTradingSafetyState();
-  const since = resolveReconciliationSince(now);
+  const postgresAuthority = executionStateProjectionService.isAuthorityActive();
+  const since = resolveReconciliationSince(now, postgresAuthority);
   const freshnessMinutes = syncFreshnessMinutes();
   const orderLimit = parsePositiveInteger(process.env.PAPER_RECONCILIATION_ORDER_LIMIT, 500, 500);
   const activityLimit = parsePositiveInteger(
@@ -526,21 +530,23 @@ export const reconcilePaperAccountBeforeExecution = async (
       .map((order) => [String(order.id), order])
   );
 
-  for (const ledgerEntry of listSuccessfulPaperExecutionLedgerEntriesSince(since)) {
-    const symbol = normalizeSymbol(ledgerEntry.symbol);
-    const matchingOrder =
-      (ledgerEntry.clientOrderId ? ordersByClientId.get(ledgerEntry.clientOrderId) : undefined) ||
-      (ledgerEntry.alpacaOrderId ? ordersById.get(ledgerEntry.alpacaOrderId) : undefined);
-    if (!ledgerEntryCanImplyOpenPosition(ledgerEntry, matchingOrder, fillActivityOrderIds)) {
-      continue;
+  if (!postgresAuthority) {
+    for (const ledgerEntry of listSuccessfulPaperExecutionLedgerEntriesSince(since)) {
+      const symbol = normalizeSymbol(ledgerEntry.symbol);
+      const matchingOrder =
+        (ledgerEntry.clientOrderId ? ordersByClientId.get(ledgerEntry.clientOrderId) : undefined) ||
+        (ledgerEntry.alpacaOrderId ? ordersById.get(ledgerEntry.alpacaOrderId) : undefined);
+      if (!ledgerEntryCanImplyOpenPosition(ledgerEntry, matchingOrder, fillActivityOrderIds)) {
+        continue;
+      }
+      addExpectedPosition(
+        expected,
+        symbol,
+        numericField(ledgerEntry.qty),
+        ledgerEntry.alpacaOrderId || undefined,
+        ledgerEntry.createdAt
+      );
     }
-    addExpectedPosition(
-      expected,
-      symbol,
-      numericField(ledgerEntry.qty),
-      ledgerEntry.alpacaOrderId || undefined,
-      ledgerEntry.createdAt
-    );
   }
 
   const positionSymbols = new Set(
@@ -555,7 +561,9 @@ export const reconcilePaperAccountBeforeExecution = async (
   const expectedQuantities: Record<string, string | null> = {};
   const missingSymbols: string[] = [];
   const events: PaperReconciliationEvent[] = [];
-  const priorEvents = latestPriorReconciliationEventsBySymbol();
+  const priorEvents = postgresAuthority
+    ? new Map<string, PriorReconciliationEventRow>()
+    : latestPriorReconciliationEventsBySymbol();
 
   for (const [symbol, entry] of [...expected.entries()].sort(([left], [right]) => left.localeCompare(right))) {
     expectedQuantities[symbol] = formatQuantity(entry);

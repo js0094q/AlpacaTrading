@@ -34,7 +34,7 @@ const COUNTABLE_ENTRY_STATUSES = new Set([
 ]);
 
 export interface ZeroDteLedgerActivityRow {
-  id: number;
+  id: number | string;
   createdAt: string;
   assetClass: string;
   symbol: string;
@@ -42,7 +42,7 @@ export interface ZeroDteLedgerActivityRow {
   status: string;
   quantity: string | number | null;
   limitPrice: string | number | null;
-  estimatedPremium: number | null;
+  estimatedPremium: number | string | null;
   clientOrderId: string | null;
   brokerOrderId: string | null;
   rawResponse: unknown;
@@ -72,9 +72,9 @@ export interface ZeroDteGenericPositionActivityRow {
   entryClientOrderId: string | null;
   openedAt: string;
   closedAt: string | null;
-  entryQuantity: number | null;
-  entryPrice: number | null;
-  realizedPnl: number | null;
+  entryQuantity: number | string | null;
+  entryPrice: number | string | null;
+  realizedPnl: number | string | null;
   outcomeCompletenessStatus: string | null;
   latestOutcomeRevisionJson: string | null;
 }
@@ -419,7 +419,7 @@ const ledgerFragment = (
     return null;
   }
   const side = normalizedStatus(row.side);
-  if (side && side !== "buy") return null;
+  if (side && side !== "buy" && side !== "buy_to_open") return null;
   const status = normalizedStatus(row.status);
   const raw = parsedObject(row.rawResponse);
   const rawStatus = normalizedStatus(raw?.status);

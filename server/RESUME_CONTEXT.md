@@ -1,5 +1,19 @@
 # Resume Context: Alpaca Investing Server Provisioning
 
+## Neon migration Release 4 staged-cutover prerequisite (2026-07-16)
+
+- Deploy the Release 4 implementation before changing authority flags. It
+  reuses PostgreSQL migrations 1 and 2 and adds no migration 3.
+- Keep all PostgreSQL authority flags disabled through deployment verification.
+  Then enable reads, writes, and shadow together as a non-authoritative stage;
+  SQLite remains authoritative until reconciliation passes.
+- Control-plane authority precedes scheduler authority. Scheduler authority may
+  advance only after all 14 approved timers prove lease, heartbeat, release,
+  expiry recovery, monotonic fencing, and stale-write rejection.
+- Backfill and reconcile execution state before enabling its shadow or authority
+  flags. Retire authoritative SQLite writes only after the final paper-only
+  concurrency gate; live trading remains disabled throughout.
+
 ## Neon migration Release 3 VPS next step (2026-07-15)
 
 - Deploy Release 3 code with every PostgreSQL authority flag off. Run direct

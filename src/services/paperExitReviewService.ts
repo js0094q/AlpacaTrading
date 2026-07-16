@@ -22,6 +22,7 @@ import {
 import { normalizeOptionQuote, roundOptionLimitPrice } from "./optionQuoteNormalizer.js";
 import { getTradingSafetyState } from "./tradingSafetyService.js";
 import { queryAll } from "../lib/db.js";
+import { executionStateProjectionService } from "./executionStateProjectionService.js";
 import type {
   PaperExitAssetClass,
   PaperExitOrderPayload,
@@ -662,9 +663,11 @@ export const buildPaperExitReviewResult = async (
   };
 
   const reconciliationStatus = reconciliationSnapshot.report.reconciliationStatus;
-  const knownLeapsSymbolsValue = await (
-    deps.getKnownLeapsOptionSymbols?.() ?? Promise.resolve(listKnownLeapsOptionSymbols())
-  );
+  const knownLeapsSymbolsValue = executionStateProjectionService.isAuthorityActive()
+    ? new Set<string>()
+    : await (
+        deps.getKnownLeapsOptionSymbols?.() ?? Promise.resolve(listKnownLeapsOptionSymbols())
+      );
   const knownLeapsOptionSymbols = knownLeapsSymbolsValue instanceof Set
     ? knownLeapsSymbolsValue
     : new Set(knownLeapsSymbolsValue.map(normalizeSymbol).filter(Boolean));

@@ -163,6 +163,11 @@ import {
   createReadConsistentSqliteSnapshot,
   reconcileControlPlaneSnapshot
 } from "./services/controlPlaneMigrationService.js";
+import {
+  assertDurableExecutionStateCheckpoint,
+  backfillExecutionStateSnapshot,
+  reconcileExecutionStateSnapshot
+} from "./services/executionStateMigrationService.js";
 
 const parseArg = (input: string): Record<string, string> | null => {
   const [rawKey, rawValue] = input.split("=", 2);
@@ -337,6 +342,19 @@ const run = async () => {
     process.env.npm_lifecycle_event !== command
   ) {
     throw new Error("CONTROL_PLANE_PACKAGED_CLI_REQUIRED");
+  }
+  const packagedExecutionStateCommands = new Set([
+    "db:postgres:execution-state:backfill",
+    "db:postgres:execution-state:reconcile",
+    "db:postgres:execution-state:shadow",
+    "db:postgres:execution-state:status"
+  ]);
+  if (
+    command &&
+    packagedExecutionStateCommands.has(command) &&
+    process.env.npm_lifecycle_event !== command
+  ) {
+    throw new Error("EXECUTION_STATE_PACKAGED_CLI_REQUIRED");
   }
   if (command === "db:postgres:connectivity") {
     const mode: PostgresConnectionMode = args.mode === "direct" ? "direct" : "pooled";
@@ -591,6 +609,186 @@ const run = async () => {
         config: databaseConfigDiagnostics(databaseConfig),
         latestCheckpoint: checkpoint.rows[0] || null,
         activeSchedulerLeases: activeLeases.rows
+      });
+    } finally {
+      await pool.end();
+    }
+    return;
+  }
+
+  if (command === "db:postgres:execution-state:backfill") {
+    if (!args.snapshot) throw new Error("EXECUTION_STATE_SNAPSHOT_PATH_REQUIRED");
+    const databaseConfig = loadDatabaseConfig(
+      { ...process.env, DATABASE_BACKEND: "postgres" },
+      { purpose: "migration" }
+    );
+    const pool = createPostgresPool(databaseConfig, "direct");
+    try {
+      const [migration, schema] = await Promise.all([
+        getPostgresMigrationStatus(pool),
+        verifyPostgresSchema(pool)
+      ]);
+      if (
+        migration.pending.length > 0 ||
+        migration.checksumMismatches.length > 0 ||
+        migration.unexpectedAppliedVersions.length > 0 ||
+        migration.latestAppliedVersion !== 2 ||
+        !schema.verificationPassed
+      ) {
+        throw new Error("EXECUTION_STATE_POSTGRES_PREFLIGHT_FAILED");
+      }
+      const backfill = await backfillExecutionStateSnapshot({
+        snapshotPath: args.snapshot,
+        pool,
+        config: databaseConfig,
+        batchSize: toInt(args.batchSize, 100)
+      });
+      const durable = await pool.query<{ count: number | string }>(
+        `SELECT COUNT(*) AS count
+         FROM reconciliation_checkpoints
+         WHERE workstream = 'execution_state_backfill'
+           AND status = 'passed'
+           AND source_checksum = $1
+           AND cursor_value->>'mappingVersion' = $2`,
+        [backfill.snapshotSha256, backfill.mappingVersion]
+      );
+      const durableBatchCheckpointCount = Number(durable.rows[0]?.count ?? 0);
+      const durableBatchCheckpointsVerified =
+        Number.isSafeInteger(durableBatchCheckpointCount) &&
+        durableBatchCheckpointCount >= backfill.batchCount;
+      if (!durableBatchCheckpointsVerified) {
+        throw new Error("EXECUTION_STATE_BACKFILL_DURABLE_CHECKPOINT_REQUIRED");
+      }
+      print({
+        operation: backfill.operation,
+        status: backfill.status,
+        snapshotSha256: backfill.snapshotSha256,
+        postgresMigrationVersion: backfill.postgresMigrationVersion,
+        mappingVersion: backfill.mappingVersion,
+        sourceRows: backfill.sourceRows,
+        insertedRows: backfill.insertedRows,
+        rowMutationCount: backfill.rowMutationCount,
+        checkpointMutationCount: backfill.checkpointMutationCount,
+        mutationCount: backfill.mutationCount,
+        idempotentReplay: backfill.idempotentReplay,
+        durableBatchCheckpointCount,
+        durableBatchCheckpointsVerified
+      });
+    } finally {
+      await pool.end();
+    }
+    return;
+  }
+
+  if (
+    command === "db:postgres:execution-state:reconcile" ||
+    command === "db:postgres:execution-state:shadow"
+  ) {
+    if (!args.snapshot) throw new Error("EXECUTION_STATE_SNAPSHOT_PATH_REQUIRED");
+    const databaseConfig = loadDatabaseConfig(
+      { ...process.env, DATABASE_BACKEND: "postgres" },
+      { purpose: "migration" }
+    );
+    const pool = createPostgresPool(databaseConfig, "direct");
+    try {
+      const [migration, schema] = await Promise.all([
+        getPostgresMigrationStatus(pool),
+        verifyPostgresSchema(pool)
+      ]);
+      if (
+        migration.pending.length > 0 ||
+        migration.checksumMismatches.length > 0 ||
+        migration.unexpectedAppliedVersions.length > 0 ||
+        migration.latestAppliedVersion !== 2 ||
+        !schema.verificationPassed
+      ) {
+        throw new Error("EXECUTION_STATE_POSTGRES_PREFLIGHT_FAILED");
+      }
+      const result = await reconcileExecutionStateSnapshot({
+        snapshotPath: args.snapshot,
+        pool,
+        config: databaseConfig,
+        checkpointId: args.checkpointId,
+        dryRun:
+          command === "db:postgres:execution-state:shadow" ||
+          flagArg(args.dryRun) ||
+          flagArg(args["dry-run"])
+      });
+      let durableCheckpointVerified = false;
+      if (!result.dryRun) {
+        const checkpoint = await pool.query<{
+          status: string;
+          source_checksum: string | null;
+          discrepancy_count: number | string;
+          cursor_value: unknown;
+          source_aggregates: unknown;
+          target_aggregates: unknown;
+          discrepancy_report: unknown;
+          completed_at: Date | string | null;
+        }>(
+          `SELECT status, source_checksum, discrepancy_count, cursor_value,
+                  source_aggregates, target_aggregates, discrepancy_report, completed_at
+           FROM reconciliation_checkpoints WHERE id = $1`,
+          [result.checkpointId]
+        );
+        durableCheckpointVerified = assertDurableExecutionStateCheckpoint(
+          checkpoint.rows[0],
+          result
+        );
+      }
+      print({
+        operation: result.operation,
+        status: result.dryRun ? `dry_run_${result.status}` : result.status,
+        checkpointId: result.checkpointId,
+        snapshotSha256: result.snapshotSha256,
+        postgresMigrationVersion: result.postgresMigrationVersion,
+        mappingVersion: result.mappingVersion,
+        tableComparisons: result.tableComparisons,
+        discrepancyCount: result.discrepancyCount,
+        discrepancyCategories: result.discrepancyCategories,
+        duplicateCount: result.duplicateCount,
+        orphanCount: result.orphanCount,
+        lifecycleOrderingCount: result.lifecycleOrderingCount,
+        reservationAllocationInvariantCount: result.reservationAllocationInvariantCount,
+        rowMutationCount: result.rowMutationCount,
+        checkpointMutationCount: result.checkpointMutationCount,
+        mutationCount: result.mutationCount,
+        idempotentReplay: result.idempotentReplay,
+        durableCheckpointVerified
+      });
+      if (result.status !== "passed") process.exitCode = 1;
+    } finally {
+      await pool.end();
+    }
+    return;
+  }
+
+  if (command === "db:postgres:execution-state:status") {
+    const databaseConfig = loadDatabaseConfig(
+      { ...process.env, DATABASE_BACKEND: "postgres" },
+      { purpose: "application" }
+    );
+    const pool = createPostgresPool(databaseConfig, "pooled");
+    try {
+      const checkpoint = await pool.query<{
+        id: string;
+        status: string;
+        source_checksum: string | null;
+        source_row_count: string | number | null;
+        target_row_count: string | number | null;
+        discrepancy_count: string | number;
+        completed_at: Date | string | null;
+      }>(
+        `SELECT id, status, source_checksum, source_row_count, target_row_count,
+                discrepancy_count, completed_at
+         FROM reconciliation_checkpoints
+         WHERE workstream = 'execution_state'
+         ORDER BY completed_at DESC NULLS LAST, created_at DESC
+         LIMIT 1`
+      );
+      print({
+        config: databaseConfigDiagnostics(databaseConfig),
+        latestCheckpoint: checkpoint.rows[0] || null
       });
     } finally {
       await pool.end();

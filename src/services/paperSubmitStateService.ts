@@ -32,6 +32,7 @@ import {
 } from "./zeroDte/zeroDteActivityEvidenceService.js";
 import { loadZeroDteConfig } from "./zeroDte/zeroDteConfigService.js";
 import { parseOptionSymbol } from "./optionSymbolService.js";
+import { executionStateProjectionService } from "./executionStateProjectionService.js";
 
 const ENTRY_SECTIONS = new Set<ReviewedPayloadSectionName>([
   "equityBuys",
@@ -181,6 +182,9 @@ export interface PaperSubmitStateDeps {
   listPositions?: typeof listPaperPositions;
   listOrders?: () => Promise<AlpacaApiResponse<AlpacaSubmittedOrder[]>>;
   listReservations?: () => PaperExecutionLedgerEntry[];
+  resolveExecutionReservations?: (
+    sqliteReservations: PaperSubmitReservationState[]
+  ) => Promise<PaperSubmitReservationState[]>;
   getMarketEvidence?: (
     intents: PaperSubmitIntent[],
     capturedAt: string
@@ -189,6 +193,11 @@ export interface PaperSubmitStateDeps {
     sourceCandidateId: string
   ) => SourceCandidateIdentity | null;
   buildZeroDteActivityEvidence?: typeof buildZeroDteActivityEvidence;
+  resolveZeroDteActivityEvidence?:
+    typeof executionStateProjectionService.resolveZeroDteActivityEvidence;
+  projectExecutionState?: (
+    attestation: PaperSubmitStateAttestation
+  ) => Promise<unknown>;
 }
 
 const unique = (values: string[]) => [...new Set(values.filter(Boolean))];
@@ -801,10 +810,17 @@ export const capturePaperSubmitState = async (
 
   let reservations: PaperSubmitReservationState[] = [];
   try {
-    reservations = normalizePaperSubmitReservations(
-      (deps.listReservations ?? listActivePaperNewRiskReservations)()
-    );
+    reservations = executionStateProjectionService.isAuthorityActive()
+      ? []
+      : normalizePaperSubmitReservations(
+          (deps.listReservations ?? listActivePaperNewRiskReservations)()
+        );
+    reservations = await (
+      deps.resolveExecutionReservations ??
+      executionStateProjectionService.resolveReservations
+    )(reservations);
   } catch {
+    reservations = [];
     blockers.push("SUBMIT_RESERVATION_EVIDENCE_UNAVAILABLE");
   }
 
@@ -842,14 +858,21 @@ export const capturePaperSubmitState = async (
       );
     } else {
       try {
-        zeroDteActivityEvidence = (
-          deps.buildZeroDteActivityEvidence ?? buildZeroDteActivityEvidence
-        )({
+        const activityInput = {
           tradingDate: tradingDates[0]!,
           asOf: input.capturedAt,
           positions: rawPositions,
           orders: rawOrders
-        });
+        };
+        const sqliteActivityEvidence = executionStateProjectionService.isAuthorityActive()
+          ? undefined
+          : (deps.buildZeroDteActivityEvidence ?? buildZeroDteActivityEvidence)(
+              activityInput
+            );
+        zeroDteActivityEvidence = await (
+          deps.resolveZeroDteActivityEvidence ??
+          executionStateProjectionService.resolveZeroDteActivityEvidence
+        )(activityInput, sqliteActivityEvidence);
         blockers.push(...zeroDteActivityEvidence.blockers);
       } catch {
         blockers.push(
@@ -893,7 +916,7 @@ export const capturePaperSubmitState = async (
     positions
   };
 
-  return {
+  const attestation: PaperSubmitStateAttestation = {
     version: "paper-submit-state-v1",
     capturedAt: input.capturedAt,
     accountIdentityHash,
@@ -918,6 +941,11 @@ export const capturePaperSubmitState = async (
     blockers: unique(blockers),
     warnings: unique(warnings)
   };
+  await (
+    deps.projectExecutionState ??
+    ((value) => executionStateProjectionService.syncAccountState(value))
+  )(attestation);
+  return attestation;
 };
 
 const selectedIntents = (

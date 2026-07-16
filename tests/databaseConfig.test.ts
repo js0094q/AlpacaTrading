@@ -26,6 +26,8 @@ test("database configuration defaults to SQLite with every PostgreSQL authority 
     postgresWrites: false,
     shadowComparison: false,
     controlPlaneAuthority: false,
+    schedulerAuthority: false,
+    executionStateShadow: false,
     executionStateAuthority: false,
     sqliteAuditMirror: false
   });
@@ -121,6 +123,78 @@ test("authority flags fail closed unless their prerequisite read and write flags
       error instanceof DatabaseConfigurationError &&
       error.code === "CONTROL_PLANE_AUTHORITY_REQUIRED"
   );
+
+  assert.throws(
+    () =>
+      loadDatabaseConfig({
+        ...base,
+        DATABASE_BACKEND: "postgres",
+        POSTGRES_READS_ENABLED: "true",
+        POSTGRES_WRITES_ENABLED: "true",
+        POSTGRES_SCHEDULER_AUTHORITY_ENABLED: "true"
+      }),
+    (error) =>
+      error instanceof DatabaseConfigurationError &&
+      error.code === "CONTROL_PLANE_AUTHORITY_REQUIRED"
+  );
+});
+
+test("shadow comparison is a non-authoritative read-write prerequisite stage", () => {
+  assert.throws(
+    () =>
+      loadDatabaseConfig({
+        ...base,
+        POSTGRES_READS_ENABLED: "true",
+        POSTGRES_SHADOW_COMPARE_ENABLED: "true"
+      }),
+    (error) =>
+      error instanceof DatabaseConfigurationError &&
+      error.code === "POSTGRES_SHADOW_PREREQUISITES_REQUIRED"
+  );
+
+  const config = loadDatabaseConfig({
+    ...base,
+    POSTGRES_READS_ENABLED: "true",
+    POSTGRES_WRITES_ENABLED: "true",
+    POSTGRES_SHADOW_COMPARE_ENABLED: "true"
+  });
+  assert.equal(config.backend, "sqlite");
+  assert.equal(config.features.controlPlaneAuthority, false);
+  assert.equal(config.features.schedulerAuthority, false);
+  assert.equal(config.features.executionStateShadow, false);
+  assert.equal(config.features.executionStateAuthority, false);
+});
+
+test("execution-state shadow and authority cannot bypass scheduler authority", () => {
+  assert.throws(
+    () =>
+      loadDatabaseConfig({
+        ...base,
+        DATABASE_BACKEND: "postgres",
+        POSTGRES_READS_ENABLED: "true",
+        POSTGRES_WRITES_ENABLED: "true",
+        POSTGRES_CONTROL_PLANE_AUTHORITY_ENABLED: "true",
+        POSTGRES_EXECUTION_STATE_SHADOW_ENABLED: "true"
+      }),
+    (error) =>
+      error instanceof DatabaseConfigurationError &&
+      error.code === "SCHEDULER_AUTHORITY_REQUIRED"
+  );
+
+  assert.throws(
+    () =>
+      loadDatabaseConfig({
+        ...base,
+        DATABASE_BACKEND: "postgres",
+        POSTGRES_READS_ENABLED: "true",
+        POSTGRES_WRITES_ENABLED: "true",
+        POSTGRES_CONTROL_PLANE_AUTHORITY_ENABLED: "true",
+        POSTGRES_EXECUTION_STATE_AUTHORITY_ENABLED: "true"
+      }),
+    (error) =>
+      error instanceof DatabaseConfigurationError &&
+      error.code === "SCHEDULER_AUTHORITY_REQUIRED"
+  );
 });
 
 test("authority cannot be enabled while SQLite remains the selected backend", () => {
@@ -170,6 +244,7 @@ test("startup diagnostics report modes and names without connection values", () 
     {
       ...base,
       POSTGRES_READS_ENABLED: "true",
+      POSTGRES_WRITES_ENABLED: "true",
       POSTGRES_SHADOW_COMPARE_ENABLED: "true"
     },
     { runtime: "local" }
