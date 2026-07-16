@@ -16,6 +16,15 @@ type JsonValue =
   | JsonValue[]
   | { [key: string]: JsonValue };
 
+const canonicalJson = (value: JsonValue): string => {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  return `{${Object.keys(value)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key]!)}`)
+    .join(",")}}`;
+};
+
 type SqliteRow = Readonly<Record<string, unknown>>;
 
 type SqliteSnapshotSeal = {
@@ -24,6 +33,135 @@ type SqliteSnapshotSeal = {
   readonly size: string;
   readonly modifiedAtNs: string;
   readonly sha256: string;
+};
+
+const parseDecimal = (value: number | string) => {
+  if (typeof value === "number" && !Number.isFinite(value)) {
+    throw new Error("POSTGRES_NUMERIC_NONFINITE");
+  }
+  const text = String(value).trim();
+  const match = /^([+-]?)(?:(\d+)(?:\.(\d*))?|\.(\d+))(?:[eE]([+-]?\d+))?$/.exec(text);
+  if (!match) throw new Error("POSTGRES_NUMERIC_INVALID");
+  const exponent = Number(match[5] ?? 0);
+  if (!Number.isSafeInteger(exponent) || Math.abs(exponent) > 1_000) {
+    throw new Error("POSTGRES_NUMERIC_INVALID");
+  }
+  const fraction = match[3] ?? match[4] ?? "";
+  let coefficient = BigInt(`${match[1] === "-" ? "-" : ""}${match[2] ?? "0"}${fraction}`);
+  let scale = fraction.length - exponent;
+  if (scale < 0) {
+    coefficient *= 10n ** BigInt(-scale);
+    scale = 0;
+  }
+  while (scale > 0 && coefficient % 10n === 0n) {
+    coefficient /= 10n;
+    scale -= 1;
+  }
+  return { coefficient, scale };
+};
+
+export const canonicalizePostgresNumeric = (
+  value: number | string | null,
+  precision: number,
+  scale: number
+): string | null => {
+  if (value === null) return null;
+  if (
+    !Number.isSafeInteger(precision) ||
+    !Number.isSafeInteger(scale) ||
+    precision < 1 ||
+    scale < 0 ||
+    scale > precision
+  ) {
+    throw new Error("POSTGRES_NUMERIC_DEFINITION_INVALID");
+  }
+  const parsed = parseDecimal(value);
+  const negative = parsed.coefficient < 0n;
+  let absolute = negative ? -parsed.coefficient : parsed.coefficient;
+  if (parsed.scale > scale) {
+    const divisor = 10n ** BigInt(parsed.scale - scale);
+    const remainder = absolute % divisor;
+    absolute /= divisor;
+    if (remainder * 2n >= divisor) absolute += 1n;
+  } else if (parsed.scale < scale) {
+    absolute *= 10n ** BigInt(scale - parsed.scale);
+  }
+  if (absolute >= 10n ** BigInt(precision)) {
+    throw new Error("POSTGRES_NUMERIC_OVERFLOW");
+  }
+  const digits = absolute.toString().padStart(scale + 1, "0");
+  const unsigned = scale === 0
+    ? digits
+    : `${digits.slice(0, -scale)}.${digits.slice(-scale)}`;
+  return negative && absolute !== 0n ? `-${unsigned}` : unsigned;
+};
+
+export const assertDurableControlPlaneCheckpoint = (
+  row: {
+    readonly status: string;
+    readonly source_checksum: string | null;
+    readonly discrepancy_count: number | string;
+    readonly cursor_value: unknown;
+    readonly source_aggregates: unknown;
+    readonly target_aggregates: unknown;
+    readonly discrepancy_report: unknown;
+    readonly completed_at: Date | string | null;
+  } | undefined,
+  expected: {
+    readonly status: string;
+    readonly snapshotSha256: string;
+    readonly discrepancyCount: number;
+    readonly postgresMigrationVersion: number;
+    readonly mappingVersion: number;
+    readonly sourceAggregates: JsonValue;
+    readonly targetAggregates: JsonValue;
+    readonly discrepancies: ReadonlyArray<{ readonly id: string }>;
+    readonly completedAt: string;
+  }
+) => {
+  let cursor: Record<string, unknown> | undefined;
+  let sourceAggregates: JsonValue | undefined;
+  let targetAggregates: JsonValue | undefined;
+  let discrepancyReport: JsonValue | undefined;
+  let completedAt: string | null = null;
+  try {
+    cursor = typeof row?.cursor_value === "string"
+      ? JSON.parse(row.cursor_value) as Record<string, unknown>
+      : row?.cursor_value as Record<string, unknown> | undefined;
+    sourceAggregates = typeof row?.source_aggregates === "string"
+      ? JSON.parse(row.source_aggregates) as JsonValue
+      : row?.source_aggregates as JsonValue | undefined;
+    targetAggregates = typeof row?.target_aggregates === "string"
+      ? JSON.parse(row.target_aggregates) as JsonValue
+      : row?.target_aggregates as JsonValue | undefined;
+    discrepancyReport = typeof row?.discrepancy_report === "string"
+      ? JSON.parse(row.discrepancy_report) as JsonValue
+      : row?.discrepancy_report as JsonValue | undefined;
+    completedAt = row?.completed_at === null || row?.completed_at === undefined
+      ? null
+      : new Date(row.completed_at).toISOString();
+  } catch {
+    throw new Error("CONTROL_PLANE_DURABLE_CHECKPOINT_VERIFICATION_FAILED");
+  }
+  if (
+    row?.status !== expected.status ||
+    row.source_checksum !== expected.snapshotSha256 ||
+    Number(row.discrepancy_count) !== expected.discrepancyCount ||
+    cursor?.postgresMigrationVersion !== expected.postgresMigrationVersion ||
+    cursor?.mappingVersion !== expected.mappingVersion ||
+    sourceAggregates === undefined ||
+    canonicalJson(sourceAggregates) !== canonicalJson(expected.sourceAggregates) ||
+    targetAggregates === undefined ||
+    canonicalJson(targetAggregates) !== canonicalJson(expected.targetAggregates) ||
+    discrepancyReport === undefined ||
+    canonicalJson(discrepancyReport) !== canonicalJson({
+      discrepancyIds: expected.discrepancies.map((row) => row.id)
+    }) ||
+    completedAt !== expected.completedAt
+  ) {
+    throw new Error("CONTROL_PLANE_DURABLE_CHECKPOINT_VERIFICATION_FAILED");
+  }
+  return true;
 };
 
 export interface SqliteSnapshotInspection {
@@ -998,6 +1136,26 @@ const candidateColumns = [
   "version", "created_at", "updated_at"
 ] as const;
 
+const candidateNumericColumns = [
+  { source: "score", column: "score", precision: 24, scale: 10 },
+  { source: "confidence", column: "confidence", precision: 12, scale: 10 },
+  { source: "expectedReturn", column: "expected_return", precision: 24, scale: 10 },
+  { source: "estimatedMaxLoss", column: "estimated_max_loss", precision: 28, scale: 8 },
+  { source: "estimatedMaxProfit", column: "estimated_max_profit", precision: 28, scale: 8 },
+  { source: "historicalWinRate", column: "historical_win_rate", precision: 12, scale: 10 },
+  { source: "historicalAvgReturn", column: "historical_avg_return", precision: 24, scale: 10 },
+  { source: "historicalMaxDrawdown", column: "historical_max_drawdown", precision: 24, scale: 10 },
+  { source: "optionLiquidityScore", column: "option_liquidity_score", precision: 24, scale: 10 },
+  { source: "volatilityScore", column: "volatility_score", precision: 24, scale: 10 },
+  { source: "recentLearningAdjustment", column: "recent_learning_adjustment", precision: 24, scale: 10 },
+  { source: "directionalAccuracy", column: "directional_accuracy", precision: 12, scale: 10 },
+  { source: "optionOutperformanceAccuracy", column: "option_outperformance_accuracy", precision: 12, scale: 10 },
+  { source: "strike", column: "strike", precision: 28, scale: 8 },
+  { source: "shortStrike", column: "short_strike", precision: 28, scale: 8 }
+] as const;
+
+const CONTROL_PLANE_MAPPING_VERSION = 2;
+
 const insertCandidateSql = `
   INSERT INTO candidates(
     id, decision_id, research_run_id, candidate_key, symbol, underlying_symbol,
@@ -1019,51 +1177,61 @@ const insertCandidateSql = `
   ) ON CONFLICT (id) DO NOTHING
 `;
 
-const candidateValues = (candidate: ControlPlaneCandidate): readonly unknown[] => [
-  candidate.id,
-  candidate.decisionId,
-  candidate.researchRunId,
-  candidate.candidateKey,
-  candidate.symbol,
-  candidate.underlyingSymbol,
-  candidate.optionSymbol,
-  candidate.assetClass,
-  candidate.asOf,
-  candidate.rank,
-  candidate.direction,
-  candidate.horizon,
-  candidate.riskProfile,
-  candidate.preferredExpression,
-  candidate.strategyFamily,
-  candidate.score,
-  candidate.confidence,
-  candidate.expectedReturn,
-  candidate.estimatedMaxLoss,
-  candidate.estimatedMaxProfit,
-  candidate.historicalWinRate,
-  candidate.historicalAvgReturn,
-  candidate.historicalMaxDrawdown,
-  candidate.similarSetupCount,
-  candidate.optionLiquidityScore,
-  candidate.volatilityScore,
-  candidate.signalFreshnessDays,
-  candidate.recentLearningAdjustment,
-  candidate.directionalAccuracy,
-  candidate.optionOutperformanceAccuracy,
-  candidate.strike,
-  candidate.shortStrike,
-  candidate.decision,
-  candidate.lifecycleStatus,
-  candidate.decisionReason,
-  JSON.stringify(candidate.rationale),
-  JSON.stringify(candidate.signalInputs),
-  candidate.dataQualityStatus,
-  candidate.relevantBacktestRunId,
-  candidate.sourceCandidateId,
-  candidate.version,
-  candidate.createdAt,
-  candidate.updatedAt
-];
+const candidateValues = (candidate: ControlPlaneCandidate): readonly unknown[] => {
+  const numeric = (source: typeof candidateNumericColumns[number]["source"]) => {
+    const definition = candidateNumericColumns.find((entry) => entry.source === source)!;
+    return canonicalizePostgresNumeric(
+      candidate[source],
+      definition.precision,
+      definition.scale
+    );
+  };
+  return [
+    candidate.id,
+    candidate.decisionId,
+    candidate.researchRunId,
+    candidate.candidateKey,
+    candidate.symbol,
+    candidate.underlyingSymbol,
+    candidate.optionSymbol,
+    candidate.assetClass,
+    candidate.asOf,
+    candidate.rank,
+    candidate.direction,
+    candidate.horizon,
+    candidate.riskProfile,
+    candidate.preferredExpression,
+    candidate.strategyFamily,
+    numeric("score"),
+    numeric("confidence"),
+    numeric("expectedReturn"),
+    numeric("estimatedMaxLoss"),
+    numeric("estimatedMaxProfit"),
+    numeric("historicalWinRate"),
+    numeric("historicalAvgReturn"),
+    numeric("historicalMaxDrawdown"),
+    candidate.similarSetupCount,
+    numeric("optionLiquidityScore"),
+    numeric("volatilityScore"),
+    candidate.signalFreshnessDays,
+    numeric("recentLearningAdjustment"),
+    numeric("directionalAccuracy"),
+    numeric("optionOutperformanceAccuracy"),
+    numeric("strike"),
+    numeric("shortStrike"),
+    candidate.decision,
+    candidate.lifecycleStatus,
+    candidate.decisionReason,
+    JSON.stringify(candidate.rationale),
+    JSON.stringify(candidate.signalInputs),
+    candidate.dataQualityStatus,
+    candidate.relevantBacktestRunId,
+    candidate.sourceCandidateId,
+    candidate.version,
+    candidate.createdAt,
+    candidate.updatedAt
+  ];
+};
 
 const candidateEventColumns = [
   "event_id", "candidate_id", "sequence_number", "event_type", "prior_status", "status",
@@ -1139,9 +1307,7 @@ const insertInBatches = async <T>(input: {
               values
             );
             if (comparison.rows[0]?.matches !== true) {
-              throw new Error(
-                `CONTROL_PLANE_BACKFILL_CONFLICT:${input.table}:${String(values[0])}`
-              );
+              throw new Error(`CONTROL_PLANE_BACKFILL_CONFLICT:${input.table}`);
             }
           }
         }
@@ -1236,6 +1402,7 @@ interface PostgresControlPlaneState {
     decisionId: string | null;
     researchRunId: string;
     lifecycleStatus: string;
+    raw: Readonly<Record<string, unknown>>;
   }>;
   readonly candidateLifecycleEvents: ReadonlyArray<{
     eventId: string;
@@ -1256,8 +1423,6 @@ interface PostgresControlPlaneState {
   readonly workstreamEventCount: number;
   readonly workstreamEventUniqueCount: number;
   readonly workstreamFailureCount: number;
-  readonly checkpointCount: number;
-  readonly existingCheckpointChecksum: string | null;
 }
 
 const countValue = (value: unknown, label: string) => {
@@ -1269,78 +1434,72 @@ const countValue = (value: unknown, label: string) => {
 };
 
 const readPostgresControlPlaneState = async (
-  client: PoolClient,
-  checkpointId: string
+  client: PoolClient
 ): Promise<PostgresControlPlaneState> => {
-  const [runs, candidates, events, scheduler, idempotency, workstream, checkpoints, checkpoint] =
-    await Promise.all([
-      client.query<{ id: string; status: string }>(
-        "SELECT id, status FROM research_runs ORDER BY id"
-      ),
-      client.query<{
-        id: string;
-        decision_id: string | null;
-        research_run_id: string;
-        lifecycle_status: string;
-      }>(
-        `SELECT id, decision_id, research_run_id, lifecycle_status
-         FROM candidates
-         ORDER BY research_run_id, rank, id`
-      ),
-      client.query<{
-        event_id: string;
-        candidate_id: string;
-        sequence_number: number | string;
-        event_type: string;
-        status: string;
-        idempotency_key: string;
-        source_event_id: string | null;
-        occurred_at: Date | string;
-        produced_at: Date | string;
-        request_id: string | null;
-        correlation_id: string | null;
-      }>(
-        `SELECT event_id, candidate_id, sequence_number, event_type, status,
-                idempotency_key, source_event_id, occurred_at, produced_at,
-                request_id, correlation_id
-         FROM candidate_lifecycle_events
-         ORDER BY candidate_id, sequence_number, event_id`
-      ),
-      client.query<{ held_count: number | string }>(
-        `SELECT COUNT(*) AS held_count
-         FROM scheduler_leases
-         WHERE status = 'held'`
-      ),
-      client.query<{ total_count: number | string; unique_count: number | string }>(
-        `SELECT COUNT(*) AS total_count,
-                COUNT(DISTINCT (scope, idempotency_key)) AS unique_count
-         FROM idempotency_records`
-      ),
-      client.query<{
-        total_count: number | string;
-        unique_count: number | string;
-        failure_count: number | string;
-      }>(
-        `SELECT COUNT(*) AS total_count,
-                COUNT(DISTINCT event_id) AS unique_count,
-                (SELECT COUNT(*) FROM workstream_event_failures) AS failure_count
-         FROM workstream_events`
-      ),
-      client.query<{ total_count: number | string }>(
-        "SELECT COUNT(*) AS total_count FROM reconciliation_checkpoints"
-      ),
-      client.query<{ source_checksum: string | null }>(
-        "SELECT source_checksum FROM reconciliation_checkpoints WHERE id = $1",
-        [checkpointId]
-      )
-    ]);
+  const runs = await client.query<{ id: string; status: string }>(
+    "SELECT id, status FROM research_runs ORDER BY id"
+  );
+  const candidates = await client.query<Record<string, unknown> & {
+    id: string;
+    decision_id: string | null;
+    research_run_id: string;
+    lifecycle_status: string;
+  }>(
+    `SELECT id, decision_id, research_run_id, lifecycle_status,
+            ${candidateNumericColumns.map((entry) => entry.column).join(", ")}
+     FROM candidates
+     ORDER BY research_run_id, rank, id`
+  );
+  const events = await client.query<{
+    event_id: string;
+    candidate_id: string;
+    sequence_number: number | string;
+    event_type: string;
+    status: string;
+    idempotency_key: string;
+    source_event_id: string | null;
+    occurred_at: Date | string;
+    produced_at: Date | string;
+    request_id: string | null;
+    correlation_id: string | null;
+  }>(
+    `SELECT event_id, candidate_id, sequence_number, event_type, status,
+            idempotency_key, source_event_id, occurred_at, produced_at,
+            request_id, correlation_id
+     FROM candidate_lifecycle_events
+     ORDER BY candidate_id, sequence_number, event_id`
+  );
+  const scheduler = await client.query<{ held_count: number | string }>(
+    `SELECT COUNT(*) AS held_count
+     FROM scheduler_leases
+     WHERE status = 'held'`
+  );
+  const idempotency = await client.query<{
+    total_count: number | string;
+    unique_count: number | string;
+  }>(
+    `SELECT COUNT(*) AS total_count,
+            COUNT(DISTINCT (scope, idempotency_key)) AS unique_count
+     FROM idempotency_records`
+  );
+  const workstream = await client.query<{
+    total_count: number | string;
+    unique_count: number | string;
+    failure_count: number | string;
+  }>(
+    `SELECT COUNT(*) AS total_count,
+            COUNT(DISTINCT event_id) AS unique_count,
+            (SELECT COUNT(*) FROM workstream_event_failures) AS failure_count
+     FROM workstream_events`
+  );
   return {
     researchRuns: runs.rows.map((row) => ({ id: row.id, status: row.status })),
     candidates: candidates.rows.map((row) => ({
       id: row.id,
       decisionId: row.decision_id,
       researchRunId: row.research_run_id,
-      lifecycleStatus: row.lifecycle_status
+      lifecycleStatus: row.lifecycle_status,
+      raw: row
     })),
     candidateLifecycleEvents: events.rows.map((row) => ({
       eventId: row.event_id,
@@ -1369,19 +1528,65 @@ const readPostgresControlPlaneState = async (
     workstreamFailureCount: countValue(
       workstream.rows[0]?.failure_count,
       "workstream_event_failures"
-    ),
-    checkpointCount: countValue(checkpoints.rows[0]?.total_count, "reconciliation_checkpoints"),
-    existingCheckpointChecksum: checkpoint.rows[0]?.source_checksum ?? null
+    )
   };
 };
 
-const canonicalJson = (value: JsonValue): string => {
-  if (value === null || typeof value !== "object") return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  return `{${Object.keys(value)
-    .sort()
-    .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key]!)}`)
-    .join(",")}}`;
+const decimalIdentity = (value: number | string | null) => {
+  if (value === null) return null;
+  const parsed = parseDecimal(value);
+  return `${parsed.coefficient}:${parsed.scale}`;
+};
+
+const classifyCandidateNumerics = (
+  source: readonly ControlPlaneCandidate[],
+  target: PostgresControlPlaneState["candidates"]
+) => {
+  const targetById = new Map(target.map((candidate) => [candidate.id, candidate]));
+  const counts = {
+    rowsExamined: 0,
+    exactBeforeNormalization: 0,
+    normalizedEquivalent: 0,
+    overflow: 0,
+    invalidNumeric: 0,
+    unexplainedMismatch: 0
+  };
+  for (const candidate of source) {
+    counts.rowsExamined += 1;
+    const stored = targetById.get(candidate.id);
+    if (!stored) {
+      counts.unexplainedMismatch += 1;
+      continue;
+    }
+    let exact = true;
+    let equivalent = true;
+    let overflow = false;
+    let invalid = false;
+    for (const numeric of candidateNumericColumns) {
+      const sourceValue = candidate[numeric.source];
+      const targetValue = stored.raw[numeric.column] as number | string | null;
+      try {
+        if (decimalIdentity(sourceValue) !== decimalIdentity(targetValue)) exact = false;
+        if (
+          canonicalizePostgresNumeric(sourceValue, numeric.precision, numeric.scale) !==
+          canonicalizePostgresNumeric(targetValue, numeric.precision, numeric.scale)
+        ) {
+          equivalent = false;
+        }
+      } catch (error) {
+        const code = error instanceof Error ? error.message : "POSTGRES_NUMERIC_INVALID";
+        if (code === "POSTGRES_NUMERIC_OVERFLOW") overflow = true;
+        else invalid = true;
+        equivalent = false;
+      }
+    }
+    if (overflow) counts.overflow += 1;
+    else if (invalid) counts.invalidNumeric += 1;
+    else if (!equivalent) counts.unexplainedMismatch += 1;
+    else if (exact) counts.exactBeforeNormalization += 1;
+    else counts.normalizedEquivalent += 1;
+  }
+  return counts;
 };
 
 const statusCounts = (statuses: readonly string[]) => {
@@ -1466,6 +1671,10 @@ const compareControlPlaneState = (input: {
   const sourceRuns = input.source.researchRuns;
   const sourceCandidates = input.source.candidates;
   const sourceEvents = input.source.candidateLifecycleEvents;
+  const candidateNumericClassification = classifyCandidateNumerics(
+    sourceCandidates,
+    input.target.candidates
+  );
   compare("research_runs", "ROW_COUNT_MISMATCH", sourceRuns.length, input.target.researchRuns.length);
   compare(
     "research_runs",
@@ -1519,6 +1728,16 @@ const compareControlPlaneState = (input: {
     "CANDIDATES_BY_RUN_MISMATCH",
     candidatesByRun(sourceCandidates),
     candidatesByRun(input.target.candidates)
+  );
+  compare(
+    "candidates",
+    "CANDIDATE_NUMERIC_MISMATCH",
+    { overflow: 0, invalidNumeric: 0, unexplainedMismatch: 0 },
+    {
+      overflow: candidateNumericClassification.overflow,
+      invalidNumeric: candidateNumericClassification.invalidNumeric,
+      unexplainedMismatch: candidateNumericClassification.unexplainedMismatch
+    }
   );
   compare(
     "candidate_lifecycle_events",
@@ -1604,87 +1823,159 @@ const compareControlPlaneState = (input: {
     input.target.workstreamEventUniqueCount
   );
   compare("workstream_event_failures", "ROW_COUNT_MISMATCH", 0, input.target.workstreamFailureCount);
-  if (
-    input.target.existingCheckpointChecksum !== null &&
-    input.target.existingCheckpointChecksum !== input.source.inspection.sha256
-  ) {
-    discrepancies.push(
-      createDiscrepancy({
-        checkpointId: input.checkpointId,
-        domain: "reconciliation_checkpoints",
-        entityId: input.checkpointId,
-        discrepancyType: "CHECKPOINT_SOURCE_CHECKSUM_MISMATCH",
-        expected: input.source.inspection.sha256,
-        actual: input.target.existingCheckpointChecksum,
-        observedAt: input.observedAt
-      })
-    );
-  }
-  return discrepancies;
+  return {
+    discrepancies,
+    candidateNumericClassification
+  };
 };
 
 export const reconcileControlPlaneSnapshot = async (input: {
   readonly snapshotPath: string;
   readonly pool: Pool;
   readonly config: DatabaseConfig;
-  readonly checkpointId: string;
+  readonly checkpointId?: string;
   readonly observedAt?: string;
+  readonly dryRun?: boolean;
 }) => {
   if (input.config.backend !== "postgres" || input.config.purpose !== "migration") {
     throw new Error("CONTROL_PLANE_RECONCILIATION_MIGRATION_CONFIG_REQUIRED");
   }
-  if (!input.checkpointId.trim()) throw new Error("CONTROL_PLANE_CHECKPOINT_ID_REQUIRED");
+  if (input.checkpointId !== undefined && !input.checkpointId.trim()) {
+    throw new Error("CONTROL_PLANE_CHECKPOINT_ID_REQUIRED");
+  }
   const observedAt = input.observedAt ?? new Date().toISOString();
   if (!Number.isFinite(Date.parse(observedAt))) {
     throw new Error("CONTROL_PLANE_RECONCILIATION_TIMESTAMP_INVALID");
   }
   const source = await readControlPlaneSnapshot(input.snapshotPath);
   return withPostgresTransaction(input.pool, input.config, async (client) => {
-  const target = await readPostgresControlPlaneState(client, input.checkpointId);
-  const discrepancies = compareControlPlaneState({
-    checkpointId: input.checkpointId,
-    observedAt,
-    source,
-    target
-  });
-  const status = discrepancies.length === 0 ? "passed" : "blocked";
-  const sourceAggregates: JsonValue = {
-    researchRuns: source.researchRuns.length,
-    candidates: source.candidates.length,
-    candidateLifecycleEvents: source.candidateLifecycleEvents.length,
-    deferredLifecycleEvents: source.deferredLifecycleEvents.length,
-    sourceIssues: source.sourceIssues.length,
-    activeLocalRuntimeLeases: source.runtimeWriteLeases.filter(
-      (lease) => Date.parse(lease.expiresAt) > Date.parse(observedAt)
-    ).length,
-    idempotencyRecords: 0,
-    workstreamEvents: 0,
-    workstreamEventFailures: 0
-  };
-  const targetAggregates: JsonValue = {
-    researchRuns: target.researchRuns.length,
-    candidates: target.candidates.length,
-    candidateLifecycleEvents: target.candidateLifecycleEvents.length,
-    heldSchedulerLeases: target.heldSchedulerLeaseCount,
-    idempotencyRecords: target.idempotencyCount,
-    workstreamEvents: target.workstreamEventCount,
-    workstreamEventFailures: target.workstreamFailureCount,
-    reconciliationCheckpoints: target.checkpointCount
-  };
-  const sourceRowCount =
-    source.researchRuns.length + source.candidates.length + source.candidateLifecycleEvents.length;
-  const targetRowCount =
-    target.researchRuns.length +
-    target.candidates.length +
-    target.candidateLifecycleEvents.length +
-    target.idempotencyCount +
-    target.workstreamEventCount +
-    target.workstreamFailureCount;
-  const lastEventOccurredAt = source.candidateLifecycleEvents
-    .map((event) => event.occurredAt)
-    .sort()
-    .at(-1) ?? null;
-  await client.query(
+    await client.query(
+      "LOCK TABLE reconciliation_checkpoints IN SHARE ROW EXCLUSIVE MODE"
+    );
+    const target = await readPostgresControlPlaneState(client);
+    let comparison = compareControlPlaneState({
+      checkpointId: input.checkpointId ?? "control-plane-attempt",
+      observedAt,
+      source,
+      target
+    });
+    const checkpointId = input.checkpointId?.trim() || (
+      comparison.discrepancies.length === 0
+        ? `control-plane-passed-${createHash("sha256")
+          .update(`${source.inspection.sha256}:${CONTROL_PLANE_MAPPING_VERSION}`)
+          .digest("hex")}`
+        : `control-plane-blocked-${observedAt.replace(/[^0-9]/g, "")}`
+    );
+    if (input.checkpointId === undefined) {
+      comparison = compareControlPlaneState({ checkpointId, observedAt, source, target });
+    }
+    const { discrepancies } = comparison;
+    const status = discrepancies.length === 0 ? "passed" : "blocked";
+    const sourceAggregates: JsonValue = {
+      researchRuns: source.researchRuns.length,
+      candidates: source.candidates.length,
+      candidateLifecycleEvents: source.candidateLifecycleEvents.length,
+      deferredLifecycleEvents: source.deferredLifecycleEvents.length,
+      sourceIssues: source.sourceIssues.length,
+      activeLocalRuntimeLeases: source.runtimeWriteLeases.filter(
+        (lease) => Date.parse(lease.expiresAt) > Date.parse(observedAt)
+      ).length,
+      idempotencyRecords: 0,
+      workstreamEvents: 0,
+      workstreamEventFailures: 0
+    };
+    const targetAggregates: JsonValue = {
+      researchRuns: target.researchRuns.length,
+      candidates: target.candidates.length,
+      candidateLifecycleEvents: target.candidateLifecycleEvents.length,
+      heldSchedulerLeases: target.heldSchedulerLeaseCount,
+      idempotencyRecords: target.idempotencyCount,
+      workstreamEvents: target.workstreamEventCount,
+      workstreamEventFailures: target.workstreamFailureCount
+    };
+    const sourceRowCount =
+      source.researchRuns.length + source.candidates.length + source.candidateLifecycleEvents.length;
+    const targetRowCount =
+      target.researchRuns.length +
+      target.candidates.length +
+      target.candidateLifecycleEvents.length +
+      target.idempotencyCount +
+      target.workstreamEventCount +
+      target.workstreamFailureCount;
+    const lastEventOccurredAt = source.candidateLifecycleEvents
+      .map((event) => event.occurredAt)
+      .sort()
+      .at(-1) ?? null;
+    const cursorValue: JsonValue = {
+      snapshotSha256: source.inspection.sha256,
+      postgresMigrationVersion: 2,
+      mappingVersion: CONTROL_PLANE_MAPPING_VERSION
+    };
+    const discrepancyReport: JsonValue = {
+      discrepancyIds: discrepancies.map((row) => row.id)
+    };
+    const result = (
+      checkpointMutationCount: number,
+      discrepancyMutationCount: number,
+      idempotentReplay: boolean,
+      completedAt = observedAt
+    ) => ({
+      operation: "control_plane_reconciliation",
+      checkpointId,
+      status,
+      authorityAllowed: status === "passed" && !input.dryRun,
+      discrepancyCount: discrepancies.length,
+      discrepancies,
+      sourceAggregates,
+      targetAggregates,
+      candidateNumericClassification: comparison.candidateNumericClassification,
+      candidateMutationCount: 0,
+      checkpointMutationCount,
+      discrepancyMutationCount,
+      mutationCount: checkpointMutationCount + discrepancyMutationCount,
+      idempotentReplay,
+      dryRun: input.dryRun === true,
+      postgresMigrationVersion: 2,
+      mappingVersion: CONTROL_PLANE_MAPPING_VERSION,
+      snapshotSha256: source.inspection.sha256,
+      completedAt
+    });
+    const existing = await client.query<{
+      status: string;
+      source_checksum: string | null;
+      discrepancy_count: number | string;
+      cursor_value: Record<string, unknown> | string;
+      source_aggregates: JsonValue | string;
+      target_aggregates: JsonValue | string;
+      discrepancy_report: JsonValue | string;
+      completed_at: Date | string | null;
+    }>(
+      `SELECT status, source_checksum, discrepancy_count, cursor_value,
+              source_aggregates, target_aggregates, discrepancy_report, completed_at
+       FROM reconciliation_checkpoints
+       WHERE id = $1`,
+      [checkpointId]
+    );
+    if (existing.rows[0]) {
+      try {
+        if (existing.rows[0].completed_at === null) {
+          throw new Error("CONTROL_PLANE_CHECKPOINT_COMPLETION_REQUIRED");
+        }
+        const replay = result(
+          0,
+          0,
+          true,
+          new Date(existing.rows[0].completed_at).toISOString()
+        );
+        assertDurableControlPlaneCheckpoint(existing.rows[0], replay);
+        return replay;
+      } catch {
+        throw new Error("CONTROL_PLANE_CHECKPOINT_IMMUTABLE");
+      }
+    }
+    if (input.dryRun) return result(0, 0, false);
+
+    const checkpointWrite = await client.query(
       `INSERT INTO reconciliation_checkpoints(
          id, workstream, checkpoint_key, source_name, target_name, status,
          source_checksum, source_row_count, target_row_count, discrepancy_count,
@@ -1694,38 +1985,29 @@ export const reconcileControlPlaneSnapshot = async (input: {
          $1, 'control_plane', $2, 'sqlite_snapshot', 'postgres_control_plane', $3,
          $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13, 1, $13, $13
        )
-       ON CONFLICT (id) DO UPDATE SET
-         status = EXCLUDED.status,
-         source_row_count = EXCLUDED.source_row_count,
-         target_row_count = EXCLUDED.target_row_count,
-         discrepancy_count = EXCLUDED.discrepancy_count,
-         cursor_value = EXCLUDED.cursor_value,
-         source_aggregates = EXCLUDED.source_aggregates,
-         target_aggregates = EXCLUDED.target_aggregates,
-         discrepancy_report = EXCLUDED.discrepancy_report,
-         last_event_occurred_at = EXCLUDED.last_event_occurred_at,
-         started_at = EXCLUDED.started_at,
-         completed_at = EXCLUDED.completed_at,
-         version = reconciliation_checkpoints.version + 1,
-         updated_at = EXCLUDED.updated_at`,
+       ON CONFLICT (id) DO NOTHING`,
       [
-        input.checkpointId,
-        input.checkpointId,
+        checkpointId,
+        checkpointId,
         status,
         source.inspection.sha256,
         sourceRowCount,
         targetRowCount,
         discrepancies.length,
-        JSON.stringify({ snapshotSha256: source.inspection.sha256 }),
+        JSON.stringify(cursorValue),
         JSON.stringify(sourceAggregates),
         JSON.stringify(targetAggregates),
-        JSON.stringify({ discrepancyIds: discrepancies.map((row) => row.id) }),
+        JSON.stringify(discrepancyReport),
         lastEventOccurredAt,
         observedAt
       ]
-  );
-  for (const discrepancy of discrepancies) {
-    await client.query(
+    );
+    if ((checkpointWrite.rowCount ?? 0) !== 1) {
+      throw new Error("CONTROL_PLANE_CHECKPOINT_IMMUTABLE");
+    }
+    let discrepancyMutationCount = 0;
+    for (const discrepancy of discrepancies) {
+      const discrepancyWrite = await client.query(
         `INSERT INTO reconciliation_discrepancies(
            id, checkpoint_id, domain, entity_id, discrepancy_type,
            expected, actual, observed_at, created_at
@@ -1741,15 +2023,9 @@ export const reconcileControlPlaneSnapshot = async (input: {
           discrepancy.actual === null ? null : JSON.stringify(discrepancy.actual),
           discrepancy.observedAt
         ]
-    );
-  }
-  return {
-    status,
-    authorityAllowed: status === "passed",
-    discrepancyCount: discrepancies.length,
-    discrepancies,
-    sourceAggregates,
-    targetAggregates
-  };
+      );
+      discrepancyMutationCount += discrepancyWrite.rowCount ?? 0;
+    }
+    return result(1, discrepancyMutationCount, false);
   }, { isolationLevel: "repeatable read" });
 };

@@ -8,7 +8,9 @@ import type { Pool, PoolClient, QueryResult } from "pg";
 
 import type { DatabaseConfig } from "../src/lib/database/config.js";
 import {
+  assertDurableControlPlaneCheckpoint,
   backfillControlPlaneSnapshot,
+  canonicalizePostgresNumeric,
   createReadConsistentSqliteSnapshot,
   enableSqliteDefensiveModeIfSupported,
   mapSqliteCandidate,
@@ -16,6 +18,100 @@ import {
   readControlPlaneSnapshot,
   reconcileControlPlaneSnapshot
 } from "../src/services/controlPlaneMigrationService.js";
+import { createControlPlaneSnapshotFixture } from "./helpers/controlPlaneSnapshotFixture.js";
+
+test("completion requires a durable checkpoint with matching migration evidence", () => {
+  const expected = {
+    status: "passed",
+    snapshotSha256: "a".repeat(64),
+    discrepancyCount: 0,
+    postgresMigrationVersion: 2,
+    mappingVersion: 2,
+    sourceAggregates: {
+      researchRuns: 2,
+      candidates: 2,
+      candidateLifecycleEvents: 3,
+      deferredLifecycleEvents: 1
+    },
+    targetAggregates: {
+      researchRuns: 2,
+      candidates: 2,
+      candidateLifecycleEvents: 3
+    },
+    discrepancies: [],
+    completedAt: "2026-07-15T13:00:00.000Z"
+  };
+  assert.throws(
+    () => assertDurableControlPlaneCheckpoint(undefined, expected),
+    /CONTROL_PLANE_DURABLE_CHECKPOINT_VERIFICATION_FAILED/
+  );
+  assert.throws(
+    () => assertDurableControlPlaneCheckpoint({
+      status: "passed",
+      source_checksum: expected.snapshotSha256,
+      discrepancy_count: 0,
+      cursor_value: { postgresMigrationVersion: 2, mappingVersion: 1 },
+      source_aggregates: expected.sourceAggregates,
+      target_aggregates: expected.targetAggregates,
+      discrepancy_report: { discrepancyIds: [] },
+      completed_at: expected.completedAt
+    }, expected),
+    /CONTROL_PLANE_DURABLE_CHECKPOINT_VERIFICATION_FAILED/
+  );
+  const durableRow = {
+    status: "passed",
+    source_checksum: expected.snapshotSha256,
+    discrepancy_count: 0,
+    cursor_value: JSON.stringify({ mappingVersion: 2, postgresMigrationVersion: 2 }),
+    source_aggregates: JSON.stringify(expected.sourceAggregates),
+    target_aggregates: JSON.stringify(expected.targetAggregates),
+    discrepancy_report: JSON.stringify({ discrepancyIds: [] }),
+    completed_at: expected.completedAt
+  };
+  assert.equal(assertDurableControlPlaneCheckpoint(durableRow, expected), true);
+  assert.throws(
+    () => assertDurableControlPlaneCheckpoint({
+      ...durableRow,
+      target_aggregates: { ...expected.targetAggregates, candidates: 1 }
+    }, expected),
+    /CONTROL_PLANE_DURABLE_CHECKPOINT_VERIFICATION_FAILED/
+  );
+  assert.throws(
+    () => assertDurableControlPlaneCheckpoint({ ...durableRow, completed_at: null }, expected),
+    /CONTROL_PLANE_DURABLE_CHECKPOINT_VERIFICATION_FAILED/
+  );
+  assert.throws(
+    () => assertDurableControlPlaneCheckpoint({
+      ...durableRow,
+      discrepancy_report: { discrepancyIds: ["stale-discrepancy"] }
+    }, expected),
+    /CONTROL_PLANE_DURABLE_CHECKPOINT_VERIFICATION_FAILED/
+  );
+});
+
+test("canonicalizes fixed-scale PostgreSQL numerics without floating-point equality", () => {
+  assert.equal(canonicalizePostgresNumeric("123.45678901234", 24, 10), "123.4567890123");
+  assert.equal(canonicalizePostgresNumeric("1.23456789015", 24, 10), "1.2345678902");
+  assert.equal(canonicalizePostgresNumeric("-1.23456789015", 24, 10), "-1.2345678902");
+  assert.equal(canonicalizePostgresNumeric("8e-3", 12, 10), "0.0080000000");
+  assert.equal(canonicalizePostgresNumeric(null, 24, 10), null);
+});
+
+test("normalizes negative zero and rejects overflow and non-finite numerics", () => {
+  assert.equal(canonicalizePostgresNumeric("-0.00000000001", 24, 10), "0.0000000000");
+  assert.throws(
+    () => canonicalizePostgresNumeric("10", 3, 2),
+    /POSTGRES_NUMERIC_OVERFLOW/
+  );
+  assert.throws(
+    () => canonicalizePostgresNumeric(Number.NaN, 24, 10),
+    /POSTGRES_NUMERIC_NONFINITE/
+  );
+  assert.throws(
+    () => canonicalizePostgresNumeric(Number.POSITIVE_INFINITY, 24, 10),
+    /POSTGRES_NUMERIC_NONFINITE/
+  );
+});
 
 test("SQLite defensive mode is optional on the Node 22 runtime", () => {
   assert.equal(enableSqliteDefensiveModeIfSupported({}), false);
@@ -100,160 +196,7 @@ const migrationConfig: DatabaseConfig = {
   }
 };
 
-const createBackfillSource = (path: string) => {
-  const database = new DatabaseSync(path);
-  database.exec(`
-    PRAGMA foreign_keys = ON;
-    CREATE TABLE research_runs (
-      id TEXT PRIMARY KEY,
-      started_at TEXT NOT NULL,
-      heartbeat_at TEXT,
-      completed_at TEXT,
-      status TEXT NOT NULL,
-      risk_profile TEXT NOT NULL,
-      options_enabled INTEGER NOT NULL,
-      universe_size INTEGER NOT NULL,
-      targets_generated INTEGER NOT NULL,
-      candidates_selected INTEGER NOT NULL,
-      error_message TEXT,
-      config_json TEXT NOT NULL,
-      summary_json TEXT,
-      worker_identity TEXT,
-      request_id TEXT,
-      correlation_id TEXT,
-      recovered_at TEXT,
-      recovery_reason TEXT,
-      recovery_source TEXT
-    );
-    CREATE TABLE paper_trade_candidates (
-      id TEXT PRIMARY KEY,
-      decision_id TEXT,
-      decision_linkage_status TEXT NOT NULL DEFAULT 'EXACT',
-      research_run_id TEXT NOT NULL REFERENCES research_runs(id),
-      symbol TEXT NOT NULL,
-      as_of TEXT NOT NULL,
-      rank INTEGER NOT NULL,
-      direction TEXT NOT NULL,
-      horizon TEXT NOT NULL,
-      risk_profile TEXT NOT NULL,
-      preferred_expression TEXT NOT NULL,
-      score REAL NOT NULL,
-      confidence REAL NOT NULL,
-      expected_return REAL,
-      estimated_max_loss REAL,
-      estimated_max_profit REAL,
-      rationale TEXT NOT NULL,
-      relevant_backtest_run_id TEXT,
-      historical_win_rate REAL,
-      historical_avg_return REAL,
-      historical_max_drawdown REAL,
-      similar_setup_count INTEGER,
-      option_liquidity_score REAL,
-      volatility_score REAL,
-      signal_freshness_days INTEGER,
-      recent_learning_adjustment REAL,
-      directional_accuracy REAL,
-      option_outperformance_accuracy REAL,
-      option_symbol TEXT,
-      strike REAL,
-      short_strike REAL,
-      decision TEXT NOT NULL,
-      decision_reason TEXT,
-      strategy_family TEXT,
-      signal_inputs_json TEXT NOT NULL,
-      data_quality_status TEXT NOT NULL
-    );
-    CREATE TABLE runtime_write_leases (
-      lease_name TEXT PRIMARY KEY,
-      owner_id TEXT NOT NULL,
-      acquired_at TEXT NOT NULL,
-      expires_at TEXT NOT NULL
-    );
-    CREATE TABLE decision_snapshots (
-      decision_id TEXT PRIMARY KEY,
-      origin_type TEXT NOT NULL DEFAULT 'paper_trade_candidate',
-      decision_role TEXT NOT NULL DEFAULT 'entry',
-      candidate_id TEXT,
-      position_lifecycle_id TEXT,
-      request_id TEXT,
-      correlation_id TEXT
-    );
-    CREATE TABLE decision_lifecycle_events (
-      event_id TEXT PRIMARY KEY,
-      decision_id TEXT NOT NULL REFERENCES decision_snapshots(decision_id),
-      status TEXT NOT NULL,
-      reason_codes_json TEXT NOT NULL,
-      occurred_at TEXT NOT NULL,
-      source_type TEXT NOT NULL,
-      source_id TEXT NOT NULL,
-      evidence_json TEXT NOT NULL
-    );
-  `);
-  const insertRun = database.prepare(`
-    INSERT INTO research_runs(
-      id, started_at, heartbeat_at, completed_at, status, risk_profile,
-      options_enabled, universe_size, targets_generated, candidates_selected,
-      error_message, config_json, summary_json, worker_identity, request_id,
-      correlation_id, recovered_at, recovery_reason, recovery_source
-    ) VALUES (?, ?, NULL, ?, 'completed', 'moderate', 1, 51, 4, 1,
-              NULL, '{}', NULL, ?, ?, ?, NULL, NULL, NULL)
-  `);
-  const insertCandidate = database.prepare(`
-    INSERT INTO paper_trade_candidates(
-      id, decision_id, research_run_id, symbol, as_of, rank, direction, horizon,
-      risk_profile, preferred_expression, score, confidence, expected_return,
-      estimated_max_loss, estimated_max_profit, rationale,
-      relevant_backtest_run_id, historical_win_rate, historical_avg_return,
-      historical_max_drawdown, similar_setup_count, option_liquidity_score,
-      volatility_score, signal_freshness_days, recent_learning_adjustment,
-      directional_accuracy, option_outperformance_accuracy, option_symbol,
-      strike, short_strike, decision, decision_reason, strategy_family,
-      signal_inputs_json, data_quality_status
-    ) VALUES (?, ?, ?, ?, ?, 1, 'long', 'swing', 'moderate', 'equity',
-              0.8, 0.75, NULL, NULL, NULL, '[]', NULL, NULL, NULL, NULL,
-              NULL, NULL, NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL,
-              'selected', NULL, 'momentum', '{}', 'COMPLETE')
-  `);
-  for (const suffix of ["1", "2"]) {
-    const startedAt = `2026-07-15T12:0${suffix}:00.000Z`;
-    const completedAt = `2026-07-15T12:1${suffix}:00.000Z`;
-    insertRun.run(
-      `run-${suffix}`,
-      startedAt,
-      completedAt,
-      `worker-${suffix}`,
-      `request-${suffix}`,
-      `correlation-${suffix}`
-    );
-    insertCandidate.run(
-      `candidate-${suffix}`,
-      `decision-${suffix}`,
-      `run-${suffix}`,
-      suffix === "1" ? "SPY" : "QQQ",
-      completedAt
-    );
-  }
-  database.exec(`
-    INSERT INTO decision_snapshots(decision_id, candidate_id, position_lifecycle_id)
-    VALUES
-      ('decision-1', 'candidate-1', NULL),
-      ('decision-2', 'candidate-2', NULL),
-      ('decision-release-4', NULL, 'position-release-4');
-    INSERT INTO decision_lifecycle_events(
-      event_id, decision_id, status, reason_codes_json, occurred_at,
-      source_type, source_id, evidence_json
-    ) VALUES
-      ('event-1b', 'decision-1', 'REVIEWED', '["REVIEW_APPROVED"]',
-       '2026-07-15T12:12:00+00:00', 'review', 'review-1', '{"approved":true}'),
-      ('event-1a', 'decision-1', 'SELECTED', '[]',
-       '2026-07-15T12:11:00+00:00', 'candidate', 'candidate-1', '{}'),
-      ('event-2a', 'decision-2', 'SELECTED', '[]',
-       '2026-07-15T12:13:00+00:00', 'candidate', 'candidate-2', '{}'),
-      ('event-release-4', 'decision-release-4', 'OPEN', '[]',
-       '2026-07-15T12:14:00+00:00', 'position', 'position-release-4', '{}');
-  `);
-  database.close();
-};
+const createBackfillSource = createControlPlaneSnapshotFixture;
 
 const fakeBackfillPool = () => {
   const rows = {
@@ -306,11 +249,21 @@ const fakeBackfillPool = () => {
   return { pool, rows, insertionOrder, transactionSizes };
 };
 
-test("backfills runs, candidates, and exact lifecycle events once in bounded dependency order", async () => {
+test("backfills normalized candidates once and rejects unexplained replay conflicts", async () => {
   const directory = await mkdtemp(join(tmpdir(), "control-plane-backfill-"));
   try {
     const sourcePath = join(directory, "source.db");
     createBackfillSource(sourcePath);
+    const source = new DatabaseSync(sourcePath);
+    source.exec(`
+      UPDATE paper_trade_candidates
+      SET score = 0.1234567890123,
+          confidence = 0.7654321098765,
+          estimated_max_loss = 12.345678905,
+          estimated_max_profit = 23.456789015
+      WHERE id = 'candidate-1';
+    `);
+    source.close();
     const fake = fakeBackfillPool();
 
     const first = await backfillControlPlaneSnapshot({
@@ -345,6 +298,11 @@ test("backfills runs, candidates, and exact lifecycle events once in bounded dep
     assert.equal(fake.rows.research_runs.size, 2);
     assert.equal(fake.rows.candidates.size, 2);
     assert.equal(fake.rows.candidate_lifecycle_events.size, 3);
+    const normalizedCandidate = fake.rows.candidates.get("candidate-1")!;
+    assert.equal(normalizedCandidate[15], "0.1234567890");
+    assert.equal(normalizedCandidate[16], "0.7654321099");
+    assert.equal(normalizedCandidate[18], "12.34567891");
+    assert.equal(normalizedCandidate[19], "23.45678902");
     assert.deepEqual(fake.insertionOrder.slice(0, 7), [
       "research_runs",
       "research_runs",
@@ -356,8 +314,8 @@ test("backfills runs, candidates, and exact lifecycle events once in bounded dep
     ]);
     assert.ok(fake.transactionSizes.every((size) => size <= 1));
 
-    const conflictingCandidate = [...fake.rows.candidates.get("candidate-1")!];
-    conflictingCandidate[4] = "DIA";
+    const conflictingCandidate = [...normalizedCandidate];
+    conflictingCandidate[15] = "0.1234567891";
     fake.rows.candidates.set("candidate-1", conflictingCandidate);
     await assert.rejects(
       () =>
@@ -367,7 +325,7 @@ test("backfills runs, candidates, and exact lifecycle events once in bounded dep
           config: migrationConfig,
           batchSize: 1
         }),
-      /CONTROL_PLANE_BACKFILL_CONFLICT:candidates:candidate-1/
+      (error) => error instanceof Error && error.message === "CONTROL_PLANE_BACKFILL_CONFLICT:candidates"
     );
   } finally {
     await rm(directory, { recursive: true, force: true });
@@ -664,7 +622,9 @@ test("blocks unknown, unlinked, and duplicate-rank candidate source data", async
   }
 });
 
-const fakeReconciliationPool = (existingChecksum: string | null = null) => {
+const fakeReconciliationPool = (
+  existingCheckpoint: Record<string, unknown> | null = null
+) => {
   const readQueries: string[] = [];
   const writeQueries: string[] = [];
   const discrepancyWrites: readonly unknown[][] = [];
@@ -686,10 +646,10 @@ const fakeReconciliationPool = (existingChecksum: string | null = null) => {
         rowCount: 1
       };
     }
-    if (/SELECT source_checksum FROM reconciliation_checkpoints/.test(text)) {
+    if (/FROM reconciliation_checkpoints\s+WHERE id = \$1/.test(text)) {
       return {
-        rows: existingChecksum === null ? [] : [{ source_checksum: existingChecksum }],
-        rowCount: existingChecksum === null ? 0 : 1
+        rows: existingCheckpoint === null ? [] : [existingCheckpoint],
+        rowCount: existingCheckpoint === null ? 0 : 1
       };
     }
     if (/FROM reconciliation_checkpoints/.test(text)) {
@@ -766,6 +726,11 @@ test("blocks reconciliation and durably records every unexplained discrepancy", 
         query.includes("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ WRITE")
       )
     );
+    assert.ok(
+      fake.readQueries.some((query) =>
+        query.includes("LOCK TABLE reconciliation_checkpoints IN SHARE ROW EXCLUSIVE MODE")
+      )
+    );
     for (const table of [
       "idempotency_records",
       "workstream_events",
@@ -784,25 +749,98 @@ test("a reconciliation checkpoint cannot be rebound to a different snapshot", as
   try {
     const sourcePath = join(directory, "source.db");
     createBackfillSource(sourcePath);
-    const fake = fakeReconciliationPool("different-source-checksum");
-    const result = await reconcileControlPlaneSnapshot({
+    for (const dryRun of [true, false]) {
+      const fake = fakeReconciliationPool({
+        status: "blocked",
+        source_checksum: "different-source-checksum",
+        discrepancy_count: "1",
+        cursor_value: {},
+        source_aggregates: {},
+        target_aggregates: {},
+        discrepancy_report: { discrepancyIds: ["stale-discrepancy"] },
+        completed_at: "2026-07-15T13:00:00.000Z"
+      });
+      await assert.rejects(
+        () => reconcileControlPlaneSnapshot({
+          snapshotPath: sourcePath,
+          pool: fake.pool,
+          config: migrationConfig,
+          checkpointId: "checkpoint-release-3",
+          observedAt: "2026-07-15T13:00:00.000Z",
+          dryRun
+        }),
+        /CONTROL_PLANE_CHECKPOINT_IMMUTABLE/
+      );
+      assert.equal(fake.writeQueries.length, 0);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("replays a passed checkpoint without changing its completion timestamp", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "control-plane-checkpoint-replay-"));
+  try {
+    const sourcePath = join(directory, "source.db");
+    createBackfillSource(sourcePath);
+    const database = new DatabaseSync(sourcePath);
+    database.exec(`
+      DELETE FROM decision_lifecycle_events;
+      DELETE FROM decision_snapshots;
+      DELETE FROM paper_trade_candidates;
+      DELETE FROM research_runs;
+    `);
+    database.close();
+    const snapshot = await readControlPlaneSnapshot(sourcePath);
+    const completedAt = "2026-07-15T13:00:00.000Z";
+    const sourceAggregates = {
+      researchRuns: 0,
+      candidates: 0,
+      candidateLifecycleEvents: 0,
+      deferredLifecycleEvents: 0,
+      sourceIssues: 0,
+      activeLocalRuntimeLeases: 0,
+      idempotencyRecords: 0,
+      workstreamEvents: 0,
+      workstreamEventFailures: 0
+    };
+    const targetAggregates = {
+      researchRuns: 0,
+      candidates: 0,
+      candidateLifecycleEvents: 0,
+      heldSchedulerLeases: 0,
+      idempotencyRecords: 0,
+      workstreamEvents: 0,
+      workstreamEventFailures: 0
+    };
+    const fake = fakeReconciliationPool({
+      status: "passed",
+      source_checksum: snapshot.inspection.sha256,
+      discrepancy_count: "0",
+      cursor_value: {
+        snapshotSha256: snapshot.inspection.sha256,
+        postgresMigrationVersion: 2,
+        mappingVersion: 2
+      },
+      source_aggregates: sourceAggregates,
+      target_aggregates: targetAggregates,
+      discrepancy_report: { discrepancyIds: [] },
+      completed_at: completedAt
+    });
+
+    const replay = await reconcileControlPlaneSnapshot({
       snapshotPath: sourcePath,
       pool: fake.pool,
       config: migrationConfig,
-      checkpointId: "checkpoint-release-3",
-      observedAt: "2026-07-15T13:00:00.000Z"
+      checkpointId: "checkpoint-passed",
+      observedAt: "2026-07-15T14:00:00.000Z"
     });
-    assert.equal(result.authorityAllowed, false);
-    assert.ok(
-      result.discrepancies.some(
-        (row) => row.discrepancyType === "CHECKPOINT_SOURCE_CHECKSUM_MISMATCH"
-      )
-    );
-    const checkpointSql = fake.writeQueries.find((query) =>
-      query.includes("INSERT INTO reconciliation_checkpoints")
-    );
-    assert.ok(checkpointSql);
-    assert.doesNotMatch(checkpointSql, /source_checksum\s*=\s*EXCLUDED\.source_checksum/i);
+
+    assert.equal(replay.status, "passed");
+    assert.equal(replay.idempotentReplay, true);
+    assert.equal(replay.mutationCount, 0);
+    assert.equal(replay.completedAt, completedAt);
+    assert.equal(fake.writeQueries.length, 0);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
