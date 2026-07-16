@@ -3,6 +3,7 @@ import test from "node:test";
 import type { Pool, PoolClient, QueryResult } from "pg";
 
 import type { DatabaseConfig } from "../src/lib/database/config.js";
+import { createPostgresPool } from "../src/lib/database/postgres.js";
 import {
   PostgresConnectivityError,
   checkPostgresConnectivity
@@ -123,4 +124,40 @@ test("connectivity fails when the required transaction timeout is unsupported", 
     () => checkPostgresConnectivity(config, { mode: "pooled", createPool: () => pool }),
     /POSTGRES_TRANSACTION_TIMEOUT_UNSUPPORTED/
   );
+});
+
+test("idle PostgreSQL pool errors are handled and logged without connection metadata", async () => {
+  const output: string[] = [];
+  const originalWrite = process.stderr.write;
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    output.push(String(chunk));
+    return true;
+  }) as typeof process.stderr.write;
+
+  const pool = createPostgresPool(config, "pooled");
+  const error = Object.assign(
+    new Error("failed postgresql://synthetic:synthetic-password@host.invalid/db"),
+    { code: "08P01" }
+  );
+  const client = {
+    connectionParameters: {
+      user: "synthetic-user",
+      host: "host.invalid",
+      database: "synthetic-db"
+    }
+  } as unknown as PoolClient;
+
+  try {
+    assert.doesNotThrow(() => pool.emit("error", error, client));
+    const logged = output.join("");
+    assert.match(logged, /postgres_pool_error/);
+    assert.match(logged, /08P01/);
+    assert.doesNotMatch(
+      logged,
+      /synthetic-password|host\.invalid|synthetic-user|synthetic-db/
+    );
+  } finally {
+    process.stderr.write = originalWrite;
+    await pool.end();
+  }
 });
