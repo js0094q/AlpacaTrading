@@ -70,6 +70,13 @@ process.stdout.write(JSON.stringify({ status: "success" }));
       .split("\n")
       .map((line) => JSON.parse(line) as string[]);
     assert.equal(existsSync(overlapPath), false, "workstreams must not overlap");
+    for (const argument of [
+      "--riskProfile=aggressive",
+      "--optionsEnabled=true",
+      "--maxCandidates=10"
+    ]) {
+      assert.equal(calls[1].includes(argument), true);
+    }
     for (const index of [6, 7, 10, 11]) {
       assert.equal(calls[index].includes("--confirmPaper"), true);
     }
