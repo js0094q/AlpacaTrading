@@ -161,8 +161,10 @@ test("historical retries share one idempotent intent while preserving broker his
       client_order_id: "client-order-retry",
       alpaca_order_id: "broker-order-retry",
       alpaca_status: "filled",
+      source_candidate_id: "candidate-retry",
       max_risk: Number(source.max_risk) + 1,
       status: "filled",
+      raw_payload_json: JSON.stringify({ position_intent: "buy_to_open" }),
       raw_response_json: JSON.stringify(response)
     };
     const columns = Object.keys(retry);

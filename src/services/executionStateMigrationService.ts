@@ -1177,24 +1177,18 @@ export const readExecutionStateSnapshot = async (
         string,
         { ledger: PaperExecutionLedgerEntry; intent: ExecutionReservationIntentInput }
       >();
+      const logicalIntentIdentity = (intent: ExecutionReservationIntentInput) =>
+        canonicalJsonHash({
+          strategyKey: intent.strategyKey,
+          symbol: intent.symbol,
+          underlyingSymbol: intent.underlyingSymbol,
+          assetClass: intent.assetClass,
+          sideClass: intent.side === "buy" || intent.side === "buy_to_open" ? "entry" : "exit"
+        });
       for (const entry of intents) {
         const key = `${entry.intent.accountId}:${entry.intent.idempotencyKey}`;
         const prior = canonicalIntents.get(key);
-        if (prior && canonicalJsonHash({
-          strategyKey: prior.intent.strategyKey,
-          candidateId: prior.intent.candidateId,
-          symbol: prior.intent.symbol,
-          underlyingSymbol: prior.intent.underlyingSymbol,
-          assetClass: prior.intent.assetClass,
-          side: prior.intent.side
-        }) !== canonicalJsonHash({
-          strategyKey: entry.intent.strategyKey,
-          candidateId: entry.intent.candidateId,
-          symbol: entry.intent.symbol,
-          underlyingSymbol: entry.intent.underlyingSymbol,
-          assetClass: entry.intent.assetClass,
-          side: entry.intent.side
-        })) {
+        if (prior && logicalIntentIdentity(prior.intent) !== logicalIntentIdentity(entry.intent)) {
           sourceIssues.push("EXECUTION_SOURCE_DUPLICATE_CONFLICT:order_intents");
         }
         if (!prior || prior.ledger.updatedAt < entry.ledger.updatedAt) {
