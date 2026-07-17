@@ -80,6 +80,26 @@ test("production-shaped blocked evidence and detached legacy decisions remain mi
           source_candidate_id = 'missing-candidate',
           decision_linkage_status = 'EXACT';
     `);
+    const sourceLedger = database.prepare(
+      "SELECT * FROM paper_execution_ledger WHERE id = 1"
+    ).get() as Record<string, unknown>;
+    const retryResponse = JSON.parse(String(sourceLedger.raw_response_json));
+    retryResponse.status = "filled";
+    const correctedLedger = {
+      ...sourceLedger,
+      id: 2,
+      updated_at: "2026-07-16T16:10:00.000Z",
+      client_order_id: "legacy-retry-client-order",
+      alpaca_status: "filled",
+      source_plan_id: null,
+      status: "filled",
+      raw_response_json: JSON.stringify(retryResponse)
+    };
+    const columns = Object.keys(correctedLedger);
+    database.prepare(`
+      INSERT INTO paper_execution_ledger(${columns.join(", ")})
+      VALUES (${columns.map(() => "?").join(", ")})
+    `).run(...Object.values(correctedLedger));
     database.close();
 
     assert.throws(
@@ -90,8 +110,11 @@ test("production-shaped blocked evidence and detached legacy decisions remain mi
     const snapshot = await readExecutionStateSnapshot(path);
     assert.deepEqual(snapshot.sourceIssues, []);
     assert.equal(snapshot.rows.get("accounts")?.length, 1);
-    assert.equal(snapshot.rows.get("order_intents")?.length, 1);
-    assert.equal(snapshot.rows.get("order_intents")?.[0]?.candidate_id, null);
+    assert.equal(snapshot.rows.get("order_intents")?.length, 2);
+    assert.ok(snapshot.rows.get("order_intents")?.every((row) => row.candidate_id === null));
+    assert.equal(snapshot.rows.get("orders")?.length, 1);
+    assert.equal(snapshot.rows.get("orders")?.[0]?.status, "filled");
+    assert.equal(snapshot.rows.get("broker_events")?.length, 2);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
