@@ -9,6 +9,7 @@ import type {
   TimeHorizon
 } from "../types.js";
 import type { RankedCandidate } from "./candidateRankingService.js";
+import { currentControlPlaneRuntimeContext } from "./controlPlaneRuntimeContext.js";
 
 interface PlanBuildInput {
   researchRunId: string;
@@ -339,6 +340,9 @@ const resolveOutcome = (
 };
 
 export const buildPaperTradePlans = (input: PlanBuildInput): PaperTradePlanRow[] => {
+  if (currentControlPlaneRuntimeContext()?.config.features.controlPlaneAuthority) {
+    return [];
+  }
   const insert = getDb().prepare(`
     INSERT INTO paper_trade_plans(
       id,
