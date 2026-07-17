@@ -14,6 +14,9 @@ import {
   type RunWithPostgresSchedulerLeaseInput
 } from "./postgresSchedulerExecutionService.js";
 
+const SCHEDULER_LEASE_DURATION_MS = 5 * 60_000;
+const SCHEDULER_HEARTBEAT_INTERVAL_MS = 15_000;
+
 export type PostgresScheduledCommandInput<T> = PostgresSchedulerCommandInput & {
   readonly operation: () => Promise<T>;
 };
@@ -74,8 +77,8 @@ export const runPostgresScheduledCommand = async <T>(
         operationId: `scheduler:${schedulerInvocationId}`,
         requestId,
         correlationId,
-        leaseDurationMs: 60_000,
-        heartbeatIntervalMs: 15_000,
+        leaseDurationMs: SCHEDULER_LEASE_DURATION_MS,
+        heartbeatIntervalMs: SCHEDULER_HEARTBEAT_INTERVAL_MS,
         operation: async ({ fence, signal }) =>
           withControlPlaneRuntimeContext(
             {

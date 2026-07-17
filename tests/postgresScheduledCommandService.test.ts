@@ -93,6 +93,38 @@ test("research authority executes inside a fenced runtime context", async () => 
   assert.deepEqual(calls, ["lease:research", "operation", "pool:end"]);
 });
 
+test("long paper review workstreams receive a bounded lease window", async () => {
+  const calls: string[] = [];
+  let leaseDurationMs: number | undefined;
+  let heartbeatIntervalMs: number | undefined;
+  const deps = dependencies(
+    configFor({ controlPlaneAuthority: true, schedulerAuthority: true }),
+    calls
+  );
+  deps.runWithLease = async (input) => {
+    leaseDurationMs = input.leaseDurationMs;
+    heartbeatIntervalMs = input.heartbeatIntervalMs;
+    return input.operation({
+      fence: {
+        jobName: input.job.jobName,
+        workstream: input.job.workstream,
+        ownerId: input.ownerId,
+        runId: input.runId,
+        fencingToken: "17"
+      },
+      signal: new AbortController().signal
+    });
+  };
+
+  await runPostgresScheduledCommand(
+    { command: "paper:ops:review", operation: async () => "completed" },
+    deps
+  );
+
+  assert.equal(leaseDurationMs, 5 * 60_000);
+  assert.equal(heartbeatIntervalMs, 15_000);
+});
+
 test("every registered mutating workstream uses PostgreSQL scheduler authority", async () => {
   const config = configFor({
     controlPlaneAuthority: true,
