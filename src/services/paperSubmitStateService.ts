@@ -658,6 +658,7 @@ const marketEvidenceBlockers = (input: {
 }) => {
   const blockers: string[] = [];
   const asOf = Date.parse(input.capturedAt);
+  const maxFutureSkewSeconds = 60;
   for (const intent of input.intents) {
     const evidence = input.marketEvidence.find(
       (row) => row.symbol === intent.symbol && row.assetClass === intent.assetClass
@@ -671,7 +672,7 @@ const marketEvidenceBlockers = (input: {
     if (
       !Number.isFinite(asOf) ||
       !Number.isFinite(observedAt) ||
-      ageSeconds < 0 ||
+      ageSeconds < -maxFutureSkewSeconds ||
       ageSeconds > input.quoteMaxAgeSeconds
     ) {
       blockers.push("SUBMIT_MARKET_EVIDENCE_STALE");

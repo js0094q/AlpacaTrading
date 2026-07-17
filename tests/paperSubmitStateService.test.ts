@@ -284,6 +284,28 @@ describe("paper submit state validation", () => {
     assert.ok(result.blockers.includes("SUBMIT_MARKET_EVIDENCE_STALE"));
   });
 
+  test("accepts fresh evidence observed after capture started", () => {
+    const capturedAt = new Date(Date.now() - 2_000).toISOString();
+    const observedAt = new Date().toISOString();
+    const current = state({
+      capturedAt,
+      marketEvidence: [
+        {
+          ...state().marketEvidence[0]!,
+          timestamp: observedAt
+        }
+      ]
+    });
+
+    const result = validatePaperSubmitState({
+      reviewed: state(),
+      current,
+      sections: ["equityBuys"]
+    });
+
+    assert.equal(result.blockers.includes("SUBMIT_MARKET_EVIDENCE_STALE"), false);
+  });
+
   test("enforces cash reserve, buying power, and portfolio deployment caps", () => {
     const current = state({
       accountState: {
