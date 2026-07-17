@@ -28,6 +28,33 @@ const currentFence = {
   current: true
 };
 
+test("finds the active strategy key for execution reservation routing", async () => {
+  let queryText = "";
+  const client = {
+    query: async (text: string) => {
+      queryText = text;
+      return {
+        rows: [{
+          account_id: "account-1",
+          account_snapshot_id: "snapshot-1",
+          strategy_key: "reviewed-paper"
+        }]
+      } as unknown as QueryResult;
+    }
+  } as unknown as PoolClient;
+
+  const result = await new PostgresExecutionStateRepository().findCurrentAccount({
+    transaction: client
+  });
+
+  assert.deepEqual(result, {
+    accountId: "account-1",
+    accountSnapshotId: "snapshot-1",
+    strategyKey: "reviewed-paper"
+  });
+  assert.match(queryText, /allocation\.strategy_key AS strategy_key/);
+});
+
 test("reuses an equivalent existing account snapshot for exposure foreign keys", async () => {
   const queries: Array<{ text: string; values: unknown[] }> = [];
   const client = {

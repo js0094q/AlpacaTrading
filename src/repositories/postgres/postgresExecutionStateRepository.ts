@@ -39,7 +39,8 @@ implements ExecutionStateRepository<PoolClient> {
       strategy_key: string;
     }>(
       `SELECT accounts.id AS account_id,
-              latest.id AS account_snapshot_id
+              latest.id AS account_snapshot_id,
+              allocation.strategy_key AS strategy_key
        FROM accounts
        JOIN LATERAL (
          SELECT id FROM account_snapshots
