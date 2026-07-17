@@ -23,6 +23,8 @@ import {
 import { listPaperExecutionLedgerEntries } from "../../src/services/paperExecutionLedgerService.js";
 import { evaluateHedgeLearning, listRecentHedgeLearningEvents } from "../../src/services/hedgeLearningLifecycleService.js";
 import { buildZeroDteDashboardSummary } from "../../src/services/zeroDte/zeroDteEngineService.js";
+import { getActiveSymbols } from "../../src/services/universeService.js";
+import { alpacaStockStream } from "../../src/services/alpacaStockStream.js";
 import { safeTokenEquals } from "../../src/lib/safeToken.js";
 import { redactSensitiveData, redactSensitiveText } from "../../src/lib/securityRedaction.js";
 import {
@@ -836,10 +838,15 @@ const actionHandlers: Record<string, ActionConfig> = {
     requireAdminToken: false,
     requireMutationPrecheck: false,
     action: "health",
-    handler: async (_input, requestId) =>
-      command("alpaca:health", ["--format=json"], 10_000, requestId, "health", {
+    handler: async (_input, requestId) => {
+      const health = await command("alpaca:health", ["--format=json"], 10_000, requestId, "health", {
         env: healthRunEnv()
-      })
+      });
+      if (health && typeof health === "object" && !Array.isArray(health)) {
+        return { ...health, stockStream: alpacaStockStream.getHealth() };
+      }
+      return { alpaca: health, stockStream: alpacaStockStream.getHealth() };
+    }
   },
   "/api/v1/hedge/recommendation": {
     method: "GET",
@@ -1461,13 +1468,46 @@ export const createControlServer = () => createServer(requestListener);
 
 const server = createControlServer();
 
-export const closeControlServer = () =>
-  new Promise((resolve) => {
-    server.close(() => resolve(undefined));
+export const closeControlServer = async () => {
+  await alpacaStockStream.stop();
+  await new Promise<void>((resolve) => {
+    server.close(() => resolve());
   });
+};
+
+const startBackgroundServices = async () => {
+  if (!alpacaStockStream.getStatus().enabled) {
+    return;
+  }
+
+  if (!process.env.ALPACA_STOCK_STREAM_SYMBOLS?.trim()) {
+    try {
+      const activeSymbols = getActiveSymbols();
+      if (activeSymbols.length > 0) {
+        await alpacaStockStream.setSymbols(activeSymbols);
+      }
+    } catch {
+      console.warn("Alpaca SIP stream active universe unavailable; using configured symbols");
+    }
+  }
+
+  await alpacaStockStream.start();
+};
 
 if (process.env.DASHBOARD_CONTROL_NO_START !== "1") {
   server.listen(CONTROL_PORT, CONTROL_HOST, () => {
     console.log(`Dashboard control API listening on ${CONTROL_HOST}:${CONTROL_PORT}`);
+    void startBackgroundServices();
   });
+
+  let shutdownStarted = false;
+  const handleShutdown = () => {
+    if (shutdownStarted) {
+      return;
+    }
+    shutdownStarted = true;
+    void closeControlServer();
+  };
+  process.once("SIGINT", handleShutdown);
+  process.once("SIGTERM", handleShutdown);
 }

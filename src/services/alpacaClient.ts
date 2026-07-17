@@ -512,6 +512,7 @@ const parseSnapshotMap = <T>(payload: unknown): Record<string, T> => {
 const getBatchedDataSnapshots = async <T>(
   endpoint: string,
   symbols: string[],
+  feed: string,
   chunkSize = 100
 ): Promise<AlpacaBatchedSnapshotResponse<T>> => {
   const uniqueSymbols = [...new Set(symbols.map((symbol) => symbol.trim().toUpperCase()).filter(Boolean))];
@@ -522,7 +523,10 @@ const getBatchedDataSnapshots = async <T>(
 
   for (let index = 0; index < uniqueSymbols.length; index += chunkSize) {
     const chunk = uniqueSymbols.slice(index, index + chunkSize);
-    const params = new URLSearchParams({ symbols: chunk.join(",") });
+    const params = new URLSearchParams({
+      symbols: chunk.join(","),
+      feed
+    });
     const response = await getAlpacaDataEndpoint<unknown>(`${endpoint}?${params.toString()}`);
     Object.assign(data, parseSnapshotMap<T>(response.data));
     if (response.requestId) {
@@ -543,12 +547,20 @@ const getBatchedDataSnapshots = async <T>(
 export const getLatestStockSnapshots = async (
   symbols: string[]
 ): Promise<AlpacaBatchedSnapshotResponse<AlpacaStockSnapshotRaw>> =>
-  getBatchedDataSnapshots<AlpacaStockSnapshotRaw>("/v2/stocks/snapshots", symbols);
+  getBatchedDataSnapshots<AlpacaStockSnapshotRaw>(
+    "/v2/stocks/snapshots",
+    symbols,
+    config.alpaca.stockDataFeed
+  );
 
 export const getLatestOptionSnapshots = async (
   symbols: string[]
 ): Promise<AlpacaBatchedSnapshotResponse<AlpacaOptionSnapshotRaw>> =>
-  getBatchedDataSnapshots<AlpacaOptionSnapshotRaw>("/v1beta1/options/snapshots", symbols);
+  getBatchedDataSnapshots<AlpacaOptionSnapshotRaw>(
+    "/v1beta1/options/snapshots",
+    symbols,
+    config.alpaca.optionDataFeed
+  );
 
 const requestJson = async <T>(
   endpoint: string,

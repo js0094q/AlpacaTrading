@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
+import { config } from "../config.js";
 import { configureDatabaseConnection, getDb } from "../lib/db.js";
 import { dedupeSymbols, normalizeSymbol } from "../lib/utils.js";
 import type { StockSnapshotRow } from "../types.js";
@@ -272,7 +273,9 @@ export const runStockObservation = async (input: {
     input.symbols?.length ? input.symbols : getObservableSymbols()
   );
   const runId = createObservationRun(initialSymbols, startedAt);
-  const feed = (input.feed || process.env.MARKET_OBSERVATORY_FEED || "iex").trim().toLowerCase();
+  const feed = (
+    input.feed || process.env.MARKET_OBSERVATORY_FEED || config.alpaca.stockDataFeed
+  ).trim().toLowerCase();
   const currency = (input.currency || process.env.MARKET_OBSERVATORY_CURRENCY || "USD").trim().toUpperCase();
   const getClock = input.getClock ?? getAlpacaMarketClock;
   const getSnapshots = input.getSnapshots ?? fetchStockSnapshots;

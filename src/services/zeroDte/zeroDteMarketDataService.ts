@@ -1,3 +1,4 @@
+import { config } from "../../config.js";
 import {
   getLatestOptionSnapshots,
   getLatestStockSnapshots,
@@ -354,7 +355,13 @@ export const createAlpacaZeroDteMarketDataProvider = (): ZeroDteMarketDataProvid
 
   async getBars(symbol, timeframe, start, end) {
     assertReadOnlyAlpacaAccessAllowed();
-    const rows = await fetchBars({ symbols: [symbol], timeframe, start, end, feed: "iex" });
+    const rows = await fetchBars({
+      symbols: [symbol],
+      timeframe,
+      start,
+      end,
+      feed: config.alpaca.stockDataFeed
+    });
     return {
       bars: rows
         .filter((row) => row.symbol.toUpperCase() === symbol.toUpperCase())

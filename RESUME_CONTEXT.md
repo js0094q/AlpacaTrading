@@ -282,6 +282,13 @@
   - `LIVE_TRADING_ENABLED=false`
   - `PAPER_ORDER_EXECUTION_ENABLED=true`
   - `PAPER_OPTIONS_EXECUTION_ENABLED=true`
+- Market-data feed defaults are centralized and paper-safe:
+  - stock REST feed `sip`
+  - stock stream URL `wss://stream.data.alpaca.markets/v2/sip`
+  - options feed `opra`
+- Optional SIP stock stream is disabled by default (`ALPACA_STOCK_STREAM_ENABLED=false`); when enabled by explicit configuration, `src/services/alpacaStockStream.ts` authenticates with the existing paper credentials, subscribes to the active stock universe, keeps latest trade/quote/bar state in memory, and reconnects after unexpected disconnects.
+- The dashboard-control process starts at most one stream service, stops it on `SIGINT`/`SIGTERM`, and exposes sanitized stream health under `data.stockStream` on `/api/v1/health`. Set `ALPACA_STOCK_STREAM_ENABLED=true` plus the documented SIP URL and non-secret controls in the applicable runtime environment; do not edit the repository `.env`.
+- `src/services/stockMarketDataAccessor.ts` prefers fresh SIP stream trades/quotes for eligible current stock reads and falls back to the existing SIP REST snapshot request for unavailable, uncovered, malformed, or stale state. Historical bars, research backfills, and complete snapshots remain REST-backed. `npm run smoke:alpaca-stream` is read-only and prints sanitized status only.
 - Paper exit management is paper-only and guarded:
   - `npm run paper:exit:review -- --format=json` is read-only and reviews open `/v2/positions` for exit candidates.
   - `npm run paper:exit:execute -- --confirmPaper --format=json` reruns review first, requires `PAPER_ORDER_EXECUTION_ENABLED=true`, and submits only generated paper exit candidates.

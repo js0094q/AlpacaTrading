@@ -1,0 +1,30 @@
+[Unit]
+Description=Alpaca Autonomous Paper Worker
+After=network-online.target alpaca-dashboard-control.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=alpaca
+Group=alpaca
+WorkingDirectory=/home/alpaca/Alpaca-Trading
+EnvironmentFile=/opt/alpaca-investing/secrets/alpaca.env
+Environment=PATH=/usr/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=NODE_ENV=production
+Environment=TRADING_MODE=paper
+Environment=ALPACA_ENV=paper
+Environment=ALPACA_LIVE_TRADE=false
+Environment=LIVE_TRADING_ENABLED=false
+Environment=AUTOMATED_PAPER_EXECUTION_ENABLED=true
+Environment=SQLITE_AUDIT_MIRROR_ENABLED=false
+ExecStart=/usr/bin/npm run paper:autonomous
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+KillMode=control-group
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
