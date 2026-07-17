@@ -1160,8 +1160,6 @@ export const readExecutionStateSnapshot = async (
           evidenceReviewIds.add(evidence.review.id);
           evidenceConfirmationIds.add(evidence.confirmation.id);
         }
-        const reservation = reservationRow(intent, ledger, latest.observedAt);
-        if (reservation) rows.get("buying_power_reservations")!.push(reservation);
         intents.push({ ledger, intent });
         if (brokerResultRequired(ledger)) {
           try {
@@ -1175,7 +1173,53 @@ export const readExecutionStateSnapshot = async (
         }
       }
 
-      for (const { ledger, intent } of intents) {
+      const canonicalIntents = new Map<
+        string,
+        { ledger: PaperExecutionLedgerEntry; intent: ExecutionReservationIntentInput }
+      >();
+      for (const entry of intents) {
+        const key = `${entry.intent.accountId}:${entry.intent.idempotencyKey}`;
+        const prior = canonicalIntents.get(key);
+        if (prior && canonicalJsonHash({
+          strategyKey: prior.intent.strategyKey,
+          candidateId: prior.intent.candidateId,
+          symbol: prior.intent.symbol,
+          underlyingSymbol: prior.intent.underlyingSymbol,
+          assetClass: prior.intent.assetClass,
+          side: prior.intent.side
+        }) !== canonicalJsonHash({
+          strategyKey: entry.intent.strategyKey,
+          candidateId: entry.intent.candidateId,
+          symbol: entry.intent.symbol,
+          underlyingSymbol: entry.intent.underlyingSymbol,
+          assetClass: entry.intent.assetClass,
+          side: entry.intent.side
+        })) {
+          sourceIssues.push("EXECUTION_SOURCE_DUPLICATE_CONFLICT:order_intents");
+        }
+        if (!prior || prior.ledger.updatedAt < entry.ledger.updatedAt) {
+          canonicalIntents.set(key, entry);
+        } else if (
+          prior.ledger.updatedAt === entry.ledger.updatedAt &&
+          canonicalJsonHash(prior.intent) !== canonicalJsonHash(entry.intent)
+        ) {
+          sourceIssues.push("EXECUTION_SOURCE_DUPLICATE_CONFLICT:order_intents");
+        }
+      }
+      const canonicalIntentIdBySourceId = new Map<string, string>();
+      for (const entry of intents) {
+        const key = `${entry.intent.accountId}:${entry.intent.idempotencyKey}`;
+        canonicalIntentIdBySourceId.set(
+          entry.intent.orderIntentId,
+          canonicalIntents.get(key)!.intent.orderIntentId
+        );
+      }
+
+      for (const { ledger, intent } of canonicalIntents.values()) {
+        const mappedReservation = reservationRow(intent, ledger, latest.observedAt);
+        if (mappedReservation) {
+          rows.get("buying_power_reservations")!.push(mappedReservation);
+        }
         const reservation = rows.get("buying_power_reservations")!
           .find((row) => row.id === intent.reservationId);
         const linkedEvidence = new Set([
@@ -1211,7 +1255,11 @@ export const readExecutionStateSnapshot = async (
       const orderIdByClient = new Map<string, string>();
       const latestOrders = new Map<string, TargetRow>();
       for (const { ledger, result } of brokerResults) {
-        const mapped = brokerRows(result, ledger, latest.accountId);
+        const mapped = brokerRows({
+          ...result,
+          orderIntentId: canonicalIntentIdBySourceId.get(result.orderIntentId) ??
+            result.orderIntentId
+        }, ledger, latest.accountId);
         const prior = latestOrders.get(mapped.order.id);
         const priorUpdatedAt = String(prior?.updated_at ?? "");
         if (!prior || priorUpdatedAt < mapped.order.updated_at) {
