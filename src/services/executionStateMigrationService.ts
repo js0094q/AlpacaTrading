@@ -1155,8 +1155,6 @@ export const readExecutionStateSnapshot = async (
           evidenceFingerprints.push(mapped.fingerprint);
           evidenceReviewIds.add(evidence.review.id);
           evidenceConfirmationIds.add(evidence.confirmation.id);
-        } else if (brokerResultRequired(ledger)) {
-          sourceIssues.push("EXECUTION_EVIDENCE_SOURCE_MISSING");
         }
         const reservation = reservationRow(intent, ledger, latest.observedAt);
         if (reservation) rows.get("buying_power_reservations")!.push(reservation);
@@ -1207,12 +1205,23 @@ export const readExecutionStateSnapshot = async (
       rows.get("lifecycle_fingerprints")!.push(...evidenceFingerprints);
 
       const orderIdByClient = new Map<string, string>();
+      const latestOrders = new Map<string, TargetRow>();
       for (const { ledger, result } of brokerResults) {
         const mapped = brokerRows(result, ledger, latest.accountId);
-        rows.get("orders")!.push(mapped.order);
+        const prior = latestOrders.get(mapped.order.id);
+        const priorUpdatedAt = String(prior?.updated_at ?? "");
+        if (!prior || priorUpdatedAt < mapped.order.updated_at) {
+          latestOrders.set(mapped.order.id, mapped.order);
+        } else if (
+          priorUpdatedAt === mapped.order.updated_at &&
+          canonicalJsonHash(prior) !== canonicalJsonHash(mapped.order)
+        ) {
+          sourceIssues.push("EXECUTION_SOURCE_DUPLICATE_CONFLICT:orders");
+        }
         rows.get("broker_events")!.push(mapped.event);
         orderIdByClient.set(result.clientOrderId, result.orderId);
       }
+      rows.get("orders")!.push(...latestOrders.values());
       const decisionCandidates = new Map(decisionRows.map((row) => [
         String(row.decision_id),
         candidateIds.has(String(row.candidate_id)) ? String(row.candidate_id) : null
