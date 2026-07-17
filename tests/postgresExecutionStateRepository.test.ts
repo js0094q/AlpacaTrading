@@ -981,6 +981,12 @@ test("consumed execution evidence remains an exact idempotent replay", async () 
     query.includes("FROM execution_reviews WHERE id")) ?? "";
   const confirmationReplay = queries.find((query) =>
     query.includes("FROM confirmation_evidence WHERE id")) ?? "";
+  const lifecycleReplay = queries.find((query) =>
+    query.includes("FROM lifecycle_fingerprints WHERE id")) ?? "";
   assert.match(reviewReplay, /status = \$5 OR\s+\(status = 'consumed'/);
   assert.match(confirmationReplay, /status = \$7 OR\s+\(status = 'consumed'/);
+  assert.doesNotMatch(confirmationReplay, /confirmed_at =/);
+  assert.doesNotMatch(confirmationReplay, /created_at =/);
+  assert.doesNotMatch(lifecycleReplay, /captured_at =/);
+  assert.doesNotMatch(lifecycleReplay, /created_at =/);
 });

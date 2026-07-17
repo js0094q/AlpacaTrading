@@ -1369,8 +1369,8 @@ implements ExecutionStateRepository<PoolClient> {
            (status = $7 OR (status = 'consumed' AND $7 = 'valid')) AND
            payload_fingerprint = $8 AND
            signature_algorithm IS NOT DISTINCT FROM $9 AND signature IS NOT DISTINCT FROM $10 AND
-           evidence = $11::jsonb AND confirmed_at = $12::timestamptz AND
-           expires_at = $13::timestamptz AND created_at = $12::timestamptz
+           evidence = $11::jsonb AND
+           expires_at = $12::timestamptz
          ) AS matches
          FROM confirmation_evidence WHERE id = $1`,
         [
@@ -1385,7 +1385,6 @@ implements ExecutionStateRepository<PoolClient> {
           confirmation.signatureAlgorithm,
           confirmation.signature,
           canonicalJson(confirmation.evidence),
-          confirmation.confirmedAt,
           confirmation.expiresAt
         ]
       );
@@ -1423,8 +1422,7 @@ implements ExecutionStateRepository<PoolClient> {
            account_id = $2 AND candidate_id IS NOT DISTINCT FROM $3 AND
            entity_type = $4 AND entity_id = $5 AND lifecycle_stage = $6 AND
            fingerprint = $7 AND payload_version = $8 AND evidence = $9::jsonb AND
-           request_id IS NOT DISTINCT FROM $10 AND correlation_id IS NOT DISTINCT FROM $11 AND
-           captured_at = $12::timestamptz AND created_at = $12::timestamptz
+           request_id IS NOT DISTINCT FROM $10 AND correlation_id IS NOT DISTINCT FROM $11
          ) AS matches
          FROM lifecycle_fingerprints WHERE id = $1`,
         [
@@ -1438,8 +1436,7 @@ implements ExecutionStateRepository<PoolClient> {
           lifecycle.payloadVersion,
           canonicalJson(lifecycle.evidence),
           lifecycle.requestId,
-          lifecycle.correlationId,
-          lifecycle.capturedAt
+          lifecycle.correlationId
         ]
       );
       if (replay.rows[0]?.matches !== true) {
