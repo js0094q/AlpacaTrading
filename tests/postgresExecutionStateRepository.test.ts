@@ -28,6 +28,99 @@ const currentFence = {
   current: true
 };
 
+test("reuses an equivalent existing account snapshot for exposure foreign keys", async () => {
+  const queries: Array<{ text: string; values: unknown[] }> = [];
+  const client = {
+    query: async (text: string, values: unknown[] = []) => {
+      queries.push({ text, values });
+      if (text.includes("FROM scheduler_leases") && text.includes("FOR UPDATE")) {
+        return { rows: [currentFence] } as unknown as QueryResult;
+      }
+      if (text.includes("INSERT INTO account_snapshots")) {
+        return { rows: [] } as unknown as QueryResult;
+      }
+      if (text.includes("FROM account_snapshots")) {
+        return { rows: [{ id: "legacy-snapshot-1" }] } as unknown as QueryResult;
+      }
+      if (text.includes("INSERT INTO portfolio_exposure")) {
+        assert.equal(values[2], "legacy-snapshot-1");
+        return { rows: [] } as unknown as QueryResult;
+      }
+      return { rows: [] } as unknown as QueryResult;
+    }
+  } as unknown as PoolClient;
+
+  const result = await new PostgresExecutionStateRepository().syncAccountState(
+    {
+      accountId: "account-1",
+      brokerAccountId: "broker-account-1",
+      accountSnapshotId: "new-snapshot-1",
+      observedAt: "2026-07-17T16:00:00.000Z",
+      accountStatus: "ACTIVE",
+      currency: "USD",
+      cash: "100000.00",
+      portfolioValue: "100000.00",
+      equity: "100000.00",
+      buyingPower: "100000.00",
+      optionsBuyingPower: "100000.00",
+      optionsApprovedLevel: 3,
+      tradingBlocked: false,
+      accountBlocked: false,
+      snapshotFingerprint: "snapshot-fingerprint-1",
+      evidence: {},
+      positions: [],
+      riskLimit: {
+        id: "risk-limit-1",
+        cashReserveAmount: "20000.00",
+        cashReserveRatio: "0.20",
+        maxDeploymentAmount: "30000.00",
+        maxDeploymentRatio: "0.50",
+        maxGrossExposure: "30000.00",
+        maxNetExposure: "30000.00",
+        maxOpenOrderExposure: "30000.00",
+        maxPositionNotional: "5000.00",
+        maxSymbolNotional: "5000.00",
+        maxPositionCount: 3,
+        maxOrderCount: 10,
+        configVersion: "v1",
+        configFingerprint: "risk-fingerprint-1"
+      },
+      strategyAllocation: {
+        id: "allocation-1",
+        strategyKey: "reviewed-paper",
+        allocationAmount: "30000.00",
+        allocationRatio: "1.00",
+        configVersion: "v1",
+        configFingerprint: "allocation-fingerprint-1"
+      },
+      exposure: {
+        id: "exposure-1",
+        grossExposure: "0.00",
+        netExposure: "0.00",
+        longExposure: "0.00",
+        shortExposure: "0.00",
+        openOrderExposure: "0.00",
+        activeReservationAmount: "0.00",
+        deployedAmount: "0.00",
+        cashReserveAmount: "20000.00",
+        availableBuyingPower: "100000.00",
+        positionCount: 0,
+        openOrderCount: 0,
+        fingerprint: "exposure-fingerprint-1",
+        evidence: {}
+      }
+    },
+    contextFor(client)
+  );
+
+  assert.deepEqual(result, {
+    status: "synced",
+    accountId: "account-1",
+    snapshotId: "legacy-snapshot-1"
+  });
+  assert.equal(queries.some(({ text }) => text.includes("INSERT INTO portfolio_exposure")), true);
+});
+
 const reservationInput = {
   reservationId: "reservation-1",
   reservationRequired: true,

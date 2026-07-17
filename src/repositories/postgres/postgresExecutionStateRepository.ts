@@ -405,7 +405,7 @@ implements ExecutionStateRepository<PoolClient> {
         input.observedAt
       ]
     );
-    await context.transaction.query(
+    const snapshotInsert = await context.transaction.query<{ id: string }>(
       `INSERT INTO account_snapshots(
          id, account_id, observed_at, account_status, currency, cash,
          portfolio_value, equity, buying_power, options_buying_power,
@@ -414,7 +414,8 @@ implements ExecutionStateRepository<PoolClient> {
        ) VALUES (
          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
          $14, $15::jsonb, $3
-       ) ON CONFLICT (account_id, snapshot_fingerprint) DO NOTHING`,
+       ) ON CONFLICT (account_id, snapshot_fingerprint) DO NOTHING
+       RETURNING id`,
       [
         input.accountSnapshotId,
         input.accountId,
@@ -433,6 +434,18 @@ implements ExecutionStateRepository<PoolClient> {
         canonicalJson(input.evidence)
       ]
     );
+    const accountSnapshotId = snapshotInsert.rows[0]?.id ?? (
+      await context.transaction.query<{ id: string }>(
+        `SELECT id
+         FROM account_snapshots
+         WHERE account_id = $1 AND snapshot_fingerprint = $2
+         LIMIT 1`,
+        [input.accountId, input.snapshotFingerprint]
+      )
+    ).rows[0]?.id;
+    if (!accountSnapshotId) {
+      throw new Error("POSTGRES_EXECUTION_ACCOUNT_SNAPSHOT_NOT_FOUND");
+    }
     const activeKeys = input.positions.map((position) => position.brokerPositionKey);
     await context.transaction.query(
       `UPDATE positions
@@ -499,7 +512,7 @@ implements ExecutionStateRepository<PoolClient> {
           position.costBasis,
           position.unrealizedPnl,
           position.realizedPnl,
-          input.accountSnapshotId,
+          accountSnapshotId,
           position.openedAt
         ]
       );
@@ -599,7 +612,7 @@ implements ExecutionStateRepository<PoolClient> {
       [
         input.exposure.id,
         input.accountId,
-        input.accountSnapshotId,
+        accountSnapshotId,
         input.currency,
         input.exposure.grossExposure,
         input.exposure.netExposure,
@@ -620,7 +633,7 @@ implements ExecutionStateRepository<PoolClient> {
     return {
       status: "synced" as const,
       accountId: input.accountId,
-      snapshotId: input.accountSnapshotId
+      snapshotId: accountSnapshotId
     };
   }
 
