@@ -105,6 +105,25 @@ export const getLatestStockObservationFeatures = (
     }
   })();
   if (!row) return null;
+  const requestedFeed = String(row.requested_feed ?? "").trim().toLowerCase();
+  const effectiveFeed = String(row.effective_feed ?? "").trim().toLowerCase();
+  const freshnessStatus = String(row.freshness_status ?? "").trim().toUpperCase();
+  const qualityStatus = String(row.data_quality_status ?? "").trim().toUpperCase();
+  const observedAt = Date.parse(String(row.observed_at ?? ""));
+  const maxAgeSeconds = positiveInteger(
+    process.env.MARKET_OBSERVATORY_MAX_AGE_SECONDS,
+    1200
+  );
+  if (
+    requestedFeed !== "sip" ||
+    effectiveFeed !== "sip" ||
+    freshnessStatus !== "FRESH" ||
+    qualityStatus !== "COMPLETE" ||
+    !Number.isFinite(observedAt) ||
+    Date.now() - observedAt > maxAgeSeconds * 1000
+  ) {
+    return null;
+  }
   return {
     observatoryObservedAt: row.observed_at,
     observatorySourceTimestamp: row.source_timestamp,

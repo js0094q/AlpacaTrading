@@ -814,6 +814,58 @@ describe("Target generation and learning influence", () => {
     assert.equal(secondRun.generated, 1);
     assert.ok(secondConfidence > firstConfidence);
   });
+
+  test("uses lifecycle-qualified symbols and excludes orphan feature rows", async () => {
+    await seedInitialUniverse();
+    const timestamp = ts(0);
+    getDb()
+      .prepare(
+        `
+        INSERT INTO universe_symbols(
+          symbol, asset_class, enabled, source, tradable, asset_status,
+          lifecycle_state, lifecycle_reason_code, created_at, updated_at
+        ) VALUES (?, 'stock', 0, 'alpaca_universe_lifecycle', 1, 'active', ?, ?, ?, ?)
+        `
+      )
+      .run(
+        "DISC",
+        "observe_only",
+        "ASSET_METADATA_ACCEPTED",
+        timestamp,
+        timestamp
+      );
+    insertFeature("DISC", timestamp, {
+      close: 120,
+      trend: "bullish",
+      atr14: 2,
+      rsi14: 72,
+      ema9: 118,
+      ema21: 114,
+      macdHistogram: 0.45,
+      relativeVolume: 1.2,
+      optionsNearestExpiration: null
+    });
+    insertFeature("ORPHAN", timestamp, {
+      close: 120,
+      trend: "bullish",
+      atr14: 2,
+      rsi14: 72,
+      ema9: 118,
+      ema21: 114,
+      macdHistogram: 0.45,
+      relativeVolume: 1.2,
+      optionsNearestExpiration: null
+    });
+
+    const output = await generateTargets({ riskProfile: "aggressive" });
+    const rows = getDb()
+      .prepare("SELECT symbol, rationale FROM target_snapshots")
+      .all() as Array<{ symbol: string; rationale: string }>;
+
+    assert.equal(output.generated, 1);
+    assert.deepEqual(rows.map((row) => row.symbol), ["DISC"]);
+    assert.match(rows[0]?.rationale ?? "", /universe_entry_reason=new_discovery/);
+  });
 });
 
 describe("Alpaca provider pagination", () => {

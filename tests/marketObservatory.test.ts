@@ -404,10 +404,10 @@ describe("market observatory stock snapshots", () => {
       ) VALUES (?, ?, ?, ?, ?, '[]', '[]', ?, 'FRESH', 'COMPLETE', 'alpaca')
     `).run(
       "AAPL",
-      "2026-07-13T16:45:00.000Z",
-      "2026-07-13T16:44:50.000Z",
-      "iex",
-      "iex",
+      new Date().toISOString(),
+      new Date().toISOString(),
+      "sip",
+      "sip",
       100.1
     );
     observatory.close();
@@ -437,6 +437,20 @@ describe("market observatory stock snapshots", () => {
       }
     }
   });
+
+  test("does not enrich features from a non-SIP observation", () => {
+    persistStockSnapshot(normalizeStockSnapshot({
+      symbol: "AAPL",
+      raw: completeSnapshot,
+      observedAt: new Date().toISOString(),
+      requestedFeed: "iex",
+      effectiveFeed: "iex",
+      currency: "USD",
+      now: new Date("2026-07-13T16:45:00.000Z")
+    }));
+
+    assert.equal(getLatestStockObservationFeatures("AAPL"), null);
+  });
 });
 
 describe("market observatory research traceability", () => {
@@ -447,12 +461,13 @@ describe("market observatory research traceability", () => {
     `);
     insertBar.run("AAPL", "2026-07-10T04:00:00.000Z", 96, 99, 95, 97, 200_000);
     insertBar.run("AAPL", "2026-07-13T04:00:00.000Z", 98, 101, 97.5, 100, 100_000);
+    const observedAt = new Date().toISOString();
     persistStockSnapshot(normalizeStockSnapshot({
       symbol: "AAPL",
       raw: completeSnapshot,
-      observedAt: "2026-07-13T16:45:00.000Z",
-      requestedFeed: "iex",
-      effectiveFeed: "iex",
+      observedAt,
+      requestedFeed: "sip",
+      effectiveFeed: "sip",
       currency: "USD",
       now: new Date("2026-07-13T16:45:00.000Z")
     }));
@@ -466,8 +481,8 @@ describe("market observatory research traceability", () => {
     const latest = JSON.parse(rows[1]?.features ?? "{}") as Record<string, unknown>;
     assert.equal(rows.length, 2);
     assert.equal(earlier.observatoryObservedAt, undefined);
-    assert.equal(latest.observatoryObservedAt, "2026-07-13T16:45:00.000Z");
-    assert.equal(latest.observatoryEffectiveFeed, "iex");
+    assert.equal(latest.observatoryObservedAt, observedAt);
+    assert.equal(latest.observatoryEffectiveFeed, "sip");
     assert.ok(Math.abs(Number(latest.observatorySpread) - 0.2) < 1e-10);
     assert.equal(latest.observatoryDataQualityStatus, "COMPLETE");
     assert.equal(latest.observatoryFreshnessStatus, "FRESH");

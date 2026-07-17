@@ -49,7 +49,7 @@ const DEFAULTS = {
   maxCandidates: 5,
   maxNewPositions: 3,
   maxPositionNotional: 100,
-  maxTotalPlanNotional: 300,
+  maxTotalPlanNotional: 30_000,
   minBuyingPowerReservePct: 20,
   maxPlanAgeMinutes: 30,
   maxBuyingPowerUsePct: 50,

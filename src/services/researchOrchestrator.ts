@@ -6,8 +6,8 @@ import {
 } from "./alpacaAssetService.js";
 import { config } from "../config.js";
 import {
-  getActiveSymbols,
-  getActiveUniverse,
+  getObservableSymbols,
+  getObservableUniverse,
   seedInitialUniverse
 } from "./universeService.js";
 import { ingestBars } from "./marketDataIngest.js";
@@ -310,8 +310,9 @@ export const runResearchDaily = async (
       getAlpacaPaperCredentials();
     }
     await seedInitialUniverse();
-    universeSize = getActiveUniverse().length;
-    symbols = getActiveSymbols();
+    const researchUniverse = getObservableUniverse();
+    universeSize = researchUniverse.length;
+    symbols = getObservableSymbols();
     await assertResearchRunLease(
       runId,
       await researchControlPlaneService.updateUniverseSize(runId, universeSize)
@@ -348,7 +349,7 @@ export const runResearchDaily = async (
     await runLearning();
     await assertResearchRunLease(runId);
 
-    targets = parseTargetRows(await generateTargets({ riskProfile }));
+    targets = parseTargetRows(await generateTargets({ riskProfile, universe: researchUniverse }));
     await assertResearchRunLease(runId);
 
     const filteredTargets = await buildAlpacaFilteredTargets(targets, useAlpacaAssets);

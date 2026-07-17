@@ -278,18 +278,32 @@ const featureRow = (symbol: string, timestamp: string, values: Record<string, nu
   features: values
 });
 
-export const getLatestFeatures = () =>
-  queryAll<Record<string, unknown>>(
+export const getLatestFeatures = (symbols?: string[]) => {
+  const normalizedSymbols = symbols?.map(normalizeSymbol).filter(Boolean) ?? [];
+  const filter = symbols === undefined
+    ? { sql: "", params: [] as string[] }
+    : normalizedSymbols.length
+      ? {
+          sql: `WHERE symbol IN (${normalizedSymbols.map(() => "?").join(", ")})`,
+          params: normalizedSymbols
+        }
+      : { sql: "WHERE 1 = 0", params: [] as string[] };
+
+  return queryAll<Record<string, unknown>>(
     `
-    SELECT f.symbol, f.timestamp, f.features
-    FROM feature_snapshots f
-    INNER JOIN (
+    WITH latest AS (
       SELECT symbol, MAX(timestamp) AS timestamp
       FROM feature_snapshots
+      ${filter.sql}
       GROUP BY symbol
-    ) x ON f.symbol = x.symbol AND f.timestamp = x.timestamp
-    `
+    )
+    SELECT f.symbol, f.timestamp, f.features
+    FROM feature_snapshots f
+    INNER JOIN latest x ON f.symbol = x.symbol AND f.timestamp = x.timestamp
+    `,
+    filter.params
   ).map(parseFeatureRow);
+};
 
 const collectBars = (
   symbol: string,

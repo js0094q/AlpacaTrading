@@ -305,7 +305,7 @@ const DEFAULTS = {
   maxCandidates: 5,
   maxNewPositions: 3,
   maxPositionNotional: 5000,
-  maxTotalPlanNotional: 50000,
+  maxTotalPlanNotional: 30_000,
   minBuyingPowerReservePct: 20,
   equityNotionalPerOrder: 1000,
   equityMaxNotionalPerOrder: 5000,

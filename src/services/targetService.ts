@@ -1,8 +1,11 @@
 import { getDb, queryAll, queryOne, getDb as rawDb } from "../lib/db.js";
 import { getLatestFeatures } from "./featureService.js";
 import { selectExpression } from "./strategySelector.js";
-import type { RiskProfile, TargetSnapshotRow } from "../types.js";
-import { seedInitialUniverse } from "./universeService.js";
+import type { RiskProfile, TargetSnapshotRow, UniverseSymbolRow } from "../types.js";
+import {
+  getObservableUniverse,
+  seedInitialUniverse
+} from "./universeService.js";
 import { nowIso } from "../lib/utils.js";
 
 interface LearningSummary {
@@ -66,9 +69,12 @@ const parseFeature = (features: Record<string, string | number | null>) => {
 export const generateTargets = async (input?: {
   riskProfile?: RiskProfile;
   optionsOnly?: boolean;
+  universe?: UniverseSymbolRow[];
 }) => {
   await seedInitialUniverse();
-  const features = getLatestFeatures();
+  const universe = input?.universe ?? getObservableUniverse();
+  const universeBySymbol = new Map(universe.map((row) => [row.symbol, row]));
+  const features = getLatestFeatures(universe.map((row) => row.symbol));
   const learning = latestLearning();
   const learningBoost = clamp01((learning?.accuracy ?? 0.5) - 0.5) || 0;
   const insert = rawDb().prepare(`
@@ -148,8 +154,16 @@ export const generateTargets = async (input?: {
       continue;
     }
 
+    const universeRow = universeBySymbol.get(snapshot.symbol);
+    const universeEntryReason =
+      universeRow?.lifecycleState === "observe_only"
+        ? universeRow.lifecycleReasonCode === "ASSET_METADATA_ACCEPTED"
+          ? "new_discovery"
+          : "universe_expansion"
+        : "active_universe";
     const rationale = [
       ...selector.rationale,
+      `universe_entry_reason=${universeEntryReason}`,
       `Risk profile set to ${riskProfile}`,
       `Learning boost from ${learning?.modelName ?? "no model"}`
     ];

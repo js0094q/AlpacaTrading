@@ -259,7 +259,7 @@ export const loadPaperSubmitSafetyConfig = (
       ),
     maxTotalPlanNotional:
       plan?.maxTotalPlanNotional ??
-      positive(env.PAPER_PLAN_MAX_TOTAL_PLAN_NOTIONAL, 50_000),
+      positive(env.PAPER_PLAN_MAX_TOTAL_PLAN_NOTIONAL, 30_000),
     equityMaxNotionalPerOrder:
       plan?.equityMaxNotionalPerOrder ??
       positive(env.PAPER_EQUITY_MAX_NOTIONAL_PER_ORDER, 5_000),

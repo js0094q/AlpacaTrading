@@ -363,6 +363,7 @@ const reviewWithPlan = async (
 
 beforeEach(() => {
   resetDatabase();
+  delete process.env.PAPER_PLAN_MAX_TOTAL_PLAN_NOTIONAL;
   setMockFetch(createMockFetcher());
 });
 
@@ -375,6 +376,40 @@ after(() => {
 });
 
 describe("paper review service", () => {
+  test("uses the authorized 30000 aggregate plan limit by default", async () => {
+    let requestedLimit: number | undefined;
+    const report = await buildPaperReviewReport(
+      {},
+      {
+        buildPlan: async (input) => {
+          requestedLimit = input.maxTotalPlanNotional;
+          const base = mockPlanReport();
+          return {
+            ...base,
+            config: {
+              ...base.config,
+              maxTotalPlanNotional: input.maxTotalPlanNotional
+            },
+            account: {
+              ...base.account,
+              buyingPower: 100_000,
+              deployableBuyingPower: 100_000
+            },
+            summary: {
+              ...base.summary,
+              estimatedTotalNotional: 3_184,
+              remainingDeployableBuyingPower: 100_000
+            }
+          };
+        }
+      }
+    );
+
+    assert.equal(requestedLimit, 30_000);
+    assert.equal(report.config.maxTotalPlanNotional, 30_000);
+    assert.equal(report.review.blockers.includes("MAX_TOTAL_PLAN_NOTIONAL_EXCEEDED"), false);
+  });
+
   test("returns ready status for safe planned candidates", async () => {
     const report = await reviewWithPlan();
     assert.equal(report.review.status, "ready_for_dry_run_execution");

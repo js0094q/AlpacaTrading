@@ -58,7 +58,7 @@ const state = (
     paperOrderExecutionEnabled: true,
     paperOptionsExecutionEnabled: true,
     maxPositionNotional: 5_000,
-    maxTotalPlanNotional: 50_000,
+    maxTotalPlanNotional: 30_000,
     equityMaxNotionalPerOrder: 5_000,
     equityMaxPortfolioDeployPct: 50,
     equityMaxPositionPct: 10,
@@ -460,7 +460,7 @@ describe("paper submit state validation", () => {
     });
 
     assert.equal(config.maxPositionNotional, 5_000);
-    assert.equal(config.maxTotalPlanNotional, 50_000);
+    assert.equal(config.maxTotalPlanNotional, 30_000);
     assert.equal(config.equityMaxNotionalPerOrder, 5_000);
     assert.equal(config.equityMaxPortfolioDeployPct, 50);
     assert.equal(config.equityMaxPositionPct, 10);
