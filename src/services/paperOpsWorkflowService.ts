@@ -148,7 +148,7 @@ export const runPaperOpsReview = async (
     });
     const { sections, dryRun } = await sectionsFromReports(portfolioReview, deps);
     const submitState = await (deps.captureSubmitState ?? capturePaperSubmitState)({
-      capturedAt: generatedAt,
+      capturedAt: new Date().toISOString(),
       payloadSections: sections
     });
     const entrySections = ENTRY_SECTIONS.filter(

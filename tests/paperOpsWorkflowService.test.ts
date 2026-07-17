@@ -274,6 +274,24 @@ describe("paper ops workflows", () => {
     );
   });
 
+  test("captures submit state at the current evidence boundary", async () => {
+    const workflowStartedAt = "2026-07-10T14:00:00.000Z";
+    let submitCapturedAt = "";
+    await runPaperOpsReview({}, {
+      buildDryRun: dryRun as any,
+      buildPortfolioReview: portfolioReview as any,
+      buildHedgeReview: hedgeReview as any,
+      captureSubmitState: async (input) => {
+        submitCapturedAt = input.capturedAt;
+        return captureSubmitState() as any;
+      },
+      now: () => workflowStartedAt
+    });
+
+    assert.notEqual(submitCapturedAt, workflowStartedAt);
+    assert.ok(Date.parse(submitCapturedAt) >= Date.parse(workflowStartedAt));
+  });
+
   test("morning workflow evaluates and governs learning before research", async () => {
     const calls: string[] = [];
     const report = await runPaperOpsMorning({}, {
