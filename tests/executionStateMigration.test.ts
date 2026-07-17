@@ -131,11 +131,58 @@ test("production-shaped blocked evidence and detached legacy decisions remain mi
     assert.deepEqual(snapshot.sourceIssues, []);
     assert.equal(snapshot.rows.get("accounts")?.length, 1);
     assert.equal(snapshot.rows.get("account_snapshots")?.length, 1);
-    assert.equal(snapshot.rows.get("order_intents")?.length, 2);
+    assert.equal(snapshot.rows.get("order_intents")?.length, 1);
     assert.ok(snapshot.rows.get("order_intents")?.every((row) => row.candidate_id === null));
     assert.equal(snapshot.rows.get("orders")?.length, 1);
     assert.equal(snapshot.rows.get("orders")?.[0]?.status, "filled");
     assert.equal(snapshot.rows.get("broker_events")?.length, 2);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("historical retries share one idempotent intent while preserving broker history", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "execution-state-idempotent-retry-"));
+  const path = join(directory, "source.db");
+  try {
+    createExecutionStateSnapshotFixture(path);
+    const database = new DatabaseSync(path);
+    const source = database.prepare(
+      "SELECT * FROM paper_execution_ledger WHERE id = 1"
+    ).get() as Record<string, unknown>;
+    const response = JSON.parse(String(source.raw_response_json));
+    response.id = "broker-order-retry";
+    response.client_order_id = "client-order-retry";
+    response.status = "filled";
+    const retry = {
+      ...source,
+      id: 2,
+      updated_at: "2026-07-16T16:10:00.000Z",
+      client_order_id: "client-order-retry",
+      alpaca_order_id: "broker-order-retry",
+      alpaca_status: "filled",
+      max_risk: Number(source.max_risk) + 1,
+      status: "filled",
+      raw_response_json: JSON.stringify(response)
+    };
+    const columns = Object.keys(retry);
+    database.prepare(`
+      INSERT INTO paper_execution_ledger(${columns.join(", ")})
+      VALUES (${columns.map(() => "?").join(", ")})
+    `).run(...Object.values(retry));
+    database.close();
+
+    const snapshot = await readExecutionStateSnapshot(path);
+    assert.deepEqual(snapshot.sourceIssues, []);
+    assert.equal(snapshot.rows.get("buying_power_reservations")?.length, 1);
+    assert.equal(snapshot.rows.get("order_intents")?.length, 1);
+    assert.equal(snapshot.rows.get("orders")?.length, 2);
+    assert.equal(snapshot.rows.get("broker_events")?.length, 2);
+    const intentId = snapshot.rows.get("order_intents")?.[0]?.id;
+    assert.ok(snapshot.rows.get("orders")?.every((row) => row.order_intent_id === intentId));
+    assert.ok(snapshot.rows.get("broker_events")?.every(
+      (row) => row.order_intent_id === intentId
+    ));
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
