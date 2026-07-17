@@ -22,7 +22,8 @@ import type { PaperSubmitStateAttestation } from "./paperSubmitStateService.js";
 import type { ZeroDteSubmitAttestation } from "./zeroDte/zeroDteSubmitAttestationService.js";
 import {
   asDecisionId,
-  asPositionLifecycleId
+  asPositionLifecycleId,
+  isDecisionId
 } from "./marketDecisionIdentityService.js";
 import {
   mapHedgeReviewToExecutionEvidence,
@@ -371,46 +372,96 @@ const hashFile = (path: string): Promise<string> =>
     stream.on("end", () => resolve(hash.digest("hex")));
   });
 
-const mapLedgerRow = (row: SqliteRow): PaperExecutionLedgerEntry => ({
-  id: Number(row.id),
-  createdAt: timestamp(row.created_at, "EXECUTION_LEDGER_CREATED_AT_INVALID"),
-  updatedAt: timestamp(row.updated_at, "EXECUTION_LEDGER_UPDATED_AT_INVALID"),
-  mode: stringValue(row.mode, "EXECUTION_LEDGER_MODE_REQUIRED"),
-  assetClass: stringValue(row.asset_class, "EXECUTION_LEDGER_ASSET_CLASS_REQUIRED"),
-  symbol: stringValue(row.symbol, "EXECUTION_LEDGER_SYMBOL_REQUIRED"),
-  underlyingSymbol: nullableString(row.underlying_symbol),
-  strategy: nullableString(row.strategy),
-  side: nullableString(row.side),
-  orderType: nullableString(row.order_type),
-  timeInForce: nullableString(row.time_in_force),
-  qty: nullableString(row.qty),
-  notional: nullableString(row.notional),
-  limitPrice: nullableString(row.limit_price),
-  estimatedPremium: numericValue(row.estimated_premium),
-  maxRisk: numericValue(row.max_risk),
-  dedupeKey: stringValue(row.dedupe_key, "EXECUTION_LEDGER_DEDUPE_REQUIRED"),
-  clientOrderId: stringValue(row.client_order_id, "EXECUTION_LEDGER_CLIENT_ORDER_REQUIRED"),
-  alpacaOrderId: nullableString(row.alpaca_order_id),
-  alpacaStatus: nullableString(row.alpaca_status),
-  requestId: nullableString(row.request_id),
-  sourcePlanId: nullableString(row.source_plan_id),
-  sourceCandidateId: nullableString(row.source_candidate_id),
-  decisionId: row.decision_id === null || row.decision_id === undefined
-    ? null
-    : asDecisionId(String(row.decision_id)),
-  positionLifecycleId: row.position_lifecycle_id === null || row.position_lifecycle_id === undefined
-    ? null
-    : asPositionLifecycleId(String(row.position_lifecycle_id)),
-  decisionLinkageStatus: (nullableString(row.decision_linkage_status) ??
-    (row.decision_id ? "EXACT" : "LEGACY_UNLINKED")) as PaperExecutionLedgerEntry["decisionLinkageStatus"],
-  status: stringValue(row.status, "EXECUTION_LEDGER_STATUS_REQUIRED") as PaperExecutionLedgerEntry["status"],
-  reason: nullableString(row.reason),
-  blockedReason: nullableString(row.blocked_reason),
-  errorMessage: nullableString(row.error_message),
-  payloadJson: stringValue(row.payload_json, "EXECUTION_LEDGER_PAYLOAD_REQUIRED"),
-  rawPayloadJson: nullableString(row.raw_payload_json),
-  rawResponseJson: nullableString(row.raw_response_json)
-});
+const migrationDecisionIdentity = (
+  row: SqliteRow,
+  knownDecisionIds: ReadonlySet<string>,
+  candidateIds: ReadonlySet<string>
+) => {
+  const rawDecisionId = nullableString(row.decision_id);
+  if (!rawDecisionId) {
+    return { decisionId: null, linkageStatus: "LEGACY_UNLINKED" as const };
+  }
+  if (isDecisionId(rawDecisionId)) {
+    return {
+      decisionId: asDecisionId(rawDecisionId),
+      linkageStatus: (nullableString(row.decision_linkage_status) ??
+        "EXACT") as PaperExecutionLedgerEntry["decisionLinkageStatus"]
+    };
+  }
+  const candidateId = nullableString(row.source_candidate_id);
+  if (
+    knownDecisionIds.has(rawDecisionId) ||
+    (candidateId && candidateIds.has(candidateId))
+  ) {
+    throw new Error("EXECUTION_LEDGER_DECISION_ID_INVALID");
+  }
+  return { decisionId: null, linkageStatus: "LEGACY_UNLINKED" as const };
+};
+
+const mapLedgerRow = (
+  row: SqliteRow,
+  knownDecisionIds: ReadonlySet<string>,
+  candidateIds: ReadonlySet<string>
+): PaperExecutionLedgerEntry => {
+  const decision = migrationDecisionIdentity(row, knownDecisionIds, candidateIds);
+  return {
+    id: Number(row.id),
+    createdAt: timestamp(row.created_at, "EXECUTION_LEDGER_CREATED_AT_INVALID"),
+    updatedAt: timestamp(row.updated_at, "EXECUTION_LEDGER_UPDATED_AT_INVALID"),
+    mode: stringValue(row.mode, "EXECUTION_LEDGER_MODE_REQUIRED"),
+    assetClass: stringValue(row.asset_class, "EXECUTION_LEDGER_ASSET_CLASS_REQUIRED"),
+    symbol: stringValue(row.symbol, "EXECUTION_LEDGER_SYMBOL_REQUIRED"),
+    underlyingSymbol: nullableString(row.underlying_symbol),
+    strategy: nullableString(row.strategy),
+    side: nullableString(row.side),
+    orderType: nullableString(row.order_type),
+    timeInForce: nullableString(row.time_in_force),
+    qty: nullableString(row.qty),
+    notional: nullableString(row.notional),
+    limitPrice: nullableString(row.limit_price),
+    estimatedPremium: numericValue(row.estimated_premium),
+    maxRisk: numericValue(row.max_risk),
+    dedupeKey: stringValue(row.dedupe_key, "EXECUTION_LEDGER_DEDUPE_REQUIRED"),
+    clientOrderId: stringValue(
+      row.client_order_id,
+      "EXECUTION_LEDGER_CLIENT_ORDER_REQUIRED"
+    ),
+    alpacaOrderId: nullableString(row.alpaca_order_id),
+    alpacaStatus: nullableString(row.alpaca_status),
+    requestId: nullableString(row.request_id),
+    sourcePlanId: nullableString(row.source_plan_id),
+    sourceCandidateId: nullableString(row.source_candidate_id),
+    decisionId: decision.decisionId,
+    positionLifecycleId:
+      row.position_lifecycle_id === null || row.position_lifecycle_id === undefined
+        ? null
+        : asPositionLifecycleId(String(row.position_lifecycle_id)),
+    decisionLinkageStatus: decision.linkageStatus,
+    status: stringValue(
+      row.status,
+      "EXECUTION_LEDGER_STATUS_REQUIRED"
+    ) as PaperExecutionLedgerEntry["status"],
+    reason: nullableString(row.reason),
+    blockedReason: nullableString(row.blocked_reason),
+    errorMessage: nullableString(row.error_message),
+    payloadJson: stringValue(
+      row.payload_json,
+      "EXECUTION_LEDGER_PAYLOAD_REQUIRED"
+    ),
+    rawPayloadJson: nullableString(row.raw_payload_json),
+    rawResponseJson: nullableString(row.raw_response_json)
+  };
+};
+
+const historicalAccountProjection = (state: PaperSubmitStateAttestation) => {
+  const staleMarketEvidenceOnly =
+    !state.complete &&
+    state.blockers.length > 0 &&
+    state.blockers.every((blocker) => blocker === "SUBMIT_MARKET_EVIDENCE_STALE");
+  return mapPaperSubmitStateToExecutionProjection(
+    staleMarketEvidenceOnly ? { ...state, complete: true, blockers: [] } : state
+  );
+};
 
 const openReadOnlySnapshot = (path: string) => {
   const database = new DatabaseSync(path, { readOnly: true });
@@ -1022,22 +1073,23 @@ export const readExecutionStateSnapshot = async (
       }
     }
     const hedgeById = new Map(hedges.map((review) => [review.reviewId, review]));
+    const candidateIds = new Set(candidateRows.map((row) => String(row.id)));
+    const knownDecisionIds = new Set(decisionRows.map((row) => String(row.decision_id)));
     const ledgers: PaperExecutionLedgerEntry[] = [];
     for (const row of ledgerRows) {
       try {
-        ledgers.push(mapLedgerRow(row));
+        ledgers.push(mapLedgerRow(row, knownDecisionIds, candidateIds));
       } catch {
         sourceIssues.push("EXECUTION_LEDGER_MAPPING_INVALID");
       }
     }
-    const candidateIds = new Set(candidateRows.map((row) => String(row.id)));
 
     const projectionBySnapshot = new Map<string, ExecutionAccountProjection>();
     for (const artifact of artifacts) {
       const submitState = artifact.artifact.submitState;
       if (!submitState) continue;
       try {
-        const projection = mapPaperSubmitStateToExecutionProjection(
+        const projection = historicalAccountProjection(
           submitState as PaperSubmitStateAttestation
         );
         projectionBySnapshot.set(projection.accountSnapshotId, projection);

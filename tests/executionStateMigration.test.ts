@@ -10,6 +10,9 @@ import {
   readExecutionStateSnapshot,
   type ExecutionStateReconciliationResult
 } from "../src/services/executionStateMigrationService.js";
+import {
+  mapPaperSubmitStateToExecutionProjection
+} from "../src/services/executionStateProjectionService.js";
 import { createExecutionStateSnapshotFixture } from "./helpers/executionStateSnapshotFixture.js";
 
 test("execution-state snapshot projects every Release 4 domain with PostgreSQL scales", async () => {
@@ -49,6 +52,46 @@ test("invalid source numerics become a blocking aggregate source issue", async (
     const snapshot = await readExecutionStateSnapshot(path);
     assert.ok(snapshot.sourceIssues.includes("EXECUTION_INTENT_MAPPING_INVALID"));
     assert.equal(snapshot.rows.get("order_intents")?.length, 0);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("production-shaped blocked evidence and detached legacy decisions remain migration-safe", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "execution-state-production-source-"));
+  const path = join(directory, "source.db");
+  try {
+    createExecutionStateSnapshotFixture(path);
+    const database = new DatabaseSync(path);
+    const artifactRow = database.prepare(
+      "SELECT artifact_json FROM paper_review_artifacts LIMIT 1"
+    ).get() as { artifact_json: string };
+    const artifact = JSON.parse(artifactRow.artifact_json);
+    artifact.submitState.complete = false;
+    artifact.submitState.blockers = ["SUBMIT_MARKET_EVIDENCE_STALE"];
+    database.prepare(
+      "UPDATE paper_review_artifacts SET artifact_json = ?"
+    ).run(JSON.stringify(artifact));
+    database.exec(`
+      DELETE FROM decision_snapshots;
+      DELETE FROM paper_trade_candidates;
+      UPDATE paper_execution_ledger
+      SET decision_id = 'legacy-decision-without-source',
+          source_candidate_id = 'missing-candidate',
+          decision_linkage_status = 'EXACT';
+    `);
+    database.close();
+
+    assert.throws(
+      () => mapPaperSubmitStateToExecutionProjection(artifact.submitState),
+      /EXECUTION_ACCOUNT_EVIDENCE_INCOMPLETE/
+    );
+
+    const snapshot = await readExecutionStateSnapshot(path);
+    assert.deepEqual(snapshot.sourceIssues, []);
+    assert.equal(snapshot.rows.get("accounts")?.length, 1);
+    assert.equal(snapshot.rows.get("order_intents")?.length, 1);
+    assert.equal(snapshot.rows.get("order_intents")?.[0]?.candidate_id, null);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
