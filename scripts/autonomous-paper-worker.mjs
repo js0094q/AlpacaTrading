@@ -7,7 +7,7 @@ const DEFAULT_CYCLE_DELAY_MS = 30_000;
 
 const WORKSTREAMS = [
   ["research:daily", ["--riskProfile=aggressive", "--optionsEnabled=true", "--maxCandidates=10", "--assetClass=all", "--format=json"]],
-  ["paper:review", ["--format=json"]],
+  ["paper:review", ["--riskProfile=aggressive", "--optionsEnabled=true", "--maxCandidates=10", "--format=json"]],
   ["paper:portfolio:review", ["--format=json"]],
   ["paper:options:discover", ["--underlying=SPY", "--dte=0", "--format=json"]],
   ["paper:ops:review", ["--format=json"]],
