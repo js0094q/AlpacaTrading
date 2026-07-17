@@ -1084,7 +1084,7 @@ export const readExecutionStateSnapshot = async (
       }
     }
 
-    const projectionBySnapshot = new Map<string, ExecutionAccountProjection>();
+    const projectionByFingerprint = new Map<string, ExecutionAccountProjection>();
     for (const artifact of artifacts) {
       const submitState = artifact.artifact.submitState;
       if (!submitState) continue;
@@ -1092,12 +1092,16 @@ export const readExecutionStateSnapshot = async (
         const projection = historicalAccountProjection(
           submitState as PaperSubmitStateAttestation
         );
-        projectionBySnapshot.set(projection.accountSnapshotId, projection);
+        const key = `${projection.accountId}:${projection.snapshotFingerprint}`;
+        const prior = projectionByFingerprint.get(key);
+        if (!prior || prior.observedAt < projection.observedAt) {
+          projectionByFingerprint.set(key, projection);
+        }
       } catch {
         sourceIssues.push("EXECUTION_ACCOUNT_PROJECTION_INVALID");
       }
     }
-    const projections = [...projectionBySnapshot.values()]
+    const projections = [...projectionByFingerprint.values()]
       .sort((left, right) => left.observedAt.localeCompare(right.observedAt));
     const accountIds = new Set(projections.map((projection) => projection.accountId));
     if (accountIds.size > 1) sourceIssues.push("EXECUTION_MULTIPLE_ACCOUNT_IDENTITIES");

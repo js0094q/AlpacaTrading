@@ -72,6 +72,26 @@ test("production-shaped blocked evidence and detached legacy decisions remain mi
     database.prepare(
       "UPDATE paper_review_artifacts SET artifact_json = ?"
     ).run(JSON.stringify(artifact));
+    const repeatedArtifact = structuredClone(artifact);
+    repeatedArtifact.id = "review-release-4-repeated-snapshot";
+    repeatedArtifact.createdAt = "2026-07-16T16:01:00.000Z";
+    repeatedArtifact.expiresAt = "2026-07-16T17:01:00.000Z";
+    repeatedArtifact.submitState.capturedAt = repeatedArtifact.createdAt;
+    database.prepare(`
+      INSERT INTO paper_review_artifacts(
+        id, created_at, expires_at, source_action, status,
+        payload_signature, payload_count, artifact_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      repeatedArtifact.id,
+      repeatedArtifact.createdAt,
+      repeatedArtifact.expiresAt,
+      repeatedArtifact.sourceAction,
+      repeatedArtifact.status,
+      repeatedArtifact.payloadSignature,
+      1,
+      JSON.stringify(repeatedArtifact)
+    );
     database.exec(`
       DELETE FROM decision_snapshots;
       DELETE FROM paper_trade_candidates;
@@ -110,6 +130,7 @@ test("production-shaped blocked evidence and detached legacy decisions remain mi
     const snapshot = await readExecutionStateSnapshot(path);
     assert.deepEqual(snapshot.sourceIssues, []);
     assert.equal(snapshot.rows.get("accounts")?.length, 1);
+    assert.equal(snapshot.rows.get("account_snapshots")?.length, 1);
     assert.equal(snapshot.rows.get("order_intents")?.length, 2);
     assert.ok(snapshot.rows.get("order_intents")?.every((row) => row.candidate_id === null));
     assert.equal(snapshot.rows.get("orders")?.length, 1);
