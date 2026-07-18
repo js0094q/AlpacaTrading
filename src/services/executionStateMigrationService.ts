@@ -92,6 +92,108 @@ interface TableSpec {
   readonly accountColumn?: string;
 }
 
+interface UniqueIdentitySpec {
+  readonly columns: readonly string[];
+  readonly mutableColumns: readonly string[];
+}
+
+interface ForeignKeyAlias {
+  readonly column: string;
+  readonly parentTable: string;
+}
+
+export interface ExecutionStateIdentityReuse {
+  readonly table: string;
+  readonly sourceId: string;
+  readonly targetId: string;
+  readonly identityColumns: readonly string[];
+  readonly mutableDifferences: readonly string[];
+}
+
+const uniqueIdentitySpecs: Readonly<Record<string, UniqueIdentitySpec>> = {
+  account_snapshots: {
+    columns: ["account_id", "snapshot_fingerprint"],
+    mutableColumns: ["observed_at", "created_at"]
+  },
+  buying_power_reservations: {
+    columns: ["account_id", "idempotency_key"],
+    mutableColumns: [
+      "status", "scheduler_job_name", "scheduler_fencing_token", "committed_at",
+      "released_at", "release_reason", "version", "updated_at"
+    ]
+  },
+  order_intents: {
+    columns: ["account_id", "idempotency_key"],
+    mutableColumns: [
+      "status", "ready_at", "submitted_at", "terminal_at", "version", "updated_at"
+    ]
+  }
+};
+
+const mutableStateColumnsByTable: Readonly<Record<string, readonly string[]>> = {
+  accounts: ["status", "version", "updated_at"],
+  account_snapshots: ["observed_at", "created_at"],
+  risk_limits: [
+    "status", "cash_reserve_amount", "cash_reserve_ratio", "max_deployment_amount",
+    "max_deployment_ratio", "max_gross_exposure", "max_net_exposure",
+    "max_open_order_exposure", "max_position_notional", "max_symbol_notional",
+    "max_position_count", "max_order_count", "config_version", "config_fingerprint",
+    "effective_from", "effective_to", "version", "updated_at"
+  ],
+  strategy_allocations: [
+    "status", "allocation_amount", "allocation_ratio", "reserved_amount",
+    "deployed_amount", "config_version", "config_fingerprint", "effective_from",
+    "effective_to", "version", "updated_at"
+  ],
+  portfolio_exposure: [
+    "gross_exposure", "net_exposure", "long_exposure", "short_exposure",
+    "open_order_exposure", "active_reservation_amount", "deployed_amount",
+    "cash_reserve_amount", "available_buying_power", "position_count",
+    "open_order_count", "observed_at"
+  ],
+  execution_reviews: ["status", "consumed_at", "version", "updated_at"],
+  confirmation_evidence: ["status", "consumed_at", "revoked_at", "version", "updated_at"],
+  buying_power_reservations: uniqueIdentitySpecs.buying_power_reservations.mutableColumns,
+  order_intents: uniqueIdentitySpecs.order_intents.mutableColumns,
+  orders: [
+    "status", "filled_quantity", "filled_average_price", "accepted_at", "filled_at",
+    "cancelled_at", "expired_at", "last_broker_update_at", "raw_status", "version",
+    "updated_at"
+  ],
+  positions: [
+    "status", "quantity", "available_quantity", "current_price", "market_value",
+    "unrealized_pnl", "realized_pnl", "closed_at", "last_reconciled_at", "version",
+    "updated_at"
+  ]
+};
+
+const foreignKeyAliases: Readonly<Record<string, readonly ForeignKeyAlias[]>> = {
+  portfolio_exposure: [
+    { column: "account_snapshot_id", parentTable: "account_snapshots" }
+  ],
+  buying_power_reservations: [
+    { column: "account_snapshot_id", parentTable: "account_snapshots" }
+  ],
+  order_intents: [
+    { column: "reservation_id", parentTable: "buying_power_reservations" }
+  ],
+  orders: [
+    { column: "order_intent_id", parentTable: "order_intents" }
+  ],
+  positions: [
+    { column: "opening_order_id", parentTable: "orders" },
+    { column: "closing_order_id", parentTable: "orders" },
+    { column: "source_account_snapshot_id", parentTable: "account_snapshots" }
+  ],
+  broker_events: [
+    { column: "order_id", parentTable: "orders" },
+    { column: "order_intent_id", parentTable: "order_intents" }
+  ],
+  lifecycle_fingerprints: [
+    { column: "order_intent_id", parentTable: "order_intents" }
+  ]
+};
+
 type NumericDefinition = Readonly<{ precision: number; scale: number }>;
 
 const money = { precision: 28, scale: 8 } as const;
@@ -553,6 +655,77 @@ const normalizeJsonColumn = (row: TargetRow, spec: TableSpec) => {
           )
         : row[column] ?? null
   ]));
+};
+
+const comparableValue = (spec: TableSpec, column: string, value: unknown) => {
+  if (value === null || value === undefined) return null;
+  if (spec.jsonColumns?.includes(column)) return canonicalJsonHash(parseJson(value) ?? null);
+  const numeric = numericColumnsByTable[spec.table]?.[column];
+  if (numeric) {
+    return canonicalizePostgresNumeric(
+      value as number | string,
+      numeric.precision,
+      numeric.scale
+    );
+  }
+  if (value instanceof Date) return value.toISOString();
+  if (column.endsWith("_at") || column === "effective_from" || column === "effective_to") {
+    const parsed = Date.parse(String(value));
+    if (Number.isFinite(parsed)) return new Date(parsed).toISOString();
+  }
+  return value;
+};
+
+const rowDifferences = (
+  spec: TableSpec,
+  expected: TargetRow,
+  actual: TargetRow,
+  excludedColumns: ReadonlySet<string> = new Set()
+) => {
+  const mutableColumns = new Set(mutableStateColumnsByTable[spec.table] ?? []);
+  const material: string[] = [];
+  const mutable: string[] = [];
+  for (const column of spec.columns) {
+    if (excludedColumns.has(column)) continue;
+    if (
+      comparableValue(spec, column, expected[column]) ===
+      comparableValue(spec, column, actual[column])
+    ) continue;
+    if (mutableColumns.has(column)) mutable.push(column);
+    else material.push(column);
+  }
+  return { material, mutable };
+};
+
+type ExecutionStateIdAliases = Map<string, Map<string, string>>;
+
+const resolveAliasedRow = (
+  spec: TableSpec,
+  row: TargetRow,
+  aliases: ExecutionStateIdAliases
+) => {
+  const resolved = { ...row };
+  for (const alias of foreignKeyAliases[spec.table] ?? []) {
+    const sourceId = row[alias.column];
+    if (sourceId === null || sourceId === undefined) continue;
+    const targetId = aliases.get(alias.parentTable)?.get(String(sourceId));
+    if (targetId) resolved[alias.column] = targetId;
+  }
+  return resolved;
+};
+
+const recordAlias = (
+  aliases: ExecutionStateIdAliases,
+  table: string,
+  sourceId: unknown,
+  targetId: unknown
+) => {
+  if (sourceId === null || sourceId === undefined || targetId === null || targetId === undefined) {
+    return;
+  }
+  const tableAliases = aliases.get(table) ?? new Map<string, string>();
+  tableAliases.set(String(sourceId), String(targetId));
+  aliases.set(table, tableAliases);
 };
 
 const evidenceRows = (input: ExecutionEvidenceInput, ledger: PaperExecutionLedgerEntry) => {
@@ -1330,31 +1503,100 @@ const parameter = (spec: TableSpec, column: string, index: number) =>
 const rowValues = (spec: TableSpec, row: TargetRow) =>
   spec.columns.map((column) => row[column] ?? null);
 
+interface InsertTargetRowResult {
+  readonly inserted: number;
+  readonly resolvedId: string;
+  readonly identityReuse: ExecutionStateIdentityReuse | null;
+}
+
+const selectTargetRow = async (
+  client: PoolClient,
+  spec: TableSpec,
+  where: string,
+  values: readonly unknown[]
+) => {
+  const result = await client.query<TargetRow>(
+    `SELECT ${spec.columns.join(", ")} FROM ${spec.table} WHERE ${where}`,
+    [...values]
+  );
+  return result.rows[0];
+};
+
 const insertTargetRow = async (
   client: PoolClient,
   spec: TableSpec,
-  row: TargetRow
-) => {
-  const values = rowValues(spec, row);
+  row: TargetRow,
+  aliases: ExecutionStateIdAliases
+): Promise<InsertTargetRowResult> => {
+  const resolvedRow = resolveAliasedRow(spec, row, aliases);
+  const values = rowValues(spec, resolvedRow);
+  const identity = uniqueIdentitySpecs[spec.table];
+  const conflictClause = identity ? "ON CONFLICT DO NOTHING" : `ON CONFLICT (${spec.key}) DO NOTHING`;
   const write = await client.query(
     `INSERT INTO ${spec.table}(${spec.columns.join(", ")})
      VALUES (${spec.columns.map((column, index) => parameter(spec, column, index + 1)).join(", ")})
-     ON CONFLICT (${spec.key}) DO NOTHING`,
+     ${conflictClause}`,
     values
   );
-  if ((write.rowCount ?? 0) === 1) return 1;
-  const replay = await client.query<{ matches: boolean }>(
-    `SELECT (${spec.columns.map((column, index) =>
-      `${column} IS NOT DISTINCT FROM ${parameter(spec, column, index + 1)}`
-    ).join(" AND ")}) AS matches
-     FROM ${spec.table}
-     WHERE ${spec.key} = $${spec.columns.length + 1}`,
-    [...values, row[spec.key]]
-  );
-  if (replay.rows[0]?.matches !== true) {
-    throw new Error(`EXECUTION_STATE_BACKFILL_CONFLICT:${spec.table}`);
+  const sourceId = String(row[spec.key]);
+  if ((write.rowCount ?? 0) === 1) {
+    recordAlias(aliases, spec.table, row[spec.key], resolvedRow[spec.key]);
+    return { inserted: 1, resolvedId: sourceId, identityReuse: null };
   }
-  return 0;
+
+  const primary = await selectTargetRow(
+    client,
+    spec,
+    `${spec.key} = $1`,
+    [resolvedRow[spec.key]]
+  );
+  if (primary) {
+    const differences = rowDifferences(spec, resolvedRow, primary);
+    if (differences.material.length > 0 || differences.mutable.length > 0) {
+      throw new Error(`EXECUTION_STATE_BACKFILL_CONFLICT:${spec.table}`);
+    }
+    recordAlias(aliases, spec.table, row[spec.key], primary[spec.key]);
+    return {
+      inserted: 0,
+      resolvedId: String(primary[spec.key]),
+      identityReuse: null
+    };
+  }
+
+  if (identity) {
+    const identityValues = identity.columns.map((column) => resolvedRow[column]);
+    const identityRow = await selectTargetRow(
+      client,
+      spec,
+      identity.columns.map((column, index) => `${column} = $${index + 1}`).join(" AND "),
+      identityValues
+    );
+    if (identityRow) {
+      const differences = rowDifferences(
+        spec,
+        resolvedRow,
+        identityRow,
+        new Set([spec.key])
+      );
+      if (differences.material.length > 0) {
+        throw new Error(`EXECUTION_STATE_BACKFILL_IDENTITY_CONFLICT:${spec.table}`);
+      }
+      recordAlias(aliases, spec.table, row[spec.key], identityRow[spec.key]);
+      return {
+        inserted: 0,
+        resolvedId: String(identityRow[spec.key]),
+        identityReuse: {
+          table: spec.table,
+          sourceId,
+          targetId: String(identityRow[spec.key]),
+          identityColumns: identity.columns,
+          mutableDifferences: differences.mutable
+        }
+      };
+    }
+  }
+
+  throw new Error(`EXECUTION_STATE_BACKFILL_CONFLICT:${spec.table}`);
 };
 
 const parseRecord = (value: unknown): Record<string, unknown> | null => {
@@ -1466,6 +1708,8 @@ export interface ExecutionStateBackfillResult {
   readonly checkpointMutationCount: number;
   readonly mutationCount: number;
   readonly idempotentReplay: boolean;
+  readonly identityReuses: readonly ExecutionStateIdentityReuse[];
+  readonly mutableStateDifferences: Readonly<Record<string, number>>;
 }
 
 export const backfillExecutionStateSnapshot = async (input: {
@@ -1493,6 +1737,9 @@ export const backfillExecutionStateSnapshot = async (input: {
     ].join(",")}`);
   }
   const insertedRows: Record<string, number> = {};
+  const identityReuses: ExecutionStateIdentityReuse[] = [];
+  const mutableStateDifferences: Record<string, number> = {};
+  const aliases: ExecutionStateIdAliases = new Map();
   let checkpointMutationCount = 0;
   let batchCount = 0;
   const client = await input.pool.connect();
@@ -1520,7 +1767,12 @@ export const backfillExecutionStateSnapshot = async (input: {
               `${MIGRATION_LOCK_KEY}:${spec.table}`
             ]);
             let inserted = 0;
-            for (const row of batch) inserted += await insertTargetRow(transaction, spec, row);
+            const batchIdentityReuses: ExecutionStateIdentityReuse[] = [];
+            for (const row of batch) {
+              const result = await insertTargetRow(transaction, spec, row, aliases);
+              inserted += result.inserted;
+              if (result.identityReuse) batchIdentityReuses.push(result.identityReuse);
+            }
             const checkpoint = await writeBatchCheckpoint({
               client: transaction,
               snapshotSha256: source.snapshotSha256,
@@ -1530,11 +1782,18 @@ export const backfillExecutionStateSnapshot = async (input: {
               tableRowCount: rows.length,
               observedAt
             });
-            return { inserted, checkpoint };
+            return { inserted, checkpoint, identityReuses: batchIdentityReuses };
           }
         );
         insertedRows[spec.table] += mutations.inserted;
         checkpointMutationCount += mutations.checkpoint;
+        identityReuses.push(...mutations.identityReuses);
+        for (const reuse of mutations.identityReuses) {
+          for (const column of reuse.mutableDifferences) {
+            const key = `${reuse.table}:${column}`;
+            mutableStateDifferences[key] = (mutableStateDifferences[key] ?? 0) + 1;
+          }
+        }
       }
     }
     if (await hashFile(input.snapshotPath) !== source.snapshotSha256) {
@@ -1565,7 +1824,9 @@ export const backfillExecutionStateSnapshot = async (input: {
     rowMutationCount,
     checkpointMutationCount,
     mutationCount,
-    idempotentReplay: mutationCount === 0
+    idempotentReplay: mutationCount === 0,
+    identityReuses,
+    mutableStateDifferences: sortedCounts(mutableStateDifferences)
   };
 };
 
@@ -1573,9 +1834,13 @@ export interface ExecutionTableComparison {
   readonly source: number;
   readonly target: number;
   readonly exact: number;
+  readonly identityEquivalent: number;
+  readonly mutableStateDifference: number;
   readonly missing: number;
   readonly mismatch: number;
   readonly unexpected: number;
+  readonly authorityOnly: number;
+  readonly mutableDifferences: Readonly<Record<string, number>>;
 }
 
 interface AggregateDiscrepancy {
@@ -1594,50 +1859,96 @@ const compareTargetTable = async (
   client: PoolClient,
   spec: TableSpec,
   expectedRows: readonly TargetRow[],
-  accountId: string | null
+  accountId: string | null,
+  observedAt: string,
+  aliases: ExecutionStateIdAliases
 ): Promise<ExecutionTableComparison> => {
   let exact = 0;
+  let identityEquivalent = 0;
+  let mutableStateDifference = 0;
   let missing = 0;
   let mismatch = 0;
-  let present = 0;
-  for (const row of expectedRows) {
-    const values = rowValues(spec, row);
-    const result = await client.query<{ matches: boolean }>(
-      `SELECT (${spec.columns.map((column, index) =>
-        `${column} IS NOT DISTINCT FROM ${parameter(spec, column, index + 1)}`
-      ).join(" AND ")}) AS matches
-       FROM ${spec.table}
-       WHERE ${spec.key} = $${spec.columns.length + 1}`,
-      [...values, row[spec.key]]
-    );
-    if (!result.rows[0]) {
-      missing += 1;
-      continue;
-    }
-    present += 1;
-    if (result.rows[0].matches) exact += 1;
-    else mismatch += 1;
-  }
+  const mutableDifferences: Record<string, number> = {};
+  const matchedTargetIds = new Set<string>();
+  const identity = uniqueIdentitySpecs[spec.table];
   const scope = spec.table === "accounts"
     ? accountId === null ? "" : " WHERE id = $1"
     : spec.accountColumn && accountId !== null
       ? ` WHERE ${spec.accountColumn} = $1`
       : "";
-  const count = await client.query<{ count: number | string }>(
-    `SELECT COUNT(*) AS count FROM ${spec.table}${scope}`,
+  const targetResult = await client.query<TargetRow>(
+    `SELECT ${spec.columns.join(", ")} FROM ${spec.table}${scope}`,
     scope ? [accountId] : []
   );
-  const target = countResult(
-    count.rows[0]?.count,
-    `EXECUTION_STATE_TARGET_COUNT_INVALID:${spec.table}`
-  );
+  const targetRows = targetResult.rows;
+  for (const row of expectedRows) {
+    const resolvedRow = resolveAliasedRow(spec, row, aliases);
+    let actual = targetRows.find((candidate) =>
+      comparableValue(spec, spec.key, candidate[spec.key]) ===
+      comparableValue(spec, spec.key, resolvedRow[spec.key])
+    );
+    let identityMatch = false;
+    if (!actual && identity) {
+      actual = targetRows.find((candidate) => identity.columns.every((column) =>
+        comparableValue(spec, column, candidate[column]) ===
+        comparableValue(spec, column, resolvedRow[column])
+      ));
+      if (actual) {
+        identityMatch = true;
+        recordAlias(aliases, spec.table, row[spec.key], actual[spec.key]);
+      }
+    }
+    if (!actual) {
+      missing += 1;
+      continue;
+    }
+    matchedTargetIds.add(String(actual[spec.key]));
+    const differences = rowDifferences(
+      spec,
+      resolvedRow,
+      actual,
+      identityMatch ? new Set([spec.key]) : new Set()
+    );
+    if (differences.material.length > 0) {
+      mismatch += 1;
+    } else if (differences.mutable.length > 0) {
+      mutableStateDifference += 1;
+      for (const column of differences.mutable) {
+        mutableDifferences[column] = (mutableDifferences[column] ?? 0) + 1;
+      }
+    } else if (identityMatch) {
+      identityEquivalent += 1;
+    } else {
+      exact += 1;
+    }
+  }
+  const observedAtMs = Date.parse(observedAt);
+  const authorityOnly = targetRows.filter((row) => {
+    if (matchedTargetIds.has(String(row[spec.key])) || accountId === null) return false;
+    const timestampColumns = [
+      "updated_at", "observed_at", "received_at", "occurred_at", "created_at",
+      "captured_at", "effective_from"
+    ];
+    return timestampColumns.some((column) => {
+      const value = row[column];
+      if (value === null || value === undefined) return false;
+      const parsed = Date.parse(String(value));
+      return Number.isFinite(parsed) && Number.isFinite(observedAtMs) && parsed > observedAtMs;
+    });
+  }).length;
+  const target = targetRows.length;
+  const unexplainedTargetRows = Math.max(0, target - matchedTargetIds.size - authorityOnly);
   return {
     source: expectedRows.length,
     target,
     exact,
+    identityEquivalent,
+    mutableStateDifference,
     missing,
     mismatch,
-    unexpected: Math.max(0, target - present)
+    unexpected: unexplainedTargetRows,
+    authorityOnly,
+    mutableDifferences: sortedCounts(mutableDifferences)
   };
 };
 
@@ -1873,6 +2184,8 @@ export interface ExecutionStateReconciliationResult {
   readonly sourceAggregates: Readonly<Record<string, unknown>>;
   readonly targetAggregates: Readonly<Record<string, unknown>>;
   readonly discrepancyCategories: Readonly<Record<string, number>>;
+  readonly classifiedStateDifferences: Readonly<Record<string, number>>;
+  readonly authorityOnlyRows: Readonly<Record<string, number>>;
   readonly discrepancyCount: number;
   readonly duplicateCount: number;
   readonly orphanCount: number;
@@ -1927,7 +2240,9 @@ export const assertDurableExecutionStateCheckpoint = (
     canonicalJsonHash(targetAggregates) !== canonicalJsonHash(expected.targetAggregates) ||
     !discrepancyReport ||
     canonicalJsonHash(discrepancyReport) !== canonicalJsonHash({
-      discrepancyCategories: expected.discrepancyCategories
+      discrepancyCategories: expected.discrepancyCategories,
+      classifiedStateDifferences: expected.classifiedStateDifferences,
+      authorityOnlyRows: expected.authorityOnlyRows
     }) ||
     completedAt !== expected.completedAt
   ) {
@@ -1972,12 +2287,15 @@ export const reconcileExecutionStateSnapshot = async (input: {
         await client.query("LOCK TABLE reconciliation_checkpoints IN SHARE ROW EXCLUSIVE MODE");
       }
       const tableComparisons: Record<string, ExecutionTableComparison> = {};
+      const aliases: ExecutionStateIdAliases = new Map();
       for (const spec of tableSpecs) {
         tableComparisons[spec.table] = await compareTargetTable(
           client,
           spec,
           source.rows.get(spec.table) ?? [],
-          source.accountId
+          source.accountId,
+          source.observedAt,
+          aliases
         );
       }
       const duplicateCounts = await runCountChecks(
@@ -2030,6 +2348,22 @@ export const reconcileExecutionStateSnapshot = async (input: {
       for (const [domain, count] of Object.entries(integrityCounts)) {
         if (count > 0) discrepancyRecords.push({ domain, type: "INVARIANT", count });
       }
+      const classifiedStateDifferences = sortedCounts(
+        Object.entries(tableComparisons).reduce<Record<string, number>>(
+          (counts, [table, comparison]) => {
+            for (const [column, count] of Object.entries(comparison.mutableDifferences)) {
+              counts[`${table}:${column}`] = count;
+            }
+            return counts;
+          },
+          {}
+        )
+      );
+      const authorityOnlyRows = sortedCounts(
+        Object.fromEntries(Object.entries(tableComparisons).map(
+          ([table, comparison]) => [table, comparison.authorityOnly]
+        ))
+      );
       const discrepancyCategories = sortedCounts(discrepancyRecords.reduce<Record<string, number>>(
         (counts, discrepancy) => {
           const key = `${discrepancy.domain}:${discrepancy.type}`;
@@ -2054,13 +2388,15 @@ export const reconcileExecutionStateSnapshot = async (input: {
       const sourceAggregates = {
         tables: sortedCounts(sourceTables),
         sourceIssues: sortedCounts(sourceIssueCounts),
-        sourceTableCounts: source.sourceCounts
+        sourceTableCounts: source.sourceCounts,
+        classifiedStateDifferences
       };
       const targetAggregates = {
         tables: sortedCounts(targetTables),
         duplicates: sortedCounts(duplicateCounts),
         orphans: sortedCounts(orphanCounts),
-        invariants: sortedCounts(integrityCounts)
+        invariants: sortedCounts(integrityCounts),
+        authorityOnlyRows
       };
       const duplicateCount = sumCounts(duplicateCounts);
       const orphanCount = sumCounts(orphanCounts);
@@ -2085,6 +2421,8 @@ export const reconcileExecutionStateSnapshot = async (input: {
         sourceAggregates,
         targetAggregates,
         discrepancyCategories,
+        classifiedStateDifferences,
+        authorityOnlyRows,
         discrepancyCount,
         duplicateCount,
         orphanCount,
@@ -2155,7 +2493,11 @@ export const reconcileExecutionStateSnapshot = async (input: {
           JSON.stringify(cursor),
           JSON.stringify(sourceAggregates),
           JSON.stringify(targetAggregates),
-          JSON.stringify({ discrepancyCategories }),
+          JSON.stringify({
+            discrepancyCategories,
+            classifiedStateDifferences,
+            authorityOnlyRows
+          }),
           lastEventOccurredAt,
           observedAt
         ]
