@@ -866,7 +866,7 @@ npm run dashboard:build
 npm run dashboard:start
 ```
 
-The dashboard shows paper account state, buying power, equity, cash, positions, latest research candidates, latest paper plan/review/dry-run payloads, confirmed submissions, execution ledger, blocked reasons, option candidates/contracts, request IDs, stale-data warnings, outcome analytics, and a clear `PAPER ONLY` environment state.
+The dashboard shows paper account state, buying power, equity, cash, positions, latest research candidates, latest paper plan/review/dry-run payloads, confirmed submissions, execution ledger, blocked reasons, option candidates/contracts, request IDs, stale-data warnings, outcome analytics, and a clear `PAPER ONLY` environment state. Options Runs displays the persisted decision-time option snapshot, including nullable Greeks and per-field decision-use metadata (`value`, `used`, `useType`, and `reason`) so used, retrieved-but-unused, unavailable, stale, and invalid values remain distinct.
 
 The `0DTE Level 2` panel adds the bounded live queue, active paper 0DTE positions, simulated shadow trades, lifecycle state, learning/outcome summary, blockers, and engine health. Its VPS and Vercel summary routes are read-only.
 

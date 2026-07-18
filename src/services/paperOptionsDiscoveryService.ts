@@ -1,5 +1,11 @@
 import { queryAll } from "../lib/db.js";
 import { getTradingSafetyState } from "./tradingSafetyService.js";
+import {
+  buildOptionDecisionSnapshot,
+  type OptionDecisionSnapshotEvidence,
+  type OptionEvidenceAvailability,
+  type OptionEvidenceDataQualityStatus
+} from "./optionDecisionEvidenceService.js";
 
 export interface PaperOptionsDiscoveryCandidate {
   underlyingSymbol: string;
@@ -17,6 +23,20 @@ export interface PaperOptionsDiscoveryCandidate {
   openInterest: number | null;
   impliedVolatility: number | null;
   delta: number | null;
+  gamma: number | null;
+  theta: number | null;
+  vega: number | null;
+  rho: number | null;
+  quoteTimestamp: string | null;
+  quoteAgeMs: number | null;
+  snapshotTimestamp: string | null;
+  source: string | null;
+  sourceFeed: string | null;
+  normalizationPath: string | null;
+  greekAvailability: OptionEvidenceAvailability;
+  dataQualityStatus: OptionEvidenceDataQualityStatus;
+  rejectionReasons: string[];
+  decisionSnapshot: OptionDecisionSnapshotEvidence;
   selected: boolean;
   reasonSelected: string | null;
   reasonSkipped: string | null;
@@ -62,6 +82,19 @@ interface OptionDiscoveryRow {
   open_interest: number | null;
   implied_volatility: number | null;
   delta: number | null;
+  gamma: number | null;
+  theta: number | null;
+  vega: number | null;
+  rho: number | null;
+  quote_timestamp: string | null;
+  quote_age_ms: number | null;
+  snapshot_timestamp: string | null;
+  source: string | null;
+  source_feed: string | null;
+  normalization_path: string | null;
+  spread_percentage: number | null;
+  timestamp: string | null;
+  multiplier: number | null;
 }
 
 const parseBoolean = (value: string | undefined, fallback = false) => {
@@ -112,7 +145,20 @@ const latestRowsForExpiration = (underlyings: string[], expirationDate: string) 
       s.volume,
       s.open_interest,
       s.implied_volatility,
-      s.delta
+      s.delta,
+      s.gamma,
+      s.theta,
+      s.vega,
+      s.rho,
+      s.quote_timestamp,
+      s.quote_age_ms,
+      s.snapshot_timestamp,
+      s.source,
+      s.source_feed,
+      s.normalization_path,
+      s.spread_percentage,
+      s.timestamp,
+      c.multiplier
     FROM option_contracts c
     LEFT JOIN option_snapshots s
       ON s.option_symbol = c.option_symbol
@@ -219,6 +265,85 @@ const candidateFromRow = (input: {
     hardSpreadCapEnabled: input.hardSpreadCapEnabled
   });
   const selected = input.selectedSymbolSet.has(input.row.option_symbol);
+  const rejectionReasons = skipped ? [skipped] : [];
+  const decisionSnapshot = buildOptionDecisionSnapshot({
+    contract: {
+      optionSymbol: input.row.option_symbol,
+      underlyingSymbol: input.row.underlying_symbol,
+      type: input.row.type,
+      expirationDate: input.row.expiration_date,
+      strike: input.row.strike,
+      multiplier: input.row.multiplier
+    },
+    snapshot: input.row.timestamp
+      ? {
+          optionSymbol: input.row.option_symbol,
+          underlyingSymbol: input.row.underlying_symbol,
+          timestamp: input.row.timestamp,
+          bid: input.row.bid,
+          ask: input.row.ask,
+          midpoint: input.row.midpoint,
+          last: null,
+          quoteStatus: input.row.quote_status,
+          executable: input.row.executable,
+          executablePrice: quoteMidpoint(input.row),
+          executablePriceSource: "midpoint",
+          rejectionReason: input.row.rejection_reason,
+          quoteTimestamp: input.row.quote_timestamp,
+          quoteAgeMs: input.row.quote_age_ms,
+          volume: input.row.volume,
+          openInterest: input.row.open_interest,
+          impliedVolatility: input.row.implied_volatility,
+          delta: input.row.delta,
+          gamma: input.row.gamma,
+          theta: input.row.theta,
+          vega: input.row.vega,
+          rho: input.row.rho,
+          snapshotTimestamp: input.row.snapshot_timestamp,
+          normalizationPath: input.row.normalization_path,
+          source: input.row.source,
+          sourceFeed: input.row.source_feed,
+          spreadPercentage: input.row.spread_percentage ?? currentSpread
+        }
+      : null,
+    decisionTimestamp: input.row.timestamp,
+    rejectionReasons,
+    decisionUseOverrides: {
+      underlyingPrice: {
+        useType: null,
+        reason: "Underlying price was not part of the paper 0DTE discovery decision"
+      },
+      bid: {
+        useType: "filter",
+        reason: "Used to reject missing quotes and enforce the spread threshold"
+      },
+      ask: {
+        useType: "filter",
+        reason: "Used to reject missing quotes, enforce the spread threshold, and enforce the premium cap"
+      },
+      midpoint: {
+        useType: "filter",
+        reason: "Used to calculate the discovery spread and executable reference price"
+      },
+      volume: {
+        useType: null,
+        reason: "Retrieved from the provider but not used by paper 0DTE discovery"
+      },
+      openInterest: {
+        useType: null,
+        reason: "Retrieved from the provider but not used by paper 0DTE discovery"
+      },
+      impliedVolatility: {
+        useType: null,
+        reason: "Retrieved from the provider but not used by paper 0DTE discovery"
+      },
+      spreadPercentage: {
+        useType: "filter",
+        reason: "Used to reject contracts above the configured spread threshold"
+      }
+    },
+    selectionBinding: "discovery_contract"
+  });
   return {
     underlyingSymbol: input.row.underlying_symbol,
     expirationDate: input.row.expiration_date,
@@ -235,6 +360,20 @@ const candidateFromRow = (input: {
     openInterest: input.row.open_interest,
     impliedVolatility: input.row.implied_volatility,
     delta: input.row.delta,
+    gamma: input.row.gamma,
+    theta: input.row.theta,
+    vega: input.row.vega,
+    rho: input.row.rho,
+    quoteTimestamp: input.row.quote_timestamp,
+    quoteAgeMs: input.row.quote_age_ms,
+    snapshotTimestamp: input.row.snapshot_timestamp,
+    source: input.row.source,
+    sourceFeed: input.row.source_feed,
+    normalizationPath: input.row.normalization_path,
+    greekAvailability: decisionSnapshot.availability.greeks,
+    dataQualityStatus: decisionSnapshot.dataQualityStatus,
+    rejectionReasons: decisionSnapshot.rejectionReasons,
+    decisionSnapshot,
     selected,
     reasonSelected: selected
       ? input.nextSessionPreparation

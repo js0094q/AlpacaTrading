@@ -18,7 +18,8 @@ import type {
   PreferredExpression,
   RiskProfile,
   TargetSnapshotRow,
-  TimeHorizon
+  TimeHorizon,
+  JsonValue
 } from "../types.js";
 
 type CandidateDirection = "long" | "short" | "neutral";
@@ -208,10 +209,36 @@ const getLatestFeatureSnapshot = (symbol: string, asOf: string) => {
     return {};
   }
   try {
-    return JSON.parse(row.features) as Record<string, string | number | null>;
+    return JSON.parse(row.features) as Record<string, JsonValue>;
   } catch {
     return {};
   }
+};
+
+const withOptionCandidateScore = (
+  features: Record<string, JsonValue>,
+  score: number
+): Record<string, JsonValue> => {
+  const rawEvidence = features.optionDecisionSnapshot;
+  if (!rawEvidence || typeof rawEvidence !== "object" || Array.isArray(rawEvidence)) {
+    return features;
+  }
+  const evidence = rawEvidence as { readonly [key: string]: JsonValue };
+  const rawDerived = evidence.derived;
+  const derived =
+    rawDerived && typeof rawDerived === "object" && !Array.isArray(rawDerived)
+      ? rawDerived as { readonly [key: string]: JsonValue }
+      : {};
+  return {
+    ...features,
+    optionDecisionSnapshot: {
+      ...evidence,
+      derived: {
+        ...derived,
+        candidateScore: score
+      }
+    }
+  };
 };
 
 const getOptionCandidate = (symbol: string, asOf: string): CandidateOptionsCandidate | null => {
@@ -447,7 +474,7 @@ export const rankResearchCandidates = (input: CandidateRankingInput): CandidateR
   const learning = parseLearningSummary();
   const backtest = parseBacktestPerformance();
   const learningGovernance = getCurrentPaperLearningGovernance();
-  const signalInputsByCandidate = new Map<string, Record<string, string | number | null>>();
+  const signalInputsByCandidate = new Map<string, Record<string, JsonValue>>();
   const governanceByCandidate = new Map<string, ReturnType<typeof resolveCandidateLearningGovernance>>();
 
   const scored = sourceFromTargets(input.targets).map((target) => {
@@ -488,9 +515,7 @@ export const rankResearchCandidates = (input: CandidateRankingInput): CandidateR
       },
       learningGovernance
     );
-    signalInputsByCandidate.set(id, featureSnapshot);
-    governanceByCandidate.set(id, governance);
-    return {
+    const candidate = {
       id,
       symbol: target.symbol,
       asOf: target.as_of,
@@ -522,6 +547,12 @@ export const rankResearchCandidates = (input: CandidateRankingInput): CandidateR
       strike: options?.strike,
       shortStrike: options?.shortStrike
     };
+    signalInputsByCandidate.set(
+      id,
+      withOptionCandidateScore(featureSnapshot, candidate.score)
+    );
+    governanceByCandidate.set(id, governance);
+    return candidate;
   });
 
   const sorted = scored.sort((left, right) => right.score - left.score);

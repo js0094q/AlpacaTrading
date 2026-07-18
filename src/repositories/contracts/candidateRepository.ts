@@ -35,7 +35,7 @@ export interface CandidateRecord extends PaperTradeCandidateRow {
   readonly lifecycleStatus: CandidateLifecycleStatus;
   readonly decisionReason: string;
   readonly strategyFamily: string;
-  readonly signalInputs: Readonly<Record<string, string | number | null>>;
+  readonly signalInputs: Readonly<Record<string, JsonValue>>;
   readonly dataQualityStatus: string;
   readonly version: number;
   readonly createdAt: string;

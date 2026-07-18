@@ -39,6 +39,10 @@ const insertSnapshot = (input: {
   symbol: string;
   bid?: number | null;
   ask?: number | null;
+  gamma?: number | null;
+  theta?: number | null;
+  vega?: number | null;
+  rho?: number | null;
 }) => {
   const bid = input.bid ?? 1;
   const ask = input.ask ?? 1.1;
@@ -46,8 +50,14 @@ const insertSnapshot = (input: {
     INSERT INTO option_snapshots(
       option_symbol, underlying_symbol, timestamp, bid, ask, midpoint, last, quote_status,
       executable, executable_price, executable_price_source, rejection_reason, quote_timestamp,
-      volume, open_interest, implied_volatility, delta, gamma, theta, vega, rho, source
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      volume, open_interest, implied_volatility, delta, gamma, theta, vega, rho,
+      source_feed, quote_age_ms, spread_percentage, source
+    ) VALUES (
+      ?, ?, ?, ?, ?, ?, ?, ?,
+      ?, ?, ?, ?, ?, ?, ?, ?,
+      ?, ?, ?, ?, ?, ?, ?, ?,
+      ?
+    )
   `).run(
     input.symbol,
     "SPY",
@@ -66,10 +76,13 @@ const insertSnapshot = (input: {
     1000,
     0.3,
     0.5,
-    null,
-    null,
-    null,
-    null,
+    input.gamma ?? null,
+    input.theta ?? null,
+    input.vega ?? null,
+    input.rho ?? null,
+    "opra",
+    500,
+    bid !== null && ask !== null ? ((ask - bid) / ((bid + ask) / 2)) * 100 : null,
     "test"
   );
 };
@@ -162,5 +175,36 @@ describe("paper options discovery", () => {
 
     assert.equal(report.summary.selected, 1);
     assert.equal(report.candidates[0]?.selected, true);
+  });
+
+  test("retains evaluated Greek evidence and rejection reasons when nothing is selected", async () => {
+    insertContract({ symbol: "SPY260707C00450000", expirationDate: "2026-07-07" });
+    insertSnapshot({
+      symbol: "SPY260707C00450000",
+      bid: 1,
+      ask: 2,
+      gamma: 0.0049,
+      theta: -0.0986,
+      vega: 2.0038,
+      rho: 0.12
+    });
+
+    const report = await buildPaperOptionsDiscoveryReport({
+      underlying: "SPY",
+      dte: 0,
+      asOf: "2026-07-07T13:00:00.000Z",
+      allowNextSessionPreparation: false
+    });
+    const candidate = report.candidates[0];
+
+    assert.equal(report.summary.selected, 0);
+    assert.equal(candidate?.reasonSkipped, "SPREAD_TOO_WIDE");
+    assert.equal(candidate?.gamma, 0.0049);
+    assert.equal(candidate?.theta, -0.0986);
+    assert.equal(candidate?.vega, 2.0038);
+    assert.equal(candidate?.rho, 0.12);
+    assert.equal(candidate?.sourceFeed, "opra");
+    assert.equal(candidate?.quoteAgeMs, 500);
+    assert.deepEqual(candidate?.rejectionReasons, ["SPREAD_TOO_WIDE"]);
   });
 });

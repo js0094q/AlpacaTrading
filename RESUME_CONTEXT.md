@@ -1,5 +1,46 @@
 # Resume Context: Alpaca Trading Research Infra
 
+## Option-Greek observability vertical slice (2026-07-18 checkpoint)
+
+- Implementation is complete on isolated branch `codex/option-greek-observability`
+  in `/Users/josephstewart/Documents/Alpaca Trading/.worktrees/option-greek-observability`,
+  based on `origin/main@a96aa34ad69e`. The primary checkout remains untouched;
+  its pre-existing dirty changes were not copied into this worktree.
+- The verified acquisition path remains Alpaca
+  `/v1beta1/options/snapshots` plus `/v1beta1/options/quotes/latest`, using the
+  configured/default `opra` feed. The normalizer retains nullable current,
+  legacy, and mixed Greek aliases. Read-only VPS diagnosis on 2026-07-17
+  still returned HTTP 401 `PROVIDER_ERROR`, so live provider receipt remains
+  unproven until runtime authentication is repaired.
+- The standard research path now persists additive option snapshot provenance
+  (`research_run_id`, `source_feed`, `quote_age_ms`, `spread_percentage`, and
+  `days_to_expiration`) and carries nested `optionDecisionSnapshot` evidence
+  through feature snapshots and candidate `signal_inputs`. PostgreSQL's
+  existing `candidates.signal_inputs` JSONB projection retains the evidence;
+  no parallel metadata schema was added.
+- Each Greek and major numeric market-data field has `decisionUse` metadata:
+  `{value, used, useType, reason}`. `used` is true only for a value that
+  actually participated in the current path; retrieved-but-unused, provider
+  unavailable, enrichment-failed, stale, and invalid states remain explicit.
+  The paper 0DTE discovery report now retains evaluated Greek/provenance
+  fields and rejection reasons without changing its eligibility rules.
+- The VPS cached dashboard summary now projects option contracts. The Options
+  Runs UI renders the persisted snapshot, Greeks, freshness/provenance, and
+  per-field decision-use status/reason without recalculating Greeks or calling
+  Alpaca.
+- Validation completed in this worktree: focused option evidence (10 tests),
+  option normalizer/discovery (15 tests), full `npm test` (all tests passed;
+  3 Neon integration tests skipped by their existing gate), `npm run
+  typecheck`, `npm run build`, `npm run dashboard:build`, and `git diff --check`.
+  Dashboard build emitted only the existing multiple-lockfile workspace-root
+  warning. No broker mutation, live trade, deploy, commit, or push was
+  performed.
+- The sanitized runtime evidence remains: paper mode, live trading disabled,
+  PostgreSQL control-plane authority enabled, provider authentication blocked
+  at 401, and the pre-change public summary reported `optionContracts: 0`.
+  Re-verify provider authentication and deploy only under a separate explicit
+  authorization.
+
 ## Neon operational-state migration Release 4 implementation (2026-07-16)
 
 - Branch `codex/neon-authority-cutover` remains based on
