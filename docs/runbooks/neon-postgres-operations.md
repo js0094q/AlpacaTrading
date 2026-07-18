@@ -161,6 +161,15 @@ mismatches. Reconciliation explicitly records mutable-state differences and
 PostgreSQL-only rows newer than the sealed snapshot; those classifications do
 not erase or mutate PostgreSQL authority rows.
 
+For `accounts`, the stable primary key identifies the broker account while the
+row itself is a mutable current-state head. Reuse at that primary key requires
+exact agreement on immutable fields and a PostgreSQL row that is monotonic over
+the sealed source by both `version` and `updated_at`. Equivalent integer
+representations of `version` compare canonically. A stale target, an immutable
+difference, or a mutable difference whose ordering cannot be proved is a
+sanitized fail-closed conflict. This rule does not weaken the
+`account_snapshots` fingerprint identity or collapse distinct observations.
+
 Use this progression after schema and backfill validation:
 
 1. Keep all PostgreSQL feature flags off while migration version 2 is applied

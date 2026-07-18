@@ -659,6 +659,13 @@ const normalizeJsonColumn = (row: TargetRow, spec: TableSpec) => {
 
 const comparableValue = (spec: TableSpec, column: string, value: unknown) => {
   if (value === null || value === undefined) return null;
+  if (spec.table === "accounts" && column === "version") {
+    try {
+      return BigInt(String(value)).toString();
+    } catch {
+      return value;
+    }
+  }
   if (spec.jsonColumns?.includes(column)) return canonicalJsonHash(parseJson(value) ?? null);
   const numeric = numericColumnsByTable[spec.table]?.[column];
   if (numeric) {
@@ -695,6 +702,32 @@ const rowDifferences = (
     else material.push(column);
   }
   return { material, mutable };
+};
+
+const accountPrimaryReplayClassification = (
+  expected: TargetRow,
+  actual: TargetRow
+): "reuse" | "stale" | "conflict" => {
+  let expectedVersion: bigint;
+  let actualVersion: bigint;
+  try {
+    expectedVersion = BigInt(String(expected.version));
+    actualVersion = BigInt(String(actual.version));
+  } catch {
+    return "conflict";
+  }
+  const expectedUpdatedAt = Date.parse(String(expected.updated_at));
+  const actualUpdatedAt = Date.parse(String(actual.updated_at));
+  if (!Number.isFinite(expectedUpdatedAt) || !Number.isFinite(actualUpdatedAt)) {
+    return "conflict";
+  }
+  if (actualVersion < expectedVersion || actualUpdatedAt < expectedUpdatedAt) {
+    return "stale";
+  }
+  if (actualVersion === expectedVersion && actualUpdatedAt === expectedUpdatedAt) {
+    return "conflict";
+  }
+  return "reuse";
 };
 
 type ExecutionStateIdAliases = Map<string, Map<string, string>>;
@@ -1537,7 +1570,18 @@ const insertTargetRow = async (
      VALUES (${spec.columns.map((column, index) => parameter(spec, column, index + 1)).join(", ")})
      ${conflictClause}`,
     values
-  );
+  ).catch((error: unknown) => {
+    if (
+      spec.table === "accounts" &&
+      error !== null &&
+      typeof error === "object" &&
+      "code" in error &&
+      error.code === "23505"
+    ) {
+      throw new Error("EXECUTION_STATE_BACKFILL_IDENTITY_CONFLICT:accounts");
+    }
+    throw error;
+  });
   const sourceId = String(row[spec.key]);
   if ((write.rowCount ?? 0) === 1) {
     recordAlias(aliases, spec.table, row[spec.key], resolvedRow[spec.key]);
@@ -1552,6 +1596,30 @@ const insertTargetRow = async (
   );
   if (primary) {
     const differences = rowDifferences(spec, resolvedRow, primary);
+    if (spec.table === "accounts" && differences.material.length > 0) {
+      throw new Error("EXECUTION_STATE_BACKFILL_IDENTITY_CONFLICT:accounts");
+    }
+    if (spec.table === "accounts" && differences.mutable.length > 0) {
+      const classification = accountPrimaryReplayClassification(resolvedRow, primary);
+      if (classification === "stale") {
+        throw new Error("EXECUTION_STATE_BACKFILL_STALE_IDENTITY_CONFLICT:accounts");
+      }
+      if (classification === "conflict") {
+        throw new Error("EXECUTION_STATE_BACKFILL_IDENTITY_CONFLICT:accounts");
+      }
+      recordAlias(aliases, spec.table, row[spec.key], primary[spec.key]);
+      return {
+        inserted: 0,
+        resolvedId: String(primary[spec.key]),
+        identityReuse: {
+          table: spec.table,
+          sourceId,
+          targetId: String(primary[spec.key]),
+          identityColumns: [spec.key],
+          mutableDifferences: differences.mutable
+        }
+      };
+    }
     if (differences.material.length > 0 || differences.mutable.length > 0) {
       throw new Error(`EXECUTION_STATE_BACKFILL_CONFLICT:${spec.table}`);
     }

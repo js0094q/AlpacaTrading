@@ -576,6 +576,13 @@ PostgreSQL-only rows newer than the sealed source snapshot as classified durable
 checkpoint evidence. Only unexplained missing rows, mismatches, duplicates,
 orphans, or invariants block the authority gate.
 
+The mutable `accounts` row is a current account head, not an account-observation
+identity. Backfill may reuse an existing row at the same primary key only when
+all immutable account fields match and PostgreSQL is provably newer by both
+`version` and `updated_at`. Numeric/string version representations are
+canonicalized. Stale, contradictory, or otherwise unprovable account heads fail
+closed; distinct `account_snapshots` remain separate observations.
+
 Terminal outcomes use persisted observations only and keep option-position and
 underlying-return bases separate. One original outcome is retained per lifecycle;
 corrections append as revisions. Trace one decision without returning raw payload

@@ -60,6 +60,7 @@ const primaryKeys: Readonly<Record<string, string>> = {
 };
 
 const identityColumns: Readonly<Record<string, readonly string[]>> = {
+  accounts: ["broker", "environment", "broker_account_id"],
   account_snapshots: ["account_id", "snapshot_fingerprint"],
   buying_power_reservations: ["account_id", "idempotency_key"]
 };
@@ -121,8 +122,11 @@ const createFakeExecutionStatePool = () => {
         const checkpoint = text.includes("'execution_state_backfill'")
           ? {
             id: values[0],
+            workstream: "execution_state_backfill",
             status: "passed",
             source_checksum: values[2],
+            source_row_count: values[3],
+            target_row_count: values[3],
             discrepancy_count: 0,
             cursor_value: values[4],
             source_aggregates: values[5],
@@ -132,6 +136,7 @@ const createFakeExecutionStatePool = () => {
           }
           : {
             id: values[0],
+            workstream: "execution_state_reconciliation",
             status: values[1],
             source_checksum: values[2],
             discrepancy_count: values[5],
@@ -218,7 +223,7 @@ const createFakeExecutionStatePool = () => {
     release: () => undefined
   } as unknown as PoolClient;
   const pool = { connect: async () => client } as unknown as Pool;
-  return { pool, rows, seed };
+  return { pool, rows, checkpoints, seed };
 };
 
 const makeFixture = async (prefix: string) => {
@@ -227,6 +232,233 @@ const makeFixture = async (prefix: string) => {
   createExecutionStateSnapshotFixture(snapshotPath);
   return { directory, snapshotPath };
 };
+
+test("reuses the newer PostgreSQL account head for the exact production conflict", async () => {
+  const fixture = await makeFixture("execution-state-account-head-production-");
+  try {
+    const source = await readExecutionStateSnapshot(fixture.snapshotPath);
+    const sourceAccount = source.rows.get("accounts")?.[0];
+    const sourceSnapshot = source.rows.get("account_snapshots")?.[0];
+    assert.ok(sourceAccount);
+    assert.ok(sourceSnapshot);
+    const fake = createFakeExecutionStatePool();
+    fake.seed("accounts", {
+      ...sourceAccount,
+      version: "57",
+      updated_at: "2026-07-18T18:20:00.000Z"
+    });
+    const authorityOnlySnapshot = {
+      ...sourceSnapshot,
+      id: "postgres-authority-only-account-snapshot",
+      observed_at: "2026-07-18T18:20:00.000Z",
+      snapshot_fingerprint: "postgres-authority-only-fingerprint",
+      created_at: "2026-07-18T18:20:00.000Z"
+    };
+    fake.seed("account_snapshots", authorityOnlySnapshot);
+
+    const first = await backfillExecutionStateSnapshot({
+      snapshotPath: fixture.snapshotPath,
+      pool: fake.pool,
+      config: migrationConfig,
+      batchSize: 1,
+      observedAt: "2026-07-18T18:25:00.000Z"
+    });
+
+    assert.equal(first.insertedRows.accounts, 0);
+    assert.ok(first.identityReuses.some((reuse) =>
+      reuse.table === "accounts" &&
+      reuse.sourceId === sourceAccount.id &&
+      reuse.targetId === sourceAccount.id &&
+      reuse.identityColumns.join(",") === "id" &&
+      reuse.mutableDifferences.join(",") === "version,updated_at"
+    ));
+    assert.equal(first.mutableStateDifferences["accounts:version"], 1);
+    assert.equal(first.mutableStateDifferences["accounts:updated_at"], 1);
+    assert.equal(fake.rows.get("accounts")?.length, 1);
+    assert.equal(
+      fake.checkpoints.some(
+        (checkpoint) => checkpoint.workstream === "execution_state_reconciliation"
+      ),
+      false
+    );
+    assert.equal(fake.rows.get("accounts")?.[0]?.version, "57");
+    assert.deepEqual(
+      fake.rows.get("account_snapshots")?.find(
+        (row) => row.id === authorityOnlySnapshot.id
+      ),
+      authorityOnlySnapshot
+    );
+    for (const rows of fake.rows.values()) {
+      assert.ok(rows.every((row) =>
+        row.account_id === undefined || row.account_id === sourceAccount.id
+      ));
+    }
+
+    const replay = await backfillExecutionStateSnapshot({
+      snapshotPath: fixture.snapshotPath,
+      pool: fake.pool,
+      config: migrationConfig,
+      batchSize: 1,
+      observedAt: "2026-07-18T18:25:00.000Z"
+    });
+    assert.equal(replay.idempotentReplay, true);
+    assert.equal(replay.mutationCount, 0);
+    assert.equal(fake.rows.get("accounts")?.length, 1);
+    assert.deepEqual(
+      fake.rows.get("account_snapshots")?.find(
+        (row) => row.id === authorityOnlySnapshot.id
+      ),
+      authorityOnlySnapshot
+    );
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("reuses a newer account head when only mutable status differs", async () => {
+  const fixture = await makeFixture("execution-state-account-head-mutable-");
+  try {
+    const source = await readExecutionStateSnapshot(fixture.snapshotPath);
+    const sourceAccount = source.rows.get("accounts")?.[0];
+    assert.ok(sourceAccount);
+    const fake = createFakeExecutionStatePool();
+    fake.seed("accounts", {
+      ...sourceAccount,
+      status: "ACCOUNT_RESTRICTED",
+      version: 2,
+      updated_at: "2026-07-18T18:20:00.000Z"
+    });
+
+    const result = await backfillExecutionStateSnapshot({
+      snapshotPath: fixture.snapshotPath,
+      pool: fake.pool,
+      config: migrationConfig,
+      batchSize: 1
+    });
+
+    assert.equal(result.insertedRows.accounts, 0);
+    assert.equal(result.mutableStateDifferences["accounts:status"], 1);
+    assert.equal(fake.rows.get("accounts")?.[0]?.status, "ACCOUNT_RESTRICTED");
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("normalizes equivalent account version representations", async () => {
+  const fixture = await makeFixture("execution-state-account-version-normalization-");
+  try {
+    const source = await readExecutionStateSnapshot(fixture.snapshotPath);
+    const sourceAccount = source.rows.get("accounts")?.[0];
+    assert.ok(sourceAccount);
+    const fake = createFakeExecutionStatePool();
+    fake.seed("accounts", {
+      ...sourceAccount,
+      version: String(sourceAccount.version)
+    });
+
+    const result = await backfillExecutionStateSnapshot({
+      snapshotPath: fixture.snapshotPath,
+      pool: fake.pool,
+      config: migrationConfig,
+      batchSize: 1
+    });
+
+    assert.equal(result.insertedRows.accounts, 0);
+    assert.equal(result.mutableStateDifferences["accounts:version"], undefined);
+    assert.equal(fake.rows.get("accounts")?.length, 1);
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("fails closed for a contradictory immutable account environment", async () => {
+  const fixture = await makeFixture("execution-state-account-immutable-conflict-");
+  try {
+    const source = await readExecutionStateSnapshot(fixture.snapshotPath);
+    const sourceAccount = source.rows.get("accounts")?.[0];
+    assert.ok(sourceAccount);
+    const fake = createFakeExecutionStatePool();
+    fake.seed("accounts", {
+      ...sourceAccount,
+      environment: "live",
+      version: 57,
+      updated_at: "2026-07-18T18:20:00.000Z"
+    });
+
+    await assert.rejects(
+      () => backfillExecutionStateSnapshot({
+        snapshotPath: fixture.snapshotPath,
+        pool: fake.pool,
+        config: migrationConfig,
+        batchSize: 1
+      }),
+      /EXECUTION_STATE_BACKFILL_IDENTITY_CONFLICT:accounts/
+    );
+    assert.equal(fake.rows.get("accounts")?.length, 1);
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("fails closed with a sanitized conflict for a different account primary key", async () => {
+  const fixture = await makeFixture("execution-state-account-primary-conflict-");
+  try {
+    const source = await readExecutionStateSnapshot(fixture.snapshotPath);
+    const sourceAccount = source.rows.get("accounts")?.[0];
+    assert.ok(sourceAccount);
+    const fake = createFakeExecutionStatePool();
+    fake.seed("accounts", {
+      ...sourceAccount,
+      id: "postgres-different-account-primary-key"
+    });
+
+    await assert.rejects(
+      () => backfillExecutionStateSnapshot({
+        snapshotPath: fixture.snapshotPath,
+        pool: fake.pool,
+        config: migrationConfig,
+        batchSize: 1
+      }),
+      /EXECUTION_STATE_BACKFILL_IDENTITY_CONFLICT:accounts/
+    );
+    assert.equal(fake.rows.get("accounts")?.length, 1);
+    assert.equal(
+      fake.rows.get("accounts")?.[0]?.id,
+      "postgres-different-account-primary-key"
+    );
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("fails closed when a differing account head is older than the sealed source", async () => {
+  const fixture = await makeFixture("execution-state-account-stale-target-");
+  try {
+    const source = await readExecutionStateSnapshot(fixture.snapshotPath);
+    const sourceAccount = source.rows.get("accounts")?.[0];
+    assert.ok(sourceAccount);
+    const fake = createFakeExecutionStatePool();
+    fake.seed("accounts", {
+      ...sourceAccount,
+      status: "ACCOUNT_RESTRICTED",
+      version: 2,
+      updated_at: "2020-01-01T00:00:00.000Z"
+    });
+
+    await assert.rejects(
+      () => backfillExecutionStateSnapshot({
+        snapshotPath: fixture.snapshotPath,
+        pool: fake.pool,
+        config: migrationConfig,
+        batchSize: 1
+      }),
+      /EXECUTION_STATE_BACKFILL_STALE_IDENTITY_CONFLICT:accounts/
+    );
+    assert.equal(fake.rows.get("accounts")?.length, 1);
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
 
 test("reuses an equivalent account snapshot identity and remaps downstream foreign keys", async () => {
   const fixture = await makeFixture("execution-state-snapshot-identity-");
@@ -391,6 +623,12 @@ test("reconciliation classifies mutable differences and preserves PostgreSQL-onl
     assert.equal(first.classifiedStateDifferences["risk_limits:status"], 1);
     assert.equal(first.authorityOnlyRows.orders, 1);
     assert.equal(first.checkpointMutationCount, 1);
+    assert.equal(
+      fake.checkpoints.find(
+        (checkpoint) => checkpoint.id === "execution-state-classification-test"
+      )?.status,
+      "passed"
+    );
 
     const replay = await reconcileExecutionStateSnapshot({
       snapshotPath: fixture.snapshotPath,
@@ -418,6 +656,12 @@ test("reconciliation classifies mutable differences and preserves PostgreSQL-onl
     });
     assert.equal(unexplained.status, "blocked");
     assert.equal(unexplained.discrepancyCategories["orders:UNEXPECTED"], 1);
+    assert.equal(
+      fake.checkpoints.find(
+        (checkpoint) => checkpoint.id === "execution-state-unexplained-target-test"
+      )?.status,
+      "blocked"
+    );
   } finally {
     await rm(fixture.directory, { recursive: true, force: true });
   }
