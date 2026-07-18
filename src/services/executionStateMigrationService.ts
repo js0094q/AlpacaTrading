@@ -442,6 +442,27 @@ const parseJson = (value: unknown): unknown => {
   return JSON.parse(value) as unknown;
 };
 
+const comparableAccountSnapshotEvidence = (value: unknown) => {
+  const parsed = parseJson(value);
+  if (!isRecord(parsed)) return canonicalJsonHash(parsed ?? null);
+  const hasMarketEvidenceFingerprint = Object.prototype.hasOwnProperty.call(
+    parsed,
+    "marketEvidenceFingerprint"
+  );
+  const marketEvidenceFingerprint = parsed.marketEvidenceFingerprint;
+  const { marketEvidenceFingerprint: _ignored, ...identityEvidence } = parsed;
+  return canonicalJsonHash({
+    identityEvidence,
+    marketEvidenceFingerprint: typeof marketEvidenceFingerprint === "string" &&
+      marketEvidenceFingerprint.trim()
+      ? "present"
+      : {
+          present: hasMarketEvidenceFingerprint,
+          value: marketEvidenceFingerprint ?? null
+        }
+  });
+};
+
 const stringValue = (value: unknown, code: string) => {
   if (typeof value !== "string" || !value.trim()) throw new Error(code);
   return value;
@@ -666,6 +687,9 @@ const comparableValue = (spec: TableSpec, column: string, value: unknown) => {
       return value;
     }
   }
+  if (spec.table === "account_snapshots" && column === "evidence") {
+    return comparableAccountSnapshotEvidence(value);
+  }
   if (spec.jsonColumns?.includes(column)) return canonicalJsonHash(parseJson(value) ?? null);
   const numeric = numericColumnsByTable[spec.table]?.[column];
   if (numeric) {
@@ -694,10 +718,19 @@ const rowDifferences = (
   const mutable: string[] = [];
   for (const column of spec.columns) {
     if (excludedColumns.has(column)) continue;
-    if (
-      comparableValue(spec, column, expected[column]) ===
-      comparableValue(spec, column, actual[column])
-    ) continue;
+    const expectedComparable = comparableValue(spec, column, expected[column]);
+    const actualComparable = comparableValue(spec, column, actual[column]);
+    if (expectedComparable === actualComparable) {
+      if (
+        spec.table === "account_snapshots" &&
+        column === "evidence" &&
+        canonicalJsonHash(parseJson(expected[column]) ?? null) !==
+          canonicalJsonHash(parseJson(actual[column]) ?? null)
+      ) {
+        mutable.push("evidence.marketEvidenceFingerprint");
+      }
+      continue;
+    }
     if (mutableColumns.has(column)) mutable.push(column);
     else material.push(column);
   }

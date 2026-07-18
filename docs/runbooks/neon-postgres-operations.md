@@ -161,6 +161,13 @@ mismatches. Reconciliation explicitly records mutable-state differences and
 PostgreSQL-only rows newer than the sealed snapshot; those classifications do
 not erase or mutate PostgreSQL authority rows.
 
+For `account_snapshots`, the identity is the canonical `portfolioFingerprint`.
+`evidence.marketEvidenceFingerprint` is separately captured market context and
+may differ only when both rows contain a non-empty value; the difference is
+explicitly classified as `account_snapshots:evidence.marketEvidenceFingerprint`.
+Structural portfolio evidence, account state, identity fields, and malformed or
+missing market-evidence values remain material fail-closed mismatches.
+
 For `accounts`, the stable primary key identifies the broker account while the
 row itself is a mutable current-state head. Reuse at that primary key requires
 exact agreement on immutable fields and a PostgreSQL row that is monotonic over

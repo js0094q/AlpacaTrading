@@ -1,5 +1,46 @@
 # Resume Context: Alpaca Trading Research Infra
 
+## Account snapshot identity repair (2026-07-18)
+
+- Read-only diagnosis against the sealed snapshot
+  `ee7624b0254eab23335b922dae774e4ddbb00fe5a399ddcb89125575435b2431` found
+  67 source `account_snapshots` rows, 86 PostgreSQL rows for the source account,
+  zero source duplicate identities, and two cross-primary-key collisions on
+  `(account_id, snapshot_fingerprint)`.
+- Both collisions had the same account and fingerprint identity. After the
+  existing numeric, UTC timestamp, and canonical-JSON normalization, the only
+  differing persisted snapshot evidence was the top-level
+  `evidence.marketEvidenceFingerprint`; source `observed_at` and `created_at`
+  were newer provenance. No raw account values or credentials were emitted.
+- The source projection sets `snapshot_fingerprint` from `portfolioFingerprint`
+  and validates market evidence separately. The isolated repair therefore
+  excludes only a present, non-empty `marketEvidenceFingerprint` from snapshot
+  identity equality, records it as
+  `account_snapshots:evidence.marketEvidenceFingerprint`, preserves the
+  existing PostgreSQL row/evidence, and remaps dependent foreign keys. All
+  structural evidence, identity fields, and malformed/missing market values
+  remain material fail-closed mismatches. No schema or fingerprint algorithm
+  changed.
+- Implementation is isolated on
+  `codex/execution-state-identity-backfill-deploy` in
+  `/private/tmp/alpaca-current-main.KFVLlj`, based on deployed SHA
+  `3d6e49cd731e0388b05f8390e2811afe4fd01e93`. It has not been committed or
+  deployed. The primary checkout remains separately dirty with unrelated user
+  changes.
+- Focused identity tests passed 13/13; Release 4 passed 53/53; full `npm test`
+  passed; typecheck, build, and diff checks passed. Neon integration was run
+  because its environment was available: 2/3 tests passed, while the packaged
+  Release 4 replay failed at `packaged_backfill_replay`; the same failure
+  reproduces on a clean base worktree at `3d6e49cd...`, so it is pre-existing
+  and remains an explicit promotion caveat.
+- Independent read-only review found no critical or important findings. Before
+  promotion, remove diagnostic-only artifacts, commit only the isolated repair
+  and handoff/spec docs, deploy that exact SHA, verify the VPS checkout, create
+  a fresh sealed snapshot, and make exactly one supported backfill attempt.
+  Stop on any new conflict or database failure; reconcile only after backfill
+  succeeds. Dashboard-control remains stopped until a durable reconciliation
+  checkpoint passes, and the autonomous worker/live paths remain stopped.
+
 ## Neon operational-state migration Release 4 implementation (2026-07-16)
 
 - Branch `codex/neon-authority-cutover` remains based on

@@ -576,6 +576,14 @@ PostgreSQL-only rows newer than the sealed source snapshot as classified durable
 checkpoint evidence. Only unexplained missing rows, mismatches, duplicates,
 orphans, or invariants block the authority gate.
 
+For `account_snapshots`, `snapshot_fingerprint` is the canonical portfolio-state
+identity. The persisted `evidence.marketEvidenceFingerprint` is separately
+captured market context, so a non-empty value may differ during identity reuse;
+that difference is recorded as `account_snapshots:evidence.marketEvidenceFingerprint`.
+Every other snapshot field and evidence value remains part of the semantic
+comparison and fails closed on mismatch. Existing PostgreSQL evidence and primary
+keys are never overwritten.
+
 The mutable `accounts` row is a current account head, not an account-observation
 identity. Backfill may reuse an existing row at the same primary key only when
 all immutable account fields match and PostgreSQL is provably newer by both

@@ -510,6 +510,180 @@ test("reuses an equivalent account snapshot identity and remaps downstream forei
   }
 });
 
+test("reuses a portfolio snapshot when only separate market evidence and provenance differ", async () => {
+  const fixture = await makeFixture("execution-state-snapshot-market-evidence-identity-");
+  try {
+    const source = await readExecutionStateSnapshot(fixture.snapshotPath);
+    const sourceSnapshot = source.rows.get("account_snapshots")?.[0];
+    assert.ok(sourceSnapshot);
+    const sourceEvidence = JSON.parse(String(sourceSnapshot.evidence)) as Record<string, unknown>;
+    const existingEvidence = {
+      ...sourceEvidence,
+      marketEvidenceFingerprint: "prior-market-evidence-fingerprint"
+    };
+    const fake = createFakeExecutionStatePool();
+    fake.seed("account_snapshots", {
+      ...sourceSnapshot,
+      id: "postgres-existing-market-evidence-snapshot",
+      observed_at: "2026-07-16T15:59:00.000Z",
+      created_at: "2026-07-16T15:59:00.000Z",
+      evidence: existingEvidence
+    });
+
+    const result = await backfillExecutionStateSnapshot({
+      snapshotPath: fixture.snapshotPath,
+      pool: fake.pool,
+      config: migrationConfig,
+      batchSize: 1,
+      observedAt: "2026-07-18T12:00:00.000Z"
+    });
+
+    assert.equal(result.insertedRows.account_snapshots, 0);
+    assert.ok(result.identityReuses.some((reuse) =>
+      reuse.table === "account_snapshots" &&
+      reuse.sourceId === sourceSnapshot.id &&
+      reuse.targetId === "postgres-existing-market-evidence-snapshot"
+    ));
+    assert.ok(fake.rows.get("portfolio_exposure")?.every(
+      (row) => row.account_snapshot_id === "postgres-existing-market-evidence-snapshot"
+    ));
+    assert.deepEqual(
+      result.identityReuses.find((reuse) => reuse.table === "account_snapshots")
+        ?.mutableDifferences,
+      ["observed_at", "evidence.marketEvidenceFingerprint", "created_at"]
+    );
+    assert.equal(
+      result.mutableStateDifferences["account_snapshots:evidence.marketEvidenceFingerprint"],
+      1
+    );
+    assert.deepEqual(
+      (fake.rows.get("account_snapshots") ?? []).find(
+        (row) => row.id === "postgres-existing-market-evidence-snapshot"
+      )?.evidence,
+      existingEvidence
+    );
+
+    const replay = await backfillExecutionStateSnapshot({
+      snapshotPath: fixture.snapshotPath,
+      pool: fake.pool,
+      config: migrationConfig,
+      batchSize: 1,
+      observedAt: "2026-07-18T12:00:00.000Z"
+    });
+    assert.equal(replay.idempotentReplay, true);
+    assert.equal(replay.mutationCount, 0);
+    assert.equal(fake.rows.get("account_snapshots")?.length, 1);
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("accepts equivalent account snapshot numeric and timestamp representations", async () => {
+  const fixture = await makeFixture("execution-state-snapshot-normalization-");
+  try {
+    const source = await readExecutionStateSnapshot(fixture.snapshotPath);
+    const sourceSnapshot = source.rows.get("account_snapshots")?.[0];
+    assert.ok(sourceSnapshot);
+    const fake = createFakeExecutionStatePool();
+    fake.seed("account_snapshots", {
+      ...sourceSnapshot,
+      id: "postgres-normalized-account-snapshot",
+      observed_at: "2026-07-16T12:00:00-04:00",
+      created_at: "2026-07-16T12:00:00-04:00",
+      cash: Number(sourceSnapshot.cash),
+      portfolio_value: Number(sourceSnapshot.portfolio_value),
+      equity: Number(sourceSnapshot.equity),
+      buying_power: Number(sourceSnapshot.buying_power),
+      options_buying_power: Number(sourceSnapshot.options_buying_power)
+    });
+
+    const result = await backfillExecutionStateSnapshot({
+      snapshotPath: fixture.snapshotPath,
+      pool: fake.pool,
+      config: migrationConfig,
+      batchSize: 1
+    });
+
+    assert.equal(result.insertedRows.account_snapshots, 0);
+    assert.ok(result.identityReuses.some((reuse) =>
+      reuse.table === "account_snapshots" &&
+      reuse.targetId === "postgres-normalized-account-snapshot"
+    ));
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("fails closed on an account snapshot fingerprint collision outside market evidence", async () => {
+  const fixture = await makeFixture("execution-state-snapshot-evidence-mismatch-");
+  try {
+    const source = await readExecutionStateSnapshot(fixture.snapshotPath);
+    const sourceSnapshot = source.rows.get("account_snapshots")?.[0];
+    assert.ok(sourceSnapshot);
+    const sourceEvidence = JSON.parse(String(sourceSnapshot.evidence)) as Record<string, unknown>;
+    const fake = createFakeExecutionStatePool();
+    fake.seed("account_snapshots", {
+      ...sourceSnapshot,
+      id: "postgres-conflicting-snapshot-evidence",
+      evidence: {
+        ...sourceEvidence,
+        structuralPortfolioFingerprint: "contradictory-structural-fingerprint"
+      }
+    });
+
+    await assert.rejects(
+      () => backfillExecutionStateSnapshot({
+        snapshotPath: fixture.snapshotPath,
+        pool: fake.pool,
+        config: migrationConfig,
+        batchSize: 1
+      }),
+      /EXECUTION_STATE_BACKFILL_IDENTITY_CONFLICT:account_snapshots/
+    );
+    assert.equal(fake.rows.get("account_snapshots")?.length, 1);
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("fails closed when market evidence fingerprint is missing, empty, or malformed", async () => {
+  for (const [label, value] of [
+    ["missing", undefined],
+    ["empty", ""],
+    ["malformed", 42]
+  ] as const) {
+    const fixture = await makeFixture(`execution-state-snapshot-market-evidence-${label}-`);
+    try {
+      const source = await readExecutionStateSnapshot(fixture.snapshotPath);
+      const sourceSnapshot = source.rows.get("account_snapshots")?.[0];
+      assert.ok(sourceSnapshot);
+      const sourceEvidence = JSON.parse(String(sourceSnapshot.evidence)) as Record<string, unknown>;
+      const existingEvidence = { ...sourceEvidence };
+      if (value === undefined) delete existingEvidence.marketEvidenceFingerprint;
+      else existingEvidence.marketEvidenceFingerprint = value;
+      const fake = createFakeExecutionStatePool();
+      fake.seed("account_snapshots", {
+        ...sourceSnapshot,
+        id: `postgres-${label}-market-evidence-snapshot`,
+        evidence: existingEvidence
+      });
+
+      await assert.rejects(
+        () => backfillExecutionStateSnapshot({
+          snapshotPath: fixture.snapshotPath,
+          pool: fake.pool,
+          config: migrationConfig,
+          batchSize: 1
+        }),
+        /EXECUTION_STATE_BACKFILL_IDENTITY_CONFLICT:account_snapshots/
+      );
+      assert.equal(fake.rows.get("account_snapshots")?.length, 1);
+    } finally {
+      await rm(fixture.directory, { recursive: true, force: true });
+    }
+  }
+});
+
 test("reuses an equivalent reservation identity, preserves the existing row, and classifies mutable state", async () => {
   const fixture = await makeFixture("execution-state-reservation-identity-");
   try {
