@@ -591,6 +591,18 @@ all immutable account fields match and PostgreSQL is provably newer by both
 canonicalized. Stale, contradictory, or otherwise unprovable account heads fail
 closed; distinct `account_snapshots` remain separate observations.
 
+For `risk_limits`, a primary-key replay is reusable only when account, scope,
+configuration fingerprint, lifecycle state, and every persisted limit or policy
+field are semantically identical. Numeric/string bigint versions and fixed-scale
+decimals are canonicalized. A source-later `effective_from`, `created_at`, or
+`updated_at` may be classified as `provenance_only` because the sealed projection
+derives those fields from its latest observation; PostgreSQL retains its earlier
+policy-activation provenance and primary key. The same classifier is used by
+reconciliation, so unsupported timestamp direction, malformed values, policy
+changes, identity changes, and current-scope uniqueness collisions remain
+fail-closed. Separately keyed superseded risk policies remain PostgreSQL-only
+authority history and are never overwritten or collapsed.
+
 Terminal outcomes use persisted observations only and keep option-position and
 underlying-return bases separate. One original outcome is retained per lifecycle;
 corrections append as revisions. Trace one decision without returning raw payload

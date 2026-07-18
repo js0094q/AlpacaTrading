@@ -158,6 +158,22 @@ const createFakeExecutionStatePool = () => {
         table,
         (identityColumns[table] ?? []).map((column) => row[column])
       );
+      const activeRiskScope = table === "risk_limits"
+        ? rows.get(table)?.find((existing) =>
+          existing.status === "active" && existing.effective_to === null &&
+          row.status === "active" && row.effective_to === null &&
+          sameValue(existing.account_id, row.account_id) &&
+          sameValue(existing.scope_type, row.scope_type) &&
+          sameValue(existing.scope_key, row.scope_key)
+        )
+        : undefined;
+      if (activeRiskScope && !existingPrimary) {
+        const error = new Error(`duplicate current risk scope for ${table}`) as Error & {
+          code?: string;
+        };
+        error.code = "23505";
+        throw error;
+      }
       if (identity && !existingPrimary && !text.includes("ON CONFLICT DO NOTHING")) {
         const error = new Error(`duplicate identity for ${table}`) as Error & { code?: string };
         error.code = "23505";
@@ -226,10 +242,13 @@ const createFakeExecutionStatePool = () => {
   return { pool, rows, checkpoints, seed };
 };
 
-const makeFixture = async (prefix: string) => {
+const makeFixture = async (
+  prefix: string,
+  options: { capturedAt?: string } = {}
+) => {
   const directory = await mkdtemp(join(tmpdir(), prefix));
   const snapshotPath = join(directory, "source.db");
-  createExecutionStateSnapshotFixture(snapshotPath);
+  createExecutionStateSnapshotFixture(snapshotPath, options);
   return { directory, snapshotPath };
 };
 
@@ -425,6 +444,328 @@ test("fails closed with a sanitized conflict for a different account primary key
     assert.equal(
       fake.rows.get("accounts")?.[0]?.id,
       "postgres-different-account-primary-key"
+    );
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("reuses the exact production risk-limit identity when only observation provenance differs", async () => {
+  const fixture = await makeFixture("execution-state-risk-limit-production-", {
+    capturedAt: "2026-07-17T19:59:53.128Z"
+  });
+  try {
+    const source = await readExecutionStateSnapshot(fixture.snapshotPath);
+    const sourceRiskLimit = source.rows.get("risk_limits")?.[0];
+    assert.ok(sourceRiskLimit);
+    const fake = createFakeExecutionStatePool();
+    const existingRiskLimit = {
+      ...sourceRiskLimit,
+      effective_from: "2026-07-17T16:35:00.031Z",
+      version: String(sourceRiskLimit.version),
+      created_at: "2026-07-17T16:35:00.031Z",
+      updated_at: "2026-07-17T16:35:00.031Z"
+    };
+    const authorityOnlySupersededRiskLimit = {
+      ...sourceRiskLimit,
+      id: "postgres-superseded-risk-policy",
+      status: "superseded",
+      config_fingerprint: "postgres-prior-config-fingerprint",
+      effective_from: "2026-07-17T13:54:34.316Z",
+      effective_to: "2026-07-17T16:35:00.031Z",
+      version: "2",
+      created_at: "2026-07-17T13:54:34.316Z",
+      updated_at: "2026-07-17T16:35:00.031Z"
+    };
+    fake.seed("risk_limits", existingRiskLimit);
+    fake.seed("risk_limits", authorityOnlySupersededRiskLimit);
+
+    const result = await backfillExecutionStateSnapshot({
+      snapshotPath: fixture.snapshotPath,
+      pool: fake.pool,
+      config: migrationConfig,
+      batchSize: 1,
+      observedAt: "2026-07-18T12:00:00.000Z"
+    });
+
+    assert.equal(result.insertedRows.risk_limits, 0);
+    assert.deepEqual(
+      result.identityReuses.find((reuse) => reuse.table === "risk_limits"),
+      {
+        table: "risk_limits",
+        sourceId: sourceRiskLimit.id,
+        targetId: sourceRiskLimit.id,
+        identityColumns: [
+          "id", "account_id", "scope_type", "scope_key", "config_fingerprint"
+        ],
+        mutableDifferences: ["effective_from", "created_at", "updated_at"],
+        classification: "provenance_only"
+      }
+    );
+    assert.deepEqual(
+      fake.rows.get("risk_limits")?.find((row) => row.id === sourceRiskLimit.id),
+      existingRiskLimit
+    );
+    assert.deepEqual(
+      fake.rows.get("risk_limits")?.find(
+        (row) => row.id === authorityOnlySupersededRiskLimit.id
+      ),
+      authorityOnlySupersededRiskLimit
+    );
+    assert.equal(fake.rows.get("risk_limits")?.length, 2);
+    assert.equal(result.mutableStateDifferences["risk_limits:effective_from"], 1);
+    assert.equal(result.mutableStateDifferences["risk_limits:created_at"], 1);
+    assert.equal(result.mutableStateDifferences["risk_limits:updated_at"], 1);
+    assert.equal(result.mutableStateDifferences["risk_limits:version"], undefined);
+    assert.ok([...source.rows.entries()].every(([table, rows]) =>
+      table === "risk_limits" || rows.every((row) =>
+        Object.values(row).every((value) => value !== sourceRiskLimit.id)
+      )
+    ));
+
+    const replay = await backfillExecutionStateSnapshot({
+      snapshotPath: fixture.snapshotPath,
+      pool: fake.pool,
+      config: migrationConfig,
+      batchSize: 1,
+      observedAt: "2026-07-18T12:00:00.000Z"
+    });
+    assert.equal(replay.idempotentReplay, true);
+    assert.equal(replay.mutationCount, 0);
+    assert.equal(fake.rows.get("risk_limits")?.length, 2);
+
+    const reconciliation = await reconcileExecutionStateSnapshot({
+      snapshotPath: fixture.snapshotPath,
+      pool: fake.pool,
+      config: migrationConfig,
+      checkpointId: "execution-state-risk-limit-production",
+      observedAt: "2026-07-18T12:00:00.000Z"
+    });
+    assert.equal(reconciliation.status, "passed");
+    assert.equal(reconciliation.discrepancyCount, 0);
+    assert.equal(reconciliation.tableComparisons.risk_limits.authorityOnly, 1);
+    assert.equal(reconciliation.tableComparisons.risk_limits.mutableStateDifference, 1);
+    assert.equal(
+      reconciliation.classifiedStateDifferences["risk_limits:effective_from"],
+      1
+    );
+    assert.equal(
+      reconciliation.classifiedStateDifferences["risk_limits:created_at"],
+      1
+    );
+    assert.equal(
+      reconciliation.classifiedStateDifferences["risk_limits:updated_at"],
+      1
+    );
+    assert.equal(
+      fake.checkpoints.find(
+        (checkpoint) => checkpoint.id === "execution-state-risk-limit-production"
+      )?.status,
+      "passed"
+    );
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("accepts only proven risk-limit numeric and bigint representation equivalence", async () => {
+  const fixture = await makeFixture("execution-state-risk-limit-normalization-");
+  try {
+    const source = await readExecutionStateSnapshot(fixture.snapshotPath);
+    const sourceRiskLimit = source.rows.get("risk_limits")?.[0];
+    assert.ok(sourceRiskLimit);
+    const fake = createFakeExecutionStatePool();
+    const numericColumns = [
+      "cash_reserve_amount", "cash_reserve_ratio", "max_deployment_amount",
+      "max_deployment_ratio", "max_gross_exposure", "max_net_exposure",
+      "max_open_order_exposure", "max_position_notional", "max_symbol_notional"
+    ];
+    const target: StoredRow = {
+      ...sourceRiskLimit,
+      version: String(sourceRiskLimit.version)
+    };
+    for (const column of numericColumns) {
+      if (target[column] !== null) target[column] = Number(target[column]);
+    }
+    fake.seed("risk_limits", target);
+
+    const result = await backfillExecutionStateSnapshot({
+      snapshotPath: fixture.snapshotPath,
+      pool: fake.pool,
+      config: migrationConfig,
+      batchSize: 1
+    });
+
+    assert.equal(result.insertedRows.risk_limits, 0);
+    assert.equal(fake.rows.get("risk_limits")?.length, 1);
+    assert.equal(
+      result.mutableStateDifferences["risk_limits:version"],
+      undefined
+    );
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("fails closed with sanitized classifications for incompatible risk-limit rows", async () => {
+  const cases: Array<{
+    label: string;
+    mutateSource?: (row: StoredRow) => void;
+    mutateTarget: (row: StoredRow) => void;
+    code: RegExp;
+  }> = [
+    {
+      label: "account-identity",
+      mutateTarget: (row) => { row.account_id = "different-account-identity"; },
+      code: /EXECUTION_STATE_BACKFILL_RISK_LIMIT_CONFLICT:IDENTITY/
+    },
+    {
+      label: "strategy-identity",
+      mutateSource: (row) => {
+        row.scope_type = "strategy";
+        row.scope_key = "strategy-one";
+      },
+      mutateTarget: (row) => { row.scope_key = "strategy-two"; },
+      code: /EXECUTION_STATE_BACKFILL_RISK_LIMIT_CONFLICT:IDENTITY/
+    },
+    {
+      label: "configuration-fingerprint-collision",
+      mutateTarget: (row) => { row.config_fingerprint = "contradictory-fingerprint"; },
+      code: /EXECUTION_STATE_BACKFILL_RISK_LIMIT_CONFLICT:POLICY/
+    },
+    {
+      label: "hard-cap-policy",
+      mutateTarget: (row) => { row.max_position_notional = "999999.00000000"; },
+      code: /EXECUTION_STATE_BACKFILL_RISK_LIMIT_CONFLICT:POLICY/
+    },
+    {
+      label: "ratio-policy",
+      mutateTarget: (row) => { row.max_deployment_ratio = "0.9999999999"; },
+      code: /EXECUTION_STATE_BACKFILL_RISK_LIMIT_CONFLICT:POLICY/
+    },
+    {
+      label: "lifecycle-status",
+      mutateTarget: (row) => { row.status = "superseded"; },
+      code: /EXECUTION_STATE_BACKFILL_RISK_LIMIT_CONFLICT:LIFECYCLE/
+    },
+    {
+      label: "malformed-numeric",
+      mutateTarget: (row) => { row.max_gross_exposure = "not-a-decimal"; },
+      code: /EXECUTION_STATE_BACKFILL_RISK_LIMIT_CONFLICT:MALFORMED/
+    },
+    {
+      label: "malformed-version",
+      mutateTarget: (row) => { row.version = "not-an-integer"; },
+      code: /EXECUTION_STATE_BACKFILL_RISK_LIMIT_CONFLICT:MALFORMED/
+    },
+    {
+      label: "unsupported-provenance-order",
+      mutateTarget: (row) => {
+        row.effective_from = "2026-07-19T00:00:00.000Z";
+        row.created_at = "2026-07-19T00:00:00.000Z";
+        row.updated_at = "2026-07-19T00:00:00.000Z";
+      },
+      code: /EXECUTION_STATE_BACKFILL_RISK_LIMIT_CONFLICT:PROVENANCE_ORDER/
+    }
+  ];
+
+  for (const scenario of cases) {
+    const fixture = await makeFixture(`execution-state-risk-limit-${scenario.label}-`);
+    try {
+      const source = await readExecutionStateSnapshot(fixture.snapshotPath);
+      const sourceRiskLimit = source.rows.get("risk_limits")?.[0] as StoredRow | undefined;
+      assert.ok(sourceRiskLimit);
+      scenario.mutateSource?.(sourceRiskLimit);
+      const target = { ...sourceRiskLimit };
+      scenario.mutateTarget(target);
+      const fake = createFakeExecutionStatePool();
+      fake.seed("risk_limits", target);
+
+      await assert.rejects(
+        () => backfillExecutionStateSnapshot({
+          snapshotPath: fixture.snapshotPath,
+          pool: fake.pool,
+          config: migrationConfig,
+          batchSize: 1
+        }),
+        scenario.code,
+        scenario.label
+      );
+      assert.deepEqual(fake.rows.get("risk_limits"), [target], scenario.label);
+    } finally {
+      await rm(fixture.directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test("fails closed on a different active risk policy in the same unique current scope", async () => {
+  const fixture = await makeFixture("execution-state-risk-limit-current-scope-");
+  try {
+    const source = await readExecutionStateSnapshot(fixture.snapshotPath);
+    const sourceRiskLimit = source.rows.get("risk_limits")?.[0];
+    assert.ok(sourceRiskLimit);
+    const existingCurrentPolicy = {
+      ...sourceRiskLimit,
+      id: "postgres-distinct-current-risk-policy",
+      config_fingerprint: "postgres-distinct-current-configuration"
+    };
+    const fake = createFakeExecutionStatePool();
+    fake.seed("risk_limits", existingCurrentPolicy);
+
+    await assert.rejects(
+      () => backfillExecutionStateSnapshot({
+        snapshotPath: fixture.snapshotPath,
+        pool: fake.pool,
+        config: migrationConfig,
+        batchSize: 1
+      }),
+      /EXECUTION_STATE_BACKFILL_RISK_LIMIT_CONFLICT:CURRENT_SCOPE/
+    );
+    assert.deepEqual(fake.rows.get("risk_limits"), [existingCurrentPolicy]);
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("newer PostgreSQL risk-limit provenance cannot produce a passed reconciliation checkpoint", async () => {
+  const fixture = await makeFixture("execution-state-risk-limit-newer-provenance-");
+  try {
+    const source = await readExecutionStateSnapshot(fixture.snapshotPath);
+    const sourceRiskLimit = source.rows.get("risk_limits")?.[0];
+    assert.ok(sourceRiskLimit);
+    const newerTarget = {
+      ...sourceRiskLimit,
+      effective_from: "2026-07-19T00:00:00.000Z",
+      created_at: "2026-07-19T00:00:00.000Z",
+      updated_at: "2026-07-19T00:00:00.000Z"
+    };
+    const fake = createFakeExecutionStatePool();
+    fake.seed("risk_limits", newerTarget);
+
+    await assert.rejects(
+      () => backfillExecutionStateSnapshot({
+        snapshotPath: fixture.snapshotPath,
+        pool: fake.pool,
+        config: migrationConfig,
+        batchSize: 1
+      }),
+      /EXECUTION_STATE_BACKFILL_RISK_LIMIT_CONFLICT:PROVENANCE_ORDER/
+    );
+    const reconciliation = await reconcileExecutionStateSnapshot({
+      snapshotPath: fixture.snapshotPath,
+      pool: fake.pool,
+      config: migrationConfig,
+      checkpointId: "execution-state-risk-limit-newer-provenance",
+      observedAt: "2026-07-18T12:00:00.000Z"
+    });
+    assert.equal(reconciliation.status, "blocked");
+    assert.equal(reconciliation.tableComparisons.risk_limits.mismatch, 1);
+    assert.equal(reconciliation.discrepancyCategories["risk_limits:MISMATCH"], 1);
+    assert.equal(
+      fake.checkpoints.find(
+        (checkpoint) => checkpoint.id === "execution-state-risk-limit-newer-provenance"
+      )?.status,
+      "blocked"
     );
   } finally {
     await rm(fixture.directory, { recursive: true, force: true });
@@ -773,9 +1114,6 @@ test("reconciliation classifies mutable differences and preserves PostgreSQL-onl
       batchSize: 1,
       observedAt: "2026-07-18T12:00:00.000Z"
     });
-    const riskLimit = fake.rows.get("risk_limits")?.[0];
-    assert.ok(riskLimit);
-    riskLimit.status = "revised";
     fake.seed("orders", {
       ...sourceOrder,
       id: "postgres-authority-only-order",
@@ -794,7 +1132,6 @@ test("reconciliation classifies mutable differences and preserves PostgreSQL-onl
     assert.equal(first.tableComparisons.orders.authorityOnly, 1);
     assert.equal(first.tableComparisons.orders.unexpected, 0);
     assert.equal(first.classifiedStateDifferences["buying_power_reservations:updated_at"], 1);
-    assert.equal(first.classifiedStateDifferences["risk_limits:status"], 1);
     assert.equal(first.authorityOnlyRows.orders, 1);
     assert.equal(first.checkpointMutationCount, 1);
     assert.equal(
@@ -835,6 +1172,66 @@ test("reconciliation classifies mutable differences and preserves PostgreSQL-onl
         (checkpoint) => checkpoint.id === "execution-state-unexplained-target-test"
       )?.status,
       "blocked"
+    );
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("a PostgreSQL failure before reconciliation checkpoint persistence cannot count as success", async () => {
+  const fixture = await makeFixture("execution-state-checkpoint-connection-failure-");
+  try {
+    const fake = createFakeExecutionStatePool();
+    await backfillExecutionStateSnapshot({
+      snapshotPath: fixture.snapshotPath,
+      pool: fake.pool,
+      config: migrationConfig,
+      batchSize: 1,
+      observedAt: "2026-07-18T12:00:00.000Z"
+    });
+    const baseClient = await fake.pool.connect();
+    const originalQuery = baseClient.query.bind(baseClient) as (
+      sql: string,
+      values?: readonly unknown[]
+    ) => Promise<QueryResult>;
+    let checkpointFailureInjected = false;
+    const failingClient = {
+      query: async (sql: string, values: readonly unknown[] = []) => {
+        if (
+          !checkpointFailureInjected &&
+          compact(sql).startsWith("INSERT INTO reconciliation_checkpoints")
+        ) {
+          checkpointFailureInjected = true;
+          const error = new Error(
+            "synthetic connection terminated before checkpoint persistence"
+          ) as Error & { code?: string };
+          error.code = "08006";
+          throw error;
+        }
+        return originalQuery(sql, values);
+      },
+      release: () => undefined
+    } as unknown as PoolClient;
+    const failingPool = {
+      connect: async () => failingClient
+    } as unknown as Pool;
+
+    await assert.rejects(
+      () => reconcileExecutionStateSnapshot({
+        snapshotPath: fixture.snapshotPath,
+        pool: failingPool,
+        config: migrationConfig,
+        checkpointId: "execution-state-connection-failure",
+        observedAt: "2026-07-18T12:00:00.000Z"
+      }),
+      /connection terminated before checkpoint persistence/
+    );
+    assert.equal(checkpointFailureInjected, true);
+    assert.equal(
+      fake.checkpoints.some(
+        (checkpoint) => checkpoint.id === "execution-state-connection-failure"
+      ),
+      false
     );
   } finally {
     await rm(fixture.directory, { recursive: true, force: true });

@@ -108,6 +108,7 @@ export interface ExecutionStateIdentityReuse {
   readonly targetId: string;
   readonly identityColumns: readonly string[];
   readonly mutableDifferences: readonly string[];
+  readonly classification?: "provenance_only";
 }
 
 const uniqueIdentitySpecs: Readonly<Record<string, UniqueIdentitySpec>> = {
@@ -680,7 +681,7 @@ const normalizeJsonColumn = (row: TargetRow, spec: TableSpec) => {
 
 const comparableValue = (spec: TableSpec, column: string, value: unknown) => {
   if (value === null || value === undefined) return null;
-  if (spec.table === "accounts" && column === "version") {
+  if (["accounts", "risk_limits"].includes(spec.table) && column === "version") {
     try {
       return BigInt(String(value)).toString();
     } catch {
@@ -761,6 +762,161 @@ const accountPrimaryReplayClassification = (
     return "conflict";
   }
   return "reuse";
+};
+
+const riskLimitIdentityColumns = [
+  "id", "account_id", "scope_type", "scope_key", "config_fingerprint"
+] as const;
+const riskLimitBaseIdentityColumns = [
+  "id", "account_id", "scope_type", "scope_key"
+] as const;
+
+const riskLimitPolicyColumns = [
+  "currency", "cash_reserve_amount", "cash_reserve_ratio", "max_deployment_amount",
+  "max_deployment_ratio", "max_gross_exposure", "max_net_exposure",
+  "max_open_order_exposure", "max_position_notional", "max_symbol_notional",
+  "max_position_count", "max_order_count", "config_version", "config_fingerprint"
+] as const;
+
+const riskLimitLifecycleColumns = ["status", "effective_to", "version"] as const;
+const riskLimitProvenanceColumns = ["effective_from", "created_at", "updated_at"] as const;
+
+type RiskLimitReplayClassification = Readonly<{
+  classification: "equivalent" | "provenance_only" | "conflict";
+  conflict?: "IDENTITY" | "POLICY" | "LIFECYCLE" | "MALFORMED" | "PROVENANCE_ORDER";
+  provenanceDifferences: readonly string[];
+}>;
+
+const positiveInteger = (value: unknown): string | null => {
+  if (
+    (typeof value !== "number" && typeof value !== "string") ||
+    !/^[0-9]+$/.test(String(value))
+  ) return null;
+  try {
+    const parsed = BigInt(String(value));
+    return parsed > 0n ? parsed.toString() : null;
+  } catch {
+    return null;
+  }
+};
+
+const riskLimitTimestamp = (value: unknown): number | null => {
+  if (value === null || value === undefined) return null;
+  const parsed = value instanceof Date ? value.getTime() : Date.parse(String(value));
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const validRiskLimitRow = (row: TargetRow) => {
+  const requiredStrings = [
+    "id", "account_id", "scope_type", "scope_key", "status", "currency",
+    "config_version", "config_fingerprint"
+  ];
+  if (requiredStrings.some((column) =>
+    typeof row[column] !== "string" || String(row[column]).trim() === ""
+  )) return false;
+  if (!["portfolio", "strategy", "symbol", "position"].includes(String(row.scope_type))) {
+    return false;
+  }
+  if (!["active", "superseded", "disabled"].includes(String(row.status))) return false;
+  if (!/^[A-Z]{3}$/.test(String(row.currency))) return false;
+  if (positiveInteger(row.version) === null) return false;
+  for (const column of ["max_position_count", "max_order_count"] as const) {
+    if (row[column] !== null && row[column] !== undefined && positiveInteger(row[column]) === null) {
+      return false;
+    }
+  }
+  try {
+    for (const [column, definition] of Object.entries(numericColumnsByTable.risk_limits ?? {})) {
+      const value = row[column];
+      if (value === null || value === undefined) continue;
+      const normalized = canonicalizePostgresNumeric(
+        value as number | string,
+        definition.precision,
+        definition.scale
+      );
+      if (normalized === null || Number(normalized) < 0) return false;
+      if (["cash_reserve_ratio", "max_deployment_ratio"].includes(column)) {
+        const ratioValue = Number(normalized);
+        if (!Number.isFinite(ratioValue) || ratioValue > 1) return false;
+      }
+    }
+  } catch {
+    return false;
+  }
+  const effectiveFrom = riskLimitTimestamp(row.effective_from);
+  const createdAt = riskLimitTimestamp(row.created_at);
+  const updatedAt = riskLimitTimestamp(row.updated_at);
+  const effectiveTo = riskLimitTimestamp(row.effective_to);
+  if (effectiveFrom === null || createdAt === null || updatedAt === null) return false;
+  if (row.effective_to !== null && row.effective_to !== undefined && effectiveTo === null) {
+    return false;
+  }
+  if (effectiveTo !== null && effectiveTo <= effectiveFrom) return false;
+  if (updatedAt < createdAt) return false;
+  return true;
+};
+
+const riskLimitColumnValue = (column: string, value: unknown) => {
+  if (column === "version" || column === "max_position_count" || column === "max_order_count") {
+    return value === null || value === undefined ? null : positiveInteger(value);
+  }
+  const numeric = numericColumnsByTable.risk_limits?.[column];
+  if (numeric) {
+    return canonicalizePostgresNumeric(
+      value as number | string | null,
+      numeric.precision,
+      numeric.scale
+    );
+  }
+  if (column === "effective_from" || column === "effective_to" || column.endsWith("_at")) {
+    const parsed = riskLimitTimestamp(value);
+    return parsed === null ? null : new Date(parsed).toISOString();
+  }
+  return value ?? null;
+};
+
+const classifyRiskLimitPrimaryReplay = (
+  expected: TargetRow,
+  actual: TargetRow
+): RiskLimitReplayClassification => {
+  if (!validRiskLimitRow(expected) || !validRiskLimitRow(actual)) {
+    return { classification: "conflict", conflict: "MALFORMED", provenanceDifferences: [] };
+  }
+  if (riskLimitBaseIdentityColumns.some((column) =>
+    riskLimitColumnValue(column, expected[column]) !==
+      riskLimitColumnValue(column, actual[column])
+  )) {
+    return { classification: "conflict", conflict: "IDENTITY", provenanceDifferences: [] };
+  }
+  if (riskLimitPolicyColumns.some((column) =>
+    riskLimitColumnValue(column, expected[column]) !==
+      riskLimitColumnValue(column, actual[column])
+  )) {
+    return { classification: "conflict", conflict: "POLICY", provenanceDifferences: [] };
+  }
+  if (riskLimitLifecycleColumns.some((column) =>
+    riskLimitColumnValue(column, expected[column]) !==
+      riskLimitColumnValue(column, actual[column])
+  )) {
+    return { classification: "conflict", conflict: "LIFECYCLE", provenanceDifferences: [] };
+  }
+  const provenanceDifferences = riskLimitProvenanceColumns.filter((column) =>
+    riskLimitColumnValue(column, expected[column]) !==
+      riskLimitColumnValue(column, actual[column])
+  );
+  if (provenanceDifferences.some((column) =>
+    riskLimitTimestamp(actual[column])! > riskLimitTimestamp(expected[column])!
+  )) {
+    return {
+      classification: "conflict",
+      conflict: "PROVENANCE_ORDER",
+      provenanceDifferences
+    };
+  }
+  return {
+    classification: provenanceDifferences.length ? "provenance_only" : "equivalent",
+    provenanceDifferences
+  };
 };
 
 type ExecutionStateIdAliases = Map<string, Map<string, string>>;
@@ -1613,6 +1769,15 @@ const insertTargetRow = async (
     ) {
       throw new Error("EXECUTION_STATE_BACKFILL_IDENTITY_CONFLICT:accounts");
     }
+    if (
+      spec.table === "risk_limits" &&
+      error !== null &&
+      typeof error === "object" &&
+      "code" in error &&
+      error.code === "23505"
+    ) {
+      throw new Error("EXECUTION_STATE_BACKFILL_RISK_LIMIT_CONFLICT:CURRENT_SCOPE");
+    }
     throw error;
   });
   const sourceId = String(row[spec.key]);
@@ -1628,6 +1793,34 @@ const insertTargetRow = async (
     [resolvedRow[spec.key]]
   );
   if (primary) {
+    if (spec.table === "risk_limits") {
+      const classification = classifyRiskLimitPrimaryReplay(resolvedRow, primary);
+      if (classification.classification === "conflict") {
+        throw new Error(
+          `EXECUTION_STATE_BACKFILL_RISK_LIMIT_CONFLICT:${classification.conflict}`
+        );
+      }
+      recordAlias(aliases, spec.table, row[spec.key], primary[spec.key]);
+      if (classification.classification === "provenance_only") {
+        return {
+          inserted: 0,
+          resolvedId: String(primary[spec.key]),
+          identityReuse: {
+            table: spec.table,
+            sourceId,
+            targetId: String(primary[spec.key]),
+            identityColumns: riskLimitIdentityColumns,
+            mutableDifferences: classification.provenanceDifferences,
+            classification: "provenance_only"
+          }
+        };
+      }
+      return {
+        inserted: 0,
+        resolvedId: String(primary[spec.key]),
+        identityReuse: null
+      };
+    }
     const differences = rowDifferences(spec, resolvedRow, primary);
     if (spec.table === "accounts" && differences.material.length > 0) {
       throw new Error("EXECUTION_STATE_BACKFILL_IDENTITY_CONFLICT:accounts");
@@ -2004,6 +2197,20 @@ const compareTargetTable = async (
       continue;
     }
     matchedTargetIds.add(String(actual[spec.key]));
+    if (spec.table === "risk_limits" && !identityMatch) {
+      const classification = classifyRiskLimitPrimaryReplay(resolvedRow, actual);
+      if (classification.classification === "conflict") {
+        mismatch += 1;
+      } else if (classification.classification === "provenance_only") {
+        mutableStateDifference += 1;
+        for (const column of classification.provenanceDifferences) {
+          mutableDifferences[column] = (mutableDifferences[column] ?? 0) + 1;
+        }
+      } else {
+        exact += 1;
+      }
+      continue;
+    }
     const differences = rowDifferences(
       spec,
       resolvedRow,
@@ -2026,6 +2233,15 @@ const compareTargetTable = async (
   const observedAtMs = Date.parse(observedAt);
   const authorityOnly = targetRows.filter((row) => {
     if (matchedTargetIds.has(String(row[spec.key])) || accountId === null) return false;
+    if (
+      spec.table === "risk_limits" &&
+      row.status === "superseded" &&
+      row.effective_to !== null &&
+      validRiskLimitRow(row) &&
+      riskLimitTimestamp(row.effective_to)! <= observedAtMs
+    ) {
+      return true;
+    }
     const timestampColumns = [
       "updated_at", "observed_at", "received_at", "occurred_at", "created_at",
       "captured_at", "effective_from"

@@ -1,5 +1,31 @@
 # Resume Context: Alpaca Trading Research Infra
 
+## Risk-limit identity repair (2026-07-18)
+
+- The production execution-state conflict is on `risk_limits_pkey (id)`, not
+  the partial current-scope index. The sealed source and PostgreSQL row have the
+  same account, portfolio scope, paper environment, associated strategy,
+  configuration fingerprint, and complete limit-policy semantics.
+- The only differences are source-later `effective_from`, `created_at`, and
+  `updated_at` observation provenance plus numeric-versus-string bigint
+  representation for `version=1`. The repair preserves the earlier PostgreSQL
+  activation row and primary key, records `provenance_only`, and uses the same
+  direction-sensitive classifier during reconciliation.
+- Every amount, ratio, count, currency, configuration identity, lifecycle
+  field, account/scope identity, malformed value, and unsupported provenance
+  order remains fail-closed. The current-scope uniqueness race is translated to
+  a sanitized conflict. No risk value, strategy behavior, schema, or identity
+  algorithm changed.
+- PostgreSQL contains a separately keyed superseded risk-policy row. It is
+  preserved as authority history; neither the source projection nor either
+  database schema has a foreign key to `risk_limits`, so no dependent key
+  remap is required.
+- A bounded read-only follow-on comparison found a separate
+  `strategy_allocations` primary replay with later PostgreSQL mutable authority
+  state. That contract remains deliberately unmodified and fail-closed. If the
+  supported production backfill reaches it, stop without reconciliation or
+  dashboard-control recovery and open a separate narrow diagnosis.
+
 ## Account snapshot identity repair (2026-07-18)
 
 - Read-only diagnosis against the sealed snapshot
