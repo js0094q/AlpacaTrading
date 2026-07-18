@@ -671,6 +671,8 @@ const run = async () => {
         checkpointMutationCount: backfill.checkpointMutationCount,
         mutationCount: backfill.mutationCount,
         idempotentReplay: backfill.idempotentReplay,
+        identityReuses: backfill.identityReuses,
+        mutableStateDifferences: backfill.mutableStateDifferences,
         durableBatchCheckpointCount,
         durableBatchCheckpointsVerified
       });
@@ -746,6 +748,8 @@ const run = async () => {
         tableComparisons: result.tableComparisons,
         discrepancyCount: result.discrepancyCount,
         discrepancyCategories: result.discrepancyCategories,
+        classifiedStateDifferences: result.classifiedStateDifferences,
+        authorityOnlyRows: result.authorityOnlyRows,
         duplicateCount: result.duplicateCount,
         orphanCount: result.orphanCount,
         lifecycleOrderingCount: result.lifecycleOrderingCount,

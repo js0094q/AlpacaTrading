@@ -204,6 +204,8 @@ test("durable execution checkpoint verification binds the snapshot and aggregate
     sourceAggregates: { tables: { orders: 1 } },
     targetAggregates: { tables: { orders: 1 } },
     discrepancyCategories: {},
+    classifiedStateDifferences: {},
+    authorityOnlyRows: {},
     discrepancyCount: 0,
     duplicateCount: 0,
     orphanCount: 0,
@@ -228,7 +230,11 @@ test("durable execution checkpoint verification binds the snapshot and aggregate
     },
     source_aggregates: expected.sourceAggregates,
     target_aggregates: expected.targetAggregates,
-    discrepancy_report: { discrepancyCategories: {} },
+    discrepancy_report: {
+      discrepancyCategories: {},
+      classifiedStateDifferences: {},
+      authorityOnlyRows: {}
+    },
     completed_at: completedAt
   };
   assert.equal(assertDurableExecutionStateCheckpoint(row, expected), true);

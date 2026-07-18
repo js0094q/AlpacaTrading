@@ -567,6 +567,15 @@ execution-state backfill, reconciliation, shadow, and authority boundaries, but
 production ownership must still advance through the documented staged gates. See
 `docs/runbooks/neon-postgres-operations.md`.
 
+Execution-state backfill treats `(account_id, snapshot_fingerprint)` and
+`(account_id, idempotency_key)` conflicts as idempotent only after comparing the
+existing PostgreSQL row semantically. It reuses the existing primary key and
+remaps dependent foreign keys without overwriting or deleting history; material
+mismatches fail closed. Reconciliation records mutable-state differences and
+PostgreSQL-only rows newer than the sealed source snapshot as classified durable
+checkpoint evidence. Only unexplained missing rows, mismatches, duplicates,
+orphans, or invariants block the authority gate.
+
 Terminal outcomes use persisted observations only and keep option-position and
 underlying-return bases separate. One original outcome is retained per lifecycle;
 corrections append as revisions. Trace one decision without returning raw payload

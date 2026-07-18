@@ -154,6 +154,12 @@ positions, order intents, orders, broker events, reservations, allocations,
 exposure, risk limits, execution evidence, and lifecycle fingerprints. A durable
 passed checkpoint, zero unexplained discrepancies, zero duplicates/orphans, and
 an idempotent zero-mutation replay are required before execution-state authority.
+The backfill reuses semantically equivalent existing rows for
+`(account_id, snapshot_fingerprint)` and `(account_id, idempotency_key)` identity
+conflicts, remapping dependent foreign keys and failing closed on material
+mismatches. Reconciliation explicitly records mutable-state differences and
+PostgreSQL-only rows newer than the sealed snapshot; those classifications do
+not erase or mutate PostgreSQL authority rows.
 
 Use this progression after schema and backfill validation:
 
