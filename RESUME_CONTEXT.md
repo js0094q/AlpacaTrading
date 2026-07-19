@@ -1,5 +1,32 @@
 # Resume Context: Alpaca Trading Research Infra
 
+## Strategy-allocation identity repair (2026-07-19)
+
+- The production `strategy_allocations` conflict is a primary-key replay of the
+  same account, strategy, configuration fingerprint, currency, allocation
+  amount, and allocation ratio. The sealed SQLite source is a generated current
+  observation, while PostgreSQL contains the same active singleton at a higher
+  version, later `updated_at`, and non-regressing deployed state.
+- The selected resolution is Outcome A, mutable singleton advancement. Reuse
+  requires exact identity, lifecycle, and allocation-policy agreement plus a
+  strictly higher PostgreSQL version and later update time. Deterministic
+  numeric, bigint, and timestamp representations compare canonically. Older or
+  unordered target state, a deployed-state regression, malformed data, later
+  activation provenance, and any identity or policy difference fail closed.
+- Valid reuse preserves the PostgreSQL row and primary key without mutation and
+  reports `mutable_singleton_advancement`. A separately keyed superseded
+  allocation remains PostgreSQL-only authority history. No database foreign key
+  references `strategy_allocations.id`, so the observed same-key replay needs no
+  downstream primary-key remap.
+- The isolated implementation is on
+  `codex/strategy-allocations-backfill-20260719`, based on deployed SHA
+  `64d3ff76f965f36097a59fdba9b97a45169b6d75`. Production promotion is still
+  gated on complete validation, commit, exact-SHA deployment, a fresh sealed
+  snapshot, and one supported backfill. Reconciliation and dashboard-control
+  recovery remain forbidden until the backfill completes and a durable passed
+  reconciliation checkpoint is independently re-read. The autonomous worker
+  remains stopped and live trading remains disabled.
+
 ## Risk-limit identity repair (2026-07-18)
 
 - The production execution-state conflict is on `risk_limits_pkey (id)`, not
@@ -20,11 +47,9 @@
   preserved as authority history; neither the source projection nor either
   database schema has a foreign key to `risk_limits`, so no dependent key
   remap is required.
-- A bounded read-only follow-on comparison found a separate
-  `strategy_allocations` primary replay with later PostgreSQL mutable authority
-  state. That contract remains deliberately unmodified and fail-closed. If the
-  supported production backfill reaches it, stop without reconciliation or
-  dashboard-control recovery and open a separate narrow diagnosis.
+- A bounded read-only follow-on comparison found the separate
+  `strategy_allocations` replay described above. Its dedicated Outcome A repair
+  supersedes the earlier instruction to leave that conflict unmodified.
 
 ## Account snapshot identity repair (2026-07-18)
 

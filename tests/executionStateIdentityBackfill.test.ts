@@ -167,8 +167,23 @@ const createFakeExecutionStatePool = () => {
           sameValue(existing.scope_key, row.scope_key)
         )
         : undefined;
+      const activeStrategyAllocation = table === "strategy_allocations"
+        ? rows.get(table)?.find((existing) =>
+          existing.status === "active" && existing.effective_to === null &&
+          row.status === "active" && row.effective_to === null &&
+          sameValue(existing.account_id, row.account_id) &&
+          sameValue(existing.strategy_key, row.strategy_key)
+        )
+        : undefined;
       if (activeRiskScope && !existingPrimary) {
         const error = new Error(`duplicate current risk scope for ${table}`) as Error & {
+          code?: string;
+        };
+        error.code = "23505";
+        throw error;
+      }
+      if (activeStrategyAllocation && !existingPrimary) {
+        const error = new Error(`duplicate current strategy allocation for ${table}`) as Error & {
           code?: string;
         };
         error.code = "23505";
@@ -244,7 +259,7 @@ const createFakeExecutionStatePool = () => {
 
 const makeFixture = async (
   prefix: string,
-  options: { capturedAt?: string } = {}
+  options: { capturedAt?: string; positionMarketValue?: number } = {}
 ) => {
   const directory = await mkdtemp(join(tmpdir(), prefix));
   const snapshotPath = join(directory, "source.db");
@@ -562,6 +577,389 @@ test("reuses the exact production risk-limit identity when only observation prov
         (checkpoint) => checkpoint.id === "execution-state-risk-limit-production"
       )?.status,
       "passed"
+    );
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("reuses the exact production-shaped newer strategy-allocation singleton", async () => {
+  const fixture = await makeFixture("execution-state-strategy-allocation-production-", {
+    capturedAt: "2026-07-17T19:59:53.128Z"
+  });
+  try {
+    const source = await readExecutionStateSnapshot(fixture.snapshotPath);
+    const sourceAllocation = source.rows.get("strategy_allocations")?.[0];
+    assert.ok(sourceAllocation);
+    const fake = createFakeExecutionStatePool();
+    const existingAllocation = {
+      ...sourceAllocation,
+      deployed_amount: "1250.50000000",
+      effective_from: "2026-07-17T16:35:00.031Z",
+      version: "158",
+      created_at: "2026-07-17T16:35:00.031Z",
+      updated_at: "2026-07-17T20:00:24.062Z"
+    };
+    const authorityOnlySupersededAllocation = {
+      ...sourceAllocation,
+      id: "postgres-superseded-strategy-allocation",
+      status: "superseded",
+      config_version: "postgres-prior-config-version",
+      config_fingerprint: "postgres-prior-config-fingerprint",
+      effective_from: "2026-07-17T13:54:34.316Z",
+      effective_to: "2026-07-17T16:35:00.031Z",
+      version: "2",
+      created_at: "2026-07-17T13:54:34.316Z",
+      updated_at: "2026-07-17T16:35:00.031Z"
+    };
+    fake.seed("strategy_allocations", existingAllocation);
+    fake.seed("strategy_allocations", authorityOnlySupersededAllocation);
+
+    const result = await backfillExecutionStateSnapshot({
+      snapshotPath: fixture.snapshotPath,
+      pool: fake.pool,
+      config: migrationConfig,
+      batchSize: 1,
+      observedAt: "2026-07-18T12:00:00.000Z"
+    });
+
+    assert.equal(result.insertedRows.strategy_allocations, 0);
+    assert.deepEqual(
+      result.identityReuses.find((reuse) => reuse.table === "strategy_allocations"),
+      {
+        table: "strategy_allocations",
+        sourceId: sourceAllocation.id,
+        targetId: sourceAllocation.id,
+        identityColumns: [
+          "id", "account_id", "strategy_key", "config_fingerprint"
+        ],
+        mutableDifferences: [
+          "deployed_amount", "effective_from", "version", "created_at", "updated_at"
+        ],
+        classification: "mutable_singleton_advancement"
+      }
+    );
+    assert.deepEqual(
+      fake.rows.get("strategy_allocations")?.find(
+        (row) => row.id === sourceAllocation.id
+      ),
+      existingAllocation
+    );
+    assert.deepEqual(
+      fake.rows.get("strategy_allocations")?.find(
+        (row) => row.id === authorityOnlySupersededAllocation.id
+      ),
+      authorityOnlySupersededAllocation
+    );
+    assert.equal(fake.rows.get("strategy_allocations")?.length, 2);
+    for (const column of [
+      "deployed_amount", "effective_from", "version", "created_at", "updated_at"
+    ]) {
+      assert.equal(result.mutableStateDifferences[`strategy_allocations:${column}`], 1);
+    }
+    assert.ok([...source.rows.entries()].every(([table, rows]) =>
+      table === "strategy_allocations" || rows.every((row) =>
+        Object.values(row).every((value) => value !== sourceAllocation.id)
+      )
+    ));
+
+    const replay = await backfillExecutionStateSnapshot({
+      snapshotPath: fixture.snapshotPath,
+      pool: fake.pool,
+      config: migrationConfig,
+      batchSize: 1,
+      observedAt: "2026-07-18T12:00:00.000Z"
+    });
+    assert.equal(replay.idempotentReplay, true);
+    assert.equal(replay.mutationCount, 0);
+    assert.equal(fake.rows.get("strategy_allocations")?.length, 2);
+
+    const reconciliation = await reconcileExecutionStateSnapshot({
+      snapshotPath: fixture.snapshotPath,
+      pool: fake.pool,
+      config: migrationConfig,
+      checkpointId: "execution-state-strategy-allocation-production",
+      observedAt: "2026-07-18T12:00:00.000Z"
+    });
+    assert.equal(reconciliation.status, "passed");
+    assert.equal(reconciliation.discrepancyCount, 0);
+    assert.equal(
+      reconciliation.tableComparisons.strategy_allocations.authorityOnly,
+      1
+    );
+    assert.equal(
+      reconciliation.tableComparisons.strategy_allocations.mutableStateDifference,
+      1
+    );
+    assert.equal(
+      fake.checkpoints.find(
+        (checkpoint) => checkpoint.id === "execution-state-strategy-allocation-production"
+      )?.status,
+      "passed"
+    );
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("accepts only proven strategy-allocation normalization equivalence", async () => {
+  const normalizationFixture = await makeFixture(
+    "execution-state-strategy-allocation-normalization-"
+  );
+  try {
+    const source = await readExecutionStateSnapshot(normalizationFixture.snapshotPath);
+    const sourceAllocation = source.rows.get("strategy_allocations")?.[0];
+    assert.ok(sourceAllocation);
+    const normalizedTarget: StoredRow = {
+      ...sourceAllocation,
+      allocation_amount: Number(sourceAllocation.allocation_amount),
+      allocation_ratio: Number(sourceAllocation.allocation_ratio),
+      reserved_amount: Number(sourceAllocation.reserved_amount),
+      deployed_amount: Number(sourceAllocation.deployed_amount),
+      version: String(sourceAllocation.version)
+    };
+    const fake = createFakeExecutionStatePool();
+    fake.seed("strategy_allocations", normalizedTarget);
+
+    const result = await backfillExecutionStateSnapshot({
+      snapshotPath: normalizationFixture.snapshotPath,
+      pool: fake.pool,
+      config: migrationConfig,
+      batchSize: 1
+    });
+
+    assert.equal(result.insertedRows.strategy_allocations, 0);
+    assert.equal(
+      result.identityReuses.some((reuse) => reuse.table === "strategy_allocations"),
+      false
+    );
+    assert.deepEqual(fake.rows.get("strategy_allocations"), [normalizedTarget]);
+  } finally {
+    await rm(normalizationFixture.directory, { recursive: true, force: true });
+  }
+
+  const staleProvenanceFixture = await makeFixture(
+    "execution-state-strategy-allocation-stale-provenance-",
+    { capturedAt: "2026-07-17T19:59:53.128Z" }
+  );
+  try {
+    const source = await readExecutionStateSnapshot(staleProvenanceFixture.snapshotPath);
+    const sourceAllocation = source.rows.get("strategy_allocations")?.[0];
+    assert.ok(sourceAllocation);
+    const staleProvenanceTarget = {
+      ...sourceAllocation,
+      effective_from: "2026-07-17T16:35:00.031Z",
+      created_at: "2026-07-17T16:35:00.031Z",
+      updated_at: "2026-07-17T16:35:00.031Z"
+    };
+    const fake = createFakeExecutionStatePool();
+    fake.seed("strategy_allocations", staleProvenanceTarget);
+
+    await assert.rejects(
+      () => backfillExecutionStateSnapshot({
+        snapshotPath: staleProvenanceFixture.snapshotPath,
+        pool: fake.pool,
+        config: migrationConfig,
+        batchSize: 1
+      }),
+      /EXECUTION_STATE_BACKFILL_STRATEGY_ALLOCATION_CONFLICT:STALE/
+    );
+    assert.deepEqual(
+      fake.rows.get("strategy_allocations"),
+      [staleProvenanceTarget]
+    );
+  } finally {
+    await rm(staleProvenanceFixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("fails closed with sanitized classifications for incompatible strategy allocations", async () => {
+  const cases: Array<{
+    label: string;
+    mutateTarget: (row: StoredRow) => void;
+    code: RegExp;
+  }> = [
+    {
+      label: "account-identity",
+      mutateTarget: (row) => { row.account_id = "different-account-identity"; },
+      code: /EXECUTION_STATE_BACKFILL_STRATEGY_ALLOCATION_CONFLICT:IDENTITY/
+    },
+    {
+      label: "strategy-identity",
+      mutateTarget: (row) => { row.strategy_key = "different-strategy"; },
+      code: /EXECUTION_STATE_BACKFILL_STRATEGY_ALLOCATION_CONFLICT:IDENTITY/
+    },
+    {
+      label: "configuration-fingerprint",
+      mutateTarget: (row) => { row.config_fingerprint = "different-fingerprint"; },
+      code: /EXECUTION_STATE_BACKFILL_STRATEGY_ALLOCATION_CONFLICT:POLICY/
+    },
+    {
+      label: "allocation-amount",
+      mutateTarget: (row) => { row.allocation_amount = "999999.00000000"; },
+      code: /EXECUTION_STATE_BACKFILL_STRATEGY_ALLOCATION_CONFLICT:POLICY/
+    },
+    {
+      label: "allocation-ratio",
+      mutateTarget: (row) => { row.allocation_ratio = "0.9999999999"; },
+      code: /EXECUTION_STATE_BACKFILL_STRATEGY_ALLOCATION_CONFLICT:POLICY/
+    },
+    {
+      label: "lifecycle-status",
+      mutateTarget: (row) => { row.status = "superseded"; },
+      code: /EXECUTION_STATE_BACKFILL_STRATEGY_ALLOCATION_CONFLICT:LIFECYCLE/
+    },
+    {
+      label: "malformed-numeric",
+      mutateTarget: (row) => { row.reserved_amount = "not-a-decimal"; },
+      code: /EXECUTION_STATE_BACKFILL_STRATEGY_ALLOCATION_CONFLICT:MALFORMED/
+    },
+    {
+      label: "malformed-version",
+      mutateTarget: (row) => { row.version = "not-an-integer"; },
+      code: /EXECUTION_STATE_BACKFILL_STRATEGY_ALLOCATION_CONFLICT:MALFORMED/
+    },
+    {
+      label: "unadvanced-version",
+      mutateTarget: (row) => {
+        row.deployed_amount = "1.00000000";
+        row.updated_at = "2026-07-18T18:20:00.000Z";
+      },
+      code: /EXECUTION_STATE_BACKFILL_STRATEGY_ALLOCATION_CONFLICT:STALE/
+    },
+    {
+      label: "later-activation-provenance",
+      mutateTarget: (row) => {
+        row.effective_from = "2026-07-19T00:00:00.000Z";
+        row.created_at = "2026-07-19T00:00:00.000Z";
+        row.updated_at = "2026-07-19T00:00:00.000Z";
+      },
+      code: /EXECUTION_STATE_BACKFILL_STRATEGY_ALLOCATION_CONFLICT:PROVENANCE_ORDER/
+    }
+  ];
+
+  for (const scenario of cases) {
+    const fixture = await makeFixture(`execution-state-strategy-${scenario.label}-`);
+    try {
+      const source = await readExecutionStateSnapshot(fixture.snapshotPath);
+      const sourceAllocation = source.rows.get("strategy_allocations")?.[0];
+      assert.ok(sourceAllocation);
+      const target: StoredRow = { ...sourceAllocation };
+      scenario.mutateTarget(target);
+      const fake = createFakeExecutionStatePool();
+      fake.seed("strategy_allocations", target);
+
+      await assert.rejects(
+        () => backfillExecutionStateSnapshot({
+          snapshotPath: fixture.snapshotPath,
+          pool: fake.pool,
+          config: migrationConfig,
+          batchSize: 1
+        }),
+        scenario.code,
+        scenario.label
+      );
+      assert.deepEqual(fake.rows.get("strategy_allocations"), [target], scenario.label);
+    } finally {
+      await rm(fixture.directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test("fails closed when a newer strategy-allocation head regresses deployed state", async () => {
+  const fixture = await makeFixture("execution-state-strategy-deployed-regression-", {
+    positionMarketValue: 100
+  });
+  try {
+    const source = await readExecutionStateSnapshot(fixture.snapshotPath);
+    const sourceAllocation = source.rows.get("strategy_allocations")?.[0];
+    assert.ok(sourceAllocation);
+    const target = {
+      ...sourceAllocation,
+      deployed_amount: "99.00000000",
+      version: "2",
+      updated_at: "2026-07-18T18:20:00.000Z"
+    };
+    const fake = createFakeExecutionStatePool();
+    fake.seed("strategy_allocations", target);
+
+    await assert.rejects(
+      () => backfillExecutionStateSnapshot({
+        snapshotPath: fixture.snapshotPath,
+        pool: fake.pool,
+        config: migrationConfig,
+        batchSize: 1
+      }),
+      /EXECUTION_STATE_BACKFILL_STRATEGY_ALLOCATION_CONFLICT:STATE_REGRESSION/
+    );
+    assert.deepEqual(fake.rows.get("strategy_allocations"), [target]);
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("fails closed on a distinct current allocation in the same account strategy", async () => {
+  const fixture = await makeFixture("execution-state-strategy-current-collision-");
+  try {
+    const source = await readExecutionStateSnapshot(fixture.snapshotPath);
+    const sourceAllocation = source.rows.get("strategy_allocations")?.[0];
+    assert.ok(sourceAllocation);
+    const distinctCurrent = {
+      ...sourceAllocation,
+      id: "postgres-distinct-current-strategy-allocation",
+      config_version: "postgres-distinct-config-version",
+      config_fingerprint: "postgres-distinct-config-fingerprint"
+    };
+    const fake = createFakeExecutionStatePool();
+    fake.seed("strategy_allocations", distinctCurrent);
+
+    await assert.rejects(
+      () => backfillExecutionStateSnapshot({
+        snapshotPath: fixture.snapshotPath,
+        pool: fake.pool,
+        config: migrationConfig,
+        batchSize: 1
+      }),
+      /EXECUTION_STATE_BACKFILL_STRATEGY_ALLOCATION_CONFLICT:CURRENT_STRATEGY/
+    );
+    assert.deepEqual(fake.rows.get("strategy_allocations"), [distinctCurrent]);
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("incompatible strategy allocation cannot produce a passed reconciliation checkpoint", async () => {
+  const fixture = await makeFixture("execution-state-strategy-reconciliation-conflict-");
+  try {
+    const source = await readExecutionStateSnapshot(fixture.snapshotPath);
+    const sourceAllocation = source.rows.get("strategy_allocations")?.[0];
+    assert.ok(sourceAllocation);
+    const target = {
+      ...sourceAllocation,
+      allocation_amount: "999999.00000000"
+    };
+    const fake = createFakeExecutionStatePool();
+    fake.seed("strategy_allocations", target);
+
+    const reconciliation = await reconcileExecutionStateSnapshot({
+      snapshotPath: fixture.snapshotPath,
+      pool: fake.pool,
+      config: migrationConfig,
+      checkpointId: "execution-state-strategy-reconciliation-conflict"
+    });
+
+    assert.equal(reconciliation.status, "blocked");
+    assert.equal(reconciliation.tableComparisons.strategy_allocations.mismatch, 1);
+    assert.equal(
+      reconciliation.discrepancyCategories["strategy_allocations:MISMATCH"],
+      1
+    );
+    assert.equal(
+      fake.checkpoints.find(
+        (checkpoint) => checkpoint.id ===
+          "execution-state-strategy-reconciliation-conflict"
+      )?.status,
+      "blocked"
     );
   } finally {
     await rm(fixture.directory, { recursive: true, force: true });

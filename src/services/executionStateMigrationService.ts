@@ -108,7 +108,7 @@ export interface ExecutionStateIdentityReuse {
   readonly targetId: string;
   readonly identityColumns: readonly string[];
   readonly mutableDifferences: readonly string[];
-  readonly classification?: "provenance_only";
+  readonly classification?: "provenance_only" | "mutable_singleton_advancement";
 }
 
 const uniqueIdentitySpecs: Readonly<Record<string, UniqueIdentitySpec>> = {
@@ -681,7 +681,7 @@ const normalizeJsonColumn = (row: TargetRow, spec: TableSpec) => {
 
 const comparableValue = (spec: TableSpec, column: string, value: unknown) => {
   if (value === null || value === undefined) return null;
-  if (["accounts", "risk_limits"].includes(spec.table) && column === "version") {
+  if (["accounts", "risk_limits", "strategy_allocations"].includes(spec.table) && column === "version") {
     try {
       return BigInt(String(value)).toString();
     } catch {
@@ -917,6 +917,179 @@ const classifyRiskLimitPrimaryReplay = (
     classification: provenanceDifferences.length ? "provenance_only" : "equivalent",
     provenanceDifferences
   };
+};
+
+const strategyAllocationIdentityColumns = [
+  "id", "account_id", "strategy_key", "config_fingerprint"
+] as const;
+const strategyAllocationBaseIdentityColumns = [
+  "id", "account_id", "strategy_key"
+] as const;
+const strategyAllocationPolicyColumns = [
+  "currency", "allocation_amount", "allocation_ratio", "config_version",
+  "config_fingerprint"
+] as const;
+const strategyAllocationLifecycleColumns = ["status", "effective_to"] as const;
+const strategyAllocationMutableColumns = [
+  "reserved_amount", "deployed_amount", "version", "updated_at"
+] as const;
+const strategyAllocationAuthorityStateColumns = [
+  "reserved_amount", "deployed_amount", "version"
+] as const;
+const strategyAllocationProvenanceColumns = ["effective_from", "created_at"] as const;
+
+type StrategyAllocationReplayClassification = Readonly<{
+  classification: "equivalent" | "mutable_singleton_advancement" | "conflict";
+  conflict?: "IDENTITY" | "POLICY" | "LIFECYCLE" | "MALFORMED" |
+    "STALE" | "STATE_REGRESSION" | "PROVENANCE_ORDER";
+  differences: readonly string[];
+}>;
+
+const validStrategyAllocationRow = (row: TargetRow) => {
+  const requiredStrings = [
+    "id", "account_id", "strategy_key", "status", "currency",
+    "config_version", "config_fingerprint"
+  ];
+  if (requiredStrings.some((column) =>
+    typeof row[column] !== "string" || String(row[column]).trim() === ""
+  )) return false;
+  if (!["active", "superseded", "disabled"].includes(String(row.status))) return false;
+  if (!/^[A-Z]{3}$/.test(String(row.currency))) return false;
+  if (positiveInteger(row.version) === null) return false;
+  if (
+    (row.allocation_amount === null || row.allocation_amount === undefined) &&
+    (row.allocation_ratio === null || row.allocation_ratio === undefined)
+  ) return false;
+  if (
+    row.reserved_amount === null || row.reserved_amount === undefined ||
+    row.deployed_amount === null || row.deployed_amount === undefined
+  ) return false;
+  try {
+    for (const [column, definition] of Object.entries(
+      numericColumnsByTable.strategy_allocations ?? {}
+    )) {
+      const value = row[column];
+      if (value === null || value === undefined) continue;
+      const normalized = canonicalizePostgresNumeric(
+        value as number | string,
+        definition.precision,
+        definition.scale
+      );
+      if (normalized === null || normalized.startsWith("-")) return false;
+      if (
+        column === "allocation_ratio" &&
+        BigInt(normalized.replace(".", "")) > 10_000_000_000n
+      ) return false;
+    }
+  } catch {
+    return false;
+  }
+  const effectiveFrom = riskLimitTimestamp(row.effective_from);
+  const createdAt = riskLimitTimestamp(row.created_at);
+  const updatedAt = riskLimitTimestamp(row.updated_at);
+  const effectiveTo = riskLimitTimestamp(row.effective_to);
+  if (effectiveFrom === null || createdAt === null || updatedAt === null) return false;
+  if (row.effective_to !== null && row.effective_to !== undefined && effectiveTo === null) {
+    return false;
+  }
+  if (effectiveTo !== null && effectiveTo <= effectiveFrom) return false;
+  if (updatedAt < createdAt) return false;
+  return true;
+};
+
+const strategyAllocationColumnValue = (column: string, value: unknown) => {
+  if (column === "version") {
+    return value === null || value === undefined ? null : positiveInteger(value);
+  }
+  const numeric = numericColumnsByTable.strategy_allocations?.[column];
+  if (numeric) {
+    return canonicalizePostgresNumeric(
+      value as number | string | null,
+      numeric.precision,
+      numeric.scale
+    );
+  }
+  if (column === "effective_from" || column === "effective_to" || column.endsWith("_at")) {
+    const parsed = riskLimitTimestamp(value);
+    return parsed === null ? null : new Date(parsed).toISOString();
+  }
+  return value ?? null;
+};
+
+const classifyStrategyAllocationPrimaryReplay = (
+  expected: TargetRow,
+  actual: TargetRow
+): StrategyAllocationReplayClassification => {
+  if (!validStrategyAllocationRow(expected) || !validStrategyAllocationRow(actual)) {
+    return { classification: "conflict", conflict: "MALFORMED", differences: [] };
+  }
+  if (strategyAllocationBaseIdentityColumns.some((column) =>
+    strategyAllocationColumnValue(column, expected[column]) !==
+      strategyAllocationColumnValue(column, actual[column])
+  )) {
+    return { classification: "conflict", conflict: "IDENTITY", differences: [] };
+  }
+  if (strategyAllocationPolicyColumns.some((column) =>
+    strategyAllocationColumnValue(column, expected[column]) !==
+      strategyAllocationColumnValue(column, actual[column])
+  )) {
+    return { classification: "conflict", conflict: "POLICY", differences: [] };
+  }
+  if (strategyAllocationLifecycleColumns.some((column) =>
+    strategyAllocationColumnValue(column, expected[column]) !==
+      strategyAllocationColumnValue(column, actual[column])
+  )) {
+    return { classification: "conflict", conflict: "LIFECYCLE", differences: [] };
+  }
+  const differences = [
+    ...strategyAllocationMutableColumns,
+    ...strategyAllocationProvenanceColumns
+  ].filter((column) =>
+    strategyAllocationColumnValue(column, expected[column]) !==
+      strategyAllocationColumnValue(column, actual[column])
+  ).sort((left, right) =>
+    tableSpecs.find((spec) => spec.table === "strategy_allocations")!.columns.indexOf(left) -
+      tableSpecs.find((spec) => spec.table === "strategy_allocations")!.columns.indexOf(right)
+  );
+  if (differences.length === 0) {
+    return { classification: "equivalent", differences };
+  }
+  if (strategyAllocationProvenanceColumns.some((column) =>
+    riskLimitTimestamp(actual[column])! > riskLimitTimestamp(expected[column])!
+  )) {
+    return { classification: "conflict", conflict: "PROVENANCE_ORDER", differences };
+  }
+  const stateDifferences = strategyAllocationAuthorityStateColumns.filter((column) =>
+    differences.includes(column)
+  );
+  if (stateDifferences.length === 0) {
+    return { classification: "conflict", conflict: "STALE", differences };
+  }
+  const expectedVersion = BigInt(positiveInteger(expected.version)!);
+  const actualVersion = BigInt(positiveInteger(actual.version)!);
+  const expectedUpdatedAt = riskLimitTimestamp(expected.updated_at)!;
+  const actualUpdatedAt = riskLimitTimestamp(actual.updated_at)!;
+  if (actualVersion <= expectedVersion || actualUpdatedAt <= expectedUpdatedAt) {
+    return { classification: "conflict", conflict: "STALE", differences };
+  }
+  const deployedDefinition = numericColumnsByTable.strategy_allocations!.deployed_amount!;
+  const expectedDeployed = canonicalizePostgresNumeric(
+    expected.deployed_amount as number | string,
+    deployedDefinition.precision,
+    deployedDefinition.scale
+  )!;
+  const actualDeployed = canonicalizePostgresNumeric(
+    actual.deployed_amount as number | string,
+    deployedDefinition.precision,
+    deployedDefinition.scale
+  )!;
+  if (
+    BigInt(actualDeployed.replace(".", "")) <
+      BigInt(expectedDeployed.replace(".", ""))
+  ) {
+    return { classification: "conflict", conflict: "STATE_REGRESSION", differences };
+  }
+  return { classification: "mutable_singleton_advancement", differences };
 };
 
 type ExecutionStateIdAliases = Map<string, Map<string, string>>;
@@ -1778,6 +1951,17 @@ const insertTargetRow = async (
     ) {
       throw new Error("EXECUTION_STATE_BACKFILL_RISK_LIMIT_CONFLICT:CURRENT_SCOPE");
     }
+    if (
+      spec.table === "strategy_allocations" &&
+      error !== null &&
+      typeof error === "object" &&
+      "code" in error &&
+      error.code === "23505"
+    ) {
+      throw new Error(
+        "EXECUTION_STATE_BACKFILL_STRATEGY_ALLOCATION_CONFLICT:CURRENT_STRATEGY"
+      );
+    }
     throw error;
   });
   const sourceId = String(row[spec.key]);
@@ -1812,6 +1996,34 @@ const insertTargetRow = async (
             identityColumns: riskLimitIdentityColumns,
             mutableDifferences: classification.provenanceDifferences,
             classification: "provenance_only"
+          }
+        };
+      }
+      return {
+        inserted: 0,
+        resolvedId: String(primary[spec.key]),
+        identityReuse: null
+      };
+    }
+    if (spec.table === "strategy_allocations") {
+      const classification = classifyStrategyAllocationPrimaryReplay(resolvedRow, primary);
+      if (classification.classification === "conflict") {
+        throw new Error(
+          `EXECUTION_STATE_BACKFILL_STRATEGY_ALLOCATION_CONFLICT:${classification.conflict}`
+        );
+      }
+      recordAlias(aliases, spec.table, row[spec.key], primary[spec.key]);
+      if (classification.classification !== "equivalent") {
+        return {
+          inserted: 0,
+          resolvedId: String(primary[spec.key]),
+          identityReuse: {
+            table: spec.table,
+            sourceId,
+            targetId: String(primary[spec.key]),
+            identityColumns: strategyAllocationIdentityColumns,
+            mutableDifferences: classification.differences,
+            classification: classification.classification
           }
         };
       }
@@ -2211,6 +2423,20 @@ const compareTargetTable = async (
       }
       continue;
     }
+    if (spec.table === "strategy_allocations" && !identityMatch) {
+      const classification = classifyStrategyAllocationPrimaryReplay(resolvedRow, actual);
+      if (classification.classification === "conflict") {
+        mismatch += 1;
+      } else if (classification.classification === "equivalent") {
+        exact += 1;
+      } else {
+        mutableStateDifference += 1;
+        for (const column of classification.differences) {
+          mutableDifferences[column] = (mutableDifferences[column] ?? 0) + 1;
+        }
+      }
+      continue;
+    }
     const differences = rowDifferences(
       spec,
       resolvedRow,
@@ -2234,10 +2460,12 @@ const compareTargetTable = async (
   const authorityOnly = targetRows.filter((row) => {
     if (matchedTargetIds.has(String(row[spec.key])) || accountId === null) return false;
     if (
-      spec.table === "risk_limits" &&
+      (spec.table === "risk_limits" || spec.table === "strategy_allocations") &&
       row.status === "superseded" &&
       row.effective_to !== null &&
-      validRiskLimitRow(row) &&
+      (spec.table === "risk_limits"
+        ? validRiskLimitRow(row)
+        : validStrategyAllocationRow(row)) &&
       riskLimitTimestamp(row.effective_to)! <= observedAtMs
     ) {
       return true;

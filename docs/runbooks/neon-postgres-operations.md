@@ -177,6 +177,17 @@ difference, or a mutable difference whose ordering cannot be proved is a
 sanitized fail-closed conflict. This rule does not weaken the
 `account_snapshots` fingerprint identity or collapse distinct observations.
 
+For `strategy_allocations`, the stable primary key identifies one current
+account, strategy, and configuration singleton. Reuse requires exact account,
+strategy, lifecycle, currency, allocation-policy, configuration-version, and
+configuration-fingerprint agreement after existing numeric normalization. A
+non-equivalent PostgreSQL row must have both a strictly higher version and a
+later `updated_at`, must not regress deployed state, and must not claim later
+activation provenance than the sealed observation. Preserve that row and its
+primary key without updating it; preserve separately keyed superseded allocation
+history. Any stale, unordered, malformed, identity-incompatible, or
+policy-incompatible row remains a sanitized fail-closed conflict.
+
 Use this progression after schema and backfill validation:
 
 1. Keep all PostgreSQL feature flags off while migration version 2 is applied

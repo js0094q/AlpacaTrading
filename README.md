@@ -576,6 +576,16 @@ PostgreSQL-only rows newer than the sealed source snapshot as classified durable
 checkpoint evidence. Only unexplained missing rows, mismatches, duplicates,
 orphans, or invariants block the authority gate.
 
+`strategy_allocations` is a current singleton per account and strategy for one
+configuration. A primary-key replay may preserve an existing PostgreSQL row only
+when account, strategy, lifecycle, configuration fingerprint/version, currency,
+allocation amount, and allocation ratio match exactly after existing canonical
+normalization; PostgreSQL has a strictly higher version and later update time;
+and deployed state does not regress. The reuse records mutable advancement and
+does not overwrite the row or collapse superseded allocation history. Stale,
+unordered, malformed, identity-incompatible, or policy-incompatible rows remain
+sanitized fail-closed conflicts.
+
 For `account_snapshots`, `snapshot_fingerprint` is the canonical portfolio-state
 identity. The persisted `evidence.marketEvidenceFingerprint` is separately
 captured market context, so a non-empty value may differ during identity reuse;

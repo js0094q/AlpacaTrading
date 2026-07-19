@@ -4,7 +4,7 @@ export const executionStateCandidateId = "candidate-execution-1";
 
 export const createExecutionStateSnapshotFixture = (
   path: string,
-  options: { capturedAt?: string } = {}
+  options: { capturedAt?: string; positionMarketValue?: number } = {}
 ) => {
   const capturedAt = options.capturedAt ?? "2026-07-16T16:00:00.000Z";
   const expiresAt = new Date(Date.parse(capturedAt) + 60 * 60 * 1_000).toISOString();
@@ -120,7 +120,13 @@ export const createExecutionStateSnapshotFixture = (
       maxPriceDriftPct: 2
     },
     configurationFingerprint: "release-4-configuration-fingerprint",
-    positions: [],
+    positions: options.positionMarketValue === undefined ? [] : [{
+      symbol: "AAPL",
+      assetClass: "equity" as const,
+      quantity: 1,
+      marketValue: options.positionMarketValue,
+      currentPrice: options.positionMarketValue
+    }],
     openOrders: [{
       symbol: "SPY",
       assetClass: "equity",
