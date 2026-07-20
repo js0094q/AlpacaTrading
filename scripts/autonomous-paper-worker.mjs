@@ -59,8 +59,20 @@ const assertRuntime = () => {
   if (!isTrue(process.env.POSTGRES_SCHEDULER_AUTHORITY_ENABLED)) {
     failures.push("POSTGRES_SCHEDULER_AUTHORITY_REQUIRED");
   }
+  if (!isTrue(process.env.POSTGRES_EXECUTION_STATE_AUTHORITY_ENABLED)) {
+    failures.push("POSTGRES_EXECUTION_STATE_AUTHORITY_REQUIRED");
+  }
+  if (!isFalse(process.env.POSTGRES_SHADOW_COMPARE_ENABLED)) {
+    failures.push("POSTGRES_SHADOW_COMPARE_DISABLED_REQUIRED");
+  }
+  if (!isFalse(process.env.POSTGRES_EXECUTION_STATE_SHADOW_ENABLED)) {
+    failures.push("POSTGRES_EXECUTION_STATE_SHADOW_DISABLED_REQUIRED");
+  }
   if (!isFalse(process.env.SQLITE_AUDIT_MIRROR_ENABLED)) {
     failures.push("SQLITE_AUDIT_MIRROR_DISABLED_REQUIRED");
+  }
+  if (!isTrue(process.env.AUTONOMOUS_RUNTIME_AUDIT_APPROVED)) {
+    failures.push("EVIDENCE_UTILIZATION_RUNTIME_AUDIT_REQUIRED");
   }
   if (failures.length) {
     const error = new Error("AUTONOMOUS_WORKER_CONFIGURATION_INVALID");

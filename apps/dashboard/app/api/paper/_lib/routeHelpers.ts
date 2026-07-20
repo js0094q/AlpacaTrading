@@ -12,10 +12,16 @@ import { parsePaperActionInput, type PaperActionInput } from "../../../../lib/da
 import { redactSensitiveData, redactSensitiveText } from "../../../../../../src/lib/securityRedaction";
 import type { RuntimeMutationActionType } from "../../../../../../src/services/runtimeMutationPreflight";
 import {
-  buildVercelHistoricalFallback,
-  isPaperDashboardBridgeEnabled,
-  shouldUseVercelReadOnlyFallback
+  isPaperDashboardBridgeEnabled
 } from "../../../../lib/runtime";
+
+const postgresBridgeRequired = () => {
+  throw new DashboardGuardError(
+    "DASHBOARD_POSTGRES_BRIDGE_REQUIRED",
+    "The PostgreSQL authority bridge is required.",
+    503
+  );
+};
 
 const readActionInput = async (request: Request): Promise<PaperActionInput> => {
   try {
@@ -267,7 +273,8 @@ export const guardedGet = async (
       return noStoreVpsControlJson(response);
     }
 
-    return noStoreJson({ ok: true, data: await handler() });
+    void handler;
+    return postgresBridgeRequired();
   } catch (error) {
     const sanitized = sanitizeDashboardError(error);
     return noStoreJson(sanitized.body, { status: sanitized.status });
@@ -288,10 +295,8 @@ export const guardedHistoricalGet = async (
       });
       return noStoreVpsControlJson(response);
     }
-    if (shouldUseVercelReadOnlyFallback()) {
-      return noStoreJson(buildVercelHistoricalFallback([]));
-    }
-    return noStoreJson({ ok: true, data: await handler() });
+    void handler;
+    return postgresBridgeRequired();
   } catch (error) {
     const sanitized = sanitizeDashboardError(error);
     return noStoreJson(sanitized.body, { status: sanitized.status });
@@ -349,7 +354,8 @@ export const guardedPost = async (
       return noStoreVpsControlJson(response);
     }
 
-    return noStoreJson({ ok: true, data: await handler(input) });
+    void handler;
+    return postgresBridgeRequired();
   } catch (error) {
     const sanitized = sanitizeDashboardError(error);
     return noStoreJson(sanitized.body, { status: sanitized.status });
@@ -398,10 +404,6 @@ export const guardedHistoricalPost = async (
       assertPaperOptionsSubmissionEnabled();
     }
 
-    if (shouldUseVercelReadOnlyFallback()) {
-      return noStoreJson(buildVercelHistoricalFallback([]));
-    }
-
     if (isPaperDashboardBridgeEnabled() && options.vpsPath) {
       const response = await guardForVpsBridge(normalizedRequest, "POST", options.vpsPath, {
         requireAdmin: requireAdminToken,
@@ -411,7 +413,8 @@ export const guardedHistoricalPost = async (
       return noStoreVpsControlJson(response);
     }
 
-    return noStoreJson({ ok: true, data: await handler(input) });
+    void handler;
+    return postgresBridgeRequired();
   } catch (error) {
     const sanitized = sanitizeDashboardError(error);
     return noStoreJson(sanitized.body, { status: sanitized.status });

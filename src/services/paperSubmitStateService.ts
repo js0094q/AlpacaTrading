@@ -17,10 +17,6 @@ import {
   listActivePaperNewRiskReservations,
   type PaperExecutionLedgerEntry
 } from "./paperExecutionLedgerService.js";
-import {
-  loadPaperPlanConfig,
-  paperOptionsConfig
-} from "./paperPlanService.js";
 import type {
   ReviewedPayloadSectionName,
   ReviewedPayloadSections
@@ -30,7 +26,16 @@ import {
   buildZeroDteActivityEvidence,
   type ZeroDteActivityEvidence
 } from "./zeroDte/zeroDteActivityEvidenceService.js";
-import { loadZeroDteConfig } from "./zeroDte/zeroDteConfigService.js";
+import {
+  loadPaperSubmitSafetyConfig,
+  type PaperSubmitConfiguration,
+  type PaperSubmitSafetyConfig
+} from "./paperSubmitSafetyConfig.js";
+export {
+  loadPaperSubmitSafetyConfig,
+  type PaperSubmitConfiguration,
+  type PaperSubmitSafetyConfig
+} from "./paperSubmitSafetyConfig.js";
 import { parseOptionSymbol } from "./optionSymbolService.js";
 import { executionStateProjectionService } from "./executionStateProjectionService.js";
 
@@ -39,34 +44,6 @@ const ENTRY_SECTIONS = new Set<ReviewedPayloadSectionName>([
   "equityAdds",
   "optionBuys"
 ]);
-
-export interface PaperSubmitConfiguration {
-  environment: string;
-  tradingMode: string;
-  liveTradingEnabled: boolean;
-  paperOrderExecutionEnabled: boolean;
-  paperOptionsExecutionEnabled: boolean;
-  maxPositionNotional: number;
-  maxTotalPlanNotional: number;
-  equityMaxNotionalPerOrder: number;
-  equityMaxPortfolioDeployPct: number;
-  equityMaxPositionPct: number;
-  equityMinCashReservePct: number;
-  optionMaxOrderNotional: number;
-  optionMaxContracts: number;
-  optionMaxPortfolioRiskPct: number;
-  optionMaxPositionRiskPct: number;
-  quoteMaxAgeSeconds: number;
-  maxPriceDriftPct: number;
-  zeroDteMaxTradesPerDay?: number;
-  zeroDteMaxDailyPremium?: number;
-  zeroDteMaxDailyRealizedLoss?: number;
-  zeroDteMaxOpenPositions?: number;
-}
-
-export interface PaperSubmitSafetyConfig extends PaperSubmitConfiguration {
-  allocationIdentity: "baseline-v1";
-}
 
 export interface PaperSubmitAccountState {
   status: string | null;
@@ -234,85 +211,6 @@ const first = (env: NodeJS.ProcessEnv, ...names: string[]) => {
     if (value !== undefined && value.trim()) return value;
   }
   return undefined;
-};
-
-export const loadPaperSubmitSafetyConfig = (
-  env: NodeJS.ProcessEnv = process.env
-): PaperSubmitSafetyConfig => {
-  const plan = env === process.env ? loadPaperPlanConfig() : null;
-  const options = env === process.env ? paperOptionsConfig() : null;
-  const liveTradingEnabled =
-    flag(env.ALPACA_LIVE_TRADE) || flag(env.LIVE_TRADING_ENABLED);
-  const zeroDte = env === process.env ? loadZeroDteConfig() : null;
-
-  return {
-    environment: String(env.ALPACA_ENV || "paper").trim().toLowerCase(),
-    tradingMode: String(env.TRADING_MODE || "paper").trim().toLowerCase(),
-    liveTradingEnabled,
-    paperOrderExecutionEnabled: flag(env.PAPER_ORDER_EXECUTION_ENABLED),
-    paperOptionsExecutionEnabled: flag(env.PAPER_OPTIONS_EXECUTION_ENABLED),
-    maxPositionNotional:
-      plan?.maxPositionNotional ??
-      positive(
-        first(env, "PAPER_PLAN_MAX_POSITION_NOTIONAL", "PAPER_EQUITY_MAX_NOTIONAL_PER_ORDER"),
-        5_000
-      ),
-    maxTotalPlanNotional:
-      plan?.maxTotalPlanNotional ??
-      positive(env.PAPER_PLAN_MAX_TOTAL_PLAN_NOTIONAL, 50_000),
-    equityMaxNotionalPerOrder:
-      plan?.equityMaxNotionalPerOrder ??
-      positive(env.PAPER_EQUITY_MAX_NOTIONAL_PER_ORDER, 5_000),
-    equityMaxPortfolioDeployPct:
-      plan?.equityMaxPortfolioDeployPct ??
-      percent(env.PAPER_EQUITY_MAX_PORTFOLIO_DEPLOY_PCT, 50),
-    equityMaxPositionPct:
-      plan?.equityMaxPositionPct ??
-      percent(env.PAPER_EQUITY_MAX_POSITION_PCT, 10),
-    equityMinCashReservePct:
-      plan?.equityMinCashReservePct ??
-      percent(
-        first(env, "PAPER_EQUITY_MIN_CASH_RESERVE_PCT", "PAPER_PLAN_MIN_BUYING_POWER_RESERVE_PCT"),
-        20
-      ),
-    optionMaxOrderNotional:
-      options?.maxOrderNotional ??
-      positive(
-        first(env, "PAPER_OPTION_MAX_ORDER_NOTIONAL", "PAPER_OPTIONS_MAX_PREMIUM_PER_ORDER"),
-        1_500
-      ),
-    optionMaxContracts:
-      options?.maxContracts ??
-      Math.max(
-        1,
-        Math.floor(
-          positive(
-            first(env, "PAPER_OPTION_MAX_CONTRACTS", "PAPER_OPTIONS_MAX_CONTRACTS"),
-            1
-          )
-        )
-      ),
-    optionMaxPortfolioRiskPct:
-      options?.maxPortfolioRiskPct ??
-      percent(env.PAPER_OPTIONS_MAX_PORTFOLIO_RISK_PCT, 20),
-    optionMaxPositionRiskPct:
-      options?.maxPositionRiskPct ??
-      percent(env.PAPER_OPTIONS_MAX_POSITION_RISK_PCT, 5),
-    quoteMaxAgeSeconds: positive(env.PAPER_SUBMIT_QUOTE_MAX_AGE_SECONDS, 60),
-    maxPriceDriftPct: percent(env.PAPER_SUBMIT_MAX_PRICE_DRIFT_PCT, 10),
-    zeroDteMaxTradesPerDay:
-      zeroDte?.maxTradesPerDay ??
-      Math.max(1, Math.floor(positive(env.ZERO_DTE_MAX_TRADES_PER_DAY, 3))),
-    zeroDteMaxDailyPremium:
-      zeroDte?.maxDailyPremium ?? positive(env.ZERO_DTE_MAX_DAILY_PREMIUM, 750),
-    zeroDteMaxDailyRealizedLoss:
-      zeroDte?.maxDailyRealizedLoss ??
-      positive(env.ZERO_DTE_MAX_DAILY_REALIZED_LOSS, 250),
-    zeroDteMaxOpenPositions:
-      zeroDte?.maxOpenPositions ??
-      Math.max(1, Math.floor(positive(env.ZERO_DTE_MAX_OPEN_POSITIONS, 3))),
-    allocationIdentity: "baseline-v1"
-  };
 };
 
 const configurationWithoutAllocation = (

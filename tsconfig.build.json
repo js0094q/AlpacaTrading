@@ -1,0 +1,19 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "dist/postgres-only",
+    "rootDir": "."
+  },
+  "include": [
+    "src/postgresOnlyCli.ts",
+    "server/dashboard-control/server.ts"
+  ],
+  "exclude": [
+    "src/cli.ts",
+    "src/lib/db.ts",
+    "src/lib/sqliteConcurrencySchema.ts",
+    "src/lib/sqliteMigrations.ts",
+    "src/lib/zeroDteSchema.ts",
+    "tests"
+  ]
+}

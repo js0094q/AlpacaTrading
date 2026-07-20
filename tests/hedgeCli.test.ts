@@ -33,12 +33,25 @@ initializeDatabaseHandle(fixtureDb);
 fixtureDb.close();
 
 const runHedgeCli = (script: string, args: string[]) => {
-  const result = spawnSync("npm", ["--silent", "run", script, "--", ...args], {
+  const command = script === "hedge:execute" ? "hedge:execute" : script;
+  const result = spawnSync(
+    process.execPath,
+    [
+      "--import",
+      "tsx",
+      "--import",
+      "./tests/helpers/enableSqliteFixtureInitialization.mjs",
+      "src/cli.ts",
+      command,
+      ...args
+    ],
+    {
     cwd: process.cwd(),
     env: safeEnv,
     encoding: "utf8",
     timeout: 15_000
-  });
+    }
+  );
   return {
     ...result,
     json: result.stdout.trim() ? JSON.parse(result.stdout) as Record<string, unknown> : null
@@ -49,12 +62,16 @@ after(() => {
   rmSync(tempDir, { recursive: true, force: true });
 });
 
-test("package exposes the read-only hedge scripts and guarded paper executor", () => {
-  assert.equal(packageJson.scripts["hedge:risk"], "tsx src/cli.ts hedge:risk");
-  assert.equal(packageJson.scripts["hedge:regime"], "tsx src/cli.ts hedge:regime");
-  assert.equal(packageJson.scripts["hedge:review"], "tsx src/cli.ts hedge:review");
-  assert.equal(packageJson.scripts["hedge:plan"], "tsx src/cli.ts hedge:plan");
-  assert.equal(packageJson.scripts["hedge:execute"], "tsx src/cli.ts hedge:execute");
+test("production package retires all SQLite-backed hedge workflows", () => {
+  for (const script of [
+    "hedge:risk",
+    "hedge:regime",
+    "hedge:review",
+    "hedge:plan",
+    "hedge:execute"
+  ]) {
+    assert.equal(packageJson.scripts[script], undefined, script);
+  }
 });
 
 test("hedge execute fails closed before broker access when the paper flag is disabled", () => {

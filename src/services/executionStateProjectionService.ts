@@ -21,7 +21,7 @@ import {
   type AlpacaApiResponse,
   type AlpacaSubmittedOrder
 } from "./alpacaClient.js";
-import { canonicalizePostgresNumeric } from "./controlPlaneMigrationService.js";
+import { canonicalizePostgresNumeric } from "../lib/database/postgresNumeric.js";
 import {
   currentControlPlaneRuntimeContext,
   type ControlPlaneRuntimeContext

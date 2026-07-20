@@ -1,541 +1,71 @@
-# Resume Context: Alpaca Trading Research Infra
+# Resume Context: PostgreSQL-Only Authority Cutover
 
-## Strategy-allocation identity repair (2026-07-19)
+Date: 2026-07-20
 
-- The production `strategy_allocations` conflict is a primary-key replay of the
-  same account, strategy, configuration fingerprint, currency, allocation
-  amount, and allocation ratio. The sealed SQLite source is a generated current
-  observation, while PostgreSQL contains the same active singleton at a higher
-  version, later `updated_at`, and non-regressing deployed state.
-- The selected resolution is Outcome A, mutable singleton advancement. Reuse
-  requires exact identity, lifecycle, and allocation-policy agreement plus a
-  strictly higher PostgreSQL version and later update time. Deterministic
-  numeric, bigint, and timestamp representations compare canonically. Older or
-  unordered target state, a deployed-state regression, malformed data, later
-  activation provenance, and any identity or policy difference fail closed.
-- Valid reuse preserves the PostgreSQL row and primary key without mutation and
-  reports `mutable_singleton_advancement`. A separately keyed superseded
-  allocation remains PostgreSQL-only authority history. No database foreign key
-  references `strategy_allocations.id`, so the observed same-key replay needs no
-  downstream primary-key remap.
-- The isolated implementation is on
-  `codex/strategy-allocations-backfill-20260719`, based on deployed SHA
-  `64d3ff76f965f36097a59fdba9b97a45169b6d75`. Production promotion is still
-  gated on complete validation, commit, exact-SHA deployment, a fresh sealed
-  snapshot, and one supported backfill. Reconciliation and dashboard-control
-  recovery remain forbidden until the backfill completes and a durable passed
-  reconciliation checkpoint is independently re-read. The autonomous worker
-  remains stopped and live trading remains disabled.
+## Authority decision
 
-## Risk-limit identity repair (2026-07-18)
+PostgreSQL is the sole production runtime authority. Do not resume historical
+SQLite migration, backfill, reconciliation, shadow comparison, dual-write,
+fallback, or migration-gate work. SQLite is available only to isolated test
+fixtures and historical implementation modules that are not packaged runtime
+commands.
 
-- The production execution-state conflict is on `risk_limits_pkey (id)`, not
-  the partial current-scope index. The sealed source and PostgreSQL row have the
-  same account, portfolio scope, paper environment, associated strategy,
-  configuration fingerprint, and complete limit-policy semantics.
-- The only differences are source-later `effective_from`, `created_at`, and
-  `updated_at` observation provenance plus numeric-versus-string bigint
-  representation for `version=1`. The repair preserves the earlier PostgreSQL
-  activation row and primary key, records `provenance_only`, and uses the same
-  direction-sensitive classifier during reconciliation.
-- Every amount, ratio, count, currency, configuration identity, lifecycle
-  field, account/scope identity, malformed value, and unsupported provenance
-  order remains fail-closed. The current-scope uniqueness race is translated to
-  a sanitized conflict. No risk value, strategy behavior, schema, or identity
-  algorithm changed.
-- PostgreSQL contains a separately keyed superseded risk-policy row. It is
-  preserved as authority history; neither the source projection nor either
-  database schema has a foreign key to `risk_limits`, so no dependent key
-  remap is required.
-- A bounded read-only follow-on comparison found the separate
-  `strategy_allocations` replay described above. Its dedicated Outcome A repair
-  supersedes the earlier instruction to leave that conflict unmodified.
+Required production settings:
 
-## Account snapshot identity repair (2026-07-18)
+- `DATABASE_BACKEND=postgres`
+- `POSTGRES_READS_ENABLED=true`
+- `POSTGRES_WRITES_ENABLED=true`
+- `POSTGRES_CONTROL_PLANE_AUTHORITY_ENABLED=true`
+- `POSTGRES_SCHEDULER_AUTHORITY_ENABLED=true`
+- `POSTGRES_EXECUTION_STATE_AUTHORITY_ENABLED=true`
+- `POSTGRES_SHADOW_COMPARE_ENABLED=false`
+- `POSTGRES_EXECUTION_STATE_SHADOW_ENABLED=false`
+- `SQLITE_AUDIT_MIRROR_ENABLED=false`
+- `ALPACA_ENV=paper`
+- `TRADING_MODE=paper`
+- `ALPACA_LIVE_TRADE=false`
+- `LIVE_TRADING_ENABLED=false`
+- `AUTONOMOUS_RUNTIME_AUDIT_APPROVED=false`
 
-- Read-only diagnosis against the sealed snapshot
-  `ee7624b0254eab23335b922dae774e4ddbb00fe5a399ddcb89125575435b2431` found
-  67 source `account_snapshots` rows, 86 PostgreSQL rows for the source account,
-  zero source duplicate identities, and two cross-primary-key collisions on
-  `(account_id, snapshot_fingerprint)`.
-- Both collisions had the same account and fingerprint identity. After the
-  existing numeric, UTC timestamp, and canonical-JSON normalization, the only
-  differing persisted snapshot evidence was the top-level
-  `evidence.marketEvidenceFingerprint`; source `observed_at` and `created_at`
-  were newer provenance. No raw account values or credentials were emitted.
-- The source projection sets `snapshot_fingerprint` from `portfolioFingerprint`
-  and validates market evidence separately. The isolated repair therefore
-  excludes only a present, non-empty `marketEvidenceFingerprint` from snapshot
-  identity equality, records it as
-  `account_snapshots:evidence.marketEvidenceFingerprint`, preserves the
-  existing PostgreSQL row/evidence, and remaps dependent foreign keys. All
-  structural evidence, identity fields, and malformed/missing market values
-  remain material fail-closed mismatches. No schema or fingerprint algorithm
-  changed.
-- Implementation is isolated on
-  `codex/execution-state-identity-backfill-deploy` in
-  `/private/tmp/alpaca-current-main.KFVLlj`, based on deployed SHA
-  `3d6e49cd731e0388b05f8390e2811afe4fd01e93`. It has not been committed or
-  deployed. The primary checkout remains separately dirty with unrelated user
-  changes.
-- Focused identity tests passed 13/13; Release 4 passed 53/53; full `npm test`
-  passed; typecheck, build, and diff checks passed. Neon integration was run
-  because its environment was available: 2/3 tests passed, while the packaged
-  Release 4 replay failed at `packaged_backfill_replay`; the same failure
-  reproduces on a clean base worktree at `3d6e49cd...`, so it is pre-existing
-  and remains an explicit promotion caveat.
-- Independent read-only review found no critical or important findings. Before
-  promotion, remove diagnostic-only artifacts, commit only the isolated repair
-  and handoff/spec docs, deploy that exact SHA, verify the VPS checkout, create
-  a fresh sealed snapshot, and make exactly one supported backfill attempt.
-  Stop on any new conflict or database failure; reconcile only after backfill
-  succeeds. Dashboard-control remains stopped until a durable reconciliation
-  checkpoint passes, and the autonomous worker/live paths remain stopped.
+Missing PostgreSQL authority or connectivity fails closed. Do not print
+connection values or other secrets.
 
-## Neon operational-state migration Release 4 implementation (2026-07-16)
+## Supported operations
 
-- Branch `codex/neon-authority-cutover` remains based on
-  `origin/main@624fc45372bc80fbe48664a586b135985f23c34c`; production flags and
-  services are unchanged while the implementation PR is prepared.
-- PostgreSQL fencing now covers all 14 approved timers. Release 4 adds the
-  execution-state repository, sealed-snapshot backfill, reconciliation,
-  shadow/authority routing, and fail-closed broker transaction boundaries.
-- PostgreSQL execution authority bypasses SQLite decisions and authoritative
-  mutations for reviewed entry/exit, hedge entry/exit, and zero-DTE entry/exit.
-  Exact replay makes no broker call, ambiguous results require reconciliation,
-  and no PostgreSQL transaction spans a broker or market-data request.
-- The implementation reuses PostgreSQL migrations 1 and 2; migration 3 remains
-  absent. Production cutover is a separate staged operation after merge and
-  deployment, with paper mode retained and live trading disabled.
+```bash
+npm run db:postgres:connectivity
+npm run db:postgres:status
+npm run db:postgres:verify
+npm run db:postgres:authority:status
+```
 
-## Neon operational-state migration Release 3 control plane (2026-07-15)
+The one-time deployment workflow is
+`npm run db:postgres:authority:cutover`. It reads fresh Alpaca paper account,
+position, and open-order state; verifies existing risk/allocation policy
+fingerprints; expires already-stale PostgreSQL reservations/reviews/evidence;
+terminalizes abandoned research rows; projects current state; reconciles known
+orders through read-only broker lookups; and writes a fresh authority baseline.
+The baseline must say:
 
-- Release 3 adds PostgreSQL schema version 2, fenced scheduler leases,
-  control-plane repositories, explicit read-only SQLite snapshot, resumable
-  backfill, reconciliation, shadow discrepancy reporting, and feature-flagged
-  research authority.
-- Defaults remain SQLite-authoritative. Deploy schema/code with all PostgreSQL
-  authority flags off, run migration twice, verify 23 tables/59 indexes, then
-  quiesce SQLite writers for the protected snapshot and backfill.
-- Reconciliation must explain every count, identifier, decision link,
-  lifecycle status/order, idempotency/provenance, active run, candidate-by-run,
-  active lease, and checkpoint difference before shadow or authority expands.
-- Only research may use Release 3 fenced scheduler authority after the gate.
-  `zero_dte`, `observatory`, `reconciliation`, `exit_review`, `paper_exit`,
-  `allocation`, and `market_data_refresh` remain SQLite-owned until their
-  durable writes validate the current fencing token.
-- In control-plane authority mode PostgreSQL commits first and never falls back
-  to SQLite. `SQLITE_AUDIT_MIRROR_ENABLED=true` is a temporary compatibility
-  projection only for remaining Release 4 readers; it is not dual authority.
-- Candidate lifecycle backfill uses candidate-linked `decision_snapshots` and
-  `decision_lifecycle_events`. Non-candidate decision lifecycle is explicitly
-  reported and deferred to Release 4.
+- `baselineType=fresh_postgresql_authority_cutover`
+- `historicalSqliteReconciliation=false`
+- `brokerMutationAttempted=false`
+- `ordersSubmitted=0`
 
-## Neon operational-state migration Release 2 foundation (2026-07-15)
+Do not relabel or overwrite earlier blocked historical reconciliation
+checkpoints.
 
-- Release 2 adds `pg`, runtime-specific pooled/direct configuration, one-client
-  transaction helpers, bounded PostgreSQL retry classification, explicit
-  connectivity/migrate/status/verify commands, domain repository contracts, and
-  the version 1 operational schema.
-- Controlled local Neon validation used only the mode-`0600` Desktop source.
-  Pooled and direct TLS connectivity passed on PostgreSQL 17 with transaction
-  timeout support. Migration version 1 applied once, applied nothing on the
-  second run, and verified 22 tables, 55 named indexes, and the scheduler
-  fencing sequence.
-- `DATABASE_BACKEND` remains `sqlite`; PostgreSQL reads, writes, shadow,
-  control-plane authority, execution-state authority, and SQLite audit mirror
-  remain off. No backfill or authority cutover has occurred.
-- The Vercel payload includes protected `GET /api/paper/database/health`. The VPS
-  receives only `DATABASE_URL` and `DATABASE_URL_UNPOOLED` through the protected
-  merge runbook; values must never appear in output or journald.
+## Runtime state after deployment
 
-## Neon operational-state migration Release 1 (2026-07-15)
+- Start and validate `alpaca-dashboard-control.service` on `127.0.0.1:4100`.
+- Keep `alpaca-autonomous-paper.service` stopped and disabled.
+- Keep all paper execution/review/research/observatory/0DTE timers disabled.
+- Dashboard reads require the PostgreSQL-backed VPS bridge and return `503`
+  when PostgreSQL or the passed authority baseline is unavailable.
+- Dashboard mutations return `POSTGRES_ONLY_RUNTIME_PATH_DISABLED`.
+- Do not submit paper or live orders.
 
-- Work is isolated on `codex/neon-postgres-operational-state` from verified
-  `origin/main@8cc9fe8431e3676b96a3a904a1256d4aa2dcf21b`. Release 1 changes inventory
-  and transition safeguards only; SQLite remains authoritative and all
-  PostgreSQL authority flags remain absent/off.
-- The inventory verifies 54 application tables plus `schema_migrations`, maps
-  every direct writer, transaction family, runtime-DDL boundary, scheduled
-  owner, and target ownership, and records ADR-010's staged PostgreSQL cutover.
-- Ordinary runtime now rejects a missing/empty/pending SQLite database without
-  creating files or applying DDL. Only explicit `db:migrate` and isolated Node
-  test fixtures may initialize schema.
-- Retry-safe operations now classify both `SQLITE_BUSY` and `SQLITE_LOCKED`, use
-  bounded exponential backoff with jitter and a total deadline, and redact
-  telemetry. Validation/constraint/corruption/application errors are not retried.
-- A quiesced same-filesystem Btrfs/RBD copy passed WAL, checkpoint, concurrent
-  reader/writer, online backup, SIGKILL recovery, integrity, foreign-key, and
-  migration-twice checks. Production remains on DELETE because backup/restore
-  is not sidecar-aware; the source database was unchanged.
-- Desktop Neon configuration was secured to mode `0600`; values were not
-  printed or copied. No Neon variable has been added to the VPS yet. No paper
-  or live order was submitted.
+## Next action
 
-## Steady-state SQLite concurrency repair (2026-07-15)
-
-- The failed research run was not a migration-startup failure. Its exact
-  failing write was the idempotent `research_runs` heartbeat update after
-  option snapshot ingestion. The closest proven competing scope was the
-  scheduled 0DTE engine's `BEGIN IMMEDIATE` persistence batch; historical logs
-  do not identify its lock-holder PID or exact duration.
-- The repair keeps the explicit migration boundary and DELETE journal mode,
-  adds the `2026-07-15-steady-state-sqlite-concurrency` migration for the
-  `runtime_write_leases` table, and keeps all 14 timers enabled. Only research
-  option persistence and the 0DTE engine persistence batch use the named heavy
-  lease. Options are normalized outside transactions and written in bounded
-  idempotent batches; bounded `SQLITE_BUSY` retry is limited to lifecycle,
-  lease-maintenance, and rollback-safe persistence writes.
-- Structured contention telemetry includes operation, transaction duration,
-  retry count, process identity, and run/correlation ID. Lost leases stop the
-  next durable write. Review, execution, exit execution, and all paper/live
-  order paths remain safety-gated and were not run during repair validation.
-
-## Paper runtime contention and research recovery release (2026-07-15)
-
-- Production diagnosis traced Automated Paper Research failure to ordinary CLI
-  startup executing base DDL plus unconditional Phase 1B and 0DTE
-  `BEGIN IMMEDIATE` transactions while six scheduled workflows overlapped.
-- The release adds migration version
-  `2026-07-15-paper-runtime-contention-recovery`. Production must run
-  `npm run db:migrate` before SQLite-backed services restart. Ordinary startup
-  is read-only when current and fails closed on empty or pending schemas; only
-  isolated Node test fixtures may initialize scratch databases automatically.
-- Dashboard command failures keep structured stdout primary and retain bounded,
-  redacted stderr warnings separately. `database is locked` is no longer
-  replaced by Node's SQLite `ExperimentalWarning`.
-- Alpaca health account and clock requests share a 9-second monotonic child
-  deadline inside the 10-second control timeout, with a 750 ms completion margin.
-- Research uses a database-backed single-flight reservation and stage
-  heartbeats. A fresh run returns `already_running`; stale rows older than 15
-  minutes become `failed` with
-  `WORKER_TERMINATED_OR_HEARTBEAT_EXPIRED`, recovery source, and retained
-  worker/request/correlation evidence.
-- Do not rerun research repeatedly before this migration and application SHA are
-  deployed. First run `system:recover` to terminalize the known stale row, then
-  invoke one guarded dashboard research run. Do not invoke confirmed paper or
-  live execution during release validation.
-
-## Adaptive allocation safety-floor pre-release (2026-07-14)
-
-- Branch `feat/adaptive-allocation-safety-floor` is based on
-  `origin/main@29f4a814d39cebc6f66b371571a92fe58228f6e1`. The branch changes
-  authenticate general review artifacts, compare
-  fresh submit state, reserve reviewed entries, fail closed on incomplete
-  scale-in and 0DTE evidence, sign 0DTE submit attestations, enforce hedge
-  capital evidence/caps, and route compatibility confirmation through reviewed
-  execution.
-- This is a prerequisite only. It adds no allocator, optimizer, weights, mode,
-  allocator-owned exit, cap increase, live path, or public mutation route.
-- General and 0DTE review/submit records require
-  `PAPER_REVIEW_SIGNING_KEY`. Existing unsigned artifacts intentionally fail
-  closed. A new `paper:ops:review` creates a signed `baseline-v1` artifact; a
-  material account, configuration, portfolio, reservation, market, price, or
-  cap change returns `FRESH_REVIEW_REQUIRED` and submits zero for that entry.
-  A signed blocked artifact also cannot authorize entry sections, while valid
-  exits remain independent. A fresh mixed artifact with an exit section reaches
-  the section-aware executor without weakening its signed entry blockers.
-  General, 0DTE, and hedge entries recheck an all-buy-side ledger-lifecycle
-  fingerprint inside their immediate reservation transaction, so an intervening
-  reservation-to-filled transition fails closed before any broker call.
-- `paper:execute --confirmPaper`, `/api/v1/execute/confirm`, and the dashboard
-  compatibility route no longer rebuild a plan. They require explicit
-  confirmation and dispatch the exact latest signed reviewed payload. The
-  late-day workflow now persists its own signed
-  `sourceAction=paper.ops.late_day` artifact with the normal 30-minute TTL.
-- Equity scale-ins remain disabled by default and retain their `$250` add size.
-  Missing position/capital/source evidence, an open order or reservation, or an
-  ordinary cash/deployment/position/order/plan cap breach produces a hold.
-- 0DTE caps remain one contract, three combined open positions/orders, three
-  daily entries, `$250` premium per trade, `$750` daily premium, and `$250`
-  daily realized loss. All entry paths contribute New York-day evidence; a
-  missing counter blocks. This includes generic reviewed
-  `discovery:zero_dte_spy:*` option buys. Standalone 0DTE submission refreshes
-  its quote, preserves the reviewed limit, and atomically reserves capacity.
-- Hedge entry defaults are `0.0075`, `0.02`, and `0.01` of equity (`0.75%`,
-  `2%`, and `1%`). Reviews and submit-time validation require complete current
-  long-put exposure, cost, reservation, broker-order, fill, and daily-premium
-  evidence with an unchanged canonical fingerprint. Deterministic review and
-  client-order IDs are signed; the persisted row must match, fresh price drift
-  is bounded, and one review is consumed atomically with one reservation.
-- Broker statuses `held` and `pending_cancel` consume exposure across general,
-  0DTE, and hedge paths. Unknown non-terminal statuses remain active and block
-  new risk until recognized.
-- A redacted pre-deploy VPS snapshot found a clean checkout at the base SHA,
-  paper-only/live-disabled flags, no selected sizing overrides, and no
-  `PAPER_REVIEW_SIGNING_KEY`. Therefore checked-in ordinary equity defaults
-  (`$1,000` per order, `$5,000` per-order cap, `$50,000` total-plan cap, `20%`
-  reserve, `50%` deployment, `10%` position) remain runtime-effective. The
-  objective's `$100`/`$300` figures were not installed and are not adopted.
-  Provision the signer without printing it before deploying this branch.
-- No paper or live order was submitted while implementing or validating this
-  prerequisite. Stop before Release 1 unless the user separately authorizes it.
-
-## Autonomous universe lifecycle production rollout checkpoint (2026-07-14)
-
-- The deployed lifecycle service is the first incomplete autonomous subsystem:
-  daily bounded Alpaca-asset discovery and lifecycle
-  governance for `discovered -> observe_only -> research_eligible ->
-  paper_eligible -> paper_active -> suspended -> retired`.
-- The service is intentionally non-broker-mutating. It uses read-only asset
-  inventory and local evidence only; existing review, execution, reconciliation,
-  monitoring, exit, and learning gates remain unchanged.
-- `observe_only` symbols are included in the existing 15-minute observatory
-  collector, which owns their historical-bar collection. The lifecycle evaluates
-  persisted historical coverage but never invokes a data-ingestion run. Research
-  consumes only lifecycle-eligible active symbols.
-- The change adds SQLite run/event provenance, `universe:lifecycle` and
-  `universe:lifecycle:status` commands, and a bounded 16:30 ET
-  `alpaca-universe-lifecycle.timer`. The unit has a 120-second start deadline,
-  30-second stop deadline, and control-group termination. A missed run is not
-  replayed automatically.
-- Request timeouts cover the complete Alpaca response read, including the body.
-  If a lower-level network operation remains blocked, the service-level timeout
-  contains the run. The next pass marks its persisted `running` record failed
-  with `RECOVERED_INCOMPLETE_RUN` before resuming. This preserves provenance
-  without replaying or bypassing any execution gate.
-
-## 0DTE operational acceptance follow-up (2026-07-14)
-
-- A naturally qualified SPY Level 2 entry exposed a stale terminal-ledger reuse defect: the paper broker accepted and filled the new client order, but the local trade pointed at an older same-contract ledger row with different candidate/client identity. Entry execution now creates a fresh immutable ledger row for different candidate/client identity while preserving exact same-attempt reuse before broker submission. Read-only reconciliation may relink the affected trade only from exact paper-broker order/client/symbol/buy-to-open/limit/day/quantity/price evidence; the old row is preserved and the relink plus fill persistence are atomic.
-- Naturally triggered Level 2 paper exits remain `exit_requested` until
-  `zero-dte:reconcile` reads the persisted exit-order identity back from Alpaca.
-- Exit reconciliation requires exact broker/client order IDs, option symbol,
-  `sell_to_close` intent, quantity, average fill price, and fill timestamp. It
-  binds those facts to the same exit-request generation, validates any existing
-  `zero-dte-exit` execution-ledger identity before updating it, and rejects fill
-  timestamps outside the entry/request/reconciliation chronology.
-- A validated full exit atomically closes the Level 2 trade, persists realized
-  result and holding time when entry evidence is complete, appends fill/close
-  lifecycle events, and records one terminal paper outcome. It never substitutes
-  a reviewed quote or mark for a broker fill, and a conflicting existing outcome
-  rolls the transaction back.
-- Pending and partial exits remain explicit. Zero-fill terminal exits return the
-  trade to `open` for a fresh review; partial terminal and identity-mismatched
-  responses remain fail-closed for operator reconciliation.
-
-## Market Observatory Phase 1B implementation checkpoint (2026-07-13)
-
-- Phase 1B starts from Phase 1A `9bcb097` on `feat/market-observatory` and adds
-  migration `2026-07-13-market-observatory-phase-1b`.
-- Candidate, decision, and position-lifecycle UUIDs are distinct. Decision origins
-  are retry-idempotent; exit reviews receive separate decision IDs.
-- Immutable snapshots and append-only events preserve selected, rejected, skipped,
-  blocked, review, eligibility, fill, open, and close evidence. Provenance hashes
-  include allowlisted strategy/risk settings only.
-- Analytical positions require exact confirmed-fill ledger lineage. Observations
-  are append-only; ambiguous Alpaca netting suppresses per-decision return/MFE/MAE.
-- Original outcomes are unique per lifecycle and use persisted observations only.
-  Option and underlying bases remain separate; corrections append as revisions.
-- Learning links candidate, entry/exit decisions, lifecycle, original outcome,
-  effective revision, completeness, and linkage. Promotion thresholds are unchanged.
-- Read-only inspection is `npm run paper:trace -- --decisionId <uuid>`.
-- Deployment must migrate a controlled copy first, preserve paper/live flags,
-  enable `alpaca-market-observatory.timer`, and account for all 51 symbols as
-  `COMPLETE` or explicit `PARTIAL`. Do not force a paper trade for validation.
-
-## Market Observatory Phase 1A branch checkpoint (2026-07-13)
-
-- `feat/market-observatory` starts from `main@1d274301fab8739702d0105bcf8e6b7ff504761a`.
-- `src/config/universe.seed.ts` remains canonical. It now contains 51 unique
-  symbols: all 32 prior names plus 19 net-new names from the requested 20-name
-  set; `TSLA` was already present.
-- Alpaca asset metadata is normalized into `universe_symbols`; inactive or
-  non-tradable rows are retained but disabled. All 20 requested names were
-  read-only validated active, tradable, fractionable, shortable, and
-  options-enabled on 2026-07-13.
-- `stock_snapshots` stores feed-aware trade, quote, minute, daily, and
-  previous-daily observations with separate source/ingestion timestamps,
-  derived values, freshness, quality, request IDs, and ingestion-run evidence.
-- Latest observatory evidence enriches only the latest feature row. Every scored
-  candidate persists with a decision and reason; only `selected` candidates can
-  enter paper planning, runtime, review, or outcome analytics.
-- `npm run observatory:collect` is read-only. The checked-in systemd timer invokes
-  it through the existing monitor runner every 15 minutes during weekday market
-  windows with market-hour and non-overlap gates. No deployment occurred in this
-  phase.
-
-## Latest VPS handoff status (2026-07-07 UTC)
-
-- VPS was rebuilt from empty and re-bootstrapped from this repo.
-- SSH target remains `alpaca@185.193.127.15` and can be reached as:
-  - `ssh njalla-vps`
-- VPS hostname is `jspaper`.
-- Repo location on VPS is `/home/alpaca/Alpaca-Trading`.
-- Runtime secrets are sourced from `/opt/alpaca-investing/secrets/alpaca.env`
-  - owned by `alpaca:alpaca`
-  - mode `600`
-- Runtime service layer currently expected:
-  - `alpaca-dashboard-control.service` (from `server/systemd/dashboard-control.service`)
-  - active and bound to `127.0.0.1:4100`.
-- Paper mode controls are still in force:
-  - `ALPACA_ENV=paper`
-  - `ALPACA_LIVE_TRADE=false`
-  - `LIVE_TRADING_ENABLED=false`
-  - `PAPER_ORDER_EXECUTION_ENABLED=true`
-  - `PAPER_OPTIONS_EXECUTION_ENABLED=true`
-- Market-data feed defaults are centralized and paper-safe:
-  - stock REST feed `sip`
-  - stock stream URL `wss://stream.data.alpaca.markets/v2/sip`
-  - options feed `opra`
-- Optional SIP stock stream is disabled by default (`ALPACA_STOCK_STREAM_ENABLED=false`); when enabled by explicit configuration, `src/services/alpacaStockStream.ts` authenticates with the existing paper credentials, subscribes to the active stock universe, keeps latest trade/quote/bar state in memory, and reconnects after unexpected disconnects.
-- The dashboard-control process starts at most one stream service, stops it on `SIGINT`/`SIGTERM`, and exposes sanitized stream health under `data.stockStream` on `/api/v1/health`. Set `ALPACA_STOCK_STREAM_ENABLED=true` plus the documented SIP URL and non-secret controls in the applicable runtime environment; do not edit the repository `.env`.
-- `src/services/stockMarketDataAccessor.ts` prefers fresh SIP stream trades/quotes for eligible current stock reads and falls back to the existing SIP REST snapshot request for unavailable, uncovered, malformed, or stale state. Historical bars, research backfills, and complete snapshots remain REST-backed. `npm run smoke:alpaca-stream` is read-only and prints sanitized status only.
-- Paper exit management is paper-only and guarded:
-  - `npm run paper:exit:review -- --format=json` is read-only and reviews open `/v2/positions` for exit candidates.
-  - `npm run paper:exit:execute -- --confirmPaper --format=json` reruns review first, requires `PAPER_ORDER_EXECUTION_ENABLED=true`, and submits only generated paper exit candidates.
-  - No live exit path exists; execution remains paper endpoint-only and requires explicit confirmation.
-  - 0DTE option exits default to 50% stop/profit outside the final 2 hours, 25% stop/profit inside the final 2 hours, force exit inside the final 30 minutes when value is at least `0.05`, and skip near-worthless contracts with `ODTE_BELOW_MIN_SELLABLE_VALUE`.
-  - Equity exits default to 5% stop loss and 8% take profit, using `qty_available` when present and skipping symbols with active sell orders.
-  - LEAPS are classified separately and skipped by default with `LEAPS_SKIPPED_BY_DEFAULT`; 0DTE rules do not sell LEAPS.
-  - Explicit `--includeLEAPS=true` enables paper-only LEAPS exit candidates for `LEAPS_STOP_LOSS_35`, `LEAPS_TAKE_PROFIT_75`, and `LEAPS_DTE_DECAY_EXIT`.
-  - LEAPS exits use sell-to-close limit orders from fresh bid quotes only; stale or unavailable quotes skip with `LEAPS_QUOTE_UNAVAILABLE`, and contracts below `0.05` skip with `LEAPS_BELOW_MIN_SELLABLE_VALUE`.
-  - Known LEAPS from the paper learning ledger may be recognized for DTE decay after falling below the normal 180-DTE classification threshold, but only when `/v2/positions` still shows the contract.
-- Options quote/execution controls after the quote-status fix:
-  - `OPTIONS_QUOTE_MAX_AGE_MS=900000` by default.
-  - `ALLOW_OPTIONS_LAST_PRICE_FALLBACK=false` by default.
-  - `ALLOW_0DTE_OPTIONS=true` for the current paper runtime target.
-  - Option contracts may be discovered with null quotes, but null quote, missing bid, missing ask, crossed quote, and non-positive derived limit price remain hard blockers.
-  - Stale quotes with complete non-crossed bid/ask are warning-only for paper option review; paper limit prices are derived from midpoint by default or `askFallback` when explicitly configured.
-- Paper option learning layer:
-  - `PAPER_OPTION_LEARNING_LEDGER_ENABLED=true` records option candidate decisions into `paper_learning_records`.
-  - Preferred paper option caps are `PAPER_OPTION_MAX_PREMIUM_PER_CONTRACT=1500`, `PAPER_OPTION_MAX_ORDER_NOTIONAL=1500`, and `PAPER_OPTION_MAX_CONTRACTS=1`.
-  - 0DTE SPY paper caps are `PAPER_0DTE_SPY_MAX_PREMIUM_PER_CONTRACT=250`, `PAPER_0DTE_SPY_MAX_ORDER_NOTIONAL=250`, and `PAPER_0DTE_SPY_MAX_CONTRACTS=1`.
-  - LEAPS paper caps are `PAPER_LEAPS_MAX_PREMIUM_PER_CONTRACT=1500`, `PAPER_LEAPS_MAX_ORDER_NOTIONAL=1500`, and `PAPER_LEAPS_MAX_CONTRACTS=1`.
-  - `PAPER_0DTE_SPY_ENABLED=false` and `PAPER_LEAPS_ENABLED=false` remain safe defaults; enabling them is paper-only and does not enable live trading.
-  - 0DTE discovery is first-class when enabled, does not require SPY to appear in normal equity candidates, considers ranked same-day SPY call/put alternatives, selects at most one executable call and one executable put, and walks OTM when the nearest contract exceeds caps.
-  - LEAPS discovery is first-class when enabled, does not require the underlying to appear in normal equity candidates, uses `PAPER_LEAPS_UNDERLYINGS=SPY,QQQ` by default, considers ranked delta/moneyness alternatives, and selects at most one executable long-dated call per underlying inside `PAPER_LEAPS_MIN_DTE=180` to `PAPER_LEAPS_MAX_DTE=730`.
-  - LEAPS exit review is now explicit and does not depend on `PAPER_LEAPS_ENABLED`; it manages already-held LEAPS through `paper:portfolio:review`, `paper:exit:review`, `paper:ops:review`, and the `optionSellToCloseExits` reviewed artifact section.
-  - LEAPS exit defaults: `LEAPS_MIN_DTE_AT_ENTRY=270`, `LEAPS_DTE_EXIT_THRESHOLD=180`, `LEAPS_REVIEW_LOSS_PCT=-20`, `LEAPS_HARD_STOP_LOSS_PCT=-35`, `LEAPS_PARTIAL_PROFIT_TAKE_PCT=75`, `LEAPS_FULL_PROFIT_TAKE_PCT=125`, `LEAPS_TREND_REVIEW_SMA=100`, `LEAPS_SEVERE_TREND_EXIT_SMA=200`, `LEAPS_MAX_BID_ASK_SPREAD_PCT=20`, `LEAPS_MIN_DELTA_REVIEW=0.45`, and `LEAPS_REVIEW_INTERVAL_DAYS=30`.
-  - LEAPS classification uses entry DTE from `paper_learning_records`, then paper execution ledger rows; if neither proves entry DTE, current DTE can classify only with `LEAPS_CLASSIFICATION_INFERRED`, so short-dated options are not promoted into LEAPS.
-  - LEAPS hard exits are `LEAPS_HARD_STOP_LOSS`, `LEAPS_FULL_PROFIT_TAKE`, `LEAPS_DTE_EXIT_WINDOW`, and `LEAPS_SEVERE_TREND_BREAK`; warning-only reasons are `LEAPS_REVIEW_LOSS_WARNING`, `LEAPS_PARTIAL_PROFIT_REVIEW`, `LEAPS_TREND_REVIEW`, `LEAPS_DELTA_DETERIORATION`, `LEAPS_DELTA_UNAVAILABLE`, and `LEAPS_PERIODIC_REVIEW_DUE`.
-  - LEAPS hard exits become executable only when bid/ask exists and spread is within `LEAPS_MAX_BID_ASK_SPREAD_PCT`; otherwise `LIMIT_EXIT_REQUIRED` or `LEAPS_QUOTE_UNAVAILABLE` keeps the reviewed candidate non-executable.
-  - `paper:plan` and `paper:review` refresh empty or stale explicit discovery contract windows from Alpaca, then refresh quotes for ranked discovery alternatives before deciding whether payloads are executable.
-  - `npm run options:diagnose -- --underlyings=SPY,QQQ` is the read-only diagnostic for local cache counts, Alpaca contract endpoint availability, SPY same-day contracts, LEAPS counts, sample symbols, quote availability, and zero-contract reasons.
-  - Wide spreads are warnings unless `PAPER_OPTIONS_HARD_SPREAD_CAP_ENABLED=true` or the family-specific hard-spread flag is enabled.
-  - `npm run paper:learn -- --format=json` evaluates pending learning rows when local option marks exist and reports promotion-readiness analytics using live-like fill profit factor.
-- Control bridge health:
-  - `GET /api/v1/health` without token returns a healthy 200.
-  - `POST /api/v1/refresh` without or with a bad token returns `401`.
-  - `POST /api/v1/refresh` with the control token returns 200, remains non-mutating, and runs only the read-only `paper:runtime` command.
-  - Public `https://www.jlsprojects.com/api/paper/summary` returns paper-only state through the Vercel-to-VPS bridge.
-  - Dashboard page summary loads use a cached VPS summary bridge with a 30 second timeout; expensive fresh plan/review/dry-run work stays on explicit protected action routes.
-  - Public `POST https://www.jlsprojects.com/api/paper/research/run` succeeds with valid admin auth after the control action was bounded to `--barLookbackDays=120`, `ALPACA_REQUEST_TIMEOUT_MS=10000`, and `ALPACA_MAX_RETRIES=0`.
-- SSH hardening:
-  - key-based auth is active and password auth is disabled.
-  - root key recovery remains intentionally preserved (`PermitRootLogin without-password`) until the user explicitly disables it.
-  - `UFW` and `fail2ban` have been revalidated.
-- Runtime check results captured prior to pause:
-  - `alpaca:health` returned `paperOnly: true`.
-  - `paper:runtime -- --format=json` returned runtime state.
-  - latest `paper:runtime` sees 3 equity candidates, each already held in current paper positions.
-  - latest `paper:plan` finds the current research run but produces zero planned orders because those candidate symbols are already held.
-  - `paper:execute` now reports this zero-payload state as `status: "no_op"` with `reason: "NO_ELIGIBLE_PAPER_PAYLOADS"` instead of a safety-review failure.
-  - Historical note superseded by the 2026-07-14 safety floor:
-    `paper:execute --confirmPaper` now accepts no inline planning or sizing
-    authority and delegates only to the exact latest signed reviewed artifact.
-- Current duplicate-classification behavior:
-  - held/open equity positions or orders block duplicate equity candidates on the same symbol.
-  - held/open equity positions or orders do not by themselves block option contracts on the same underlying.
-  - held/open option contracts are compared by option contract symbol and reported with option-specific duplicate reasons.
-- Paper operations layer added after this checkpoint:
-  - Dashboard cards live under `Paper Trading Controls`.
-  - New dashboard routes live under `apps/dashboard/app/api/paper/actions/*`.
-  - New VPS allowlisted control routes live under `/api/v1/actions/*`.
-  - `paper:portfolio:review` is review-only and emits `BUY_NEW_EQUITY`, `ADD_TO_EQUITY`, `SELL_EQUITY`, `HOLD_EQUITY`, `BUY_OPTION`, `SELL_TO_CLOSE_OPTION`, and `HOLD_OPTION` recommendations.
-  - `paper:options:discover` is review-only and labels current-session 0DTE versus `nextSessionPreparation: true`.
-  - `paper:ops:review` persists an HMAC-signed latest reviewed payload artifact, `baseline-v1` state evidence, and operation log rows.
-  - `paper:execute:reviewed -- --confirmPaper` refuses missing, unsigned, stale, empty, tampered, state-drifted, or payload-signature-mismatched review artifacts before paper submission.
-  - `paper:execute:reviewed` now supports `--sections=` so scheduler entry execution is limited to `equityBuys,equityAdds,optionBuys` and scheduler exit execution is limited to `equitySells,optionSellToCloseExits`.
-  - Reviewed LEAPS sell-to-close execution also fails closed unless `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, `LIVE_TRADING_ENABLED=false`, `PAPER_ORDER_EXECUTION_ENABLED=true`, `PAPER_OPTIONS_EXECUTION_ENABLED=true`, `AUTOMATED_PAPER_EXECUTION_ENABLED=true`, and `--confirmPaper` are all present.
-  - Review-only `paper-ops-*` timers intentionally override `AUTOMATED_PAPER_EXECUTION_ENABLED=false`; bounded paper execution tasks use the checked-in target value `true` only with confirmation and paper-runtime gates.
-  - Continuous monitor timers are installed from `scripts/install-paper-monitoring-systemd.sh` and run through `npm run paper:monitor`, which gates market hours/holidays, paper runtime, live-off flags, execution flags, and per-task locks.
-- 0DTE Level 2 engine implementation:
-  - The standalone engine is independent of the Market Observatory and persists engine runs, ranked candidates, signal observations, five playbook evaluations, decisions, lifecycle events, paper trades, shadow trades, position marks, terminal outcomes, and configuration versions.
-  - Migrations are `2026-07-13-zero-dte-level-2` and `2026-07-13-zero-dte-level-2-hardening`.
-  - Direct commands are `npm run zero-dte:engine -- --dryRun --format=json`, `npm run zero-dte:engine -- --confirmPaper --format=json`, `npm run zero-dte:exit:review -- --format=json`, `npm run zero-dte:reconcile -- --format=json`, `npm run zero-dte:eod -- --format=json`, and `npm run zero-dte:summary -- --format=json`.
-  - Scheduler units are `alpaca-zero-dte-engine.timer`, `alpaca-zero-dte-exit-review.timer`, `alpaca-zero-dte-reconcile.timer`, and `alpaca-zero-dte-eod.timer`; each uses a dedicated `/tmp/alpaca-zero-dte-*.lock`.
-  - Operational acceptance accepts Alpaca's top-level stock snapshot symbol map, keeps selected engine candidates inside the guarded execution path, scopes `ZERO_DTE_MAX_OPEN_POSITIONS` to active same-day option positions, permits the read-only EOD task after a valid session closes, staggers database-heavy timer wakeups, and uses a bounded 5-second SQLite busy timeout plus scoped finite retries for transient writer contention.
-  - The summary routes are `GET /api/v1/zero-dte/summary` on the VPS and `GET /api/paper/zero-dte/summary` on Vercel. The dashboard panel is `0DTE Level 2` and labels shadow positions as simulated.
-  - Paper execution remains fail-closed on `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, `LIVE_TRADING_ENABLED=false`, `PAPER_ORDER_EXECUTION_ENABLED=true`, `PAPER_OPTIONS_EXECUTION_ENABLED=true`, `AUTOMATED_PAPER_EXECUTION_ENABLED=true`, `ZERO_DTE_ENGINE_ENABLED=true`, `ZERO_DTE_PAPER_EXECUTION_ENABLED=true`, and `--confirmPaper`. No live endpoint is used.
-- Deployed paper-only portfolio risk and hedge-management layer:
-  - Canonical OCC parsing now feeds asset identity, LEAPS exit review, portfolio review, and paper dry-run DTE logic.
-  - Hedge analysis commands are `hedge:risk`, `hedge:regime`, `hedge:review`, and `hedge:plan -- --paperOnly`; reviewed paper entry and exit execution use `hedge:execute` and `hedge:exit:execute` only after explicit confirmation.
-  - The checked-in paper hedge target enables `HEDGE_PAPER_EXECUTION_ENABLED`, `HEDGE_AUTOMATED_PAPER_EXECUTION_ENABLED`, `HEDGE_EXIT_MANAGEMENT_ENABLED`, `HEDGE_LEARNING_ENABLED`, and `HEDGE_DASHBOARD_MUTATIONS_ENABLED`; live hedge execution and multi-leg execution remain false.
-  - Portfolio risk uses observed option Greeks, signed-exposure beta, grouped concentration, persisted paper high-water marks, and 5/8/10/15 percent benchmark-decline scenarios.
-  - Option delta coverage is reported by absolute contract quantity and absolute market value. Defaults are 80% on each basis with 10% of account equity as the materiality threshold; material gaps keep beta/scenario precision null, mark the effective risk band `indeterminate`, and force monitoring without hedge candidates.
-  - A 2026-07-10 read-only runtime check found valid complete Greeks for `SPY270115C00805000` and `QQQ270115C00840000`. Alpaca returned camelCase snapshot keys while the parser expected legacy-shaped aliases; ingestion now accepts both shapes. The observed issue was parser compatibility, not symbol, entitlement, batching, or snapshot availability for those samples.
-  - Beta cache identity includes symbol, benchmark, lookback, interval, minimum observations, calculation version, and latest aligned market-data date; incompatible or expired rows are ignored.
-  - Hedge recommendations prefer concentrated/profitable LEAPS trimming before paid protection. Long-put entries subtract complete existing, reserved, open-order, completed-fill, and daily-premium evidence; missing evidence blocks rather than becoming zero.
-  - Put spreads remain analysis-only with `MULTI_LEG_EXECUTION_UNSUPPORTED`; SH/PSQ remain secondary alternatives.
-  - Signed plans are stored in `paper_learning_records`, expire, retain configuration/model/snapshot integrity, and are not recognized by the reviewed order executor.
-  - Existing paper-ops moments refresh persisted hedge reviews but cannot submit hedge orders and do not alter reviewed order sections.
-  - Cached GET routes are `/api/v1/hedge/risk`, `/api/v1/hedge/regime`, and `/api/v1/hedge/recommendation`, with matching Vercel `/api/paper/hedge/*` routes.
-  - Authenticated hedge mutation routes are `/api/v1/hedge/review`, `/api/v1/hedge/execute`, `/api/v1/hedge/exit/review`, and `/api/v1/hedge/exit/execute`; status and learning reads are `/api/v1/hedge/execution` and `/api/v1/hedge/learning`.
-  - The dashboard marks `stale` and `expired` recommendations as not current and displays model versions, quality, scenarios, LEAPS logic, candidates, warnings, and blockers.
-- Alpaca paper reconciliation behavior after the July 6 equity-fill incident:
-  - Alpaca paper `/v2/orders` and `/v2/account/activities` can show simulated fills before `/v2/positions` is fully synchronized.
-  - Missing paper positions can later reappear in `/v2/positions`; do not invent sell fills or realized P/L for that gap.
-  - `/v2/positions` and `/v2/account` are authoritative for current paper exposure.
-  - `paper:exit:review` and `paper:exit:execute` follow the same authority model: no synthetic sells, no sell payloads for local-only missing positions, and reconciliation events are preserved.
-  - Reviewed entry execution performs a read-only reconciliation before any submit call and records audit events:
-    - `PAPER_POSITION_SYNC_PENDING` while a missing filled paper position is still inside `PAPER_POSITION_SYNC_FRESHNESS_MINUTES`.
-    - `PAPER_POSITION_SYNC_RESTORED` when a previously missing symbol reappears in `/v2/positions`.
-    - `PAPER_SYNC_POSITION_REMOVAL` only after the sync window expires and account math is consistent without the missing symbol.
-  - Hard fail remains `ACCOUNT_RECONCILIATION_MISMATCH` when `account.position_market_value` differs materially from the sum of `/v2/positions.market_value`, account cash/equity/market value are internally inconsistent, exposure cannot be safely calculated, or the mismatch is live-account behavior. The position-market-value tolerance defaults to `$2` or `0.25%`, whichever is larger.
-  - Missing paper symbols are excluded from current exposure calculations unless `/v2/positions` confirms them; evidence and Alpaca request IDs are preserved in `paper_reconciliation_events`.
-
-## Token/env coordination
-
-- `VPS_CONTROL_TOKEN` is configured in `/opt/alpaca-investing/secrets/alpaca.env`; Vercel must use the same value in `VPS_CONTROL_TOKEN`.
-- `DASHBOARD_ADMIN_TOKEN` belongs in Vercel production environment for dashboard mutating/admin routes.
-- `PAPER_REVIEW_SIGNING_KEY` belongs only in the VPS runtime environment. It is
-  required for general and 0DTE signed review records, was absent in the
-  2026-07-14 pre-deploy snapshot, and must be provisioned without printing or
-  copying it to Vercel. Deployment must not copy `.env.example` over the
-  protected environment and must reject its illustrative placeholder values.
-- `HEDGE_REVIEW_SIGNING_KEY` remains the independent VPS-only signer for hedge
-  execution reviews.
-- Secrets must not be copied into repo files, client code, or Vercel frontend bundles.
-- Use `npm run vercel:env:parity -- --check-vercel-presence --pull-vercel` for redacted Vercel production env checks. The utility reports presence and sha256 fingerprint match booleans only.
-
-## Current continuation objective
-
-1. Open SSH control:
-   - `ssh njalla-vps`
-   - `cd /home/alpaca/Alpaca-Trading`
-   - load NVM and source `/opt/alpaca-investing/secrets/alpaca.env`.
-2. Recover and inspect stale research state before any rerun:
-   - `npm run system:recover -- --format=json`
-   - `npm run system:recover:status -- --format=json`
-   - `ps -ef | rg "tsx src/cli.ts research daily|npm run research:daily|timeout .*research:daily"`.
-3. Run bounded paper research once only when no valid run is active:
-   - `ALPACA_REQUEST_TIMEOUT_MS=10000 ALPACA_MAX_RETRIES=0 timeout 300 npm run research:daily -- --riskProfile=aggressive --optionsEnabled=true --maxCandidates=3 --format=json --barLookbackDays=120`.
-4. Verify output and re-run readiness chain:
-   - `npm run paper:snapshots -- --format=json --limit=5`
-   - `npm run paper:runtime -- --format=json`
-   - `npm run options:diagnose -- --underlyings=SPY,QQQ`
-   - `npm run paper:review -- --riskProfile=aggressive --optionsEnabled=true --format=json`
-   - `npm run paper:plan -- --riskProfile=aggressive --optionsEnabled=true --maxCandidates=10 --format=json`.
-   - `npm run paper:portfolio:review -- --format=json`
-   - `npm run paper:exit:review -- --format=json`
-   - `npm run paper:options:discover -- --underlying=SPY --dte=0 --format=json`
-   - `npm run paper:ops:review -- --format=json`
-   - `npm run hedge:risk -- --format=json`
-   - `npm run hedge:regime -- --format=json`
-   - `npm run hedge:review -- --format=json`
-   - `npm run hedge:plan -- --paperOnly --format=json`
-5. Once snapshots flow, re-check control bridge actions:
-   - `curl -sS -H "Authorization: Bearer $VPS_CONTROL_TOKEN" http://127.0.0.1:4100/api/v1/review/latest`
-   - `curl -sS -H "Authorization: Bearer $VPS_CONTROL_TOKEN" http://127.0.0.1:4100/api/v1/plan/latest`
-   - `curl -sS -X POST -H "Authorization: Bearer $VPS_CONTROL_TOKEN" -H "Content-Type: application/json" -d '{}' http://127.0.0.1:4100/api/v1/refresh`
-
-## Known safe boundaries
-
-- Do not enable any live or direct Alpaca execution on Vercel.
-- Keep dashboard actions behind explicit admin controls and VPS allowlisted commands.
-- Do not relax paper-only gates without an explicit request.
-- Do not run `npm run paper:execute:reviewed -- --confirmPaper` or `npm run paper:execute -- --confirmPaper` unless the user explicitly requests paper execution.
-- No live execution route exists in the dashboard operations layer.
-- Hedge execution is available only through explicit paper review IDs, paper confirmation, dashboard/VPS authentication, and the single-long-put gates; do not run `hedge:execute` or `hedge:exit:execute` during validation unless paper execution is explicitly requested.
-- Automated paper execution is only allowed through the `alpaca-paper-*` and `alpaca-zero-dte-*` monitor timers, their reviewed/engine guards, section filters where applicable, and paper-only/live-off runner gates.
+Perform the evidence-utilization and runtime audit before restoring any
+autonomous paper-trading workflow.

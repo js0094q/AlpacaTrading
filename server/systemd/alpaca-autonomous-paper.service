@@ -16,6 +16,10 @@ Environment=ALPACA_ENV=paper
 Environment=ALPACA_LIVE_TRADE=false
 Environment=LIVE_TRADING_ENABLED=false
 Environment=AUTOMATED_PAPER_EXECUTION_ENABLED=true
+Environment=AUTONOMOUS_RUNTIME_AUDIT_APPROVED=false
+Environment=DATABASE_BACKEND=postgres
+Environment=POSTGRES_SHADOW_COMPARE_ENABLED=false
+Environment=POSTGRES_EXECUTION_STATE_SHADOW_ENABLED=false
 Environment=SQLITE_AUDIT_MIRROR_ENABLED=false
 ExecStart=/usr/bin/npm run paper:autonomous
 Restart=always

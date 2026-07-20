@@ -15,6 +15,7 @@ export interface AlpacaOpenOrderSnapshot {
   submittedAt?: string;
   filledQty?: string;
   filledAvgPrice?: string;
+  positionIntent?: string;
 }
 
 type ApiOrderPayload = {
@@ -32,6 +33,7 @@ type ApiOrderPayload = {
   submitted_at?: string;
   filled_qty?: string;
   filled_avg_price?: string;
+  position_intent?: string;
 };
 
 const mapOrder = (row: ApiOrderPayload): AlpacaOpenOrderSnapshot => ({
@@ -48,7 +50,8 @@ const mapOrder = (row: ApiOrderPayload): AlpacaOpenOrderSnapshot => ({
   status: row.status,
   submittedAt: row.submitted_at,
   filledQty: row.filled_qty,
-  filledAvgPrice: row.filled_avg_price
+  filledAvgPrice: row.filled_avg_price,
+  positionIntent: row.position_intent
 });
 
 export const listAlpacaOpenOrders = async (): Promise<{

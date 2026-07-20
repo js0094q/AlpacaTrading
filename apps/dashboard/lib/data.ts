@@ -107,7 +107,7 @@ type DashboardResult<T> =
     }
   | DashboardResultError;
 
-export type DashboardSnapshotMode = "local-sqlite" | typeof VERCEL_READ_ONLY_MODE | string;
+export type DashboardSnapshotMode = typeof VERCEL_READ_ONLY_MODE | "postgres-only-authority" | string;
 
 export interface DashboardSnapshot {
   paperOnly: true;
@@ -287,13 +287,8 @@ export const latestZeroDteSummary = async (limit = 25): Promise<ZeroDteDashboard
   if (isPaperDashboardBridgeEnabled()) {
     return fetchPaperBridgePayload<ZeroDteDashboardSummary>("api/v1/zero-dte/summary");
   }
-  if (shouldUseVercelReadOnlyFallback()) {
-    return unavailableZeroDteSummary();
-  }
-  const { buildZeroDteDashboardSummary } = await import(
-    "../../../src/services/zeroDte/zeroDteEngineService"
-  );
-  return buildZeroDteDashboardSummary({ limit }) as unknown as ZeroDteDashboardSummary;
+  void limit;
+  return unavailableZeroDteSummary();
 };
 
 const normalizeRiskProfile = (value: unknown): RiskProfileInput => {
@@ -304,14 +299,6 @@ const normalizeRiskProfile = (value: unknown): RiskProfileInput => {
 
 const normalizeAssetClass = (value: unknown): "all" | "equity" | "option" => {
   return value === "equity" || value === "option" || value === "all" ? value : "all";
-};
-
-const queryAllRows = async <T = Record<string, unknown>>(
-  sql: string,
-  params: Array<string | number | null> = []
-): Promise<T[]> => {
-  const { queryAll } = await import("../../../src/lib/db");
-  return queryAll<T>(sql, params);
 };
 
 export const parsePaperActionInput = (value: unknown): PaperActionInput => {
@@ -346,34 +333,14 @@ export const parsePaperActionInput = (value: unknown): PaperActionInput => {
 };
 
 export const latestResearchRuns = async (limit = 5) =>
-  shouldUseVercelReadOnlyFallback()
-    ? []
-    : isPaperDashboardBridgeEnabled()
-      ? getPaperBridgeSummary().then((summary) => clampRows(summary.latestResearch, limit))
-    : queryAllRows(
-        `
-        SELECT id, started_at, completed_at, status, risk_profile, options_enabled, candidates_selected
-        FROM research_runs
-        ORDER BY started_at DESC
-        LIMIT ?
-        `,
-        [safeLimit(limit, 5, 25)]
-      );
+  isPaperDashboardBridgeEnabled()
+    ? getPaperBridgeSummary().then((summary) => clampRows(summary.latestResearch, limit))
+    : [];
 
 export const latestPaperPlans = async (limit = 10) =>
-  shouldUseVercelReadOnlyFallback()
-    ? []
-    : isPaperDashboardBridgeEnabled()
-      ? getPaperBridgeSummary().then((summary) => clampRows(summary.latestPaperPlans, limit))
-    : queryAllRows(
-        `
-        SELECT id, research_run_id, symbol, created_at, status, direction, expression, option_symbol, estimated_max_loss, estimated_max_profit
-        FROM paper_trade_plans
-        ORDER BY created_at DESC
-        LIMIT ?
-        `,
-        [safeLimit(limit, 10, 50)]
-      );
+  isPaperDashboardBridgeEnabled()
+    ? getPaperBridgeSummary().then((summary) => clampRows(summary.latestPaperPlans, limit))
+    : [];
 
 const quoteStatusForDashboard = (
   value: string | null
@@ -459,86 +426,21 @@ const normalizeOptionContractDashboardRow = (row: {
 };
 
 export const latestOptionContracts = async (limit = 10) =>
-  shouldUseVercelReadOnlyFallback()
-    ? []
-    : isPaperDashboardBridgeEnabled()
-      ? getPaperBridgeSummary().then((summary) => clampRows(summary.optionContracts, limit))
-    : queryAllRows<{
-        underlying_symbol: string;
-        option_symbol: string;
-        type: string;
-        expiration_date: string;
-        strike: number | null;
-        tradable: number;
-        bid: number | null;
-        ask: number | null;
-        midpoint: number | null;
-        last: number | null;
-        quote_status: string | null;
-        executable: number | null;
-        executable_price: number | null;
-        executable_price_source: string | null;
-        rejection_reason: string | null;
-        quote_timestamp: string | null;
-        timestamp: string | null;
-      }>(
-        `
-        SELECT
-          c.underlying_symbol,
-          c.option_symbol,
-          c.type,
-          c.expiration_date,
-          c.strike,
-          c.tradable,
-          s.bid,
-          s.ask,
-          s.midpoint,
-          s.last,
-          s.quote_status,
-          s.executable,
-          s.executable_price,
-          s.executable_price_source,
-          s.rejection_reason,
-          s.quote_timestamp,
-          s.timestamp
-        FROM option_contracts c
-        LEFT JOIN option_snapshots s
-          ON s.option_symbol = c.option_symbol
-          AND s.timestamp = (
-            SELECT MAX(timestamp)
-            FROM option_snapshots
-            WHERE option_symbol = c.option_symbol
-          )
-        ORDER BY COALESCE(s.timestamp, c.expiration_date) DESC
-        LIMIT ?
-        `,
-        [safeLimit(limit, 10, 50)]
-      ).then((rows) => rows.map(normalizeOptionContractDashboardRow));
+  isPaperDashboardBridgeEnabled()
+    ? getPaperBridgeSummary().then((summary) => clampRows(summary.optionContracts, limit))
+    : [];
 
 export const latestOpenOrders = async (limit = 12) =>
-  shouldUseVercelReadOnlyFallback()
-    ? []
-    : isPaperDashboardBridgeEnabled()
-      ? getPaperBridgeSummary().then((summary) =>
-          clampRows(normalizeOpenOrdersRows(summary.openOrders), limit)
-        )
-    : listAlpacaOpenOrders().then((result) => clampRows(result.orders, limit));
+  isPaperDashboardBridgeEnabled()
+    ? getPaperBridgeSummary().then((summary) =>
+        clampRows(normalizeOpenOrdersRows(summary.openOrders), limit)
+      )
+    : [];
 
 export const latestApiRequestIds = async (limit = 12) =>
-  shouldUseVercelReadOnlyFallback()
-    ? []
-    : isPaperDashboardBridgeEnabled()
-      ? getPaperBridgeSummary().then((summary) => clampRows(summary.requestIds, limit))
-    : queryAllRows(
-        `
-        SELECT provider, endpoint, method, status, request_id, created_at
-        FROM api_request_log
-        WHERE request_id IS NOT NULL
-        ORDER BY created_at DESC
-        LIMIT ?
-        `,
-        [safeLimit(limit, 12, 50)]
-      );
+  isPaperDashboardBridgeEnabled()
+    ? getPaperBridgeSummary().then((summary) => clampRows(summary.requestIds, limit))
+    : [];
 
 const capture = async <T>(label: string, fn: () => Promise<T> | T) => {
   try {
@@ -704,167 +606,62 @@ const cachedReviewAndDryRun = async (): Promise<{
 };
 
 export const latestPaperExecutions = async (limit = 50) => {
-  if (shouldUseVercelReadOnlyFallback()) {
-    return [];
-  }
   if (isPaperDashboardBridgeEnabled()) {
     const summary = await getPaperBridgeSummary();
     return clampRows(summary.executions, limit);
   }
-  const { listPaperExecutionLedgerEntries } = await import(
-    "../../../src/services/paperExecutionLedgerService"
-  );
-  return listPaperExecutionLedgerEntries(limit);
+  return [];
 };
 
 const latestPaperRecommendationSnapshots = async (limit = 10) => {
-  if (shouldUseVercelReadOnlyFallback()) {
-    return [];
-  }
   if (isPaperDashboardBridgeEnabled()) {
     const summary = await getPaperBridgeSummary();
     return clampRows(summary.snapshots, limit);
   }
-  const { listPaperRecommendationSnapshots } = await import(
-    "../../../src/services/paperRecommendationSnapshotService"
-  );
-  return listPaperRecommendationSnapshots({ limit });
+  return [];
 };
 
 export const latestHedgeDashboardRecommendation = async () => {
-  const { latestHedgeRecommendationForCurrentConfig } = await import(
-    "../../../src/services/hedgePersistenceService"
-  );
-  return latestHedgeRecommendationForCurrentConfig();
+  if (isPaperDashboardBridgeEnabled()) {
+    return fetchPaperBridgePayload("api/v1/hedge/recommendation");
+  }
+  return historicalUnavailable("hedgeRecommendation");
 };
 
 export const latestHedgeDashboardRisk = async () => {
-  const { buildPersistedHedgeRiskRead } = await import(
-    "../../../src/services/hedgePersistenceService"
-  );
-  const recommendation = await latestHedgeDashboardRecommendation();
-  return buildPersistedHedgeRiskRead(recommendation);
+  if (isPaperDashboardBridgeEnabled()) {
+    return fetchPaperBridgePayload("api/v1/hedge/risk");
+  }
+  return historicalUnavailable("hedgeRisk");
 };
 
 export const latestHedgeDashboardRegime = async () => {
-  const recommendation = await latestHedgeDashboardRecommendation();
-  return {
-    paperOnly: true,
-    effectiveStatus: recommendation?.effectiveStatus ?? "blocked",
-    generatedAt: recommendation?.generatedAt ?? null,
-    expiresAt: recommendation?.expiresAt ?? null,
-    regime: recommendation?.regime ?? null,
-    warnings: recommendation?.integrityWarnings ?? ["NO_HEDGE_RECOMMENDATION"],
-    blockers: recommendation ? [] : ["NO_HEDGE_RECOMMENDATION"]
-  };
+  if (isPaperDashboardBridgeEnabled()) {
+    return fetchPaperBridgePayload("api/v1/hedge/regime");
+  }
+  return historicalUnavailable("hedgeRegime");
 };
 
 export const latestHedgeExecutionStatus = async () => {
   if (isPaperDashboardBridgeEnabled()) {
     return fetchPaperBridgePayload("api/v1/hedge/execution");
   }
-  if (shouldUseVercelReadOnlyFallback()) return historicalUnavailable("hedgeExecution");
-  const { listPaperExecutionLedgerEntries } = await import(
-    "../../../src/services/paperExecutionLedgerService"
-  );
-  return { paperOnly: true, environment: "paper", entries: listPaperExecutionLedgerEntries(100) };
+  return historicalUnavailable("hedgeExecution");
 };
 
 export const latestHedgeLearningStatus = async () => {
   if (isPaperDashboardBridgeEnabled()) {
     return fetchPaperBridgePayload("api/v1/hedge/learning");
   }
-  if (shouldUseVercelReadOnlyFallback()) return historicalUnavailable("hedgeLearning");
-  const { listRecentHedgeLearningEvents } = await import(
-    "../../../src/services/hedgeLearningLifecycleService"
-  );
-  return { paperOnly: true, environment: "paper", events: listRecentHedgeLearningEvents(100) };
+  return historicalUnavailable("hedgeLearning");
 };
 
 export const buildCachedDashboardSnapshot = async (): Promise<DashboardSnapshot> => {
-  const state = assertPaperDashboardAccess();
-
-  const [account, positions, openOrders, latestResearch, latestPlans, executions, snapshots, requestIds] =
-    await Promise.all([
-      captureWithTimeout("account", () => getAlpacaAccountSnapshot()),
-      captureWithTimeout("positions", () => listAlpacaPositions()),
-      captureWithTimeout("openOrders", () => listAlpacaOpenOrders()),
-      rowsOrEmpty(() => latestResearchRuns(5)),
-      rowsOrEmpty(() => latestPaperPlans(10)),
-      captureWithTimeout("executions", () => latestPaperExecutions(25)),
-      rowsOrEmpty(() => latestPaperRecommendationSnapshots(10)),
-      rowsOrEmpty(() => latestApiRequestIds(12))
-    ]);
-
-  const [reviewDryRun, learningSummary, promotionReadiness, hedge] = await Promise.all([
-    captureWithTimeout("review", () => cachedReviewAndDryRun(), 3_000),
-    captureWithTimeout("learningSummary", async () => {
-      const { paperLearningSummary } = await import(
-        "../../../src/services/paperLearningLedgerService"
-      );
-      return paperLearningSummary();
-    }, 3_000),
-    Promise.resolve()
-      .then(async () => {
-        const service = await import("../../../src/services/paperLearningLedgerService");
-        return service.buildPromotionReadinessAnalytics();
-      })
-      .catch(() => []),
-    captureWithTimeout(
-      "hedge",
-      () => latestHedgeDashboardRecommendation(),
-      3_000
-    )
-  ]);
-
-  const review =
-    reviewDryRun.ok
-      ? reviewDryRun.data.review
-      : {
-          ok: false as const,
-          label: "review",
-          error: reviewDryRun.error
-        };
-  const dryRun =
-    reviewDryRun.ok
-      ? reviewDryRun.data.dryRun
-      : {
-          ok: false as const,
-          label: "dryRun",
-          error: reviewDryRun.error
-        };
-
-  return {
-    paperOnly: true,
-    environment: state.alpacaEnv,
-    liveTradingEnabled: state.liveTradingEnabled,
-    generatedAt: new Date().toISOString(),
-    mode: "vps-cached-summary",
-    historicalDataAvailable: true,
-    durableStorageConfigured: false,
-    historicalWarning: null,
-    durableStorageWarning: null,
-    account,
-    positions,
-    runtime: cachedSummaryUnavailable("runtime"),
-    plan: cachedPlanResult(latestPlans),
-    review,
-    dryRun,
-    openOrders,
-    latestResearch,
-    latestPaperPlans: latestPlans,
-    snapshots,
-    executions,
-    learningSummary,
-    promotionReadiness: Array.isArray(promotionReadiness) ? promotionReadiness : [],
-    optionContracts: [],
-    requestIds,
-    hedge
-  } as DashboardSnapshot;
+  throw new Error("DASHBOARD_POSTGRES_BRIDGE_REQUIRED");
 };
 
 export const buildDashboardSnapshot = async (): Promise<DashboardSnapshot> => {
-  const state = assertPaperDashboardAccess();
+  assertPaperDashboardAccess();
 
   if (isPaperDashboardBridgeEnabled()) {
     const bridgeSummary = await getPaperBridgeSummary();
@@ -877,299 +674,74 @@ export const buildDashboardSnapshot = async (): Promise<DashboardSnapshot> => {
     } as DashboardSnapshot;
   }
 
-  if (shouldUseVercelReadOnlyFallback()) {
-    const [account, positions, openOrders] = await Promise.all([
-      capture("account", () => getAlpacaAccountSnapshot()),
-      capture("positions", () => listAlpacaPositions()),
-      capture("openOrders", () => listAlpacaOpenOrders())
-    ]);
-
-    return {
-      paperOnly: true,
-      environment: state.alpacaEnv,
-      liveTradingEnabled: state.liveTradingEnabled,
-      generatedAt: new Date().toISOString(),
-      mode: VERCEL_READ_ONLY_MODE,
-      historicalDataAvailable: false,
-      durableStorageConfigured: hasDashboardDurableStorageConfig(),
-      historicalWarning: VERCEL_HISTORICAL_UNAVAILABLE_MESSAGE,
-      durableStorageWarning: VERCEL_HISTORICAL_STORAGE_WARNING,
-      account,
-      positions,
-      runtime: historicalUnavailable("runtime"),
-      plan: historicalUnavailable("plan"),
-      review: historicalUnavailable("review"),
-      dryRun: historicalUnavailable("dryRun"),
-      latestResearch: [],
-      latestPaperPlans: [],
-      openOrders,
-      snapshots: [],
-      executions: historicalUnavailable("executions"),
-      learningSummary: historicalUnavailable("learningSummary"),
-      promotionReadiness: [],
-      optionContracts: [],
-      requestIds: [],
-      hedge: historicalUnavailable("hedge")
-    };
-  }
-
-  const [account, positions, openOrders, runtime, plan, review, dryRun, executions, learningSummary, hedge] =
-    await Promise.all([
-      capture("account", () => getAlpacaAccountSnapshot()),
-      capture("positions", () => listAlpacaPositions()),
-      capture("openOrders", () => listAlpacaOpenOrders()),
-      capture("runtime", async () => {
-        const { buildPaperRuntimeReport } = await import(
-          "../../../src/services/paperRuntimeService"
-        );
-        return buildPaperRuntimeReport({
-          riskProfile: "aggressive",
-          optionsEnabled: true,
-          maxCandidates: 10
-        });
-      }),
-      capture("plan", async () => {
-        const { buildPaperPlanReport } = await import(
-          "../../../src/services/paperPlanService"
-        );
-        return buildPaperPlanReport({
-          riskProfile: "aggressive",
-          optionsEnabled: true,
-          maxCandidates: 10
-        });
-      }),
-      capture("review", async () => {
-        const { buildPaperReviewReport } = await import(
-          "../../../src/services/paperReviewService"
-        );
-        return buildPaperReviewReport({
-          riskProfile: "aggressive",
-          optionsEnabled: true,
-          maxCandidates: 10
-        });
-      }),
-      capture("dryRun", async () => {
-        const { buildPaperExecuteDryRunReport } = await import(
-          "../../../src/services/paperExecuteDryRunService"
-        );
-        return buildPaperExecuteDryRunReport({
-          dryRun: true,
-          riskProfile: "aggressive",
-          optionsEnabled: true,
-          maxCandidates: 10,
-          assetClass: "all"
-        });
-      }),
-      capture("executions", () => latestPaperExecutions(25)),
-      capture("learningSummary", async () => {
-        const { paperLearningSummary } = await import(
-          "../../../src/services/paperLearningLedgerService"
-        );
-        return paperLearningSummary();
-      }),
-      capture("hedge", () => latestHedgeDashboardRecommendation())
-    ]);
-  const [
-    latestResearch,
-    latestPlans,
-    latestOpenOrderRows,
-    snapshots,
-    promotionReadiness,
-    optionContracts,
-    requestIds
-  ] = await Promise.all([
-    latestResearchRuns(5),
-    latestPaperPlans(10),
-    latestOpenOrders(12),
-    latestPaperRecommendationSnapshots(10),
-    import("../../../src/services/paperLearningLedgerService").then((service) =>
-      service.buildPromotionReadinessAnalytics()
-    ),
-    latestOptionContracts(10),
-    latestApiRequestIds(12)
-  ]);
-
-  return {
-    paperOnly: true,
-    environment: state.alpacaEnv,
-    liveTradingEnabled: state.liveTradingEnabled,
-    generatedAt: new Date().toISOString(),
-    mode: "local-sqlite" as const,
-    historicalDataAvailable: true,
-    durableStorageConfigured: false,
-    historicalWarning: null,
-    durableStorageWarning: null,
-    account,
-    positions,
-    runtime,
-    plan,
-    review,
-    dryRun,
-    openOrders,
-    latestResearch,
-    latestPaperPlans: latestPlans,
-    snapshots,
-    executions,
-    learningSummary,
-    promotionReadiness,
-    optionContracts,
-    requestIds
-  } as DashboardSnapshot;
+  throw new Error("DASHBOARD_POSTGRES_BRIDGE_REQUIRED");
 };
 
 export const runPaperResearch = async (input: PaperActionInput) => {
-  const { runResearchDaily } = await import("../../../src/services/researchOrchestrator");
-  return runResearchDaily({
-    riskProfile: input.riskProfile,
-    optionsEnabled: input.optionsEnabled,
-    maxCandidates: input.maxCandidates,
-    useAlpacaAssets: true
-  });
+  void input;
+  throw new Error("POSTGRES_ONLY_RUNTIME_PATH_DISABLED");
 };
 
 export const runPaperPlan = async (input: PaperActionInput) => {
-  const { buildPaperPlanReport } = await import("../../../src/services/paperPlanService");
-  return buildPaperPlanReport({
-    riskProfile: input.riskProfile,
-    optionsEnabled: input.optionsEnabled,
-    maxCandidates: input.maxCandidates
-  });
+  void input;
+  throw new Error("POSTGRES_ONLY_RUNTIME_PATH_DISABLED");
 };
 
 export const runPaperReview = async (input: PaperActionInput) => {
-  const { buildPaperReviewReport } = await import("../../../src/services/paperReviewService");
-  return buildPaperReviewReport({
-    riskProfile: input.riskProfile,
-    optionsEnabled: input.optionsEnabled,
-    maxCandidates: input.maxCandidates
-  });
+  void input;
+  throw new Error("POSTGRES_ONLY_RUNTIME_PATH_DISABLED");
 };
 
 export const runPaperDryRun = async (input: PaperActionInput) => {
-  const { buildPaperExecuteDryRunReport } = await import(
-    "../../../src/services/paperExecuteDryRunService"
-  );
-  return buildPaperExecuteDryRunReport({
-    dryRun: true,
-    riskProfile: input.riskProfile,
-    optionsEnabled: input.optionsEnabled,
-    maxCandidates: input.maxCandidates,
-    assetClass: input.assetClass
-  });
+  void input;
+  throw new Error("POSTGRES_ONLY_RUNTIME_PATH_DISABLED");
 };
 
 export const runPaperConfirm = async (input: PaperActionInput) => {
-  const { buildPaperReviewedPayloadExecutionReport } = await import(
-    "../../../src/services/paperReviewedPayloadExecutionService"
-  );
-  const { latestPaperReviewArtifact } = await import(
-    "../../../src/services/paperReviewArtifactService"
-  );
-  const artifact = latestPaperReviewArtifact();
-  return buildPaperReviewedPayloadExecutionReport({
-    confirmPaper: input.confirmPaper === true,
-    expectedPayloadSignature: artifact?.payloadSignature
-  });
+  void input;
+  throw new Error("POSTGRES_ONLY_RUNTIME_PATH_DISABLED");
 };
 
 export const runPaperLearningCommit = async () => {
-  const service = await import("../../../src/services/paperLearningLedgerService");
-  const evaluation = service.evaluatePaperLearningRecords({ limit: 100 });
-  return {
-    paperOnly: true,
-    status: "success",
-    summary: {
-      evaluatedRows: evaluation.evaluated,
-      submittedRows: 0,
-      pendingRows: evaluation.stillPending,
-      promotedSignals: service.paperLearningSummary().promoted,
-      demotedSignals: service.paperLearningSummary().rejected,
-      skippedReasons: evaluation.pendingReasons.slice(0, 20)
-    },
-    evaluation,
-    learningSummary: service.paperLearningSummary(),
-    promotionReadiness: service.buildPromotionReadinessAnalytics(),
-    blockers: [],
-    warnings: []
-  };
+  throw new Error("POSTGRES_ONLY_RUNTIME_PATH_DISABLED");
 };
 
 export const runPaperPortfolioReview = async (input: PaperActionInput) => {
-  const { buildPaperPortfolioReviewReport } = await import(
-    "../../../src/services/paperPortfolioReviewService"
-  );
-  return buildPaperPortfolioReviewReport({
-    moment: "manual"
-  });
+  void input;
+  throw new Error("POSTGRES_ONLY_RUNTIME_PATH_DISABLED");
 };
 
 export const runPaperOptionsDiscovery = async (input: PaperActionInput) => {
-  const { buildPaperOptionsDiscoveryReport } = await import(
-    "../../../src/services/paperOptionsDiscoveryService"
-  );
-  return buildPaperOptionsDiscoveryReport({
-    underlying: input.underlying,
-    dte: input.dte
-  });
+  void input;
+  throw new Error("POSTGRES_ONLY_RUNTIME_PATH_DISABLED");
 };
 
 export const runPaperOpsReviewAction = async () => {
-  const { runPaperOpsReview } = await import(
-    "../../../src/services/paperOpsWorkflowService"
-  );
-  return runPaperOpsReview({ triggerSource: "dashboard" });
+  throw new Error("POSTGRES_ONLY_RUNTIME_PATH_DISABLED");
 };
 
 export const runPaperReviewedExecution = async (input: PaperActionInput) => {
-  const { buildPaperReviewedPayloadExecutionReport } = await import(
-    "../../../src/services/paperReviewedPayloadExecutionService"
-  );
-  return buildPaperReviewedPayloadExecutionReport({
-    confirmPaper: input.confirmPaper,
-    expectedPayloadSignature: input.expectedPayloadSignature
-  });
+  void input;
+  throw new Error("POSTGRES_ONLY_RUNTIME_PATH_DISABLED");
 };
 
 export const runHedgeReviewAction = async () => {
-  const { buildAndPersistHedgeReview } = await import(
-    "../../../src/services/hedgeLearningService"
-  );
-  return buildAndPersistHedgeReview({ triggerSource: "dashboard-hedge-review" });
+  throw new Error("POSTGRES_ONLY_RUNTIME_PATH_DISABLED");
 };
 
 export const runHedgeExecutionAction = async (input: PaperActionInput) => {
-  const { executeReviewedPaperHedge } = await import(
-    "../../../src/services/hedgeExecutionService"
-  );
-  return executeReviewedPaperHedge({ reviewId: input.reviewId ?? "", confirmPaper: input.confirmPaper === true });
+  void input;
+  throw new Error("POSTGRES_ONLY_RUNTIME_PATH_DISABLED");
 };
 
 export const runHedgeExitReviewAction = async (input: PaperActionInput) => {
-  const { buildHedgeExitReview } = await import("../../../src/services/hedgeExitService");
-  return buildHedgeExitReview({
-    symbol: input.symbol ?? "",
-    underlying: input.underlying ?? "SPY",
-    quantity: input.quantity ?? 1,
-    entryPrice: input.entryPrice ?? 0,
-    currentPrice: input.currentPrice ?? 0,
-    expirationDate: input.expirationDate ?? "",
-    entryAt: input.entryAt ?? new Date().toISOString(),
-    asOf: input.asOf ?? new Date().toISOString(),
-    accountHash: "dashboard-paper-account",
-    sourceRecommendationId: "dashboard-hedge-exit",
-    sourceSnapshotId: "dashboard-snapshot",
-    sourceRegimeId: "dashboard-regime",
-    riskModelVersion: "portfolio-risk-v1",
-    regimeModelVersion: "market-regime-v1",
-    configurationFingerprint: "dashboard-config",
-    staleThesis: input.staleThesis,
-    riskNormalizationObservations: input.riskNormalizationObservations
-  });
+  void input;
+  throw new Error("POSTGRES_ONLY_RUNTIME_PATH_DISABLED");
 };
 
 export const runHedgeExitExecutionAction = async (input: PaperActionInput) => {
-  const { executeReviewedPaperHedgeExit } = await import("../../../src/services/hedgeExitService");
-  return executeReviewedPaperHedgeExit({ reviewId: input.reviewId ?? "", confirmPaper: input.confirmPaper === true });
+  void input;
+  throw new Error("POSTGRES_ONLY_RUNTIME_PATH_DISABLED");
 };
 
 export const dashboardMoney = (value: unknown) => {

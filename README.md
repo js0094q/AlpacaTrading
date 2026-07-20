@@ -1,5 +1,36 @@
 # Alpaca Trading Research Infrastructure
 
+## PostgreSQL-only runtime authority (2026-07-20)
+
+PostgreSQL is the sole production runtime authority. SQLite migration,
+backfill, reconciliation, shadow, dual-write, fallback, and runtime access are
+retired. Historical SQLite implementation notes later in this file describe
+completed development releases only; their commands are not supported runtime
+operations.
+
+Production startup requires `DATABASE_BACKEND=postgres`, PostgreSQL reads and
+writes, control-plane/scheduler/execution-state authority, both shadow flags
+off, and `SQLITE_AUDIT_MIRROR_ENABLED=false`. Missing PostgreSQL connectivity
+or an incomplete authority configuration fails closed. Dashboard reads require
+the PostgreSQL-backed VPS bridge. Dashboard mutations, timers, monitors, and
+the autonomous worker remain disabled pending the evidence-utilization and
+runtime audit.
+
+Supported authority operations are:
+
+```bash
+npm run db:postgres:connectivity
+npm run db:postgres:status
+npm run db:postgres:verify
+npm run db:postgres:authority:status
+```
+
+`db:postgres:authority:cutover` is the one-time supported current-state
+cutover workflow. It captures fresh Alpaca paper evidence, preserves existing
+risk policy fingerprints, closes only stale PostgreSQL runtime rows, submits
+zero orders, and creates a fresh authority baseline explicitly marked as not a
+historical SQLite reconciliation.
+
 ## Current continuation checkpoint (July 2026)
 
 - 2026-07-14 safety-floor branch: general reviewed payloads are HMAC signed,
@@ -161,10 +192,16 @@ PAPER_POSITION_SYNC_FRESHNESS_MINUTES=2160
 ENABLE_OPTIONS_RESEARCH=true
 ENABLE_AGGRESSIVE_PAPER_STRATEGIES=true
 ENABLE_SHORT_RESEARCH=true
-RESEARCH_DB_PATH=./data/research.db
-SQLITE_BUSY_TIMEOUT_MS=5000
-SQLITE_BUSY_RETRY_MAX_ATTEMPTS=4
-SQLITE_BUSY_RETRY_DELAY_MS=25
+DATABASE_BACKEND=postgres
+POSTGRES_READS_ENABLED=true
+POSTGRES_WRITES_ENABLED=true
+POSTGRES_SHADOW_COMPARE_ENABLED=false
+POSTGRES_CONTROL_PLANE_AUTHORITY_ENABLED=true
+POSTGRES_SCHEDULER_AUTHORITY_ENABLED=true
+POSTGRES_EXECUTION_STATE_SHADOW_ENABLED=false
+POSTGRES_EXECUTION_STATE_AUTHORITY_ENABLED=true
+SQLITE_AUDIT_MIRROR_ENABLED=false
+AUTONOMOUS_RUNTIME_AUDIT_APPROVED=false
 ALPACA_REQUEST_TIMEOUT_MS=15000
 ALPACA_MAX_RETRIES=2
 VPS_RESEARCH_REQUEST_TIMEOUT_MS=10000
@@ -503,39 +540,12 @@ confirmed fills in `paper_execution_ledger`. If Alpaca nets more than one possib
 decision into a symbol position, the linked lifecycles are marked
 `AMBIGUOUS_NETTED_POSITION` and per-decision return/MFE/MAE stay null.
 
-Run and verify the additive migration (the database flag defaults to
-`RESEARCH_DB_PATH` when omitted):
+SQLite schema and WAL commands are retained only in isolated tests and
+historical implementation sources. They are not packaged runtime commands and
+must not be used to import more history.
 
-```bash
-npm run db:migrate -- --database /path/to/research.db
-npm run db:verify -- --database /path/to/research.db
-```
-
-Test WAL only against a new copy target. The command refuses in-place use,
-preserves the source checksum, emits no row data, and leaves journal-mode policy
-unchanged for the source:
-
-```bash
-npm run db:sqlite:wal-verify -- --source /path/to/source.db --copy /path/to/new-copy.db
-```
-
-Run this only after quiescing writers, and place the copy on the same filesystem
-and storage class as the source. A passing script is necessary but not sufficient
-to adopt WAL; filesystem, sidecar-aware backup/restore, migration-twice, and
-deployment evidence must also pass.
-
-`db:migrate` is the only production schema-mutation path. Run it before
-restarting SQLite-backed services. Once the required versions are applied,
-ordinary CLI startup reads migration state without DDL or a migration writer
-transaction. An empty database or one with pending versions fails closed with
-`DATABASE_MIGRATION_REQUIRED`; only isolated Node test fixtures may initialize
-their scratch schema automatically. `db:verify` reports pending versions, integrity,
-foreign-key violations, and current journal/busy-timeout/foreign-key/synchronous
-PRAGMAs.
-
-The staged Neon control plane remains non-authoritative by default. Use the
-pooled variable for normal application traffic and the direct variable only for
-controlled migration/backfill work:
+Use the pooled PostgreSQL variable for application traffic and the direct
+variable only for PostgreSQL schema migration and verification:
 
 ```bash
 npm run db:postgres:connectivity
@@ -543,38 +553,16 @@ npm run db:postgres:connectivity -- --mode=direct
 npm run db:postgres:status
 npm run db:postgres:migrate
 npm run db:postgres:verify
-npm run db:postgres:control-plane:snapshot -- --source /path/to/source.db --destination /protected/snapshot-directory
-npm run db:postgres:control-plane:backfill -- --snapshot /protected/snapshot-directory/source-snapshot.db
-npm run db:postgres:control-plane:reconcile -- --snapshot /protected/snapshot-directory/source-snapshot.db
-npm run db:postgres:control-plane:shadow -- --snapshot /protected/snapshot-directory/source-snapshot.db
-npm run db:postgres:control-plane:status
-npm run db:postgres:execution-state:backfill -- --snapshot /protected/snapshot-directory/source-snapshot.db
-npm run db:postgres:execution-state:reconcile -- --snapshot /protected/snapshot-directory/source-snapshot.db
-npm run db:postgres:execution-state:shadow -- --snapshot /protected/snapshot-directory/source-snapshot.db
-npm run db:postgres:execution-state:status
+npm run db:postgres:authority:status
 ```
 
 Only `db:postgres:migrate` applies PostgreSQL DDL. Run it through the direct
 endpoint; running it twice must leave the second `appliedVersions` list empty.
-The control-plane snapshot uses SQLite online backup, records its checksum and
-checks, and makes the copy read-only. Backfill is bounded and idempotent;
-reconcile and shadow persist sanitized discrepancy evidence and fail closed on
-unexplained differences. All output reports variable names and presence, never
-values. Keep `DATABASE_BACKEND=sqlite` and every PostgreSQL read/write, shadow,
-and authority flag false until the applicable gate passes. The Release 4 code
-routes all 14 approved scheduled workstreams through PostgreSQL fencing and adds
-execution-state backfill, reconciliation, shadow, and authority boundaries, but
-production ownership must still advance through the documented staged gates. See
-`docs/runbooks/neon-postgres-operations.md`.
-
-Execution-state backfill treats `(account_id, snapshot_fingerprint)` and
-`(account_id, idempotency_key)` conflicts as idempotent only after comparing the
-existing PostgreSQL row semantically. It reuses the existing primary key and
-remaps dependent foreign keys without overwriting or deleting history; material
-mismatches fail closed. Reconciliation records mutable-state differences and
-PostgreSQL-only rows newer than the sealed source snapshot as classified durable
-checkpoint evidence. Only unexplained missing rows, mismatches, duplicates,
-orphans, or invariants block the authority gate.
+All diagnostics report variable names and presence, never values. The fresh
+authority baseline validates current account, positions, open orders,
+reservations, policy state, review evidence, learning/recovery state, and
+scheduler ownership directly against the Alpaca paper account. It does not
+claim historical SQLite reconciliation.
 
 `strategy_allocations` is a current singleton per account and strategy for one
 configuration. A primary-key replay may preserve an existing PostgreSQL row only
@@ -637,9 +625,11 @@ The continuous paper monitor is installed separately with `scripts/install-paper
 - `alpaca-zero-dte-reconcile.timer`: wakes every five minutes to mark paper/shadow positions and capture forward outcomes.
 - `alpaca-zero-dte-eod.timer`: writes the end-of-day 0DTE summary after the force-exit window.
 
-Database-heavy wakeups are deliberately staggered: general exit review starts on minute 1, general review on minute 3, the 0DTE engine near second 45, 0DTE exit review near second 55, and reconciliation on minute 1 modulo 5 near second 30. SQLite connections use the bounded 5-second busy timeout by default (`SQLITE_BUSY_TIMEOUT_MS`, capped at 30 seconds), plus finite retry only for explicitly idempotent lifecycle/lease/batch writes. Research option persistence and the 0DTE engine batch use the narrow `research-options-and-zero-dte-engine` lease; reads and order paths are not globally serialized. Ordinary startup no longer performs migration writes. The monitor runner otherwise no-ops with `MARKET_CLOSED` outside regular market hours, weekends, and configured US market holidays; the read-only `zero-dte-eod` task is the sole post-close exception on a valid weekday session. It fails closed unless `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, `LIVE_TRADING_ENABLED=false`, `PAPER_ORDER_EXECUTION_ENABLED=true`, `PAPER_OPTIONS_EXECUTION_ENABLED=true`, and `AUTOMATED_PAPER_EXECUTION_ENABLED=true` for execution tasks. See `docs/paper-monitoring-operations.md`.
-
-Set the VPS timezone to `America/New_York` or adjust the timer calendar before enabling timers.
+These former monitor schedules remain only as historical design evidence.
+Production command gating disables every monitor/trading workflow, and all such
+timers must remain stopped pending the evidence-utilization and runtime audit.
+Do not enable them or use `docs/paper-monitoring-operations.md` as a current
+operating runbook.
 
 Each 0DTE monitor task has a dedicated lock (`/tmp/alpaca-zero-dte-engine.lock`, `/tmp/alpaca-zero-dte-exit-review.lock`, `/tmp/alpaca-zero-dte-reconcile.lock`, or `/tmp/alpaca-zero-dte-eod.lock`). Only the engine task is mutation-capable; exit review, reconciliation, and end-of-day summary tasks set `AUTOMATED_PAPER_EXECUTION_ENABLED=false`.
 
@@ -916,9 +906,12 @@ The dashboard shows paper account state, buying power, equity, cash, positions, 
 
 The `0DTE Level 2` panel adds the bounded live queue, active paper 0DTE positions, simulated shadow trades, lifecycle state, learning/outcome summary, blockers, and engine health. Its VPS and Vercel summary routes are read-only.
 
-On local and VPS runtimes, historical dashboard sections read the local SQLite database at `RESEARCH_DB_PATH` or `./data/research.db`. On Vercel, the dashboard does not initialize local SQLite or create app-local data directories. Vercel historical sections render a read-only fallback warning because durable runtime history and the paper execution ledger live on the VPS/local runtime.
+All dashboard state is served through the PostgreSQL-backed VPS bridge. No
+local, VPS, or Vercel dashboard route reads SQLite or returns an empty SQLite
+fallback. Bridge or PostgreSQL failure returns `503`.
 
-Dashboard actions include:
+The following dashboard actions remain visible but fail closed pending the
+evidence-utilization and runtime audit:
 
 - Run research
 - Build paper plan
@@ -926,7 +919,11 @@ Dashboard actions include:
 - Run dry-run execution
 - Submit to Alpaca Paper Account
 
-Every dashboard API route enforces `ALPACA_ENV=paper` and `LIVE_TRADING_ENABLED=false`. Order-submission routes additionally require `PAPER_ORDER_EXECUTION_ENABLED=true`, and option submissions require `PAPER_OPTIONS_EXECUTION_ENABLED=true`. Vercel dashboard deployments remain read-only and do not allow order submission. Routes must not expose Alpaca keys, secrets, `.env` contents, raw process environment, live endpoint URLs, secret-bearing error messages, or live-trading toggles.
+Every dashboard API route enforces `ALPACA_ENV=paper`, both live flags off, and
+PostgreSQL authority availability. Mutating control routes return
+`POSTGRES_ONLY_RUNTIME_PATH_DISABLED`; the autonomous worker remains stopped.
+Routes must not expose credentials, environment contents, connection strings,
+or secret-bearing errors.
 
 ## Vercel Deployment
 
@@ -966,14 +963,16 @@ npm run vercel:env:parity -- --check-vercel-presence --pull-vercel
 
 The parity check prints only presence booleans and sha256 fingerprint comparison results. It must not print raw token, URL, or credential values.
 
-The Vercel serverless runtime must not rely on writable SQLite persistence under `/var/task`. Without future durable dashboard storage, historical API routes return:
+The Vercel serverless runtime requires the configured PostgreSQL authority
+bridge. Without it, dashboard reads fail closed:
 
 ```json
 {
-  "ok": true,
-  "mode": "vercel-read-only",
-  "data": [],
-  "warning": "Historical runtime data is stored on the VPS. Configure durable dashboard storage to show this data on Vercel."
+  "ok": false,
+  "error": {
+    "code": "DASHBOARD_POSTGRES_BRIDGE_REQUIRED",
+    "message": "The PostgreSQL authority bridge is required."
+  }
 }
 ```
 
@@ -1179,9 +1178,11 @@ Alpaca option snapshots may use current camelCase fields (`greeks`, `latestQuote
 
 The bounded beta cache is compatible only when symbol, benchmark, lookback, interval, minimum observations, calculation version, latest aligned market-data date, and expiry all match. Persisted recommendations retain generated/expiry times, paper environment, source snapshot ID, risk/regime versions, configuration fingerprint, quality/status, and the reviewed-payload hash after planning. Dashboard reads re-evaluate freshness and never label stale or expired records current.
 
-## Data persistence
+## Historical test-fixture persistence
 
-Local/VPS persistence uses `data/research.db` by default with the following collections/tables:
+The isolated legacy test suite can create `data/research.db`-shaped scratch
+fixtures with the following collections/tables. Production does not open,
+create, read, write, migrate, or fall back to this database:
 
 - universe_symbols
 - universe_lifecycle_runs
@@ -1209,13 +1210,17 @@ Local/VPS persistence uses `data/research.db` by default with the following coll
 - portfolio_beta_cache
 - paper_reconciliation_events
 
-Alpaca API request IDs are persisted in `api_request_log.request_id`.
+The historical fixture includes `api_request_log`, but production SQLite API
+request logging is disabled. Current broker callers retain request IDs in their
+returned evidence; a future durable request-log sink must be PostgreSQL-backed.
 
-On Vercel, API request logging does not write to local SQLite. Historical dashboard state remains unavailable until an external durable dashboard store is added.
+On Vercel, no route reads or writes local SQLite. Dashboard data requires the
+PostgreSQL-backed VPS bridge and fails closed when that bridge is unavailable.
 
 ## API request IDs
 
-- Recorded in `api_request_log` with columns `provider`, `endpoint`, `method`, `status`, `request_id`, `created_at`.
+- Returned through broker read results and command evidence. No production
+  SQLite request-log write is enabled.
 
 ## Safety boundaries
 
@@ -1303,7 +1308,7 @@ Cached hedge reads are available at `/api/paper/hedge/risk`, `/api/paper/hedge/r
 
 ## Known limitations (phase 1)
 
-- Dashboard persistence depends on the configured local/VPS SQLite database path. Vercel renders historical dashboard sections with a read-only fallback until an external durable store is added.
+- Dashboard reads depend on the PostgreSQL-backed VPS bridge and fail closed when it is unavailable.
 - Options support uses Alpaca snapshot-based simulation approximations where historical option pricing is unavailable.
 - Multi-leg options are not implemented.
 - API responses and request IDs are logged, but route-level retry policy is intentionally minimal.

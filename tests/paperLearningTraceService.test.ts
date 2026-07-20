@@ -192,6 +192,8 @@ describe("learning linkage and read-only decision trace", () => {
       [
         "--import",
         "tsx",
+        "--import",
+        "./tests/helpers/enableSqliteFixtureInitialization.mjs",
         "src/cli.ts",
         "paper:trace",
         "--decisionId",

@@ -5,6 +5,8 @@ export interface AlpacaPositionSnapshot {
   assetId?: string;
   assetClass?: string;
   qty?: string;
+  qtyAvailable?: string;
+  averageEntryPrice?: string;
   marketValue?: string;
   costBasis?: string;
   unrealizedPl?: string;
@@ -18,6 +20,8 @@ type ApiPositionPayload = {
   asset_id?: string;
   asset_class?: string;
   qty?: string;
+  qty_available?: string;
+  avg_entry_price?: string;
   market_value?: string;
   cost_basis?: string;
   unrealized_pl?: string;
@@ -31,6 +35,8 @@ const mapPosition = (row: ApiPositionPayload): AlpacaPositionSnapshot => ({
   assetId: row.asset_id,
   assetClass: row.asset_class,
   qty: row.qty,
+  qtyAvailable: row.qty_available,
+  averageEntryPrice: row.avg_entry_price,
   marketValue: row.market_value,
   costBasis: row.cost_basis,
   unrealizedPl: row.unrealized_pl,
