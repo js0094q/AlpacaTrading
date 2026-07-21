@@ -196,6 +196,8 @@ export const refreshPostgresMarketData = async (input: {
   const optionContracts: PostgresOptionContract[] = [];
   const optionSnapshots: PostgresOptionSnapshot[] = [];
   if (input.optionsEnabled) {
+    const optionFeed = process.env.ALPACA_OPTION_DATA_FEED?.trim().toLowerCase() || "opra";
+    if (optionFeed !== "opra") throw new Error(`POSTGRES_OPTION_FEED_INVALID:${optionFeed}`);
     const rawContracts = await dependencies.fetchOptionContracts({
       underlyingSymbols: requestedSymbols,
       minDaysToExpiration: 0,
@@ -249,7 +251,11 @@ export const refreshPostgresMarketData = async (input: {
         rho: normalized.greeks.rho,
         source: "alpaca",
         requestId: null,
-        evidence: fetched.raw as Readonly<Record<string, unknown>>
+        evidence: {
+          requestedFeed: optionFeed,
+          effectiveFeed: optionFeed,
+          raw: fetched.raw
+        }
       });
     }
     if (optionSnapshots.length === 0) {

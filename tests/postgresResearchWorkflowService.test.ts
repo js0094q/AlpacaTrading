@@ -28,10 +28,12 @@ const target = {
 
 test("research persists current PostgreSQL evidence and selected candidates before completing", async () => {
   const sql: string[] = [];
+  let candidateValues: readonly unknown[] = [];
   const result = await runPostgresResearchWorkflow({
     query: {
-      query: async (statement: string) => {
+      query: async (statement: string, values?: readonly unknown[]) => {
         sql.push(statement);
+        if (statement.includes("INSERT INTO candidates")) candidateValues = values ?? [];
         return { rows: statement.includes("INSERT INTO research_runs") ? [{ version: "1" }] : [], rowCount: 1 };
       }
     },
@@ -57,7 +59,10 @@ test("research persists current PostgreSQL evidence and selected candidates befo
           features: { close: 555, trend: "bullish", marketEvidenceTimestamp: bar.observedAt },
           sourceFingerprint: "feature-fingerprint"
         }],
-        targets: [target]
+        targets: [{ ...target, optionsStrategy: { decisionInputs: {
+          currentTradablePrice: 555, intradayReturn: 0.01,
+          stockEvidenceFreshnessStatus: "FRESH", marketSessionEligible: true
+        } } }]
       }),
       symbols: ["SPY"]
     }
@@ -69,6 +74,15 @@ test("research persists current PostgreSQL evidence and selected candidates befo
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO candidates")), true);
   assert.equal(sql.some((statement) => /id, decision_id, research_run_id/.test(statement)), true);
   assert.equal(sql.some((statement) => /SET status = 'completed'/.test(statement)), true);
+  assert.deepEqual(JSON.parse(String(candidateValues[22])), {
+    targetSourceFingerprint: "target-fingerprint", marketEvidenceTimestamp: bar.observedAt,
+    entryReference: 555, stopLoss: 547.5, takeProfit: 570,
+    marketDecisionInputs: {
+      currentTradablePrice: 555, intradayReturn: 0.01,
+      stockEvidenceFreshnessStatus: "FRESH", marketSessionEligible: true,
+      option: null
+    }
+  });
 });
 
 test("research fails closed and records failure when current market evidence is unavailable", async () => {

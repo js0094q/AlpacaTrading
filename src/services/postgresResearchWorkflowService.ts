@@ -158,7 +158,11 @@ const persistCandidates = async (input: {
       marketEvidenceTimestamp: target.asOf,
       entryReference: target.entryReference,
       stopLoss: target.stopLoss,
-      takeProfit: target.takeProfit
+      takeProfit: target.takeProfit,
+      marketDecisionInputs: {
+        ...(target.optionsStrategy?.decisionInputs as Record<string, unknown> | undefined),
+        option: option?.decisionInputs ?? null
+      }
     };
     const result = await input.query.query(
       `INSERT INTO candidates(
@@ -249,6 +253,7 @@ export const runPostgresResearchWorkflow = async (input: {
     });
     const generated = await deps.buildFeaturesAndTargets({
       bars: market.bars,
+      stockSnapshots: market.stockSnapshots,
       optionContracts: market.optionContracts,
       optionSnapshots: market.optionSnapshots,
       riskProfile: input.riskProfile,

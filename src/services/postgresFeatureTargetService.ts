@@ -5,6 +5,7 @@ import type {
   PostgresMarketBar,
   PostgresOptionContract,
   PostgresOptionSnapshot,
+  PostgresStockSnapshot,
   PostgresTargetSnapshot
 } from "../repositories/postgres/postgresMarketDataRepository.js";
 import { PostgresMarketDataRepository } from "../repositories/postgres/postgresMarketDataRepository.js";
@@ -18,7 +19,67 @@ type FeatureTargetWriter = Pick<
   "upsertFeatureSnapshots" | "upsertTargetSnapshots"
 >;
 
-type FeatureValues = Record<string, string | number | null>;
+type FeatureValues = Record<string, string | number | boolean | null | undefined>;
+
+const numberValue = (value: unknown) => typeof value === "number" && Number.isFinite(value) ? value : null;
+const stringValue = (value: unknown) => typeof value === "string" && value.length > 0 ? value : null;
+
+const isRegularMarketSession = (timestamp: string) => {
+  const date = new Date(timestamp);
+  if (!Number.isFinite(date.getTime())) return false;
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York", weekday: "short", hour: "2-digit", minute: "2-digit", hourCycle: "h23"
+  }).formatToParts(date);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  if (values.weekday === "Sat" || values.weekday === "Sun") return false;
+  const minutes = Number(values.hour) * 60 + Number(values.minute);
+  return minutes >= 570 && minutes <= 960;
+};
+
+const stockEvidenceAsOf = (input: { symbol: string; asOf: string; snapshots: readonly PostgresStockSnapshot[] }) =>
+  input.snapshots
+    .filter((row) => normalizeSymbol(row.symbol) === input.symbol && Date.parse(row.observedAt) <= Date.parse(input.asOf))
+    .sort((left, right) => Date.parse(right.observedAt) - Date.parse(left.observedAt))[0] ?? null;
+
+const latestStockEvidence = (symbol: string, snapshots: readonly PostgresStockSnapshot[]) =>
+  snapshots
+    .filter((row) => normalizeSymbol(row.symbol) === symbol)
+    .sort((left, right) => Date.parse(right.observedAt) - Date.parse(left.observedAt))[0] ?? null;
+
+const stockDecisionFeatures = (snapshot: PostgresStockSnapshot | null) => {
+  if (!snapshot) return {};
+  const evidence = snapshot.evidence;
+  const freshnessStatus = stringValue(evidence.freshnessStatus);
+  const dataQualityStatus = stringValue(evidence.dataQualityStatus);
+  const midpoint = numberValue(evidence.midpoint);
+  const latestTradePrice = numberValue(evidence.latestTradePrice);
+  const currentTradablePrice = midpoint ?? latestTradePrice;
+  return {
+    currentTradablePrice,
+    latestTradePrice,
+    bidPrice: numberValue(evidence.bidPrice),
+    askPrice: numberValue(evidence.askPrice),
+    bidAskMidpoint: midpoint,
+    absoluteSpread: numberValue(evidence.spread),
+    percentageSpread: numberValue(evidence.spreadPct),
+    intradayReturn: numberValue(evidence.returnFromOpen),
+    snapshotDailyReturn: numberValue(evidence.dailyReturn),
+    distanceFromVwap: numberValue(evidence.distanceFromVwap),
+    snapshotRelativeVolume: numberValue(evidence.relativeCurrentDayVolume),
+    currentRangePosition: (() => {
+      const low = numberValue(evidence.dailyLow);
+      const high = numberValue(evidence.dailyHigh);
+      return currentTradablePrice !== null && low !== null && high !== null && high > low
+        ? (currentTradablePrice - low) / (high - low)
+        : null;
+    })(),
+    marketSessionEligible: freshnessStatus === "FRESH" && dataQualityStatus === "COMPLETE" && isRegularMarketSession(snapshot.sourceTimestamp ?? snapshot.observedAt),
+    stockEvidenceFreshnessStatus: freshnessStatus,
+    stockDataQualityStatus: dataQualityStatus,
+    stockEvidenceTimestamp: snapshot.sourceTimestamp ?? snapshot.observedAt,
+    stockEffectiveFeed: snapshot.effectiveFeed
+  };
+};
 
 const fingerprint = (value: unknown) => canonicalJsonHash(value);
 
@@ -84,7 +145,8 @@ const buildOptionFeatures = (input: {
   const puts = nearestRows.filter((row) => row.contract.type === "put");
   const bid = selected.snapshot.bid;
   const ask = selected.snapshot.ask;
-  const spreadPct = bid !== null && ask !== null && bid > 0 ? (ask - bid) / bid : null;
+  const midpoint = selected.snapshot.midpoint;
+  const spreadPct = bid !== null && ask !== null && midpoint !== null && midpoint > 0 ? (ask - bid) / midpoint : null;
   const liquidity = (selected.snapshot.volume ?? 0) + (selected.snapshot.openInterest ?? 0);
   const spreadSignal = spreadPct === null ? 0 : 1 - Math.min(1, Math.abs(spreadPct));
   const liquidityScore =
@@ -103,6 +165,24 @@ const buildOptionFeatures = (input: {
     selected.snapshot.snapshotTimestamp ?? selected.snapshot.tradeTimestamp ??
     selected.snapshot.observedAt;
   const entryPrice = selected.snapshot.midpoint ?? selected.snapshot.ask ?? selected.snapshot.last ?? null;
+  const quoteAgeSeconds = (Date.parse(input.asOf) - Date.parse(evidenceTimestamp)) / 1000;
+  const quoteFreshnessStatus = Number.isFinite(quoteAgeSeconds) && quoteAgeSeconds >= 0 && quoteAgeSeconds <= 1_200
+    ? "fresh"
+    : "stale";
+  const moneyness = selected.contract.type === "call"
+    ? (input.close - selected.contract.strike) / input.close
+    : (selected.contract.strike - input.close) / input.close;
+  const intrinsicValue = selected.contract.type === "call"
+    ? Math.max(0, input.close - selected.contract.strike)
+    : Math.max(0, selected.contract.strike - input.close);
+  const extrinsicValue = entryPrice === null ? null : Math.max(0, entryPrice - intrinsicValue);
+  const expirationMs = Date.parse(`${nearestExpiration}T20:00:00.000Z`);
+  const hoursToExpiration = Math.max(0, (expirationMs - Date.parse(input.asOf)) / 3_600_000);
+  const greekCoverage = [selected.snapshot.delta, selected.snapshot.gamma, selected.snapshot.theta, selected.snapshot.vega]
+    .filter((value) => value !== null && value !== undefined).length / 4;
+  const decisionLiquidityScore = liquidityScore + greekCoverage * 0.1;
+  const optionFeedValidated = selected.snapshot.evidence.requestedFeed === "opra" && selected.snapshot.evidence.effectiveFeed === "opra";
+  const contractEligible = hasLiquidity && optionFeedValidated && quoteFreshnessStatus === "fresh" && spreadPct !== null && spreadPct <= 0.08 && entryPrice !== null;
 
   return {
     values: {
@@ -115,7 +195,21 @@ const buildOptionFeatures = (input: {
       callSpreadAvailable: calls.length >= 2 ? 1 : 0,
       putSpreadAvailable: puts.length >= 2 ? 1 : 0,
       estimatedBidAskSpreadPct: spreadPct,
-      preferredContractLiquidityScore: liquidityScore,
+      optionUnderlyingPrice: input.close,
+      optionMidpoint: midpoint,
+      optionMoneyness: moneyness,
+      optionIntrinsicValue: intrinsicValue,
+      optionExtrinsicValue: extrinsicValue,
+      hoursToExpiration,
+      optionQuoteAgeSeconds: quoteAgeSeconds,
+      optionQuoteFreshnessStatus: quoteFreshnessStatus,
+      optionFeedValidated,
+      optionContractEligible: contractEligible,
+      optionDelta: selected.snapshot.delta,
+      optionGamma: selected.snapshot.gamma ?? null,
+      optionTheta: selected.snapshot.theta ?? null,
+      optionVega: selected.snapshot.vega ?? null,
+      preferredContractLiquidityScore: decisionLiquidityScore,
       optionSuitability: hasLiquidity && liquidityScore > 0.7
         ? "suitable"
         : hasLiquidity && liquidityScore > 0.35
@@ -123,7 +217,7 @@ const buildOptionFeatures = (input: {
           : "unsuitable",
       marketEvidenceTimestamp: evidenceTimestamp
     } satisfies FeatureValues,
-    candidate: {
+    candidate: contractEligible ? {
       optionSymbol: selected.contract.optionSymbol,
       expirationDate: selected.contract.expirationDate,
       strike: selected.contract.strike,
@@ -132,14 +226,21 @@ const buildOptionFeatures = (input: {
       maxLoss: null,
       maxProfit: null,
       breakeven: null,
-      liquidityScore,
+      liquidityScore: decisionLiquidityScore,
       evidenceTimestamp
-    }
+      ,decisionInputs: {
+        delta: selected.snapshot.delta, gamma: selected.snapshot.gamma ?? null,
+        theta: selected.snapshot.theta ?? null, vega: selected.snapshot.vega ?? null,
+        impliedVolatility, spreadPct, moneyness, quoteFreshnessStatus,
+        feed: optionFeedValidated ? "opra" : null
+      }
+    } : null
   };
 };
 
 const calculateFeatures = (input: {
   bars: readonly PostgresMarketBar[];
+  stockSnapshots: readonly PostgresStockSnapshot[];
   contracts: readonly PostgresOptionContract[];
   snapshots: readonly PostgresOptionSnapshot[];
 }) => {
@@ -163,10 +264,15 @@ const calculateFeatures = (input: {
     const sma50 = sma(closeSeries, 50);
     const averageVolume = sma(volumeSeries, 20);
     const macdValues = macd(closeSeries);
+    const stockSnapshot = index === input.bars.length - 1
+      ? latestStockEvidence(normalizeSymbol(bar.symbol), input.stockSnapshots)
+      : stockEvidenceAsOf({ symbol: normalizeSymbol(bar.symbol), asOf: bar.observedAt, snapshots: input.stockSnapshots });
+    const stock = stockDecisionFeatures(stockSnapshot);
+    const decisionAsOf = stockSnapshot?.observedAt ?? bar.observedAt;
     const option = buildOptionFeatures({
       symbol: normalizeSymbol(bar.symbol),
-      asOf: bar.observedAt,
-      close: bar.close,
+      asOf: decisionAsOf,
+      close: typeof stock.currentTradablePrice === "number" ? stock.currentTradablePrice : bar.close,
       contracts: input.contracts,
       snapshots: input.snapshots
     });
@@ -198,13 +304,17 @@ const calculateFeatures = (input: {
       distanceFrom20High: distanceFrom(highs[index]!, sma10 && sma20 ? Math.max(...highSeries.slice(-20)) : null),
       distanceFrom20Low: distanceFrom(lows[index]!, sma10 && sma20 ? Math.min(...lowSeries.slice(-20)) : null),
       trend: classifyTrend({ sma10, sma20, sma50, close: bar.close }),
+      multiPeriodReturn5: index >= 5 ? bar.close / closes[index - 5]! - 1 : null,
+      multiPeriodReturn20: index >= 20 ? bar.close / closes[index - 20]! - 1 : null,
+      realizedVolatility20: rollingStd(logs.slice(0, index + 1).filter((value): value is number => value !== null), 20),
+      ...stock,
       ...option.values
     };
     return {
       symbol: normalizeSymbol(bar.symbol),
-      observedAt: bar.observedAt,
+      observedAt: decisionAsOf,
       features: values,
-      sourceFingerprint: fingerprint({ bar, optionEvidenceTimestamp: option.values.marketEvidenceTimestamp }),
+      sourceFingerprint: fingerprint({ bar, stockSnapshot, optionEvidenceTimestamp: option.values.marketEvidenceTimestamp }),
       optionCandidate: option.candidate
     };
   });
@@ -224,7 +334,11 @@ const targetFromFeature = (input: {
       ? (values.ema9 - values.ema21) / (values.ema21 || 1)
       : 0) +
     (typeof values.macdHistogram === "number" ? Math.sign(values.macdHistogram) * 0.2 : 0) +
-    (typeof values.relativeVolume === "number" ? 0.2 * (values.relativeVolume - 1) : 0);
+    (typeof values.snapshotRelativeVolume === "number"
+      ? 0.2 * (values.snapshotRelativeVolume - 1)
+      : typeof values.relativeVolume === "number" ? 0.2 * (values.relativeVolume - 1) : 0) +
+    (typeof values.intradayReturn === "number" ? Math.max(-0.25, Math.min(0.25, values.intradayReturn * 5)) : 0) +
+    (typeof values.distanceFromVwap === "number" ? Math.max(-0.15, Math.min(0.15, values.distanceFromVwap * 3)) : 0);
   const volatilityAdjusted = Math.max(0, Math.min(2,
     1 + (typeof values.atmImpliedVol === "number" ? values.atmImpliedVol : 0.2)
   ));
@@ -233,7 +347,9 @@ const targetFromFeature = (input: {
   const confidence = Math.max(0, Math.min(1, Math.abs(directionScore) / 2 + learningBoost * 0.2));
   const direction = directionScore > 0.25 ? "long" : directionScore < -0.25 ? "short" : "neutral";
   const atr14 = typeof values.atr14 === "number" ? values.atr14 : null;
-  const close = typeof values.close === "number" ? values.close : 0;
+  const close = typeof values.currentTradablePrice === "number"
+    ? values.currentTradablePrice
+    : typeof values.close === "number" ? values.close : 0;
   const stopDistance = (atr14 ?? 0) * 1.5;
   const profitDistance = (atr14 ?? 0) * 3;
   const selector = selectExpressionWithPolicy({
@@ -275,13 +391,26 @@ const targetFromFeature = (input: {
     optionsStrategy: {
       alternatives: selector.alternatives,
       rationale: selector.rationale,
-      optionsCandidate: input.feature.optionCandidate
+      optionsCandidate: input.feature.optionCandidate,
+      decisionInputs: {
+        currentTradablePrice: values.currentTradablePrice,
+        intradayReturn: values.intradayReturn,
+        distanceFromVwap: values.distanceFromVwap,
+        relativeVolume: values.relativeVolume,
+        realizedVolatility20: values.realizedVolatility20,
+        currentRangePosition: values.currentRangePosition,
+        distanceToStopLoss: stopDistance,
+        distanceToTakeProfit: profitDistance,
+        stockEvidenceFreshnessStatus: values.stockEvidenceFreshnessStatus,
+        marketSessionEligible: values.marketSessionEligible
+      }
     }
   };
 };
 
 export const buildPostgresFeaturesAndTargets = async (input: {
   bars: readonly PostgresMarketBar[];
+  stockSnapshots: readonly PostgresStockSnapshot[];
   optionContracts: readonly PostgresOptionContract[];
   optionSnapshots: readonly PostgresOptionSnapshot[];
   riskProfile: RiskProfile;
@@ -303,8 +432,17 @@ export const buildPostgresFeaturesAndTargets = async (input: {
   for (const [symbol, symbolBars] of bySymbol) {
     const ordered = [...symbolBars].sort((a, b) => Date.parse(a.observedAt) - Date.parse(b.observedAt));
     if (ordered.length < 50) throw new Error(`POSTGRES_FEATURE_HISTORY_INSUFFICIENT:${symbol}`);
+    const stockSnapshot = latestStockEvidence(symbol, input.stockSnapshots);
+    if (!stockSnapshot) throw new Error(`POSTGRES_DECISION_STOCK_EVIDENCE_MISSING:${symbol}`);
+    const stock = stockDecisionFeatures(stockSnapshot);
+    if (stock.stockEvidenceFreshnessStatus !== "FRESH") throw new Error(`POSTGRES_DECISION_STOCK_EVIDENCE_STALE:${symbol}`);
+    if (stock.stockDataQualityStatus !== "COMPLETE" || stock.currentTradablePrice === null || stock.stockEffectiveFeed !== "sip") {
+      throw new Error(`POSTGRES_DECISION_STOCK_EVIDENCE_INVALID:${symbol}`);
+    }
+    if (stock.marketSessionEligible !== true) throw new Error(`POSTGRES_DECISION_MARKET_SESSION_INELIGIBLE:${symbol}`);
     calculated.push(...calculateFeatures({
       bars: ordered,
+      stockSnapshots: input.stockSnapshots,
       contracts: input.optionsEnabled ? input.optionContracts : [],
       snapshots: input.optionsEnabled ? input.optionSnapshots : []
     }));
