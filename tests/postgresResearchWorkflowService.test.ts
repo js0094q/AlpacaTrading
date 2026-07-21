@@ -67,6 +67,7 @@ test("research persists current PostgreSQL evidence and selected candidates befo
   assert.equal(result.candidatesSelected, 1);
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO research_evidence")), true);
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO candidates")), true);
+  assert.equal(sql.some((statement) => /id, decision_id, research_run_id/.test(statement)), true);
   assert.equal(sql.some((statement) => /SET status = 'completed'/.test(statement)), true);
 });
 

@@ -162,14 +162,14 @@ const persistCandidates = async (input: {
     };
     const result = await input.query.query(
       `INSERT INTO candidates(
-         id, research_run_id, candidate_key, symbol, underlying_symbol,
+         id, decision_id, research_run_id, candidate_key, symbol, underlying_symbol,
          option_symbol, asset_class, as_of, rank, direction, horizon,
          risk_profile, preferred_expression, strategy_family, score, confidence,
          expected_return, estimated_max_loss, estimated_max_profit,
          option_liquidity_score, volatility_score, strike, decision,
          lifecycle_status, decision_reason, rationale, signal_inputs,
          data_quality_status, created_at, updated_at
-       ) SELECT $1, $2, $1, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+       ) SELECT $1, $1, $2, $1, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
                 $13, $14, $15, $16, $17, $18, $19, $20, $21,
                 'selected', 'selected', 'RANKED_SELECTED', $22::jsonb,
                 $23::jsonb, 'CURRENT_POSTGRES_MARKET_EVIDENCE', $24, $24
