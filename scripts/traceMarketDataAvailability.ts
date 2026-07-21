@@ -3,6 +3,7 @@ import { Pool, type PoolClient } from "pg";
 import { normalizeOptionSnapshot } from "../src/services/optionSnapshotNormalizer.js";
 import { normalizeStockSnapshot } from "../src/services/stockSnapshotNormalizer.js";
 import { AlpacaStockStreamService } from "../src/services/alpacaStockStream.js";
+import { getAlpacaMarketClock } from "../src/services/alpacaMarketClockService.js";
 import {
   fetchOptionContracts,
   fetchOptionSnapshots,
@@ -67,7 +68,10 @@ const checkStockStream = async () => {
 };
 
 const equityTrace = async (client: PoolClient) => {
-  const response = (await fetchStockSnapshots({ symbols: [symbol], feed: "sip", currency: "USD" }))[0];
+  const [response, marketClock] = await Promise.all([
+    fetchStockSnapshots({ symbols: [symbol], feed: "sip", currency: "USD" }).then((rows) => rows[0]),
+    getAlpacaMarketClock()
+  ]);
   const normalized = normalizeStockSnapshot({
     symbol, raw: response?.raw ?? null, observedAt: now.toISOString(), requestedFeed: response?.requestedFeed ?? "sip",
     effectiveFeed: response?.effectiveFeed ?? null, currency: response?.currency ?? "USD", requestId: response?.requestId ?? null,
@@ -90,7 +94,9 @@ const equityTrace = async (client: PoolClient) => {
     relativeVolume: normalized.relativeCurrentDayVolume, rangePosition: normalized.dailyHigh !== null && normalized.dailyLow !== null && normalized.latestTradePrice !== null && normalized.dailyHigh > normalized.dailyLow
       ? (normalized.latestTradePrice - normalized.dailyLow) / (normalized.dailyHigh - normalized.dailyLow) : null,
     requestedFeed: normalized.requestedFeed, effectiveFeed: normalized.effectiveFeed,
-    evidenceTimestamp: normalized.sourceTimestamp, freshnessStatus: normalized.freshnessStatus
+    evidenceTimestamp: normalized.sourceTimestamp, freshnessStatus: normalized.freshnessStatus,
+    marketClockTimestamp: marketClock.timestamp ?? null, sessionStatus: marketClock.isOpen ?? null,
+    nextOpen: marketClock.nextOpen ?? null, nextClose: marketClock.nextClose ?? null
   };
   const postgresValues: JsonRecord = {
     ...evidence, requestedFeed: persisted.requested_feed, effectiveFeed: persisted.effective_feed,
@@ -117,11 +123,14 @@ const equityTrace = async (client: PoolClient) => {
     report.executionAllowed = false;
     report.rejectionReasons.push("SIP_STREAM_AUTHENTICATION_UNAVAILABLE");
   }
-  return { ...report, stream: "wss://stream.data.alpaca.markets/v2/sip", streamStatus, streamMapping: ["trade", "quote", "bar"] };
+  return { ...report, endpoints: ["/v2/stocks/snapshots", "/v2/clock"], stream: "wss://stream.data.alpaca.markets/v2/sip", streamStatus, streamMapping: ["trade", "quote", "bar"] };
 };
 
 const optionTrace = async (client: PoolClient) => {
-  const contracts = await fetchOptionContracts({ underlyingSymbols: [symbol], status: "active", minDaysToExpiration: 0, maxDaysToExpiration: 730, limit: 20 });
+  const [contracts, stockResponse] = await Promise.all([
+    fetchOptionContracts({ underlyingSymbols: [symbol], status: "active", minDaysToExpiration: 0, maxDaysToExpiration: 730, limit: 20 }),
+    fetchStockSnapshots({ symbols: [symbol], feed: "sip", currency: "USD" }).then((rows) => rows[0])
+  ]);
   const optionSymbols = contracts.map((contract) => String(contract.symbol ?? "")).filter(Boolean);
   const response = (await fetchOptionSnapshots(optionSymbols))[0];
   const contract = contracts.find((row) => row.symbol === response?.symbol) ?? contracts[0];
@@ -140,7 +149,12 @@ const optionTrace = async (client: PoolClient) => {
   const greeks = normalized?.greeks;
   const expiration = String(contract?.expiration_date ?? persisted.expiration_date ?? "");
   const strike = Number(contract?.strike_price ?? persisted.strike ?? NaN);
-  const underlyingPrice = finite(record(feature.features).optionUnderlyingPrice);
+  const stockSnapshot = normalizeStockSnapshot({
+    symbol, raw: stockResponse?.raw ?? null, observedAt: now.toISOString(), requestedFeed: stockResponse?.requestedFeed ?? "sip",
+    effectiveFeed: stockResponse?.effectiveFeed ?? null, currency: stockResponse?.currency ?? "USD", requestId: stockResponse?.requestId ?? null,
+    error: stockResponse?.error ?? null, now, maxAgeSeconds: 1_200
+  });
+  const underlyingPrice = stockSnapshot.latestTradePrice;
   const midpoint = latestQuote?.bidPrice !== null && latestQuote?.bidPrice !== undefined && latestQuote.askPrice !== null && latestQuote.askPrice !== undefined
     ? (latestQuote.bidPrice + latestQuote.askPrice) / 2 : null;
   const dteHours = expiration && Number.isFinite(Date.parse(`${expiration}T20:00:00.000Z`))
@@ -213,7 +227,7 @@ const optionTrace = async (client: PoolClient) => {
     },
     field: "delta", afterValue: actualDelta === null ? 0.5 : null
   });
-  return { ...report, contractsEndpoint: "/v2/options/contracts", deterministicTrace: trace };
+  return { ...report, endpoints: ["/v2/options/contracts", "/v1beta1/options/snapshots", "/v2/stocks/snapshots"], deterministicTrace: trace };
 };
 
 const main = async () => {

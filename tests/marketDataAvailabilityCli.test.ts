@@ -10,6 +10,7 @@ test("market-data availability command is PostgreSQL-only, read-only, and regist
   assert.match(source, /fetchStockSnapshots/);
   assert.match(source, /fetchOptionSnapshots/);
   assert.match(source, /AlpacaStockStreamService/);
+  assert.match(source, /getAlpacaMarketClock/);
   assert.match(source, /authenticated/);
   assert.match(source, /BEGIN READ ONLY/);
   assert.doesNotMatch(source, /submit|createOrder|paper:execute|src\/lib\/db/);
