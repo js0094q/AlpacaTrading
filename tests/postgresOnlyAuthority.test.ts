@@ -238,6 +238,28 @@ test("fresh baseline validation covers current risk, evidence, learning, and rec
   ]);
 });
 
+test("unknown learning state on an actionable candidate blocks PostgreSQL authority", () => {
+  const state = evaluatePostgresAuthorityState({
+    ...validState,
+    candidateLearningStateCount: 0
+  });
+  assert.deepEqual(state, {
+    status: "blocked",
+    discrepancies: ["LEARNING_ADJUSTMENT_STATE_INCOMPLETE"]
+  });
+});
+
+test("authority counts learning state only for latest actionable PostgreSQL candidates", () => {
+  const source = readFileSync("src/services/postgresAuthorityCutoverService.ts", "utf8");
+  assert.match(source, /WITH latest_research AS/);
+  assert.match(source, /candidate\.decision = 'selected'/);
+  assert.match(source, /candidate\.lifecycle_status NOT IN \('closed', 'expired', 'rejected', 'skipped', 'blocked'\)/);
+  assert.match(source, /not_applicable_no_postgres_learning_model/);
+  assert.match(source, /learningModelCapability,authority/);
+  assert.match(source, /learningModelCapability,relation/);
+  assert.match(source, /learningModelCapability,status/);
+});
+
 test("authority comparison checks exact position and order identity and terms", () => {
   const brokerPosition = {
     brokerPositionKey: "equity:SPY",

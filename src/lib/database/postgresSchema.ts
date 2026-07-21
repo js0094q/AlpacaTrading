@@ -113,7 +113,15 @@ export const POSTGRES_RELEASE_3_COLUMNS = [
   "workstream_events.processing_started_at",
   "workstream_events.attempts",
   "reconciliation_discrepancies.id",
-  "reconciliation_discrepancies.checkpoint_id"
+  "reconciliation_discrepancies.checkpoint_id",
+  "option_contracts.contract_id",
+  "option_contracts.status",
+  "option_contracts.exercise_style",
+  "option_contracts.open_interest",
+  "option_contracts.open_interest_date",
+  "option_contracts.close_price",
+  "option_contracts.close_price_date",
+  "option_contracts.evidence"
 ] as const;
 
 export const POSTGRES_RELEASE_3_CONSTRAINTS = [
@@ -121,11 +129,13 @@ export const POSTGRES_RELEASE_3_CONSTRAINTS = [
   "workstream_events_attempts_nonnegative",
   "workstream_events_processing_timestamp_order",
   "workstream_events_processing_started_required",
-  "workstream_events_processed_timestamp_order"
+  "workstream_events_processed_timestamp_order",
+  "option_contracts_evidence_object"
 ] as const;
 
 export const POSTGRES_RELEASE_3_NOT_NULL_COLUMNS = [
-  "candidates.decision_id"
+  "candidates.decision_id",
+  "option_contracts.evidence"
 ] as const;
 
 const release3ConstraintDefinitions: Readonly<
@@ -158,6 +168,10 @@ const release3ConstraintDefinitions: Readonly<
   workstream_events_processed_timestamp_order: {
     table: "workstream_events",
     fragments: ["processed_at is null", "processed_at >= processing_started_at"]
+  },
+  option_contracts_evidence_object: {
+    table: "option_contracts",
+    fragments: ["jsonb_typeof(evidence) = 'object'::text"]
   }
 };
 

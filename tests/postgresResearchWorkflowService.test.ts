@@ -34,6 +34,9 @@ test("research persists current PostgreSQL evidence and selected candidates befo
       query: async (statement: string, values?: readonly unknown[]) => {
         sql.push(statement);
         if (statement.includes("INSERT INTO candidates")) candidateValues = values ?? [];
+        if (statement.includes("to_regclass('public.learning_runs')")) {
+          return { rows: [{ learning_model_relation: null }], rowCount: 1 };
+        }
         return { rows: statement.includes("INSERT INTO research_runs") ? [{ version: "1" }] : [], rowCount: 1 };
       }
     },
@@ -81,8 +84,45 @@ test("research persists current PostgreSQL evidence and selected candidates befo
       currentTradablePrice: 555, intradayReturn: 0.01,
       stockEvidenceFreshnessStatus: "FRESH", marketSessionEligible: true,
       option: null
+    },
+    learningAdjustmentStatus: "not_applicable_no_postgres_learning_model",
+    learningModelCapability: {
+      authority: "postgres",
+      relation: "public.learning_runs",
+      status: "absent",
+      verifiedAt: "2026-07-20T22:00:00.000Z"
     }
   });
+});
+
+test("research fails closed when a PostgreSQL learning model exists without supported wiring", async () => {
+  const sql: string[] = [];
+  await assert.rejects(runPostgresResearchWorkflow({
+    query: {
+      query: async (statement: string) => {
+        sql.push(statement);
+        if (statement.includes("INSERT INTO research_runs")) {
+          return { rows: [{ version: "1" }], rowCount: 1 };
+        }
+        if (statement.includes("to_regclass('public.learning_runs')")) {
+          return { rows: [{ learning_model_relation: "learning_runs" }], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence, riskProfile: "aggressive", optionsEnabled: false, maxCandidates: 10,
+    now: new Date("2026-07-20T22:00:00.000Z"),
+    dependencies: {
+      refreshMarketData: async () => ({
+        bars: [bar], stockSnapshots: [], optionContracts: [], optionSnapshots: [], summary: {}
+      }) as never,
+      buildFeaturesAndTargets: async () => ({ features: [], targets: [target] }),
+      symbols: ["SPY"]
+    }
+  }), /POSTGRES_LEARNING_MODEL_PRESENT_UNSUPPORTED/);
+  assert.equal(sql.some((statement) => statement.includes("INSERT INTO candidates")), false);
+  assert.equal(sql.some((statement) => /SET status = 'completed'/.test(statement)), false);
+  assert.equal(sql.some((statement) => /SET status = 'failed'/.test(statement)), true);
 });
 
 test("research fails closed and records failure when current market evidence is unavailable", async () => {
@@ -111,6 +151,57 @@ test("research fails closed and records failure when current market evidence is 
   assert.equal(sql.some((statement) => /SET status = 'completed'/.test(statement)), false);
 });
 
+test("research evidence is inserted in bounded batches", async () => {
+  const sql: string[] = [];
+  const snapshots = Array.from({ length: 251 }, (_, index) => ({
+    id: `stock-${index}`, symbol: `S${index}`, observedAt: bar.observedAt,
+    sourceTimestamp: bar.observedAt, requestedFeed: "sip", effectiveFeed: "sip",
+    source: "alpaca", requestId: "batch", evidence: { price: index }
+  }));
+  const result = await runPostgresResearchWorkflow({
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        sql.push(statement);
+        if (statement.includes("INSERT INTO research_runs")) return { rows: [{ version: "1" }], rowCount: 1 };
+        if (statement.includes("INSERT INTO research_evidence")) {
+          return { rows: [], rowCount: JSON.parse(String(values?.[0])).length };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence, riskProfile: "aggressive", optionsEnabled: false, maxCandidates: 0,
+    now: new Date("2026-07-20T22:00:00.000Z"),
+    dependencies: {
+      refreshMarketData: async () => ({ bars: [], stockSnapshots: snapshots, optionContracts: [], optionSnapshots: [], summary: {} }) as never,
+      buildFeaturesAndTargets: async () => ({ features: [], targets: [] }), symbols: ["SPY"]
+    }
+  });
+  assert.equal(result.status, "completed");
+  const evidence = sql.filter((statement) => statement.includes("INSERT INTO research_evidence"));
+  assert.equal(evidence.length, 2);
+  assert.match(evidence[0]!, /jsonb_to_recordset/);
+});
+
+test("rejected evidence fence prevents any batch insert", async () => {
+  const sql: string[] = [];
+  await assert.rejects(runPostgresResearchWorkflow({
+    query: {
+      query: async (statement: string) => {
+        sql.push(statement);
+        if (statement.includes("INSERT INTO research_runs")) return { rows: [{ version: "1" }], rowCount: 1 };
+        if (statement.startsWith("SELECT 1 WHERE")) return { rows: [], rowCount: 0 };
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence, riskProfile: "aggressive", optionsEnabled: false, maxCandidates: 0,
+    dependencies: {
+      refreshMarketData: async () => ({ bars: [], stockSnapshots: [{ id: "stock", symbol: "SPY", observedAt: bar.observedAt, sourceTimestamp: bar.observedAt, requestedFeed: "sip", effectiveFeed: "sip", source: "alpaca", requestId: "x", evidence: {} }], optionContracts: [], optionSnapshots: [], summary: {} }) as never,
+      buildFeaturesAndTargets: async () => ({ features: [], targets: [] }), symbols: ["SPY"]
+    }
+  }), /POSTGRES_RESEARCH_EVIDENCE_FENCE_REJECTED/);
+  assert.equal(sql.some((statement) => statement.includes("INSERT INTO research_evidence")), false);
+});
+
 test("research never converts a shares expression into an option candidate", async () => {
   let candidateValues: readonly unknown[] = [];
   const sharesWithOptionEvidence = {
@@ -128,6 +219,9 @@ test("research never converts a shares expression into an option candidate", asy
     query: {
       query: async (statement: string, values?: readonly unknown[]) => {
         if (statement.includes("INSERT INTO candidates")) candidateValues = values ?? [];
+        if (statement.includes("to_regclass('public.learning_runs')")) {
+          return { rows: [{ learning_model_relation: null }], rowCount: 1 };
+        }
         return { rows: statement.includes("INSERT INTO research_runs") ? [{ version: "1" }] : [], rowCount: 1 };
       }
     },
@@ -164,6 +258,9 @@ test("research assigns zero_dte_spy only to a matching SPY same-day option expre
     query: {
       query: async (statement: string, values?: readonly unknown[]) => {
         if (statement.includes("INSERT INTO candidates")) candidateValues = values ?? [];
+        if (statement.includes("to_regclass('public.learning_runs')")) {
+          return { rows: [{ learning_model_relation: null }], rowCount: 1 };
+        }
         return { rows: statement.includes("INSERT INTO research_runs") ? [{ version: "1" }] : [], rowCount: 1 };
       }
     },

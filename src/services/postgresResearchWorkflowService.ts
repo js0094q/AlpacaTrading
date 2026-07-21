@@ -19,6 +19,13 @@ export type PostgresResearchQuery = {
 type MarketResult = Awaited<ReturnType<typeof refreshPostgresMarketData>>;
 type FeatureTargetResult = Awaited<ReturnType<typeof buildPostgresFeaturesAndTargets>>;
 
+type PostgresLearningModelCapability = {
+  authority: "postgres";
+  relation: "public.learning_runs";
+  status: "absent";
+  verifiedAt: string;
+};
+
 type ResearchDependencies = {
   symbols: readonly string[];
   refreshMarketData: typeof refreshPostgresMarketData;
@@ -42,6 +49,31 @@ const fenceSql = (start: number) => `EXISTS (
 const fenceValues = (fence: SchedulerFence) => [
   fence.jobName, fence.workstream, fence.ownerId, fence.runId, fence.fencingToken
 ];
+
+const EVIDENCE_BATCH_SIZE = 250;
+
+const resolvePostgresLearningModelCapability = async (
+  query: PostgresResearchQuery,
+  verifiedAt: string
+): Promise<PostgresLearningModelCapability> => {
+  const result = await query.query(
+    "SELECT to_regclass('public.learning_runs')::text AS learning_model_relation"
+  );
+  if (result.rowCount !== 1 || !result.rows[0] ||
+      !("learning_model_relation" in result.rows[0])) {
+    throw new Error("POSTGRES_LEARNING_MODEL_CAPABILITY_UNVERIFIED");
+  }
+  const relation = result.rows[0].learning_model_relation;
+  if (relation !== null) {
+    throw new Error("POSTGRES_LEARNING_MODEL_PRESENT_UNSUPPORTED");
+  }
+  return {
+    authority: "postgres",
+    relation: "public.learning_runs",
+    status: "absent",
+    verifiedAt
+  };
+};
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 
@@ -108,22 +140,42 @@ const persistEvidence = async (input: {
     ...[...latestFeatures.values()].map((row) => ({ type: "feature_snapshot", symbol: row.symbol, observedAt: row.observedAt, table: "feature_snapshots", key: `${row.symbol}:${row.observedAt}`, fingerprint: row.sourceFingerprint, payload: row.features })),
     ...input.targets.map((row) => ({ type: "target_snapshot", symbol: row.symbol, observedAt: row.asOf, table: "target_snapshots", key: `${row.symbol}:${row.asOf}:${row.riskProfile}`, fingerprint: row.sourceFingerprint, payload: row }))
   ];
-  for (const row of rows) {
+  const unique = [...new Map(rows.map((row) => {
     const id = `research_evidence_${canonicalJsonHash({ run: input.researchRunId, type: row.type, key: row.key, fingerprint: row.fingerprint })}`;
+    return [id, {
+      id, evidence_type: row.type, symbol: row.symbol, observed_at: row.observedAt,
+      source_table: row.table, source_key: row.key, source_fingerprint: row.fingerprint,
+      payload: row.payload
+    }];
+  })).values()];
+  for (let offset = 0; offset < unique.length; offset += EVIDENCE_BATCH_SIZE) {
+    const batch = unique.slice(offset, offset + EVIDENCE_BATCH_SIZE);
+    const fence = await input.query.query(
+      `SELECT 1 WHERE ${fenceSql(1)}`,
+      fenceValues(input.fence)
+    );
+    if (fence.rowCount !== 1) throw new Error("POSTGRES_RESEARCH_EVIDENCE_FENCE_REJECTED");
     const result = await input.query.query(
       `INSERT INTO research_evidence(
          id, research_run_id, evidence_type, symbol, observed_at, source_table,
          source_key, source_fingerprint, payload, created_at
-       ) SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10
-         WHERE ${fenceSql(11)}
+       ) SELECT r.id, $2, r.evidence_type, r.symbol, r.observed_at::timestamptz,
+                r.source_table, r.source_key, r.source_fingerprint, r.payload::jsonb, $3
+         FROM jsonb_to_recordset($1::jsonb) AS r(
+           id text, evidence_type text, symbol text, observed_at text,
+           source_table text, source_key text, source_fingerprint text, payload jsonb)
+         WHERE ${fenceSql(4)}
        ON CONFLICT (id) DO NOTHING`,
-      [id, input.researchRunId, row.type, row.symbol, row.observedAt, row.table,
-        row.key, row.fingerprint, JSON.stringify(row.payload), input.now,
-        ...fenceValues(input.fence)]
+      [JSON.stringify(batch), input.researchRunId, input.now, ...fenceValues(input.fence)]
     );
-    if (result.rowCount !== 1 && result.rowCount !== 0) throw new Error("POSTGRES_RESEARCH_EVIDENCE_PERSISTENCE_FAILED");
+    if (result.rowCount === 0 && batch.length > 0) {
+      const stillHeld = await input.query.query(`SELECT 1 WHERE ${fenceSql(1)}`, fenceValues(input.fence));
+      if (stillHeld.rowCount !== 1) throw new Error("POSTGRES_RESEARCH_EVIDENCE_FENCE_REJECTED");
+    } else if (result.rowCount === null || result.rowCount > batch.length) {
+      throw new Error("POSTGRES_RESEARCH_EVIDENCE_PERSISTENCE_FAILED");
+    }
   }
-  return rows.length;
+  return unique.length;
 };
 
 const persistCandidates = async (input: {
@@ -150,6 +202,9 @@ const persistCandidates = async (input: {
     })
     .sort((left, right) => right.score - left.score)
     .slice(0, input.maxCandidates);
+  const learningModelCapability = selected.length > 0
+    ? await resolvePostgresLearningModelCapability(input.query, input.now.toISOString())
+    : null;
   for (let index = 0; index < selected.length; index += 1) {
     const { target, option, optionSymbol, strategyFamily, score } = selected[index]!;
     const id = `candidate_${canonicalJsonHash({ run: input.researchRunId, source: target.sourceFingerprint })}`;
@@ -162,7 +217,9 @@ const persistCandidates = async (input: {
       marketDecisionInputs: {
         ...(target.optionsStrategy?.decisionInputs as Record<string, unknown> | undefined),
         option: option?.decisionInputs ?? null
-      }
+      },
+      learningAdjustmentStatus: "not_applicable_no_postgres_learning_model",
+      learningModelCapability
     };
     const result = await input.query.query(
       `INSERT INTO candidates(

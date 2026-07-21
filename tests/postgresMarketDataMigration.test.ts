@@ -26,3 +26,27 @@ test("migration 003 creates the complete PostgreSQL market-data authority schema
   assert.match(sql, /source_fingerprint text/);
   assert.match(sql, /jsonb/);
 });
+
+test("migration 004 preserves option contract identity and provider fields as PostgreSQL evidence", async () => {
+  const sql = await readFile(
+    "src/lib/database/migrations/004_option_contract_evidence.sql",
+    "utf8"
+  );
+  assert.match(sql, /ALTER TABLE option_contracts/);
+  for (const column of [
+    "contract_id text",
+    "status text",
+    "exercise_style text",
+    "open_interest numeric",
+    "open_interest_date date",
+    "close_price numeric",
+    "close_price_date date",
+    "evidence jsonb NOT NULL"
+  ]) {
+    assert.match(sql, new RegExp(`ADD COLUMN(?: IF NOT EXISTS)? ${column}`));
+  }
+  assert.match(sql, /jsonb_typeof\(evidence\) = 'object'/);
+  assert.match(sql, /pg_constraint/);
+  assert.match(sql, /conrelid = 'option_contracts'::regclass/);
+  assert.doesNotMatch(sql, /sqlite/i);
+});

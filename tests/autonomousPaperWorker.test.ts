@@ -80,6 +80,7 @@ const readJsonLines = <T>(path: string): T[] => {
 const runWorker = (options: {
   cwd?: string;
   failCommand?: string;
+  failOutput?: string;
   failStateEvent?: string;
   environment?: Record<string, string>;
 } = {}) => {
@@ -128,7 +129,7 @@ writeFileSync(process.env.WORKER_ACTIVE_PATH, command);
 Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
 rmSync(process.env.WORKER_ACTIVE_PATH, { force: true });
 if (command === process.env.WORKER_FAIL_COMMAND) {
-  process.stdout.write(JSON.stringify({ status: "failed", reason: "EXPECTED_TEST_FAILURE", token: "worker-test-secret" }));
+  process.stdout.write(process.env.WORKER_FAIL_OUTPUT || JSON.stringify({ status: "failed", reason: "EXPECTED_TEST_FAILURE", token: "worker-test-secret" }));
   process.exit(1);
 }
 process.stdout.write(JSON.stringify({ status: "success" }));
@@ -152,6 +153,7 @@ process.stdout.write(JSON.stringify({ status: "success" }));
           WORKER_ACTIVE_PATH: activePath,
           WORKER_OVERLAP_PATH: overlapPath,
           WORKER_FAIL_COMMAND: options.failCommand ?? "",
+          WORKER_FAIL_OUTPUT: options.failOutput ?? "",
           WORKER_FAIL_STATE_EVENT: options.failStateEvent ?? ""
         },
         encoding: "utf8",
@@ -245,6 +247,19 @@ test("an ordinary workstream failure fails fast with durable terminal state", ()
   assert.match(result.stdout, /"event":"cycle_failed"/);
   assert.doesNotMatch(result.stdout, /"event":"cycle_completed"|"event":"worker_stopped"/);
   assert.doesNotMatch(result.stdout + result.stderr, /worker-test-secret/);
+});
+
+test("a PostgreSQL workstream failure preserves the exact safe dependency code", () => {
+  const { result, states } = runWorker({
+    failCommand: "paper:review",
+    failOutput: JSON.stringify({ error: "POSTGRES_REVIEW_POSITION_EXISTS:CVS" })
+  });
+  assert.notEqual(result.status, 0, result.stderr || result.stdout);
+  assert.equal(states.at(-2)?.eventType, "workstream_failed");
+  assert.equal(states.at(-2)?.payload.code, "POSTGRES_REVIEW_POSITION_EXISTS");
+  assert.equal(states.at(-1)?.eventType, "cycle_failed");
+  assert.equal(states.at(-1)?.payload.code, "POSTGRES_REVIEW_POSITION_EXISTS");
+  assert.doesNotMatch(result.stdout, /"event":"cycle_completed"/);
 });
 
 test("a worker-state persistence failure is fatal before the workstream starts", () => {

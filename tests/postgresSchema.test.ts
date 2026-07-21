@@ -99,6 +99,8 @@ const poolWith = (options: {
             conname,
             table_name: conname === "scheduler_leases_timestamp_order"
               ? "scheduler_leases"
+              : conname === "option_contracts_evidence_object"
+                ? "option_contracts"
               : "workstream_events",
             convalidated: options.invalidConstraint === conname ? false : true,
             definition: conname === "scheduler_leases_timestamp_order"
@@ -109,6 +111,8 @@ const poolWith = (options: {
                 ? "CHECK ((processing_started_at IS NULL) OR (processing_started_at >= produced_at))"
                 : conname === "workstream_events_processing_started_required"
                   ? "CHECK ((processing_status <> 'processing'::text) OR (processing_started_at IS NOT NULL))"
+                : conname === "option_contracts_evidence_object"
+                  ? "CHECK (jsonb_typeof(evidence) = 'object'::text)"
                 : "CHECK ((processed_at IS NULL) OR (processing_started_at IS NULL) OR (processed_at >= processing_started_at))"
           }))
       } as unknown as QueryResult;
@@ -130,6 +134,18 @@ test("schema verification requires every operational table, index, and fencing s
   assert.ok(
     POSTGRES_OPERATIONAL_INDEXES.includes("reconciliation_discrepancies_checkpoint_idx")
   );
+  for (const column of [
+    "option_contracts.contract_id",
+    "option_contracts.status",
+    "option_contracts.exercise_style",
+    "option_contracts.open_interest",
+    "option_contracts.open_interest_date",
+    "option_contracts.close_price",
+    "option_contracts.close_price_date",
+    "option_contracts.evidence"
+  ]) {
+    assert.ok(POSTGRES_RELEASE_3_COLUMNS.includes(column as never), column);
+  }
   assert.equal(result.presentIndexCount, POSTGRES_OPERATIONAL_INDEXES.length);
   assert.deepEqual(result.missingTables, []);
   assert.deepEqual(result.missingIndexes, []);

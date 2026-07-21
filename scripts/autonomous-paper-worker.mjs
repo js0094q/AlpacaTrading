@@ -250,7 +250,11 @@ const classify = ({ exitCode, output, spawnError, timedOut }) => {
   if (/SCHEDULER_LEASE_HELD|already owned by another active lease/i.test(output)) {
     return { classification: "lease_unavailable", code: "SCHEDULER_LEASE_UNAVAILABLE" };
   }
-  if (/Scheduler (heartbeat|lease acquisition) failed|POSTGRES_[A-Z0-9_]+|PostgreSQL (connection|transaction)/i.test(output)) {
+  const postgresCode = output.match(/\b(POSTGRES_[A-Z0-9_]+)\b/)?.[1];
+  if (postgresCode) {
+    return { classification: "postgres_failure", code: postgresCode };
+  }
+  if (/Scheduler (heartbeat|lease acquisition) failed|PostgreSQL (connection|transaction)/i.test(output)) {
     return { classification: "postgres_unavailable", code: "POSTGRES_WORKSTREAM_UNAVAILABLE" };
   }
   return { classification: "failed", code: "WORKSTREAM_COMMAND_FAILED" };

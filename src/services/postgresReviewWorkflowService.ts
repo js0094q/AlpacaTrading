@@ -352,7 +352,7 @@ const runExitReview = async (input: {
   }
   return {
     status: "completed" as const, command: input.command, reviewsCreated: created,
-    pendingIntentsCreated: created, confirmationCreated: false, paperOnly: true
+    pendingIntentsCreated: created, skipped: 0, confirmationCreated: false, paperOnly: true
   };
 };
 
@@ -426,13 +426,41 @@ export const runPostgresReviewWorkflow = async (input: {
   if (!rows.length) {
     return { status: "no_op" as const, code: "NO_ELIGIBLE_POSTGRES_CANDIDATES", reviewsCreated: 0, pendingIntentsCreated: 0 };
   }
-  let created = 0;
+  // Classify already-held / already-ordered candidates as row-level skips. Validate
+  // every remaining row before writing anything so stale or incomplete evidence
+  // still fails closed for the entire review batch.
+  let skipped = 0;
+  const eligibleRows: ReviewSourceRow[] = [];
   for (const row of rows) {
     if (!row.structural_fingerprint || !row.snapshot_fingerprint) {
       throw new Error("POSTGRES_REVIEW_ACCOUNT_FINGERPRINT_MISSING");
     }
-    if (Number(row.open_position_count) > 0) throw new Error(`POSTGRES_REVIEW_POSITION_EXISTS:${row.symbol}`);
-    if (Number(row.open_order_count) > 0) throw new Error(`POSTGRES_REVIEW_OPEN_ORDER_EXISTS:${row.symbol}`);
+    if (Number(row.open_position_count) > 0 || Number(row.open_order_count) > 0) {
+      skipped += 1;
+      continue;
+    }
+    const marketTimestamp = new Date(row.market_timestamp).toISOString();
+    const age = now.getTime() - Date.parse(marketTimestamp);
+    const maxAge = (input.maxMarketAgeHours ?? 96) * 3_600_000;
+    if (!Number.isFinite(age) || age < -60_000 || age > maxAge) {
+      throw new Error(`POSTGRES_REVIEW_MARKET_EVIDENCE_STALE:${row.symbol}`);
+    }
+    const price = finite(row.market_price);
+    if (price === null || price <= 0) throw new Error(`POSTGRES_REVIEW_MARKET_PRICE_MISSING:${row.symbol}`);
+    const amount = sizing(row);
+    if (row.asset_class === "option" && !Math.floor(amount / (price * 100))) {
+      throw new Error(`POSTGRES_REVIEW_OPTION_CAPACITY_INSUFFICIENT:${row.symbol}`);
+    }
+    eligibleRows.push(row);
+  }
+  if (!eligibleRows.length) {
+    return {
+      status: "completed" as const, command: input.command, reviewsCreated: 0,
+      pendingIntentsCreated: 0, skipped, confirmationCreated: false, paperOnly: true
+    };
+  }
+  let created = 0;
+  for (const row of eligibleRows) {
     const marketTimestamp = new Date(row.market_timestamp).toISOString();
     const age = now.getTime() - Date.parse(marketTimestamp);
     const maxAge = (input.maxMarketAgeHours ?? 96) * 3_600_000;
@@ -540,6 +568,7 @@ export const runPostgresReviewWorkflow = async (input: {
     command: input.command,
     reviewsCreated: created,
     pendingIntentsCreated: created,
+    skipped,
     confirmationCreated: false,
     paperOnly: true
   };

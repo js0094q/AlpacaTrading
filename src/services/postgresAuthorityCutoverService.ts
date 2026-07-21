@@ -668,9 +668,38 @@ const readAuthorityState = async (
     "SELECT COUNT(*) AS count FROM confirmation_evidence WHERE account_id = $1",
     [projection.accountId]
   );
-  const candidates = await client.query<CountRow>("SELECT COUNT(*) AS count FROM candidates");
+  const candidates = await client.query<CountRow>(
+    `WITH latest_research AS (
+       SELECT id FROM research_runs WHERE status = 'completed'
+       ORDER BY completed_at DESC, id DESC LIMIT 1
+     )
+     SELECT COUNT(*) AS count
+     FROM candidates candidate
+     JOIN latest_research research ON research.id = candidate.research_run_id
+     WHERE candidate.decision = 'selected'
+       AND candidate.lifecycle_status NOT IN ('closed', 'expired', 'rejected', 'skipped', 'blocked')`
+  );
   const learning = await client.query<CountRow>(
-    "SELECT COUNT(*) AS count FROM candidates WHERE recent_learning_adjustment IS NOT NULL"
+    `WITH latest_research AS (
+       SELECT id FROM research_runs WHERE status = 'completed'
+       ORDER BY completed_at DESC, id DESC LIMIT 1
+     )
+     SELECT COUNT(*) AS count
+     FROM candidates candidate
+     JOIN latest_research research ON research.id = candidate.research_run_id
+     WHERE candidate.decision = 'selected'
+       AND candidate.lifecycle_status NOT IN ('closed', 'expired', 'rejected', 'skipped', 'blocked')
+       AND (
+         candidate.recent_learning_adjustment IS NOT NULL OR
+         (
+           candidate.signal_inputs->>'learningAdjustmentStatus' =
+             'not_applicable_no_postgres_learning_model'
+           AND candidate.signal_inputs#>>'{learningModelCapability,authority}' = 'postgres'
+           AND candidate.signal_inputs#>>'{learningModelCapability,relation}' =
+             'public.learning_runs'
+           AND candidate.signal_inputs#>>'{learningModelCapability,status}' = 'absent'
+         )
+       )`
   );
   const recoveredResearch = await client.query<CountRow>(
     "SELECT COUNT(*) AS count FROM research_runs WHERE recovered_at IS NOT NULL OR status = 'recovered'"
