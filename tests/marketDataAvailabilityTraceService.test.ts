@@ -75,3 +75,15 @@ test("missing required quote timestamp is unavailable and rejects rather than be
   assert.equal(report.executionAllowed, false);
   assert.deepEqual(report.rejectionReasons, ["OPTION_QUOTE_TIMESTAMP_UNAVAILABLE"]);
 });
+
+test("a claimed material field with no propagated decision value fails the trace", () => {
+  const report = buildMarketDataCoverage({
+    asset: "equities", now: "2026-07-21T14:00:00.000Z",
+    provider: { endpoint: "/v2/stocks/snapshots", feed: "sip", values: { midpoint: 500 }, timestamps: {} },
+    postgres: { table: "stock_snapshots.evidence", values: { midpoint: 500 } },
+    decision: { values: { midpoint: null }, materiallyConsumed: ["midpoint"] }
+  });
+  assert.equal(report.fields.midpoint.consumption, "NOT_PROPAGATED");
+  assert.equal(report.executionAllowed, false);
+  assert.deepEqual(report.rejectionReasons, ["FALSE_CONSUMPTION_LABEL_MIDPOINT"]);
+});

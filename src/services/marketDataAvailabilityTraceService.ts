@@ -61,6 +61,7 @@ export const buildMarketDataCoverage = (input: MarketDataCoverageInput) => {
     const persistedValue = input.postgres.values[field] ?? null;
     const decisionValue = input.decision.values[field] ?? null;
     const material = input.decision.materiallyConsumed.includes(field);
+    const materiallyPropagated = material && decisionValue !== null && decisionValue !== undefined;
     const propagated = Object.hasOwn(input.decision.values, field);
     const persisted = Object.hasOwn(input.postgres.values, field);
     return [field, {
@@ -72,15 +73,19 @@ export const buildMarketDataCoverage = (input: MarketDataCoverageInput) => {
       persistedValue,
       decisionValue,
       availability: field === "freshnessStatus" && rawValue === "STALE" ? "STALE" : availabilityOf(field, rawValue),
-      consumption: material
+      consumption: materiallyPropagated
         ? "DECISION_INPUT"
-        : propagated || persisted ? "PERSISTED_UNUSED" : "NOT_PROPAGATED"
+        : material ? "NOT_PROPAGATED" : propagated || persisted ? "PERSISTED_UNUSED" : "NOT_PROPAGATED"
     }];
   }));
   const quoteTimestamp = input.provider.timestamps.quoteTimestamp;
   const rejectionReasons = input.asset === "options" && (quoteTimestamp === null || quoteTimestamp === undefined)
     ? ["OPTION_QUOTE_TIMESTAMP_UNAVAILABLE"]
     : [];
+  for (const field of input.decision.materiallyConsumed) {
+    const value = input.decision.values[field];
+    if (value === null || value === undefined) rejectionReasons.push(`FALSE_CONSUMPTION_LABEL_${field.toUpperCase()}`);
+  }
   for (const field of input.requiredFields ?? []) {
     const state = (fields as Record<string, { availability?: MarketDataAvailability }>)[field]?.availability;
     if (state !== "AVAILABLE") rejectionReasons.push(`REQUIRED_FIELD_${field.toUpperCase()}_${state ?? "MISSING"}`);
