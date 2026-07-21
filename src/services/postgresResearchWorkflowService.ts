@@ -52,6 +52,53 @@ const fenceValues = (fence: SchedulerFence) => [
 
 const EVIDENCE_BATCH_SIZE = 250;
 
+const failResearchRun = async (input: {
+  query: PostgresResearchQuery;
+  fence: SchedulerFence;
+  runId: string;
+  message: string;
+}) => {
+  const failedAt = new Date().toISOString();
+  const values = [
+    input.runId,
+    input.message.split(":", 1)[0],
+    input.message,
+    failedAt
+  ];
+  try {
+    const fenced = await input.query.query(
+      `UPDATE research_runs
+       SET status = 'failed', error_code = $2, error_message = $3,
+           completed_at = $4, heartbeat_at = $4, updated_at = $4,
+           version = version + 1
+       WHERE id = $1 AND status = 'running' AND ${fenceSql(5)}`,
+      [...values, ...fenceValues(input.fence)]
+    );
+    if (fenced.rowCount === 1) return;
+  } catch {
+    // Retry below with exact run ownership when the fenced query itself failed.
+  }
+  const owned = await input.query.query(
+    `UPDATE research_runs
+     SET status = 'failed', error_code = $2, error_message = $3,
+         completed_at = $4, heartbeat_at = $4, updated_at = $4,
+         version = version + 1
+     WHERE id = $1 AND status = 'running'
+       AND worker_identity = $5 AND scheduler_job_name = $6
+       AND scheduler_fencing_token = $7`,
+    [...values, input.fence.ownerId, input.fence.jobName, input.fence.fencingToken]
+  );
+  if (owned.rowCount !== 1) {
+    const current = await input.query.query(
+      "SELECT status FROM research_runs WHERE id = $1",
+      [input.runId]
+    );
+    if (current.rows[0]?.status === "reserved" || current.rows[0]?.status === "running") {
+      throw new Error("POSTGRES_RESEARCH_FAILURE_PERSIST_FAILED");
+    }
+  }
+};
+
 const resolvePostgresLearningModelCapability = async (
   query: PostgresResearchQuery,
   verifiedAt: string
@@ -276,6 +323,22 @@ export const runPostgresResearchWorkflow = async (input: {
     stockFeed: "sip",
     optionFeed: "opra"
   };
+  await input.query.query(
+    `UPDATE research_runs
+     SET status = 'recovered',
+         error_code = 'WORKER_TERMINATED_OR_HEARTBEAT_EXPIRED',
+         error_message = COALESCE(error_message, 'Active research run was abandoned by an older scheduler lease.'),
+         completed_at = $1, recovered_at = $1,
+         recovery_reason = 'WORKER_TERMINATED_OR_HEARTBEAT_EXPIRED',
+         recovery_source = 'research_preflight', updated_at = $1,
+         version = version + 1
+     WHERE workstream = 'research' AND status IN ('reserved', 'running')
+       AND (worker_identity IS DISTINCT FROM $2
+         OR scheduler_job_name IS DISTINCT FROM $3
+         OR scheduler_fencing_token IS DISTINCT FROM $7)
+       AND ${fenceSql(3)}`,
+    [nowIso, input.fence.ownerId, ...fenceValues(input.fence)]
+  );
   const reserved = await input.query.query(
     `INSERT INTO research_runs(
        id, workstream, run_key, status, risk_profile, options_enabled, config,
@@ -348,14 +411,7 @@ export const runPostgresResearchWorkflow = async (input: {
     };
   } catch (error) {
     const message = error instanceof Error ? error.message.slice(0, 240) : "POSTGRES_RESEARCH_FAILED";
-    await input.query.query(
-      `UPDATE research_runs
-       SET status = 'failed', error_code = $2, error_message = $3,
-           completed_at = $4, heartbeat_at = $4, updated_at = $4,
-           version = version + 1
-       WHERE id = $1 AND status = 'running' AND ${fenceSql(5)}`,
-      [runId, message.split(":", 1)[0], message, new Date().toISOString(), ...fenceValues(input.fence)]
-    );
+    await failResearchRun({ query: input.query, fence: input.fence, runId, message });
     throw error;
   }
 };

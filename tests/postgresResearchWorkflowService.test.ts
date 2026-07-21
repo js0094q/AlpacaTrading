@@ -95,6 +95,48 @@ test("research persists current PostgreSQL evidence and selected candidates befo
   });
 });
 
+test("research reservation closes an abandoned run owned by an older scheduler fence", async () => {
+  const sql: string[] = [];
+  let abandonedClosed = false;
+  const result = await runPostgresResearchWorkflow({
+    query: {
+      query: async (statement: string) => {
+        sql.push(statement);
+        if (statement.trimStart().startsWith("UPDATE research_runs") &&
+            statement.includes("SET status = 'recovered'")) {
+          abandonedClosed = true;
+          return { rows: [], rowCount: 1 };
+        }
+        if (statement.includes("INSERT INTO research_runs")) {
+          if (!abandonedClosed) {
+            const conflict = new Error("research_runs_one_active_workstream_idx") as Error & { code: string };
+            conflict.code = "23505";
+            throw conflict;
+          }
+          return { rows: [{ version: "1" }], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    riskProfile: "aggressive",
+    optionsEnabled: false,
+    maxCandidates: 0,
+    now: new Date("2026-07-20T22:00:00.000Z"),
+    dependencies: {
+      refreshMarketData: async () => ({
+        bars: [], stockSnapshots: [], optionContracts: [], optionSnapshots: [], summary: {}
+      }) as never,
+      buildFeaturesAndTargets: async () => ({ features: [], targets: [] }),
+      symbols: ["SPY"]
+    }
+  });
+  assert.equal(result.status, "completed");
+  assert.match(sql[0]!, /SET status = 'recovered'/);
+  assert.match(sql[0]!, /scheduler_fencing_token IS DISTINCT FROM/);
+  assert.match(sql[1]!, /INSERT INTO research_runs/);
+});
+
 test("research fails closed when a PostgreSQL learning model exists without supported wiring", async () => {
   const sql: string[] = [];
   await assert.rejects(runPostgresResearchWorkflow({
@@ -149,6 +191,72 @@ test("research fails closed and records failure when current market evidence is 
   );
   assert.equal(sql.some((statement) => /SET status = 'failed'/.test(statement)), true);
   assert.equal(sql.some((statement) => /SET status = 'completed'/.test(statement)), false);
+});
+
+test("research closes its own run when failure terminalization loses the scheduler fence", async () => {
+  const failureUpdates: string[] = [];
+  await assert.rejects(
+    runPostgresResearchWorkflow({
+      query: {
+        query: async (statement: string) => {
+          if (statement.includes("INSERT INTO research_runs")) {
+            return { rows: [{ version: "1" }], rowCount: 1 };
+          }
+          if (/SET status = 'failed'/.test(statement)) {
+            failureUpdates.push(statement);
+            return { rows: [], rowCount: failureUpdates.length === 1 ? 0 : 1 };
+          }
+          return { rows: [], rowCount: 1 };
+        }
+      },
+      fence,
+      riskProfile: "aggressive",
+      optionsEnabled: true,
+      maxCandidates: 10,
+      dependencies: {
+        refreshMarketData: async () => { throw new Error("POSTGRES_MARKET_BARS_STALE:SPY"); },
+        buildFeaturesAndTargets: async () => { throw new Error("must not build features"); },
+        symbols: ["SPY"]
+      }
+    }),
+    /POSTGRES_MARKET_BARS_STALE:SPY/
+  );
+  assert.equal(failureUpdates.length, 2);
+  assert.match(failureUpdates[0]!, /scheduler_leases/);
+  assert.match(failureUpdates[1]!, /worker_identity/);
+  assert.doesNotMatch(failureUpdates[1]!, /scheduler_leases/);
+});
+
+test("research preserves the workflow error when the first failure update times out", async () => {
+  let failureUpdates = 0;
+  await assert.rejects(
+    runPostgresResearchWorkflow({
+      query: {
+        query: async (statement: string) => {
+          if (statement.includes("INSERT INTO research_runs")) {
+            return { rows: [{ version: "1" }], rowCount: 1 };
+          }
+          if (/SET status = 'failed'/.test(statement)) {
+            failureUpdates += 1;
+            if (failureUpdates === 1) throw new Error("Query read timeout");
+            return { rows: [], rowCount: 1 };
+          }
+          return { rows: [], rowCount: 1 };
+        }
+      },
+      fence,
+      riskProfile: "aggressive",
+      optionsEnabled: true,
+      maxCandidates: 10,
+      dependencies: {
+        refreshMarketData: async () => { throw new Error("POSTGRES_MARKET_BARS_STALE:SPY"); },
+        buildFeaturesAndTargets: async () => { throw new Error("must not build features"); },
+        symbols: ["SPY"]
+      }
+    }),
+    /POSTGRES_MARKET_BARS_STALE:SPY/
+  );
+  assert.equal(failureUpdates, 2);
 });
 
 test("research evidence is inserted in bounded batches", async () => {
