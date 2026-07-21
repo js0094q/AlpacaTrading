@@ -128,6 +128,53 @@ export type PostgresTargetSnapshot = {
   optionsStrategy: Readonly<Record<string, unknown>> | null;
 };
 
+type PostgresOptionContractRow = {
+  option_symbol: string;
+  underlying_symbol: string;
+  type: "call" | "put";
+  expiration_date: Date | string;
+  strike: string;
+  multiplier: string;
+  tradable: boolean;
+  source: string;
+  request_id: string | null;
+  observed_at: Date | string;
+  contract_id: string | null;
+  status: string | null;
+  exercise_style: string | null;
+  open_interest: string | number | null;
+  open_interest_date: Date | string | null;
+  close_price: string | number | null;
+  close_price_date: Date | string | null;
+  evidence: unknown;
+};
+
+type PostgresOptionSnapshotRow = {
+  option_symbol: string;
+  underlying_symbol: string;
+  observed_at: Date | string;
+  quote_timestamp: Date | string | null;
+  trade_timestamp: Date | string | null;
+  snapshot_timestamp: Date | string | null;
+  bid: string | null;
+  ask: string | null;
+  midpoint: string | null;
+  last: string | null;
+  volume: string | null;
+  open_interest: string | null;
+  implied_volatility: string | null;
+  delta: string | null;
+  gamma: string | null;
+  theta: string | null;
+  vega: string | null;
+  rho: string | null;
+  source: string;
+  request_id: string | null;
+  evidence: unknown;
+  evidence_fingerprint: string;
+  updated_at: Date | string;
+};
+
 const normalizedSymbol = (value: string) => value.trim().toUpperCase();
 const iso = (value: string) => new Date(value).toISOString();
 const json = (value: unknown) => canonicalJson(parseJsonValue(value));
@@ -195,6 +242,7 @@ const assertWritten = (rowCount: number | null, code = "POSTGRES_MARKET_DATA_FEN
 
 // Keep high-volume market ingestion bounded while using fenced, set-based writes.
 export const POSTGRES_MARKET_DATA_WRITE_BATCH_SIZE = 250;
+export const POSTGRES_OPTION_READ_BATCH_SIZE = 1_000;
 const chunks = <T>(rows: readonly T[], size = POSTGRES_MARKET_DATA_WRITE_BATCH_SIZE) => {
   const result: T[][] = [];
   for (let index = 0; index < rows.length; index += size) result.push(rows.slice(index, index + size) as T[]);
@@ -429,36 +477,21 @@ export class PostgresMarketDataRepository {
   ): Promise<PostgresOptionContract[]> {
     await requireFence(context);
     if (!input.optionSymbols.length) return [];
-    const result = await context.transaction.query<{
-      option_symbol: string;
-      underlying_symbol: string;
-      type: "call" | "put";
-      expiration_date: Date | string;
-      strike: string;
-      multiplier: string;
-      tradable: boolean;
-      source: string;
-      request_id: string | null;
-      observed_at: Date | string;
-      contract_id: string | null;
-      status: string | null;
-      exercise_style: string | null;
-      open_interest: string | number | null;
-      open_interest_date: Date | string | null;
-      close_price: string | number | null;
-      close_price_date: Date | string | null;
-      evidence: unknown;
-    }>(
-      `SELECT option_symbol, underlying_symbol, type, expiration_date, strike,
-              multiplier, tradable, source, request_id, observed_at,
-              contract_id, status, exercise_style, open_interest, open_interest_date,
-              close_price, close_price_date, evidence
-       FROM option_contracts
-       WHERE option_symbol = ANY($1::text[])
-       ORDER BY underlying_symbol, expiration_date, strike, option_symbol`,
-      [input.optionSymbols.map(normalizedSymbol)]
-    );
-    return result.rows.map((row) => {
+    const rows: PostgresOptionContractRow[] = [];
+    for (const batch of chunks(input.optionSymbols, POSTGRES_OPTION_READ_BATCH_SIZE)) {
+      const result = await context.transaction.query<PostgresOptionContractRow>(
+        `SELECT option_symbol, underlying_symbol, type, expiration_date, strike,
+                multiplier, tradable, source, request_id, observed_at,
+                contract_id, status, exercise_style, open_interest, open_interest_date,
+                close_price, close_price_date, evidence
+         FROM option_contracts
+         WHERE option_symbol = ANY($1::text[])
+         ORDER BY underlying_symbol, expiration_date, strike, option_symbol`,
+        [batch.map(normalizedSymbol)]
+      );
+      rows.push(...result.rows);
+    }
+    return rows.map((row) => {
       const evidence = record(row.evidence);
       return {
         optionSymbol: row.option_symbol,
@@ -489,47 +522,27 @@ export class PostgresMarketDataRepository {
   ): Promise<PostgresOptionSnapshot[]> {
     await requireFence(context);
     if (!input.identities.length) return [];
-    const result = await context.transaction.query<{
-      option_symbol: string;
-      underlying_symbol: string;
-      observed_at: Date | string;
-      quote_timestamp: Date | string | null;
-      trade_timestamp: Date | string | null;
-      snapshot_timestamp: Date | string | null;
-      bid: string | null;
-      ask: string | null;
-      midpoint: string | null;
-      last: string | null;
-      volume: string | null;
-      open_interest: string | null;
-      implied_volatility: string | null;
-      delta: string | null;
-      gamma: string | null;
-      theta: string | null;
-      vega: string | null;
-      rho: string | null;
-      source: string;
-      request_id: string | null;
-      evidence: unknown;
-      evidence_fingerprint: string;
-      updated_at: Date | string;
-    }>(
-      `SELECT option_symbol, underlying_symbol, observed_at, quote_timestamp,
-              trade_timestamp, snapshot_timestamp, bid, ask, midpoint, last,
-              volume, open_interest, implied_volatility, delta, gamma, theta,
-              vega, rho, source, request_id, evidence, evidence_fingerprint,
-              updated_at
-       FROM option_snapshots
-       WHERE (option_symbol, observed_at) IN (
-         SELECT * FROM unnest($1::text[], $2::timestamptz[])
-       )
-       ORDER BY underlying_symbol, option_symbol, observed_at`,
-      [
-        input.identities.map((entry) => normalizedSymbol(entry.optionSymbol)),
-        input.identities.map((entry) => iso(entry.observedAt))
-      ]
-    );
-    return result.rows.map((row) => {
+    const rows: PostgresOptionSnapshotRow[] = [];
+    for (const batch of chunks(input.identities, POSTGRES_OPTION_READ_BATCH_SIZE)) {
+      const result = await context.transaction.query<PostgresOptionSnapshotRow>(
+        `SELECT option_symbol, underlying_symbol, observed_at, quote_timestamp,
+                trade_timestamp, snapshot_timestamp, bid, ask, midpoint, last,
+                volume, open_interest, implied_volatility, delta, gamma, theta,
+                vega, rho, source, request_id, evidence, evidence_fingerprint,
+                updated_at
+         FROM option_snapshots
+         WHERE (option_symbol, observed_at) IN (
+           SELECT * FROM unnest($1::text[], $2::timestamptz[])
+         )
+         ORDER BY underlying_symbol, option_symbol, observed_at`,
+        [
+          batch.map((entry) => normalizedSymbol(entry.optionSymbol)),
+          batch.map((entry) => iso(entry.observedAt))
+        ]
+      );
+      rows.push(...result.rows);
+    }
+    return rows.map((row) => {
       const evidence = record(row.evidence);
       const freshnessStatus = evidence.freshnessStatus === "fresh" ? "fresh" : "stale";
       return {

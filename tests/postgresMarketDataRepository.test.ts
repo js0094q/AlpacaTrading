@@ -372,6 +372,41 @@ test("PostgreSQL option readback restores persisted contract, OPRA, and persiste
   assert.equal(snapshots[0]?.evidenceFingerprint, "option-evidence-fingerprint");
 });
 
+test("whole-universe option readback uses bounded PostgreSQL queries", async () => {
+  const queries: Array<{ text: string; values?: readonly unknown[] }> = [];
+  const client = {
+    query: async (text: string, values?: readonly unknown[]) => {
+      queries.push({ text, values });
+      if (text.includes("FROM scheduler_leases") && text.includes("FOR UPDATE")) {
+        return { rows: [currentFence], rowCount: 1 } as unknown as QueryResult;
+      }
+      if (text.includes("FROM option_contracts") || text.includes("FROM option_snapshots")) {
+        return { rows: [], rowCount: 0 } as unknown as QueryResult;
+      }
+      throw new Error(`unexpected query: ${text}`);
+    }
+  } as unknown as PoolClient;
+  const repository = new PostgresMarketDataRepository();
+  const context = contextFor(client);
+  const optionSymbols = Array.from({ length: 1001 }, (_, index) =>
+    `SPY260724C${String(index).padStart(8, "0")}`
+  );
+  await repository.listOptionContractsBySymbols({ optionSymbols }, context);
+  await repository.listOptionSnapshotsByIdentity({
+    identities: optionSymbols.map((optionSymbol) => ({
+      optionSymbol,
+      observedAt: "2026-07-21T13:41:58.000Z"
+    }))
+  }, context);
+
+  const contractReads = queries.filter((entry) => entry.text.includes("FROM option_contracts"));
+  const snapshotReads = queries.filter((entry) => entry.text.includes("FROM option_snapshots"));
+  assert.equal(contractReads.length, 2);
+  assert.equal(snapshotReads.length, 2);
+  assert.deepEqual(contractReads.map((entry) => (entry.values?.[0] as unknown[]).length), [1000, 1]);
+  assert.deepEqual(snapshotReads.map((entry) => (entry.values?.[0] as unknown[]).length), [1000, 1]);
+});
+
 test("market-data reads are bounded, ordered, and normalized", async () => {
   const fake = fakeClient();
   const rows = await new PostgresMarketDataRepository().listBars({

@@ -330,8 +330,7 @@ const deriveOptionContractFeature = (input: {
         ? "marginal"
         : "unsuitable",
     eligibility,
-    rejectionReasons,
-    fieldClassifications: OPTION_FIELD_CLASSIFICATIONS
+    rejectionReasons
   } as const;
 };
 
@@ -347,12 +346,17 @@ const buildOptionFeatures = (input: {
     contract: PostgresOptionContract;
     snapshot: PostgresOptionSnapshot;
   } => row.contract.tradable && row.contract.status === "active" && Boolean(row.snapshot));
+  const activeRowsByExpiration = new Map<string, number>();
+  for (const row of rows) {
+    activeRowsByExpiration.set(
+      row.contract.expirationDate,
+      (activeRowsByExpiration.get(row.contract.expirationDate) ?? 0) + 1
+    );
+  }
   const contractFeatures = evidenceRows.map((row) => deriveOptionContractFeature({
     row,
     asOf: input.asOf,
-    activeRowsAtExpiration: rows.filter((candidate) =>
-      candidate.contract.expirationDate === row.contract.expirationDate
-    ).length
+    activeRowsAtExpiration: activeRowsByExpiration.get(row.contract.expirationDate) ?? 0
   }));
   if (!rows.length) {
     return {
@@ -517,6 +521,18 @@ const calculateFeatures = (input: {
   contracts: readonly PostgresOptionContract[];
   snapshots: readonly PostgresOptionSnapshot[];
 }) => {
+  const featureSymbol = normalizeSymbol(input.bars[0]?.symbol ?? "");
+  const symbolContracts = input.contracts.filter((contract) =>
+    normalizeSymbol(contract.underlyingSymbol) === featureSymbol
+  );
+  const symbolSnapshots = input.snapshots.filter((snapshot) =>
+    normalizeSymbol(snapshot.underlyingSymbol) === featureSymbol
+  );
+  const earliestOptionObservation = symbolSnapshots.reduce<number | null>((earliest, snapshot) => {
+    const observed = Date.parse(snapshot.observedAt);
+    if (!Number.isFinite(observed)) return earliest;
+    return earliest === null || observed < earliest ? observed : earliest;
+  }, null);
   const closes = input.bars.map((row) => row.close);
   const highs = input.bars.map((row) => row.high);
   const lows = input.bars.map((row) => row.low);
@@ -543,8 +559,7 @@ const calculateFeatures = (input: {
     const stock = stockDecisionFeatures(stockSnapshot);
     const baseDecisionAsOf = stockSnapshot?.observedAt ?? bar.observedAt;
     const latestOptionObservedAt = index === input.bars.length - 1
-      ? input.snapshots
-        .filter((snapshot) => normalizeSymbol(snapshot.underlyingSymbol) === normalizeSymbol(bar.symbol))
+      ? symbolSnapshots
         .map((snapshot) => snapshot.observedAt)
         .filter((observedAt) => Number.isFinite(Date.parse(observedAt)))
         .sort((left, right) => Date.parse(right) - Date.parse(left))[0]
@@ -553,12 +568,18 @@ const calculateFeatures = (input: {
       Date.parse(latestOptionObservedAt) > Date.parse(baseDecisionAsOf)
       ? latestOptionObservedAt
       : baseDecisionAsOf;
+    const currentDecisionRow = index === input.bars.length - 1;
+    const historicalOptionEvidenceAvailable = earliestOptionObservation !== null &&
+      earliestOptionObservation <= Date.parse(decisionAsOf);
+    const includeOptionEvidence = currentDecisionRow || historicalOptionEvidenceAvailable;
     const option = buildOptionFeatures({
       symbol: normalizeSymbol(bar.symbol),
       asOf: decisionAsOf,
       close: typeof stock.currentTradablePrice === "number" ? stock.currentTradablePrice : bar.close,
-      contracts: input.contracts,
-      snapshots: input.snapshots
+      // Current OPRA evidence cannot retroactively populate historical bars.
+      // Preserve genuine historical option snapshots when callers supply them.
+      contracts: includeOptionEvidence ? symbolContracts : [],
+      snapshots: includeOptionEvidence ? symbolSnapshots : []
     });
     const values: FeatureValues = {
       close: bar.close,

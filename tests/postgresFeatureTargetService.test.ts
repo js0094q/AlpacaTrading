@@ -334,6 +334,34 @@ test("Alpaca option quote, liquidity, IV, and all five Greeks propagate into cla
   assert.equal(classifications.openInterest, "execution_gate");
   assert.equal(classifications.eligibility, "execution_gate");
   assert.deepEqual(feature.unclassifiedOptionFields, []);
+  const contractFeatures = feature.optionContractFeatures as Array<Record<string, unknown>>;
+  assert.equal(contractFeatures.length, 1);
+  assert.equal("fieldClassifications" in contractFeatures[0]!, false);
+  assert.deepEqual(result.features[0]!.features.optionContractFeatures, []);
+});
+
+test("historical option evidence remains available only at matching historical as-of rows", async () => {
+  const contract = optionContractFixture("SPY260829C00510000", 510, {
+    observedAt: "2026-05-10T20:00:00.000Z"
+  });
+  const snapshot = optionSnapshotFixture(contract.optionSymbol, {
+    observedAt: "2026-05-10T20:00:00.000Z",
+    quoteTimestamp: "2026-05-10T19:59:59.000Z",
+    tradeTimestamp: "2026-05-10T19:59:58.000Z",
+    snapshotTimestamp: "2026-05-10T19:59:59.000Z",
+    retrievedAt: "2026-05-10T20:00:00.000Z",
+    persistedAt: "2026-05-10T20:00:01.000Z",
+    underlyingPrice: 509
+  });
+  const result = await buildOptionFeaturesFixture({ contracts: [contract], snapshots: [snapshot] });
+  assert.deepEqual(result.features[0]!.features.optionContractFeatures, []);
+  const firstEligibleAsOf = result.features.find((row) =>
+    Date.parse(row.observedAt) >= Date.parse(snapshot.observedAt)
+  );
+  assert.equal(
+    (firstEligibleAsOf?.features.optionContractFeatures as unknown[])?.length,
+    1
+  );
 });
 
 test("successful OPRA request provenance validates feed without fabricating an observed feed", async () => {
