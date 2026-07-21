@@ -10,19 +10,17 @@ import {
 } from "../src/services/providers/alpaca.js";
 import {
   buildMarketDataCoverage,
+  parseMarketDataTraceArguments,
   runDeterministicMarketDataTrace
 } from "../src/services/marketDataAvailabilityTraceService.js";
 
 type JsonRecord = Record<string, unknown>;
 type Asset = "equities" | "options" | "all";
 
-const args = new Map(process.argv.slice(2).map((argument) => {
-  const [key, ...rest] = argument.split("=");
-  return [key, rest.join("=") || true];
-}));
-const asset = String(args.get("--asset") ?? "all") as Asset;
-const symbol = String(args.get("--symbol") ?? "SPY").trim().toUpperCase();
-const jsonOutput = args.has("--json");
+const parsedArguments = parseMarketDataTraceArguments(process.argv.slice(2));
+const asset = parsedArguments.asset as Asset;
+const symbol = parsedArguments.symbol;
+const jsonOutput = parsedArguments.json;
 const now = new Date();
 
 const requiredFalse = (name: string) => !["true", "1"].includes(String(process.env[name] ?? "").toLowerCase());

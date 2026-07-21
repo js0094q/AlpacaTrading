@@ -3,8 +3,15 @@ import test from "node:test";
 
 import {
   buildMarketDataCoverage,
+  parseMarketDataTraceArguments,
   runDeterministicMarketDataTrace
 } from "../src/services/marketDataAvailabilityTraceService.js";
+
+test("diagnostic arguments support both spaced and equals forms", () => {
+  assert.deepEqual(parseMarketDataTraceArguments(["--asset", "equities", "--symbol=SPY", "--json"]), {
+    asset: "equities", symbol: "SPY", json: true
+  });
+});
 
 test("coverage separates provider availability, PostgreSQL persistence, and material decision use", () => {
   const report = buildMarketDataCoverage({

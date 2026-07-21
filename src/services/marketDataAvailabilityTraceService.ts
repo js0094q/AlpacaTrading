@@ -8,6 +8,31 @@ export type MarketDataConsumption =
 
 type Values = Readonly<Record<string, unknown>>;
 
+export const parseMarketDataTraceArguments = (args: readonly string[]) => {
+  const values = new Map<string, string | true>();
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index]!;
+    if (!argument.startsWith("--")) continue;
+    const equals = argument.indexOf("=");
+    if (equals > 0) {
+      values.set(argument.slice(0, equals), argument.slice(equals + 1));
+      continue;
+    }
+    const next = args[index + 1];
+    if (next && !next.startsWith("--")) {
+      values.set(argument, next);
+      index += 1;
+    } else {
+      values.set(argument, true);
+    }
+  }
+  return {
+    asset: String(values.get("--asset") ?? "all"),
+    symbol: String(values.get("--symbol") ?? "SPY").trim().toUpperCase(),
+    json: values.has("--json")
+  };
+};
+
 export type MarketDataCoverageInput = {
   asset: "equities" | "options";
   now: string;
