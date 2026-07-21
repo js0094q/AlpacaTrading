@@ -122,7 +122,9 @@ const poolWith = (options: {
 test("schema verification requires every operational table, index, and fencing sequence", async () => {
   const result = await verifyPostgresSchema(poolWith());
   assert.equal(result.verificationPassed, true);
-  assert.equal(result.presentTableCount, 23);
+  assert.equal(result.presentTableCount, POSTGRES_OPERATIONAL_TABLES.length);
+  assert.ok(POSTGRES_OPERATIONAL_TABLES.includes("market_bars"));
+  assert.ok(POSTGRES_OPERATIONAL_TABLES.includes("research_evidence"));
   assert.ok(POSTGRES_OPERATIONAL_TABLES.includes("reconciliation_discrepancies"));
   assert.ok(POSTGRES_OPERATIONAL_INDEXES.includes("candidates_decision_id_idx"));
   assert.ok(

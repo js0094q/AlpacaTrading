@@ -1,9 +1,15 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 const MAX_CAPTURE_BYTES = 32 * 1024;
-const POSTGRES_FAILURE_LIMIT = 3;
 const DEFAULT_CYCLE_DELAY_MS = 30_000;
+const DEFAULT_WORKSTREAM_TIMEOUT_MS = 30 * 60 * 1000;
+const MAX_WORKSTREAM_TIMEOUT_MS = 6 * 60 * 60 * 1000;
+const STATE_PERSIST_TIMEOUT_MS = 60_000;
+const FORCE_KILL_DELAY_MS = 5_000;
 
 const WORKSTREAMS = [
   ["research:daily", ["--riskProfile=aggressive", "--optionsEnabled=true", "--maxCandidates=10", "--assetClass=all", "--format=json"]],
@@ -24,23 +30,56 @@ const WORKSTREAMS = [
   ["system:recover", ["--format=json"]]
 ];
 
+const STATE_COMMAND = "worker:state";
+const REQUIRED_COMMANDS = [...WORKSTREAMS.map(([command]) => command), STATE_COMMAND];
+const EXPECTED_CONTRACT_ENTRY = {
+  allowed: true,
+  persistence: "postgres",
+  production: true,
+  noOp: false,
+  schedulerRegistered: true,
+  sqliteFreeImportGraph: true,
+  required: true
+};
+
 const normalized = (value) => String(value ?? "").trim().toLowerCase();
 const isTrue = (value) => ["true", "1"].includes(normalized(value));
 const isFalse = (value) => ["false", "0"].includes(normalized(value));
 const log = (payload) => process.stdout.write(`${JSON.stringify(payload)}\n`);
+
+const codedError = (code) => {
+  const error = new Error(code);
+  error.code = code;
+  return error;
+};
+
+const codeOf = (error, fallback = "AUTONOMOUS_WORKER_FAILED") =>
+  typeof error?.code === "string" ? error.code : fallback;
 
 const argumentValue = (name) => {
   const prefix = `--${name}=`;
   return process.argv.slice(2).find((value) => value.startsWith(prefix))?.slice(prefix.length);
 };
 
-const cycleDelay = () => {
-  const value = Number(argumentValue("cycle-delay-ms") ?? DEFAULT_CYCLE_DELAY_MS);
-  if (!Number.isSafeInteger(value) || value < 0 || value > 300_000) {
-    throw new Error("AUTONOMOUS_WORKER_CYCLE_DELAY_INVALID");
+const boundedIntegerArgument = (name, fallback, { minimum, maximum, code }) => {
+  const value = Number(argumentValue(name) ?? fallback);
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw codedError(code);
   }
   return value;
 };
+
+const cycleDelay = () => boundedIntegerArgument(
+  "cycle-delay-ms",
+  DEFAULT_CYCLE_DELAY_MS,
+  { minimum: 0, maximum: 300_000, code: "AUTONOMOUS_WORKER_CYCLE_DELAY_INVALID" }
+);
+
+const workstreamTimeout = () => boundedIntegerArgument(
+  "workstream-timeout-ms",
+  DEFAULT_WORKSTREAM_TIMEOUT_MS,
+  { minimum: 1_000, maximum: MAX_WORKSTREAM_TIMEOUT_MS, code: "AUTONOMOUS_WORKER_TIMEOUT_INVALID" }
+);
 
 const assertRuntime = () => {
   const failures = [];
@@ -74,20 +113,139 @@ const assertRuntime = () => {
   if (!isTrue(process.env.AUTONOMOUS_RUNTIME_AUDIT_APPROVED)) {
     failures.push("EVIDENCE_UTILIZATION_RUNTIME_AUDIT_REQUIRED");
   }
-  if (failures.length) {
-    const error = new Error("AUTONOMOUS_WORKER_CONFIGURATION_INVALID");
-    error.code = failures[0];
-    throw error;
+  if (failures.length) throw codedError(failures[0]);
+};
+
+const readProductionContract = () => {
+  try {
+    const packageJson = JSON.parse(readFileSync(join(process.cwd(), "package.json"), "utf8"));
+    const contract = JSON.parse(readFileSync(
+      join(process.cwd(), "scripts", "autonomous-worker-command-contract.json"),
+      "utf8"
+    ));
+    if (!packageJson?.scripts || typeof packageJson.scripts !== "object") {
+      throw codedError("AUTONOMOUS_WORKER_COMMAND_CONTRACT_INVALID");
+    }
+    if (contract?.version !== 1 || !contract.commands || typeof contract.commands !== "object") {
+      throw codedError("AUTONOMOUS_WORKER_COMMAND_CONTRACT_INVALID");
+    }
+    return { packageScripts: packageJson.scripts, contractCommands: contract.commands };
+  } catch (error) {
+    if (codeOf(error, "") === "AUTONOMOUS_WORKER_COMMAND_CONTRACT_INVALID") throw error;
+    throw codedError("AUTONOMOUS_WORKER_COMMAND_CONTRACT_INVALID");
   }
 };
 
-const appendBounded = (current, chunk) =>
-  `${current}${chunk}`.slice(-MAX_CAPTURE_BYTES);
+const assertCommandEntry = ({ packageScripts, contractCommands }, command) => {
+  const expectedEntry = `tsx src/postgresOnlyCli.ts ${command}`;
+  const entry = contractCommands[command];
+  if (packageScripts[command] !== expectedEntry || !entry || typeof entry !== "object") {
+    throw codedError("AUTONOMOUS_WORKER_COMMAND_CONTRACT_INVALID");
+  }
+  if (entry.entry !== expectedEntry) {
+    throw codedError("AUTONOMOUS_WORKER_COMMAND_CONTRACT_INVALID");
+  }
+  const expectedKeys = [...Object.keys(EXPECTED_CONTRACT_ENTRY), "entry"].sort();
+  if (JSON.stringify(Object.keys(entry).sort()) !== JSON.stringify(expectedKeys)) {
+    throw codedError("AUTONOMOUS_WORKER_COMMAND_CONTRACT_INVALID");
+  }
+  for (const [key, expected] of Object.entries(EXPECTED_CONTRACT_ENTRY)) {
+    if (entry[key] !== expected) {
+      throw codedError("AUTONOMOUS_WORKER_COMMAND_CONTRACT_INVALID");
+    }
+  }
+};
 
-const classify = (exitCode, output, spawnError) => {
+const assertCompleteCommandContract = (contract) => {
+  const actualCommands = Object.keys(contract.contractCommands).sort();
+  const expectedCommands = [...REQUIRED_COMMANDS].sort();
+  if (JSON.stringify(actualCommands) !== JSON.stringify(expectedCommands)) {
+    throw codedError("AUTONOMOUS_WORKER_COMMAND_CONTRACT_INVALID");
+  }
+  for (const command of REQUIRED_COMMANDS) assertCommandEntry(contract, command);
+};
+
+const appendBounded = (current, chunk) => `${current}${chunk}`.slice(-MAX_CAPTURE_BYTES);
+
+let activeChild = null;
+let wakeDelay = null;
+let stopRequested = false;
+let stopSignal = null;
+for (const signal of ["SIGTERM", "SIGINT"]) {
+  process.on(signal, () => {
+    stopRequested = true;
+    stopSignal = signal;
+    activeChild?.kill("SIGTERM");
+    wakeDelay?.();
+  });
+}
+
+const runNpmCommand = (script, args, timeoutMs) =>
+  new Promise((resolve) => {
+    const startedAt = Date.now();
+    let stdout = "";
+    let stderr = "";
+    let spawnError = false;
+    let timedOut = false;
+    let settled = false;
+    let forceKillTimer = null;
+    const child = spawn("npm", ["run", script, "--", ...args], {
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    activeChild = child;
+    child.stdout?.on("data", (chunk) => {
+      stdout = appendBounded(stdout, chunk);
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr = appendBounded(stderr, chunk);
+    });
+    child.on("error", () => {
+      spawnError = true;
+    });
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+      forceKillTimer = setTimeout(() => child.kill("SIGKILL"), FORCE_KILL_DELAY_MS);
+      forceKillTimer.unref?.();
+    }, timeoutMs);
+    timeout.unref?.();
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+      activeChild = null;
+      resolve({
+        exitCode: Number.isInteger(code) ? code : 1,
+        durationMs: Date.now() - startedAt,
+        output: `${stdout}\n${stderr}`,
+        spawnError,
+        timedOut
+      });
+    });
+  });
+
+const classify = ({ exitCode, output, spawnError, timedOut }) => {
   if (spawnError) return { classification: "runner_unavailable", code: "WORKSTREAM_RUNNER_UNAVAILABLE" };
+  if (timedOut) return { classification: "timed_out", code: "WORKSTREAM_TIMEOUT" };
+  if (exitCode === 0) {
+    if (/"status"\s*:\s*"(failed|rejected)"/i.test(output)) {
+      return { classification: "failed", code: "WORKSTREAM_COMMAND_FAILED" };
+    }
+    if (/"status"\s*:\s*"(blocked|no_op)"|NO_CANDIDATE|NO_RUNTIME_CANDIDATES/i.test(output)) {
+      return { classification: "blocked", code: "WORKSTREAM_BLOCKED" };
+    }
+    if (/"status"\s*:\s*"skipped"/i.test(output)) {
+      return { classification: "skipped", code: "WORKSTREAM_SKIPPED" };
+    }
+    return { classification: "success", code: null };
+  }
   if (/PAPER_RUNTIME_REQUIRED|LIVE_TRADING_DISABLED_REQUIRED|ALPACA_ENV=live|TRADING_MODE=live/i.test(output)) {
     return { classification: "safety_failure", code: "PAPER_SAFETY_GUARD_FAILED" };
+  }
+  if (/POSTGRES_ONLY_RUNTIME_PATH_DISABLED|AUTONOMOUS_COMMAND_NOT_IMPLEMENTED/i.test(output)) {
+    return { classification: "command_rejected", code: "WORKSTREAM_COMMAND_REJECTED" };
   }
   if (/SCHEDULER_LEASE_HELD|already owned by another active lease/i.test(output)) {
     return { classification: "lease_unavailable", code: "SCHEDULER_LEASE_UNAVAILABLE" };
@@ -95,61 +253,32 @@ const classify = (exitCode, output, spawnError) => {
   if (/Scheduler (heartbeat|lease acquisition) failed|POSTGRES_[A-Z0-9_]+|PostgreSQL (connection|transaction)/i.test(output)) {
     return { classification: "postgres_unavailable", code: "POSTGRES_WORKSTREAM_UNAVAILABLE" };
   }
-  if (/"status"\s*:\s*"(blocked|no_op)"|NO_CANDIDATE|NO_RUNTIME_CANDIDATES/i.test(output)) {
-    return { classification: "blocked", code: "WORKSTREAM_BLOCKED" };
-  }
-  if (/"status"\s*:\s*"skipped"/i.test(output)) {
-    return { classification: "skipped", code: "WORKSTREAM_SKIPPED" };
-  }
-  return exitCode === 0
-    ? { classification: "success", code: null }
-    : { classification: "failed", code: "WORKSTREAM_COMMAND_FAILED" };
+  return { classification: "failed", code: "WORKSTREAM_COMMAND_FAILED" };
 };
 
-let activeChild = null;
-let wakeDelay = null;
-let stopRequested = false;
-for (const signal of ["SIGTERM", "SIGINT"]) {
-  process.on(signal, () => {
-    stopRequested = true;
-    activeChild?.kill("SIGTERM");
-    wakeDelay?.();
-  });
-}
+const runWorkstream = async (script, args, timeoutMs) => {
+  const raw = await runNpmCommand(script, args, timeoutMs);
+  const result = classify(raw);
+  return {
+    ...result,
+    exitCode: raw.exitCode,
+    durationMs: raw.durationMs
+  };
+};
 
-const runWorkstream = (script, args) =>
-  new Promise((resolve) => {
-    const startedAt = Date.now();
-    let stdout = "";
-    let stderr = "";
-    let spawnError = false;
-    let settled = false;
-    const child = spawn("npm", ["run", script, "--", ...args], {
-      env: process.env,
-      stdio: ["ignore", "pipe", "pipe"]
-    });
-    activeChild = child;
-    child.stdout.on("data", (chunk) => {
-      stdout = appendBounded(stdout, chunk);
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr = appendBounded(stderr, chunk);
-    });
-    child.on("error", () => {
-      spawnError = true;
-    });
-    child.on("close", (code) => {
-      if (settled) return;
-      settled = true;
-      activeChild = null;
-      const exitCode = Number.isInteger(code) ? code : 1;
-      resolve({
-        ...classify(exitCode, `${stdout}\n${stderr}`, spawnError),
-        exitCode,
-        durationMs: Date.now() - startedAt
-      });
-    });
-  });
+const persistState = async (cycleId, eventType, payload) => {
+  const occurredAt = new Date().toISOString();
+  const encodedPayload = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const result = await runNpmCommand(STATE_COMMAND, [
+    `--cycleId=${cycleId}`,
+    `--eventType=${eventType}`,
+    `--payload=${encodedPayload}`,
+    `--occurredAt=${occurredAt}`
+  ], STATE_PERSIST_TIMEOUT_MS);
+  if (result.exitCode !== 0 || result.spawnError || result.timedOut) {
+    throw codedError("AUTONOMOUS_WORKER_STATE_PERSIST_FAILED");
+  }
+};
 
 const wait = (milliseconds) =>
   new Promise((resolve) => {
@@ -163,55 +292,116 @@ const wait = (milliseconds) =>
     wakeDelay = finish;
   });
 
+const statePayload = (cycle, extra = {}) => ({
+  cycle,
+  paperOnly: true,
+  ...extra
+});
+
 const main = async () => {
-  assertRuntime();
   const cycleDelayMs = cycleDelay();
+  const workstreamTimeoutMs = workstreamTimeout();
   const once = process.argv.includes("--once");
+  const preflightCycleId = randomUUID();
+  assertRuntime();
+
+  const contract = readProductionContract();
+  assertCommandEntry(contract, STATE_COMMAND);
+  try {
+    assertCompleteCommandContract(contract);
+  } catch (error) {
+    const code = codeOf(error, "AUTONOMOUS_WORKER_COMMAND_CONTRACT_INVALID");
+    await persistState(preflightCycleId, "preflight_failed", {
+      classification: "preflight_failure",
+      code,
+      message: "The autonomous production command contract is invalid.",
+      paperOnly: true
+    });
+    log({ event: "preflight_failed", cycleId: preflightCycleId, code });
+    throw error;
+  }
+
   let cycle = 0;
-  let consecutivePostgresFailures = 0;
+  let lastCycleId = preflightCycleId;
   log({ event: "worker_started", paperOnly: true, workstreamCount: WORKSTREAMS.length });
   while (!stopRequested) {
     cycle += 1;
-    let failed = 0;
-    for (let index = 0; index < WORKSTREAMS.length && !stopRequested; index += 1) {
+    const cycleId = cycle === 1 ? preflightCycleId : randomUUID();
+    lastCycleId = cycleId;
+    await persistState(cycleId, "cycle_started", statePayload(cycle, {
+      workerPid: process.pid,
+      workstreamCount: WORKSTREAMS.length
+    }));
+    log({ event: "cycle_started", cycle, cycleId, workstreamCount: WORKSTREAMS.length });
+
+    for (let index = 0; index < WORKSTREAMS.length; index += 1) {
+      if (stopRequested) break;
       const [script, args] = WORKSTREAMS[index];
-      const result = await runWorkstream(script, args);
-      if (result.classification === "safety_failure" || result.classification === "runner_unavailable") {
-        const error = new Error(result.code);
-        error.code = result.code;
-        throw error;
-      }
-      if (result.classification === "postgres_unavailable") {
-        consecutivePostgresFailures += 1;
-      } else {
-        consecutivePostgresFailures = 0;
-      }
-      if (consecutivePostgresFailures >= POSTGRES_FAILURE_LIMIT) {
-        const error = new Error("POSTGRES_UNAVAILABLE_RETRY_LIMIT");
-        error.code = "POSTGRES_UNAVAILABLE_RETRY_LIMIT";
-        throw error;
-      }
-      if (["failed", "postgres_unavailable"].includes(result.classification)) failed += 1;
-      log({
-        event: "workstream_completed",
-        cycle,
+      const basePayload = statePayload(cycle, {
         position: index + 1,
-        workstream: script,
-        ...result
+        workstream: script
       });
+      await persistState(cycleId, "workstream_started", basePayload);
+      log({ event: "workstream_started", cycle, cycleId, position: index + 1, workstream: script });
+      const result = await runWorkstream(script, args, workstreamTimeoutMs);
+
+      if (stopRequested) {
+        await persistState(cycleId, "worker_stopped", statePayload(cycle, {
+          reason: "signal",
+          signal: stopSignal,
+          position: index + 1,
+          workstream: script
+        }));
+        log({ event: "worker_stopped", cycle, cycleId, reason: "signal" });
+        return;
+      }
+
+      if (result.code && !["WORKSTREAM_BLOCKED", "WORKSTREAM_SKIPPED"].includes(result.code)) {
+        const failurePayload = {
+          ...basePayload,
+          ...result,
+          message: "A required autonomous workstream failed."
+        };
+        await persistState(cycleId, "workstream_failed", failurePayload);
+        log({ event: "workstream_failed", cycle, cycleId, position: index + 1, workstream: script, ...result });
+        await persistState(cycleId, "cycle_failed", statePayload(cycle, {
+          classification: result.classification,
+          code: result.code,
+          message: "The autonomous cycle failed before completion.",
+          failedPosition: index + 1,
+          failedWorkstream: script
+        }));
+        log({ event: "cycle_failed", cycle, cycleId, code: result.code, failedWorkstream: script });
+        throw codedError(result.code);
+      }
+
+      const completionPayload = { ...basePayload, ...result };
+      await persistState(cycleId, "workstream_completed", completionPayload);
+      log({ event: "workstream_completed", cycle, cycleId, position: index + 1, workstream: script, ...result });
     }
+
     if (stopRequested) break;
-    log({ event: "cycle_completed", cycle, workstreamCount: WORKSTREAMS.length, failed });
-    if (once) break;
+    await persistState(cycleId, "cycle_completed", statePayload(cycle, {
+      workstreamCount: WORKSTREAMS.length,
+      failed: 0
+    }));
+    log({ event: "cycle_completed", cycle, cycleId, workstreamCount: WORKSTREAMS.length, failed: 0 });
+    if (once) {
+      await persistState(cycleId, "worker_stopped", statePayload(cycle, { reason: "once" }));
+      log({ event: "worker_stopped", cycle, cycleId, reason: "once" });
+      return;
+    }
     await wait(cycleDelayMs);
   }
-  log({ event: "worker_stopped", cycle, reason: stopRequested ? "signal" : "once" });
+
+  await persistState(lastCycleId, "worker_stopped", statePayload(cycle, {
+    reason: "signal",
+    signal: stopSignal
+  }));
+  log({ event: "worker_stopped", cycle, cycleId: lastCycleId, reason: "signal" });
 };
 
 main().catch((error) => {
-  log({
-    event: "worker_failed",
-    code: typeof error?.code === "string" ? error.code : "AUTONOMOUS_WORKER_FAILED"
-  });
+  log({ event: "worker_failed", code: codeOf(error) });
   process.exitCode = 1;
 });

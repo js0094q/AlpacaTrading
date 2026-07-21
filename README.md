@@ -12,9 +12,18 @@ Production startup requires `DATABASE_BACKEND=postgres`, PostgreSQL reads and
 writes, control-plane/scheduler/execution-state authority, both shadow flags
 off, and `SQLITE_AUDIT_MIRROR_ENABLED=false`. Missing PostgreSQL connectivity
 or an incomplete authority configuration fails closed. Dashboard reads require
-the PostgreSQL-backed VPS bridge. Dashboard mutations, timers, monitors, and
-the autonomous worker remain disabled pending the evidence-utilization and
-runtime audit.
+the PostgreSQL-backed VPS bridge. The autonomous paper worker is restored only
+through `src/postgresOnlyCli.ts`; its 16 registered workstreams and lifecycle
+events have no production import path to SQLite. Historical timers remain
+disabled so that systemd has one scheduler authority.
+
+Migration `003_market_data_authority.sql` adds PostgreSQL authority for the
+worker's universe symbols, market bars, SIP stock snapshots, OPRA option
+contracts and snapshots, feature and target snapshots, strategy snapshots, and
+research evidence. Research rejects missing, future, or stale market evidence.
+Reviews create signed, unconfirmed PostgreSQL intents; they do not manufacture
+confirmation or bypass the existing paper execution gates. Reconciliation
+keeps unresolved ambiguous submissions available for a later broker lookup.
 
 Supported authority operations are:
 
@@ -30,6 +39,10 @@ cutover workflow. It captures fresh Alpaca paper evidence, preserves existing
 risk policy fingerprints, closes only stale PostgreSQL runtime rows, submits
 zero orders, and creates a fresh authority baseline explicitly marked as not a
 historical SQLite reconciliation.
+
+After a passed schema/authority check, run one current `research:daily` refresh,
+run `zero-dte:reconcile`, install the checked-in worker unit, and verify a
+persisted `cycle_completed` event before considering the worker restored.
 
 ## Current continuation checkpoint (July 2026)
 

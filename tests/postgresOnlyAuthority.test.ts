@@ -120,7 +120,7 @@ test("the SQLite fixture symbol cannot activate SQLite under production NODE_ENV
   assert.equal(result.stdout, "RUNTIME_SQLITE_DISABLED");
 });
 
-test("production CLI allows only broker reads and PostgreSQL authority operations", () => {
+test("production CLI allows only broker reads, PostgreSQL authority, and audited worker operations", () => {
   assert.doesNotThrow(() => assertPostgresOnlyCliCommand("alpaca:positions"));
   assert.doesNotThrow(() => assertPostgresOnlyCliCommand("db:postgres:authority:status"));
   for (const command of [
@@ -128,7 +128,7 @@ test("production CLI allows only broker reads and PostgreSQL authority operation
     "db:postgres:control-plane:backfill",
     "db:postgres:execution-state:reconcile",
     "paper:execute",
-    "research:daily"
+    "hedge:execute"
   ]) {
     assert.throws(
       () => assertPostgresOnlyCliCommand(command),
@@ -137,8 +137,17 @@ test("production CLI allows only broker reads and PostgreSQL authority operation
         error.code === POSTGRES_ONLY_RUNTIME_PATH_DISABLED
     );
   }
+  const autonomous = new Set([
+    "research:daily", "paper:review", "paper:portfolio:review",
+    "paper:options:discover", "paper:ops:review", "paper:exit:review",
+    "paper:exit:execute", "paper:execute:reviewed", "hedge:review",
+    "hedge:exit:review", "hedge:exit:execute", "zero-dte:engine",
+    "zero-dte:exit:review", "zero-dte:reconcile", "paper:learn",
+    "system:recover", "worker:state"
+  ]);
   assert.ok(listSafePostgresOnlyCliCommands().every((command) =>
-    command.startsWith("alpaca:") || command.startsWith("db:postgres:")
+    command.startsWith("alpaca:") || command.startsWith("db:postgres:") ||
+    autonomous.has(command)
   ));
 });
 
@@ -172,14 +181,22 @@ test("package scripts expose no SQLite migration, backfill, reconciliation, or m
   assert.match(buildConfig, /src\/lib\/db\.ts/);
   const productionCli = readFileSync("src/postgresOnlyCli.ts", "utf8");
   assert.doesNotMatch(productionCli, /node:sqlite|src\/cli|src\/lib\/db/);
-  for (const retired of [
-    "research:daily",
-    "paper:execute",
-    "paper:review",
-    "zero-dte:engine",
-    "hedge:execute"
-  ]) {
+  for (const retired of ["paper:execute", "hedge:execute"]) {
     assert.equal(packageJson.scripts[retired], undefined, retired);
+  }
+  for (const restored of [
+    "research:daily", "paper:review", "paper:portfolio:review",
+    "paper:options:discover", "paper:ops:review", "paper:exit:review",
+    "paper:exit:execute", "paper:execute:reviewed", "hedge:review",
+    "hedge:exit:review", "hedge:exit:execute", "zero-dte:engine",
+    "zero-dte:exit:review", "zero-dte:reconcile", "paper:learn",
+    "system:recover", "worker:state"
+  ]) {
+    assert.equal(
+      packageJson.scripts[restored],
+      `tsx src/postgresOnlyCli.ts ${restored}`,
+      restored
+    );
   }
 });
 
@@ -415,6 +432,8 @@ test("enabled production import graphs contain no SQLite dependency", () => {
   for (const entry of [
     "src/postgresOnlyCli.ts",
     "src/services/postgresAuthorityCutoverService.ts",
+    "src/services/postgresMarketDataService.ts",
+    "src/services/postgresStockStreamPersistenceService.ts",
     "server/dashboard-control/server.ts"
   ]) {
     const graph = collectImportGraph(entry);

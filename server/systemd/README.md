@@ -2,10 +2,11 @@
 
 ## Current service boundary
 
-PostgreSQL is the sole production runtime authority. During the fresh authority
-cutover, start only `alpaca-dashboard-control.service`. Keep the autonomous
-worker and every paper, research, observatory, recovery, universe, and 0DTE timer
-stopped and disabled pending the separate evidence-utilization and runtime audit.
+PostgreSQL is the sole production runtime authority. Complete the fresh
+authority cutover, migration 003, current market-data ingestion, and paper
+account reconciliation before starting `alpaca-autonomous-paper.service`.
+The autonomous worker is the sole scheduler; all legacy timers remain stopped
+and disabled.
 
 Historical timer templates remain in this directory as deployment evidence,
 but production command gating rejects their application paths with
@@ -39,7 +40,7 @@ curl -fsS -H "Authorization: Bearer $VPS_CONTROL_TOKEN" \
   http://127.0.0.1:4100/api/v1/health
 ```
 
-## Autonomous-worker hold
+## Autonomous-worker installation
 
 The autonomous worker unit hardcodes:
 
@@ -48,20 +49,25 @@ DATABASE_BACKEND=postgres
 POSTGRES_SHADOW_COMPARE_ENABLED=false
 POSTGRES_EXECUTION_STATE_SHADOW_ENABLED=false
 SQLITE_AUDIT_MIRROR_ENABLED=false
-AUTONOMOUS_RUNTIME_AUDIT_APPROVED=false
+AUTONOMOUS_RUNTIME_AUDIT_APPROVED=true
 ```
 
-The worker and monitor runner require full PostgreSQL authority and then fail
-closed while `AUTONOMOUS_RUNTIME_AUDIT_APPROVED=false`. Keep the service and its
-timer disabled:
+The worker requires full PostgreSQL authority and validates the checked-in
+17-command contract (16 workstreams plus lifecycle state). Install the unit and
+leave its retired timer disabled:
 
 ```bash
-sudo systemctl disable --now alpaca-autonomous-paper.service 2>/dev/null || true
+sudo install -m 644 \
+  /home/alpaca/Alpaca-Trading/server/systemd/alpaca-autonomous-paper.service \
+  /etc/systemd/system/alpaca-autonomous-paper.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now alpaca-autonomous-paper.service
 sudo systemctl disable --now alpaca-autonomous-paper.timer 2>/dev/null || true
 sudo bash /home/alpaca/Alpaca-Trading/scripts/disable-paper-monitoring-systemd.sh
 ```
 
-Do not change the audit approval flag during this cutover.
+Do not set the audit approval flag in the shared environment; the validated
+worker unit supplies it locally after the preceding gates pass.
 
 ## Deployment verification
 
@@ -76,7 +82,8 @@ Verify all of the following without printing secrets:
 - `db:postgres:authority:status` reports a passed
   `fresh_postgresql_authority_cutover` checkpoint;
 - dashboard-control is active;
-- autonomous worker and all trading/research timers are inactive;
+- autonomous worker is active and has persisted one complete successful cycle;
+- all legacy trading/research timers are inactive;
 - no application SQLite database is open;
 - no migration, backfill, or reconciliation process is active;
 - the cutover submitted zero orders.

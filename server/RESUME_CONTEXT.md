@@ -19,17 +19,24 @@ shadow, mirror, fallback, or historical import command.
 6. Run `npm run db:postgres:authority:cutover` once. Require a passed fresh
    baseline with `historicalSqliteReconciliation=false` and zero submitted
    orders.
-7. Install the checked-in dashboard-control unit, daemon-reload, and start
+7. Run one current `research:daily` refresh and verify genuine PostgreSQL market
+   bars, stock/option snapshots, features, targets, and research evidence.
+8. Run `zero-dte:reconcile` against the Alpaca paper account; retain unresolved
+   ambiguous submissions for later resolution.
+9. Install the checked-in dashboard-control and autonomous-worker units,
+   daemon-reload, and start
    `alpaca-dashboard-control.service`.
-8. Validate `/api/v1/health`, `/api/v1/postgres-authority/status`, and
+10. Validate `/api/v1/health`, `/api/v1/postgres-authority/status`, and
    `/api/v1/summary` locally.
-9. Confirm the checkout is clean, the deployed SHA is exact, PostgreSQL is
-   reachable, no application process has a SQLite file open, all timers remain
-   disabled, and the autonomous worker is inactive/disabled.
+11. Enable and start `alpaca-autonomous-paper.service`; keep every legacy timer
+    disabled and require one persisted `cycle_completed` event.
+12. Confirm the checkout is clean, the deployed SHA is exact, PostgreSQL is
+    reachable, no application process has a SQLite file open, dashboard-control
+    is healthy, and paper/live-off safety flags remain exact.
 
 Do not delete old SQLite files during this cutover. Deletion requires a later,
 separate confirmation that no process has them open and no supported runtime
 path references them.
 
-Next action: evidence-utilization and runtime audit before autonomous paper
-trading is restored.
+Next action: deploy the exact validated worker-restoration commit and collect
+the runtime acceptance evidence above.

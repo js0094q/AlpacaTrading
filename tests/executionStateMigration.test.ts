@@ -244,10 +244,11 @@ test("durable execution checkpoint verification binds the snapshot and aggregate
   );
 });
 
-test("PostgreSQL schema remains migrations 1 and 2 only", async () => {
+test("PostgreSQL schema contains only the three validated authority migrations", async () => {
   const files = await readdir(new URL("../src/lib/database/migrations", import.meta.url));
   assert.deepEqual(files.sort(), [
     "001_initial_operational_state.sql",
-    "002_control_plane_authority.sql"
+    "002_control_plane_authority.sql",
+    "003_market_data_authority.sql"
   ]);
 });

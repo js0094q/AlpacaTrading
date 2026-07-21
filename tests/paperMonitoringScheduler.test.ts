@@ -81,18 +81,23 @@ describe("retired paper monitoring scheduler", () => {
     assert.match(source, /POSTGRES_ONLY_RUNTIME_PATH_DISABLED/);
   });
 
-  test("package scripts expose no retired monitor dependencies", () => {
+  test("package scripts keep retired monitor dependencies absent and restored workstreams PostgreSQL-only", () => {
     const packageJson = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8")) as {
       scripts: Record<string, string | undefined>;
     };
+    for (const command of ["observatory:collect", "paper:ops:morning"]) {
+      assert.equal(packageJson.scripts[command], undefined, command);
+    }
     for (const command of [
-      "observatory:collect",
-      "paper:ops:morning",
       "paper:execute:reviewed",
       "zero-dte:engine",
       "zero-dte:reconcile"
     ]) {
-      assert.equal(packageJson.scripts[command], undefined, command);
+      assert.equal(
+        packageJson.scripts[command],
+        `tsx src/postgresOnlyCli.ts ${command}`,
+        command
+      );
     }
   });
 
@@ -101,8 +106,8 @@ describe("retired paper monitoring scheduler", () => {
       join(repoRoot, "server/systemd/README.md"),
       "utf8"
     );
-    assert.match(systemdReadme, /stopped and disabled pending/);
+    assert.match(systemdReadme, /legacy timers remain stopped\s+and disabled/i);
     assert.match(systemdReadme, /POSTGRES_ONLY_RUNTIME_PATH_DISABLED/);
-    assert.match(systemdReadme, /AUTONOMOUS_RUNTIME_AUDIT_APPROVED=false/);
+    assert.match(systemdReadme, /AUTONOMOUS_RUNTIME_AUDIT_APPROVED=true/);
   });
 });

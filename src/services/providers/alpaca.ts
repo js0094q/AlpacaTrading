@@ -1,8 +1,31 @@
+import { config as loadDotenv } from "dotenv";
+
 import { recordApiRequest } from "../apiLog.js";
-import { config } from "../../config.js";
 import { assertReadOnlyAlpacaAccessAllowed } from "../tradingSafetyService.js";
 import type { Timeframe } from "../../types.js";
 import type { StockSnapshotRaw } from "../stockSnapshotNormalizer.js";
+
+loadDotenv();
+loadDotenv({ path: ".env.txt", override: false });
+
+const firstEnv = (...names: string[]) => {
+  for (const name of names) {
+    const value = process.env[name]?.trim();
+    if (value) return value;
+  }
+  return "";
+};
+const marketConfig = {
+  paperKey: firstEnv("ALPACA_PAPER_API_KEY", "ALPACA_PAPER_KEY", "ALPACA_API_KEY"),
+  paperSecret: firstEnv("ALPACA_PAPER_SECRET_KEY", "ALPACA_PAPER_SECRET", "ALPACA_SECRET_KEY"),
+  paperBaseUrl: firstEnv("ALPACA_PAPER_BASE_URL") || "https://paper-api.alpaca.markets",
+  dataBaseUrl: firstEnv("ALPACA_DATA_BASE_URL") || "https://data.alpaca.markets",
+  stockDataFeed: process.env.ALPACA_STOCK_DATA_FEED?.trim() || "sip",
+  optionDataFeed: process.env.ALPACA_OPTION_DATA_FEED?.trim() || "opra",
+  requestTimeoutMs: Number.parseInt(process.env.ALPACA_REQUEST_TIMEOUT_MS || "15000", 10) || 15000,
+  maxRetries: Math.max(0, Number.parseInt(process.env.ALPACA_MAX_RETRIES || "2", 10) || 0),
+  userAgent: process.env.ALPACA_USER_AGENT || "alpaca-research-cli"
+};
 
 export interface RawBar {
   t: string;
@@ -19,8 +42,8 @@ export interface ApiResponse<T> {
 }
 
 const getAuthHeaders = (): Record<string, string> => {
-  const key = config.paperByDefault ? config.alpaca.paperKey : config.alpaca.liveKey;
-  const secret = config.paperByDefault ? config.alpaca.paperSecret : config.alpaca.liveSecret;
+  const key = marketConfig.paperKey;
+  const secret = marketConfig.paperSecret;
   return key && secret
     ? {
         "APCA-API-KEY-ID": key,
@@ -76,10 +99,10 @@ const requestJson = async <T>(
 ): Promise<ApiResponse<T>> => {
   assertReadOnlyAlpacaAccessAllowed();
   const apiRoot = baseUrl === "trade"
-    ? (config.paperByDefault ? config.alpaca.paperBaseUrl : config.alpaca.liveBaseUrl)
-    : config.alpaca.dataBaseUrl;
-  const timeoutMs = config.alpaca.requestTimeoutMs;
-  const maxRetries = config.alpaca.maxRetries;
+    ? marketConfig.paperBaseUrl
+    : marketConfig.dataBaseUrl;
+  const timeoutMs = marketConfig.requestTimeoutMs;
+  const maxRetries = marketConfig.maxRetries;
   let response: Response | null = null;
   let lastError: unknown = null;
 
@@ -92,7 +115,7 @@ const requestJson = async <T>(
             ...(options.headers || {}),
             ...getAuthHeaders(),
             "Content-Type": "application/json",
-            "User-Agent": config.alpaca.userAgent
+            "User-Agent": marketConfig.userAgent
           },
           signal
         })
@@ -413,7 +436,7 @@ export const fetchBars = async (options: ProviderOptions): Promise<{ symbol: str
     timeframe,
     start: options.start,
     end: options.end,
-    feed: options.feed || config.alpaca.stockDataFeed,
+    feed: options.feed || marketConfig.stockDataFeed,
     page_token: options.pageToken,
     limit: 1000
   });
@@ -455,7 +478,7 @@ export const fetchAllBars = async (
       timeframe: options.timeframe || "1Day",
       start: options.start,
       end: options.end,
-      feed: options.feed || config.alpaca.stockDataFeed,
+      feed: options.feed || marketConfig.stockDataFeed,
       page_token: pageToken ?? undefined,
       limit: 1000
     });
@@ -587,7 +610,7 @@ export const fetchOptionSnapshots = async (
     const chunk = optionSymbols.slice(index, index + chunkSize);
     const endpoint = `/v1beta1/options/snapshots?${toSearchParams({
       symbols: chunk.join(","),
-      feed: config.alpaca.optionDataFeed
+      feed: marketConfig.optionDataFeed
     })}`;
     const response = await requestJson<unknown>(endpoint);
     results.push(
@@ -612,7 +635,7 @@ export const fetchOptionQuotes = async (
     const chunk = optionSymbols.slice(index, index + chunkSize);
     const endpoint = `/v1beta1/options/quotes/latest?${toSearchParams({
       symbols: chunk.join(","),
-      feed: config.alpaca.optionDataFeed
+      feed: marketConfig.optionDataFeed
     })}`;
     const response = await requestJson<unknown>(endpoint);
     results.push(

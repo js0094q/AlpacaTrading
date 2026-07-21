@@ -25,7 +25,7 @@ Required production settings:
 - `TRADING_MODE=paper`
 - `ALPACA_LIVE_TRADE=false`
 - `LIVE_TRADING_ENABLED=false`
-- `AUTONOMOUS_RUNTIME_AUDIT_APPROVED=false`
+- `AUTONOMOUS_RUNTIME_AUDIT_APPROVED=true` (worker service only, after all gates pass)
 
 Missing PostgreSQL authority or connectivity fails closed. Do not print
 connection values or other secrets.
@@ -55,17 +55,26 @@ The baseline must say:
 Do not relabel or overwrite earlier blocked historical reconciliation
 checkpoints.
 
-## Runtime state after deployment
+## Runtime state required after deployment
 
 - Start and validate `alpaca-dashboard-control.service` on `127.0.0.1:4100`.
-- Keep `alpaca-autonomous-paper.service` stopped and disabled.
+- Apply migration `003_market_data_authority.sql` and verify the PostgreSQL schema.
+- Run a current SIP/OPRA research refresh and verify genuine PostgreSQL market
+  bars, stock snapshots, option contracts/snapshots, features, targets, and
+  research evidence.
+- Reconcile PostgreSQL order state against the Alpaca paper account; unresolved
+  ambiguous submissions must remain non-terminal for a later lookup.
+- Install, enable, and start `alpaca-autonomous-paper.service`; require a
+  persisted `cycle_completed` lifecycle event for one complete 16-workstream cycle.
 - Keep all paper execution/review/research/observatory/0DTE timers disabled.
 - Dashboard reads require the PostgreSQL-backed VPS bridge and return `503`
   when PostgreSQL or the passed authority baseline is unavailable.
-- Dashboard mutations return `POSTGRES_ONLY_RUNTIME_PATH_DISABLED`.
-- Do not submit paper or live orders.
+- Production worker, research, review, reconciliation, execution, and market-data
+  imports must remain isolated from SQLite.
+- Keep `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, and
+  `LIVE_TRADING_ENABLED=false`; no live order path is permitted.
 
 ## Next action
 
-Perform the evidence-utilization and runtime audit before restoring any
-autonomous paper-trading workflow.
+Deploy the exact validated worker-restoration commit and collect the runtime
+evidence above without enabling any legacy timer.

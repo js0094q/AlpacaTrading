@@ -8,11 +8,17 @@ workflows. Production requires full PostgreSQL control-plane, scheduler, and
 execution-state authority with both shadow flags and the SQLite audit mirror
 off. PostgreSQL failure is terminal.
 
-Only `alpaca-dashboard-control.service` may be started after a passed fresh
-PostgreSQL authority checkpoint. Keep the autonomous worker and all paper,
-research, and autonomous timers stopped pending the evidence-utilization and
-runtime audit. Dashboard-control is read-only and cannot submit, replace, or
-cancel orders.
+After a passed fresh PostgreSQL authority checkpoint and migration 003, the
+checked-in `alpaca-autonomous-paper.service` is the sole autonomous scheduler.
+It runs all 16 workstreams through the PostgreSQL-only CLI and persists worker
+lifecycle evidence. Keep every legacy paper, research, observatory, and 0DTE
+timer disabled. Dashboard-control remains bound to `127.0.0.1:4100`.
+
+Before enabling the worker, run current SIP/OPRA market-data ingestion, verify
+the PostgreSQL market/feature/target/research rows, and reconcile against the
+Alpaca paper account. Missing or stale evidence is terminal for the workstream;
+unresolved ambiguous submissions remain pending. The unit hard-codes paper
+mode and live-off flags and must never be changed to a live environment.
 
 This directory prepares a Njalla-hosted Ubuntu LTS VPS for a future paper-first Alpaca investing platform. It hardens the host before any trading code, secrets, public UI, or live execution path exists.
 

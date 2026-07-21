@@ -148,7 +148,7 @@ const runPackagedExecutionStateCommand = (input: {
   }
 };
 
-test("actual Neon PostgreSQL applies Release 3 twice and fences concurrent control-plane writers", {
+test("actual Neon PostgreSQL applies every migration twice and fences concurrent control-plane writers", {
   skip: !enabled
 }, async () => {
   const config = loadDatabaseConfig(
@@ -177,11 +177,11 @@ test("actual Neon PostgreSQL applies Release 3 twice and fences concurrent contr
     const second = await runPostgresMigrations(schemaPool, config);
     const verification = await verifyPostgresSchema(schemaPool);
 
-    assert.deepEqual(first.appliedVersions, [1, 2]);
+    assert.deepEqual(first.appliedVersions, [1, 2, 3]);
     assert.deepEqual(second.appliedVersions, []);
     assert.equal(verification.verificationPassed, true);
-    assert.equal(verification.presentTableCount, 23);
-    assert.equal(verification.presentIndexCount, 59);
+    assert.equal(verification.presentTableCount, 33);
+    assert.equal(verification.presentIndexCount, 69);
     assert.equal(verification.schedulerFencingSequencePresent, true);
     assert.deepEqual(verification.missingColumns, []);
     assert.deepEqual(verification.missingConstraints, []);
@@ -525,7 +525,7 @@ test("actual Neon reconciles fixed-scale partial state without candidate updates
       sessionOptions: `-c search_path=${schema}`
     });
     phase = "migrate_twice";
-    assert.deepEqual((await runPostgresMigrations(schemaPool, config)).appliedVersions, [1, 2]);
+    assert.deepEqual((await runPostgresMigrations(schemaPool, config)).appliedVersions, [1, 2, 3]);
     assert.deepEqual((await runPostgresMigrations(schemaPool, config)).appliedVersions, []);
 
     phase = "seed_partial_state";
@@ -780,13 +780,13 @@ test("actual Neon backfills and reconciles Release 4 execution state idempotentl
       sessionOptions: `-c search_path=${schema}`
     });
     phase = "migrate_twice";
-    assert.deepEqual((await runPostgresMigrations(schemaPool, config)).appliedVersions, [1, 2]);
+    assert.deepEqual((await runPostgresMigrations(schemaPool, config)).appliedVersions, [1, 2, 3]);
     assert.deepEqual((await runPostgresMigrations(schemaPool, config)).appliedVersions, []);
     assert.deepEqual(
       (await schemaPool.query<{ version: number }>(
         "SELECT version FROM schema_migrations ORDER BY version"
       )).rows.map((row) => Number(row.version)),
-      [1, 2]
+      [1, 2, 3]
     );
     phase = "seed_control_plane_candidate";
     await schemaPool.query(

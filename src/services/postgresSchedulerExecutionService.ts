@@ -42,6 +42,17 @@ export const POSTGRES_SCHEDULER_JOBS = {
   autonomousRecovery: {
     jobName: "autonomous-recovery",
     workstream: "autonomous_recovery"
+  },
+  optionDiscovery: {
+    jobName: "option-discovery",
+    workstream: "option_discovery"
+  },
+  hedgeReview: { jobName: "hedge-review", workstream: "hedge_review" },
+  hedgeExit: { jobName: "hedge-exit", workstream: "hedge_exit" },
+  learning: { jobName: "learning", workstream: "learning" },
+  autonomousWorkerState: {
+    jobName: "autonomous-worker-state",
+    workstream: "autonomous_worker_state"
   }
 } as const satisfies Record<string, PostgresSchedulerJob>;
 
