@@ -149,6 +149,7 @@ test("system recovery cancels only provably stale created intents and fences all
   assert.doesNotMatch(reservationSql ?? "", /GREATEST/);
   assert.match(reservationSql ?? "", /FOR UPDATE/);
   assert.match(reservationSql ?? "", /COUNT\(DISTINCT allocation\.id\)/);
+  assert.match(reservationSql ?? "", /EXISTS \(\s*SELECT 1 FROM locked_reservations/s);
   assert.match(reservationSql ?? "", /reserved_amount >=/);
   assert.match(reservationSql ?? "", /mismatch/);
   assert.match(reservationSql ?? "", /reserved_amount = allocation\.reserved_amount - totals\.amount/);
@@ -559,7 +560,7 @@ test("PostgreSQL recovery fails closed for a missing active allocation", {
          idempotency_key, reservation_fingerprint, account_snapshot_id,
          expires_at, created_at, updated_at
        ) VALUES ('missing-reservation', 'missing-account', 'baseline', 'SPY', 'equity', 20,
-         'missing-key', 'missing-fingerprint', 'missing-snapshot',
+         'active', 'missing-key', 'missing-fingerprint', 'missing-snapshot',
          '2026-07-20T21:30:00.000Z', '2026-07-20T20:00:00.000Z', '2026-07-20T20:00:00.000Z')`
     );
     await assert.rejects(
@@ -605,7 +606,7 @@ test("PostgreSQL recovery fails closed for active allocation reservation underfl
          idempotency_key, reservation_fingerprint, account_snapshot_id,
          expires_at, created_at, updated_at
        ) VALUES ('underflow-reservation', 'underflow-account', 'baseline', 'SPY', 'equity', 20,
-         'underflow-key', 'underflow-fingerprint', 'underflow-snapshot',
+         'active', 'underflow-key', 'underflow-fingerprint', 'underflow-snapshot',
          '2026-07-20T21:30:00.000Z', '2026-07-20T20:00:00.000Z', '2026-07-20T20:00:00.000Z')`
     );
     await assert.rejects(

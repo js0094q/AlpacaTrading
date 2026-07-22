@@ -158,11 +158,12 @@ export const runAutonomousPostgresRecovery = async (
        SELECT allocation.id, allocation.account_id, allocation.strategy_key,
               allocation.reserved_amount
        FROM strategy_allocations allocation
-       JOIN (
-         SELECT DISTINCT account_id, strategy_key FROM locked_reservations
-       ) group_key ON group_key.account_id = allocation.account_id
-                  AND group_key.strategy_key = allocation.strategy_key
        WHERE allocation.status = 'active' AND allocation.effective_to IS NULL
+         AND EXISTS (
+           SELECT 1 FROM locked_reservations reservation
+           WHERE reservation.account_id = allocation.account_id
+             AND reservation.strategy_key = allocation.strategy_key
+         )
        FOR UPDATE
      ), grouped AS (
        SELECT reservation.account_id, reservation.strategy_key,

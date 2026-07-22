@@ -257,3 +257,21 @@ Results: 26 focused tests passed, 4 gated PostgreSQL integration tests skipped l
 ### Fixture accounting correction
 
 The fixture was corrected so expired amounts 30+10 plus the surviving live amount 20 equal the seeded active allocation reservation of 60. `deployed_amount=125` remains unchanged, and the expected post-recovery reserved amount is 20.
+
+## Isolated-run SQL/fixture corrections
+
+The parent’s isolated PostgreSQL run exposed two setup/runtime RED issues before concurrency and adverse assertions completed:
+
+- PostgreSQL 0A000 rejected the production `locked_allocations` CTE because `FOR UPDATE` cannot be used with its `SELECT DISTINCT` join source.
+- PostgreSQL 42601 rejected both adverse reservation inserts because the literal `active` status value was omitted after the amount column.
+
+The allocation-lock CTE now uses a correlated `WHERE EXISTS (SELECT 1 FROM locked_reservations ...)`, which selects each active allocation row once and remains lockable with `FOR UPDATE`. The grouped validation still uses `COUNT(DISTINCT allocation.id)`. Both adverse fixtures now include the literal `'active'` status.
+
+Local RED/GREEN evidence for the SQL assertion:
+
+```text
+RED: 30 tests: 25 passed, 1 failed, 4 skipped
+GREEN: 30 tests: 26 passed, 0 failed, 4 skipped
+```
+
+Ordinary typecheck, build, and diff check also passed. No production access or deployment was performed.
