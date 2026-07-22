@@ -73,8 +73,7 @@ Results:
 
 ## Concerns / unresolved risks
 
-- The focused tests validate generated SQL and mocked row counts; no PostgreSQL integration execution was run, per the task boundary prohibiting production/database access. The CTE should be exercised by the existing PostgreSQL-only recovery path after deployment.
-- Production validation and worker-cycle observation remain pending deployment by the parent workflow. No deployment was performed here.
+- Production deployment and live worker-cycle validation remain pending. No deployment was performed here.
 
 ## Follow-up reviewer fixes
 
@@ -174,3 +173,13 @@ JavaScript expected: 2026-07-20T21:30:00.000Z
 ```
 
 These values are semantically equivalent. The integration test now compares the non-timestamp evidence fields directly and normalizes `reviewExpiresAt` through `new Date(...).toISOString()` before comparison. Production code was unchanged for this follow-up.
+
+## Final isolated PostgreSQL GREEN evidence
+
+The parent’s final isolated PostgreSQL integration run passed all assertions:
+
+```text
+5/5 passed, 0 skipped, duration 9571.714026ms
+```
+
+This confirms the recovery mutation, selective intent states, canonical SHA-256 fingerprint, lifecycle audit evidence, reservation reconciliation, and deployed-amount preservation against the isolated temporary schema. Only production deployment and live-cycle validation remain.
