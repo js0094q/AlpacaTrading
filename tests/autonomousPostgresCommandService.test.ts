@@ -148,6 +148,7 @@ test("system recovery cancels only provably stale created intents and fences all
   assert.match(reservationSql ?? "", /UPDATE strategy_allocations/);
   assert.doesNotMatch(reservationSql ?? "", /GREATEST/);
   assert.match(reservationSql ?? "", /FOR UPDATE/);
+  assert.match(reservationSql ?? "", /COUNT\(DISTINCT allocation\.id\)/);
   assert.match(reservationSql ?? "", /reserved_amount >=/);
   assert.match(reservationSql ?? "", /mismatch/);
   assert.match(reservationSql ?? "", /reserved_amount = allocation\.reserved_amount - totals\.amount/);
@@ -279,6 +280,7 @@ test("PostgreSQL recovery persists SHA-256 cancellation audit rows in an isolate
       );
     };
     await insertReservation("reservation-expired", 30, staleExpiry);
+    await insertReservation("reservation-expired-2", 10, staleExpiry);
     await insertReservation("reservation-live", 20, liveExpiry);
 
     const insertReview = async (id: string, status: string, expiresAt: string) => {
@@ -317,7 +319,7 @@ test("PostgreSQL recovery persists SHA-256 cancellation audit rows in an isolate
 
     const result = await runAutonomousPostgresRecovery(schemaPool, fence, new Date(now));
     assert.equal(result.intents, 1);
-    assert.equal(result.reservations, 1);
+    assert.equal(result.reservations, 2);
 
     const intents = await schemaPool.query(
       `SELECT id, status, terminal_at, version, lifecycle_fingerprint
@@ -377,13 +379,14 @@ test("PostgreSQL recovery persists SHA-256 cancellation audit rows in an isolate
       `SELECT reserved_amount::text, deployed_amount::text
        FROM strategy_allocations WHERE id = 'allocation-recovery-test'`
     );
-    assert.equal(allocation.rows[0]?.reserved_amount, "20.00000000");
+    assert.equal(allocation.rows[0]?.reserved_amount, "10.00000000");
     assert.equal(allocation.rows[0]?.deployed_amount, "125.00000000");
     const reservations = await schemaPool.query(
       `SELECT id, status FROM buying_power_reservations ORDER BY id`
     );
     assert.deepEqual(reservations.rows, [
       { id: "reservation-expired", status: "expired" },
+      { id: "reservation-expired-2", status: "expired" },
       { id: "reservation-live", status: "active" }
     ]);
   } finally {

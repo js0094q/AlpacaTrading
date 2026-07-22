@@ -223,3 +223,33 @@ Results:
 - No production access or deployment was performed. The new concurrency/adverse integration cases require the parent’s authorized isolated PostgreSQL run.
 
 The strict sizing evidence tests cover null, blank, and malformed values for buying power, cash, and equity, plus explicit zero values for each field.
+
+## Grouped reservation-count follow-up
+
+The parent review identified that grouped recovery counted one active allocation once per expired reservation. The happy-path isolated PostgreSQL fixture now seeds two expired reservations for the same account/strategy plus the live reservation, expecting two expired reservations and an allocation `reserved_amount` decrease from 50 to 10.
+
+### RED evidence
+
+After adding the fixture and focused SQL assertion, before the production correction:
+
+```text
+npx tsx --test tests/postgresReviewWorkflowService.test.ts tests/autonomousPostgresCommandService.test.ts
+30 tests: 25 passed, 1 failed, 4 skipped
+```
+
+The failure showed the recovery SQL still used `COUNT(allocation.id)`.
+
+### GREEN evidence
+
+Changed only the grouped allocation count to `COUNT(DISTINCT allocation.id)`. The happy-path fixture now validates that two expired reservations reconcile against one allocation without a false mismatch.
+
+Commands rerun:
+
+```text
+npx tsx --test tests/postgresReviewWorkflowService.test.ts tests/autonomousPostgresCommandService.test.ts
+npm run typecheck
+npm run build
+git diff --check
+```
+
+Results: 26 focused tests passed, 4 gated PostgreSQL integration tests skipped locally; typecheck, build, and diff check passed.

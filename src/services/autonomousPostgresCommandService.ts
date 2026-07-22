@@ -167,7 +167,7 @@ export const runAutonomousPostgresRecovery = async (
      ), grouped AS (
        SELECT reservation.account_id, reservation.strategy_key,
               SUM(reservation.amount) AS expired_sum,
-              COUNT(allocation.id) AS allocation_count,
+              COUNT(DISTINCT allocation.id) AS allocation_count,
               MIN(allocation.reserved_amount) AS allocation_reserved
        FROM locked_reservations reservation
        LEFT JOIN locked_allocations allocation
