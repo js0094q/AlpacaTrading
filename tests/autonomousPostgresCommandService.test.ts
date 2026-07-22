@@ -151,7 +151,7 @@ test("system recovery cancels only provably stale created intents and fences all
   assert.match(intentSql ?? "", /terminal_at = \$1/);
   assert.match(intentSql ?? "", /version = intent\.version \+ 1/);
   assert.match(intentSql ?? "", /encode\(sha256\(convert_to/);
-  assert.match(intentSql ?? "", /concat_ws\('\|', intent\.id, intent\.lifecycle_fingerprint, 'cancelled', \$1::text\)/);
+  assert.match(intentSql ?? "", /to_char\(\$1::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS\.MS"Z"'\)/);
   assert.doesNotMatch(intentSql ?? "", /\bmd5\(/);
   assert.match(intentSql ?? "", /INSERT INTO lifecycle_fingerprints/);
   assert.match(intentSql ?? "", /order_intent_id, entity_type, entity_id/);

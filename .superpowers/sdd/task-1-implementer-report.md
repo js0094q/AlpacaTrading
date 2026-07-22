@@ -153,3 +153,13 @@ The parent then reran the isolated PostgreSQL integration test and reported a se
 ```
 
 The deterministic scheduler lease expiry reused `liveExpiry` (`2026-07-20T23:00:00.000Z`), but the real PostgreSQL clock was 2026-07-22, so the production fence predicate `lease.expires_at > now()` correctly rejected the lease. The test now gives only the scheduler lease a runtime-future expiry (`Date.now() + 60 minutes`); deterministic recovery, review, and reservation timestamps remain unchanged.
+
+## Timestamp canonicalization follow-up
+
+The parent’s third isolated-PostgreSQL run reached recovery and proved selective mutation, but reported a real RED fingerprint mismatch:
+
+```text
+PostgreSQL produced cf8e...; JavaScript expected 3298...
+```
+
+The cause was production SQL hashing `$1::text`, whose timestamptz text rendering depends on session timezone/format. The recovery hash input now uses PostgreSQL `to_char($1::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')`, matching the JavaScript `Date.toISOString()` value used by the integration assertion. The SQL-text regression assertion now requires this canonical UTC expression.

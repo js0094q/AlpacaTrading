@@ -197,7 +197,8 @@ export const runAutonomousPostgresRecovery = async (
        SET status = 'cancelled', terminal_at = $1, updated_at = $1,
            version = intent.version + 1,
            lifecycle_fingerprint = encode(sha256(convert_to(
-             concat_ws('|', intent.id, intent.lifecycle_fingerprint, 'cancelled', $1::text),
+             concat_ws('|', intent.id, intent.lifecycle_fingerprint, 'cancelled',
+               to_char($1::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')),
              'UTF8'
            )), 'hex')
        WHERE intent.id IN (SELECT stale.id FROM stale)
