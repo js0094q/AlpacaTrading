@@ -184,6 +184,7 @@ test("PostgreSQL recovery persists SHA-256 cancellation audit rows in an isolate
   const createdAt = "2026-07-20T20:00:00.000Z";
   const liveExpiry = "2026-07-20T23:00:00.000Z";
   const staleExpiry = "2026-07-20T21:30:00.000Z";
+  const schedulerExpiry = new Date(Date.now() + 60 * 60_000).toISOString();
   const fence = {
     jobName: "autonomous-recovery",
     workstream: "autonomous_recovery",
@@ -220,7 +221,7 @@ test("PostgreSQL recovery persists SHA-256 cancellation audit rows in an isolate
          acquired_at, heartbeat_at, expires_at, created_at, updated_at
        ) VALUES ('autonomous-recovery', 'autonomous_recovery', 'integration-owner',
          'integration-run', 77, 'held', $1, $1, $2, $1, $1)`,
-      [createdAt, liveExpiry]
+      [createdAt, schedulerExpiry]
     );
     await schemaPool.query(
       `INSERT INTO strategy_allocations(

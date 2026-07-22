@@ -143,3 +143,13 @@ git diff --check
 ```
 
 The integration gate remained disabled locally; no database was accessed in this follow-up.
+
+## Scheduler-fence fixture follow-up
+
+The parent then reran the isolated PostgreSQL integration test and reported a second RED result after setup succeeded:
+
+```text
+4 passed; integration reached recovery but result.intents was 0 at test line 286
+```
+
+The deterministic scheduler lease expiry reused `liveExpiry` (`2026-07-20T23:00:00.000Z`), but the real PostgreSQL clock was 2026-07-22, so the production fence predicate `lease.expires_at > now()` correctly rejected the lease. The test now gives only the scheduler lease a runtime-future expiry (`Date.now() + 60 minutes`); deterministic recovery, review, and reservation timestamps remain unchanged.
