@@ -424,7 +424,8 @@ test("autonomous service fixes paper-only authority and bounds failure restarts"
   assert.match(service, /^Environment=POSTGRES_SHADOW_COMPARE_ENABLED=false$/m);
   assert.match(service, /^Environment=POSTGRES_EXECUTION_STATE_SHADOW_ENABLED=false$/m);
   assert.match(service, /^Environment=SQLITE_AUDIT_MIRROR_ENABLED=false$/m);
-  assert.match(service, /^ExecStart=\/usr\/bin\/npm run paper:autonomous -- --workstream-timeout-ms=3600000$/m);
+  assert.match(service, /^ExecStart=\/usr\/bin\/node scripts\/autonomous-paper-worker\.mjs --workstream-timeout-ms=3600000$/m);
+  assert.doesNotMatch(service, /^ExecStart=.*npm run paper:autonomous/m);
   assert.match(service, /^StartLimitIntervalSec=300$/m);
   assert.match(service, /^StartLimitBurst=3$/m);
   assert.match(service, /^Restart=on-failure$/m);
