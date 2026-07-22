@@ -40,7 +40,11 @@ export const POSTGRES_SCHEDULER_COMMAND_REGISTRY = [
   },
   {
     job: POSTGRES_SCHEDULER_JOBS.reconciliation,
-    aliases: ["zero-dte:reconcile", "db:postgres:authority:cutover"]
+    aliases: [
+      "zero-dte:reconcile",
+      "paper:reconcile:external-order",
+      "db:postgres:authority:cutover"
+    ]
   },
   {
     job: POSTGRES_SCHEDULER_JOBS.exitReview,

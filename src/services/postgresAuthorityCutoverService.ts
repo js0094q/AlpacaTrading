@@ -62,6 +62,12 @@ type PostgresOrderRow = {
   notional: string | null;
   limit_price: string | null;
 };
+type ExternalBrokerOrderEventRow = {
+  broker_order_id: string | null;
+  client_order_id: string | null;
+  event_status: string;
+  response_payload: unknown;
+};
 
 export type PostgresAuthorityState = {
   accountCount: number;
@@ -289,6 +295,89 @@ const comparablePostgresOrder = (order: PostgresOrderRow) => ({
   notional: order.notional === null ? null : money(order.notional),
   limitPrice: order.limit_price === null ? null : money(order.limit_price)
 });
+
+const observationRecord = (value: unknown, code: string) => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(code);
+  return value as Record<string, unknown>;
+};
+const observationText = (value: unknown, code: string) => {
+  const text = String(value ?? "").trim();
+  if (!text) throw new Error(code);
+  return text;
+};
+const observationDecimal = (value: unknown, code: string) => {
+  if (value === null || value === undefined || value === "") return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) throw new Error(code);
+  return String(value);
+};
+
+export const mapExternalBrokerOrderObservation = (
+  row: Record<string, unknown>
+): PostgresOrderRow => {
+  const payload = observationRecord(
+    row.response_payload,
+    "POSTGRES_EXTERNAL_ORDER_OBSERVATION_PAYLOAD_INVALID"
+  );
+  if (payload.provenance !== "external_order_without_postgres_intent") {
+    throw new Error("POSTGRES_EXTERNAL_ORDER_PROVENANCE_INVALID");
+  }
+  const observed = observationRecord(
+    payload.observedOrder,
+    "POSTGRES_EXTERNAL_ORDER_OBSERVATION_STATE_INVALID"
+  );
+  const brokerOrderId = observationText(
+    row.broker_order_id,
+    "POSTGRES_EXTERNAL_ORDER_OBSERVATION_BROKER_ID_MISSING"
+  );
+  const clientOrderId = observationText(
+    row.client_order_id,
+    "POSTGRES_EXTERNAL_ORDER_OBSERVATION_CLIENT_ID_MISSING"
+  );
+  const status = observationText(
+    row.event_status,
+    "POSTGRES_EXTERNAL_ORDER_OBSERVATION_STATUS_MISSING"
+  ).toLowerCase();
+  if (
+    observationText(observed.brokerOrderId, "POSTGRES_EXTERNAL_ORDER_OBSERVATION_BROKER_ID_MISSING") !== brokerOrderId ||
+    observationText(observed.clientOrderId, "POSTGRES_EXTERNAL_ORDER_OBSERVATION_CLIENT_ID_MISSING") !== clientOrderId ||
+    observationText(observed.status, "POSTGRES_EXTERNAL_ORDER_OBSERVATION_STATUS_MISSING").toLowerCase() !== status
+  ) {
+    throw new Error("POSTGRES_EXTERNAL_ORDER_OBSERVATION_IDENTITY_MISMATCH");
+  }
+  const assetClass = observationText(
+    observed.assetClass,
+    "POSTGRES_EXTERNAL_ORDER_OBSERVATION_ASSET_CLASS_MISSING"
+  ).toLowerCase();
+  if (assetClass !== "equity" && assetClass !== "option") {
+    throw new Error("POSTGRES_EXTERNAL_ORDER_OBSERVATION_ASSET_CLASS_INVALID");
+  }
+  return {
+    broker_order_id: brokerOrderId,
+    client_order_id: clientOrderId,
+    symbol: observationText(observed.symbol, "POSTGRES_EXTERNAL_ORDER_OBSERVATION_SYMBOL_MISSING").toUpperCase(),
+    asset_class: assetClass,
+    side: observationText(observed.side, "POSTGRES_EXTERNAL_ORDER_OBSERVATION_SIDE_MISSING").toLowerCase(),
+    order_type: observationText(observed.orderType, "POSTGRES_EXTERNAL_ORDER_OBSERVATION_TYPE_MISSING").toLowerCase(),
+    time_in_force: observationText(
+      observed.timeInForce,
+      "POSTGRES_EXTERNAL_ORDER_OBSERVATION_TIME_IN_FORCE_MISSING"
+    ).toLowerCase(),
+    status,
+    quantity: observationDecimal(
+      observed.quantity,
+      "POSTGRES_EXTERNAL_ORDER_OBSERVATION_QUANTITY_INVALID"
+    ),
+    notional: observationDecimal(
+      observed.notional,
+      "POSTGRES_EXTERNAL_ORDER_OBSERVATION_NOTIONAL_INVALID"
+    ),
+    limit_price: observationDecimal(
+      observed.limitPrice,
+      "POSTGRES_EXTERNAL_ORDER_OBSERVATION_LIMIT_PRICE_INVALID"
+    )
+  };
+};
 
 export const countOrderDiscrepancies = (
   broker: readonly AuthorityBrokerOrder[],
@@ -604,6 +693,21 @@ const readAuthorityState = async (
      ORDER BY broker_order_id NULLS LAST, client_order_id`,
     [projection.accountId, [...TERMINAL_ORDER_STATUSES]]
   );
+  const externalOrderEvents = await client.query<ExternalBrokerOrderEventRow>(
+    `SELECT DISTINCT ON (broker_order_id)
+            broker_order_id, client_order_id, event_status, response_payload
+     FROM broker_events
+     WHERE account_id = $1 AND event_type = 'external_order_observed'
+       AND broker_order_id = ANY($2::text[])
+     ORDER BY broker_order_id, occurred_at DESC, event_id DESC`,
+    [projection.accountId, snapshot.orders.map((order) => order.brokerOrderId)]
+  );
+  const currentOrders = [
+    ...orders.rows,
+    ...externalOrderEvents.rows.map((row) =>
+      mapExternalBrokerOrderObservation(row as unknown as Record<string, unknown>)
+    )
+  ];
   const reservations = await client.query<CountRow>(
     "SELECT COUNT(*) AS count FROM buying_power_reservations WHERE account_id = $1 AND status = 'active' AND expires_at > $2",
     [projection.accountId, now]
@@ -727,8 +831,8 @@ const readAuthorityState = async (
     postgresPositionCount: positions.rows.length,
     positionDiscrepancyCount: countPositionDiscrepancies(snapshot.positions, positions.rows),
     brokerOpenOrderCount: snapshot.orders.length,
-    postgresOpenOrderCount: orders.rows.length,
-    orderDiscrepancyCount: countOrderDiscrepancies(snapshot.orders, orders.rows),
+    postgresOpenOrderCount: currentOrders.length,
+    orderDiscrepancyCount: countOrderDiscrepancies(snapshot.orders, currentOrders),
     activeReservationCount: count(reservations.rows[0]),
     staleActiveReservationCount: count(staleReservations.rows[0]),
     activeStrategyAllocationCount: count(allocations.rows[0]),

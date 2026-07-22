@@ -1,11 +1,14 @@
 import { canonicalJsonHash } from "../lib/canonicalJson.js";
 import type { SchedulerFence } from "../repositories/contracts/common.js";
 import { stableRecordId } from "../repositories/postgres/postgresRepositorySupport.js";
+import { getAlpacaAccountSnapshot } from "./alpacaAccountService.js";
 import {
+  getPaperOrder,
   getPaperOrderByClientOrderId,
   type AlpacaApiResponse,
   type AlpacaSubmittedOrder
 } from "./alpacaClient.js";
+import { paperSubmitConfiguration } from "./paperSubmitSafetyConfig.js";
 
 type ReconciliationQuery = {
   query: (sql: string, values?: readonly unknown[]) => Promise<{
@@ -65,6 +68,155 @@ ORDER BY intent.created_at, intent.id`;
 
 const terminalStatuses = new Set(["filled", "canceled", "cancelled", "expired", "rejected"]);
 
+type ExternalOrderObservation = {
+  brokerOrderId: string;
+  clientOrderId: string;
+  status: string;
+  provenance: "external_order_without_postgres_intent";
+  recorded: boolean;
+};
+
+const observeExternalBrokerOrder = async (input: {
+  query: ReconciliationQuery;
+  fence: SchedulerFence;
+  brokerOrderId: string;
+  now: Date;
+  getAccountSnapshot: () => Promise<{ id?: string }>;
+  getOrderById: (orderId: string) => Promise<AlpacaApiResponse<AlpacaSubmittedOrder>>;
+  safety: { environment: string; tradingMode: string; liveTradingEnabled: boolean };
+}): Promise<ExternalOrderObservation> => {
+  if (
+    input.safety.environment !== "paper" ||
+    input.safety.tradingMode !== "paper" ||
+    input.safety.liveTradingEnabled
+  ) {
+    throw new Error("PAPER_RUNTIME_REQUIRED");
+  }
+  const [account, response] = await Promise.all([
+    input.getAccountSnapshot(),
+    input.getOrderById(input.brokerOrderId)
+  ]);
+  const brokerAccountId = required(account.id, "POSTGRES_EXTERNAL_ORDER_ACCOUNT_ID_MISSING");
+  const accountId = `account_${canonicalJsonHash({ accountId: brokerAccountId })}`;
+  const raw = response.data as unknown as Record<string, unknown>;
+  const brokerOrderId = required(response.data.id, "POSTGRES_EXTERNAL_ORDER_BROKER_ID_MISSING");
+  if (brokerOrderId !== input.brokerOrderId) {
+    throw new Error("POSTGRES_EXTERNAL_ORDER_BROKER_IDENTITY_MISMATCH");
+  }
+  const clientOrderId = required(
+    response.data.client_order_id,
+    "POSTGRES_EXTERNAL_ORDER_CLIENT_ID_MISSING"
+  );
+  const status = required(response.data.status, "POSTGRES_EXTERNAL_ORDER_STATUS_MISSING").toLowerCase();
+  const symbol = required(response.data.symbol, "POSTGRES_EXTERNAL_ORDER_SYMBOL_MISSING").toUpperCase();
+  const assetClass = String(response.data.asset_class ?? "").toLowerCase().includes("option") ||
+    /\d{6}[CP]\d{8}$/.test(symbol)
+    ? "option"
+    : "equity";
+  const occurredAt = required(
+    response.data.filled_at ?? raw.canceled_at ?? raw.cancelled_at ?? raw.expired_at ??
+      response.data.updated_at ?? response.data.submitted_at,
+    "POSTGRES_EXTERNAL_ORDER_TIMESTAMP_MISSING"
+  );
+  const occurredAtIso = new Date(occurredAt).toISOString();
+  const terminalAt = optional(
+    response.data.filled_at ?? raw.canceled_at ?? raw.cancelled_at ?? raw.expired_at ??
+      raw.rejected_at
+  );
+  const identity = await input.query.query(
+    `SELECT EXISTS(SELECT 1 FROM accounts WHERE id = $1 AND environment = 'paper') AS account_exists,
+            EXISTS(SELECT 1 FROM order_intents
+                   WHERE account_id = $1 AND client_order_id = $2) AS intent_exists,
+            EXISTS(SELECT 1 FROM orders
+                   WHERE account_id = $1 AND (client_order_id = $2 OR broker_order_id = $3)) AS order_exists,
+            EXISTS(SELECT 1 FROM broker_events
+                   WHERE account_id = $1 AND event_type = 'external_order_observed'
+                     AND broker_order_id = $3 AND event_status = $4
+                     AND occurred_at = $5) AS observation_exists`,
+    [accountId, clientOrderId, brokerOrderId, status, occurredAtIso]
+  );
+  const state = identity.rows[0] ?? {};
+  if (state.account_exists !== true) throw new Error("POSTGRES_EXTERNAL_ORDER_ACCOUNT_MISSING");
+  if (state.intent_exists === true || state.order_exists === true) {
+    throw new Error("POSTGRES_EXTERNAL_ORDER_ALREADY_AUTHORIZED");
+  }
+  if (state.observation_exists === true) {
+    return {
+      brokerOrderId,
+      clientOrderId,
+      status,
+      provenance: "external_order_without_postgres_intent",
+      recorded: false
+    };
+  }
+  const observedOrder = {
+    brokerOrderId,
+    clientOrderId,
+    symbol,
+    assetClass,
+    side: required(
+      response.data.position_intent ?? response.data.side,
+      "POSTGRES_EXTERNAL_ORDER_SIDE_MISSING"
+    ).toLowerCase(),
+    orderType: required(response.data.type, "POSTGRES_EXTERNAL_ORDER_TYPE_MISSING").toLowerCase(),
+    timeInForce: required(
+      response.data.time_in_force,
+      "POSTGRES_EXTERNAL_ORDER_TIME_IN_FORCE_MISSING"
+    ).toLowerCase(),
+    status,
+    quantity: optional(response.data.qty),
+    notional: optional(response.data.notional),
+    limitPrice: optional(response.data.limit_price),
+    filledQuantity: optional(response.data.filled_qty) ?? "0",
+    filledAveragePrice: optional(response.data.filled_avg_price),
+    submittedAt: optional(response.data.submitted_at),
+    terminalAt,
+    lastBrokerUpdateAt: optional(response.data.updated_at)
+  };
+  const payload = {
+    schemaVersion: "external-broker-order-observation-v1",
+    source: "alpaca_paper_api",
+    provenance: "external_order_without_postgres_intent",
+    observedOrder,
+    brokerResponse: raw
+  };
+  const eventId = `broker_event_${stableRecordId(
+    "external_order_observed",
+    `${accountId}:${brokerOrderId}:${status}:${occurredAtIso}`
+  )}`;
+  const inserted = await input.query.query(
+    `INSERT INTO broker_events(
+       event_id, account_id, order_id, order_intent_id, broker,
+       broker_order_id, client_order_id, event_type, event_status,
+       request_id, http_status, error_classification, retryable,
+       response_payload, response_fingerprint, occurred_at, received_at
+     ) SELECT $1, $2, NULL, NULL, 'alpaca', $3, $4,
+              'external_order_observed', $5, $6, $7,
+              'external_order_without_postgres_intent', false,
+              $8::jsonb, $9, $10, $11
+       WHERE NOT EXISTS(SELECT 1 FROM order_intents
+                        WHERE account_id = $2 AND client_order_id = $4)
+         AND NOT EXISTS(SELECT 1 FROM orders
+                        WHERE account_id = $2 AND (client_order_id = $4 OR broker_order_id = $3))
+         AND ${fenceSql(12)}
+     ON CONFLICT (event_id) DO NOTHING`,
+    [eventId, accountId, brokerOrderId, clientOrderId, status,
+      response.requestId ?? null, response.status, JSON.stringify(payload),
+      canonicalJsonHash(payload), occurredAtIso, input.now.toISOString(),
+      ...fenceValues(input.fence)]
+  );
+  if (inserted.rowCount !== 1) {
+    throw new Error("POSTGRES_EXTERNAL_ORDER_OBSERVATION_PERSISTENCE_FAILED");
+  }
+  return {
+    brokerOrderId,
+    clientOrderId,
+    status,
+    provenance: "external_order_without_postgres_intent",
+    recorded: true
+  };
+};
+
 export const reconcilePostgresPaperOrders = async (input: {
   query: ReconciliationQuery;
   fence: SchedulerFence;
@@ -72,12 +224,28 @@ export const reconcilePostgresPaperOrders = async (input: {
   getOrderByClientOrderId?: (
     clientOrderId: string
   ) => Promise<AlpacaApiResponse<AlpacaSubmittedOrder>>;
+  externalBrokerOrderId?: string;
+  getOrderById?: (orderId: string) => Promise<AlpacaApiResponse<AlpacaSubmittedOrder>>;
+  getAccountSnapshot?: () => Promise<{ id?: string }>;
+  safety?: { environment: string; tradingMode: string; liveTradingEnabled: boolean };
 }) => {
   const now = input.now ?? new Date();
+  const externalObservation = input.externalBrokerOrderId
+    ? await observeExternalBrokerOrder({
+        query: input.query,
+        fence: input.fence,
+        brokerOrderId: input.externalBrokerOrderId,
+        now,
+        getAccountSnapshot: input.getAccountSnapshot ?? getAlpacaAccountSnapshot,
+        getOrderById: input.getOrderById ?? getPaperOrder,
+        safety: input.safety ?? paperSubmitConfiguration()
+      })
+    : null;
   const listed = await input.query.query(targetsSql);
   const targets = listed.rows as Target[];
   const result = {
     status: "reconciled" as const,
+    externalObservation,
     checked: 0,
     recorded: 0,
     replayed: 0,

@@ -308,6 +308,20 @@ const run = async (scheduledContext?: PostgresScheduledCommandOperationContext) 
     return;
   }
 
+  if (command === "paper:reconcile:external-order") {
+    const context = requireScheduledContext(scheduledContext);
+    const brokerOrderId = String(args.brokerOrderId || "").trim();
+    if (!brokerOrderId) throw new Error("EXTERNAL_BROKER_ORDER_ID_REQUIRED");
+    const result = await reconcilePostgresPaperOrders({
+      query: queryAdapter(context.pool),
+      fence: context.fence,
+      externalBrokerOrderId: brokerOrderId
+    });
+    print({ ...paperEnvelope(), command, ...result });
+    if (result.errors.length > 0) process.exitCode = 1;
+    return;
+  }
+
   if (command === "research:daily") {
     const context = requireScheduledContext(scheduledContext);
     const riskProfile = ["aggressive", "moderate", "conservative"].includes(String(args.riskProfile))

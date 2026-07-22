@@ -24,6 +24,7 @@ import {
   mapBrokerSnapshotToExecutionProjection,
   type PostgresAuthorityState
 } from "../src/services/postgresAuthorityCutoverService.js";
+import * as authorityService from "../src/services/postgresAuthorityCutoverService.js";
 import type { PostgresAuthorityBrokerSnapshot } from "../src/services/postgresAuthorityBrokerSnapshot.js";
 
 const postgresOnlyEnvironment = {
@@ -123,6 +124,7 @@ test("the SQLite fixture symbol cannot activate SQLite under production NODE_ENV
 test("production CLI allows only broker reads, PostgreSQL authority, and audited worker operations", () => {
   assert.doesNotThrow(() => assertPostgresOnlyCliCommand("alpaca:positions"));
   assert.doesNotThrow(() => assertPostgresOnlyCliCommand("db:postgres:authority:status"));
+  assert.doesNotThrow(() => assertPostgresOnlyCliCommand("paper:reconcile:external-order"));
   for (const command of [
     "db:migrate",
     "db:postgres:control-plane:backfill",
@@ -143,7 +145,7 @@ test("production CLI allows only broker reads, PostgreSQL authority, and audited
     "paper:exit:execute", "paper:execute:reviewed", "hedge:review",
     "hedge:exit:review", "hedge:exit:execute", "zero-dte:engine",
     "zero-dte:exit:review", "zero-dte:reconcile", "paper:learn",
-    "system:recover", "worker:state"
+    "paper:reconcile:external-order", "system:recover", "worker:state"
   ]);
   assert.ok(listSafePostgresOnlyCliCommands().every((command) =>
     command.startsWith("alpaca:") || command.startsWith("db:postgres:") ||
@@ -172,6 +174,10 @@ test("package scripts expose no SQLite migration, backfill, reconciliation, or m
   assert.equal(
     packageJson.scripts["db:postgres:authority:cutover"],
     "tsx src/postgresOnlyCli.ts db:postgres:authority:cutover"
+  );
+  assert.equal(
+    packageJson.scripts["paper:reconcile:external-order"],
+    "tsx src/postgresOnlyCli.ts paper:reconcile:external-order"
   );
   assert.equal(packageJson.scripts.build, "tsc --project tsconfig.build.json");
   const buildConfig = readFileSync("tsconfig.build.json", "utf8");
@@ -329,6 +335,47 @@ test("authority comparison checks exact position and order identity and terms", 
     countOrderDiscrepancies([brokerOrder], [{ ...postgresOrder, limit_price: "501" }]),
     1
   );
+});
+
+test("authority maps an explicit external broker observation without an order intent", () => {
+  const mapObservation = (
+    authorityService as unknown as Record<string, unknown>
+  ).mapExternalBrokerOrderObservation;
+  assert.equal(typeof mapObservation, "function");
+  const mapped = (mapObservation as (row: Record<string, unknown>) => unknown)({
+    broker_order_id: "broker-external-1",
+    client_order_id: "broker-assigned-client-1",
+    event_status: "accepted",
+    response_payload: {
+      provenance: "external_order_without_postgres_intent",
+      observedOrder: {
+        brokerOrderId: "broker-external-1",
+        clientOrderId: "broker-assigned-client-1",
+        symbol: "TQQQ",
+        assetClass: "equity",
+        side: "buy_to_open",
+        orderType: "market",
+        timeInForce: "day",
+        status: "accepted",
+        quantity: null,
+        notional: "10000",
+        limitPrice: null
+      }
+    }
+  });
+  assert.deepEqual(mapped, {
+    broker_order_id: "broker-external-1",
+    client_order_id: "broker-assigned-client-1",
+    symbol: "TQQQ",
+    asset_class: "equity",
+    side: "buy_to_open",
+    order_type: "market",
+    time_in_force: "day",
+    status: "accepted",
+    quantity: null,
+    notional: "10000",
+    limit_price: null
+  });
 });
 
 test("authority projection preserves the full current broker position state", () => {
