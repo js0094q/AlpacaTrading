@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -12,6 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { setTimeout as waitFor } from "node:timers/promises";
 
 const repoRoot = process.cwd();
 const workerPath = join(repoRoot, "scripts/autonomous-paper-worker.mjs");
@@ -300,6 +301,88 @@ test("a worker-state persistence failure is fatal before the workstream starts",
   assert.doesNotMatch(result.stdout + result.stderr, /worker-test-secret-state-failure/);
 });
 
+test("SIGTERM during workstream-start persistence stops before launching the workstream", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "autonomous-paper-worker-signal-state-"));
+  const callsPath = join(directory, "calls.jsonl");
+  const statesPath = join(directory, "states.jsonl");
+  const stateStartedPath = join(directory, "state-started");
+  const fakeNpm = join(directory, "npm");
+  writeFileSync(
+    fakeNpm,
+    `#!/usr/bin/env node
+const { appendFileSync, writeFileSync } = require("node:fs");
+const command = process.argv[3];
+const args = process.argv.slice(4);
+appendFileSync(process.env.WORKER_CALLS_PATH, JSON.stringify({ command, args }) + "\\n");
+if (command !== "worker:state") process.exit(20);
+const value = (name) => args.find((entry) => entry.startsWith("--" + name + "="))?.slice(name.length + 3);
+const state = {
+  cycleId: value("cycleId"),
+  eventType: value("eventType"),
+  occurredAt: value("occurredAt"),
+  payload: JSON.parse(Buffer.from(value("payload"), "base64url").toString("utf8"))
+};
+if (state.eventType === "workstream_started") {
+  writeFileSync(process.env.WORKER_STATE_STARTED_PATH, "started");
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
+}
+appendFileSync(process.env.WORKER_STATES_PATH, JSON.stringify(state) + "\\n");
+process.stdout.write(JSON.stringify({ status: "persisted" }));
+`,
+    { mode: 0o700 }
+  );
+  chmodSync(fakeNpm, 0o700);
+
+  let child: ReturnType<typeof spawn> | undefined;
+  try {
+    let stdout = "";
+    let stderr = "";
+    child = spawn(process.execPath, [workerPath, "--cycle-delay-ms=0"], {
+      cwd: repoRoot,
+      env: {
+        ...completePostgresOnlyEnvironment,
+        PATH: `${directory}:${process.env.PATH}`,
+        WORKER_CALLS_PATH: callsPath,
+        WORKER_STATES_PATH: statesPath,
+        WORKER_STATE_STARTED_PATH: stateStartedPath
+      },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    child.stdout?.on("data", (chunk) => { stdout += String(chunk); });
+    child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
+    const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+      child!.once("close", (code, signal) => resolve({ code, signal }));
+    });
+
+    for (let attempt = 0; attempt < 200 && !existsSync(stateStartedPath); attempt += 1) {
+      await waitFor(10);
+    }
+    assert.equal(existsSync(stateStartedPath), true, "state persistence did not start");
+    child.kill("SIGTERM");
+    const outcome = await Promise.race([
+      closed,
+      waitFor(5_000).then(() => ({ code: null, signal: "SIGALRM" as NodeJS.Signals }))
+    ]);
+
+    assert.equal(outcome.code, 0, stderr || stdout);
+    assert.equal(outcome.signal, null, stderr || stdout);
+    assert.deepEqual(
+      readJsonLines<FakeState>(statesPath).map((state) => state.eventType),
+      ["cycle_started", "workstream_started", "worker_stopped"]
+    );
+    assert.equal(
+      readJsonLines<{ command: string }>(callsPath).every((call) => call.command === "worker:state"),
+      true,
+      "no workstream may launch after a stop requested during state persistence"
+    );
+    assert.match(stdout, /"event":"worker_stopped"/);
+    assert.doesNotMatch(stdout + stderr, /AUTONOMOUS_WORKER_STATE_PERSIST_FAILED|worker_failed/);
+  } finally {
+    if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("a mismatched production command entry persists preflight_failed and runs no workstream", () => {
   const directory = mkdtempSync(join(tmpdir(), "autonomous-paper-worker-contract-"));
   mkdirSync(join(directory, "scripts"));
@@ -346,4 +429,5 @@ test("autonomous service fixes paper-only authority and bounds failure restarts"
   assert.match(service, /^StartLimitBurst=3$/m);
   assert.match(service, /^Restart=on-failure$/m);
   assert.match(service, /^RestartSec=30$/m);
+  assert.match(service, /^KillMode=mixed$/m);
 });

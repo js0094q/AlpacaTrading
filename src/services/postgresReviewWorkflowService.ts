@@ -280,6 +280,7 @@ const runExitReview = async (input: {
     return { status: "no_op" as const, code: "NO_POSTGRES_EXIT_TRIGGER", reviewsCreated: 0, pendingIntentsCreated: 0, capacityBlocked: 0 };
   }
   let created = 0;
+  let skipped = 0;
   for (const item of eligible) {
     const row = item.row;
     const accountId = String(row.account_id);
@@ -315,23 +316,48 @@ const runExitReview = async (input: {
     const nowIso = input.now.toISOString();
     const expiresAt = new Date(input.now.getTime() + 15 * 60_000).toISOString();
     const review = await input.query.query(
-      `INSERT INTO execution_reviews(
-         id, account_id, candidate_id, review_type, environment, paper_only,
-         live_trading_enabled, status, client_order_id, account_fingerprint,
-         source_snapshot_id, configuration_fingerprint, payload_fingerprint,
-         signature_algorithm, signature, order_intent, market_evidence,
-         portfolio_evidence, warnings, blockers, expires_at, created_at, updated_at
-       ) SELECT $1, $2, $3, 'exit', 'paper', true, false, 'valid', $4, $5,
-                $6, $7, $8, 'hmac-sha256', $9, $10::jsonb, $11::jsonb,
-                $12::jsonb, '[]'::jsonb, '[]'::jsonb, $13, $14, $14
-         WHERE ${fenceSql(15)}
-       ON CONFLICT (account_id, payload_fingerprint) DO NOTHING`,
+      `WITH fence_state AS (
+         SELECT ${fenceSql(15)} AS held
+       ), inserted_review AS (
+         INSERT INTO execution_reviews(
+           id, account_id, candidate_id, review_type, environment, paper_only,
+           live_trading_enabled, status, client_order_id, account_fingerprint,
+           source_snapshot_id, configuration_fingerprint, payload_fingerprint,
+           signature_algorithm, signature, order_intent, market_evidence,
+           portfolio_evidence, warnings, blockers, expires_at, created_at, updated_at
+         ) SELECT $1, $2, $3, 'exit', 'paper', true, false, 'valid', $4, $5,
+                  $6, $7, $8, 'hmac-sha256', $9, $10::jsonb, $11::jsonb,
+                  $12::jsonb, '[]'::jsonb, '[]'::jsonb, $13, $14, $14
+           FROM fence_state WHERE held
+         ON CONFLICT (account_id, client_order_id)
+           WHERE client_order_id IS NOT NULL
+         DO NOTHING
+         RETURNING id
+       )
+       SELECT fence_state.held AS fence_held,
+              (SELECT COUNT(*)::integer FROM inserted_review) AS inserted_count
+       FROM fence_state`,
       [reviewId, accountId, candidateId, clientOrderId, structural, snapshotId,
         canonicalJsonHash({ reason: item.reason }), payloadFingerprint, signature,
         JSON.stringify(orderIntent), JSON.stringify(marketEvidence),
         JSON.stringify({ snapshotId, portfolioFingerprint: portfolio, structuralPortfolioFingerprint: structural }),
         expiresAt, nowIso, ...fenceValues(input.fence)]
     );
+    const reviewOutcome = review.rowCount === 1 ? review.rows[0] : undefined;
+    if (!reviewOutcome) {
+      throw new Error("POSTGRES_EXIT_REVIEW_PERSISTENCE_FAILED");
+    }
+    if (reviewOutcome.fence_held !== true) {
+      throw new Error("SCHEDULER_FENCE_LOST");
+    }
+    const insertedCount = Number(reviewOutcome.inserted_count);
+    if (!Number.isInteger(insertedCount) || ![0, 1].includes(insertedCount)) {
+      throw new Error("POSTGRES_EXIT_REVIEW_PERSISTENCE_FAILED");
+    }
+    if (insertedCount === 0) {
+      skipped += 1;
+      continue;
+    }
     const intentFingerprint = canonicalJsonHash({ reviewId, orderIntent });
     const intent = await input.query.query(
       `INSERT INTO order_intents(
@@ -356,14 +382,14 @@ const runExitReview = async (input: {
         intentFingerprint, canonicalJsonHash({ status: "created", at: nowIso }),
         JSON.stringify(orderIntent), nowIso, ...fenceValues(input.fence)]
     );
-    if (![0, 1].includes(review.rowCount ?? -1) || ![0, 1].includes(intent.rowCount ?? -1)) {
+    if (intent.rowCount !== 1) {
       throw new Error("POSTGRES_EXIT_REVIEW_PERSISTENCE_FAILED");
     }
-    created += review.rowCount === 1 ? 1 : 0;
+    created += 1;
   }
   return {
     status: "completed" as const, command: input.command, reviewsCreated: created,
-    pendingIntentsCreated: created, skipped: 0, capacityBlocked: 0, confirmationCreated: false, paperOnly: true
+    pendingIntentsCreated: created, skipped, capacityBlocked: 0, confirmationCreated: false, paperOnly: true
   };
 };
 

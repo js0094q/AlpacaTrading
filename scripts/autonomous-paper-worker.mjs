@@ -169,6 +169,7 @@ const assertCompleteCommandContract = (contract) => {
 const appendBounded = (current, chunk) => `${current}${chunk}`.slice(-MAX_CAPTURE_BYTES);
 
 let activeChild = null;
+let activeChildPurpose = null;
 let wakeDelay = null;
 let stopRequested = false;
 let stopSignal = null;
@@ -176,12 +177,12 @@ for (const signal of ["SIGTERM", "SIGINT"]) {
   process.on(signal, () => {
     stopRequested = true;
     stopSignal = signal;
-    activeChild?.kill("SIGTERM");
+    if (activeChildPurpose === "workstream") activeChild?.kill("SIGTERM");
     wakeDelay?.();
   });
 }
 
-const runNpmCommand = (script, args, timeoutMs) =>
+const runNpmCommand = (script, args, timeoutMs, purpose) =>
   new Promise((resolve) => {
     const startedAt = Date.now();
     let stdout = "";
@@ -195,6 +196,7 @@ const runNpmCommand = (script, args, timeoutMs) =>
       stdio: ["ignore", "pipe", "pipe"]
     });
     activeChild = child;
+    activeChildPurpose = purpose;
     child.stdout?.on("data", (chunk) => {
       stdout = appendBounded(stdout, chunk);
     });
@@ -216,7 +218,10 @@ const runNpmCommand = (script, args, timeoutMs) =>
       settled = true;
       clearTimeout(timeout);
       if (forceKillTimer) clearTimeout(forceKillTimer);
-      activeChild = null;
+      if (activeChild === child) {
+        activeChild = null;
+        activeChildPurpose = null;
+      }
       resolve({
         exitCode: Number.isInteger(code) ? code : 1,
         durationMs: Date.now() - startedAt,
@@ -270,7 +275,7 @@ const classify = ({ exitCode, output, spawnError, timedOut }) => {
 };
 
 const runWorkstream = async (script, args, timeoutMs) => {
-  const raw = await runNpmCommand(script, args, timeoutMs);
+  const raw = await runNpmCommand(script, args, timeoutMs, "workstream");
   const result = classify(raw);
   return {
     ...result,
@@ -287,7 +292,7 @@ const persistState = async (cycleId, eventType, payload) => {
     `--eventType=${eventType}`,
     `--payload=${encodedPayload}`,
     `--occurredAt=${occurredAt}`
-  ], STATE_PERSIST_TIMEOUT_MS);
+  ], STATE_PERSIST_TIMEOUT_MS, "state");
   if (result.exitCode !== 0 || result.spawnError || result.timedOut) {
     throw codedError("AUTONOMOUS_WORKER_STATE_PERSIST_FAILED");
   }
@@ -356,6 +361,16 @@ const main = async () => {
       });
       await persistState(cycleId, "workstream_started", basePayload);
       log({ event: "workstream_started", cycle, cycleId, position: index + 1, workstream: script });
+      if (stopRequested) {
+        await persistState(cycleId, "worker_stopped", statePayload(cycle, {
+          reason: "signal",
+          signal: stopSignal,
+          position: index + 1,
+          workstream: script
+        }));
+        log({ event: "worker_stopped", cycle, cycleId, reason: "signal" });
+        return;
+      }
       const result = await runWorkstream(script, args, workstreamTimeoutMs);
 
       if (stopRequested) {

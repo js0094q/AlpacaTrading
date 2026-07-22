@@ -32,7 +32,7 @@ ExecStart=/usr/bin/npm run paper:autonomous -- --workstream-timeout-ms=3600000
 Restart=on-failure
 RestartSec=30
 TimeoutStopSec=30
-KillMode=control-group
+KillMode=mixed
 NoNewPrivileges=true
 StandardOutput=journal
 StandardError=journal
