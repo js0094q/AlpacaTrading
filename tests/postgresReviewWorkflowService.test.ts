@@ -50,6 +50,57 @@ test("entry review persists signed PostgreSQL review and unconfirmed pending int
   assert.equal(sql.some((statement) => /'created'/.test(statement) && statement.includes("order_intents")), true);
 });
 
+test("entry review skips an existing candidate and account-snapshot review identity", async () => {
+  let reviewCreated = false;
+  let sourceReads = 0;
+  const query = {
+    query: async (statement: string) => {
+      if (statement.includes("FROM candidates candidate")) {
+        sourceReads += 1;
+        const excludesExistingIdentity = statement.includes("FROM execution_reviews existing_review");
+        if (reviewCreated && excludesExistingIdentity) return { rows: [], rowCount: 0 };
+        return {
+          rows: [{
+            ...candidate,
+            market_timestamp: sourceReads === 1
+              ? "2026-07-20T21:59:30.000Z"
+              : "2026-07-20T21:59:45.000Z"
+          }],
+          rowCount: 1
+        };
+      }
+      if (statement.includes("INSERT INTO execution_reviews")) {
+        if (reviewCreated) {
+          throw new Error("duplicate key value violates unique constraint execution_reviews_client_order_idx");
+        }
+        reviewCreated = true;
+      }
+      return { rows: [], rowCount: 1 };
+    }
+  };
+
+  const first = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query,
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+  assert.equal(first.reviewsCreated, 1);
+
+  const second = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query,
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    now: new Date("2026-07-20T22:00:10.000Z")
+  });
+  assert.equal(second.status, "no_op");
+  assert.equal(second.reviewsCreated, 0);
+  assert.equal(second.pendingIntentsCreated, 0);
+  assert.equal(sourceReads, 2);
+});
+
 test("review fails closed before persistence when market evidence is stale", async () => {
   const sql: string[] = [];
   await assert.rejects(

@@ -20,6 +20,9 @@ disabled so that systemd has one scheduler authority.
 The worker records closed-session missing-current-option evidence and market
 session ineligibility as deferred workstream outcomes, then continues its cycle.
 Those outcomes do not relax market-data freshness or paper-execution gates.
+Repeated entry-review workstreams skip a candidate and account-snapshot identity
+that already has a persisted entry review, preserving the database client-order
+uniqueness contract across continuously refreshed market evidence.
 
 Migration `003_market_data_authority.sql` adds PostgreSQL authority for the
 worker's universe symbols, market bars, SIP stock snapshots, OPRA option

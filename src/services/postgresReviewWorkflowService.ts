@@ -162,6 +162,14 @@ JOIN LATERAL (
 ) market ON market.market_price > 0 AND market.market_timestamp IS NOT NULL
 WHERE candidate.decision = 'selected'
   AND candidate.lifecycle_status NOT IN ('closed','expired','rejected','skipped','blocked')
+  AND NOT EXISTS (
+    SELECT 1 FROM execution_reviews existing_review
+    WHERE existing_review.account_id = account.id
+      AND existing_review.candidate_id = candidate.id
+      AND existing_review.source_snapshot_id = snapshot.id
+      AND existing_review.review_type = 'entry'
+      AND existing_review.client_order_id IS NOT NULL
+  )
   ${command === "paper:options:discover" ? `AND candidate.option_symbol IS NOT NULL
     AND candidate.symbol = $1
     AND contract.expiration_date = (($2::timestamptz AT TIME ZONE 'America/New_York')::date + $3::integer)` : ""}
