@@ -17,6 +17,10 @@ through `src/postgresOnlyCli.ts`; its 16 registered workstreams and lifecycle
 events have no production import path to SQLite. Historical timers remain
 disabled so that systemd has one scheduler authority.
 
+The worker records closed-session missing-current-option evidence and market
+session ineligibility as deferred workstream outcomes, then continues its cycle.
+Those outcomes do not relax market-data freshness or paper-execution gates.
+
 Migration `003_market_data_authority.sql` adds PostgreSQL authority for the
 worker's universe symbols, market bars, SIP stock snapshots, OPRA option
 contracts and snapshots, feature and target snapshots, strategy snapshots, and

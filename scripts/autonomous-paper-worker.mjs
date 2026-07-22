@@ -10,6 +10,7 @@ const DEFAULT_WORKSTREAM_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_WORKSTREAM_TIMEOUT_MS = 6 * 60 * 60 * 1000;
 const STATE_PERSIST_TIMEOUT_MS = 60_000;
 const FORCE_KILL_DELAY_MS = 5_000;
+const EXPECTED_DEFERRED_REASON_PATTERN = /\b(POSTGRES_OPTION_SNAPSHOTS_CURRENT_MISSING|POSTGRES_DECISION_MARKET_SESSION_INELIGIBLE)\b/;
 
 const WORKSTREAMS = [
   ["research:daily", ["--riskProfile=aggressive", "--optionsEnabled=true", "--maxCandidates=10", "--assetClass=all", "--format=json"]],
@@ -250,6 +251,14 @@ const classify = ({ exitCode, output, spawnError, timedOut }) => {
   if (/SCHEDULER_LEASE_HELD|already owned by another active lease/i.test(output)) {
     return { classification: "lease_unavailable", code: "SCHEDULER_LEASE_UNAVAILABLE" };
   }
+  const deferredReasonCode = output.match(EXPECTED_DEFERRED_REASON_PATTERN)?.[1];
+  if (deferredReasonCode) {
+    return {
+      classification: "deferred",
+      code: "WORKSTREAM_DEFERRED",
+      reasonCode: deferredReasonCode
+    };
+  }
   const postgresCode = output.match(/\b(POSTGRES_[A-Z0-9_]+)\b/)?.[1];
   if (postgresCode) {
     return { classification: "postgres_failure", code: postgresCode };
@@ -360,7 +369,10 @@ const main = async () => {
         return;
       }
 
-      if (result.code && !["WORKSTREAM_BLOCKED", "WORKSTREAM_SKIPPED"].includes(result.code)) {
+      if (
+        result.code &&
+        !["WORKSTREAM_BLOCKED", "WORKSTREAM_SKIPPED", "WORKSTREAM_DEFERRED"].includes(result.code)
+      ) {
         const failurePayload = {
           ...basePayload,
           ...result,

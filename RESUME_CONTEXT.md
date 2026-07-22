@@ -71,6 +71,9 @@ checkpoints.
   when PostgreSQL or the passed authority baseline is unavailable.
 - Production worker, research, review, reconciliation, execution, and market-data
   imports must remain isolated from SQLite.
+- Missing current option snapshots outside the option session and explicit
+  market-session ineligibility are deferred worker outcomes; they continue the
+  worker cycle without weakening any execution-readiness gate.
 - Keep `ALPACA_ENV=paper`, `TRADING_MODE=paper`, `ALPACA_LIVE_TRADE=false`, and
   `LIVE_TRADING_ENABLED=false`; no live order path is permitted.
 

@@ -262,6 +262,32 @@ test("a PostgreSQL workstream failure preserves the exact safe dependency code",
   assert.doesNotMatch(result.stdout, /"event":"cycle_completed"/);
 });
 
+test("expected closed-market readiness conditions defer without stopping the worker", () => {
+  for (const reasonCode of [
+    "POSTGRES_OPTION_SNAPSHOTS_CURRENT_MISSING",
+    "POSTGRES_DECISION_MARKET_SESSION_INELIGIBLE"
+  ]) {
+    const { result, calls, states } = runWorker({
+      failCommand: "research:daily",
+      failOutput: JSON.stringify({ error: `${reasonCode}:SPY` })
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.deepEqual(
+      calls.filter((call) => call.command !== "worker:state").map((call) => call.command),
+      workstreams
+    );
+    const researchCompletion = states.find((state) =>
+      state.eventType === "workstream_completed" && state.payload.workstream === "research:daily"
+    );
+    assert.equal(researchCompletion?.payload.classification, "deferred");
+    assert.equal(researchCompletion?.payload.code, "WORKSTREAM_DEFERRED");
+    assert.equal(researchCompletion?.payload.reasonCode, reasonCode);
+    assert.equal(states.some((state) => state.eventType === "workstream_failed"), false);
+    assert.equal(states.some((state) => state.eventType === "cycle_failed"), false);
+    assert.equal(states.some((state) => state.eventType === "cycle_completed"), true);
+  }
+});
+
 test("a worker-state persistence failure is fatal before the workstream starts", () => {
   const { result, calls, states } = runWorker({ failStateEvent: "workstream_started" });
   assert.notEqual(result.status, 0, result.stderr || result.stdout);
