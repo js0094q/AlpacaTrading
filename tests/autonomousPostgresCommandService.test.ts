@@ -331,12 +331,13 @@ test("PostgreSQL recovery persists SHA-256 cancellation audit rows in an isolate
     assert.equal(audit.fingerprint, staleIntent.lifecycle_fingerprint);
     assert.equal(audit.algorithm, "sha256");
     assert.equal(audit.payload_version, 1);
-    assert.deepEqual(audit.evidence, {
-      executionReviewId: "review-stale",
-      reviewStatus: "revoked",
-      reviewExpiresAt: new Date(staleExpiry).toISOString(),
-      recoveryReason: "STALE_CREATED_INTENT_RECOVERY"
-    });
+    assert.equal(audit.evidence.executionReviewId, "review-stale");
+    assert.equal(audit.evidence.reviewStatus, "revoked");
+    assert.equal(
+      new Date(audit.evidence.reviewExpiresAt).toISOString(),
+      new Date(staleExpiry).toISOString()
+    );
+    assert.equal(audit.evidence.recoveryReason, "STALE_CREATED_INTENT_RECOVERY");
     assert.equal(new Date(audit.captured_at).toISOString(), now);
     assert.equal(new Date(audit.created_at).toISOString(), now);
 

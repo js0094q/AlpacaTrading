@@ -163,3 +163,14 @@ PostgreSQL produced cf8e...; JavaScript expected 3298...
 ```
 
 The cause was production SQL hashing `$1::text`, whose timestamptz text rendering depends on session timezone/format. The recovery hash input now uses PostgreSQL `to_char($1::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')`, matching the JavaScript `Date.toISOString()` value used by the integration assertion. The SQL-text regression assertion now requires this canonical UTC expression.
+
+## Audit evidence timestamp assertion follow-up
+
+The parent’s fourth isolated-PostgreSQL run passed recovery, selective intent states, SHA-256 fingerprint, and allocation assertions. Its only failure was the raw JSONB evidence timestamp representation:
+
+```text
+PostgreSQL JSONB: 2026-07-20T21:30:00+00:00
+JavaScript expected: 2026-07-20T21:30:00.000Z
+```
+
+These values are semantically equivalent. The integration test now compares the non-timestamp evidence fields directly and normalizes `reviewExpiresAt` through `new Date(...).toISOString()` before comparison. Production code was unchanged for this follow-up.
