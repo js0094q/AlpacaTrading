@@ -263,7 +263,7 @@ test("PostgreSQL recovery persists SHA-256 cancellation audit rows in an isolate
          created_at, updated_at
        ) VALUES (
          'allocation-recovery-test', 'account-recovery-test', 'baseline', 'active',
-         1000, 50, 125, 'test-v1', 'allocation-fingerprint', $1, $1, $1
+         1000, 60, 125, 'test-v1', 'allocation-fingerprint', $1, $1, $1
        )`,
       [createdAt]
     );
@@ -379,7 +379,7 @@ test("PostgreSQL recovery persists SHA-256 cancellation audit rows in an isolate
       `SELECT reserved_amount::text, deployed_amount::text
        FROM strategy_allocations WHERE id = 'allocation-recovery-test'`
     );
-    assert.equal(allocation.rows[0]?.reserved_amount, "10.00000000");
+    assert.equal(allocation.rows[0]?.reserved_amount, "20.00000000");
     assert.equal(allocation.rows[0]?.deployed_amount, "125.00000000");
     const reservations = await schemaPool.query(
       `SELECT id, status FROM buying_power_reservations ORDER BY id`

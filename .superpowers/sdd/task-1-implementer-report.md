@@ -226,7 +226,7 @@ The strict sizing evidence tests cover null, blank, and malformed values for buy
 
 ## Grouped reservation-count follow-up
 
-The parent review identified that grouped recovery counted one active allocation once per expired reservation. The happy-path isolated PostgreSQL fixture now seeds two expired reservations for the same account/strategy plus the live reservation, expecting two expired reservations and an allocation `reserved_amount` decrease from 50 to 10.
+The parent review identified that grouped recovery counted one active allocation once per expired reservation. The happy-path isolated PostgreSQL fixture now seeds two expired reservations for the same account/strategy plus the live reservation, with coherent `reserved_amount=60` and expected post-recovery `reserved_amount=20`.
 
 ### RED evidence
 
@@ -253,3 +253,7 @@ git diff --check
 ```
 
 Results: 26 focused tests passed, 4 gated PostgreSQL integration tests skipped locally; typecheck, build, and diff check passed.
+
+### Fixture accounting correction
+
+The fixture was corrected so expired amounts 30+10 plus the surviving live amount 20 equal the seeded active allocation reservation of 60. `deployed_amount=125` remains unchanged, and the expected post-recovery reserved amount is 20.
