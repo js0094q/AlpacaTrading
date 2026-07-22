@@ -67,6 +67,9 @@ const fenceValues = (fence: SchedulerFence) => [
   fence.jobName, fence.workstream, fence.ownerId, fence.runId, fence.fencingToken
 ];
 const finite = (value: unknown) => {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string" && value.trim() === "") return null;
+  if (typeof value !== "string" && typeof value !== "number") return null;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
 };

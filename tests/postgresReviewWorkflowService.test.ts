@@ -238,6 +238,65 @@ test("exhausted allocation capacity is a successful row-level no-op", async () =
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO order_intents")), false);
 });
 
+for (const field of ["buying_power", "cash", "equity"] as const) {
+  for (const missingValue of [null, "   ", "not-a-number"] as const) {
+    test(`missing or malformed ${field} sizing evidence fails closed before persistence`, async () => {
+      const sql: string[] = [];
+      await assert.rejects(
+        runPostgresReviewWorkflow({
+          command: "paper:review",
+          query: {
+            query: async (statement: string) => {
+              sql.push(statement);
+              if (statement.includes("FROM candidates candidate")) {
+                return { rows: [{ ...candidate, [field]: missingValue }], rowCount: 1 };
+              }
+              return { rows: [], rowCount: 1 };
+            }
+          },
+          fence,
+          signingKey: "test-signing-key-with-sufficient-length",
+          now: new Date("2026-07-20T22:00:00.000Z")
+        }),
+        /POSTGRES_REVIEW_ACCOUNT_SIZING_EVIDENCE_MISSING/
+      );
+      assert.equal(sql.some((statement) => statement.includes("INSERT INTO execution_reviews")), false);
+      assert.equal(sql.some((statement) => statement.includes("INSERT INTO order_intents")), false);
+    });
+  }
+
+  test(`explicit zero ${field} evidence produces a completed capacity outcome`, async () => {
+    const sql: string[] = [];
+    const result = await runPostgresReviewWorkflow({
+      command: "paper:review",
+      query: {
+        query: async (statement: string) => {
+          sql.push(statement);
+          if (statement.includes("FROM candidates candidate")) {
+            return {
+              rows: [{
+                ...candidate,
+                [field]: "0",
+                ...(field === "equity" ? { cash_reserve_amount: "8000" } : {})
+              }],
+              rowCount: 1
+            };
+          }
+          return { rows: [], rowCount: 1 };
+        }
+      },
+      fence,
+      signingKey: "test-signing-key-with-sufficient-length",
+      now: new Date("2026-07-20T22:00:00.000Z")
+    });
+    assert.equal(result.status, "completed");
+    assert.equal(result.code, "POSTGRES_REVIEW_CAPACITY_UNAVAILABLE");
+    assert.equal(result.capacityBlocked, 1);
+    assert.equal(sql.some((statement) => statement.includes("INSERT INTO execution_reviews")), false);
+    assert.equal(sql.some((statement) => statement.includes("INSERT INTO order_intents")), false);
+  });
+}
+
 test("exit review evaluates existing thresholds against PostgreSQL position and market evidence", async () => {
   const sql: string[] = [];
   const result = await runPostgresReviewWorkflow({

@@ -183,3 +183,43 @@ The parent’s final isolated PostgreSQL integration run passed all assertions:
 ```
 
 This confirms the recovery mutation, selective intent states, canonical SHA-256 fingerprint, lifecycle audit evidence, reservation reconciliation, and deployed-amount preservation against the isolated temporary schema. Only production deployment and live-cycle validation remain.
+
+## Final whole-range review fixes
+
+### RED evidence
+
+Added test-first coverage for the three final Important invariants. Before implementation, the ordinary focused run reported:
+
+```text
+npx tsx --test tests/postgresReviewWorkflowService.test.ts tests/autonomousPostgresCommandService.test.ts
+21 tests: 14 passed, 6 failed, 1 skipped
+```
+
+The failures covered the old `GREATEST` reservation mutation, missing reservation/allocation mismatch sentinel, missing direct sizing-evidence rejection for blank values, and the new direct intent revalidation assertions.
+
+### Implemented fixes
+
+- Intent cancellation retains the stale selection CTE but directly revalidates `intent.status = 'created'`, the linked review identity, and terminal/expired review conditions in the data-modifying UPDATE predicate. Added a gated two-session PostgreSQL test that holds an uncommitted transition, polls `pg_stat_activity` for a lock wait, commits the transition, and proves no cancellation or audit row occurs.
+- `finite()` now rejects null, undefined, blank strings, non-string/non-number values, and malformed numeric strings while preserving explicit numeric zero. Added blank-evidence fail-closed tests and explicit-zero capacity tests for buying power, cash, and equity.
+- Reservation recovery now locks expired active reservations and matching active allocations, validates every group has exactly one current allocation with sufficient reserved amount, and gates both updates on one whole-statement validation result. It subtracts the exact validated total without `GREATEST`, rechecks status/expiry/current allocation/fence predicates, returns expired-count metadata, and throws `POSTGRES_RECOVERY_RESERVATION_ALLOCATION_MISMATCH` on mismatch. Added gated isolated PostgreSQL missing-allocation and underflow tests proving reservations and allocations remain unchanged.
+
+### GREEN evidence
+
+Commands run after the final-review fixes:
+
+```text
+npx tsx --test tests/postgresReviewWorkflowService.test.ts tests/autonomousPostgresCommandService.test.ts
+npm run typecheck
+npm run build
+git diff --check
+```
+
+Results:
+
+- Ordinary focused tests: PASS, 26 passed and 4 PostgreSQL integration tests skipped because the integration gate was unset.
+- Typecheck: PASS.
+- Build: PASS.
+- `git diff --check`: PASS.
+- No production access or deployment was performed. The new concurrency/adverse integration cases require the parent’s authorized isolated PostgreSQL run.
+
+The strict sizing evidence tests cover null, blank, and malformed values for buying power, cash, and equity, plus explicit zero values for each field.

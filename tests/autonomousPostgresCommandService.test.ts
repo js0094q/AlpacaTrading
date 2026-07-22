@@ -80,7 +80,9 @@ test("system recovery performs bounded fenced PostgreSQL recovery before evaluat
     query: async (sql: string) => {
       calls.push(sql);
       if (sql.includes("UPDATE research_runs")) return { rows: [], rowCount: 1 };
-      if (sql.includes("UPDATE buying_power_reservations")) return { rows: [], rowCount: 2 };
+      if (sql.includes("UPDATE buying_power_reservations")) {
+        return { rows: [{ outcome: "ok", expired_reservation_count: "2" }], rowCount: 1 };
+      }
       if (sql.includes("UPDATE execution_reviews")) return { rows: [], rowCount: 3 };
       if (sql.includes("UPDATE confirmation_evidence")) return { rows: [], rowCount: 4 };
       if (sql.includes("UPDATE order_intents")) return { rows: [], rowCount: 5 };
@@ -117,7 +119,9 @@ test("system recovery cancels only provably stale created intents and fences all
     query: async (sql: string) => {
       calls.push(sql);
       if (sql.includes("UPDATE research_runs")) return { rows: [], rowCount: 0 };
-      if (sql.includes("UPDATE buying_power_reservations")) return { rows: [], rowCount: 2 };
+      if (sql.includes("UPDATE buying_power_reservations")) {
+        return { rows: [{ outcome: "ok", expired_reservation_count: "2" }], rowCount: 1 };
+      }
       if (sql.includes("UPDATE execution_reviews")) return { rows: [], rowCount: 0 };
       if (sql.includes("UPDATE confirmation_evidence")) return { rows: [], rowCount: 0 };
       if (sql.includes("UPDATE order_intents")) return { rows: [], rowCount: 3 };
@@ -142,11 +146,17 @@ test("system recovery cancels only provably stale created intents and fences all
   const intentSql = calls.find((sql) => sql.includes("UPDATE order_intents"));
   assert.equal(result.recovery?.intents, 3);
   assert.match(reservationSql ?? "", /UPDATE strategy_allocations/);
-  assert.match(reservationSql ?? "", /reserved_amount = GREATEST\(0, allocation\.reserved_amount - totals\.amount\)/);
+  assert.doesNotMatch(reservationSql ?? "", /GREATEST/);
+  assert.match(reservationSql ?? "", /FOR UPDATE/);
+  assert.match(reservationSql ?? "", /reserved_amount >=/);
+  assert.match(reservationSql ?? "", /mismatch/);
+  assert.match(reservationSql ?? "", /reserved_amount = allocation\.reserved_amount - totals\.amount/);
   assert.match(reservationSql ?? "", /scheduler_leases/);
   assert.match(intentSql ?? "", /intent\.status = 'created'/);
   assert.match(intentSql ?? "", /review\.status IN \('expired', 'revoked', 'blocked'\)/);
   assert.match(intentSql ?? "", /review\.expires_at <= \$1/);
+  assert.ok((intentSql?.match(/intent\.status = 'created'/g) ?? []).length >= 2);
+  assert.ok((intentSql?.match(/review\.status IN \('expired', 'revoked', 'blocked'\)/g) ?? []).length >= 2);
   assert.match(intentSql ?? "", /status = 'cancelled'/);
   assert.match(intentSql ?? "", /terminal_at = \$1/);
   assert.match(intentSql ?? "", /version = intent\.version \+ 1/);
@@ -164,6 +174,28 @@ test("system recovery cancels only provably stale created intents and fences all
   assert.match(intentSql ?? "", /captured_at, created_at/);
   assert.match(intentSql ?? "", /SELECT cancelled\.id\s+FROM cancelled\s+JOIN fingerprints/);
   assert.match(intentSql ?? "", /scheduler_leases/);
+});
+
+test("reservation recovery fails closed on a PostgreSQL allocation mismatch sentinel", async () => {
+  const query: AutonomousPostgresQueryExecutor = {
+    query: async (sql: string) => {
+      if (sql.includes("UPDATE buying_power_reservations")) {
+        return { rows: [{ outcome: "mismatch", expired_reservation_count: "1" }], rowCount: 1 };
+      }
+      if (sql.includes("UPDATE research_runs")) return { rows: [], rowCount: 0 };
+      return { rows: [], rowCount: 0 };
+    }
+  };
+  await assert.rejects(
+    runAutonomousPostgresRecovery(query, {
+      jobName: "autonomous-recovery",
+      workstream: "autonomous_recovery",
+      ownerId: "owner",
+      runId: "run",
+      fencingToken: "11"
+    }, new Date("2026-07-20T22:00:00.000Z")),
+    /POSTGRES_RECOVERY_RESERVATION_ALLOCATION_MISMATCH/
+  );
 });
 
 test("PostgreSQL recovery persists SHA-256 cancellation audit rows in an isolated schema", {
@@ -359,4 +391,232 @@ test("PostgreSQL recovery persists SHA-256 cancellation audit rows in an isolate
     await adminPool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
     await adminPool.end();
   }
+});
+
+const withRecoverySchema = async (
+  label: string,
+  callback: (pool: Pool, config: ReturnType<typeof loadDatabaseConfig>, schema: string) => Promise<void>
+) => {
+  const config = loadDatabaseConfig(
+    {
+      ...process.env,
+      DATABASE_BACKEND: "postgres",
+      POSTGRES_APPLICATION_NAME: `alpaca-${label}-integration-test`
+    },
+    { runtime: "test", purpose: "migration" }
+  );
+  const schema = `${label}_${Date.now()}_${randomBytes(4).toString("hex")}`;
+  const adminPool = createPostgresPool(config, "direct");
+  let schemaPool: Pool | undefined;
+  try {
+    await adminPool.query(`CREATE SCHEMA "${schema}"`);
+    schemaPool = createPostgresPool(config, "direct", {
+      sessionOptions: `-c search_path=${schema}`
+    });
+    await runPostgresMigrations(schemaPool, config);
+    await callback(schemaPool, config, schema);
+  } finally {
+    await schemaPool?.end();
+    await adminPool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    await adminPool.end();
+  }
+};
+
+const recoveryFence = {
+  jobName: "autonomous-recovery",
+  workstream: "autonomous_recovery",
+  ownerId: "integration-owner",
+  runId: "integration-run",
+  fencingToken: "177"
+};
+
+test("PostgreSQL recovery revalidates an intent after a concurrent status transition", {
+  skip: process.env.POSTGRES_INTEGRATION_TEST_ENABLED !== "true"
+}, async () => {
+  await withRecoverySchema("review_recovery_race", async (pool, config, schema) => {
+    const now = "2026-07-20T22:00:00.000Z";
+    const createdAt = "2026-07-20T20:00:00.000Z";
+    const staleExpiry = "2026-07-20T21:30:00.000Z";
+    const schedulerExpiry = new Date(Date.now() + 60 * 60_000).toISOString();
+    await pool.query(
+      `INSERT INTO accounts(id, broker_account_id, environment, status, created_at, updated_at)
+       VALUES ('race-account', 'race-broker', 'paper', 'active', $1, $1)`, [createdAt]
+    );
+    await pool.query(
+      `INSERT INTO account_snapshots(
+         id, account_id, observed_at, account_status, snapshot_fingerprint, created_at
+       ) VALUES ('race-snapshot', 'race-account', $1, 'active', 'race-snapshot-fingerprint', $1)`,
+      [createdAt]
+    );
+    await pool.query(
+      `INSERT INTO scheduler_leases(
+         job_name, workstream, owner_id, run_id, fencing_token, status,
+         acquired_at, heartbeat_at, expires_at, created_at, updated_at
+       ) VALUES ('autonomous-recovery', 'autonomous_recovery', 'integration-owner',
+         'integration-run', 177, 'held', $1, $1, $2, $1, $1)`,
+      [createdAt, schedulerExpiry]
+    );
+    await pool.query(
+      `INSERT INTO execution_reviews(
+         id, account_id, review_type, status, account_fingerprint,
+         configuration_fingerprint, payload_fingerprint, signature_algorithm,
+         signature, order_intent, expires_at, created_at, updated_at
+       ) VALUES ('race-review', 'race-account', 'entry', 'revoked', 'account-fingerprint',
+         'config-fingerprint', 'payload-fingerprint', 'hmac-sha256', 'signature',
+         '{}'::jsonb, $1, $2, $2)`,
+      [staleExpiry, createdAt]
+    );
+    await pool.query(
+      `INSERT INTO order_intents(
+         id, account_id, execution_review_id, client_order_id, idempotency_key,
+         strategy_key, symbol, asset_class, side, order_type, time_in_force,
+         notional, status, intent_fingerprint, lifecycle_fingerprint,
+         request_payload, created_at, updated_at
+       ) VALUES ('race-intent', 'race-account', 'race-review', 'race-client',
+         'race-key', 'baseline', 'SPY', 'equity', 'buy', 'market', 'day', 100,
+         'created', 'race-intent-fingerprint', 'race-lifecycle-fingerprint',
+         '{}'::jsonb, $1, $1)`,
+      [createdAt]
+    );
+
+    const transitionPool = createPostgresPool(config, "direct", {
+      sessionOptions: `-c search_path=${schema}`
+    });
+    const monitorPool = createPostgresPool(config, "direct", {
+      sessionOptions: `-c search_path=${schema}`
+    });
+    const transition = await transitionPool.connect();
+    try {
+      await transition.query("BEGIN");
+      await transition.query(
+        `UPDATE order_intents SET status = 'ready_for_submission', ready_at = $1, updated_at = $1
+         WHERE id = 'race-intent'`, [createdAt]
+      );
+      const recoveryPromise = runAutonomousPostgresRecovery(pool, recoveryFence, new Date(now));
+      const deadline = Date.now() + 5_000;
+      let lockWaiting = false;
+      while (Date.now() < deadline) {
+        const waiting = await monitorPool.query<{ waiting: boolean }>(
+          `SELECT EXISTS (
+             SELECT 1 FROM pg_stat_activity
+             WHERE wait_event_type = 'Lock' AND state = 'active'
+               AND query LIKE '%UPDATE order_intents%'
+           ) AS waiting`
+        );
+        if (waiting.rows[0]?.waiting) {
+          lockWaiting = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      assert.equal(lockWaiting, true);
+      await transition.query("COMMIT");
+      const recovery = await recoveryPromise;
+      assert.equal(recovery.intents, 0);
+      const intent = await pool.query(
+        `SELECT status FROM order_intents WHERE id = 'race-intent'`
+      );
+      assert.equal(intent.rows[0]?.status, "ready_for_submission");
+      const audit = await pool.query(
+        `SELECT COUNT(*)::int AS count FROM lifecycle_fingerprints
+         WHERE order_intent_id = 'race-intent' AND lifecycle_stage = 'cancelled'`
+      );
+      assert.equal(audit.rows[0]?.count, 0);
+    } finally {
+      await transition.query("ROLLBACK").catch(() => undefined);
+      transition.release();
+      await transitionPool.end();
+      await monitorPool.end();
+    }
+  });
+});
+
+test("PostgreSQL recovery fails closed for a missing active allocation", {
+  skip: process.env.POSTGRES_INTEGRATION_TEST_ENABLED !== "true"
+}, async () => {
+  await withRecoverySchema("review_recovery_missing_allocation", async (pool) => {
+    await pool.query(
+      `INSERT INTO accounts(id, broker_account_id, environment, status)
+       VALUES ('missing-account', 'missing-broker', 'paper', 'active')`
+    );
+    await pool.query(
+      `INSERT INTO account_snapshots(id, account_id, observed_at, account_status, snapshot_fingerprint)
+       VALUES ('missing-snapshot', 'missing-account', '2026-07-20T20:00:00.000Z', 'active', 'missing-snapshot')`
+    );
+    await pool.query(
+      `INSERT INTO scheduler_leases(
+         job_name, workstream, owner_id, run_id, fencing_token, status,
+         acquired_at, heartbeat_at, expires_at
+       ) VALUES ('autonomous-recovery', 'autonomous_recovery', 'integration-owner',
+         'integration-run', 177, 'held', now(), now(), now() + interval '1 hour')`
+    );
+    await pool.query(
+      `INSERT INTO buying_power_reservations(
+         id, account_id, strategy_key, symbol, asset_class, amount, status,
+         idempotency_key, reservation_fingerprint, account_snapshot_id,
+         expires_at, created_at, updated_at
+       ) VALUES ('missing-reservation', 'missing-account', 'baseline', 'SPY', 'equity', 20,
+         'missing-key', 'missing-fingerprint', 'missing-snapshot',
+         '2026-07-20T21:30:00.000Z', '2026-07-20T20:00:00.000Z', '2026-07-20T20:00:00.000Z')`
+    );
+    await assert.rejects(
+      runAutonomousPostgresRecovery(pool, recoveryFence, new Date("2026-07-20T22:00:00.000Z")),
+      /POSTGRES_RECOVERY_RESERVATION_ALLOCATION_MISMATCH/
+    );
+    const unchanged = await pool.query(
+      `SELECT status FROM buying_power_reservations WHERE id = 'missing-reservation'`
+    );
+    assert.equal(unchanged.rows[0]?.status, "active");
+  });
+});
+
+test("PostgreSQL recovery fails closed for active allocation reservation underflow", {
+  skip: process.env.POSTGRES_INTEGRATION_TEST_ENABLED !== "true"
+}, async () => {
+  await withRecoverySchema("review_recovery_underflow", async (pool) => {
+    await pool.query(
+      `INSERT INTO accounts(id, broker_account_id, environment, status)
+       VALUES ('underflow-account', 'underflow-broker', 'paper', 'active')`
+    );
+    await pool.query(
+      `INSERT INTO account_snapshots(id, account_id, observed_at, account_status, snapshot_fingerprint)
+       VALUES ('underflow-snapshot', 'underflow-account', '2026-07-20T20:00:00.000Z', 'active', 'underflow-snapshot')`
+    );
+    await pool.query(
+      `INSERT INTO scheduler_leases(
+         job_name, workstream, owner_id, run_id, fencing_token, status,
+         acquired_at, heartbeat_at, expires_at
+       ) VALUES ('autonomous-recovery', 'autonomous_recovery', 'integration-owner',
+         'integration-run', 177, 'held', now(), now(), now() + interval '1 hour')`
+    );
+    await pool.query(
+      `INSERT INTO strategy_allocations(
+         id, account_id, strategy_key, status, allocation_amount, reserved_amount,
+         deployed_amount, config_version, config_fingerprint, effective_from
+       ) VALUES ('underflow-allocation', 'underflow-account', 'baseline', 'active',
+         1000, 10, 125, 'test-v1', 'underflow-allocation-fingerprint', now())`
+    );
+    await pool.query(
+      `INSERT INTO buying_power_reservations(
+         id, account_id, strategy_key, symbol, asset_class, amount, status,
+         idempotency_key, reservation_fingerprint, account_snapshot_id,
+         expires_at, created_at, updated_at
+       ) VALUES ('underflow-reservation', 'underflow-account', 'baseline', 'SPY', 'equity', 20,
+         'underflow-key', 'underflow-fingerprint', 'underflow-snapshot',
+         '2026-07-20T21:30:00.000Z', '2026-07-20T20:00:00.000Z', '2026-07-20T20:00:00.000Z')`
+    );
+    await assert.rejects(
+      runAutonomousPostgresRecovery(pool, recoveryFence, new Date("2026-07-20T22:00:00.000Z")),
+      /POSTGRES_RECOVERY_RESERVATION_ALLOCATION_MISMATCH/
+    );
+    const unchanged = await pool.query(
+      `SELECT reserved_amount::text, deployed_amount::text
+       FROM strategy_allocations WHERE id = 'underflow-allocation'`
+    );
+    assert.deepEqual(unchanged.rows[0], { reserved_amount: "10.00000000", deployed_amount: "125.00000000" });
+    const reservation = await pool.query(
+      `SELECT status FROM buying_power_reservations WHERE id = 'underflow-reservation'`
+    );
+    assert.equal(reservation.rows[0]?.status, "active");
+  });
 });

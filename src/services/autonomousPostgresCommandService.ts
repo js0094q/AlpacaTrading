@@ -147,31 +147,82 @@ export const runAutonomousPostgresRecovery = async (
     values
   );
   const reservations = await query.query(
-    `WITH expired AS (
-       UPDATE buying_power_reservations reservation
-       SET status = 'expired', released_at = $1, release_reason = 'expired',
-           updated_at = $1, version = version + 1
+    `WITH locked_reservations AS MATERIALIZED (
+       SELECT reservation.id, reservation.account_id, reservation.strategy_key,
+              reservation.amount
+       FROM buying_power_reservations reservation
        WHERE reservation.status = 'active' AND reservation.expires_at <= $1
          AND ${fenceSql}
-       RETURNING reservation.account_id, reservation.strategy_key, reservation.amount
+       FOR UPDATE
+     ), locked_allocations AS MATERIALIZED (
+       SELECT allocation.id, allocation.account_id, allocation.strategy_key,
+              allocation.reserved_amount
+       FROM strategy_allocations allocation
+       JOIN (
+         SELECT DISTINCT account_id, strategy_key FROM locked_reservations
+       ) group_key ON group_key.account_id = allocation.account_id
+                  AND group_key.strategy_key = allocation.strategy_key
+       WHERE allocation.status = 'active' AND allocation.effective_to IS NULL
+       FOR UPDATE
+     ), grouped AS (
+       SELECT reservation.account_id, reservation.strategy_key,
+              SUM(reservation.amount) AS expired_sum,
+              COUNT(allocation.id) AS allocation_count,
+              MIN(allocation.reserved_amount) AS allocation_reserved
+       FROM locked_reservations reservation
+       LEFT JOIN locked_allocations allocation
+         ON allocation.account_id = reservation.account_id
+        AND allocation.strategy_key = reservation.strategy_key
+       GROUP BY reservation.account_id, reservation.strategy_key
+     ), validation AS (
+       SELECT CASE WHEN COUNT(*) FILTER (
+         WHERE grouped.allocation_count <> 1
+            OR grouped.allocation_reserved < grouped.expired_sum
+       ) > 0 THEN 'mismatch' ELSE 'ok' END AS outcome
+       FROM grouped
      ), totals AS (
        SELECT account_id, strategy_key, SUM(amount) AS amount
-       FROM expired
+       FROM locked_reservations
        GROUP BY account_id, strategy_key
      ), allocation_updates AS (
        UPDATE strategy_allocations allocation
-       SET reserved_amount = GREATEST(0, allocation.reserved_amount - totals.amount),
+       SET reserved_amount = allocation.reserved_amount - totals.amount,
            version = allocation.version + 1, updated_at = $1
-       FROM totals
+       FROM totals, validation
        WHERE allocation.account_id = totals.account_id
          AND allocation.strategy_key = totals.strategy_key
          AND allocation.status = 'active' AND allocation.effective_to IS NULL
+         AND validation.outcome = 'ok'
+         AND allocation.reserved_amount >= totals.amount
          AND ${fenceSql}
        RETURNING allocation.id
+     ), expired AS (
+       UPDATE buying_power_reservations reservation
+       SET status = 'expired', released_at = $1, release_reason = 'expired',
+           updated_at = $1, version = version + 1
+       FROM locked_reservations locked, validation
+       WHERE reservation.id = locked.id
+         AND validation.outcome = 'ok'
+         AND reservation.status = 'active' AND reservation.expires_at <= $1
+         AND ${fenceSql}
+       RETURNING reservation.id
      )
-     SELECT account_id, strategy_key, amount FROM expired`,
+     SELECT validation.outcome,
+            (SELECT COUNT(*) FROM expired)::text AS expired_reservation_count
+     FROM validation
+     UNION ALL
+     SELECT 'ok', '0'
+     WHERE NOT EXISTS (SELECT 1 FROM validation)`,
     values
   );
+  const reservationOutcome = String(reservations.rows[0]?.outcome ?? "mismatch");
+  if (reservationOutcome !== "ok") {
+    throw new Error("POSTGRES_RECOVERY_RESERVATION_ALLOCATION_MISMATCH");
+  }
+  const expiredReservationCount = Number(reservations.rows[0]?.expired_reservation_count ?? 0);
+  if (!Number.isSafeInteger(expiredReservationCount) || expiredReservationCount < 0) {
+    throw new Error("POSTGRES_RECOVERY_RESERVATION_ALLOCATION_MISMATCH");
+  }
   const reviews = await query.query(
     `UPDATE execution_reviews
      SET status = 'expired', updated_at = $1, version = version + 1
@@ -201,7 +252,11 @@ export const runAutonomousPostgresRecovery = async (
                to_char($1::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')),
              'UTF8'
            )), 'hex')
+       FROM execution_reviews review
        WHERE intent.id IN (SELECT stale.id FROM stale)
+         AND intent.execution_review_id = review.id
+         AND intent.status = 'created'
+         AND (review.status IN ('expired', 'revoked', 'blocked') OR review.expires_at <= $1)
          AND ${fenceSql}
        RETURNING intent.id, intent.account_id, intent.execution_review_id,
                  intent.lifecycle_fingerprint
@@ -232,7 +287,7 @@ export const runAutonomousPostgresRecovery = async (
   );
   return {
     researchRuns: researchRuns.rowCount ?? 0,
-    reservations: reservations.rowCount ?? 0,
+    reservations: expiredReservationCount,
     reviews: reviews.rowCount ?? 0,
     confirmations: confirmations.rowCount ?? 0,
     intents: intents.rowCount ?? 0
