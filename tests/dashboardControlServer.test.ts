@@ -25,17 +25,55 @@ const passedAuthority = {
   }
 };
 
+const dashboardData = {
+  latestResearch: [{ id: "research-1", status: "completed" }],
+  latestPaperPlans: [{ id: "candidate-1", decision: "blocked" }],
+  reviews: [{ id: "review-1", status: "blocked" }],
+  executions: [],
+  optionContracts: [],
+  readyIntentCount: 0,
+  requestIds: ["request-1"]
+};
+
+const workerHealth = {
+  status: "running" as const,
+  active: true,
+  lastEventType: "cycle_completed",
+  lastEventAt: "2026-07-22T15:00:00.000Z",
+  cycleId: "cycle-1",
+  lastCycleCompletedAt: "2026-07-22T15:00:00.000Z"
+};
+
+const zeroDteSummary = {
+  paperOnly: true as const,
+  generatedAt: "2026-07-22T15:00:00.000Z",
+  tradingDate: "2026-07-22",
+  engine: { enabled: true, lastRunAt: null, status: "blocked", queueSize: 0, staleDataCount: 0 },
+  queue: [],
+  paperPositions: [],
+  shadowTrades: [],
+  lifecycle: { counts: {}, recent: [] },
+  learning: null,
+  blockers: ["NO_CURRENT_POSTGRES_ZERO_DTE_CANDIDATES"]
+};
+
+let scheduledCommands: string[];
 let server: Server;
 let port = 0;
 
 const call = async (
   path: string,
   method: "GET" | "POST" = "GET",
-  token?: string
+  token?: string,
+  body?: Record<string, unknown>
 ) => {
   const response = await fetch(`http://127.0.0.1:${port}${path}`, {
     method,
-    headers: token ? { Authorization: `Bearer ${token}` } : undefined
+    headers: {
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(body ? { "content-type": "application/json" } : {})
+    },
+    ...(body ? { body: JSON.stringify(body) } : {})
   });
   return {
     status: response.status,
@@ -56,11 +94,24 @@ before(async () => {
 });
 
 beforeEach(() => {
+  scheduledCommands = [];
   module.setControlDependenciesForTests({
     authorityStatus: async () => passedAuthority,
     account: async () => ({ paperOnly: true, account: { status: "ACTIVE" } }) as never,
     positions: async () => ({ paperOnly: true, positions: [] }) as never,
-    openOrders: async () => ({ paperOnly: true, orders: [] }) as never
+    openOrders: async () => ({ paperOnly: true, orders: [] }) as never,
+    dashboardData: async () => dashboardData,
+    workerHealth: async () => workerHealth,
+    zeroDteSummary: async () => zeroDteSummary,
+    scheduledCommand: async (command) => {
+      scheduledCommands.push(command);
+      return {
+        paperOnly: true,
+        status: "blocked",
+        code: "NO_ELIGIBLE_POSTGRES_CANDIDATES",
+        blockers: ["NO_ELIGIBLE_POSTGRES_CANDIDATES"]
+      };
+    }
   });
 });
 
@@ -70,76 +121,128 @@ after(async () => {
 });
 
 describe("PostgreSQL-only dashboard control", () => {
-  test("exports only broker/PostgreSQL reads plus explicitly disabled mutations", () => {
+  test("registers PostgreSQL reads and guarded paper actions", () => {
     for (const path of [
       "/api/v1/health",
       "/api/v1/postgres-authority/status",
       "/api/v1/account",
       "/api/v1/positions",
       "/api/v1/orders",
-      "/api/v1/summary"
+      "/api/v1/summary",
+      "/api/v1/zero-dte/summary"
     ]) {
       assert.equal(module.ACTION_HANDLERS[path]?.method, "GET");
     }
-    assert.equal(module.ACTION_HANDLERS["/api/v1/research/run"]?.method, "POST");
-    assert.equal(module.ACTION_HANDLERS["/api/v1/execute/confirm"]?.method, "POST");
+    for (const path of [
+      "/api/v1/actions/research/run",
+      "/api/v1/actions/portfolio/review",
+      "/api/v1/actions/options/discover",
+      "/api/v1/actions/review",
+      "/api/v1/actions/execute",
+      "/api/v1/execute/confirm",
+      "/api/v1/refresh"
+    ]) {
+      assert.equal(module.ACTION_HANDLERS[path]?.method, "POST");
+      assert.equal(module.ACTION_HANDLERS[path]?.requireAdminToken, true);
+    }
   });
 
-  test("health proves paper-only PostgreSQL authority", async () => {
+  test("health derives autonomousWorker from persisted worker evidence", async () => {
     const response = await call("/api/v1/health");
     assert.equal(response.status, 200);
     const data = response.payload.data as Record<string, unknown>;
     assert.equal(data.paperOnly, true);
     assert.equal(data.liveTradingEnabled, false);
-    assert.equal(data.autonomousWorker, "stopped_pending_audit");
+    assert.equal(data.autonomousWorker, "running");
+    assert.deepEqual(data.worker, workerHealth);
     assert.deepEqual(data.authority, passedAuthority);
   });
 
-  test("summary contains no SQLite-backed sections", async () => {
+  test("summary is PostgreSQL-backed and preserves blocked domain decisions", async () => {
     const response = await call("/api/v1/summary");
     assert.equal(response.status, 200);
     const data = response.payload.data as Record<string, unknown>;
     assert.equal(data.mode, "postgres-only-authority");
-    assert.equal(data.durableStorageConfigured, true);
-    assert.match(JSON.stringify(data), /POSTGRES_ONLY_RUNTIME_PATH_DISABLED/);
-    assert.doesNotMatch(JSON.stringify(data), /local-sqlite|research\.db/i);
+    assert.equal(JSON.stringify(data).includes("POSTGRES_ONLY_RUNTIME_PATH_DISABLED"), false);
+    assert.equal((data.plan as Record<string, unknown>).ok, true);
+    assert.equal(((data.plan as Record<string, unknown>).data as Record<string, unknown>).plan instanceof Array, true);
   });
 
-  test("retired mutation routes are authenticated and fail closed", async () => {
-    const unauthenticated = await call("/api/v1/research/run", "POST");
-    assert.equal(unauthenticated.status, 401);
-    assert.equal(
-      (unauthenticated.payload.error as Record<string, unknown>).code,
-      "CONTROL_TOKEN_INVALID"
-    );
-
-    const disabled = await call(
-      "/api/v1/research/run",
-      "POST",
-      "synthetic-control-token"
-    );
-    assert.equal(disabled.status, 503);
-    assert.equal(
-      (disabled.payload.error as Record<string, unknown>).code,
-      "POSTGRES_ONLY_RUNTIME_PATH_DISABLED"
-    );
+  test("0DTE summary is a PostgreSQL read and returns blocked state as data", async () => {
+    const response = await call("/api/v1/zero-dte/summary");
+    assert.equal(response.status, 200);
+    const data = response.payload.data as Record<string, unknown>;
+    assert.equal(data.paperOnly, true);
+    assert.equal((data.engine as Record<string, unknown>).status, "blocked");
+    assert.deepEqual(data.blockers, ["NO_CURRENT_POSTGRES_ZERO_DTE_CANDIDATES"]);
   });
 
-  test("PostgreSQL authority failure returns 503 without fallback", async () => {
-    module.setControlDependenciesForTests({
-      authorityStatus: async () => {
-        throw new Error("synthetic postgres unavailable");
-      },
-      account: async () => ({}) as never,
-      positions: async () => ({}) as never,
-      openOrders: async () => ({}) as never
-    });
-    const response = await call("/api/v1/summary");
-    assert.equal(response.status, 503);
+  test("action routes require the control token", async () => {
+    const response = await call("/api/v1/actions/portfolio/review", "POST");
+    assert.equal(response.status, 401);
     assert.equal(
       (response.payload.error as Record<string, unknown>).code,
-      "POSTGRES_AUTHORITY_UNAVAILABLE"
+      "CONTROL_TOKEN_INVALID"
     );
+  });
+
+  test("routes guarded paper actions to PostgreSQL workflows", async () => {
+    const response = await call(
+      "/api/v1/actions/portfolio/review",
+      "POST",
+      "synthetic-control-token",
+      { riskProfile: "aggressive", optionsEnabled: true }
+    );
+    assert.equal(response.status, 200);
+    assert.equal(response.payload.status, "blocked");
+    assert.deepEqual(scheduledCommands, ["paper:portfolio:review"]);
+  });
+
+  test("rejects non-paper action runtime before invoking a workflow", async () => {
+    process.env.ALPACA_ENV = "live";
+    try {
+      const response = await call(
+        "/api/v1/actions/research/run",
+        "POST",
+        "synthetic-control-token"
+      );
+      assert.equal(response.status, 503);
+      assert.equal(
+        (response.payload.error as Record<string, unknown>).code,
+        "PAPER_RUNTIME_REQUIRED"
+      );
+      assert.deepEqual(scheduledCommands, []);
+    } finally {
+      process.env.ALPACA_ENV = "paper";
+    }
+  });
+
+  test("requires confirmPaper for reviewed execution and does not invoke submission", async () => {
+    const response = await call(
+      "/api/v1/actions/execute",
+      "POST",
+      "synthetic-control-token",
+      {}
+    );
+    assert.equal(response.status, 200);
+    assert.equal(response.payload.status, "blocked");
+    assert.equal(
+      ((response.payload.data as Record<string, unknown>).code),
+      "PAPER_CONFIRMATION_REQUIRED"
+    );
+    assert.deepEqual(scheduledCommands, []);
+  });
+
+  test("non-mutating guarded refresh returns current PostgreSQL summary", async () => {
+    const response = await call(
+      "/api/v1/refresh",
+      "POST",
+      "synthetic-control-token",
+      {}
+    );
+    assert.equal(response.status, 200);
+    assert.equal((response.payload.data as Record<string, unknown>).mode, "postgres-only-authority");
+    assert.deepEqual(scheduledCommands, []);
   });
 
   test("audit log records no control token", async () => {

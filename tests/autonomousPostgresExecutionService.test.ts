@@ -127,6 +127,52 @@ test("an execution command with no ready PostgreSQL intent makes no broker call"
   assert.equal(brokerCalls, 0);
 });
 
+test("reviewed execution rejects a mismatched persisted review artifact", async () => {
+  const transaction = async <T>(operation: (query: {
+    query: (sql: string) => Promise<{ rows: Record<string, unknown>[]; rowCount: number }>;
+  }) => Promise<T>) => operation({
+    query: async (sql: string) => sql.includes("FROM order_intents intent")
+      ? {
+          rows: [intent({
+            review_signature: "persisted-signature",
+            payload_fingerprint: "persisted-payload"
+          }) as unknown as Record<string, unknown>],
+          rowCount: 1
+        }
+      : { rows: [], rowCount: 1 }
+  });
+
+  await assert.rejects(
+    runAutonomousPostgresExecutionCommand({
+      command: "paper:execute:reviewed",
+      query: { query: async () => ({ rows: [{ ready_count: "1" }], rowCount: 1 }) },
+      transaction,
+      marketOpen: async () => true,
+      captureBrokerSnapshot: async () => broker,
+      submitOrder: async () => { throw new Error("must not submit"); },
+      safety: {
+        environment: "paper",
+        tradingMode: "paper",
+        liveTradingEnabled: false,
+        paperOrderExecutionEnabled: true,
+        paperOptionsExecutionEnabled: true,
+        quoteMaxAgeSeconds: 60
+      },
+      confirmPaper: true,
+      expectedPayloadSignature: "different-signature",
+      fence: {
+        jobName: "paper-execution",
+        workstream: "paper_execution",
+        ownerId: "owner",
+        runId: "run",
+        fencingToken: "10"
+      },
+      now: new Date("2026-07-20T22:00:00.000Z")
+    }),
+    /PAPER_REVIEW_ARTIFACT_MISMATCH/
+  );
+});
+
 test("live flags block before querying PostgreSQL or Alpaca", async () => {
   const previous = process.env.LIVE_TRADING_ENABLED;
   process.env.LIVE_TRADING_ENABLED = "true";

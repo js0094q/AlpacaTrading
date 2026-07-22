@@ -77,7 +77,7 @@ persisted `cycle_completed` event before considering the worker restored.
   - Repo path on VPS: `/home/alpaca/Alpaca-Trading`
   - Runtime repo service: `alpaca-dashboard-control` (systemd) is active and bound to `127.0.0.1:4100`.
   - Health endpoint is reachable locally at `/api/v1/health` (paper-only checks enabled).
-  - `POST /api/v1/refresh` requires auth token, runs the read-only `paper:runtime` command, and does not run order execution or mutating safety prechecks.
+  - `POST /api/v1/refresh` requires the dashboard admin token and returns a fresh PostgreSQL-only dashboard snapshot without order execution.
 - Current hardening posture after rebuild:
   - SSH is key-only (`PasswordAuthentication no`, `KbdInteractiveAuthentication no`).
   - Root key recovery remains intentionally preserved (`PermitRootLogin without-password`) until explicitly disabled.
@@ -933,22 +933,20 @@ The `0DTE Level 2` panel adds the bounded live queue, active paper 0DTE position
 
 All dashboard state is served through the PostgreSQL-backed VPS bridge. No
 local, VPS, or Vercel dashboard route reads SQLite or returns an empty SQLite
-fallback. Bridge or PostgreSQL failure returns `503`.
+fallback. Bridge or PostgreSQL failure returns `503`. The VPS bridge exposes
+PostgreSQL-backed research, review, portfolio-review, options-discovery,
+learning, dry-run, and guarded paper-execution workflows through the existing
+admin-token and paper-only gates. `GET /api/v1/zero-dte/summary` reads the
+PostgreSQL candidate, option-market, position, and lifecycle state.
 
-The following dashboard actions remain visible but fail closed pending the
-evidence-utilization and runtime audit:
-
-- Run research
-- Build paper plan
-- Run paper review
-- Run dry-run execution
-- Submit to Alpaca Paper Account
-
-Every dashboard API route enforces `ALPACA_ENV=paper`, both live flags off, and
-PostgreSQL authority availability. Mutating control routes return
-`POSTGRES_ONLY_RUNTIME_PATH_DISABLED`; the autonomous worker remains stopped.
-Routes must not expose credentials, environment contents, connection strings,
-or secret-bearing errors.
+Every dashboard API route enforces PostgreSQL authority availability, and every
+guarded action enforces `ALPACA_ENV=paper`, `TRADING_MODE=paper`, both live flags
+off, and the existing `confirmPaper` plus reviewed-artifact requirements for
+execution. Blocked strategy decisions remain domain results rather than
+infrastructure failures. The dashboard health response derives autonomous
+worker state from persisted PostgreSQL lifecycle events. Routes must not expose
+credentials, environment contents, connection strings, or secret-bearing
+errors.
 
 ## Vercel Deployment
 

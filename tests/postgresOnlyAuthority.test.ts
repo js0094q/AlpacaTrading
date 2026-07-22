@@ -209,8 +209,11 @@ test("package scripts expose no SQLite migration, backfill, reconciliation, or m
 test("dashboard-control has no SQLite data module or database import", () => {
   const source = readFileSync("server/dashboard-control/server.ts", "utf8");
   assert.doesNotMatch(source, /node:sqlite|src\/lib\/db|apps\/dashboard\/lib\/data/);
-  assert.match(source, /POSTGRES_ONLY_RUNTIME_PATH_DISABLED/);
-  assert.match(source, /stopped_pending_audit/);
+  assert.doesNotMatch(source, /POSTGRES_ONLY_RUNTIME_PATH_DISABLED/);
+  assert.doesNotMatch(source, /stopped_pending_audit/);
+  assert.match(source, /readPostgresWorkerHealth/);
+  assert.match(source, /readPostgresZeroDteDashboardSummary/);
+  assert.match(source, /runPostgresScheduledCommand/);
 });
 
 test("autonomous and timer runners remain blocked pending the runtime audit", () => {

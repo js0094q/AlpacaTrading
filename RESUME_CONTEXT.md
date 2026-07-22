@@ -72,8 +72,14 @@ checkpoints.
 - Install, enable, and start `alpaca-autonomous-paper.service`; require a
   persisted `cycle_completed` lifecycle event for one complete 16-workstream cycle.
 - Keep all paper execution/review/research/observatory/0DTE timers disabled.
-- Dashboard reads require the PostgreSQL-backed VPS bridge and return `503`
-  when PostgreSQL or the passed authority baseline is unavailable.
+- Dashboard reads and guarded paper actions require the PostgreSQL-backed VPS
+  bridge and return `503` when PostgreSQL or the passed authority baseline is
+  unavailable. The bridge includes PostgreSQL-backed research, review,
+  portfolio-review, options-discovery, learning, dry-run, and reviewed paper
+  execution routes; `GET /api/v1/zero-dte/summary` is PostgreSQL-backed.
+- Dashboard health derives `autonomousWorker` from persisted PostgreSQL worker
+  lifecycle events. A blocked strategy decision is a valid domain result and
+  is not reported as infrastructure failure.
 - Production worker, research, review, reconciliation, execution, and market-data
   imports must remain isolated from SQLite.
 - Missing current option snapshots outside the option session and explicit

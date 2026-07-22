@@ -14,6 +14,13 @@ It runs all 16 workstreams through the PostgreSQL-only CLI and persists worker
 lifecycle evidence. Keep every legacy paper, research, observatory, and 0DTE
 timer disabled. Dashboard-control remains bound to `127.0.0.1:4100`.
 
+Dashboard-control reads and guarded paper actions use the PostgreSQL-only
+command and workflow services. `GET /api/v1/zero-dte/summary` reads current
+PostgreSQL candidates, option evidence, positions, and lifecycle events. The
+health route reports autonomous-worker state from persisted PostgreSQL lifecycle
+events; blocked strategy decisions remain blocked domain results. No dashboard
+route restores SQLite or a legacy runtime fallback.
+
 Before enabling the worker, run current SIP/OPRA market-data ingestion, verify
 the PostgreSQL market/feature/target/research rows, and reconcile against the
 Alpaca paper account. Missing or stale evidence is terminal for the workstream;

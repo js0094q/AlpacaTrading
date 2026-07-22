@@ -55,13 +55,23 @@ test("dashboard hedge route files expose GET only", () => {
   }
 });
 
-test("control hedge reads are retired instead of falling back to SQLite", () => {
+test("control hedge reads return PostgreSQL-only blocked results instead of falling back to SQLite", async () => {
   for (const path of [
     "/api/v1/hedge/risk",
     "/api/v1/hedge/regime",
     "/api/v1/hedge/recommendation"
   ]) {
-    assert.equal(serverModule.ACTION_HANDLERS[path], undefined);
+    assert.equal(serverModule.ACTION_HANDLERS[path]?.method, "GET");
+    const result = await serverModule.ACTION_HANDLERS[path]!.handler();
+    assert.deepEqual(result, {
+      paperOnly: true,
+      environment: "paper",
+      liveTradingEnabled: false,
+      status: "blocked",
+      code: "NO_POSTGRES_HEDGE_STATE",
+      blockers: ["NO_POSTGRES_HEDGE_STATE"],
+      mutationAttempted: false
+    });
   }
 });
 

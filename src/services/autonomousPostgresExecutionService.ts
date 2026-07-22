@@ -19,6 +19,8 @@ export type AutonomousExecutionIntentRow = {
   reservation_id: string | null;
   execution_review_id: string;
   confirmation_evidence_id: string;
+  review_signature?: string | null;
+  payload_fingerprint?: string | null;
   client_order_id: string;
   strategy_key: string;
   symbol: string;
@@ -188,7 +190,8 @@ const claimIntent = async (
   query: AutonomousExecutionQuery,
   command: string,
   fence: SchedulerFence,
-  now: Date
+  now: Date,
+  expectedPayloadSignature?: string
 ) => {
   const selected = await query.query(
     `SELECT intent.id AS order_intent_id, intent.account_id,
@@ -196,7 +199,8 @@ const claimIntent = async (
             snapshot.snapshot_fingerprint AS account_snapshot_fingerprint,
             review.account_fingerprint AS review_account_fingerprint,
             intent.reservation_id, intent.execution_review_id,
-            intent.confirmation_evidence_id, intent.client_order_id,
+            intent.confirmation_evidence_id, review.signature AS review_signature,
+            review.payload_fingerprint, intent.client_order_id,
             intent.strategy_key, intent.symbol, intent.asset_class,
             intent.side, intent.order_type, intent.time_in_force,
             intent.quantity::text AS quantity, intent.notional::text AS notional,
@@ -244,6 +248,13 @@ const claimIntent = async (
   );
   const intent = selected.rows[0] as AutonomousExecutionIntentRow | undefined;
   if (!intent) throw new Error("POSTGRES_EXECUTION_EVIDENCE_GATE_FAILED");
+  if (
+    expectedPayloadSignature &&
+    intent.review_signature !== expectedPayloadSignature &&
+    intent.payload_fingerprint !== expectedPayloadSignature
+  ) {
+    throw new Error("PAPER_REVIEW_ARTIFACT_MISMATCH");
+  }
   const claimed = await query.query(
     `UPDATE order_intents
      SET status = 'submission_pending', updated_at = $2, version = version + 1
@@ -433,6 +444,7 @@ export const runAutonomousPostgresExecutionCommand = async (input: {
   readonly fence: SchedulerFence;
   readonly safety: AutonomousExecutionSafety;
   readonly confirmPaper: boolean;
+  readonly expectedPayloadSignature?: string;
   readonly now?: Date;
 }) => {
   assertSafety(input.safety, input.confirmPaper);
@@ -467,7 +479,7 @@ export const runAutonomousPostgresExecutionCommand = async (input: {
   const now = input.now ?? new Date();
   const broker = await input.captureBrokerSnapshot();
   const intent = await input.transaction((query) =>
-    claimIntent(query, input.command, input.fence, now)
+    claimIntent(query, input.command, input.fence, now, input.expectedPayloadSignature)
   );
   let payload: AlpacaPaperOrderRequest;
   try {
