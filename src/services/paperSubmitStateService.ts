@@ -627,34 +627,6 @@ export const capturePaperSubmitState = async (
   const blockers = [...normalizedIntents.blockers];
   const warnings: string[] = [];
 
-  if (!normalizedIntents.intents.length) {
-    return {
-      version: "paper-submit-state-v1",
-      capturedAt: input.capturedAt,
-      accountIdentityHash: null,
-      accountState: emptyAccountState(),
-      configuration,
-      configurationFingerprint: canonicalJsonHash(configuration),
-      positions: [],
-      openOrders: [],
-      reservations: [],
-      marketEvidence: [],
-      payloadIntents: [],
-      structuralPortfolioFingerprint: canonicalJsonHash([]),
-      portfolioFingerprint: canonicalJsonHash([]),
-      marketEvidenceFingerprint: canonicalJsonHash([]),
-      zeroDteActivityEvidence: null,
-      allocationAttestation: {
-        mode: "baseline",
-        identity: "baseline-v1",
-        allocatorControlled: false
-      },
-      complete: true,
-      blockers: [],
-      warnings: []
-    };
-  }
-
   const [accountResult, positionsResult, ordersResult, marketResult] =
     await Promise.allSettled([
       (deps.getAccount ?? getAccount)(),

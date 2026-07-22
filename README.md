@@ -24,6 +24,11 @@ Repeated entry-review workstreams skip a candidate and account-snapshot identity
 that already has a persisted entry review, preserving the database client-order
 uniqueness contract across continuously refreshed market evidence.
 
+Execution-state projection refreshes `/v2/positions` directly at the PostgreSQL
+projection boundary. A successful empty array is authoritative; a failed or
+malformed position response fails closed, and no-intent state capture still
+refreshes current account and position evidence.
+
 Migration `003_market_data_authority.sql` adds PostgreSQL authority for the
 worker's universe symbols, market bars, SIP stock snapshots, OPRA option
 contracts and snapshots, feature and target snapshots, strategy snapshots, and

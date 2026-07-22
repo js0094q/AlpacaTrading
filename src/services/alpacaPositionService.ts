@@ -51,7 +51,10 @@ export const listAlpacaPositions = async (): Promise<{
 }> => {
   const response: AlpacaApiResponse<ApiPositionPayload[]> =
     await getAlpacaPaperEndpoint<ApiPositionPayload[]>("/v2/positions");
-  const payload = Array.isArray(response.data) ? response.data : [];
+  if (!Array.isArray(response.data)) {
+    throw new Error("BROKER_POSITION_RESPONSE_INVALID");
+  }
+  const payload = response.data;
   return {
     positions: payload.map(mapPosition),
     requestId: response.requestId

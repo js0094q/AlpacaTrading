@@ -52,6 +52,11 @@ The baseline must say:
 - `brokerMutationAttempted=false`
 - `ordersSubmitted=0`
 
+Execution-state freshness safeguard: the projection boundary reads the current
+Alpaca paper `/v2/positions` response directly, treats a successful empty array
+as authoritative, and fails closed on failed or malformed position evidence.
+No-intent paper state capture does not bypass the account/position refresh.
+
 Do not relabel or overwrite earlier blocked historical reconciliation
 checkpoints.
 

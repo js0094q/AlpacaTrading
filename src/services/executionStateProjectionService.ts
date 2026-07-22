@@ -21,6 +21,10 @@ import {
   type AlpacaApiResponse,
   type AlpacaSubmittedOrder
 } from "./alpacaClient.js";
+import {
+  listAlpacaPositions,
+  type AlpacaPositionSnapshot
+} from "./alpacaPositionService.js";
 import { canonicalizePostgresNumeric } from "../lib/database/postgresNumeric.js";
 import {
   currentControlPlaneRuntimeContext,
@@ -664,6 +668,59 @@ const reconciliationErrorCode = (error: unknown) => {
 const finite = (value: number | null) =>
   value !== null && Number.isFinite(value) ? value : 0;
 
+const refreshBrokerPositions = async (
+  state: PaperSubmitStateAttestation,
+  listCurrentPositions: typeof listAlpacaPositions
+): Promise<PaperSubmitStateAttestation> => {
+  const snapshot = await listCurrentPositions();
+  const positions = snapshot.positions.map((position: AlpacaPositionSnapshot) => {
+    const symbol = text(position.symbol)?.toUpperCase();
+    const assetClassValue = text(position.assetClass)?.toLowerCase();
+    const assetClass = assetClassValue?.includes("option")
+      ? "option" as const
+      : assetClassValue?.includes("equity")
+        ? "equity" as const
+        : null;
+    const brokerQuantity = numeric(position.qty);
+    const marketValue = numeric(position.marketValue);
+    const currentPrice = numeric(position.currentPrice);
+    if (!symbol || !assetClass || brokerQuantity === null || marketValue === null) {
+      throw new ExecutionStateProjectionError("EXECUTION_BROKER_POSITION_EVIDENCE_INVALID");
+    }
+    return {
+      symbol,
+      assetClass,
+      quantity: brokerQuantity,
+      marketValue,
+      currentPrice
+    };
+  });
+  const structuralState = {
+    accountIdentityHash: state.accountIdentityHash,
+    accountStatus: state.accountState.status,
+    accountBlocked: state.accountState.accountBlocked,
+    tradingBlocked: state.accountState.tradingBlocked,
+    positions: positions.map(({ symbol, assetClass: kind, quantity }) => ({
+      symbol,
+      assetClass: kind,
+      quantity
+    })),
+    openOrders: state.openOrders,
+    reservations: state.reservations
+  };
+  const portfolioState = {
+    ...structuralState,
+    accountState: state.accountState,
+    positions
+  };
+  return {
+    ...state,
+    positions,
+    structuralPortfolioFingerprint: canonicalJsonHash(structuralState),
+    portfolioFingerprint: canonicalJsonHash(portfolioState)
+  };
+};
+
 export const mapPaperSubmitStateToExecutionProjection = (
   state: PaperSubmitStateAttestation
 ): ExecutionAccountProjection => {
@@ -839,6 +896,7 @@ const postgresContext = (
 export interface ExecutionStateProjectionDependencies {
   readonly currentRuntime: () => ControlPlaneRuntimeContext | null;
   readonly repository: ExecutionStateRepository<PoolClient>;
+  readonly listCurrentPositions?: typeof listAlpacaPositions;
   readonly transaction: <T>(
     pool: Pool,
     config: DatabaseConfig,
@@ -850,6 +908,7 @@ export interface ExecutionStateProjectionDependencies {
 const defaultDependencies: ExecutionStateProjectionDependencies = {
   currentRuntime: currentControlPlaneRuntimeContext,
   repository: new PostgresExecutionStateRepository(),
+  listCurrentPositions: listAlpacaPositions,
   transaction: withPostgresTransaction,
   reportDiscrepancy: (code) => {
     process.stderr.write(`${JSON.stringify({ event: "execution_state_shadow_discrepancy", code })}\n`);
@@ -1057,9 +1116,25 @@ export const createExecutionStateProjectionService = (
     if (!state.accountIdentityHash && state.payloadIntents.length === 0) {
       return { status: "inactive" as const };
     }
+    let currentState = state;
+    if (dependencies.listCurrentPositions) {
+      try {
+        currentState = await refreshBrokerPositions(state, dependencies.listCurrentPositions);
+      } catch (error) {
+        const positionError = error instanceof ExecutionStateProjectionError
+          ? error
+          : new ExecutionStateProjectionError(
+              "EXECUTION_BROKER_POSITION_EVIDENCE_UNAVAILABLE",
+              error
+            );
+        if (runtime.config.features.executionStateAuthority) throw positionError;
+        dependencies.reportDiscrepancy(positionError.code);
+        return { status: "shadow_failed" as const };
+      }
+    }
     let projection: ExecutionAccountProjection;
     try {
-      projection = mapPaperSubmitStateToExecutionProjection(state);
+      projection = mapPaperSubmitStateToExecutionProjection(currentState);
     } catch (error) {
       if (runtime.config.features.executionStateAuthority) throw error;
       dependencies.reportDiscrepancy("EXECUTION_ACCOUNT_SOURCE_INCOMPLETE");
