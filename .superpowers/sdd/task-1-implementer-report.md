@@ -119,7 +119,7 @@ Results:
 - Typecheck: PASS.
 - Build: PASS.
 - `git diff --check`: PASS.
-- The gated PostgreSQL integration test was not enabled because the available connection configuration was not explicitly authorized as isolated test infrastructure; no production or external database was accessed.
+- The parent has completed the authorized isolated PostgreSQL validation; only production deployment and live worker-cycle validation remain pending.
 
 ## Integration setup follow-up
 
@@ -275,3 +275,13 @@ GREEN: 30 tests: 26 passed, 0 failed, 4 skipped
 ```
 
 Ordinary typecheck, build, and diff check also passed. No production access or deployment was performed.
+
+## Final isolated PostgreSQL validation
+
+The parent’s final isolated PostgreSQL rerun is fully GREEN:
+
+```text
+9/9 passed, 0 skipped, duration 30832.57ms
+```
+
+The run covered happy-path multi-reservation recovery, the two-session intent transition race, missing active allocation, and reserved-amount underflow. Only production deployment and live-cycle validation remain pending.
