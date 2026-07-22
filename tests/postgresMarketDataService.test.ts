@@ -32,10 +32,21 @@ const stockRaw = {
 
 const withEvidenceFingerprints = (
   rows: readonly unknown[]
-): Array<Record<string, unknown> & { evidenceFingerprint: string }> => rows.map((row) => ({
-  ...(row as Record<string, unknown>),
-  evidenceFingerprint: optionSnapshotEvidenceFingerprint(row as PostgresOptionSnapshot)
-}));
+): Array<Record<string, unknown> & { evidenceFingerprint: string }> => rows.map((value) => {
+  const row = value as PostgresOptionSnapshot;
+  return {
+    ...row,
+    // PostgreSQL stores the canonical enriched evidence document, then hydrates
+    // that document on readback rather than returning the provider-only input.
+    evidence: {
+      ...row.evidence,
+      optionSymbol: row.optionSymbol,
+      underlyingSymbol: row.underlyingSymbol,
+      observedAt: row.observedAt
+    },
+    evidenceFingerprint: optionSnapshotEvidenceFingerprint(row)
+  };
+});
 
 test("refresh persists genuine SIP and OPRA evidence in PostgreSQL", async () => {
   const calls: Record<string, unknown[][]> = {};

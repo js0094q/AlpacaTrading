@@ -144,7 +144,7 @@ const optionSnapshotPersistenceMaterial = (row: PostgresOptionSnapshot) => ({
   retrievedAt: row.retrievedAt ?? null,
   source: row.source,
   requestId: row.requestId,
-  evidence: row.evidence
+  evidenceFingerprint: row.evidenceFingerprint ?? optionSnapshotEvidenceFingerprint(row)
 });
 
 const contractRow = (
