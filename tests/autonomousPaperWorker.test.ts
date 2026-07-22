@@ -266,7 +266,9 @@ test("a PostgreSQL workstream failure preserves the exact safe dependency code",
 test("expected closed-market readiness conditions defer without stopping the worker", () => {
   for (const reasonCode of [
     "POSTGRES_OPTION_SNAPSHOTS_CURRENT_MISSING",
-    "POSTGRES_DECISION_MARKET_SESSION_INELIGIBLE"
+    "POSTGRES_DECISION_MARKET_SESSION_INELIGIBLE",
+    "NO_ELIGIBLE_POSTGRES_CANDIDATES",
+    "NO_READY_POSTGRES_ORDER_INTENTS"
   ]) {
     const { result, calls, states } = runWorker({
       failCommand: "research:daily",
