@@ -261,6 +261,7 @@ test("research preserves the workflow error when the first failure update times 
 
 test("research evidence is inserted in bounded batches", async () => {
   const sql: string[] = [];
+  let evidencePreparationYielded = false;
   const snapshots = Array.from({ length: 251 }, (_, index) => ({
     id: `stock-${index}`, symbol: `S${index}`, observedAt: bar.observedAt,
     sourceTimestamp: bar.observedAt, requestedFeed: "sip", effectiveFeed: "sip",
@@ -271,6 +272,7 @@ test("research evidence is inserted in bounded batches", async () => {
       query: async (statement: string, values?: readonly unknown[]) => {
         sql.push(statement);
         if (statement.includes("INSERT INTO research_runs")) return { rows: [{ version: "1" }], rowCount: 1 };
+        if (statement.startsWith("SELECT 1 WHERE")) assert.equal(evidencePreparationYielded, true);
         if (statement.includes("INSERT INTO research_evidence")) {
           return { rows: [], rowCount: JSON.parse(String(values?.[0])).length };
         }
@@ -281,7 +283,11 @@ test("research evidence is inserted in bounded batches", async () => {
     now: new Date("2026-07-20T22:00:00.000Z"),
     dependencies: {
       refreshMarketData: async () => ({ bars: [], stockSnapshots: snapshots, optionContracts: [], optionSnapshots: [], summary: {} }) as never,
-      buildFeaturesAndTargets: async () => ({ features: [], targets: [] }), symbols: ["SPY"]
+      buildFeaturesAndTargets: async () => {
+        setImmediate(() => { evidencePreparationYielded = true; });
+        return { features: [], targets: [] };
+      },
+      symbols: ["SPY"]
     }
   });
   assert.equal(result.status, "completed");

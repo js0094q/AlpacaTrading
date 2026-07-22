@@ -47,6 +47,23 @@ const defaults: MarketDataDependencies = {
   fetchOptionChainSnapshots
 };
 
+const COOPERATIVE_YIELD_BATCH_SIZE = 250;
+const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+const fingerprintMap = async <T>(
+  rows: readonly T[],
+  keyFor: (row: T) => string,
+  materialFor: (row: T) => unknown
+) => {
+  const result = new Map<string, string>();
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index]!;
+    result.set(keyFor(row), canonicalJsonHash(materialFor(row)));
+    if ((index + 1) % COOPERATIVE_YIELD_BATCH_SIZE === 0) await yieldToEventLoop();
+  }
+  return result;
+};
+
 const symbols = (values: readonly string[]) => Array.from(new Set(
   values.map((value) => value.trim().toUpperCase()).filter(Boolean)
 ));
@@ -528,24 +545,31 @@ export const refreshPostgresMarketData = async (input: {
     if (persistedSnapshots.length !== optionSnapshots.length) {
       throw new Error("POSTGRES_OPTION_SNAPSHOT_READBACK_INCOMPLETE");
     }
+    await yieldToEventLoop();
     const persistedSnapshotEvidenceFingerprints = new Map(persistedSnapshots.map((row) => [
       `${row.optionSymbol}:${row.observedAt}`,
       row.evidenceFingerprint ?? null
     ]));
-    if (optionSnapshots.some((row) =>
-      persistedSnapshotEvidenceFingerprints.get(`${row.optionSymbol}:${row.observedAt}`) !==
-      optionSnapshotEvidenceFingerprint(row)
-    )) {
-      throw new Error("POSTGRES_OPTION_SNAPSHOT_EVIDENCE_FINGERPRINT_MISMATCH");
+    for (let index = 0; index < optionSnapshots.length; index += 1) {
+      const row = optionSnapshots[index]!;
+      if (
+        persistedSnapshotEvidenceFingerprints.get(`${row.optionSymbol}:${row.observedAt}`) !==
+        optionSnapshotEvidenceFingerprint(row)
+      ) {
+        throw new Error("POSTGRES_OPTION_SNAPSHOT_EVIDENCE_FINGERPRINT_MISMATCH");
+      }
+      if ((index + 1) % COOPERATIVE_YIELD_BATCH_SIZE === 0) await yieldToEventLoop();
     }
-    const expectedContractsBySymbol = new Map(optionContracts.map((row) => [
-      row.optionSymbol,
-      canonicalJsonHash(optionContractPersistenceMaterial(row))
-    ]));
-    const actualContractsBySymbol = new Map(persistedContracts.map((row) => [
-      row.optionSymbol,
-      canonicalJsonHash(optionContractPersistenceMaterial(row))
-    ]));
+    const expectedContractsBySymbol = await fingerprintMap(
+      optionContracts,
+      (row) => row.optionSymbol,
+      optionContractPersistenceMaterial
+    );
+    const actualContractsBySymbol = await fingerprintMap(
+      persistedContracts,
+      (row) => row.optionSymbol,
+      optionContractPersistenceMaterial
+    );
     if (
       actualContractsBySymbol.size !== expectedContractsBySymbol.size ||
       [...expectedContractsBySymbol].some(([key, fingerprint]) =>
@@ -553,14 +577,16 @@ export const refreshPostgresMarketData = async (input: {
     ) {
       throw new Error("POSTGRES_OPTION_CONTRACT_READBACK_MISMATCH");
     }
-    const expectedSnapshotsByIdentity = new Map(optionSnapshots.map((row) => [
-      `${row.optionSymbol}:${row.observedAt}`,
-      canonicalJsonHash(optionSnapshotPersistenceMaterial(row))
-    ]));
-    const actualSnapshotsByIdentity = new Map(persistedSnapshots.map((row) => [
-      `${row.optionSymbol}:${row.observedAt}`,
-      canonicalJsonHash(optionSnapshotPersistenceMaterial(row))
-    ]));
+    const expectedSnapshotsByIdentity = await fingerprintMap(
+      optionSnapshots,
+      (row) => `${row.optionSymbol}:${row.observedAt}`,
+      optionSnapshotPersistenceMaterial
+    );
+    const actualSnapshotsByIdentity = await fingerprintMap(
+      persistedSnapshots,
+      (row) => `${row.optionSymbol}:${row.observedAt}`,
+      optionSnapshotPersistenceMaterial
+    );
     if (
       actualSnapshotsByIdentity.size !== expectedSnapshotsByIdentity.size ||
       [...expectedSnapshotsByIdentity].some(([key, fingerprint]) =>

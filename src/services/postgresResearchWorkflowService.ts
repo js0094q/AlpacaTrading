@@ -51,6 +51,17 @@ const fenceValues = (fence: SchedulerFence) => [
 ];
 
 const EVIDENCE_BATCH_SIZE = 250;
+const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+type ResearchEvidenceRow = {
+  type: string;
+  symbol: string;
+  observedAt: string;
+  table: string;
+  key: string;
+  fingerprint: string;
+  payload: unknown;
+};
 
 const failResearchRun = async (input: {
   query: PostgresResearchQuery;
@@ -180,21 +191,52 @@ const persistEvidence = async (input: {
       latestFeatures.set(feature.symbol, feature);
     }
   }
-  const rows = [
-    ...[...latestBars.values()].map((row) => ({ type: "market_bar", symbol: row.symbol, observedAt: row.observedAt, table: "market_bars", key: `${row.symbol}:${row.timeframe}:${row.observedAt}`, fingerprint: canonicalJsonHash(row), payload: row })),
-    ...input.market.stockSnapshots.map((row) => ({ type: "stock_snapshot", symbol: row.symbol, observedAt: row.sourceTimestamp ?? row.observedAt, table: "stock_snapshots", key: row.id, fingerprint: canonicalJsonHash(row.evidence), payload: row.evidence })),
-    ...input.market.optionSnapshots.map((row) => ({ type: "option_snapshot", symbol: row.underlyingSymbol, observedAt: row.quoteTimestamp ?? row.observedAt, table: "option_snapshots", key: `${row.optionSymbol}:${row.observedAt}`, fingerprint: canonicalJsonHash(row.evidence), payload: row.evidence })),
-    ...[...latestFeatures.values()].map((row) => ({ type: "feature_snapshot", symbol: row.symbol, observedAt: row.observedAt, table: "feature_snapshots", key: `${row.symbol}:${row.observedAt}`, fingerprint: row.sourceFingerprint, payload: row.features })),
-    ...input.targets.map((row) => ({ type: "target_snapshot", symbol: row.symbol, observedAt: row.asOf, table: "target_snapshots", key: `${row.symbol}:${row.asOf}:${row.riskProfile}`, fingerprint: row.sourceFingerprint, payload: row }))
-  ];
-  const unique = [...new Map(rows.map((row) => {
+  const rows: ResearchEvidenceRow[] = [...latestBars.values()].map((row) => ({
+    type: "market_bar", symbol: row.symbol, observedAt: row.observedAt,
+    table: "market_bars", key: `${row.symbol}:${row.timeframe}:${row.observedAt}`,
+    fingerprint: canonicalJsonHash(row), payload: row
+  }));
+  for (let index = 0; index < input.market.stockSnapshots.length; index += 1) {
+    const row = input.market.stockSnapshots[index]!;
+    rows.push({
+      type: "stock_snapshot", symbol: row.symbol,
+      observedAt: row.sourceTimestamp ?? row.observedAt, table: "stock_snapshots",
+      key: row.id, fingerprint: canonicalJsonHash(row.evidence), payload: row.evidence
+    });
+    if ((index + 1) % EVIDENCE_BATCH_SIZE === 0) await yieldToEventLoop();
+  }
+  for (let index = 0; index < input.market.optionSnapshots.length; index += 1) {
+    const row = input.market.optionSnapshots[index]!;
+    rows.push({
+      type: "option_snapshot", symbol: row.underlyingSymbol,
+      observedAt: row.quoteTimestamp ?? row.observedAt, table: "option_snapshots",
+      key: `${row.optionSymbol}:${row.observedAt}`,
+      fingerprint: canonicalJsonHash(row.evidence), payload: row.evidence
+    });
+    if ((index + 1) % EVIDENCE_BATCH_SIZE === 0) await yieldToEventLoop();
+  }
+  rows.push(...[...latestFeatures.values()].map((row) => ({
+    type: "feature_snapshot", symbol: row.symbol, observedAt: row.observedAt,
+    table: "feature_snapshots", key: `${row.symbol}:${row.observedAt}`,
+    fingerprint: row.sourceFingerprint, payload: row.features
+  })));
+  rows.push(...input.targets.map((row) => ({
+    type: "target_snapshot", symbol: row.symbol, observedAt: row.asOf,
+    table: "target_snapshots", key: `${row.symbol}:${row.asOf}:${row.riskProfile}`,
+    fingerprint: row.sourceFingerprint, payload: row
+  })));
+  const uniqueById = new Map<string, Record<string, unknown>>();
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index]!;
     const id = `research_evidence_${canonicalJsonHash({ run: input.researchRunId, type: row.type, key: row.key, fingerprint: row.fingerprint })}`;
-    return [id, {
+    uniqueById.set(id, {
       id, evidence_type: row.type, symbol: row.symbol, observed_at: row.observedAt,
       source_table: row.table, source_key: row.key, source_fingerprint: row.fingerprint,
       payload: row.payload
-    }];
-  })).values()];
+    });
+    if ((index + 1) % EVIDENCE_BATCH_SIZE === 0) await yieldToEventLoop();
+  }
+  const unique = [...uniqueById.values()];
   for (let offset = 0; offset < unique.length; offset += EVIDENCE_BATCH_SIZE) {
     const batch = unique.slice(offset, offset + EVIDENCE_BATCH_SIZE);
     const fence = await input.query.query(

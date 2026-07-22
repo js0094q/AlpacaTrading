@@ -140,8 +140,11 @@ const buildOptionFeaturesFixture = (input: {
 
 test("existing indicators and target thresholds persist genuine PostgreSQL features and targets", async () => {
   const stored: { features?: unknown[]; targets?: unknown[] } = {};
+  let heartbeatYielded = false;
+  setImmediate(() => { heartbeatYielded = true; });
   const repository = {
     upsertFeatureSnapshots: async (rows: unknown[]) => {
+      assert.equal(heartbeatYielded, true);
       stored.features = rows;
       return { stored: rows.length };
     },

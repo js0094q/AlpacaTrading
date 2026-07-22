@@ -84,6 +84,7 @@ const stockDecisionFeatures = (snapshot: PostgresStockSnapshot | null) => {
 
 const fingerprint = (value: unknown) => canonicalJsonHash(value);
 const EXISTING_NO_IV_VOLATILITY_MULTIPLIER = 1.2;
+const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 const OPTION_FIELD_CLASSIFICATIONS = {
   contractId: "audit_only",
@@ -759,6 +760,7 @@ export const buildPostgresFeaturesAndTargets = async (input: {
       contracts: input.optionsEnabled ? input.optionContracts : [],
       snapshots: input.optionsEnabled ? input.optionSnapshots : []
     }));
+    await yieldToEventLoop();
   }
   const features: PostgresFeatureSnapshot[] = calculated.map(({ optionCandidate: _candidate, ...feature }) => feature);
   const targets = Array.from(bySymbol.keys()).map((symbol) => {

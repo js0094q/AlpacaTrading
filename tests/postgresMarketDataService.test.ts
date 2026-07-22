@@ -50,6 +50,7 @@ const withEvidenceFingerprints = (
 
 test("refresh persists genuine SIP and OPRA evidence in PostgreSQL", async () => {
   const calls: Record<string, unknown[][]> = {};
+  let readbackYielded = false;
   const writer = Object.fromEntries([
     "upsertUniverseSymbols",
     "upsertBars",
@@ -63,7 +64,10 @@ test("refresh persists genuine SIP and OPRA evidence in PostgreSQL", async () =>
   const repository = {
     ...writer,
     listOptionContractsBySymbols: async () => calls.upsertOptionContracts?.[0] ?? [],
-    listOptionSnapshotsByIdentity: async () => withEvidenceFingerprints(calls.upsertOptionSnapshots?.[0] ?? [])
+    listOptionSnapshotsByIdentity: async () => {
+      setImmediate(() => { readbackYielded = true; });
+      return withEvidenceFingerprints(calls.upsertOptionSnapshots?.[0] ?? []);
+    }
   } as never;
 
   const result = await refreshPostgresMarketData({
@@ -140,6 +144,7 @@ test("refresh persists genuine SIP and OPRA evidence in PostgreSQL", async () =>
   assert.equal(calls.upsertBars?.[0]?.[0] && (calls.upsertBars[0][0] as { requestId: string }).requestId, "request-bars");
   assert.equal((calls.upsertStockSnapshots?.[0]?.[0] as { effectiveFeed: string }).effectiveFeed, "sip");
   assert.equal((calls.upsertOptionSnapshots?.[0]?.[0] as { midpoint: number }).midpoint, 1.25);
+  assert.equal(readbackYielded, true);
 });
 
 test("refresh fails closed when a required symbol has no current bars", async () => {
