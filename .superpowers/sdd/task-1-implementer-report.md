@@ -121,3 +121,25 @@ Results:
 - Build: PASS.
 - `git diff --check`: PASS.
 - The gated PostgreSQL integration test was not enabled because the available connection configuration was not explicitly authorized as isolated test infrastructure; no production or external database was accessed.
+
+## Integration setup follow-up
+
+The parent ran the gated PostgreSQL-only integration test against an isolated temporary VPS schema and supplied this real RED result before this fix:
+
+```text
+4 passed, integration test failed before recovery
+PostgreSQL 42601: cannot insert multiple commands into a prepared statement
+```
+
+The failure occurred at the setup query around test line 202, where parameterized account, snapshot, scheduler lease, and allocation inserts were combined with semicolon separators. The setup now executes those four inserts as separate parameterized `schemaPool.query` calls. Recovery logic and all existing seed/assertion scope are unchanged.
+
+Follow-up local validation after splitting the setup statements:
+
+```text
+npx tsx --test tests/postgresReviewWorkflowService.test.ts tests/autonomousPostgresCommandService.test.ts
+npm run typecheck
+npm run build
+git diff --check
+```
+
+The integration gate remained disabled locally; no database was accessed in this follow-up.

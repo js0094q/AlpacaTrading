@@ -201,28 +201,37 @@ test("PostgreSQL recovery persists SHA-256 cancellation audit rows in an isolate
     await runPostgresMigrations(schemaPool, config);
     await schemaPool.query(
       `INSERT INTO accounts(id, broker_account_id, environment, status, created_at, updated_at)
-       VALUES ('account-recovery-test', 'broker-recovery-test', 'paper', 'active', $1, $1);
-       INSERT INTO account_snapshots(
+       VALUES ('account-recovery-test', 'broker-recovery-test', 'paper', 'active', $1, $1)`,
+      [createdAt]
+    );
+    await schemaPool.query(
+      `INSERT INTO account_snapshots(
          id, account_id, observed_at, account_status, cash, portfolio_value,
          equity, buying_power, snapshot_fingerprint, created_at
        ) VALUES (
          'snapshot-recovery-test', 'account-recovery-test', $1, 'active',
          1000, 1000, 1000, 1000, 'snapshot-fingerprint', $1
-       );
-       INSERT INTO scheduler_leases(
+       )`,
+      [createdAt]
+    );
+    await schemaPool.query(
+      `INSERT INTO scheduler_leases(
          job_name, workstream, owner_id, run_id, fencing_token, status,
          acquired_at, heartbeat_at, expires_at, created_at, updated_at
        ) VALUES ('autonomous-recovery', 'autonomous_recovery', 'integration-owner',
-         'integration-run', 77, 'held', $1, $1, $2, $1, $1);
-       INSERT INTO strategy_allocations(
+         'integration-run', 77, 'held', $1, $1, $2, $1, $1)`,
+      [createdAt, liveExpiry]
+    );
+    await schemaPool.query(
+      `INSERT INTO strategy_allocations(
          id, account_id, strategy_key, status, allocation_amount, reserved_amount,
          deployed_amount, config_version, config_fingerprint, effective_from,
          created_at, updated_at
        ) VALUES (
          'allocation-recovery-test', 'account-recovery-test', 'baseline', 'active',
          1000, 50, 125, 'test-v1', 'allocation-fingerprint', $1, $1, $1
-       );`,
-      [createdAt, liveExpiry]
+       )`,
+      [createdAt]
     );
 
     const insertReservation = async (id: string, amount: number, expiresAt: string) => {
