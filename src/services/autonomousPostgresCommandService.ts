@@ -147,10 +147,29 @@ const recover = async (
     values
   );
   const reservations = await query.query(
-    `UPDATE buying_power_reservations
-     SET status = 'expired', released_at = $1, release_reason = 'expired',
-         updated_at = $1, version = version + 1
-     WHERE status = 'active' AND expires_at <= $1 AND ${fenceSql}`,
+    `WITH expired AS (
+       UPDATE buying_power_reservations reservation
+       SET status = 'expired', released_at = $1, release_reason = 'expired',
+           updated_at = $1, version = version + 1
+       WHERE reservation.status = 'active' AND reservation.expires_at <= $1
+         AND ${fenceSql}
+       RETURNING reservation.account_id, reservation.strategy_key, reservation.amount
+     ), totals AS (
+       SELECT account_id, strategy_key, SUM(amount) AS amount
+       FROM expired
+       GROUP BY account_id, strategy_key
+     ), allocation_updates AS (
+       UPDATE strategy_allocations allocation
+       SET reserved_amount = GREATEST(0, allocation.reserved_amount - totals.amount),
+           version = allocation.version + 1, updated_at = $1
+       FROM totals
+       WHERE allocation.account_id = totals.account_id
+         AND allocation.strategy_key = totals.strategy_key
+         AND allocation.status = 'active' AND allocation.effective_to IS NULL
+         AND ${fenceSql}
+       RETURNING allocation.id
+     )
+     SELECT account_id, strategy_key, amount FROM expired`,
     values
   );
   const reviews = await query.query(
@@ -165,11 +184,24 @@ const recover = async (
      WHERE status = 'valid' AND expires_at <= $1 AND ${fenceSql}`,
     values
   );
+  const intents = await query.query(
+    `UPDATE order_intents intent
+     SET status = 'cancelled', terminal_at = $1, updated_at = $1,
+         version = intent.version + 1,
+         lifecycle_fingerprint = md5(intent.lifecycle_fingerprint || ':cancelled:' || $1::text)
+     FROM execution_reviews review
+     WHERE intent.execution_review_id = review.id
+       AND intent.status = 'created'
+       AND (review.status IN ('expired', 'revoked', 'blocked') OR review.expires_at <= $1)
+       AND ${fenceSql}`,
+    values
+  );
   return {
     researchRuns: researchRuns.rowCount ?? 0,
     reservations: reservations.rowCount ?? 0,
     reviews: reviews.rowCount ?? 0,
-    confirmations: confirmations.rowCount ?? 0
+    confirmations: confirmations.rowCount ?? 0,
+    intents: intents.rowCount ?? 0
   };
 };
 

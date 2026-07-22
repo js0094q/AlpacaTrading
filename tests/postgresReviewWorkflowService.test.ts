@@ -211,6 +211,33 @@ test("option capacity failure is detected before a preceding valid candidate is 
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO order_intents")), false);
 });
 
+test("exhausted allocation capacity is a successful row-level no-op", async () => {
+  const sql: string[] = [];
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string) => {
+        sql.push(statement);
+        if (statement.includes("FROM candidates candidate")) {
+          return { rows: [{ ...candidate, reserved_amount: "5000" }], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.status, "completed");
+  assert.equal(result.code, "POSTGRES_REVIEW_CAPACITY_UNAVAILABLE");
+  assert.equal(result.reviewsCreated, 0);
+  assert.equal(result.pendingIntentsCreated, 0);
+  assert.equal(result.capacityBlocked, 1);
+  assert.equal(sql.some((statement) => statement.includes("INSERT INTO execution_reviews")), false);
+  assert.equal(sql.some((statement) => statement.includes("INSERT INTO order_intents")), false);
+});
+
 test("exit review evaluates existing thresholds against PostgreSQL position and market evidence", async () => {
   const sql: string[] = [];
   const result = await runPostgresReviewWorkflow({

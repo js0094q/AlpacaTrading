@@ -77,6 +77,7 @@ test("system recovery performs bounded fenced PostgreSQL recovery before evaluat
       if (sql.includes("UPDATE buying_power_reservations")) return { rows: [], rowCount: 2 };
       if (sql.includes("UPDATE execution_reviews")) return { rows: [], rowCount: 3 };
       if (sql.includes("UPDATE confirmation_evidence")) return { rows: [], rowCount: 4 };
+      if (sql.includes("UPDATE order_intents")) return { rows: [], rowCount: 5 };
       return { rows: [completeEvidence], rowCount: 1 };
     }
   };
@@ -97,8 +98,52 @@ test("system recovery performs bounded fenced PostgreSQL recovery before evaluat
     researchRuns: 1,
     reservations: 2,
     reviews: 3,
-    confirmations: 4
+    confirmations: 4,
+    intents: 5
   });
-  assert.equal(calls.length, 5);
-  for (const sql of calls.slice(0, 4)) assert.match(sql, /scheduler_leases/);
+  assert.equal(calls.length, 6);
+  for (const sql of calls.slice(0, 5)) assert.match(sql, /scheduler_leases/);
+});
+
+test("system recovery cancels only provably stale created intents and fences allocation release", async () => {
+  const calls: string[] = [];
+  const query: AutonomousPostgresQueryExecutor = {
+    query: async (sql: string) => {
+      calls.push(sql);
+      if (sql.includes("UPDATE research_runs")) return { rows: [], rowCount: 0 };
+      if (sql.includes("UPDATE buying_power_reservations")) return { rows: [], rowCount: 2 };
+      if (sql.includes("UPDATE execution_reviews")) return { rows: [], rowCount: 0 };
+      if (sql.includes("UPDATE confirmation_evidence")) return { rows: [], rowCount: 0 };
+      if (sql.includes("UPDATE order_intents")) return { rows: [], rowCount: 3 };
+      return { rows: [completeEvidence], rowCount: 1 };
+    }
+  };
+
+  const result = await runAutonomousPostgresCommand({
+    command: "system:recover",
+    query,
+    fence: {
+      jobName: "autonomous-recovery",
+      workstream: "autonomous_recovery",
+      ownerId: "owner",
+      runId: "run",
+      fencingToken: "10"
+    },
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  const reservationSql = calls.find((sql) => sql.includes("UPDATE buying_power_reservations"));
+  const intentSql = calls.find((sql) => sql.includes("UPDATE order_intents"));
+  assert.equal(result.recovery?.intents, 3);
+  assert.match(reservationSql ?? "", /UPDATE strategy_allocations/);
+  assert.match(reservationSql ?? "", /reserved_amount = GREATEST\(0, allocation\.reserved_amount - totals\.amount\)/);
+  assert.match(reservationSql ?? "", /scheduler_leases/);
+  assert.match(intentSql ?? "", /intent\.status = 'created'/);
+  assert.match(intentSql ?? "", /review\.status IN \('expired', 'revoked', 'blocked'\)/);
+  assert.match(intentSql ?? "", /review\.expires_at <= \$1/);
+  assert.match(intentSql ?? "", /status = 'cancelled'/);
+  assert.match(intentSql ?? "", /terminal_at = \$1/);
+  assert.match(intentSql ?? "", /version = intent\.version \+ 1/);
+  assert.match(intentSql ?? "", /lifecycle_fingerprint/);
+  assert.match(intentSql ?? "", /scheduler_leases/);
 });

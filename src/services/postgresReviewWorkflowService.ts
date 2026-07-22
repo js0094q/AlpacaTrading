@@ -274,7 +274,7 @@ const runExitReview = async (input: {
     return reason ? [{ row, price, quantity, timestamp, option, reason, directionalReturn }] : [];
   });
   if (!eligible.length) {
-    return { status: "no_op" as const, code: "NO_POSTGRES_EXIT_TRIGGER", reviewsCreated: 0, pendingIntentsCreated: 0 };
+    return { status: "no_op" as const, code: "NO_POSTGRES_EXIT_TRIGGER", reviewsCreated: 0, pendingIntentsCreated: 0, capacityBlocked: 0 };
   }
   let created = 0;
   for (const item of eligible) {
@@ -360,11 +360,11 @@ const runExitReview = async (input: {
   }
   return {
     status: "completed" as const, command: input.command, reviewsCreated: created,
-    pendingIntentsCreated: created, skipped: 0, confirmationCreated: false, paperOnly: true
+    pendingIntentsCreated: created, skipped: 0, capacityBlocked: 0, confirmationCreated: false, paperOnly: true
   };
 };
 
-const sizing = (row: ReviewSourceRow) => {
+const sizing = (row: ReviewSourceRow): number | null => {
   const buyingPower = finite(row.buying_power);
   const cash = finite(row.cash);
   const equity = finite(row.equity);
@@ -389,7 +389,7 @@ const sizing = (row: ReviewSourceRow) => {
     positiveOrInfinity(row.max_symbol_notional),
     positiveOrInfinity(row.max_deployment_amount)
   ) * 100) / 100;
-  if (!Number.isFinite(amount) || amount <= 0) throw new Error(`POSTGRES_REVIEW_CAPACITY_UNAVAILABLE:${row.symbol}`);
+  if (!Number.isFinite(amount) || amount <= 0) return null;
   return amount;
 };
 
@@ -404,7 +404,7 @@ export const runPostgresReviewWorkflow = async (input: {
   dte?: number;
 }) => {
   if (!ENTRY_REVIEW_COMMANDS.has(input.command) && !EXIT_REVIEW_COMMANDS.has(input.command)) {
-    return { status: "no_op" as const, code: "NO_POSTGRES_REVIEW_SCOPE", reviewsCreated: 0, pendingIntentsCreated: 0 };
+    return { status: "no_op" as const, code: "NO_POSTGRES_REVIEW_SCOPE", reviewsCreated: 0, pendingIntentsCreated: 0, capacityBlocked: 0 };
   }
   const signingKey = input.signingKey ?? process.env.PAPER_REVIEW_SIGNING_KEY?.trim();
   if (!signingKey || signingKey.length < 16) throw new Error("PAPER_REVIEW_SIGNING_KEY_REQUIRED");
@@ -432,12 +432,13 @@ export const runPostgresReviewWorkflow = async (input: {
   }
   const rows = (await input.query.query(entrySourceSql(input.command), sourceValues)).rows as ReviewSourceRow[];
   if (!rows.length) {
-    return { status: "no_op" as const, code: "NO_ELIGIBLE_POSTGRES_CANDIDATES", reviewsCreated: 0, pendingIntentsCreated: 0 };
+    return { status: "no_op" as const, code: "NO_ELIGIBLE_POSTGRES_CANDIDATES", reviewsCreated: 0, pendingIntentsCreated: 0, capacityBlocked: 0 };
   }
   // Classify already-held / already-ordered candidates as row-level skips. Validate
   // every remaining row before writing anything so stale or incomplete evidence
   // still fails closed for the entire review batch.
   let skipped = 0;
+  let capacityBlocked = 0;
   const eligibleRows: ReviewSourceRow[] = [];
   for (const row of rows) {
     if (!row.structural_fingerprint || !row.snapshot_fingerprint) {
@@ -456,6 +457,10 @@ export const runPostgresReviewWorkflow = async (input: {
     const price = finite(row.market_price);
     if (price === null || price <= 0) throw new Error(`POSTGRES_REVIEW_MARKET_PRICE_MISSING:${row.symbol}`);
     const amount = sizing(row);
+    if (amount === null) {
+      capacityBlocked += 1;
+      continue;
+    }
     if (row.asset_class === "option" && !Math.floor(amount / (price * 100))) {
       throw new Error(`POSTGRES_REVIEW_OPTION_CAPACITY_INSUFFICIENT:${row.symbol}`);
     }
@@ -464,7 +469,9 @@ export const runPostgresReviewWorkflow = async (input: {
   if (!eligibleRows.length) {
     return {
       status: "completed" as const, command: input.command, reviewsCreated: 0,
-      pendingIntentsCreated: 0, skipped, confirmationCreated: false, paperOnly: true
+      pendingIntentsCreated: 0, skipped, capacityBlocked,
+      ...(capacityBlocked > 0 ? { code: "POSTGRES_REVIEW_CAPACITY_UNAVAILABLE" } : {}),
+      confirmationCreated: false, paperOnly: true
     };
   }
   let created = 0;
@@ -478,6 +485,7 @@ export const runPostgresReviewWorkflow = async (input: {
     const price = finite(row.market_price);
     if (price === null || price <= 0) throw new Error(`POSTGRES_REVIEW_MARKET_PRICE_MISSING:${row.symbol}`);
     const amount = sizing(row);
+    if (amount === null) continue;
     const option = row.asset_class === "option";
     const quantity = option ? Math.floor(amount / (price * 100)) : null;
     if (option && (!quantity || quantity <= 0)) throw new Error(`POSTGRES_REVIEW_OPTION_CAPACITY_INSUFFICIENT:${row.symbol}`);
@@ -577,6 +585,7 @@ export const runPostgresReviewWorkflow = async (input: {
     reviewsCreated: created,
     pendingIntentsCreated: created,
     skipped,
+    capacityBlocked,
     confirmationCreated: false,
     paperOnly: true
   };
