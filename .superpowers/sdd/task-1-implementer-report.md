@@ -75,3 +75,49 @@ Results:
 
 - The focused tests validate generated SQL and mocked row counts; no PostgreSQL integration execution was run, per the task boundary prohibiting production/database access. The CTE should be exercised by the existing PostgreSQL-only recovery path after deployment.
 - Production validation and worker-cycle observation remain pending deployment by the parent workflow. No deployment was performed here.
+
+## Follow-up reviewer fixes
+
+The independent review identified two Important issues, both fixed in the follow-up commit.
+
+### SHA-256 lifecycle contract and audit
+
+- Replaced the recovery-time `md5` expression with PostgreSQL `encode(sha256(convert_to(..., 'UTF8')), 'hex')`.
+- The hashed input contains the intent id, prior lifecycle fingerprint, cancelled stage, and recovery timestamp.
+- Recovery now uses a fenced data-modifying CTE to insert one `lifecycle_fingerprints` row per cancelled intent with `order_intent` / `cancelled` identity, SHA-256 algorithm, payload version 1, linked review status and expiry, recovery reason, and recovery timestamps.
+- The final `SELECT` explicitly joins the fingerprint-insert CTE and therefore preserves rowCount equal to cancelled intents.
+- Exported only the narrow `runAutonomousPostgresRecovery` helper for isolated PostgreSQL integration coverage; command result semantics are unchanged except for the existing recovered-intent count.
+
+### PostgreSQL-only integration evidence
+
+Added an environment-gated test in `tests/autonomousPostgresCommandService.test.ts`. It imports only PostgreSQL configuration, pool, migration, and recovery modules; it does not import or initialize SQLite. When enabled, it creates a random temporary schema, runs the actual migrations and recovery helper, seeds the held scheduler fence, allocation, expired/live reservations, terminal/current reviews, stale/current intents, and ready-for-submission intent, then drops the schema in `finally`.
+
+## Follow-up RED evidence
+
+After tightening the existing SQL regression assertions to require the SHA-256 expression and lifecycle audit CTE, before the reviewer fix:
+
+```text
+npx tsx --test tests/postgresReviewWorkflowService.test.ts tests/autonomousPostgresCommandService.test.ts
+13 tests: 12 passed, 1 failed
+```
+
+The failure showed the old recovery SQL still used `md5` and had no `lifecycle_fingerprints` insert.
+
+## Follow-up GREEN evidence
+
+Commands run after the reviewer fixes:
+
+```text
+npx tsx --test tests/postgresReviewWorkflowService.test.ts tests/autonomousPostgresCommandService.test.ts
+npm run typecheck
+npm run build
+git diff --check
+```
+
+Results:
+
+- Ordinary focused tests: PASS, 13 passed and 1 integration test skipped because `POSTGRES_INTEGRATION_TEST_ENABLED` was unset.
+- Typecheck: PASS.
+- Build: PASS.
+- `git diff --check`: PASS.
+- The gated PostgreSQL integration test was not enabled because the available connection configuration was not explicitly authorized as isolated test infrastructure; no production or external database was accessed.

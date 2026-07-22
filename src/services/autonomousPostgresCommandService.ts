@@ -116,7 +116,7 @@ const requireAuthorityEvidence = (row: EvidenceRow | undefined) => {
   }
 };
 
-const recover = async (
+export const runAutonomousPostgresRecovery = async (
   query: AutonomousPostgresQueryExecutor,
   fence: SchedulerFence,
   now: Date
@@ -185,15 +185,48 @@ const recover = async (
     values
   );
   const intents = await query.query(
-    `UPDATE order_intents intent
-     SET status = 'cancelled', terminal_at = $1, updated_at = $1,
-         version = intent.version + 1,
-         lifecycle_fingerprint = md5(intent.lifecycle_fingerprint || ':cancelled:' || $1::text)
-     FROM execution_reviews review
-     WHERE intent.execution_review_id = review.id
-       AND intent.status = 'created'
-       AND (review.status IN ('expired', 'revoked', 'blocked') OR review.expires_at <= $1)
-       AND ${fenceSql}`,
+    `WITH stale AS (
+       SELECT intent.id
+       FROM order_intents intent
+       JOIN execution_reviews review ON review.id = intent.execution_review_id
+       WHERE intent.status = 'created'
+         AND (review.status IN ('expired', 'revoked', 'blocked') OR review.expires_at <= $1)
+         AND ${fenceSql}
+     ), cancelled AS (
+       UPDATE order_intents intent
+       SET status = 'cancelled', terminal_at = $1, updated_at = $1,
+           version = intent.version + 1,
+           lifecycle_fingerprint = encode(sha256(convert_to(
+             concat_ws('|', intent.id, intent.lifecycle_fingerprint, 'cancelled', $1::text),
+             'UTF8'
+           )), 'hex')
+       WHERE intent.id IN (SELECT stale.id FROM stale)
+         AND ${fenceSql}
+       RETURNING intent.id, intent.account_id, intent.execution_review_id,
+                 intent.lifecycle_fingerprint
+     ), fingerprints AS (
+       INSERT INTO lifecycle_fingerprints(
+         id, account_id, order_intent_id, entity_type, entity_id,
+         lifecycle_stage, fingerprint, algorithm, payload_version, evidence,
+         captured_at, created_at
+       )
+       SELECT 'recovery_order_intent_cancelled:' || cancelled.id,
+              cancelled.account_id, cancelled.id, 'order_intent', cancelled.id,
+              'cancelled', cancelled.lifecycle_fingerprint, 'sha256', 1,
+              jsonb_build_object(
+                'executionReviewId', review.id,
+                'reviewStatus', review.status,
+                'reviewExpiresAt', review.expires_at,
+                'recoveryReason', 'STALE_CREATED_INTENT_RECOVERY'
+              ),
+              $1, $1
+       FROM cancelled
+       JOIN execution_reviews review ON review.id = cancelled.execution_review_id
+       RETURNING order_intent_id
+     )
+     SELECT cancelled.id
+     FROM cancelled
+     JOIN fingerprints ON fingerprints.order_intent_id = cancelled.id`,
     values
   );
   return {
@@ -216,7 +249,7 @@ export const runAutonomousPostgresCommand = async (input: {
   }
   const now = input.now ?? new Date();
   const recovery = input.command === "system:recover"
-    ? await recover(input.query, input.fence, now)
+    ? await runAutonomousPostgresRecovery(input.query, input.fence, now)
     : undefined;
   const evidenceResult = await input.query.query(inspectionSql);
   const row = evidenceResult.rows[0] as EvidenceRow | undefined;
