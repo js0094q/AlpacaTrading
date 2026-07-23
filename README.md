@@ -31,6 +31,15 @@ run in separate process groups so timeout and worker-shutdown handling can send
 The worker emits `workstream_timeout` and `worker_stopping` events without
 changing research, market-data, review, or execution eligibility.
 
+OPRA snapshot persistence commits symbol-scoped batches of at most 250 rows and
+immediately reads each exact identity back before the next batch begins. Each
+batch emits committed/readback counts, insert/update counts, query and pool
+timing, and scheduler-fence telemetry; count or evidence mismatches fail with an
+explicit batch and symbol diagnostic. The first production readback also emits
+an `EXPLAIN ANALYZE` summary with planner time, execution time, returned rows,
+and index usage. Downstream `research_evidence` inserts retain every evidence
+row while bounding each serialized PostgreSQL payload to 250 rows and 4 MB.
+
 ## Paper exploration profile (2026-07-23)
 
 The autonomous PostgreSQL path uses a reversible paper-only exploration profile.

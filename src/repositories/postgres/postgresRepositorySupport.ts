@@ -66,9 +66,17 @@ export const requireCurrentFence = async (
     owner_id: string;
     run_id: string;
     current: boolean;
+    heartbeat_at: Date | string | null;
+    expires_at: Date | string | null;
+    remaining_lease_ms: string | number | null;
   }>(
     `SELECT fencing_token, workstream, owner_id, run_id,
-            status = 'held' AND expires_at > now() AS current
+            status = 'held' AND expires_at > now() AS current,
+            heartbeat_at, expires_at,
+            GREATEST(
+              0,
+              floor(extract(epoch FROM (expires_at - clock_timestamp())) * 1000)
+            )::bigint AS remaining_lease_ms
      FROM scheduler_leases
      WHERE job_name = $1
      FOR UPDATE`,
@@ -84,9 +92,23 @@ export const requireCurrentFence = async (
   );
   if (!accepted) {
     const current = row?.current ? row.fencing_token : null;
-    return { accepted: false as const, currentFencingToken: current };
+    return {
+      accepted: false as const,
+      currentFencingToken: current,
+      leaseOwner: row?.owner_id ?? null,
+      heartbeatAt: asIsoString(row?.heartbeat_at),
+      expiresAt: asIsoString(row?.expires_at),
+      remainingLeaseMs: asNumber(row?.remaining_lease_ms)
+    };
   }
-  return { accepted: true as const, currentFencingToken: row.fencing_token };
+  return {
+    accepted: true as const,
+    currentFencingToken: row.fencing_token,
+    leaseOwner: row.owner_id,
+    heartbeatAt: asIsoString(row.heartbeat_at),
+    expiresAt: asIsoString(row.expires_at),
+    remainingLeaseMs: asNumber(row.remaining_lease_ms)
+  };
 };
 
 export const fencePredicate = (startIndex: number) => `EXISTS (

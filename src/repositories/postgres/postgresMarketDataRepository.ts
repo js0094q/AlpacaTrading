@@ -1,4 +1,8 @@
 import type { JsonValue } from "../contracts/common.js";
+import {
+  postgresErrorTelemetry,
+  readPostgresQueryTelemetry
+} from "../../lib/database/postgresTelemetry.js";
 import type { FencedPostgresRepositoryContext } from "./postgresRepositorySupport.js";
 import {
   canonicalJson,
@@ -199,6 +203,15 @@ type PostgresOptionSnapshotRow = {
   updated_at: Date | string;
 };
 
+type PostgresOptionSnapshotWriteRow = {
+  inserted: boolean;
+};
+
+type MarketDataTelemetryContext = FencedPostgresRepositoryContext & {
+  emitTelemetry?: (event: Record<string, unknown>) => void;
+  profileOptionReadbackQuery?: boolean;
+};
+
 const normalizedSymbol = (value: string) => value.trim().toUpperCase();
 const iso = (value: string) => new Date(value).toISOString();
 const json = (value: unknown) => canonicalJson(parseJsonValue(value));
@@ -215,6 +228,122 @@ const nullableNumber = (value: unknown) => {
 };
 const nullableString = (value: unknown) =>
   typeof value === "string" && value.trim() ? value.trim() : null;
+
+const emitTelemetry = (
+  context: FencedPostgresRepositoryContext,
+  event: Record<string, unknown>
+) => {
+  (context as MarketDataTelemetryContext).emitTelemetry?.(event);
+};
+
+const optionSnapshotFromRow = (
+  row: PostgresOptionSnapshotRow
+): PostgresOptionSnapshot => {
+  const evidence = record(row.evidence);
+  const freshnessStatus = evidence.freshnessStatus === "fresh" ? "fresh" : "stale";
+  return {
+    optionSymbol: row.option_symbol,
+    underlyingSymbol: row.underlying_symbol,
+    observedAt: new Date(row.observed_at).toISOString(),
+    quoteTimestamp: row.quote_timestamp ? new Date(row.quote_timestamp).toISOString() : null,
+    tradeTimestamp: row.trade_timestamp ? new Date(row.trade_timestamp).toISOString() : null,
+    snapshotTimestamp: row.snapshot_timestamp ? new Date(row.snapshot_timestamp).toISOString() : null,
+    underlyingPrice: nullableNumber(evidence.underlyingPrice),
+    bid: nullableNumber(row.bid),
+    ask: nullableNumber(row.ask),
+    bidSize: nullableNumber(evidence.bidSize),
+    askSize: nullableNumber(evidence.askSize),
+    midpoint: nullableNumber(row.midpoint),
+    spread: nullableNumber(evidence.spread),
+    spreadPct: nullableNumber(evidence.spreadPct),
+    last: nullableNumber(row.last),
+    volume: nullableNumber(row.volume),
+    openInterest: nullableNumber(row.open_interest),
+    impliedVolatility: nullableNumber(row.implied_volatility),
+    delta: nullableNumber(row.delta),
+    gamma: nullableNumber(row.gamma),
+    theta: nullableNumber(row.theta),
+    vega: nullableNumber(row.vega),
+    rho: nullableNumber(row.rho),
+    freshnessStatus,
+    requestedFeed: nullableString(evidence.requestedFeed) ?? undefined,
+    effectiveFeed: nullableString(evidence.effectiveFeed) ?? undefined,
+    validationBasis: evidence.validationBasis === "request_feed_opra"
+      ? "request_feed_opra"
+      : null,
+    endpoint: nullableString(evidence.endpoint) ?? undefined,
+    pageToken: nullableString(evidence.pageToken),
+    retrievedAt: nullableString(evidence.retrievedAt) ?? undefined,
+    persistedAt: new Date(row.updated_at).toISOString(),
+    evidenceFingerprint: row.evidence_fingerprint,
+    source: row.source,
+    requestId: row.request_id,
+    evidence
+  };
+};
+
+const OPTION_SNAPSHOT_READBACK_SQL = `SELECT option_symbol, underlying_symbol, observed_at, quote_timestamp,
+       trade_timestamp, snapshot_timestamp, bid, ask, midpoint, last,
+       volume, open_interest, implied_volatility, delta, gamma, theta,
+       vega, rho, source, request_id, evidence, evidence_fingerprint,
+       updated_at
+FROM option_snapshots
+WHERE (option_symbol, observed_at) IN (
+  SELECT * FROM unnest($1::text[], $2::timestamptz[])
+)
+ORDER BY underlying_symbol, option_symbol, observed_at`;
+
+const OPTION_SNAPSHOT_UPSERT_SQL = `INSERT INTO option_snapshots(
+  option_symbol, underlying_symbol, observed_at, quote_timestamp, trade_timestamp,
+  snapshot_timestamp, bid, ask, midpoint, last, volume, open_interest,
+  implied_volatility, delta, gamma, theta, vega, rho, source, request_id,
+  evidence, evidence_fingerprint, created_at, updated_at
+) SELECT r.option_symbol, r.underlying_symbol, r.observed_at::timestamptz,
+         r.quote_timestamp::timestamptz, r.trade_timestamp::timestamptz,
+         r.snapshot_timestamp::timestamptz, r.bid::numeric, r.ask::numeric,
+         r.midpoint::numeric, r.last::numeric, r.volume::numeric,
+         r.open_interest::numeric, r.implied_volatility::numeric, r.delta::numeric,
+         r.gamma::numeric, r.theta::numeric, r.vega::numeric, r.rho::numeric,
+         r.source, r.request_id, r.evidence::jsonb, r.evidence_fingerprint, now(), now()
+  FROM jsonb_to_recordset($1::jsonb) AS r(
+    option_symbol text, underlying_symbol text, observed_at text, quote_timestamp text,
+    trade_timestamp text, snapshot_timestamp text, bid numeric, ask numeric,
+    midpoint numeric, last numeric, volume numeric, open_interest numeric,
+    implied_volatility numeric, delta numeric, gamma numeric, theta numeric, vega numeric,
+    rho numeric, source text, request_id text, evidence jsonb, evidence_fingerprint text)
+  WHERE ${fencePredicate(2)}
+ON CONFLICT (option_symbol, observed_at) DO UPDATE SET
+  quote_timestamp = EXCLUDED.quote_timestamp, trade_timestamp = EXCLUDED.trade_timestamp,
+  snapshot_timestamp = EXCLUDED.snapshot_timestamp, bid = EXCLUDED.bid, ask = EXCLUDED.ask,
+  midpoint = EXCLUDED.midpoint, last = EXCLUDED.last, volume = EXCLUDED.volume,
+  open_interest = EXCLUDED.open_interest, implied_volatility = EXCLUDED.implied_volatility,
+  delta = EXCLUDED.delta, gamma = EXCLUDED.gamma, theta = EXCLUDED.theta,
+  vega = EXCLUDED.vega, rho = EXCLUDED.rho, request_id = EXCLUDED.request_id,
+  evidence = EXCLUDED.evidence, evidence_fingerprint = EXCLUDED.evidence_fingerprint,
+  updated_at = now()
+RETURNING (xmax = 0) AS inserted`;
+
+const readbackPlanSummary = (value: unknown) => {
+  const root = Array.isArray(value) ? value[0] as Record<string, unknown> | undefined : undefined;
+  const plan = root?.Plan as Record<string, unknown> | undefined;
+  const indexes = new Set<string>();
+  const visit = (node: Record<string, unknown> | undefined) => {
+    if (!node) return;
+    if (typeof node["Index Name"] === "string") indexes.add(node["Index Name"]);
+    const children = Array.isArray(node.Plans)
+      ? node.Plans as Record<string, unknown>[]
+      : [];
+    for (const child of children) visit(child);
+  };
+  visit(plan);
+  return {
+    plannerTimeMs: nullableNumber(root?.["Planning Time"]),
+    executionTimeMs: nullableNumber(root?.["Execution Time"]),
+    rowsReturned: nullableNumber(plan?.["Actual Rows"]),
+    indexUsage: [...indexes],
+    planNode: nullableString(plan?.["Node Type"])
+  };
+};
 
 const optionSnapshotEvidenceJson = (row: PostgresOptionSnapshot) => json({
   ...row.evidence,
@@ -255,9 +384,35 @@ const optionSnapshotEvidenceJson = (row: PostgresOptionSnapshot) => json({
 export const optionSnapshotEvidenceFingerprint = (row: PostgresOptionSnapshot) =>
   stableRecordId("option_snapshot_evidence", optionSnapshotEvidenceJson(row));
 
+const optionSnapshotPayload = (row: PostgresOptionSnapshot) => ({
+  option_symbol: normalizedSymbol(row.optionSymbol),
+  underlying_symbol: normalizedSymbol(row.underlyingSymbol),
+  observed_at: iso(row.observedAt),
+  quote_timestamp: row.quoteTimestamp ? iso(row.quoteTimestamp) : null,
+  trade_timestamp: row.tradeTimestamp ? iso(row.tradeTimestamp) : null,
+  snapshot_timestamp: row.snapshotTimestamp ? iso(row.snapshotTimestamp) : null,
+  bid: row.bid,
+  ask: row.ask,
+  midpoint: row.midpoint,
+  last: row.last ?? null,
+  volume: row.volume,
+  open_interest: row.openInterest,
+  implied_volatility: row.impliedVolatility,
+  delta: row.delta,
+  gamma: row.gamma ?? null,
+  theta: row.theta ?? null,
+  vega: row.vega ?? null,
+  rho: row.rho ?? null,
+  source: row.source,
+  request_id: row.requestId,
+  evidence: JSON.parse(optionSnapshotEvidenceJson(row)),
+  evidence_fingerprint: optionSnapshotEvidenceFingerprint(row)
+});
+
 const requireFence = async (context: FencedPostgresRepositoryContext) => {
   const result = await requireCurrentFence(context);
   if (!result.accepted) throw new Error("POSTGRES_MARKET_DATA_FENCE_REJECTED");
+  return result;
 };
 
 const assertWritten = (rowCount: number | null, code = "POSTGRES_MARKET_DATA_FENCE_REJECTED") => {
@@ -284,6 +439,36 @@ const dedupeStable = <T>(rows: readonly T[], keyOf: (row: T) => string) => {
     if (!previous) unique.set(key, row);
   }
   return [...unique.values()];
+};
+
+const writeOptionSnapshotBatch = (
+  batch: readonly PostgresOptionSnapshot[],
+  context: FencedPostgresRepositoryContext
+) => context.transaction.query<PostgresOptionSnapshotWriteRow>(
+  OPTION_SNAPSHOT_UPSERT_SQL,
+  [
+    JSON.stringify(batch.map(optionSnapshotPayload)),
+    ...fenceValues(context.schedulerFence)
+  ]
+);
+
+const readOptionSnapshotBatch = async (
+  batch: readonly { optionSymbol: string; observedAt: string }[],
+  context: FencedPostgresRepositoryContext
+) => {
+  const values: [string[], string[]] = [
+    batch.map((entry) => normalizedSymbol(entry.optionSymbol)),
+    batch.map((entry) => iso(entry.observedAt))
+  ];
+  const result = await context.transaction.query<PostgresOptionSnapshotRow>(
+    OPTION_SNAPSHOT_READBACK_SQL,
+    values
+  );
+  return {
+    values,
+    result,
+    rows: result.rows.map(optionSnapshotFromRow)
+  };
 };
 
 export class PostgresMarketDataRepository {
@@ -528,51 +713,306 @@ export class PostgresMarketDataRepository {
     if (!rows.length) return { stored: 0 };
     const unique = dedupeStable(rows, (row) => `${normalizedSymbol(row.optionSymbol)}\0${iso(row.observedAt)}`);
     for (const batch of chunks(unique)) {
-      const payload = batch.map((row) => ({
-        option_symbol: normalizedSymbol(row.optionSymbol), underlying_symbol: normalizedSymbol(row.underlyingSymbol),
-        observed_at: iso(row.observedAt), quote_timestamp: row.quoteTimestamp ? iso(row.quoteTimestamp) : null,
-        trade_timestamp: row.tradeTimestamp ? iso(row.tradeTimestamp) : null,
-        snapshot_timestamp: row.snapshotTimestamp ? iso(row.snapshotTimestamp) : null,
-        bid: row.bid, ask: row.ask, midpoint: row.midpoint, last: row.last ?? null, volume: row.volume,
-        open_interest: row.openInterest, implied_volatility: row.impliedVolatility, delta: row.delta,
-        gamma: row.gamma ?? null, theta: row.theta ?? null, vega: row.vega ?? null, rho: row.rho ?? null,
-        source: row.source, request_id: row.requestId,
-        evidence: JSON.parse(optionSnapshotEvidenceJson(row)),
-        evidence_fingerprint: optionSnapshotEvidenceFingerprint(row)
-      }));
-      const result = await context.transaction.query(
-        `INSERT INTO option_snapshots(
-           option_symbol, underlying_symbol, observed_at, quote_timestamp, trade_timestamp,
-           snapshot_timestamp, bid, ask, midpoint, last, volume, open_interest,
-           implied_volatility, delta, gamma, theta, vega, rho, source, request_id,
-           evidence, evidence_fingerprint, created_at, updated_at
-         ) SELECT r.option_symbol, r.underlying_symbol, r.observed_at::timestamptz,
-                  r.quote_timestamp::timestamptz, r.trade_timestamp::timestamptz,
-                  r.snapshot_timestamp::timestamptz, r.bid::numeric, r.ask::numeric,
-                  r.midpoint::numeric, r.last::numeric, r.volume::numeric,
-                  r.open_interest::numeric, r.implied_volatility::numeric, r.delta::numeric,
-                  r.gamma::numeric, r.theta::numeric, r.vega::numeric, r.rho::numeric,
-                  r.source, r.request_id, r.evidence::jsonb, r.evidence_fingerprint, now(), now()
-           FROM jsonb_to_recordset($1::jsonb) AS r(
-             option_symbol text, underlying_symbol text, observed_at text, quote_timestamp text,
-             trade_timestamp text, snapshot_timestamp text, bid numeric, ask numeric,
-             midpoint numeric, last numeric, volume numeric, open_interest numeric,
-             implied_volatility numeric, delta numeric, gamma numeric, theta numeric, vega numeric,
-             rho numeric, source text, request_id text, evidence jsonb, evidence_fingerprint text)
-           WHERE ${fencePredicate(2)}
-         ON CONFLICT (option_symbol, observed_at) DO UPDATE SET
-           quote_timestamp = EXCLUDED.quote_timestamp, trade_timestamp = EXCLUDED.trade_timestamp,
-           snapshot_timestamp = EXCLUDED.snapshot_timestamp, bid = EXCLUDED.bid, ask = EXCLUDED.ask,
-           midpoint = EXCLUDED.midpoint, last = EXCLUDED.last, volume = EXCLUDED.volume,
-           open_interest = EXCLUDED.open_interest, implied_volatility = EXCLUDED.implied_volatility,
-           delta = EXCLUDED.delta, gamma = EXCLUDED.gamma, theta = EXCLUDED.theta,
-           vega = EXCLUDED.vega, rho = EXCLUDED.rho, request_id = EXCLUDED.request_id,
-           evidence = EXCLUDED.evidence, evidence_fingerprint = EXCLUDED.evidence_fingerprint, updated_at = now()`,
-        [JSON.stringify(payload), ...fenceValues(context.schedulerFence)]
-      );
+      const result = await writeOptionSnapshotBatch(batch, context);
       if (result.rowCount !== batch.length) throw new Error("POSTGRES_MARKET_DATA_PERSISTENCE_FAILED");
     }
     return { stored: unique.length };
+  }
+
+  async persistOptionSnapshotsWithReadback(
+    rows: readonly PostgresOptionSnapshot[],
+    context: FencedPostgresRepositoryContext
+  ) {
+    await requireFence(context);
+    if (!rows.length) return { stored: 0, persistedRows: [] as PostgresOptionSnapshot[] };
+    const unique = dedupeStable(
+      rows,
+      (row) => `${normalizedSymbol(row.optionSymbol)}\0${iso(row.observedAt)}`
+    );
+    const byUnderlying = new Map<string, PostgresOptionSnapshot[]>();
+    for (const row of unique) {
+      const underlying = normalizedSymbol(row.underlyingSymbol);
+      const symbolRows = byUnderlying.get(underlying);
+      if (symbolRows) {
+        symbolRows.push(row);
+      } else {
+        byUnderlying.set(underlying, [row]);
+      }
+    }
+    const batches = [...byUnderlying.entries()].flatMap(([symbol, symbolRows]) =>
+      chunks(symbolRows).map((batch) => ({ symbol, batch }))
+    );
+    const persistedRows: PostgresOptionSnapshot[] = [];
+    let profiledReadback = false;
+
+    for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
+      const { symbol, batch } = batches[batchIndex]!;
+      const batchNumber = batchIndex + 1;
+      const fence = await requireFence(context);
+      const transactionStartedAt = performance.now();
+      let writeResult: Awaited<ReturnType<typeof writeOptionSnapshotBatch>>;
+      try {
+        writeResult = await writeOptionSnapshotBatch(batch, context);
+      } catch (error) {
+        const writeTelemetry = readPostgresQueryTelemetry(error);
+        emitTelemetry(context, {
+          event: "postgres_option_snapshot_batch",
+          batchNumber,
+          batchCount: batches.length,
+          batchSize: batch.length,
+          symbol,
+          optionContractCount: new Set(batch.map((row) => row.optionSymbol)).size,
+          rowsAttempted: batch.length,
+          rowsInserted: 0,
+          rowsUpdated: 0,
+          rowsSkipped: 0,
+          rowsRejected: batch.length,
+          rowsCommitted: 0,
+          rowsReadBack: 0,
+          transactionDurationMs: performance.now() - transactionStartedAt,
+          readbackDurationMs: 0,
+          connectionAcquisitionMs: writeTelemetry.connectionAcquisitionMs,
+          poolWaitMs: writeTelemetry.poolWaitMs,
+          leaseOwner: fence.leaseOwner,
+          remainingLeaseMs: fence.remainingLeaseMs,
+          fencingToken: context.schedulerFence.fencingToken,
+          outcome: "failed"
+        });
+        emitTelemetry(context, postgresErrorTelemetry(error, {
+          failingStatement: OPTION_SNAPSHOT_UPSERT_SQL,
+          batchNumber,
+          symbol
+        }));
+        throw error;
+      }
+      const transactionDurationMs = performance.now() - transactionStartedAt;
+      const commitCompletedAt = new Date().toISOString();
+      const committed = writeResult.rowCount ?? 0;
+      const insertedRows = writeResult.rows.length === committed
+        ? writeResult.rows.filter((row) => row.inserted).length
+        : Math.min(writeResult.rows.filter((row) => row.inserted).length, committed);
+      const writeTelemetry = readPostgresQueryTelemetry(writeResult);
+      if (committed !== batch.length) {
+        const error = new Error(
+          `POSTGRES_OPTION_SNAPSHOT_BATCH_COMMIT_MISMATCH:batch=${batchNumber}:symbol=${symbol}:expected=${batch.length}:committed=${committed}`
+        );
+        emitTelemetry(context, {
+          event: "postgres_option_snapshot_batch",
+          batchNumber,
+          batchCount: batches.length,
+          batchSize: batch.length,
+          symbol,
+          optionContractCount: new Set(batch.map((row) => row.optionSymbol)).size,
+          rowsAttempted: batch.length,
+          rowsInserted: insertedRows,
+          rowsUpdated: committed - insertedRows,
+          rowsSkipped: batch.length - committed,
+          rowsRejected: batch.length - committed,
+          rowsCommitted: committed,
+          rowsReadBack: 0,
+          transactionDurationMs,
+          readbackDurationMs: 0,
+          connectionAcquisitionMs: writeTelemetry.connectionAcquisitionMs,
+          poolWaitMs: writeTelemetry.poolWaitMs,
+          leaseOwner: fence.leaseOwner,
+          remainingLeaseMs: fence.remainingLeaseMs,
+          fencingToken: context.schedulerFence.fencingToken,
+          outcome: "commit_mismatch"
+        });
+        throw error;
+      }
+
+      const readbackStartedAt = new Date().toISOString();
+      const readbackTimer = performance.now();
+      let readback: Awaited<ReturnType<typeof readOptionSnapshotBatch>>;
+      try {
+        readback = await readOptionSnapshotBatch(
+          batch.map((row) => ({
+            optionSymbol: row.optionSymbol,
+            observedAt: row.observedAt
+          })),
+          context
+        );
+      } catch (error) {
+        const readbackDurationMs = performance.now() - readbackTimer;
+        const readTelemetry = readPostgresQueryTelemetry(error);
+        emitTelemetry(context, {
+          event: "postgres_option_snapshot_batch",
+          batchNumber,
+          batchCount: batches.length,
+          batchSize: batch.length,
+          symbol,
+          optionContractCount: new Set(batch.map((row) => row.optionSymbol)).size,
+          rowsAttempted: batch.length,
+          rowsInserted: insertedRows,
+          rowsUpdated: committed - insertedRows,
+          rowsSkipped: 0,
+          rowsRejected: batch.length,
+          rowsCommitted: committed,
+          rowsReadBack: 0,
+          transactionDurationMs,
+          readbackDurationMs,
+          connectionAcquisitionMs:
+            writeTelemetry.connectionAcquisitionMs +
+            readTelemetry.connectionAcquisitionMs,
+          poolWaitMs: writeTelemetry.poolWaitMs + readTelemetry.poolWaitMs,
+          leaseOwner: fence.leaseOwner,
+          remainingLeaseMs: fence.remainingLeaseMs,
+          fencingToken: context.schedulerFence.fencingToken,
+          commitCompletedAt,
+          readbackStartedAt,
+          outcome: "readback_failed"
+        });
+        emitTelemetry(context, postgresErrorTelemetry(error, {
+          failingStatement: OPTION_SNAPSHOT_READBACK_SQL,
+          batchNumber,
+          symbol
+        }));
+        throw error;
+      }
+      const readbackDurationMs = performance.now() - readbackTimer;
+      const readTelemetry = readPostgresQueryTelemetry(readback.result);
+      if (readback.rows.length !== committed) {
+        const error = new Error(
+          `POSTGRES_OPTION_SNAPSHOT_BATCH_READBACK_MISMATCH:batch=${batchNumber}:symbol=${symbol}:expected=${batch.length}:committed=${committed}:read=${readback.rows.length}`
+        );
+        emitTelemetry(context, {
+          event: "postgres_option_snapshot_batch",
+          batchNumber,
+          batchCount: batches.length,
+          batchSize: batch.length,
+          symbol,
+          optionContractCount: new Set(batch.map((row) => row.optionSymbol)).size,
+          rowsAttempted: batch.length,
+          rowsInserted: insertedRows,
+          rowsUpdated: committed - insertedRows,
+          rowsSkipped: 0,
+          rowsRejected: batch.length,
+          rowsCommitted: committed,
+          rowsReadBack: readback.rows.length,
+          transactionDurationMs,
+          readbackDurationMs,
+          connectionAcquisitionMs:
+            writeTelemetry.connectionAcquisitionMs +
+            readTelemetry.connectionAcquisitionMs,
+          poolWaitMs: writeTelemetry.poolWaitMs + readTelemetry.poolWaitMs,
+          leaseOwner: fence.leaseOwner,
+          remainingLeaseMs: fence.remainingLeaseMs,
+          fencingToken: context.schedulerFence.fencingToken,
+          commitCompletedAt,
+          readbackStartedAt,
+          outcome: "readback_count_mismatch"
+        });
+        throw error;
+      }
+      const expectedFingerprints = new Map(batch.map((row) => [
+        `${normalizedSymbol(row.optionSymbol)}:${iso(row.observedAt)}`,
+        optionSnapshotEvidenceFingerprint(row)
+      ]));
+      const mismatched = readback.rows.find((row) =>
+        expectedFingerprints.get(`${normalizedSymbol(row.optionSymbol)}:${iso(row.observedAt)}`) !==
+          row.evidenceFingerprint
+      );
+      if (mismatched) {
+        const error = new Error(
+          `POSTGRES_OPTION_SNAPSHOT_BATCH_EVIDENCE_MISMATCH:batch=${batchNumber}:symbol=${symbol}:option=${mismatched.optionSymbol}`
+        );
+        emitTelemetry(context, {
+          event: "postgres_option_snapshot_batch",
+          batchNumber,
+          batchCount: batches.length,
+          batchSize: batch.length,
+          symbol,
+          optionContractCount: new Set(batch.map((row) => row.optionSymbol)).size,
+          rowsAttempted: batch.length,
+          rowsInserted: insertedRows,
+          rowsUpdated: committed - insertedRows,
+          rowsSkipped: 0,
+          rowsRejected: batch.length,
+          rowsCommitted: committed,
+          rowsReadBack: readback.rows.length,
+          transactionDurationMs,
+          readbackDurationMs,
+          connectionAcquisitionMs:
+            writeTelemetry.connectionAcquisitionMs +
+            readTelemetry.connectionAcquisitionMs,
+          poolWaitMs: writeTelemetry.poolWaitMs + readTelemetry.poolWaitMs,
+          leaseOwner: fence.leaseOwner,
+          remainingLeaseMs: fence.remainingLeaseMs,
+          fencingToken: context.schedulerFence.fencingToken,
+          commitCompletedAt,
+          readbackStartedAt,
+          outcome: "readback_evidence_mismatch"
+        });
+        throw error;
+      }
+      persistedRows.push(...readback.rows);
+
+      if (
+        !profiledReadback &&
+        (context as MarketDataTelemetryContext).profileOptionReadbackQuery
+      ) {
+        profiledReadback = true;
+        const profileStartedAt = performance.now();
+        try {
+          const profile = await context.transaction.query<{ "QUERY PLAN": unknown }>(
+            `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${OPTION_SNAPSHOT_READBACK_SQL}`,
+            [...readback.values]
+          );
+          emitTelemetry(context, {
+            event: "postgres_option_snapshot_readback_query_profile",
+            batchNumber,
+            symbol,
+            queryExecutionDurationMs: performance.now() - profileStartedAt,
+            failingStatement: "option_snapshot_batch_readback",
+            ...readbackPlanSummary(profile.rows[0]?.["QUERY PLAN"]),
+            ...readPostgresQueryTelemetry(profile)
+          });
+        } catch (error) {
+          emitTelemetry(context, postgresErrorTelemetry(error, {
+            failingStatement:
+              `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${OPTION_SNAPSHOT_READBACK_SQL}`,
+            batchNumber,
+            symbol
+          }));
+        }
+      }
+
+      emitTelemetry(context, {
+        event: "postgres_option_snapshot_batch",
+        batchNumber,
+        batchCount: batches.length,
+        batchSize: batch.length,
+        symbol,
+        optionContractCount: new Set(batch.map((row) => row.optionSymbol)).size,
+        rowsAttempted: batch.length,
+        rowsInserted: insertedRows,
+        rowsUpdated: committed - insertedRows,
+        rowsSkipped: batch.length - committed,
+        rowsRejected: 0,
+        rowsCommitted: committed,
+        rowsReadBack: readback.rows.length,
+        transactionDurationMs,
+        readbackDurationMs,
+        connectionAcquisitionMs:
+          writeTelemetry.connectionAcquisitionMs +
+          readTelemetry.connectionAcquisitionMs,
+        poolWaitMs: writeTelemetry.poolWaitMs + readTelemetry.poolWaitMs,
+        writeConnectionAcquisitionMs: writeTelemetry.connectionAcquisitionMs,
+        readbackConnectionAcquisitionMs: readTelemetry.connectionAcquisitionMs,
+        writePoolWaitMs: writeTelemetry.poolWaitMs,
+        readbackPoolWaitMs: readTelemetry.poolWaitMs,
+        leaseOwner: fence.leaseOwner,
+        leaseHeartbeatAt: fence.heartbeatAt,
+        leaseExpiresAt: fence.expiresAt,
+        remainingLeaseMs: fence.remainingLeaseMs,
+        fencingToken: context.schedulerFence.fencingToken,
+        commitCompletedAt,
+        readbackStartedAt,
+        outcome: "committed_and_read_back"
+      });
+    }
+    return { stored: unique.length, persistedRows };
   }
 
   async listOptionContractsBySymbols(
@@ -628,67 +1068,10 @@ export class PostgresMarketDataRepository {
     if (!input.identities.length) return [];
     const rows: PostgresOptionSnapshotRow[] = [];
     for (const batch of chunks(input.identities, POSTGRES_OPTION_READ_BATCH_SIZE)) {
-      const result = await context.transaction.query<PostgresOptionSnapshotRow>(
-        `SELECT option_symbol, underlying_symbol, observed_at, quote_timestamp,
-                trade_timestamp, snapshot_timestamp, bid, ask, midpoint, last,
-                volume, open_interest, implied_volatility, delta, gamma, theta,
-                vega, rho, source, request_id, evidence, evidence_fingerprint,
-                updated_at
-         FROM option_snapshots
-         WHERE (option_symbol, observed_at) IN (
-           SELECT * FROM unnest($1::text[], $2::timestamptz[])
-         )
-         ORDER BY underlying_symbol, option_symbol, observed_at`,
-        [
-          batch.map((entry) => normalizedSymbol(entry.optionSymbol)),
-          batch.map((entry) => iso(entry.observedAt))
-        ]
-      );
-      rows.push(...result.rows);
+      const readback = await readOptionSnapshotBatch(batch, context);
+      rows.push(...readback.result.rows);
     }
-    return rows.map((row) => {
-      const evidence = record(row.evidence);
-      const freshnessStatus = evidence.freshnessStatus === "fresh" ? "fresh" : "stale";
-      return {
-        optionSymbol: row.option_symbol,
-        underlyingSymbol: row.underlying_symbol,
-        observedAt: new Date(row.observed_at).toISOString(),
-        quoteTimestamp: row.quote_timestamp ? new Date(row.quote_timestamp).toISOString() : null,
-        tradeTimestamp: row.trade_timestamp ? new Date(row.trade_timestamp).toISOString() : null,
-        snapshotTimestamp: row.snapshot_timestamp ? new Date(row.snapshot_timestamp).toISOString() : null,
-        underlyingPrice: nullableNumber(evidence.underlyingPrice),
-        bid: nullableNumber(row.bid),
-        ask: nullableNumber(row.ask),
-        bidSize: nullableNumber(evidence.bidSize),
-        askSize: nullableNumber(evidence.askSize),
-        midpoint: nullableNumber(row.midpoint),
-        spread: nullableNumber(evidence.spread),
-        spreadPct: nullableNumber(evidence.spreadPct),
-        last: nullableNumber(row.last),
-        volume: nullableNumber(row.volume),
-        openInterest: nullableNumber(row.open_interest),
-        impliedVolatility: nullableNumber(row.implied_volatility),
-        delta: nullableNumber(row.delta),
-        gamma: nullableNumber(row.gamma),
-        theta: nullableNumber(row.theta),
-        vega: nullableNumber(row.vega),
-        rho: nullableNumber(row.rho),
-        freshnessStatus,
-        requestedFeed: nullableString(evidence.requestedFeed) ?? undefined,
-        effectiveFeed: nullableString(evidence.effectiveFeed) ?? undefined,
-        validationBasis: evidence.validationBasis === "request_feed_opra"
-          ? "request_feed_opra"
-          : null,
-        endpoint: nullableString(evidence.endpoint) ?? undefined,
-        pageToken: nullableString(evidence.pageToken),
-        retrievedAt: nullableString(evidence.retrievedAt) ?? undefined,
-        persistedAt: new Date(row.updated_at).toISOString(),
-        evidenceFingerprint: row.evidence_fingerprint,
-        source: row.source,
-        requestId: row.request_id,
-        evidence
-      };
-    });
+    return rows.map(optionSnapshotFromRow);
   }
 
   async upsertFeatureSnapshots(

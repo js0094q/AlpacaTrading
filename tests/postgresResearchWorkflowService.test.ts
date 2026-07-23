@@ -385,6 +385,62 @@ test("research evidence is inserted in bounded batches", async () => {
   assert.match(evidence[0]!, /jsonb_to_recordset/);
 });
 
+test("research evidence batching is bounded by serialized bytes as well as row count", async () => {
+  const evidencePayloadSizes: number[] = [];
+  const oversized = "x".repeat(2_200_000);
+  const result = await runPostgresResearchWorkflow({
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("INSERT INTO research_runs")) {
+          return { rows: [{ version: "1" }], rowCount: 1 };
+        }
+        if (statement.includes("INSERT INTO research_evidence")) {
+          const payload = String(values?.[0] ?? "");
+          evidencePayloadSizes.push(Buffer.byteLength(payload));
+          return { rows: [], rowCount: JSON.parse(payload).length };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    riskProfile: "aggressive",
+    optionsEnabled: true,
+    maxCandidates: 0,
+    now: new Date("2026-07-20T22:00:00.000Z"),
+    dependencies: {
+      refreshMarketData: async () => ({
+        bars: [],
+        stockSnapshots: [],
+        optionContracts: [],
+        optionSnapshots: [],
+        summary: {}
+      }) as never,
+      buildFeaturesAndTargets: async () => ({
+        features: [
+          {
+            symbol: "SPY",
+            observedAt: "2026-07-20T21:59:58.000Z",
+            features: { optionContractFeatures: [oversized] },
+            sourceFingerprint: "feature-spy"
+          },
+          {
+            symbol: "QQQ",
+            observedAt: "2026-07-20T21:59:59.000Z",
+            features: { optionContractFeatures: [oversized] },
+            sourceFingerprint: "feature-qqq"
+          }
+        ],
+        targets: []
+      }) as never,
+      symbols: ["SPY", "QQQ"]
+    }
+  });
+
+  assert.equal(result.status, "completed");
+  assert.equal(evidencePayloadSizes.length, 2);
+  assert.equal(evidencePayloadSizes.every((bytes) => bytes <= 4_000_000), true);
+});
+
 test("rejected evidence fence prevents any batch insert", async () => {
   const sql: string[] = [];
   await assert.rejects(runPostgresResearchWorkflow({

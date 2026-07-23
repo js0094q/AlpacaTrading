@@ -31,6 +31,27 @@ const currentFence = {
   current: true
 };
 
+const optionSnapshotFixture = (): PostgresOptionSnapshot => ({
+  optionSymbol: "SPY260724C00744000",
+  underlyingSymbol: "SPY",
+  observedAt: "2026-07-21T13:41:58.000Z",
+  quoteTimestamp: "2026-07-21T13:41:58.000Z",
+  bid: 1,
+  ask: 2,
+  midpoint: 1.5,
+  volume: 10,
+  openInterest: 20,
+  impliedVolatility: 0.2,
+  delta: 0.5,
+  freshnessStatus: "fresh",
+  requestedFeed: "opra",
+  effectiveFeed: "opra",
+  validationBasis: "request_feed_opra",
+  source: "alpaca",
+  requestId: "batch",
+  evidence: {}
+});
+
 const fakeClient = () => {
   const queries: Array<{ text: string; values?: readonly unknown[] }> = [];
   const client = {
@@ -405,6 +426,239 @@ test("whole-universe option readback uses bounded PostgreSQL queries", async () 
   assert.equal(snapshotReads.length, 2);
   assert.deepEqual(contractReads.map((entry) => (entry.values?.[0] as unknown[]).length), [1000, 1]);
   assert.deepEqual(snapshotReads.map((entry) => (entry.values?.[0] as unknown[]).length), [1000, 1]);
+});
+
+test("option snapshot persistence commits and reads back every bounded batch before continuing", async () => {
+  const events: Array<Record<string, unknown>> = [];
+  const queryOrder: string[] = [];
+  const stored = new Map<string, Record<string, unknown>>();
+  const snapshots: PostgresOptionSnapshot[] = Array.from({ length: 251 }, (_, index) => ({
+    optionSymbol: `SPY260724C${String(700 + index).padStart(8, "0")}`,
+    underlyingSymbol: "SPY",
+    observedAt: `2026-07-21T13:${String(40 + Math.floor(index / 60)).padStart(2, "0")}:${String(index % 60).padStart(2, "0")}.000Z`,
+    quoteTimestamp: "2026-07-21T13:41:58.000Z",
+    bid: 1,
+    ask: 2,
+    midpoint: 1.5,
+    volume: 10,
+    openInterest: 20,
+    impliedVolatility: 0.2,
+    delta: 0.5,
+    freshnessStatus: "fresh",
+    requestedFeed: "opra",
+    effectiveFeed: "opra",
+    validationBasis: "request_feed_opra",
+    source: "alpaca",
+    requestId: "batch",
+    evidence: {}
+  }));
+  const client = {
+    query: async (text: string, values?: readonly unknown[]) => {
+      if (text.includes("FROM scheduler_leases") && text.includes("FOR UPDATE")) {
+        return {
+          rows: [{
+            ...currentFence,
+            heartbeat_at: "2026-07-21T13:43:00.000Z",
+            expires_at: "2026-07-21T13:44:00.000Z",
+            remaining_lease_ms: "60000"
+          }],
+          rowCount: 1,
+          postgresTelemetry: {
+            connectionAcquisitionMs: 2,
+            poolWaitMs: 1,
+            queryDurationMs: 3
+          }
+        } as unknown as QueryResult;
+      }
+      if (text.includes("INSERT INTO option_snapshots")) {
+        queryOrder.push("write");
+        const payload = JSON.parse(String(values?.[0])) as Array<Record<string, unknown>>;
+        for (const row of payload) {
+          stored.set(`${row.option_symbol}:${row.observed_at}`, row);
+        }
+        return {
+          rows: payload.map(() => ({ inserted: true })),
+          rowCount: payload.length,
+          postgresTelemetry: {
+            connectionAcquisitionMs: 4,
+            poolWaitMs: 2,
+            queryDurationMs: 8
+          }
+        } as unknown as QueryResult;
+      }
+      if (text.includes("FROM option_snapshots")) {
+        queryOrder.push("readback");
+        const symbols = values?.[0] as string[];
+        const observed = values?.[1] as string[];
+        const rows = symbols.map((optionSymbol, index) => {
+          const observedAt = new Date(observed[index]!).toISOString();
+          const persisted = stored.get(`${optionSymbol}:${observedAt}`)!;
+          return {
+            option_symbol: persisted.option_symbol,
+            underlying_symbol: persisted.underlying_symbol,
+            observed_at: persisted.observed_at,
+            quote_timestamp: persisted.quote_timestamp,
+            trade_timestamp: persisted.trade_timestamp,
+            snapshot_timestamp: persisted.snapshot_timestamp,
+            bid: persisted.bid,
+            ask: persisted.ask,
+            midpoint: persisted.midpoint,
+            last: persisted.last,
+            volume: persisted.volume,
+            open_interest: persisted.open_interest,
+            implied_volatility: persisted.implied_volatility,
+            delta: persisted.delta,
+            gamma: persisted.gamma,
+            theta: persisted.theta,
+            vega: persisted.vega,
+            rho: persisted.rho,
+            source: persisted.source,
+            request_id: persisted.request_id,
+            evidence: persisted.evidence,
+            evidence_fingerprint: persisted.evidence_fingerprint,
+            updated_at: "2026-07-21T13:43:01.000Z"
+          };
+        });
+        return {
+          rows,
+          rowCount: rows.length,
+          postgresTelemetry: {
+            connectionAcquisitionMs: 3,
+            poolWaitMs: 1,
+            queryDurationMs: 6
+          }
+        } as unknown as QueryResult;
+      }
+      throw new Error(`unexpected query: ${text}`);
+    }
+  } as unknown as PoolClient;
+  const context = {
+    ...contextFor(client),
+    emitTelemetry: (event: Record<string, unknown>) => events.push(event)
+  } as never;
+
+  const result = await new PostgresMarketDataRepository().persistOptionSnapshotsWithReadback(
+    snapshots,
+    context
+  ) as { stored: number; persistedRows?: PostgresOptionSnapshot[] };
+
+  assert.equal(result.stored, 251);
+  assert.equal(result.persistedRows?.length, 251);
+  assert.deepEqual(queryOrder, ["write", "readback", "write", "readback"]);
+  const batches = events.filter((event) => event.event === "postgres_option_snapshot_batch");
+  assert.equal(batches.length, 2);
+  assert.deepEqual(batches.map((event) => event.batchNumber), [1, 2]);
+  assert.deepEqual(batches.map((event) => event.rowsAttempted), [250, 1]);
+  assert.deepEqual(batches.map((event) => event.rowsCommitted), [250, 1]);
+  assert.deepEqual(batches.map((event) => event.rowsReadBack), [250, 1]);
+  assert.equal(batches.every((event) => event.symbol === "SPY"), true);
+  assert.equal(batches.every((event) => Number(event.remainingLeaseMs) > 0), true);
+  assert.equal(
+    batches.every((event) =>
+      Date.parse(String(event.readbackStartedAt)) >= Date.parse(String(event.commitCompletedAt))
+    ),
+    true
+  );
+});
+
+test("option snapshot batch readback mismatch returns explicit batch diagnostics", async () => {
+  const events: Record<string, unknown>[] = [];
+  const client = {
+    query: async (text: string, values?: readonly unknown[]) => {
+      if (text.includes("FROM scheduler_leases") && text.includes("FOR UPDATE")) {
+        return {
+          rows: [{
+            ...currentFence,
+            heartbeat_at: "2026-07-21T13:43:00.000Z",
+            expires_at: "2026-07-21T13:44:00.000Z",
+            remaining_lease_ms: "60000"
+          }],
+          rowCount: 1
+        } as unknown as QueryResult;
+      }
+      if (text.includes("INSERT INTO option_snapshots")) {
+        const payload = JSON.parse(String(values?.[0])) as unknown[];
+        return {
+          rows: payload.map(() => ({ inserted: true })),
+          rowCount: payload.length
+        } as unknown as QueryResult;
+      }
+      if (text.includes("FROM option_snapshots")) {
+        return { rows: [], rowCount: 0 } as unknown as QueryResult;
+      }
+      throw new Error(`unexpected query: ${text}`);
+    }
+  } as unknown as PoolClient;
+  const context = {
+    ...contextFor(client),
+    emitTelemetry: (event: Record<string, unknown>) => events.push(event)
+  } as never;
+
+  await assert.rejects(
+    new PostgresMarketDataRepository().persistOptionSnapshotsWithReadback(
+      [optionSnapshotFixture()],
+      context
+    ),
+    /POSTGRES_OPTION_SNAPSHOT_BATCH_READBACK_MISMATCH:batch=1:symbol=SPY:expected=1:committed=1:read=0/
+  );
+  const batch = events.find((event) => event.event === "postgres_option_snapshot_batch");
+  assert.equal(batch?.outcome, "readback_count_mismatch");
+  assert.equal(batch?.rowsCommitted, 1);
+  assert.equal(batch?.rowsReadBack, 0);
+});
+
+test("option snapshot PostgreSQL errors include structured statement and server diagnostics", async () => {
+  const events: Record<string, unknown>[] = [];
+  const client = {
+    query: async (text: string) => {
+      if (text.includes("FROM scheduler_leases") && text.includes("FOR UPDATE")) {
+        return {
+          rows: [{
+            ...currentFence,
+            heartbeat_at: "2026-07-21T13:43:00.000Z",
+            expires_at: "2026-07-21T13:44:00.000Z",
+            remaining_lease_ms: "60000"
+          }],
+          rowCount: 1
+        } as unknown as QueryResult;
+      }
+      if (text.includes("INSERT INTO option_snapshots")) {
+        throw Object.assign(new Error("deadlock detected"), {
+          code: "40P01",
+          detail: "Process waits for ShareLock.",
+          hint: "Retry the transaction.",
+          constraint: "option_snapshots_pkey",
+          schema: "public",
+          table: "option_snapshots",
+          index: "option_snapshots_pkey"
+        });
+      }
+      throw new Error(`unexpected query: ${text}`);
+    }
+  } as unknown as PoolClient;
+  const context = {
+    ...contextFor(client),
+    emitTelemetry: (event: Record<string, unknown>) => events.push(event)
+  } as never;
+
+  await assert.rejects(
+    new PostgresMarketDataRepository().persistOptionSnapshotsWithReadback(
+      [optionSnapshotFixture()],
+      context
+    ),
+    /deadlock detected/
+  );
+  const error = events.find((event) => event.event === "postgres_query_error");
+  assert.equal(error?.sqlState, "40P01");
+  assert.equal(error?.detail, "Process waits for ShareLock.");
+  assert.equal(error?.hint, "Retry the transaction.");
+  assert.equal(error?.constraint, "option_snapshots_pkey");
+  assert.equal(error?.schema, "public");
+  assert.equal(error?.table, "option_snapshots");
+  assert.equal(error?.index, "option_snapshots_pkey");
+  assert.match(String(error?.failingStatement), /INSERT INTO option_snapshots/);
+  assert.equal(error?.batchNumber, 1);
+  assert.equal(error?.symbol, "SPY");
 });
 
 test("market-data reads are bounded, ordered, and normalized", async () => {
