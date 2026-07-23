@@ -236,6 +236,11 @@ CREATE TABLE IF NOT EXISTS option_snapshots (
   rho REAL,
   snapshot_timestamp TEXT,
   normalization_path TEXT,
+  research_run_id TEXT,
+  source_feed TEXT,
+  quote_age_ms INTEGER,
+  spread_percentage REAL,
+  days_to_expiration INTEGER,
   source TEXT NOT NULL,
   UNIQUE(option_symbol, timestamp)
 );
@@ -1271,6 +1276,11 @@ const runMigrations = (db: DbHandle) => {
   addColumnIfMissing(db, "option_snapshots", "trade_timestamp", "trade_timestamp TEXT");
   addColumnIfMissing(db, "option_snapshots", "snapshot_timestamp", "snapshot_timestamp TEXT");
   addColumnIfMissing(db, "option_snapshots", "normalization_path", "normalization_path TEXT");
+  addColumnIfMissing(db, "option_snapshots", "research_run_id", "research_run_id TEXT");
+  addColumnIfMissing(db, "option_snapshots", "source_feed", "source_feed TEXT");
+  addColumnIfMissing(db, "option_snapshots", "quote_age_ms", "quote_age_ms INTEGER");
+  addColumnIfMissing(db, "option_snapshots", "spread_percentage", "spread_percentage REAL");
+  addColumnIfMissing(db, "option_snapshots", "days_to_expiration", "days_to_expiration INTEGER");
   addColumnIfMissing(db, "paper_execution_ledger", "side", "side TEXT");
   addColumnIfMissing(db, "paper_execution_ledger", "order_type", "order_type TEXT");
   addColumnIfMissing(db, "paper_execution_ledger", "time_in_force", "time_in_force TEXT");

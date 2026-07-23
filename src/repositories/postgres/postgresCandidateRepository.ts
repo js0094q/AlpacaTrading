@@ -57,7 +57,7 @@ const candidateColumns = `
 const nullableNumber = (row: CandidateRow, key: string) =>
   asNumber(row[key] as number | string | null | undefined);
 
-const mapCandidate = (row: CandidateRow): CandidateRecord => ({
+export const projectCandidateRow = (row: CandidateRow): CandidateRecord => ({
   id: row.id,
   decisionId: row.decision_id,
   researchRunId: row.research_run_id,
@@ -92,7 +92,7 @@ const mapCandidate = (row: CandidateRow): CandidateRecord => ({
   lifecycleStatus: row.lifecycle_status,
   decisionReason: row.decision_reason || "LEGACY_UNSPECIFIED",
   strategyFamily: row.strategy_family || row.preferred_expression,
-  signalInputs: parseJsonValue(row.signal_inputs) as Record<string, string | number | null>,
+  signalInputs: parseJsonValue(row.signal_inputs) as Record<string, JsonValue>,
   dataQualityStatus: row.data_quality_status,
   version: Number(row.version),
   createdAt: asIsoString(row.created_at)!,
@@ -215,7 +215,7 @@ export class PostgresCandidateRepository implements CandidateRepository<PoolClie
       `SELECT ${candidateColumns} FROM candidates WHERE id = $1`,
       [input.candidateId]
     );
-    return result.rows[0] ? mapCandidate(result.rows[0]) : null;
+    return result.rows[0] ? projectCandidateRow(result.rows[0]) : null;
   }
 
   async listByResearchRun(
@@ -227,7 +227,7 @@ export class PostgresCandidateRepository implements CandidateRepository<PoolClie
        FROM candidates WHERE research_run_id = $1 ORDER BY rank, id`,
       [input.researchRunId]
     );
-    return result.rows.map(mapCandidate);
+    return result.rows.map(projectCandidateRow);
   }
 
   async insertMany(
@@ -307,7 +307,7 @@ export class PostgresCandidateRepository implements CandidateRepository<PoolClie
         params
       );
       if (inserted.rows[0]) {
-        results.push({ status: "inserted", candidate: mapCandidate(inserted.rows[0]) });
+        results.push({ status: "inserted", candidate: projectCandidateRow(inserted.rows[0]) });
         continue;
       }
       const token = await currentFenceToken(context.transaction, context.schedulerFence);

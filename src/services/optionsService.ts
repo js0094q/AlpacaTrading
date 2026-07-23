@@ -1,6 +1,7 @@
 import { getDb } from "../lib/db.js";
 import { runWithSqliteBusyRetry } from "../lib/sqliteConcurrency.js";
 import { nowIso, dedupeSymbols, normalizeSymbol } from "../lib/utils.js";
+import { config } from "../config.js";
 import { getActiveSymbols, seedInitialUniverse } from "./universeService.js";
 import {
   fetchOptionContracts,
@@ -117,7 +118,8 @@ const toNullableNumber = (value: unknown): number | null => {
 export const toSnapshotRow = (
   optionSymbol: string,
   symbolData: OptionSnapshotRaw,
-  quoteData?: OptionQuoteRaw | null
+  quoteData?: OptionQuoteRaw | null,
+  context?: { researchRunId?: string | null }
 ) => {
   const timestamp = nowIso();
   const canonical = normalizeOptionSnapshot(optionSymbol, symbolData, {
@@ -140,6 +142,22 @@ export const toSnapshotRow = (
   );
   const volume = toNullableNumber(symbolData.volume);
   const openInterest = toNullableNumber(symbolData.openInterest ?? symbolData.open_interest);
+  const quoteAgeMs = canonical.latestQuote?.timestamp
+    ? Math.max(0, Date.parse(timestamp) - Date.parse(canonical.latestQuote.timestamp))
+    : null;
+  const spreadPercentage =
+    normalizedQuote.bid !== null &&
+    normalizedQuote.ask !== null &&
+    normalizedQuote.midpoint !== null &&
+    normalizedQuote.midpoint > 0
+      ? ((normalizedQuote.ask - normalizedQuote.bid) / normalizedQuote.midpoint) * 100
+      : null;
+  const expirationTimestamp = Date.parse(`${canonical.expiration}T00:00:00.000Z`);
+  const decisionTimestamp = Date.parse(timestamp);
+  const daysToExpiration =
+    Number.isFinite(expirationTimestamp) && Number.isFinite(decisionTimestamp)
+      ? Math.max(0, Math.round((expirationTimestamp - decisionTimestamp) / (24 * 60 * 60 * 1000)))
+      : null;
 
   return {
     optionSymbol: canonical.symbol,
@@ -168,7 +186,12 @@ export const toSnapshotRow = (
     vega: canonical.greeks.vega,
     rho: canonical.greeks.rho,
     snapshotTimestamp: canonical.snapshotTimestamp,
-    normalizationPath: canonical.normalizationPath
+    normalizationPath: canonical.normalizationPath,
+    researchRunId: context?.researchRunId ?? null,
+    sourceFeed: config.alpaca.optionDataFeed,
+    quoteAgeMs,
+    spreadPercentage,
+    daysToExpiration
   };
 };
 
@@ -306,8 +329,14 @@ const insertOptionSnapshotRows = async (
       option_symbol, underlying_symbol, timestamp, bid, ask, midpoint, last,
       quote_status, executable, executable_price, executable_price_source, rejection_reason, quote_timestamp,
       volume, open_interest, bid_size, ask_size, trade_size, trade_timestamp,
-      implied_volatility, delta, gamma, theta, vega, rho, snapshot_timestamp, normalization_path, source
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'alpaca')
+      implied_volatility, delta, gamma, theta, vega, rho, snapshot_timestamp, normalization_path,
+      research_run_id, source_feed, quote_age_ms, spread_percentage, days_to_expiration, source
+    ) VALUES (
+      ?, ?, ?, ?, ?, ?, ?, ?,
+      ?, ?, ?, ?, ?, ?, ?, ?,
+      ?, ?, ?, ?, ?, ?, ?, ?,
+      ?, ?, ?, ?, ?, ?, ?, ?, 'alpaca'
+    )
     ON CONFLICT(option_symbol, timestamp) DO NOTHING
   `);
 
@@ -318,7 +347,9 @@ const insertOptionSnapshotRows = async (
   ]);
   const quotesBySymbol = new Map(quotes.map((row) => [row.symbol, row.raw]));
   const normalizedRows = snapshots.flatMap(({ symbol, raw }) => {
-    const row = toSnapshotRow(symbol, raw, quotesBySymbol.get(symbol));
+    const row = toSnapshotRow(symbol, raw, quotesBySymbol.get(symbol), {
+      researchRunId: params?.researchRunId ?? null
+    });
     if (params?.minDelta !== undefined && params.minDelta !== null) {
       if (row.delta === null || row.delta < params.minDelta) return [];
     }
@@ -370,7 +401,12 @@ const insertOptionSnapshotRows = async (
                 row.vega,
                 row.rho,
                 row.snapshotTimestamp,
-                row.normalizationPath
+                row.normalizationPath,
+                row.researchRunId,
+                row.sourceFeed,
+                row.quoteAgeMs,
+                row.spreadPercentage,
+                row.daysToExpiration
               );
               if (result.changes === 1) rowsInserted += 1;
             }

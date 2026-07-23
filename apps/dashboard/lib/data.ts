@@ -13,6 +13,14 @@ import {
   shouldUseVercelReadOnlyFallback
 } from "./runtime";
 import { optionsQuoteConfig } from "../../../src/services/optionQuoteNormalizer";
+import {
+  buildOptionDecisionSnapshot,
+  type OptionDecisionFieldEvidenceMap,
+  type OptionDecisionSnapshotEvidence,
+  type OptionEvidenceAvailability,
+  type OptionEvidenceDataQualityStatus,
+  type OptionStrategyUseMap
+} from "../../../src/services/optionDecisionEvidenceService";
 
 export type RiskProfileInput = "moderate" | "aggressive" | "conservative";
 
@@ -148,17 +156,41 @@ export interface OptionContractDashboardRow {
   type: string;
   expiration_date: string;
   strike: number | null;
+  multiplier: number | null;
   tradable: boolean;
   bid: number | null;
   ask: number | null;
   midpoint: number | null;
   last: number | null;
+  volume: number | null;
+  openInterest: number | null;
+  impliedVolatility: number | null;
+  delta: number | null;
+  gamma: number | null;
+  theta: number | null;
+  vega: number | null;
+  rho: number | null;
+  spreadPercentage: number | null;
   quoteStatus: "valid" | "missing" | "invalid" | "stale";
   executable: boolean;
   executablePrice: number | null;
   executablePriceSource: string | null;
   rejectionReason: string | null;
+  rejectionReasons: string[];
   quoteTimestamp: string | null;
+  quoteAgeMs: number | null;
+  snapshotTimestamp: string | null;
+  source: string | null;
+  sourceFeed: string | null;
+  normalizationPath: string | null;
+  daysToExpiration: number | null;
+  underlyingPrice: number | null;
+  underlyingPriceSource: string | null;
+  greekAvailability: OptionEvidenceAvailability;
+  dataQualityStatus: OptionEvidenceDataQualityStatus;
+  strategyUse: OptionStrategyUseMap;
+  decisionUse: OptionDecisionFieldEvidenceMap;
+  decisionSnapshot: OptionDecisionSnapshotEvidence;
   timestamp: string | null;
   displayCategory: OptionContractDisplayCategory;
 }
@@ -378,22 +410,13 @@ const optionDisplayCategory = (input: {
   return "Discovered";
 };
 
-const inferredQuoteStatus = (row: Record<string, unknown>) => {
-  const explicit = textOrNull(row.quote_status ?? row.quoteStatus);
-  if (explicit) return quoteStatusForDashboard(explicit);
-  const timestamp = textOrNull(row.quote_timestamp ?? row.quoteTimestamp ?? row.observed_at ?? row.timestamp);
-  const bid = numberOrNull(row.bid);
-  const ask = numberOrNull(row.ask);
-  if (timestamp && bid !== null && ask !== null && bid >= 0 && ask >= bid) return "valid" as const;
-  return timestamp ? "invalid" as const : "missing" as const;
-};
-
-const normalizeOptionContractDashboardRow = (row: {
+export const normalizeOptionContractDashboardRow = (row: {
   underlying_symbol: string;
   option_symbol: string;
   type: string;
   expiration_date: string;
   strike: number | null;
+  multiplier: number | null;
   tradable: number;
   bid: number | null;
   ask: number | null;
@@ -405,6 +428,21 @@ const normalizeOptionContractDashboardRow = (row: {
   executable_price_source: string | null;
   rejection_reason: string | null;
   quote_timestamp: string | null;
+  quote_age_ms: number | null;
+  snapshot_timestamp: string | null;
+  source: string | null;
+  source_feed: string | null;
+  normalization_path: string | null;
+  days_to_expiration: number | null;
+  volume: number | null;
+  open_interest: number | null;
+  implied_volatility: number | null;
+  delta: number | null;
+  gamma: number | null;
+  theta: number | null;
+  vega: number | null;
+  rho: number | null;
+  spread_percentage: number | null;
   timestamp: string | null;
 }): OptionContractDashboardRow => {
   const quoteStatus = quoteStatusForDashboard(row.quote_status);
@@ -418,6 +456,50 @@ const normalizeOptionContractDashboardRow = (row: {
     expirationRejection ||
     row.rejection_reason ||
     (row.timestamp && quoteStatus === "missing" ? "quote_unavailable" : null);
+  const decisionSnapshot = buildOptionDecisionSnapshot({
+    contract: {
+      optionSymbol: row.option_symbol,
+      underlyingSymbol: row.underlying_symbol,
+      type: row.type === "put" ? "put" : "call",
+      expirationDate: row.expiration_date,
+      strike: row.strike,
+      multiplier: row.multiplier
+    },
+    snapshot: row.timestamp
+      ? {
+          optionSymbol: row.option_symbol,
+          underlyingSymbol: row.underlying_symbol,
+          timestamp: row.timestamp,
+          bid: row.bid,
+          ask: row.ask,
+          midpoint: row.midpoint,
+          last: row.last,
+          quoteStatus,
+          executable: row.executable,
+          executablePrice: row.executable_price,
+          executablePriceSource: row.executable_price_source,
+          rejectionReason,
+          quoteTimestamp: row.quote_timestamp,
+          quoteAgeMs: row.quote_age_ms,
+          volume: row.volume,
+          openInterest: row.open_interest,
+          impliedVolatility: row.implied_volatility,
+          delta: row.delta,
+          gamma: row.gamma,
+          theta: row.theta,
+          vega: row.vega,
+          rho: row.rho,
+          snapshotTimestamp: row.snapshot_timestamp,
+          normalizationPath: row.normalization_path,
+          source: row.source,
+          sourceFeed: row.source_feed,
+          spreadPercentage: row.spread_percentage
+        }
+      : null,
+    decisionTimestamp: row.timestamp,
+    daysToExpiration: row.days_to_expiration,
+    maxQuoteAgeMs: optionsQuoteConfig().maxAgeMs
+  });
 
   return {
     underlying_symbol: row.underlying_symbol,
@@ -425,17 +507,41 @@ const normalizeOptionContractDashboardRow = (row: {
     type: row.type,
     expiration_date: row.expiration_date,
     strike: row.strike,
+    multiplier: row.multiplier,
     tradable: row.tradable === 1,
     bid: row.bid,
     ask: row.ask,
     midpoint: row.midpoint,
     last: row.last,
+    volume: row.volume,
+    openInterest: row.open_interest,
+    impliedVolatility: row.implied_volatility,
+    delta: row.delta,
+    gamma: row.gamma,
+    theta: row.theta,
+    vega: row.vega,
+    rho: row.rho,
+    spreadPercentage: row.spread_percentage,
     quoteStatus,
     executable,
     executablePrice: executable ? row.executable_price : null,
     executablePriceSource: executable ? row.executable_price_source : null,
     rejectionReason,
+    rejectionReasons: decisionSnapshot.rejectionReasons,
     quoteTimestamp: row.quote_timestamp,
+    quoteAgeMs: row.quote_age_ms,
+    snapshotTimestamp: row.snapshot_timestamp,
+    source: row.source,
+    sourceFeed: row.source_feed,
+    normalizationPath: row.normalization_path,
+    daysToExpiration: decisionSnapshot.daysToExpiration,
+    underlyingPrice: decisionSnapshot.underlyingPrice,
+    underlyingPriceSource: decisionSnapshot.underlyingPriceSource,
+    greekAvailability: decisionSnapshot.availability.greeks,
+    dataQualityStatus: decisionSnapshot.dataQualityStatus,
+    strategyUse: decisionSnapshot.strategyUse,
+    decisionUse: decisionSnapshot.decisionUse,
+    decisionSnapshot,
     timestamp: row.timestamp,
     displayCategory: optionDisplayCategory({
       hasSnapshot: Boolean(row.timestamp),
@@ -450,16 +556,16 @@ const normalizeBridgeOptionContractRow = (value: unknown): OptionContractDashboa
   const row = recordValue(value);
   const quoteStatus = inferredQuoteStatus(row);
   return normalizeOptionContractDashboardRow({
-    underlying_symbol: textOrNull(row.underlying_symbol ?? row.underlyingSymbol) ?? "-",
-    option_symbol: textOrNull(row.option_symbol ?? row.optionSymbol) ?? "-",
-    type: textOrNull(row.type ?? row.optionType) ?? "-",
-    expiration_date: textOrNull(row.expiration_date ?? row.expirationDate) ?? "-",
-    strike: numberOrNull(row.strike),
-    tradable: booleanFlag(row.tradable) ? 1 : 0,
-    bid: numberOrNull(row.bid),
-    ask: numberOrNull(row.ask),
-    midpoint: numberOrNull(row.midpoint),
-    last: numberOrNull(row.last),
+    underlying_symbol: textOrNull(row.underlying_symbol ?? row.underlyingSymbol) ?? "-"(:
+    option_symbol: textOrNull(row.option_symbol ?? row.optionSymbol) ?? "-"
+    type: textOrNull(row.type ?? row.optionType) ?? "-"
+    expiration_date: textOrNull(row.expiration_date ?? row.expirationDate) ?? "-"
+    strike: numberOrNull(row.strike)
+    tradable: booleanFlag(row.tradable) ? 1 : 0
+    bid: numberOrNull(row.bid)
+    ask: numberOrNull(row.ask)
+    midpoint: numberOrNull(row.midpoint)
+    last: numberOrNull(row.last)
     quote_status: quoteStatus,
     executable: booleanFlag(row.executable) ? 1 : 0,
     executable_price: numberOrNull(row.executable_price ?? row.executablePrice),
@@ -471,11 +577,102 @@ const normalizeBridgeOptionContractRow = (value: unknown): OptionContractDashboa
 };
 
 export const latestOptionContracts = async (limit = 10) =>
+codex/option-greek-observability
+  shouldUseVercelReadOnlyFallback()
+    ? []
+    : isPaperDashboardBridgeEnabled()
+      ? getPaperBridgeSummary().then((summary) => clampRows(summary.optionContracts, limit))
+    : queryAllRows<{
+        underlying_symbol: string;
+        option_symbol: string;
+        type: string;
+        expiration_date: string;
+        strike: number | null;
+        multiplier: number | null;
+        tradable: number;
+        bid: number | null;
+        ask: number | null;
+        midpoint: number | null;
+        last: number | null;
+        quote_status: string | null;
+        executable: number | null;
+        executable_price: number | null;
+        executable_price_source: string | null;
+        rejection_reason: string | null;
+        quote_timestamp: string | null;
+        quote_age_ms: number | null;
+        snapshot_timestamp: string | null;
+        source: string | null;
+        source_feed: string | null;
+        normalization_path: string | null;
+        days_to_expiration: number | null;
+        volume: number | null;
+        open_interest: number | null;
+        implied_volatility: number | null;
+        delta: number | null;
+        gamma: number | null;
+        theta: number | null;
+        vega: number | null;
+        rho: number | null;
+        spread_percentage: number | null;
+        timestamp: string | null;
+      }>(
+        `
+        SELECT
+          c.underlying_symbol,
+          c.option_symbol,
+          c.type,
+          c.expiration_date,
+          c.strike,
+          c.multiplier,
+          c.tradable,
+          s.bid,
+          s.ask,
+          s.midpoint,
+          s.last,
+          s.quote_status,
+          s.executable,
+          s.executable_price,
+          s.executable_price_source,
+          s.rejection_reason,
+          s.quote_timestamp,
+          s.quote_age_ms,
+          s.snapshot_timestamp,
+          s.source,
+          s.source_feed,
+          s.normalization_path,
+          s.days_to_expiration,
+          s.volume,
+          s.open_interest,
+          s.implied_volatility,
+          s.delta,
+          s.gamma,
+          s.theta,
+          s.vega,
+          s.rho,
+          s.spread_percentage,
+          s.timestamp
+        FROM option_contracts c
+        LEFT JOIN option_snapshots s
+          ON s.option_symbol = c.option_symbol
+          AND s.timestamp = (
+            SELECT MAX(timestamp)
+            FROM option_snapshots
+            WHERE option_symbol = c.option_symbol
+          )
+        ORDER BY COALESCE(s.timestamp, c.expiration_date) DESC
+        LIMIT ?
+        `,
+        [safeLimit(limit, 10, 50)]
+      ).then((rows) => rows.map(normalizeOptionContractDashboardRow));
+
   isPaperDashboardBridgeEnabled()
     ? getPaperBridgeSummary().then((summary) =>
         clampRows(summary.optionContracts, limit).map(normalizeBridgeOptionContractRow)
       )
     : [];
+
+main
 
 export const latestOpenOrders = async (limit = 12) =>
   isPaperDashboardBridgeEnabled()
@@ -749,6 +946,87 @@ export const latestHedgeLearningStatus = async () => {
 };
 
 export const buildCachedDashboardSnapshot = async (): Promise<DashboardSnapshot> => {
+<
+  const state = assertPaperDashboardAccess();
+
+  const [account, positions, openOrders, latestResearch, latestPlans, executions, snapshots, requestIds, optionContracts] =
+    await Promise.all([
+      captureWithTimeout("account", () => getAlpacaAccountSnapshot()),
+      captureWithTimeout("positions", () => listAlpacaPositions()),
+      captureWithTimeout("openOrders", () => listAlpacaOpenOrders()),
+      rowsOrEmpty(() => latestResearchRuns(5)),
+      rowsOrEmpty(() => latestPaperPlans(10)),
+      captureWithTimeout("executions", () => latestPaperExecutions(25)),
+      rowsOrEmpty(() => latestPaperRecommendationSnapshots(10)),
+      rowsOrEmpty(() => latestApiRequestIds(12)),
+      rowsOrEmpty(() => latestOptionContracts(10))
+    ]);
+
+  const [reviewDryRun, learningSummary, promotionReadiness, hedge] = await Promise.all([
+    captureWithTimeout("review", () => cachedReviewAndDryRun(), 3_000),
+    captureWithTimeout("learningSummary", async () => {
+      const { paperLearningSummary } = await import(
+        "../../../src/services/paperLearningLedgerService"
+      );
+      return paperLearningSummary();
+    }, 3_000),
+    Promise.resolve()
+      .then(async () => {
+        const service = await import("../../../src/services/paperLearningLedgerService");
+        return service.buildPromotionReadinessAnalytics();
+      })
+      .catch(() => []),
+    captureWithTimeout(
+      "hedge",
+      () => latestHedgeDashboardRecommendation(),
+      3_000
+    )
+  ]);
+
+  const review =
+    reviewDryRun.ok
+      ? reviewDryRun.data.review
+      : {
+          ok: false as const,
+          label: "review",
+          error: reviewDryRun.error
+        };
+  const dryRun =
+    reviewDryRun.ok
+      ? reviewDryRun.data.dryRun
+      : {
+          ok: false as const,
+          label: "dryRun",
+          error: reviewDryRun.error
+        };
+
+  return {
+    paperOnly: true,
+    environment: state.alpacaEnv,
+    liveTradingEnabled: state.liveTradingEnabled,
+    generatedAt: new Date().toISOString(),
+    mode: "vps-cached-summary",
+    historicalDataAvailable: true,
+    durableStorageConfigured: false,
+    historicalWarning: null,
+    durableStorageWarning: null,
+    account,
+    positions,
+    runtime: cachedSummaryUnavailable("runtime"),
+    plan: cachedPlanResult(latestPlans),
+    review,
+    dryRun,
+    openOrders,
+    latestResearch,
+    latestPaperPlans: latestPlans,
+    snapshots,
+    executions,
+    learningSummary,
+    promotionReadiness: Array.isArray(promotionReadiness) ? promotionReadiness : [],
+    optionContracts,
+    requestIds,
+    hedge
+  } as DashboardSnapshot;
   throw new Error("DASHBOARD_POSTGRES_BRIDGE_REQUIRED");
 };
 

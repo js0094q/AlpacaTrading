@@ -11,6 +11,10 @@ import {
   type DashboardSnapshot,
   type ZeroDteDashboardSummary
 } from "../lib/data";
+import {
+  formatOptionDecisionField,
+  formatOptionEvidenceValue
+} from "../../../src/services/optionDecisionEvidenceService";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -427,14 +431,40 @@ export default async function DashboardPage() {
               <span>Price Source</span>
             </div>
             {optionRows.slice(0, 10).map((entry) => (
-              <div className="option-row" key={entry.option_symbol}>
-                <span>{entry.displayCategory}</span>
-                <strong>{entry.option_symbol}</strong>
-                <span>{entry.quoteStatus}</span>
-                <span>{String(entry.executable)}</span>
-                <span>{entry.rejectionReason || "-"}</span>
-                <span className="mono">{optionPrice(entry.executablePrice)}</span>
-                <span>{entry.executablePriceSource || "-"}</span>
+              <div key={entry.option_symbol}>
+                <div className="option-row">
+                  <span>{entry.displayCategory}</span>
+                  <strong>{entry.option_symbol}</strong>
+                  <span>{entry.quoteStatus}</span>
+                  <span>{String(entry.executable)}</span>
+                  <span>{entry.rejectionReason || "-"}</span>
+                  <span className="mono">{optionPrice(entry.executablePrice)}</span>
+                  <span>{entry.executablePriceSource || "-"}</span>
+                </div>
+                <div className="option-evidence-grid">
+                  <span><b>Underlying Price</b>{formatOptionDecisionField(entry.decisionUse.underlyingPrice)}</span>
+                  <span><b>Strike</b>{formatOptionDecisionField(entry.decisionUse.strike)}</span>
+                  <span><b>Days to Expiration</b>{formatOptionDecisionField(entry.decisionUse.daysToExpiration)}</span>
+                  <span><b>Delta</b>{formatOptionDecisionField(entry.decisionUse.delta)}</span>
+                  <span><b>Gamma</b>{formatOptionDecisionField(entry.decisionUse.gamma)}</span>
+                  <span><b>Theta</b>{formatOptionDecisionField(entry.decisionUse.theta)}</span>
+                  <span><b>Vega</b>{formatOptionDecisionField(entry.decisionUse.vega)}</span>
+                  <span><b>Rho</b>{formatOptionDecisionField(entry.decisionUse.rho)}</span>
+                  <span><b>Implied Volatility</b>{formatOptionDecisionField(entry.decisionUse.impliedVolatility)}</span>
+                  <span><b>Bid</b>{formatOptionDecisionField(entry.decisionUse.bid)}</span>
+                  <span><b>Ask</b>{formatOptionDecisionField(entry.decisionUse.ask)}</span>
+                  <span><b>Midpoint</b>{formatOptionDecisionField(entry.decisionUse.midpoint)}</span>
+                  <span><b>Last Price</b>{formatOptionDecisionField(entry.decisionUse.last)}</span>
+                  <span><b>Spread %</b>{formatOptionDecisionField(entry.decisionUse.spreadPercentage, "%")}</span>
+                  <span><b>Open Interest</b>{formatOptionDecisionField(entry.decisionUse.openInterest)}</span>
+                  <span><b>Volume</b>{formatOptionDecisionField(entry.decisionUse.volume)}</span>
+                  <span><b>Quote Timestamp</b>{formatOptionEvidenceValue(entry.quoteTimestamp, entry.decisionSnapshot.availability.quote)}</span>
+                  <span><b>Quote Age</b>{formatOptionDecisionField(entry.decisionUse.quoteAgeMs, " ms")}</span>
+                  <span><b>Data Source</b>{entry.sourceFeed || entry.source || formatOptionEvidenceValue(null, entry.decisionSnapshot.availability.snapshot)}</span>
+                  <span><b>Greek Status</b>{entry.greekAvailability} · {entry.dataQualityStatus}</span>
+                  <span><b>Decision Use</b>Each value includes used, retrieved-but-unused, unavailable, stale, or invalid status.</span>
+                  <span className="option-evidence-reason"><b>Rejection Reason</b>{entry.rejectionReasons.join(", ") || "-"}</span>
+                </div>
               </div>
             ))}
             {!optionRows.length ? <p className="subtle">No option contracts discovered.</p> : null}

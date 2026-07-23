@@ -4,6 +4,11 @@ import { getActiveSymbols, seedInitialUniverse } from "./universeService.js";
 import { normalizeSymbol } from "../lib/utils.js";
 import { sma, ema, rollingStd, rsi, atr, macd, classifyTrend, distanceFrom } from "./indicators.js";
 import { getLatestStockObservationFeatures } from "./stockObservationService.js";
+import { optionsQuoteConfig } from "./optionQuoteNormalizer.js";
+import {
+  buildOptionDecisionSnapshot,
+  type OptionDecisionSnapshotEvidence
+} from "./optionDecisionEvidenceService.js";
 import type { Timeframe, FeatureSnapshotRow } from "../types.js";
 
 const parseFeatureRow = (row: Record<string, unknown>): FeatureSnapshotRow => {
@@ -22,13 +27,33 @@ type OptionQuoteRow = {
   type: "call" | "put";
   expirationDate: string;
   strike: number;
+  multiplier: number | null;
+  timestamp: string;
+  daysToExpiration: number | null;
   bid: number | null;
   ask: number | null;
   midpoint: number | null;
+  last: number | null;
+  quoteStatus: string | null;
+  executable: number | null;
+  executablePrice: number | null;
+  executablePriceSource: string | null;
+  rejectionReason: string | null;
+  quoteTimestamp: string | null;
+  quoteAgeMs: number | null;
   impliedVolatility: number | null;
   volume: number | null;
   openInterest: number | null;
   delta: number | null;
+  gamma: number | null;
+  theta: number | null;
+  vega: number | null;
+  rho: number | null;
+  snapshotTimestamp: string | null;
+  normalizationPath: string | null;
+  source: string | null;
+  sourceFeed: string | null;
+  spreadPercentage: number | null;
 };
 
 type HistoricalIvRow = {
@@ -51,8 +76,38 @@ const readLatestContractRows = (symbol: string): OptionQuoteRow[] => {
   return getDb()
     .prepare(
       `
-      SELECT c.option_symbol, c.type, c.expiration_date, c.strike,
-             s.bid, s.ask, s.midpoint, s.implied_volatility, s.volume, s.open_interest, s.delta
+      SELECT
+        c.option_symbol AS "optionSymbol",
+        c.type,
+        c.expiration_date AS "expirationDate",
+        c.strike,
+        c.multiplier,
+        s.bid,
+        s.ask,
+        s.midpoint,
+        s.last,
+        s.timestamp,
+        s.quote_status AS "quoteStatus",
+        s.executable,
+        s.executable_price AS "executablePrice",
+        s.executable_price_source AS "executablePriceSource",
+        s.rejection_reason AS "rejectionReason",
+        s.quote_timestamp AS "quoteTimestamp",
+        s.quote_age_ms AS "quoteAgeMs",
+        s.days_to_expiration AS "daysToExpiration",
+        s.implied_volatility AS "impliedVolatility",
+        s.volume,
+        s.open_interest AS "openInterest",
+        s.delta,
+        s.gamma,
+        s.theta,
+        s.vega,
+        s.rho,
+        s.snapshot_timestamp AS "snapshotTimestamp",
+        s.normalization_path AS "normalizationPath",
+        s.source,
+        s.source_feed AS "sourceFeed",
+        s.spread_percentage AS "spreadPercentage"
       FROM option_contracts AS c
       LEFT JOIN option_snapshots AS s
         ON s.option_symbol = c.option_symbol
@@ -146,6 +201,7 @@ const buildOptionFeatures = (
   estimatedBidAskSpreadPct: number | null;
   preferredContractLiquidityScore: number;
   optionSuitability: "suitable" | "marginal" | "unsuitable" | "insufficient_data";
+  optionDecisionSnapshot: OptionDecisionSnapshotEvidence;
 } => {
   const asOfTs = parseDate(asOf);
   const rows = getLatestContractRows(symbol, context).filter((row) =>
@@ -164,7 +220,15 @@ const buildOptionFeatures = (
       putSpreadAvailable: 0,
       estimatedBidAskSpreadPct: null,
       preferredContractLiquidityScore: 0,
-      optionSuitability: "insufficient_data"
+      optionSuitability: "insufficient_data",
+      optionDecisionSnapshot: buildOptionDecisionSnapshot({
+        contract: null,
+        snapshot: null,
+        decisionTimestamp: asOf,
+        underlyingPrice: close,
+        underlyingPriceSource: "stock_bar_close",
+        maxQuoteAgeMs: optionsQuoteConfig().maxAgeMs
+      })
     };
   }
 
@@ -184,7 +248,15 @@ const buildOptionFeatures = (
       putSpreadAvailable: 0,
       estimatedBidAskSpreadPct: null,
       preferredContractLiquidityScore: 0,
-      optionSuitability: "insufficient_data"
+      optionSuitability: "insufficient_data",
+      optionDecisionSnapshot: buildOptionDecisionSnapshot({
+        contract: null,
+        snapshot: null,
+        decisionTimestamp: asOf,
+        underlyingPrice: close,
+        underlyingPriceSource: "stock_bar_close",
+        maxQuoteAgeMs: optionsQuoteConfig().maxAgeMs
+      })
     };
   }
 
@@ -241,6 +313,62 @@ const buildOptionFeatures = (
     Math.round((nearestTs - asOfTs) / (24 * 60 * 60 * 1000))
   );
 
+  const optionDecisionSnapshot = buildOptionDecisionSnapshot({
+    contract: selected
+      ? {
+          optionSymbol: selected.optionSymbol,
+          underlyingSymbol: symbol,
+          type: selected.type,
+          expirationDate: selected.expirationDate,
+          strike: selected.strike,
+          multiplier: selected.multiplier
+        }
+      : null,
+    snapshot: selected
+      ? {
+          optionSymbol: selected.optionSymbol,
+          underlyingSymbol: symbol,
+          timestamp: selected.timestamp,
+          bid: selected.bid,
+          ask: selected.ask,
+          midpoint: selected.midpoint,
+          last: selected.last,
+          quoteStatus: selected.quoteStatus,
+          executable: selected.executable,
+          executablePrice: selected.executablePrice,
+          executablePriceSource: selected.executablePriceSource,
+          rejectionReason: selected.rejectionReason,
+          quoteTimestamp: selected.quoteTimestamp,
+          quoteAgeMs: selected.quoteAgeMs,
+          volume: selected.volume,
+          openInterest: selected.openInterest,
+          impliedVolatility: selected.impliedVolatility,
+          delta: selected.delta,
+          gamma: selected.gamma,
+          theta: selected.theta,
+          vega: selected.vega,
+          rho: selected.rho,
+          snapshotTimestamp: selected.snapshotTimestamp,
+          normalizationPath: selected.normalizationPath,
+          source: selected.source,
+          sourceFeed: selected.sourceFeed,
+          spreadPercentage: selected.spreadPercentage
+        }
+      : null,
+    decisionTimestamp: asOf,
+    daysToExpiration: selected?.daysToExpiration ?? null,
+    underlyingPrice: close,
+    underlyingPriceSource: "stock_bar_close",
+    derived: {
+      spreadPercentage: selected?.spreadPercentage ?? null,
+      liquidityScore: preferredContractLiquidityScore,
+      ivPercentile,
+      candidateScore: null
+    },
+    selectionBinding: selected ? "nearest_contract_feature_snapshot" : "not_bound",
+    maxQuoteAgeMs: optionsQuoteConfig().maxAgeMs
+  });
+
   return {
     nearestExpiration,
     daysToExpiration,
@@ -252,7 +380,8 @@ const buildOptionFeatures = (
     putSpreadAvailable,
     estimatedBidAskSpreadPct,
     preferredContractLiquidityScore,
-    optionSuitability
+    optionSuitability,
+    optionDecisionSnapshot
   };
 };
 
@@ -269,10 +398,10 @@ interface BarRecord {
 interface FeatureMap {
   symbol: string;
   timestamp: string;
-  features: Record<string, number | string | null>;
+  features: Record<string, unknown>;
 }
 
-const featureRow = (symbol: string, timestamp: string, values: Record<string, number | string | null>): FeatureMap => ({
+const featureRow = (symbol: string, timestamp: string, values: Record<string, unknown>): FeatureMap => ({
   symbol,
   timestamp,
   features: values
@@ -402,7 +531,8 @@ const calculateRows = (
         putSpreadAvailable: optionMetrics.putSpreadAvailable,
         estimatedBidAskSpreadPct: optionMetrics.estimatedBidAskSpreadPct,
         preferredContractLiquidityScore: optionMetrics.preferredContractLiquidityScore,
-        optionSuitability: optionMetrics.optionSuitability
+        optionSuitability: optionMetrics.optionSuitability,
+        optionDecisionSnapshot: optionMetrics.optionDecisionSnapshot
       })
     );
   }

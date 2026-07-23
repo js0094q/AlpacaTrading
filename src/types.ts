@@ -271,6 +271,11 @@ export type ExitReasonCode = string & { readonly [exitReasonCodeBrand]: true };
 export type DataQualityStatus = string & {
   readonly [dataQualityStatusBrand]: true;
 };
+export type JsonPrimitive = boolean | number | string | null;
+export type JsonValue =
+  | JsonPrimitive
+  | JsonValue[]
+  | { readonly [key: string]: JsonValue };
 export type OutcomeCompletenessStatus =
   | "COMPLETE"
   | "PARTIAL"
@@ -324,7 +329,7 @@ export interface CandidateDecisionRecord extends Omit<PaperTradeCandidateRow, "r
   decision: CandidateDecision;
   decisionReason: string;
   strategyFamily: string;
-  signalInputs: Record<string, string | number | null>;
+  signalInputs: Record<string, JsonValue>;
   dataQualityStatus: string;
 }
 

@@ -366,6 +366,34 @@ button {
   font-weight: 700;
 }
 
+.option-evidence-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(120px, 1fr));
+  gap: 8px 12px;
+  min-width: 900px;
+  padding: 10px 0 12px 106px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.option-evidence-grid span {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.option-evidence-grid b {
+  color: var(--text);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.option-evidence-reason {
+  grid-column: span 2;
+}
+
 .actions {
   display: flex;
   flex-wrap: wrap;
