@@ -417,6 +417,86 @@ test("refresh rejects stale option evidence, persists ingestion telemetry, and r
   });
 });
 
+test("optional stale option evidence still persists a symbol-specific rejection reason", async () => {
+  const ingestionRuns: Array<Record<string, unknown>> = [];
+  const result = await refreshPostgresMarketData({
+    symbols: ["MSFT"],
+    timeframe: "1Day",
+    start: "2026-01-01T00:00:00.000Z",
+    end: "2026-07-20T23:59:59.999Z",
+    optionsEnabled: true,
+    requiredOptionUnderlyings: [],
+    now: new Date("2026-07-20T20:05:00.000Z"),
+    repository: {
+      upsertUniverseSymbols: async (rows: unknown[]) => ({ stored: rows.length }),
+      upsertBars: async (rows: unknown[]) => ({ stored: rows.length }),
+      upsertStockSnapshots: async (rows: unknown[]) => ({ stored: rows.length }),
+      upsertOptionContracts: async (rows: unknown[]) => ({ stored: rows.length }),
+      upsertOptionSnapshots: async (rows: unknown[]) => ({ stored: rows.length }),
+      listOptionContractsBySymbols: async () => [],
+      listOptionSnapshotsByIdentity: async () => [],
+      recordMarketDataIngestionRun: async (run: Record<string, unknown>) => {
+        ingestionRuns.push(run);
+        return { stored: 1 };
+      }
+    } as never,
+    context,
+    dependencies: {
+      fetchAllBars: async () => [{
+        symbol: "MSFT",
+        bar: { t: "2026-07-20T20:00:00.000Z", o: 510, h: 515, l: 508, c: 514, v: 900_000 },
+        requestIds: ["request-bars"]
+      }],
+      fetchStockSnapshots: async () => [{
+        symbol: "MSFT",
+        raw: stockRaw,
+        requestedFeed: "sip",
+        effectiveFeed: "sip",
+        currency: "USD",
+        requestId: "request-stocks"
+      }],
+      fetchOptionContracts: async () => [{
+        symbol: "MSFT260720C00515000",
+        underlying_symbol: "MSFT",
+        type: "call",
+        expiration_date: "2026-07-20",
+        strike_price: "515",
+        multiplier: "100",
+        status: "active",
+        tradable: true
+      }],
+      fetchOptionSnapshots: async () => [],
+      fetchOptionChainSnapshots: async () => ({
+        underlyingSymbol: "MSFT",
+        pagesConsumed: 1,
+        snapshots: [{
+          symbol: "MSFT260720C00515000",
+          raw: {
+            snapshotTimestamp: "2026-07-10T20:00:02.000Z",
+            latestQuote: { bp: 1.2, ap: 1.3, t: "2026-07-10T20:00:02.000Z" }
+          },
+          requestId: "request-options",
+          endpoint: "/v1beta1/options/snapshots/MSFT?feed=opra&limit=1000",
+          underlyingSymbol: "MSFT",
+          requestedFeed: "opra",
+          effectiveFeed: "opra",
+          pageToken: null,
+          retrievedAt: "2026-07-20T20:05:00.000Z"
+        }]
+      })
+    }
+  });
+
+  assert.equal(result.optionSnapshots.length, 0);
+  assert.deepEqual(result.summary.optionDataRejectionReasons, []);
+  assert.equal(ingestionRuns.length, 1);
+  assert.equal(
+    ingestionRuns[0]?.rejectionReason,
+    "POSTGRES_OPTION_SNAPSHOTS_CURRENT_MISSING:MSFT"
+  );
+  assert.equal(ingestionRuns[0]?.persistenceResult, "not_persisted_stale");
+});
+
 test("an unavailable OPRA endpoint records the failure and does not block current equity research", async () => {
   const ingestionRuns: Array<Record<string, unknown>> = [];
   const result = await refreshPostgresMarketData({

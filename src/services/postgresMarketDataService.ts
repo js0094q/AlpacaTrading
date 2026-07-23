@@ -577,10 +577,12 @@ export const refreshPostgresMarketData = async (input: {
       }
       optionSnapshotsByUnderlying[underlying] = acceptedRows;
       freshOptionSnapshotsByUnderlying[underlying] = acceptedRows;
-      const rejectionReason = requiredOptionUnderlyingSet.has(underlying) && acceptedRows === 0
+      const rejectionReason = acceptedRows === 0
         ? `POSTGRES_OPTION_SNAPSHOTS_CURRENT_MISSING:${underlying}`
         : null;
-      if (rejectionReason) optionDataRejectionReasons.push(rejectionReason);
+      if (rejectionReason && requiredOptionUnderlyingSet.has(underlying)) {
+        optionDataRejectionReasons.push(rejectionReason);
+      }
       const orderedProviderTimestamps = providerTimestamps
         .filter((timestamp) => Number.isFinite(Date.parse(timestamp)))
         .sort((left, right) => Date.parse(left) - Date.parse(right));
