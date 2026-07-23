@@ -41,6 +41,15 @@ candidate persists its pass/fail reason and decision inputs; review, sizing,
 execution, and execution-defer reasons advance `candidates.lifecycle_status`
 and `candidates.decision_reason`.
 
+Exploration v2 lowers only paper candidate-selection gates from the deployed v1
+profile: direction score `0.15` to `0.05`, directional confidence `0.25` to
+`0.10`, option liquidity `0.35` to `0.10`, long-option confidence `0.40` to
+`0.25`, aggressive-option confidence `0.60` to `0.40`, defined-risk confidence
+`0.70` to `0.50`, option expected return `0.75%` to `0.25%`, and defined-risk
+expected return `1.00%` to `0.50%`. Maximum option spread increases from `12%`
+to `15%`. Candidate count remains `25` and maximum order notional remains
+`$1,000`.
+
 The profile does not change the 1,200-second OPRA freshness limit, the
 regular-session stock-evidence gate, the 50-bar indicator requirement, required
 option fields, paper/live enforcement, PostgreSQL authority, reconciliation,

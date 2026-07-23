@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { paperExplorationThresholds } from "../src/services/paperExplorationConfig.js";
 import { runPostgresResearchWorkflow } from "../src/services/postgresResearchWorkflowService.js";
+
+const paperEnv = {
+  ALPACA_ENV: "paper",
+  TRADING_MODE: "paper",
+  ALPACA_LIVE_TRADE: "false",
+  LIVE_TRADING_ENABLED: "false"
+};
 
 const fence = {
   jobName: "research",
@@ -124,6 +132,7 @@ test("paper exploration persists selected and rejected candidate decisions with 
     riskProfile: "aggressive",
     optionsEnabled: false,
     maxCandidates: 25,
+    explorationThresholds: paperExplorationThresholds(paperEnv),
     now: new Date("2026-07-20T22:00:00.000Z"),
     dependencies: {
       refreshMarketData: async () => ({
@@ -158,18 +167,18 @@ test("paper exploration persists selected and rejected candidate decisions with 
   assert.equal(candidateRows[1]?.[23], "DIRECTION_THRESHOLD_NOT_MET");
   assert.deepEqual(researchConfig.explorationProfile, {
     scope: "paper_only",
-    profile: "exploration_v1",
+    profile: "exploration_v2",
     thresholds: {
-      directionScore: { previous: 0.25, current: 0.15 },
-      directionalConfidence: { previous: 0.35, current: 0.25 },
-      optionLiquidityScore: { previous: 0.5, current: 0.35 },
-      maxOptionSpreadPct: { previous: 0.08, current: 0.12 },
-      longOptionConfidence: { previous: 0.5, current: 0.4 },
-      aggressiveOptionConfidence: { previous: 0.7, current: 0.6 },
-      definedRiskConfidence: { previous: 0.8, current: 0.7 },
-      optionExpectedReturnPct: { previous: 1, current: 0.75 },
-      definedRiskExpectedReturnPct: { previous: 1.5, current: 1 },
-      maxCandidates: { previous: 10, current: 25 },
+      directionScore: { previous: 0.15, current: 0.05 },
+      directionalConfidence: { previous: 0.25, current: 0.1 },
+      optionLiquidityScore: { previous: 0.35, current: 0.1 },
+      maxOptionSpreadPct: { previous: 0.12, current: 0.15 },
+      longOptionConfidence: { previous: 0.4, current: 0.25 },
+      aggressiveOptionConfidence: { previous: 0.6, current: 0.4 },
+      definedRiskConfidence: { previous: 0.7, current: 0.5 },
+      optionExpectedReturnPct: { previous: 0.75, current: 0.25 },
+      definedRiskExpectedReturnPct: { previous: 1, current: 0.5 },
+      maxCandidates: { previous: 25, current: 25 },
       maxOrderNotional: { previous: 1_000, current: 1_000 }
     }
   });

@@ -133,7 +133,14 @@ const buildOptionFeaturesFixture = (input: {
   optionSnapshots: input.snapshots,
   riskProfile: "aggressive",
   optionsEnabled: true,
-  ...(input.exploration ? { decisionThresholds: paperExplorationThresholds({}) } : {}),
+  ...(input.exploration ? {
+    decisionThresholds: paperExplorationThresholds({
+      ALPACA_ENV: "paper",
+      TRADING_MODE: "paper",
+      ALPACA_LIVE_TRADE: "false",
+      LIVE_TRADING_ENABLED: "false"
+    })
+  } : {}),
   repository: {
     upsertFeatureSnapshots: async (rows: unknown[]) => ({ stored: rows.length }),
     upsertTargetSnapshots: async (rows: unknown[]) => ({ stored: rows.length })

@@ -29,6 +29,34 @@ export const BASELINE_DECISION_THRESHOLDS: PaperExplorationThresholds = {
   maxOrderNotional: 1_000
 };
 
+export const PAPER_EXPLORATION_V1_THRESHOLDS: PaperExplorationThresholds = {
+  directionScore: 0.15,
+  minimumDirectionalConfidence: 0.25,
+  minimumOptionLiquidityScore: 0.35,
+  maximumOptionSpreadPct: 0.12,
+  minimumLongOptionConfidence: 0.4,
+  minimumAggressiveOptionConfidence: 0.6,
+  minimumDefinedRiskConfidence: 0.7,
+  minimumOptionExpectedReturnPct: 0.75,
+  minimumDefinedRiskExpectedReturnPct: 1,
+  maxCandidates: 25,
+  maxOrderNotional: 1_000
+};
+
+export const PAPER_EXPLORATION_V2_THRESHOLDS: PaperExplorationThresholds = {
+  directionScore: 0.05,
+  minimumDirectionalConfidence: 0.1,
+  minimumOptionLiquidityScore: 0.1,
+  maximumOptionSpreadPct: 0.15,
+  minimumLongOptionConfidence: 0.25,
+  minimumAggressiveOptionConfidence: 0.4,
+  minimumDefinedRiskConfidence: 0.5,
+  minimumOptionExpectedReturnPct: 0.25,
+  minimumDefinedRiskExpectedReturnPct: 0.5,
+  maxCandidates: 25,
+  maxOrderNotional: 1_000
+};
+
 const boundedNumber = (
   value: string | undefined,
   fallback: number,
@@ -53,83 +81,82 @@ const boundedInteger = (
     : fallback;
 };
 
-const enabled = (value: string | undefined) =>
-  value?.trim().toLowerCase() === "true" || value?.trim() === "1";
+const normalized = (value: string | undefined) => value?.trim().toLowerCase();
 
-const explicitlyOutsidePaperMode = (env: NodeJS.ProcessEnv) =>
-  env.ALPACA_ENV?.trim().toLowerCase() === "live" ||
-  env.TRADING_MODE?.trim().toLowerCase() === "live" ||
-  enabled(env.ALPACA_LIVE_TRADE) ||
-  enabled(env.LIVE_TRADING_ENABLED);
+const explicitlyPaperOnly = (env: NodeJS.ProcessEnv) =>
+  normalized(env.ALPACA_ENV) === "paper" &&
+  normalized(env.TRADING_MODE) === "paper" &&
+  normalized(env.ALPACA_LIVE_TRADE) === "false" &&
+  normalized(env.LIVE_TRADING_ENABLED) === "false";
 
 export const paperExplorationThresholds = (
   env: NodeJS.ProcessEnv = process.env
 ): PaperExplorationThresholds => {
-  if (explicitlyOutsidePaperMode(env)) return { ...BASELINE_DECISION_THRESHOLDS };
+  if (!explicitlyPaperOnly(env)) return { ...BASELINE_DECISION_THRESHOLDS };
   return {
     directionScore: boundedNumber(
       env.PAPER_EXPLORATION_DIRECTION_SCORE,
-      0.15,
+      PAPER_EXPLORATION_V2_THRESHOLDS.directionScore,
       0.05,
       BASELINE_DECISION_THRESHOLDS.directionScore
     ),
     minimumDirectionalConfidence: boundedNumber(
       env.PAPER_EXPLORATION_MIN_DIRECTIONAL_CONFIDENCE,
-      0.25,
+      PAPER_EXPLORATION_V2_THRESHOLDS.minimumDirectionalConfidence,
       0.1,
       BASELINE_DECISION_THRESHOLDS.minimumDirectionalConfidence
     ),
     minimumOptionLiquidityScore: boundedNumber(
       env.PAPER_EXPLORATION_MIN_OPTION_LIQUIDITY_SCORE,
-      0.35,
+      PAPER_EXPLORATION_V2_THRESHOLDS.minimumOptionLiquidityScore,
       0.1,
       BASELINE_DECISION_THRESHOLDS.minimumOptionLiquidityScore
     ),
     maximumOptionSpreadPct: boundedNumber(
       env.PAPER_EXPLORATION_MAX_OPTION_SPREAD_PCT,
-      0.12,
+      PAPER_EXPLORATION_V2_THRESHOLDS.maximumOptionSpreadPct,
       BASELINE_DECISION_THRESHOLDS.maximumOptionSpreadPct,
       0.15
     ),
     minimumLongOptionConfidence: boundedNumber(
       env.PAPER_EXPLORATION_MIN_LONG_OPTION_CONFIDENCE,
-      0.4,
+      PAPER_EXPLORATION_V2_THRESHOLDS.minimumLongOptionConfidence,
       0.25,
       BASELINE_DECISION_THRESHOLDS.minimumLongOptionConfidence
     ),
     minimumAggressiveOptionConfidence: boundedNumber(
       env.PAPER_EXPLORATION_MIN_AGGRESSIVE_OPTION_CONFIDENCE,
-      0.6,
+      PAPER_EXPLORATION_V2_THRESHOLDS.minimumAggressiveOptionConfidence,
       0.4,
       BASELINE_DECISION_THRESHOLDS.minimumAggressiveOptionConfidence
     ),
     minimumDefinedRiskConfidence: boundedNumber(
       env.PAPER_EXPLORATION_MIN_DEFINED_RISK_CONFIDENCE,
-      0.7,
+      PAPER_EXPLORATION_V2_THRESHOLDS.minimumDefinedRiskConfidence,
       0.5,
       BASELINE_DECISION_THRESHOLDS.minimumDefinedRiskConfidence
     ),
     minimumOptionExpectedReturnPct: boundedNumber(
       env.PAPER_EXPLORATION_MIN_OPTION_EXPECTED_RETURN_PCT,
-      0.75,
+      PAPER_EXPLORATION_V2_THRESHOLDS.minimumOptionExpectedReturnPct,
       0.25,
       BASELINE_DECISION_THRESHOLDS.minimumOptionExpectedReturnPct
     ),
     minimumDefinedRiskExpectedReturnPct: boundedNumber(
       env.PAPER_EXPLORATION_MIN_DEFINED_RISK_EXPECTED_RETURN_PCT,
-      1,
+      PAPER_EXPLORATION_V2_THRESHOLDS.minimumDefinedRiskExpectedReturnPct,
       0.5,
       BASELINE_DECISION_THRESHOLDS.minimumDefinedRiskExpectedReturnPct
     ),
     maxCandidates: boundedInteger(
       env.PAPER_EXPLORATION_MAX_CANDIDATES,
-      25,
+      PAPER_EXPLORATION_V2_THRESHOLDS.maxCandidates,
       BASELINE_DECISION_THRESHOLDS.maxCandidates,
       25
     ),
     maxOrderNotional: boundedNumber(
       env.PAPER_EXPLORATION_MAX_ORDER_NOTIONAL,
-      1_000,
+      PAPER_EXPLORATION_V2_THRESHOLDS.maxOrderNotional,
       50,
       BASELINE_DECISION_THRESHOLDS.maxOrderNotional
     )
@@ -140,50 +167,50 @@ export const paperExplorationProfile = (
   thresholds: PaperExplorationThresholds = paperExplorationThresholds()
 ) => ({
   scope: "paper_only" as const,
-  profile: "exploration_v1" as const,
+  profile: "exploration_v2" as const,
   thresholds: {
     directionScore: {
-      previous: BASELINE_DECISION_THRESHOLDS.directionScore,
+      previous: PAPER_EXPLORATION_V1_THRESHOLDS.directionScore,
       current: thresholds.directionScore
     },
     directionalConfidence: {
-      previous: BASELINE_DECISION_THRESHOLDS.minimumDirectionalConfidence,
+      previous: PAPER_EXPLORATION_V1_THRESHOLDS.minimumDirectionalConfidence,
       current: thresholds.minimumDirectionalConfidence
     },
     optionLiquidityScore: {
-      previous: BASELINE_DECISION_THRESHOLDS.minimumOptionLiquidityScore,
+      previous: PAPER_EXPLORATION_V1_THRESHOLDS.minimumOptionLiquidityScore,
       current: thresholds.minimumOptionLiquidityScore
     },
     maxOptionSpreadPct: {
-      previous: BASELINE_DECISION_THRESHOLDS.maximumOptionSpreadPct,
+      previous: PAPER_EXPLORATION_V1_THRESHOLDS.maximumOptionSpreadPct,
       current: thresholds.maximumOptionSpreadPct
     },
     longOptionConfidence: {
-      previous: BASELINE_DECISION_THRESHOLDS.minimumLongOptionConfidence,
+      previous: PAPER_EXPLORATION_V1_THRESHOLDS.minimumLongOptionConfidence,
       current: thresholds.minimumLongOptionConfidence
     },
     aggressiveOptionConfidence: {
-      previous: BASELINE_DECISION_THRESHOLDS.minimumAggressiveOptionConfidence,
+      previous: PAPER_EXPLORATION_V1_THRESHOLDS.minimumAggressiveOptionConfidence,
       current: thresholds.minimumAggressiveOptionConfidence
     },
     definedRiskConfidence: {
-      previous: BASELINE_DECISION_THRESHOLDS.minimumDefinedRiskConfidence,
+      previous: PAPER_EXPLORATION_V1_THRESHOLDS.minimumDefinedRiskConfidence,
       current: thresholds.minimumDefinedRiskConfidence
     },
     optionExpectedReturnPct: {
-      previous: BASELINE_DECISION_THRESHOLDS.minimumOptionExpectedReturnPct,
+      previous: PAPER_EXPLORATION_V1_THRESHOLDS.minimumOptionExpectedReturnPct,
       current: thresholds.minimumOptionExpectedReturnPct
     },
     definedRiskExpectedReturnPct: {
-      previous: BASELINE_DECISION_THRESHOLDS.minimumDefinedRiskExpectedReturnPct,
+      previous: PAPER_EXPLORATION_V1_THRESHOLDS.minimumDefinedRiskExpectedReturnPct,
       current: thresholds.minimumDefinedRiskExpectedReturnPct
     },
     maxCandidates: {
-      previous: BASELINE_DECISION_THRESHOLDS.maxCandidates,
+      previous: PAPER_EXPLORATION_V1_THRESHOLDS.maxCandidates,
       current: thresholds.maxCandidates
     },
     maxOrderNotional: {
-      previous: BASELINE_DECISION_THRESHOLDS.maxOrderNotional,
+      previous: PAPER_EXPLORATION_V1_THRESHOLDS.maxOrderNotional,
       current: thresholds.maxOrderNotional
     }
   }

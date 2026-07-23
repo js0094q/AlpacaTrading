@@ -99,6 +99,12 @@ checkpoints.
   aggregate exposure, cash reserve, reservation, reconciliation, and duplicate
   gates. Candidate lifecycle reasons record review skips, capacity blocks,
   sizing, execution deferral/ambiguity, and successful paper submission.
+  Exploration v2 lowers only paper candidate-selection gates to direction
+  `0.05`, directional confidence `0.10`, option liquidity `0.10`, maximum option
+  spread `0.15`, long-option confidence `0.25`, aggressive-option confidence
+  `0.40`, defined-risk confidence `0.50`, option expected return `0.25%`, and
+  defined-risk expected return `0.50%`; candidate count `25` and maximum order
+  notional `$1,000` are unchanged.
 - Repeated entry-review workstreams must skip an already persisted
   candidate/account-snapshot review identity rather than create a second review
   with the same client order ID.
