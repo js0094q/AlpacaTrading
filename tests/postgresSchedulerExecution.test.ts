@@ -105,7 +105,7 @@ const abortableWaitAfterFirstTick = () => {
   };
 };
 
-test("exports bounded scheduler mappings for Release 3 workstreams", () => {
+test("exports bounded scheduler mappings for the restored autonomous workstreams", () => {
   assert.deepEqual(Object.keys(POSTGRES_SCHEDULER_JOBS), [
     "research",
     "zeroDte",
@@ -117,7 +117,12 @@ test("exports bounded scheduler mappings for Release 3 workstreams", () => {
     "allocation",
     "marketDataRefresh",
     "universeLifecycle",
-    "autonomousRecovery"
+    "autonomousRecovery",
+    "optionDiscovery",
+    "hedgeReview",
+    "hedgeExit",
+    "learning",
+    "autonomousWorkerState"
   ]);
   assert.deepEqual(POSTGRES_SCHEDULER_JOBS.marketDataRefresh, {
     jobName: "market-data-refresh",
@@ -136,7 +141,12 @@ test("exports bounded scheduler mappings for Release 3 workstreams", () => {
       "allocation",
       "market_data_refresh",
       "universe_lifecycle",
-      "autonomous_recovery"
+      "autonomous_recovery",
+      "option_discovery",
+      "hedge_review",
+      "hedge_exit",
+      "learning",
+      "autonomous_worker_state"
     ]
   );
 });

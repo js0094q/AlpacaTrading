@@ -1,3 +1,5 @@
+import { sqliteTestFixtureInitializationEnabled } from "./postgresOnlyRuntime.js";
+
 export type DatabaseBackend = "sqlite" | "postgres";
 export type DatabaseRuntime = "vercel" | "vps" | "local" | "test";
 export type DatabasePurpose = "application" | "migration" | "backfill";
@@ -118,11 +120,11 @@ export const loadDatabaseConfig = (
 ): DatabaseConfig => {
   const runtime = options.runtime || inferRuntime(environment);
   const purpose = options.purpose || "application";
-  const backendValue = environment.DATABASE_BACKEND?.trim().toLowerCase() || "sqlite";
+  const backendValue = environment.DATABASE_BACKEND?.trim().toLowerCase() || "postgres";
   if (backendValue !== "sqlite" && backendValue !== "postgres") {
     throw new DatabaseConfigurationError(
       "DATABASE_BACKEND_INVALID",
-      "DATABASE_BACKEND must be sqlite or postgres."
+      "DATABASE_BACKEND must be postgres; SQLite runtime authority is retired."
     );
   }
 
@@ -172,6 +174,33 @@ export const loadDatabaseConfig = (
       "POSTGRES_SHADOW_PREREQUISITES_REQUIRED",
       "PostgreSQL shadow comparison requires POSTGRES_READS_ENABLED and POSTGRES_WRITES_ENABLED."
     );
+  }
+
+  const testFixtureInitializationEnabled = sqliteTestFixtureInitializationEnabled();
+  if (purpose === "application" && !testFixtureInitializationEnabled) {
+    const requiredAuthorityFlags = [
+      features.postgresReads,
+      features.postgresWrites,
+      features.controlPlaneAuthority,
+      features.schedulerAuthority,
+      features.executionStateAuthority
+    ];
+    if (backendValue !== "postgres" || requiredAuthorityFlags.some((value) => !value)) {
+      throw new DatabaseConfigurationError(
+        "POSTGRES_ONLY_AUTHORITY_REQUIRED",
+        "Application runtime requires PostgreSQL reads, writes, control-plane authority, scheduler authority, and execution-state authority."
+      );
+    }
+    if (
+      features.shadowComparison ||
+      features.executionStateShadow ||
+      features.sqliteAuditMirror
+    ) {
+      throw new DatabaseConfigurationError(
+        "POSTGRES_ONLY_FALLBACK_DISABLED",
+        "SQLite mirrors, shadow comparison, and dual-authority runtime modes are disabled."
+      );
+    }
   }
   if (
     (features.controlPlaneAuthority ||

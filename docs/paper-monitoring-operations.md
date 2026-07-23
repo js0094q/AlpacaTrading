@@ -1,5 +1,11 @@
 # Paper Monitoring Operations
 
+> Retired runtime procedure as of 2026-07-20. PostgreSQL is the sole production
+> authority, and every monitor/trading timer must remain stopped pending the
+> evidence-utilization and runtime audit. Production command gating rejects the
+> workflows described below. This file is preserved only as historical design
+> evidence; do not use it as an operating runbook.
+
 This repo has two VPS scheduling layers:
 
 - `paper-ops-*` timers: legacy review-only scheduled workflows. They keep `AUTOMATED_PAPER_EXECUTION_ENABLED=false`.

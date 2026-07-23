@@ -1,5 +1,32 @@
 # Alpaca Investing VPS Bootstrap
 
+## Current PostgreSQL-only runtime boundary (2026-07-20)
+
+PostgreSQL is the sole production runtime authority. Do not run historical
+SQLite migration, backfill, reconciliation, shadow, dual-write, or fallback
+workflows. Production requires full PostgreSQL control-plane, scheduler, and
+execution-state authority with both shadow flags and the SQLite audit mirror
+off. PostgreSQL failure is terminal.
+
+After a passed fresh PostgreSQL authority checkpoint and migration 003, the
+checked-in `alpaca-autonomous-paper.service` is the sole autonomous scheduler.
+It runs all 16 workstreams through the PostgreSQL-only CLI and persists worker
+lifecycle evidence. Keep every legacy paper, research, observatory, and 0DTE
+timer disabled. Dashboard-control remains bound to `127.0.0.1:4100`.
+
+Dashboard-control reads and guarded paper actions use the PostgreSQL-only
+command and workflow services. `GET /api/v1/zero-dte/summary` reads current
+PostgreSQL candidates, option evidence, positions, and lifecycle events. The
+health route reports autonomous-worker state from persisted PostgreSQL lifecycle
+events; blocked strategy decisions remain blocked domain results. No dashboard
+route restores SQLite or a legacy runtime fallback.
+
+Before enabling the worker, run current SIP/OPRA market-data ingestion, verify
+the PostgreSQL market/feature/target/research rows, and reconcile against the
+Alpaca paper account. Missing or stale evidence is terminal for the workstream;
+unresolved ambiguous submissions remain pending. The unit hard-codes paper
+mode and live-off flags and must never be changed to a live environment.
+
 This directory prepares a Njalla-hosted Ubuntu LTS VPS for a future paper-first Alpaca investing platform. It hardens the host before any trading code, secrets, public UI, or live execution path exists.
 
 Nothing here connects to Alpaca, requests API keys, deploys trading logic, submits orders, or enables live trading.
@@ -227,24 +254,26 @@ sudo systemctl stop alpaca-zero-dte-engine.timer alpaca-zero-dte-exit-review.tim
 docker compose -f /opt/alpaca-investing/app/docker-compose.yml down
 ```
 
-For a schema-bearing release, record the prior timer state, stop affected SQLite
-writers, back up the database, and validate `db:migrate` twice on a copy. Run
-`db:migrate` once on production before restarting the control service or timers,
-then run `db:verify`. Ordinary runtime commands intentionally do not initialize
-empty databases or apply pending production migrations and fail closed with
-`DATABASE_MIGRATION_REQUIRED`.
+For a schema-bearing release, record the prior timer state and keep every
+application service stopped. Run `db:postgres:migrate` through the direct
+connection, then `db:postgres:verify`, before running the fresh authority
+cutover. Ordinary runtime commands never apply schema migrations.
 
 Neon configuration is independent of Vercel and belongs in the protected VPS
 environment file. Install only canonical `DATABASE_URL` and
 `DATABASE_URL_UNPOOLED` values from a mode-`0600` transfer fragment. Use
 `scripts/manage-postgres-env.mjs merge` with an unused protected backup path; the
 script preserves unrelated lines, ownership, and mode and prints no values.
-Delete the transfer fragment after a presence-only check. Release 2 keeps
-`DATABASE_BACKEND=sqlite` and all PostgreSQL authority flags off, so restart only
-`alpaca-dashboard-control.service` to validate pooled/direct connectivity; timer
-ownership does not move until the control-plane cutover.
+Delete the transfer fragment after a presence-only check. Set
+`DATABASE_BACKEND=postgres`, enable PostgreSQL reads/writes plus control-plane,
+scheduler, and execution-state authority, and disable both shadow flags and the
+SQLite audit mirror. Run the fresh current-state authority cutover before
+starting only `alpaca-dashboard-control.service`.
 
-The continuous paper-monitor installer also installs the independent 0DTE Level 2 services and timers. The 0DTE engine runs every minute during the configured entry window; its exit review runs every minute, reconciliation runs every five minutes, and the end-of-day summary runs after the force-exit window. Only `alpaca-zero-dte-engine.service` sets `AUTOMATED_PAPER_EXECUTION_ENABLED=true`, and it still requires the CLI `--confirmPaper` and paper-runtime gates. The other 0DTE services are read-only or mark/summarize local paper and shadow state. See `server/systemd/README.md` for the install/disable commands.
+The historical continuous-monitor units remain checked in for audit, but the
+PostgreSQL-only production command gate prevents them from running. Do not
+install or enable them during this cutover. See `server/systemd/README.md` for
+the current service boundary.
 
 ## Intentionally Not Implemented
 

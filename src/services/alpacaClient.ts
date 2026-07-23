@@ -1,5 +1,5 @@
 import { recordApiRequest } from "./apiLog.js";
-import { config } from "../config.js";
+import { alpacaRuntimeConfig } from "./alpacaRuntimeConfig.js";
 import {
   assertLiveTradingDisabled,
   assertReadOnlyAlpacaAccessAllowed,
@@ -216,8 +216,8 @@ const firstEnv = (...names: string[]) => {
 export const getAlpacaPaperCredentials = () => {
   const apiKey = firstEnv("ALPACA_PAPER_API_KEY", "ALPACA_PAPER_KEY", "ALPACA_API_KEY");
   const secretKey = firstEnv("ALPACA_PAPER_SECRET_KEY", "ALPACA_PAPER_SECRET", "ALPACA_SECRET_KEY");
-  const baseUrl = firstEnv("ALPACA_PAPER_BASE_URL") || config.alpaca.paperBaseUrl;
-  const dataBaseUrl = firstEnv("ALPACA_DATA_BASE_URL") || config.alpaca.dataBaseUrl;
+  const baseUrl = firstEnv("ALPACA_PAPER_BASE_URL") || alpacaRuntimeConfig.paperBaseUrl;
+  const dataBaseUrl = firstEnv("ALPACA_DATA_BASE_URL") || alpacaRuntimeConfig.dataBaseUrl;
 
   if (!apiKey || !secretKey) {
     throw new Error(
@@ -332,7 +332,7 @@ const requestPaperTradingJson = async <T>(
           headers: {
             "APCA-API-KEY-ID": credentials.apiKey,
             "APCA-API-SECRET-KEY": credentials.secretKey,
-            "User-Agent": config.alpaca.userAgent,
+            "User-Agent": alpacaRuntimeConfig.userAgent,
             "Content-Type": "application/json",
             ...(options.headers || {})
           },
@@ -550,7 +550,7 @@ export const getLatestStockSnapshots = async (
   getBatchedDataSnapshots<AlpacaStockSnapshotRaw>(
     "/v2/stocks/snapshots",
     symbols,
-    config.alpaca.stockDataFeed
+    alpacaRuntimeConfig.stockDataFeed
   );
 
 export const getLatestOptionSnapshots = async (
@@ -559,7 +559,7 @@ export const getLatestOptionSnapshots = async (
   getBatchedDataSnapshots<AlpacaOptionSnapshotRaw>(
     "/v1beta1/options/snapshots",
     symbols,
-    config.alpaca.optionDataFeed
+    alpacaRuntimeConfig.optionDataFeed
   );
 
 const requestJson = async <T>(
@@ -601,7 +601,7 @@ const requestJson = async <T>(
             headers: {
               "APCA-API-KEY-ID": credentials.apiKey,
               "APCA-API-SECRET-KEY": credentials.secretKey,
-              "User-Agent": config.alpaca.userAgent,
+              "User-Agent": alpacaRuntimeConfig.userAgent,
               "Content-Type": "application/json"
             },
             signal

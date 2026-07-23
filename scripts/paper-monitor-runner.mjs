@@ -7,7 +7,7 @@ import {
   unlinkSync,
   writeFileSync
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
 
 const TASKS = {
   observatory: {
@@ -216,6 +216,23 @@ const guardFailures = (task) => {
   if (!isFalse(process.env.ALPACA_LIVE_TRADE) || !isFalse(process.env.LIVE_TRADING_ENABLED)) {
     failures.push("LIVE_TRADING_DISABLED_REQUIRED");
   }
+  if (
+    process.env.DATABASE_BACKEND !== "postgres" ||
+    !isTrue(process.env.POSTGRES_READS_ENABLED) ||
+    !isTrue(process.env.POSTGRES_WRITES_ENABLED) ||
+    !isTrue(process.env.POSTGRES_CONTROL_PLANE_AUTHORITY_ENABLED) ||
+    !isTrue(process.env.POSTGRES_SCHEDULER_AUTHORITY_ENABLED) ||
+    !isTrue(process.env.POSTGRES_EXECUTION_STATE_AUTHORITY_ENABLED) ||
+    !isFalse(process.env.POSTGRES_SHADOW_COMPARE_ENABLED) ||
+    !isFalse(process.env.POSTGRES_EXECUTION_STATE_SHADOW_ENABLED) ||
+    !isFalse(process.env.SQLITE_AUDIT_MIRROR_ENABLED)
+  ) {
+    failures.push("POSTGRES_ONLY_AUTHORITY_REQUIRED");
+  }
+  if (!isTrue(process.env.AUTONOMOUS_RUNTIME_AUDIT_APPROVED)) {
+    failures.push("EVIDENCE_UTILIZATION_RUNTIME_AUDIT_REQUIRED");
+  }
+  failures.push("POSTGRES_ONLY_RUNTIME_PATH_DISABLED");
   if (task.requireExecution) {
     if (
       !isTrue(process.env.PAPER_ORDER_EXECUTION_ENABLED) ||
@@ -276,6 +293,18 @@ const market = marketWindowStatus(now);
 const selectedCommand = task.finalHourCommand && market.finalHour ? task.finalHourCommand : task.command;
 const scriptName = selectedCommand[1][1];
 
+const failedChecks = guardFailures({ ...task, command: selectedCommand });
+if (failedChecks.length) {
+  jsonLine({
+    ok: false,
+    status: "blocked",
+    reason: failedChecks[0],
+    task: taskName,
+    failedChecks
+  });
+  process.exit(1);
+}
+
 if (!loadPackageScripts().includes(scriptName)) {
   jsonLine({
     ok: false,
@@ -298,18 +327,6 @@ if (!market.open && !(task.allowAfterMarketClose && market.afterMarketClose)) {
   process.exit(0);
 }
 
-const failedChecks = guardFailures({ ...task, command: selectedCommand });
-if (failedChecks.length) {
-  jsonLine({
-    ok: false,
-    status: "blocked",
-    reason: failedChecks[0],
-    task: taskName,
-    failedChecks
-  });
-  process.exit(1);
-}
-
 const releaseLock = acquireLock(task.lockFile);
 if (!releaseLock) {
   jsonLine({
@@ -323,20 +340,6 @@ if (!releaseLock) {
 }
 
 const commandSummary = `${selectedCommand[0]} ${selectedCommand[1].join(" ")}`;
-const postgresAuthorityActive =
-  process.env.DATABASE_BACKEND === "postgres" &&
-  (
-    isTrue(process.env.POSTGRES_CONTROL_PLANE_AUTHORITY_ENABLED) ||
-    isTrue(process.env.POSTGRES_SCHEDULER_AUTHORITY_ENABLED)
-  );
-const commandEnvironment = taskName === "observatory" && postgresAuthorityActive
-  ? {
-      ...process.env,
-      RESEARCH_DB_PATH:
-        process.env.MARKET_OBSERVATORY_DB_PATH?.trim() ||
-        join(process.cwd(), "data", "market-observatory.db")
-    }
-  : process.env;
 let exitCode = 0;
 
 try {
@@ -351,7 +354,7 @@ try {
     });
   } else {
     const result = spawnSync(selectedCommand[0], selectedCommand[1], {
-      env: commandEnvironment,
+      env: process.env,
       encoding: "utf8",
       maxBuffer: 50 * 1024 * 1024
     });

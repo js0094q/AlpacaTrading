@@ -40,7 +40,11 @@ export const POSTGRES_SCHEDULER_COMMAND_REGISTRY = [
   },
   {
     job: POSTGRES_SCHEDULER_JOBS.reconciliation,
-    aliases: ["zero-dte:reconcile"]
+    aliases: [
+      "zero-dte:reconcile",
+      "paper:reconcile:external-order",
+      "db:postgres:authority:cutover"
+    ]
   },
   {
     job: POSTGRES_SCHEDULER_JOBS.exitReview,
@@ -80,6 +84,26 @@ export const POSTGRES_SCHEDULER_COMMAND_REGISTRY = [
   {
     job: POSTGRES_SCHEDULER_JOBS.autonomousRecovery,
     aliases: ["system:recover"]
+  },
+  {
+    job: POSTGRES_SCHEDULER_JOBS.optionDiscovery,
+    aliases: ["paper:options:discover"]
+  },
+  {
+    job: POSTGRES_SCHEDULER_JOBS.hedgeReview,
+    aliases: ["hedge:review"]
+  },
+  {
+    job: POSTGRES_SCHEDULER_JOBS.hedgeExit,
+    aliases: ["hedge:exit:review", "hedge:exit:execute"]
+  },
+  {
+    job: POSTGRES_SCHEDULER_JOBS.learning,
+    aliases: ["paper:learn"]
+  },
+  {
+    job: POSTGRES_SCHEDULER_JOBS.autonomousWorkerState,
+    aliases: ["worker:state"]
   }
 ] as const satisfies readonly PostgresSchedulerCommandRegistration[];
 

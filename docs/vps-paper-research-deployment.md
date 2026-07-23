@@ -1,5 +1,10 @@
 # Paper-Only VPS Research Deployment
 
+> Retired runtime procedure as of 2026-07-20. PostgreSQL is the sole production
+> authority, SQLite-backed research workflows are disabled, and all research or
+> trading timers remain stopped pending the evidence-utilization and runtime
+> audit. Use `docs/runbooks/neon-postgres-operations.md` for current operations.
+
 ## Purpose
 
 This guide documents running the paper-only Alpaca research loop on a VPS for scheduled execution.

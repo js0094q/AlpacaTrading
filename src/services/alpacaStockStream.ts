@@ -1,6 +1,17 @@
 import WebSocket from "ws";
-import { config, type AlpacaStockStreamConfig } from "../config.js";
+import { seedUniverse } from "../config/universe.seed.js";
 import { getAlpacaPaperCredentials } from "./alpacaClient.js";
+
+export interface AlpacaStockStreamConfig {
+  enabled: boolean;
+  url: string;
+  symbols: string[];
+  trades: boolean;
+  quotes: boolean;
+  bars: boolean;
+  reconnectMs: number;
+  staleAfterMs: number;
+}
 
 export interface StockTradeEvent {
   type: "trade";
@@ -87,11 +98,31 @@ export interface AlpacaStockStreamOptions {
   now?: () => Date;
   setTimeoutFn?: (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
   clearTimeoutFn?: (handle: ReturnType<typeof setTimeout>) => void;
+  onEvent?: (event: StockTradeEvent | StockQuoteEvent | StockBarEvent) => void | Promise<void>;
 }
 
 type StreamMessage = Record<string, unknown>;
 
 const OPEN_STATE = 1;
+
+const boolean = (value: string | undefined, fallback = false) =>
+  value === undefined || value.trim() === "" ? fallback : value === "true" || value === "1";
+const integer = (value: string | undefined, fallback: number) => {
+  const parsed = Number.parseInt(value || "", 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+};
+const defaultStreamConfig = (): AlpacaStockStreamConfig => ({
+  enabled: boolean(process.env.ALPACA_STOCK_STREAM_ENABLED),
+  url: process.env.ALPACA_STOCK_STREAM_URL?.trim() || "wss://stream.data.alpaca.markets/v2/sip",
+  symbols: normalizeStockSymbols(
+    (process.env.ALPACA_STOCK_STREAM_SYMBOLS?.trim() || seedUniverse.join(",")).split(",")
+  ),
+  trades: boolean(process.env.ALPACA_STOCK_STREAM_TRADES, true),
+  quotes: boolean(process.env.ALPACA_STOCK_STREAM_QUOTES, true),
+  bars: boolean(process.env.ALPACA_STOCK_STREAM_BARS, true),
+  reconnectMs: integer(process.env.ALPACA_STOCK_STREAM_RECONNECT_MS, 5_000),
+  staleAfterMs: Math.max(1, integer(process.env.ALPACA_STOCK_STREAM_STALE_AFTER_MS, 30_000))
+});
 
 const defaultLogger: AlpacaStockStreamLogger = {
   info: (message) => console.info(message),
@@ -162,6 +193,7 @@ export class AlpacaStockStreamService {
     delayMs: number
   ) => ReturnType<typeof setTimeout>;
   private readonly clearTimeoutFn: (handle: ReturnType<typeof setTimeout>) => void;
+  private readonly onEvent?: AlpacaStockStreamOptions["onEvent"];
 
   private symbols: string[];
   private socket: AlpacaStockWebSocket | undefined;
@@ -180,7 +212,7 @@ export class AlpacaStockStreamService {
   private readonly latestBars = new Map<string, StockBarEvent>();
 
   constructor(options: AlpacaStockStreamOptions = {}) {
-    this.streamConfig = options.config ?? config.alpaca.stockStream;
+    this.streamConfig = options.config ?? defaultStreamConfig();
     this.symbols = normalizeStockSymbols(this.streamConfig.symbols);
     this.credentialsProvider =
       options.credentialsProvider ?? (() => {
@@ -193,6 +225,7 @@ export class AlpacaStockStreamService {
     this.now = options.now ?? (() => new Date());
     this.setTimeoutFn = options.setTimeoutFn ?? ((callback, delayMs) => setTimeout(callback, delayMs));
     this.clearTimeoutFn = options.clearTimeoutFn ?? ((handle) => clearTimeout(handle));
+    this.onEvent = options.onEvent;
   }
 
   async start(): Promise<void> {
@@ -418,6 +451,7 @@ export class AlpacaStockStreamService {
       const event = this.normalizeTrade(message, receivedAt);
       if (event) {
         this.latestTrades.set(event.symbol, event);
+        this.persistEvent(event);
       }
       return;
     }
@@ -426,6 +460,7 @@ export class AlpacaStockStreamService {
       const event = this.normalizeQuote(message, receivedAt);
       if (event) {
         this.latestQuotes.set(event.symbol, event);
+        this.persistEvent(event);
       }
       return;
     }
@@ -434,6 +469,7 @@ export class AlpacaStockStreamService {
       const event = this.normalizeBar(message, receivedAt);
       if (event) {
         this.latestBars.set(event.symbol, event);
+        this.persistEvent(event);
       }
     }
   }
@@ -592,6 +628,15 @@ export class AlpacaStockStreamService {
 
   private normalizeLookupSymbol(symbol: string): string {
     return symbol.trim().toUpperCase();
+  }
+
+  private persistEvent(event: StockTradeEvent | StockQuoteEvent | StockBarEvent): void {
+    if (!this.onEvent) return;
+    Promise.resolve(this.onEvent(event)).catch(() => {
+      this.lastError = "postgres_stream_persistence_failed";
+      const socket = this.socket;
+      if (socket) this.handleSocketError(socket);
+    });
   }
 }
 

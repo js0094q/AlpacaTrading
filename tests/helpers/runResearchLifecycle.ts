@@ -3,6 +3,10 @@ if (!mode || !databasePath || !nowIso) {
   process.exit(2);
 }
 
+(globalThis as typeof globalThis & { [key: symbol]: unknown })[
+  Symbol.for("alpaca.sqlite.test-fixture-initialization")
+] = true;
+
 process.env.RESEARCH_DB_PATH = databasePath;
 process.env.TRADING_MODE = "paper";
 process.env.ALPACA_LIVE_TRADE = "false";

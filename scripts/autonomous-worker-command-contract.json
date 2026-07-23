@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "commands": {
+    "research:daily": { "allowed": true, "entry": "tsx src/postgresOnlyCli.ts research:daily", "persistence": "postgres", "production": true, "noOp": false, "schedulerRegistered": true, "sqliteFreeImportGraph": true, "required": true },
+    "paper:review": { "allowed": true, "entry": "tsx src/postgresOnlyCli.ts paper:review", "persistence": "postgres", "production": true, "noOp": false, "schedulerRegistered": true, "sqliteFreeImportGraph": true, "required": true },
+    "paper:portfolio:review": { "allowed": true, "entry": "tsx src/postgresOnlyCli.ts paper:portfolio:review", "persistence": "postgres", "production": true, "noOp": false, "schedulerRegistered": true, "sqliteFreeImportGraph": true, "required": true },
+    "paper:options:discover": { "allowed": true, "entry": "tsx src/postgresOnlyCli.ts paper:options:discover", "persistence": "postgres", "production": true, "noOp": false, "schedulerRegistered": true, "sqliteFreeImportGraph": true, "required": true },
+    "paper:ops:review": { "allowed": true, "entry": "tsx src/postgresOnlyCli.ts paper:ops:review", "persistence": "postgres", "production": true, "noOp": false, "schedulerRegistered": true, "sqliteFreeImportGraph": true, "required": true },
+    "paper:exit:review": { "allowed": true, "entry": "tsx src/postgresOnlyCli.ts paper:exit:review", "persistence": "postgres", "production": true, "noOp": false, "schedulerRegistered": true, "sqliteFreeImportGraph": true, "required": true },
+    "paper:exit:execute": { "allowed": true, "entry": "tsx src/postgresOnlyCli.ts paper:exit:execute", "persistence": "postgres", "production": true, "noOp": false, "schedulerRegistered": true, "sqliteFreeImportGraph": true, "required": true },
+    "paper:execute:reviewed": { "allowed": true, "entry": "tsx src/postgresOnlyCli.ts paper:execute:reviewed", "persistence": "postgres", "production": true, "noOp": false, "schedulerRegistered": true, "sqliteFreeImportGraph": true, "required": true },
+    "hedge:review": { "allowed": true, "entry": "tsx src/postgresOnlyCli.ts hedge:review", "persistence": "postgres", "production": true, "noOp": false, "schedulerRegistered": true, "sqliteFreeImportGraph": true, "required": true },
+    "hedge:exit:review": { "allowed": true, "entry": "tsx src/postgresOnlyCli.ts hedge:exit:review", "persistence": "postgres", "production": true, "noOp": false, "schedulerRegistered": true, "sqliteFreeImportGraph": true, "required": true },
+    "hedge:exit:execute": { "allowed": true, "entry": "tsx src/postgresOnlyCli.ts hedge:exit:execute", "persistence": "postgres", "production": true, "noOp": false, "schedulerRegistered": true, "sqliteFreeImportGraph": true, "required": true },
+    "zero-dte:engine": { "allowed": true, "entry": "tsx src/postgresOnlyCli.ts zero-dte:engine", "persistence": "postgres", "production": true, "noOp": false, "schedulerRegistered": true, "sqliteFreeImportGraph": true, "required": true },
+    "zero-dte:exit:review": { "allowed": true, "entry": "tsx src/postgresOnlyCli.ts zero-dte:exit:review", "persistence": "postgres", "production": true, "noOp": false, "schedulerRegistered": true, "sqliteFreeImportGraph": true, "required": true },
+    "zero-dte:reconcile": { "allowed": true, "entry": "tsx src/postgresOnlyCli.ts zero-dte:reconcile", "persistence": "postgres", "production": true, "noOp": false, "schedulerRegistered": true, "sqliteFreeImportGraph": true, "required": true },
+    "paper:learn": { "allowed": true, "entry": "tsx src/postgresOnlyCli.ts paper:learn", "persistence": "postgres", "production": true, "noOp": false, "schedulerRegistered": true, "sqliteFreeImportGraph": true, "required": true },
+    "system:recover": { "allowed": true, "entry": "tsx src/postgresOnlyCli.ts system:recover", "persistence": "postgres", "production": true, "noOp": false, "schedulerRegistered": true, "sqliteFreeImportGraph": true, "required": true },
+    "worker:state": { "allowed": true, "entry": "tsx src/postgresOnlyCli.ts worker:state", "persistence": "postgres", "production": true, "noOp": false, "schedulerRegistered": true, "sqliteFreeImportGraph": true, "required": true }
+  }
+}

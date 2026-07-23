@@ -150,7 +150,7 @@ Before each backfill:
 4. Verify the PostgreSQL migration version.
 5. Verify that no uncontrolled schema migration is running.
 
-Backfill is resumable, idempotent, dependency-ordered, transactionally bounded, and observable. Each table mapping defines identifier, timestamp, null, duplicate, and foreign-key behavior.
+Backfill is resumable, idempotent, dependency-ordered, transactionally bounded, and observable. Each table mapping defines identifier, timestamp, null, duplicate, and foreign-key behavior. Execution-state identity conflicts on `(account_id, snapshot_fingerprint)` and `(account_id, idempotency_key)` may reuse an existing PostgreSQL row only after semantic comparison; dependent foreign keys follow the reused primary key, and material mismatches remain blocking. Reconciliation persists explicit mutable-state and PostgreSQL-only authority-row classifications in its durable checkpoint without deleting or overwriting target history.
 
 ## Reconciliation Gates
 

@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse as parseDotenv } from "dotenv";
-import { config } from "../config.js";
+import { alpacaRuntimeConfig } from "./alpacaRuntimeConfig.js";
 import { getTradingSafetyState } from "./tradingSafetyService.js";
 
 type EnvFileName = ".env" | ".env.txt";
@@ -187,11 +187,11 @@ export const buildAlpacaConfigDiagnostic = (
       paperSecretKeyHasOuterQuotes: hasOuterQuotes(paperSecret.value),
       hasLiveApiKey: Boolean(liveKey.value),
       hasLiveSecretKey: Boolean(liveSecret.value),
-      paperBaseUrl: paperBaseUrl.value || config.alpaca.paperBaseUrl || null,
+      paperBaseUrl: paperBaseUrl.value || alpacaRuntimeConfig.paperBaseUrl || null,
       paperBaseUrlSource: sourceForValue(paperBaseUrl.variable, paperBaseUrl.value, env, dotEnv, dotEnvTxt),
-      dataBaseUrl: dataBaseUrl.value || config.alpaca.dataBaseUrl || null,
+      dataBaseUrl: dataBaseUrl.value || alpacaRuntimeConfig.dataBaseUrl || null,
       dataBaseUrlSource: sourceForValue(dataBaseUrl.variable, dataBaseUrl.value, env, dotEnv, dotEnvTxt),
-      liveBaseUrl: liveBaseUrl.value || config.alpaca.liveBaseUrl || null,
+      liveBaseUrl: liveBaseUrl.value || alpacaRuntimeConfig.liveBaseUrl || null,
       envFilesLoaded,
       envFilesDetected: envFilesLoaded,
       envPrecedence: ".env -> .env.txt fallback; process env keeps precedence when already set",

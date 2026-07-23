@@ -2,7 +2,12 @@ import { DatabaseSync } from "node:sqlite";
 
 export const executionStateCandidateId = "candidate-execution-1";
 
-export const createExecutionStateSnapshotFixture = (path: string) => {
+export const createExecutionStateSnapshotFixture = (
+  path: string,
+  options: { capturedAt?: string; positionMarketValue?: number } = {}
+) => {
+  const capturedAt = options.capturedAt ?? "2026-07-16T16:00:00.000Z";
+  const expiresAt = new Date(Date.parse(capturedAt) + 60 * 60 * 1_000).toISOString();
   const database = new DatabaseSync(path);
   database.exec(`
     PRAGMA foreign_keys = ON;
@@ -83,7 +88,7 @@ export const createExecutionStateSnapshotFixture = (path: string) => {
   `);
   const state = {
     version: "paper-submit-state-v1",
-    capturedAt: "2026-07-16T16:00:00.000Z",
+    capturedAt,
     accountIdentityHash: "account-hash-release-4",
     accountState: {
       status: "ACTIVE",
@@ -115,7 +120,13 @@ export const createExecutionStateSnapshotFixture = (path: string) => {
       maxPriceDriftPct: 2
     },
     configurationFingerprint: "release-4-configuration-fingerprint",
-    positions: [],
+    positions: options.positionMarketValue === undefined ? [] : [{
+      symbol: "AAPL",
+      assetClass: "equity" as const,
+      quantity: 1,
+      marketValue: options.positionMarketValue,
+      currentPrice: options.positionMarketValue
+    }],
     openOrders: [{
       symbol: "SPY",
       assetClass: "equity",
@@ -144,8 +155,8 @@ export const createExecutionStateSnapshotFixture = (path: string) => {
   const artifact = {
     recordType: "paper_review_artifact",
     id: "review-release-4",
-    createdAt: "2026-07-16T16:00:00.000Z",
-    expiresAt: "2026-07-16T17:00:00.000Z",
+    createdAt: capturedAt,
+    expiresAt,
     sourceAction: "paper:review",
     status: "approved",
     payloadSignature: "release-4-payload-signature",
