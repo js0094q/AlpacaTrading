@@ -90,7 +90,7 @@ checkpoints.
 - The 2026-07-23 autonomous paper exploration profile is configured in
   `alpaca-autonomous-paper.service`. Research persists every baseline/effective
   gate pair and all selected/rejected candidate reasons. Entry review uses a
-  `$250` per-order exploration cap while retaining PostgreSQL risk limits,
+  `$1,000` per-order exploration cap while retaining PostgreSQL risk limits,
   aggregate exposure, cash reserve, reservation, reconciliation, and duplicate
   gates. Candidate lifecycle reasons record review skips, capacity blocks,
   sizing, execution deferral/ambiguity, and successful paper submission.

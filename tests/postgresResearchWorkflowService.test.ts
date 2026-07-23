@@ -170,7 +170,7 @@ test("paper exploration persists selected and rejected candidate decisions with 
       optionExpectedReturnPct: { previous: 1, current: 0.75 },
       definedRiskExpectedReturnPct: { previous: 1.5, current: 1 },
       maxCandidates: { previous: 10, current: 25 },
-      maxOrderNotional: { previous: 1_000, current: 250 }
+      maxOrderNotional: { previous: 1_000, current: 1_000 }
     }
   });
 });

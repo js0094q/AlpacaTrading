@@ -430,7 +430,7 @@ test("autonomous service fixes paper-only authority and bounds failure restarts"
   assert.match(service, /^Environment=PAPER_EXPLORATION_MIN_OPTION_LIQUIDITY_SCORE=0\.35$/m);
   assert.match(service, /^Environment=PAPER_EXPLORATION_MAX_OPTION_SPREAD_PCT=0\.12$/m);
   assert.match(service, /^Environment=PAPER_EXPLORATION_MAX_CANDIDATES=25$/m);
-  assert.match(service, /^Environment=PAPER_EXPLORATION_MAX_ORDER_NOTIONAL=250$/m);
+  assert.match(service, /^Environment=PAPER_EXPLORATION_MAX_ORDER_NOTIONAL=1000$/m);
   assert.match(service, /^Environment=POSTGRES_READS_ENABLED=true$/m);
   assert.match(service, /^Environment=POSTGRES_WRITES_ENABLED=true$/m);
   assert.match(service, /^Environment=POSTGRES_CONTROL_PLANE_AUTHORITY_ENABLED=true$/m);

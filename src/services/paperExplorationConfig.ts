@@ -129,7 +129,7 @@ export const paperExplorationThresholds = (
     ),
     maxOrderNotional: boundedNumber(
       env.PAPER_EXPLORATION_MAX_ORDER_NOTIONAL,
-      250,
+      1_000,
       50,
       BASELINE_DECISION_THRESHOLDS.maxOrderNotional
     )

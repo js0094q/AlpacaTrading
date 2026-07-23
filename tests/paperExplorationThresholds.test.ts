@@ -39,6 +39,22 @@ test("paper directional scoring is relaxed from 0.25 to 0.15 and remains reversi
   assert.equal(classifyDirectionalScore(0.2, exploration.directionScore), "long");
 });
 
+test("paper exploration uses $1,000 orders while retaining every other relaxed threshold", () => {
+  assert.deepEqual(paperExplorationThresholds({}), {
+    directionScore: 0.15,
+    minimumDirectionalConfidence: 0.25,
+    minimumOptionLiquidityScore: 0.35,
+    maximumOptionSpreadPct: 0.12,
+    minimumLongOptionConfidence: 0.4,
+    minimumAggressiveOptionConfidence: 0.6,
+    minimumDefinedRiskConfidence: 0.7,
+    minimumOptionExpectedReturnPct: 0.75,
+    minimumDefinedRiskExpectedReturnPct: 1,
+    maxCandidates: 25,
+    maxOrderNotional: 1_000
+  });
+});
+
 test("explicit live-mode flags disable every relaxed exploration threshold", () => {
   const thresholds = paperExplorationThresholds({
     ALPACA_ENV: "live",

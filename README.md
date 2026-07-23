@@ -28,7 +28,7 @@ uniqueness contract across continuously refreshed market evidence.
 
 The autonomous PostgreSQL path uses a reversible paper-only exploration profile.
 Its explicit systemd environment values broaden genuine-data candidate
-admission and cap each new paper order at `$250`. Every research run persists
+admission and cap each new paper order at `$1,000`. Every research run persists
 the baseline and effective gate values in `research_runs.config`; every
 candidate persists its pass/fail reason and decision inputs; review, sizing,
 execution, and execution-defer reasons advance `candidates.lifecycle_status`
