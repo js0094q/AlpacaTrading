@@ -19,6 +19,7 @@ import {
   verifyDatabaseFile,
   verifyDatabaseSchema
 } from "../src/services/databaseMaintenanceService.js";
+import { PostgresOnlyRuntimeError } from "../src/lib/database/postgresOnlyRuntime.js";
 
 const root = mkdtempSync(join(tmpdir(), "alpaca-runtime-migrations-"));
 
@@ -66,8 +67,8 @@ describe("runtime database migration boundary", () => {
       assert.throws(
         () => getDb(),
         (error) =>
-          error instanceof DatabaseMigrationRequiredError &&
-          error.pendingVersions.length === REQUIRED_RUNTIME_MIGRATION_VERSIONS.length
+          error instanceof PostgresOnlyRuntimeError &&
+          error.code === "RUNTIME_SQLITE_DISABLED"
       );
       assert.equal(existsSync(path), false);
     } finally {

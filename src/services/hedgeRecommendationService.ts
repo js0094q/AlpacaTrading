@@ -25,6 +25,7 @@ import {
 } from "./hedgeCapitalEvidenceService.js";
 import { listRecentPaperOrders } from "./alpacaClient.js";
 import { listPaperExecutionLedgerEntries } from "./paperExecutionLedgerService.js";
+import { executionStateProjectionService } from "./executionStateProjectionService.js";
 
 export interface OptionHedgeCandidateEvidence {
   optionSymbol: string;
@@ -826,7 +827,9 @@ const buildRecommendationCapitalEvidence = async (
       allowedUnderlyings: config.executionPolicy.allowedUnderlyings,
       positions: risk.positions,
       orders: Array.isArray(orders.data) ? orders.data : [],
-      ledger: listPaperExecutionLedgerEntries(500).map((entry) => ({
+      ledger: (executionStateProjectionService.isAuthorityActive()
+        ? []
+        : listPaperExecutionLedgerEntries(500)).map((entry) => ({
         ledgerId: entry.id,
         mode: entry.mode,
         strategy: entry.strategy,

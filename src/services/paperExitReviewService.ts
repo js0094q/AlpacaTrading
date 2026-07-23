@@ -11,7 +11,6 @@ import {
   type AlpacaBatchedSnapshotResponse,
   type AlpacaOptionSnapshotRaw,
   type AlpacaPositionRaw,
-  type AlpacaStockSnapshotRaw,
   type AlpacaSubmittedOrder
 } from "./alpacaClient.js";
 import { getAlpacaMarketClock, type AlpacaMarketClockSnapshot } from "./alpacaMarketClockService.js";
@@ -21,7 +20,13 @@ import {
 } from "./paperAccountReconciliationService.js";
 import { normalizeOptionQuote, roundOptionLimitPrice } from "./optionQuoteNormalizer.js";
 import { getTradingSafetyState } from "./tradingSafetyService.js";
+import {
+  getLatestStockPrices,
+  type LatestStockPriceRead,
+  type StockPriceBatchResponse
+} from "./stockMarketDataAccessor.js";
 import { queryAll } from "../lib/db.js";
+import { executionStateProjectionService } from "./executionStateProjectionService.js";
 import type {
   PaperExitAssetClass,
   PaperExitOrderPayload,
@@ -92,6 +97,7 @@ interface PaperExitReviewDeps {
   listPaperAccountActivities?: typeof listPaperAccountActivities;
   getMarketClock?: typeof getAlpacaMarketClock;
   getLatestStockSnapshots?: typeof getLatestStockSnapshots;
+  getLatestStockPrices?: (symbols: string[]) => Promise<StockPriceBatchResponse>;
   getLatestOptionSnapshots?: typeof getLatestOptionSnapshots;
   reconcilePaperAccountBeforeExecution?: typeof reconcilePaperAccountBeforeExecution;
   getKnownLeapsOptionSymbols?: () => Set<string> | string[] | Promise<Set<string> | string[]>;
@@ -258,26 +264,6 @@ const isActiveSellOrderFor = (orders: AlpacaSubmittedOrder[], symbol: string): b
 const snapshotRequestId = (response: AlpacaBatchedSnapshotResponse<unknown>): string | undefined =>
   response.requestIds.length ? response.requestIds.join(",") : undefined;
 
-const stockSnapshotPrice = (snapshot: AlpacaStockSnapshotRaw | undefined): number | null => {
-  if (!snapshot) {
-    return null;
-  }
-  const trade = optionalNumberField(snapshot.latestTrade?.p);
-  if (trade !== null && trade > 0) {
-    return trade;
-  }
-  const bid = optionalNumberField(snapshot.latestQuote?.bp);
-  const ask = optionalNumberField(snapshot.latestQuote?.ap);
-  if (bid !== null && ask !== null && bid > 0 && ask > 0 && ask >= bid) {
-    return Number(((bid + ask) / 2).toFixed(4));
-  }
-  return (
-    optionalNumberField(snapshot.minuteBar?.c) ??
-    optionalNumberField(snapshot.dailyBar?.c) ??
-    optionalNumberField(snapshot.prevDailyBar?.c)
-  );
-};
-
 const optionQuoteInput = (symbol: string, snapshot: AlpacaOptionSnapshotRaw | undefined) => ({
   optionSymbol: symbol,
   bid: snapshot?.latest_quote?.bp ?? snapshot?.latest_quote?.b ?? snapshot?.latestQuote?.bp ?? snapshot?.latestQuote?.b ?? null,
@@ -312,16 +298,20 @@ const optionCurrentPrice = (
 
 const equityCurrentPrice = (
   position: AlpacaPositionRaw,
-  snapshot: AlpacaStockSnapshotRaw | undefined,
+  currentMarketPrice: number | null | undefined,
   qty: number
 ): number => {
+  if (
+    currentMarketPrice !== null &&
+    currentMarketPrice !== undefined &&
+    Number.isFinite(currentMarketPrice) &&
+    currentMarketPrice > 0
+  ) {
+    return currentMarketPrice;
+  }
   const explicit = optionalNumberField(position.current_price);
   if (explicit !== null) {
     return explicit;
-  }
-  const snapshotPrice = stockSnapshotPrice(snapshot);
-  if (snapshotPrice !== null) {
-    return snapshotPrice;
   }
   const value = marketValue(position);
   return qty > 0 ? Math.abs(value / qty) : 0;
@@ -616,6 +606,13 @@ export const buildPaperExitReviewResult = async (
   const listOrdersFn = deps.listRecentPaperOrders ?? listRecentPaperOrders;
   const listActivitiesFn = deps.listPaperAccountActivities ?? listPaperAccountActivities;
   const getStockSnapshotsFn = deps.getLatestStockSnapshots ?? getLatestStockSnapshots;
+  const getStockPricesFn =
+    deps.getLatestStockPrices ??
+    ((symbols: string[]) =>
+      getLatestStockPrices(symbols, {
+        getLatestStockSnapshots: getStockSnapshotsFn,
+        now: deps.now
+      }));
   const getOptionSnapshotsFn = deps.getLatestOptionSnapshots ?? getLatestOptionSnapshots;
   const reconcileFn = deps.reconcilePaperAccountBeforeExecution ?? reconcilePaperAccountBeforeExecution;
 
@@ -662,9 +659,11 @@ export const buildPaperExitReviewResult = async (
   };
 
   const reconciliationStatus = reconciliationSnapshot.report.reconciliationStatus;
-  const knownLeapsSymbolsValue = await (
-    deps.getKnownLeapsOptionSymbols?.() ?? Promise.resolve(listKnownLeapsOptionSymbols())
-  );
+  const knownLeapsSymbolsValue = executionStateProjectionService.isAuthorityActive()
+    ? new Set<string>()
+    : await (
+        deps.getKnownLeapsOptionSymbols?.() ?? Promise.resolve(listKnownLeapsOptionSymbols())
+      );
   const knownLeapsOptionSymbols = knownLeapsSymbolsValue instanceof Set
     ? knownLeapsSymbolsValue
     : new Set(knownLeapsSymbolsValue.map(normalizeSymbol).filter(Boolean));
@@ -714,14 +713,13 @@ export const buildPaperExitReviewResult = async (
     .filter((position) => String(position.asset_class || "").toLowerCase() === "us_option")
     .map((position) => normalizeSymbol(position.symbol));
 
-  let stockSnapshots: Record<string, AlpacaStockSnapshotRaw> = {};
+  let stockPrices: Record<string, LatestStockPriceRead> = {};
   let optionSnapshots: Record<string, AlpacaOptionSnapshotRaw> = {};
   try {
-    const stockResponse = await getStockSnapshotsFn(equitySymbols);
-    stockSnapshots = stockResponse.data;
-    const requestId = snapshotRequestId(stockResponse as AlpacaBatchedSnapshotResponse<unknown>);
-    if (requestId) {
-      alpacaRequestIds.stockSnapshots = requestId;
+    const stockResponse = await getStockPricesFn(equitySymbols);
+    stockPrices = stockResponse.data;
+    if (stockResponse.requestIds.length > 0) {
+      alpacaRequestIds.stockSnapshots = stockResponse.requestIds.join(",");
     }
   } catch (error) {
     events.push({
@@ -800,7 +798,7 @@ export const buildPaperExitReviewResult = async (
         skipped.push({ symbol, assetClass, positionClass, reason: "EQUITY_EXIT_DISABLED" });
         continue;
       }
-      const currentPrice = equityCurrentPrice(position, stockSnapshots[symbol], qty);
+      const currentPrice = equityCurrentPrice(position, stockPrices[symbol]?.price, qty);
       const value = Math.abs(marketValue(position));
       if (value < equityRules.minPositionMarketValue) {
         skipped.push({

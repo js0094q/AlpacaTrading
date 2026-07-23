@@ -1,0 +1,79 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import test from "node:test";
+
+test("migration 003 creates the complete PostgreSQL market-data authority schema", async () => {
+  const sql = await readFile(
+    "src/lib/database/migrations/003_market_data_authority.sql",
+    "utf8"
+  );
+  for (const table of [
+    "market_data_ingestion_runs",
+    "universe_symbols",
+    "market_bars",
+    "stock_snapshots",
+    "option_contracts",
+    "option_snapshots",
+    "feature_snapshots",
+    "target_snapshots",
+    "options_strategy_snapshots",
+    "research_evidence"
+  ]) {
+    assert.match(sql, new RegExp(`CREATE TABLE ${table}`));
+  }
+  assert.doesNotMatch(sql, /sqlite/i);
+  assert.match(sql, /request_id text/);
+  assert.match(sql, /source_fingerprint text/);
+  assert.match(sql, /jsonb/);
+});
+
+test("migration 004 preserves option contract identity and provider fields as PostgreSQL evidence", async () => {
+  const sql = await readFile(
+    "src/lib/database/migrations/004_option_contract_evidence.sql",
+    "utf8"
+  );
+  assert.match(sql, /ALTER TABLE option_contracts/);
+  for (const column of [
+    "contract_id text",
+    "status text",
+    "exercise_style text",
+    "open_interest numeric",
+    "open_interest_date date",
+    "close_price numeric",
+    "close_price_date date",
+    "evidence jsonb NOT NULL"
+  ]) {
+    assert.match(sql, new RegExp(`ADD COLUMN(?: IF NOT EXISTS)? ${column}`));
+  }
+  assert.match(sql, /jsonb_typeof\(evidence\) = 'object'/);
+  assert.match(sql, /pg_constraint/);
+  assert.match(sql, /conrelid = 'option_contracts'::regclass/);
+  assert.doesNotMatch(sql, /sqlite/i);
+});
+
+test("migration 005 adds structured market-data ingestion observability", async () => {
+  const sql = await readFile(
+    "src/lib/database/migrations/005_market_data_ingestion_observability.sql",
+    "utf8"
+  );
+  for (const column of [
+    "cycle_id text",
+    "workstream text",
+    "symbol text",
+    "provider_endpoint text",
+    "pages_retrieved integer",
+    "newest_provider_timestamp timestamptz",
+    "oldest_provider_timestamp timestamptz",
+    "newest_provider_age_seconds numeric\\(20, 3\\)",
+    "records_accepted integer",
+    "records_stale integer",
+    "records_rejected integer",
+    "freshness_threshold_seconds integer",
+    "rejection_reason text",
+    "persistence_result text"
+  ]) {
+    assert.match(sql, new RegExp(`ADD COLUMN(?: IF NOT EXISTS)? ${column}`));
+  }
+  assert.match(sql, /market_data_ingestion_runs_counts_nonnegative/);
+  assert.doesNotMatch(sql, /sqlite/i);
+});

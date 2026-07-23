@@ -35,6 +35,8 @@ const config = (controlPlaneAuthority = true): DatabaseConfig => ({
     postgresWrites: true,
     shadowComparison: false,
     controlPlaneAuthority,
+    schedulerAuthority: controlPlaneAuthority,
+    executionStateShadow: false,
     executionStateAuthority: false,
     sqliteAuditMirror: false
   }
@@ -103,7 +105,7 @@ const abortableWaitAfterFirstTick = () => {
   };
 };
 
-test("exports bounded scheduler mappings for Release 3 workstreams", () => {
+test("exports bounded scheduler mappings for the restored autonomous workstreams", () => {
   assert.deepEqual(Object.keys(POSTGRES_SCHEDULER_JOBS), [
     "research",
     "zeroDte",
@@ -111,8 +113,16 @@ test("exports bounded scheduler mappings for Release 3 workstreams", () => {
     "reconciliation",
     "exitReview",
     "paperExit",
+    "paperExecution",
     "allocation",
-    "marketDataRefresh"
+    "marketDataRefresh",
+    "universeLifecycle",
+    "autonomousRecovery",
+    "optionDiscovery",
+    "hedgeReview",
+    "hedgeExit",
+    "learning",
+    "autonomousWorkerState"
   ]);
   assert.deepEqual(POSTGRES_SCHEDULER_JOBS.marketDataRefresh, {
     jobName: "market-data-refresh",
@@ -127,8 +137,16 @@ test("exports bounded scheduler mappings for Release 3 workstreams", () => {
       "reconciliation",
       "exit_review",
       "paper_exit",
+      "paper_execution",
       "allocation",
-      "market_data_refresh"
+      "market_data_refresh",
+      "universe_lifecycle",
+      "autonomous_recovery",
+      "option_discovery",
+      "hedge_review",
+      "hedge_exit",
+      "learning",
+      "autonomous_worker_state"
     ]
   );
 });

@@ -7,6 +7,7 @@ import {
   validatePaperSubmitState,
   type PaperSubmitStateAttestation
 } from "../src/services/paperSubmitStateService.js";
+import { withExecutionAuthority } from "./helpers/executionAuthorityRuntime.js";
 
 const capturedAt = "2026-07-14T14:00:00.000Z";
 
@@ -468,6 +469,7 @@ describe("paper submit state validation", () => {
   });
 
   test("captures complete fresh account, portfolio, reservation, source, and market evidence", async () => {
+    let projected: PaperSubmitStateAttestation | null = null;
     const captured = await withPaperEnv(() =>
       capturePaperSubmitState(
         {
@@ -532,7 +534,10 @@ describe("paper submit state validation", () => {
           resolveSourceCandidate: (id) =>
             id === "candidate-aapl"
               ? { id, symbol: "AAPL", optionSymbol: null }
-              : null
+              : null,
+          projectExecutionState: async (attestation) => {
+            projected = attestation;
+          }
         }
       )
     );
@@ -547,6 +552,123 @@ describe("paper submit state validation", () => {
       identity: "baseline-v1",
       allocatorControlled: false
     });
+    assert.equal(projected, captured);
+  });
+
+  test("captures and projects an authoritative empty portfolio when there are no reviewed intents", async () => {
+    let projected: PaperSubmitStateAttestation | null = null;
+    const captured = await withPaperEnv(() =>
+      capturePaperSubmitState(
+        {
+          capturedAt,
+          payloadSections: {
+            equityBuys: [],
+            equityAdds: [],
+            equitySells: [],
+            optionBuys: [],
+            optionSellToCloseExits: []
+          }
+        },
+        {
+          getAccount: async () => ({
+            data: {
+              id: "paper-account-123",
+              status: "ACTIVE",
+              cash: "94040.99",
+              equity: "94040.99",
+              buying_power: "376163.96",
+              options_buying_power: "94040.99",
+              options_approved_level: 3,
+              trading_blocked: false,
+              account_blocked: false
+            },
+            status: 200,
+            url: "account"
+          }),
+          listPositions: async () => ({ data: [], status: 200, url: "positions" }),
+          listOrders: async () => ({ data: [], status: 200, url: "orders" }),
+          listReservations: () => [],
+          projectExecutionState: async (attestation) => {
+            projected = attestation;
+          }
+        }
+      )
+    );
+
+    assert.equal(captured.complete, true);
+    assert.equal(captured.accountIdentityHash !== null, true);
+    assert.deepEqual(captured.positions, []);
+    assert.equal(projected, captured);
+  });
+
+  test("PostgreSQL authority resolves reservations without consulting SQLite first", async () => {
+    let resolved = 0;
+    const captured = await withExecutionAuthority(() =>
+      withPaperEnv(() =>
+        capturePaperSubmitState(
+          {
+            capturedAt,
+            payloadSections: {
+              equityBuys: [{
+                assetClass: "equity",
+                symbol: "AAPL",
+                side: "buy",
+                type: "market",
+                time_in_force: "day",
+                notional: "100.00",
+                sourceCandidateId: "candidate-aapl",
+                client_order_id: "paper-entry-aapl-authority"
+              }],
+              equityAdds: [],
+              equitySells: [],
+              optionBuys: [],
+              optionSellToCloseExits: []
+            }
+          },
+          {
+            getAccount: async () => ({
+              data: {
+                id: "paper-account-123",
+                status: "ACTIVE",
+                cash: "100000",
+                equity: "100000",
+                buying_power: "100000",
+                options_buying_power: "100000",
+                options_approved_level: 3,
+                trading_blocked: false,
+                account_blocked: false
+              },
+              status: 200,
+              url: "account"
+            }),
+            listPositions: async () => ({ data: [], status: 200, url: "positions" }),
+            listOrders: async () => ({ data: [], status: 200, url: "orders" }),
+            listReservations: () => {
+              throw new Error("SQLite reservations must not be read under PostgreSQL authority");
+            },
+            resolveExecutionReservations: async (reservations) => {
+              resolved += 1;
+              assert.deepEqual(reservations, []);
+              return [];
+            },
+            getMarketEvidence: async () => [{
+              symbol: "AAPL",
+              assetClass: "equity",
+              referencePrice: 200,
+              bid: 199.9,
+              ask: 200.1,
+              timestamp: capturedAt,
+              complete: true
+            }],
+            resolveSourceCandidate: (id) => ({ id, symbol: "AAPL", optionSymbol: null }),
+            projectExecutionState: async () => undefined
+          }
+        )
+      )
+    );
+
+    assert.equal(resolved, 1);
+    assert.equal(captured.blockers.includes("SUBMIT_RESERVATION_EVIDENCE_UNAVAILABLE"), false);
   });
 
   test("retains held and pending-cancel broker orders as active cap evidence", async () => {
@@ -788,6 +910,93 @@ describe("paper submit state validation", () => {
     assert.equal(captured.complete, true);
     assert.equal(captured.zeroDteActivityEvidence?.dailyTradeCount, 1);
     assert.equal(captured.zeroDteActivityEvidence?.openExposureCount, 1);
+  });
+
+  test("PostgreSQL authority never builds 0DTE activity from SQLite", async () => {
+    const symbol = "SPY260714C00600000";
+    let postgresReads = 0;
+    let sqliteReads = 0;
+    const captured = await withExecutionAuthority(() => withPaperEnv(() =>
+      capturePaperSubmitState(
+        {
+          capturedAt,
+          payloadSections: {
+            equityBuys: [],
+            equityAdds: [],
+            equitySells: [],
+            optionBuys: [{
+              assetClass: "option",
+              symbol,
+              side: "buy",
+              type: "limit",
+              qty: "1",
+              limit_price: "1",
+              estimatedPremium: 100,
+              position_intent: "buy_to_open",
+              sourceCandidateId: `discovery:zero_dte_spy:${symbol}`,
+              client_order_id: "zero-dte-postgres-authority"
+            }],
+            optionSellToCloseExits: []
+          }
+        },
+        {
+          getAccount: async () => ({
+            data: {
+              id: "paper-account-123",
+              status: "ACTIVE",
+              cash: "100000",
+              equity: "100000",
+              buying_power: "100000",
+              options_buying_power: "100000",
+              options_approved_level: 3,
+              trading_blocked: false,
+              account_blocked: false
+            },
+            status: 200,
+            url: "account"
+          }),
+          listPositions: async () => ({ data: [], status: 200, url: "positions" }),
+          listOrders: async () => ({ data: [], status: 200, url: "orders" }),
+          resolveExecutionReservations: async () => [],
+          getMarketEvidence: async () => [{
+            symbol,
+            assetClass: "option",
+            referencePrice: 1,
+            bid: 0.95,
+            ask: 1.05,
+            timestamp: capturedAt,
+            complete: true
+          }],
+          resolveSourceCandidate: (id) => ({ id, symbol: "SPY", optionSymbol: symbol }),
+          buildZeroDteActivityEvidence: () => {
+            sqliteReads += 1;
+            throw new Error("SQLite 0DTE activity must not be read under authority");
+          },
+          resolveZeroDteActivityEvidence: async (input) => {
+            postgresReads += 1;
+            return {
+              tradingDate: input.tradingDate,
+              asOf: input.asOf,
+              complete: true,
+              dailyTradeCount: 0,
+              dailyPremium: 0,
+              dailyRealizedLoss: 0,
+              openPositionCount: 0,
+              openOrderCount: 0,
+              openExposureCount: 0,
+              blockers: [],
+              warnings: [],
+              evidenceFingerprint: "postgres-activity-fingerprint"
+            };
+          },
+          projectExecutionState: async () => undefined
+        }
+      )
+    ));
+
+    assert.equal(captured.complete, true);
+    assert.equal(postgresReads, 1);
+    assert.equal(sqliteReads, 0);
   });
 
   test("fails closed when current market evidence is missing", async () => {

@@ -19,10 +19,16 @@ import {
   readHedgeExecutionReview
 } from "./hedgePersistenceService.js";
 import {
+  applyPaperExecutionLedgerUpdate,
+  buildPaperExecutionLedgerEntry,
   releaseExpiredHedgeReservations,
   reservePaperExecutionAttempt,
-  updatePaperExecutionLedgerEntry
+  findPaperExecutionById,
+  updatePaperExecutionLedgerEntry,
+  type PaperExecutionLedgerEntry,
+  type PaperExecutionLedgerUpdate
 } from "./paperExecutionLedgerService.js";
+import { executionStateProjectionService } from "./executionStateProjectionService.js";
 import { recordHedgeLearningEvent } from "./hedgeLearningLifecycleService.js";
 import { getTradingSafetyState } from "./tradingSafetyService.js";
 
@@ -79,6 +85,10 @@ export interface HedgeExitExecutionDeps {
   getPaperOrder?: typeof getPaperOrder;
   cancelPaperOrder?: typeof cancelPaperOrder;
   now?: () => string;
+  authorizeExecution?: typeof executionStateProjectionService.reserveOrderIntent;
+  authorizeBrokerMutation?: typeof executionStateProjectionService.authorizeBrokerMutation;
+  recordExecutionResult?: typeof executionStateProjectionService.recordBrokerResult;
+  storeExecutionEvidence?: typeof executionStateProjectionService.storeHedgeReviewEvidence;
 };
 
 const boolFlag = (name: string) => process.env[name] === "true" || process.env[name] === "1";
@@ -218,6 +228,7 @@ export const executeReviewedPaperHedgeExit = async (
   ];
   if (blockers.length > 0) return executionBlocked(input.reviewId, blockers);
   const asOf = deps.now?.() ?? new Date().toISOString();
+  const postgresAuthority = executionStateProjectionService.isAuthorityActive();
   const stored = deps.review
     ? {
         review: deps.review,
@@ -230,7 +241,8 @@ export const executeReviewedPaperHedgeExit = async (
     : readHedgeExecutionReview({
         reviewId: input.reviewId,
         signingKey: process.env.HEDGE_REVIEW_SIGNING_KEY!,
-        asOf
+        asOf,
+        requireReviewedStatus: !postgresAuthority
       });
   const review = stored.review;
   if (!review) return executionBlocked(input.reviewId, ["HEDGE_REVIEW_NOT_FOUND"]);
@@ -267,23 +279,65 @@ export const executeReviewedPaperHedgeExit = async (
   }
   const quote = await (deps.refreshQuote ?? (async () => ({ bid: review.orderIntent.limitPrice, ask: review.orderIntent.limitPrice, midpoint: review.orderIntent.limitPrice, quoteTimestamp: null })))(review.orderIntent.symbol);
   const limitPrice = quote.bid && quote.bid > 0 ? quote.bid : review.orderIntent.limitPrice;
-  releaseExpiredHedgeReservations();
-  const reservation = reservePaperExecutionAttempt({
-    reviewId: review.reviewId,
-    clientOrderId: review.clientOrderId,
-    symbol: review.orderIntent.symbol,
-    underlyingSymbol: review.orderIntent.underlying,
-    quantity: review.orderIntent.quantity,
-    limitPrice,
-    estimatedPremium: limitPrice * review.orderIntent.quantity * review.orderIntent.multiplier,
-    expiresAt: review.expiresAt,
-    requestId: review.requestId,
-    mode: "hedge-exit",
-    side: "sell",
-    positionIntent: "sell_to_close",
-    consumeReview: true
-  });
-  if (!reservation.reserved) return executionBlocked(input.reviewId, reservation.blockers);
+  const estimatedPremium =
+    limitPrice * review.orderIntent.quantity * review.orderIntent.multiplier;
+  let executionEntry: PaperExecutionLedgerEntry;
+  let reservationId: number | null = null;
+  if (postgresAuthority) {
+    executionEntry = buildPaperExecutionLedgerEntry({
+      mode: "hedge-exit",
+      assetClass: "option",
+      symbol: review.orderIntent.symbol,
+      underlyingSymbol: review.orderIntent.underlying,
+      strategy: "portfolio_hedge",
+      side: "sell",
+      orderType: "limit",
+      timeInForce: "day",
+      qty: String(review.orderIntent.quantity),
+      limitPrice: String(limitPrice),
+      estimatedPremium,
+      maxRisk: estimatedPremium,
+      dedupeKey: `hedge-exit:${review.reviewId}`,
+      clientOrderId: review.clientOrderId,
+      requestId: review.requestId,
+      status: "reserved",
+      sourcePlanId: review.reviewId,
+      payload: {
+        reviewId: review.reviewId,
+        clientOrderId: review.clientOrderId,
+        symbol: review.orderIntent.symbol,
+        quantity: review.orderIntent.quantity,
+        limitPrice,
+        estimatedPremium,
+        expiresAt: review.expiresAt,
+        mode: "hedge-exit",
+        side: "sell",
+        positionIntent: "sell_to_close"
+      }
+    }, { createdAt: asOf });
+  } else {
+    releaseExpiredHedgeReservations();
+    const reservation = reservePaperExecutionAttempt({
+      reviewId: review.reviewId,
+      clientOrderId: review.clientOrderId,
+      symbol: review.orderIntent.symbol,
+      underlyingSymbol: review.orderIntent.underlying,
+      quantity: review.orderIntent.quantity,
+      limitPrice,
+      estimatedPremium,
+      expiresAt: review.expiresAt,
+      requestId: review.requestId,
+      mode: "hedge-exit",
+      side: "sell",
+      positionIntent: "sell_to_close",
+      consumeReview: true
+    });
+    if (!reservation.reserved) {
+      return executionBlocked(input.reviewId, reservation.blockers);
+    }
+    executionEntry = reservation.entry;
+    reservationId = reservation.entry.id;
+  }
   const payload: AlpacaPaperOrderRequest = {
     symbol: review.orderIntent.symbol,
     qty: String(review.orderIntent.quantity),
@@ -294,26 +348,100 @@ export const executeReviewedPaperHedgeExit = async (
     client_order_id: review.clientOrderId,
     position_intent: "sell_to_close"
   };
-  try {
-    const submit = deps.submitPaperOrder ?? ((order: Record<string, unknown>) => submitPaperOrder(order as unknown as AlpacaPaperOrderRequest));
-    const response = await submit(payload as unknown as Record<string, unknown>);
-    const brokerOrderId = response.data.id ?? null;
-    updatePaperExecutionLedgerEntry(reservation.entry.id, { status: "submitted", alpacaOrderId: brokerOrderId, alpacaStatus: response.data.status ?? "submitted", requestId: response.requestId });
-    recordHedgeLearningEvent({ eventId: `${review.reviewId}:submit`, reviewId: review.reviewId, eventType: "submit", evidence: { symbol: review.orderIntent.symbol, clientOrderId: review.clientOrderId, brokerOrderId } });
-    if (!brokerOrderId) return executionBlocked(input.reviewId, ["HEDGE_BROKER_ORDER_ID_MISSING"]);
-    const orderResponse = await (deps.getPaperOrder ?? getPaperOrder)(brokerOrderId);
-    const filledQuantity = finite(orderResponse.data.filled_qty, 0);
-    const status = String(orderResponse.data.status ?? "").toLowerCase();
-    if (status === "filled") {
-      updatePaperExecutionLedgerEntry(reservation.entry.id, { status: "filled", alpacaOrderId: brokerOrderId, alpacaStatus: status, requestId: orderResponse.requestId });
-      recordHedgeLearningEvent({ eventId: `${review.reviewId}:fill`, reviewId: review.reviewId, eventType: "fill", evidence: { symbol: review.orderIntent.symbol, filledQuantity, filledAveragePrice: orderResponse.data.filled_avg_price } });
-      return { paperOnly: true as const, environment: "paper" as const, status: "filled" as const, reviewId: review.reviewId, clientOrderId: review.clientOrderId, brokerOrderId, filledQuantity, averageFillPrice: finite(orderResponse.data.filled_avg_price, 0), blockers: [], warnings: [], reservationId: reservation.entry.id, verification };
+  const authorizeExecution = deps.authorizeExecution ??
+    executionStateProjectionService.reserveOrderIntent;
+  const recordExecutionResult = deps.recordExecutionResult ??
+    executionStateProjectionService.recordBrokerResult;
+  const authorizeBrokerMutation = deps.authorizeBrokerMutation ??
+    executionStateProjectionService.authorizeBrokerMutation;
+  const storeExecutionEvidence = deps.storeExecutionEvidence ??
+    executionStateProjectionService.storeHedgeReviewEvidence;
+  const updateCurrentExecution = (update: PaperExecutionLedgerUpdate) => {
+    if (postgresAuthority) {
+      executionEntry = applyPaperExecutionLedgerUpdate(executionEntry, update);
+      return;
     }
-    await (deps.cancelPaperOrder ?? cancelPaperOrder)(brokerOrderId);
-    updatePaperExecutionLedgerEntry(reservation.entry.id, { status: filledQuantity > 0 ? "partial" : "canceled", alpacaOrderId: brokerOrderId, alpacaStatus: "canceled" });
-    return { paperOnly: true as const, environment: "paper" as const, status: filledQuantity > 0 ? "partial" as const : "canceled" as const, reviewId: review.reviewId, clientOrderId: review.clientOrderId, brokerOrderId, filledQuantity, averageFillPrice: finite(orderResponse.data.filled_avg_price, 0), blockers: [], warnings: [], reservationId: reservation.entry.id, verification };
+    updatePaperExecutionLedgerEntry(executionEntry.id, update);
+    executionEntry = findPaperExecutionById(executionEntry.id) ?? executionEntry;
+  };
+  const recordCurrentExecution = async () => recordExecutionResult(executionEntry);
+  await storeExecutionEvidence(review, executionEntry);
+  const postgresAuthorization = await authorizeExecution(executionEntry);
+  if (!postgresAuthorization.brokerAllowed) {
+    const authorityBlockers = [...(postgresAuthorization.blockers ?? [
+      "POSTGRES_EXECUTION_INTENT_BLOCKED"
+    ])];
+    updateCurrentExecution({
+      status: "released",
+      reason: authorityBlockers[0],
+      blockedReason: authorityBlockers[0]
+    });
+    return executionBlocked(input.reviewId, authorityBlockers);
+  }
+  const submit = deps.submitPaperOrder ?? ((order: Record<string, unknown>) =>
+    submitPaperOrder(order as unknown as AlpacaPaperOrderRequest));
+  let response: AlpacaApiResponse<AlpacaSubmittedOrder>;
+  try {
+    response = await submit(payload as unknown as Record<string, unknown>);
   } catch (error) {
-    updatePaperExecutionLedgerEntry(reservation.entry.id, { status: "failed", reason: "HEDGE_EXIT_ORDER_SUBMISSION_FAILED", errorMessage: error instanceof Error ? error.message : "Paper hedge exit submission failed." });
+    updateCurrentExecution({ status: "failed", reason: "HEDGE_EXIT_ORDER_SUBMISSION_FAILED", errorMessage: error instanceof Error ? error.message : "Paper hedge exit submission failed." });
+    await recordCurrentExecution();
     return executionBlocked(input.reviewId, ["HEDGE_EXIT_ORDER_SUBMISSION_FAILED"]);
   }
+  const brokerOrderId = response.data.id ?? null;
+  updateCurrentExecution({
+    status: brokerOrderId ? "submitted" : "failed",
+    alpacaOrderId: brokerOrderId,
+    alpacaStatus: response.data.status ?? "submitted",
+    requestId: response.requestId,
+    reason: brokerOrderId ? null : "HEDGE_BROKER_ORDER_ID_MISSING",
+    rawResponse: response.data
+  });
+  await recordCurrentExecution();
+  recordHedgeLearningEvent({ eventId: `${review.reviewId}:submit`, reviewId: review.reviewId, eventType: "submit", evidence: { symbol: review.orderIntent.symbol, clientOrderId: review.clientOrderId, brokerOrderId } });
+  if (!brokerOrderId) return executionBlocked(input.reviewId, ["HEDGE_BROKER_ORDER_ID_MISSING"]);
+
+  let orderResponse: AlpacaApiResponse<AlpacaSubmittedOrder>;
+  try {
+    orderResponse = await (deps.getPaperOrder ?? getPaperOrder)(brokerOrderId);
+  } catch (error) {
+    updateCurrentExecution({
+      status: "failed",
+      alpacaOrderId: brokerOrderId,
+      reason: "HEDGE_EXIT_ORDER_STATUS_FAILED",
+      errorMessage: error instanceof Error ? error.message : "Paper hedge exit status failed."
+    });
+    await recordCurrentExecution();
+    return executionBlocked(input.reviewId, ["HEDGE_EXIT_ORDER_STATUS_FAILED"]);
+  }
+  const filledQuantity = finite(orderResponse.data.filled_qty, 0);
+  const status = String(orderResponse.data.status ?? "").toLowerCase();
+  if (status === "filled") {
+    updateCurrentExecution({ status: "filled", alpacaOrderId: brokerOrderId, alpacaStatus: status, requestId: orderResponse.requestId, rawResponse: orderResponse.data });
+    await recordCurrentExecution();
+    recordHedgeLearningEvent({ eventId: `${review.reviewId}:fill`, reviewId: review.reviewId, eventType: "fill", evidence: { symbol: review.orderIntent.symbol, filledQuantity, filledAveragePrice: orderResponse.data.filled_avg_price } });
+    return { paperOnly: true as const, environment: "paper" as const, status: "filled" as const, reviewId: review.reviewId, clientOrderId: review.clientOrderId, brokerOrderId, filledQuantity, averageFillPrice: finite(orderResponse.data.filled_avg_price, 0), blockers: [], warnings: [], reservationId, verification };
+  }
+  const cancelAuthorization = await authorizeBrokerMutation(executionEntry, "cancel");
+  if (!cancelAuthorization.brokerAllowed) {
+    return executionBlocked(
+      input.reviewId,
+      [...(cancelAuthorization.blockers ?? ["EXECUTION_BROKER_MUTATION_BLOCKED"])]
+    );
+  }
+  try {
+    await (deps.cancelPaperOrder ?? cancelPaperOrder)(brokerOrderId);
+  } catch (error) {
+    updateCurrentExecution({
+      status: "failed",
+      alpacaOrderId: brokerOrderId,
+      reason: "HEDGE_EXIT_ORDER_CANCEL_FAILED",
+      errorMessage: error instanceof Error ? error.message : "Paper hedge exit cancel failed."
+    });
+    await recordCurrentExecution();
+    return executionBlocked(input.reviewId, ["HEDGE_EXIT_ORDER_CANCEL_FAILED"]);
+  }
+  updateCurrentExecution({ status: filledQuantity > 0 ? "partial" : "canceled", alpacaOrderId: brokerOrderId, alpacaStatus: "canceled", requestId: orderResponse.requestId, rawResponse: orderResponse.data });
+  await recordCurrentExecution();
+  return { paperOnly: true as const, environment: "paper" as const, status: filledQuantity > 0 ? "partial" as const : "canceled" as const, reviewId: review.reviewId, clientOrderId: review.clientOrderId, brokerOrderId, filledQuantity, averageFillPrice: finite(orderResponse.data.filled_avg_price, 0), blockers: [], warnings: [], reservationId, verification };
 };

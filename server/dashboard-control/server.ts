@@ -1,45 +1,37 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
-import { createServer, IncomingMessage } from "node:http";
-import { spawn } from "node:child_process";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import type { Pool } from "pg";
 
-import {
-  buildCachedDashboardSnapshot,
-  latestPaperExecutions,
-  latestPaperPlans,
-  latestResearchRuns,
-  runPaperReview
-} from "../../apps/dashboard/lib/data.js";
-import { getAlpacaAccountSnapshot } from "../../src/services/alpacaAccountService.js";
-import { listAlpacaOpenOrders } from "../../src/services/alpacaOrderReadService.js";
-import { listAlpacaPositions } from "../../src/services/alpacaPositionService.js";
-import { listPaperOperations } from "../../src/services/paperOperationLogService.js";
-import { latestReviewArtifactReadiness } from "../../src/services/paperOpsWorkflowService.js";
-import {
-  buildPersistedHedgeRiskRead,
-  latestHedgeRecommendationForCurrentConfig
-} from "../../src/services/hedgePersistenceService.js";
-import { listPaperExecutionLedgerEntries } from "../../src/services/paperExecutionLedgerService.js";
-import { evaluateHedgeLearning, listRecentHedgeLearningEvents } from "../../src/services/hedgeLearningLifecycleService.js";
-import { buildZeroDteDashboardSummary } from "../../src/services/zeroDte/zeroDteEngineService.js";
+import { loadDatabaseConfig } from "../../src/lib/database/config.js";
+import { createPostgresPool } from "../../src/lib/database/postgres.js";
+import { assertPostgresOnlyDatabaseAuthority } from "../../src/lib/database/postgresOnlyRuntime.js";
+import { withPostgresTransaction } from "../../src/lib/database/postgresTransaction.js";
 import { safeTokenEquals } from "../../src/lib/safeToken.js";
 import { redactSensitiveData, redactSensitiveText } from "../../src/lib/securityRedaction.js";
+import { getTradingSafetyState } from "../../src/services/tradingSafetyService.js";
+import { getAlpacaAccountSnapshot } from "../../src/services/alpacaAccountService.js";
+import { getAlpacaMarketClock } from "../../src/services/alpacaMarketClockService.js";
+import { listAlpacaOpenOrders } from "../../src/services/alpacaOrderReadService.js";
+import { listAlpacaPositions } from "../../src/services/alpacaPositionService.js";
+import { submitPaperOrder } from "../../src/services/alpacaClient.js";
+import { readPostgresAuthorityStatus } from "../../src/services/postgresAuthorityCutoverService.js";
+import { runPostgresScheduledCommand } from "../../src/services/postgresScheduledCommandService.js";
+import { runPostgresResearchWorkflow } from "../../src/services/postgresResearchWorkflowService.js";
+import { runPostgresReviewWorkflow } from "../../src/services/postgresReviewWorkflowService.js";
+import { runAutonomousPostgresCommand } from "../../src/services/autonomousPostgresCommandService.js";
+import { runAutonomousPostgresExecutionCommand } from "../../src/services/autonomousPostgresExecutionService.js";
+import { capturePostgresAuthorityBrokerSnapshot } from "../../src/services/postgresAuthorityBrokerSnapshot.js";
+import { paperSubmitConfiguration } from "../../src/services/paperSubmitSafetyConfig.js";
 import {
-  RuntimePreflightError,
-  assertRuntimeMutationPreflight,
-  buildRuntimePreflightChecks,
-  type RuntimeMutationActionType,
-  type RuntimePreflightChecks
-} from "../../src/services/runtimeMutationPreflight.js";
-import {
-  appendBoundedCommandOutput,
-  COMMAND_OUTPUT_LIMIT,
-  COMMAND_STREAM_OUTPUT_LIMIT,
-  GuardedCommandError,
-  normalizeCommandFailure,
-  type GuardedCommandFailure
-} from "./commandResult.js";
+  readPostgresDashboardData,
+  readPostgresWorkerHealth,
+  readPostgresZeroDteDashboardSummary,
+  type PostgresDashboardQuery,
+  type PostgresWorkerHealth,
+  type PostgresZeroDteDashboardSummary
+} from "../../src/services/postgresDashboardReadService.js";
 
 type RiskProfile = "moderate" | "aggressive" | "conservative";
 type AssetClass = "all" | "equity" | "option";
@@ -51,6 +43,7 @@ type ControlInput = {
   assetClass: AssetClass;
   confirmPaper: boolean;
   expectedPayloadSignature?: string;
+  sections?: string;
   underlying: string;
   dte: number;
   quantity?: number;
@@ -65,103 +58,47 @@ type ControlInput = {
   riskNormalizationObservations?: number;
 };
 
-type Envelope = {
-  ok: true;
-  status: string;
-  action: string;
-  requestId: string;
-  startedAt: string;
-  finishedAt: string;
-  durationMs: number;
-  summary?: unknown;
-  details?: unknown;
-  blockers?: unknown;
-  warnings?: unknown;
-  data: unknown;
-  params?: Record<string, unknown>;
-  correlationId?: string;
+type ControlContext = {
+  readonly input: ControlInput;
+  readonly requestId: string;
+  readonly correlationId: string;
 };
 
-type ErrorEnvelope = {
-  ok: false;
-  action: string;
-  requestId: string;
-  correlationId?: string;
-  error: {
-    code: string;
-    message: string;
-  };
-  guard?: EnvironmentGuardState;
-  checks?: RuntimePreflightChecks;
-  failedChecks?: string[];
-  command?: GuardedCommandFailure;
-};
-
-type AuditEntry = {
-  timestamp: string;
-  action: string;
-  method: string;
-  requestId: string;
-  correlationId: string;
-  params: Record<string, unknown>;
-  status: "success" | "error";
-  durationMs: number;
-  resultSummary: string;
-  error?: string;
-};
-
-type ActionHandler = (
-  input: ControlInput,
-  requestId: string,
-  correlationId: string
-) => Promise<unknown>;
-
-type ControlRuntimePreflight = {
-  actionType: RuntimeMutationActionType;
-  confirmPaper?: boolean;
-  confirmPaperFromInput?: boolean;
-  requireOptionsExecution?: boolean;
-};
+type Handler = (context: ControlContext) => Promise<unknown>;
 
 type ActionConfig = {
   method: "GET" | "POST";
-  timeoutMs: number;
   requireAdminToken: boolean;
-  requireMutationPrecheck: boolean;
-  requireHedgeDashboardMutations?: boolean;
-  runtimePreflight?: ControlRuntimePreflight;
   action: string;
-  handler: ActionHandler;
+  handler: Handler;
 };
 
-type CommandRunner = (
-  script: string,
-  args: string[],
-  timeoutMs: number,
-  requestId: string,
-  action: string,
-  options?: {
-    env?: Record<string, string>;
+type ControlDependencies = {
+  authorityStatus: () => Promise<unknown>;
+  account: typeof getAlpacaAccountSnapshot;
+  positions: typeof listAlpacaPositions;
+  openOrders: typeof listAlpacaOpenOrders;
+  query?: () => PostgresDashboardQuery;
+  workerHealth?: () => Promise<PostgresWorkerHealth>;
+  dashboardData?: (limit?: number) => Promise<Awaited<ReturnType<typeof readPostgresDashboardData>>>;
+  zeroDteSummary?: (limit?: number) => Promise<PostgresZeroDteDashboardSummary>;
+  scheduledCommand?: (
+    command: string,
+    context: ControlContext
+  ) => Promise<unknown>;
+};
+
+class ControlRouteError extends Error {
+  constructor(
+    readonly code: string,
+    readonly status: number,
+    message: string
+  ) {
+    super(message);
+    this.name = "ControlRouteError";
   }
-) => Promise<unknown>;
+}
 
-type OpenOrdersFetcher = () => Promise<unknown>;
-
-type EnvironmentGuardState = {
-  paperOnly: boolean;
-  environment: string;
-  tradingMode: string;
-  liveTradingEnabled: boolean;
-  mutationAllowed: boolean;
-  paperExecutionEnabled: boolean;
-  paperOrderExecutionEnabled: boolean;
-  paperOptionsExecutionEnabled: boolean;
-  automatedPaperExecutionEnabled: boolean;
-  liveApiBaseUrlReachableOrConfigured: boolean;
-  paperApiBaseUrlConfigured: boolean;
-};
-
-const getControlToken = () => process.env.VPS_CONTROL_TOKEN?.trim() || "";
 const CONTROL_HOST =
   process.env.VPS_CONTROL_BIND_HOST?.trim() ||
   process.env.DASHBOARD_CONTROL_HOST?.trim() ||
@@ -172,1288 +109,658 @@ const CONTROL_PORT = Number(
     process.env.PORT ||
     "4100"
 );
-const getLogPath = () =>
-  process.env.VPS_CONTROL_AUDIT_PATH?.trim() ||
-  process.env.DASHBOARD_CONTROL_LOG_PATH?.trim() ||
-  "./logs/dashboard-control-audit.jsonl";
+const MAX_REQUEST_BODY_BYTES = 100_000;
 
-const TIMEOUT_DEFAULT_MS = 10_000;
+let pool: Pool | null = null;
+let testDependencies: ControlDependencies | null = null;
 
-const killProcessTree = (child: ReturnType<typeof spawn>) => {
-  if (child.pid && process.platform !== "win32") {
-    try {
-      process.kill(-child.pid, "SIGKILL");
-      return;
-    } catch {
-      // Fall back to killing the direct child below.
-    }
-  }
-  child.kill("SIGKILL");
+const postgresPool = () => {
+  if (pool) return pool;
+  const config = loadDatabaseConfig(process.env, { purpose: "application" });
+  assertPostgresOnlyDatabaseAuthority(config);
+  pool = createPostgresPool(config, "pooled");
+  return pool;
 };
 
-export const parseControlCommandOutput = (
-  output: string,
-  durationMs: number,
-  requestId: string
-): Record<string, unknown> => {
-  const trimmed = output.trim();
-  if (!trimmed) {
-    return { _controlDurationMs: durationMs, _controlRequestId: requestId };
-  }
-  try {
-    const parsed = JSON.parse(trimmed) as unknown;
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return {
-        ...(parsed as Record<string, unknown>),
-        _controlDurationMs: durationMs,
-        _controlRequestId: requestId
-      };
-    }
-    return {
-      value: parsed,
-      _controlDurationMs: durationMs,
-      _controlRequestId: requestId
-    };
-  } catch {
-    const redacted = redactSensitiveText(trimmed);
-    const suffix = "...[truncated]";
-    const value =
-      redacted.length <= COMMAND_OUTPUT_LIMIT
-        ? redacted
-        : `${redacted.slice(0, COMMAND_OUTPUT_LIMIT - suffix.length)}${suffix}`;
-    return { value, _controlDurationMs: durationMs, _controlRequestId: requestId };
-  }
-};
-
-const runCommandViaSpawn = (
-  script: string,
-  args: string[],
-  timeoutMs: number,
-  requestId: string,
-  action: string,
-  options: {
-    env?: Record<string, string>;
-  } = {}
-): Promise<unknown> => {
-  return new Promise((resolve, reject) => {
-    let output = "";
-    let errored = "";
-    let timedOut = false;
-    let outputLimitExceeded: "stdout" | "stderr" | null = null;
-    let settled = false;
-    const started = Date.now();
-    const child = spawn("npm", ["--silent", "run", script, "--", ...args], {
-      detached: process.platform !== "win32",
-      env: {
-        ...process.env,
-        ...(options.env || {})
-      },
-      stdio: ["ignore", "pipe", "pipe"]
-    });
-
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      killProcessTree(child);
-    }, timeoutMs);
-
-    child.stdout?.on("data", (chunk) => {
-      if (outputLimitExceeded) return;
-      const bounded = appendBoundedCommandOutput(output, String(chunk));
-      output = bounded.value;
-      if (bounded.exceeded) {
-        outputLimitExceeded = "stdout";
-        killProcessTree(child);
-      }
-    });
-    child.stderr?.on("data", (chunk) => {
-      if (outputLimitExceeded) return;
-      const bounded = appendBoundedCommandOutput(errored, String(chunk));
-      errored = bounded.value;
-      if (bounded.exceeded) {
-        outputLimitExceeded = "stderr";
-        killProcessTree(child);
-      }
-    });
-    child.on("error", (error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      const failure = normalizeCommandFailure({
-        exitCode: null,
-        signal: null,
-        timedOut,
-        stdout: output,
-        stderr: `${errored}\n${error.message}`,
-        ...(outputLimitExceeded
-          ? {
-              errorOverride: {
-                code: "COMMAND_OUTPUT_LIMIT_EXCEEDED",
-                message: `Command ${outputLimitExceeded} exceeded the ${COMMAND_STREAM_OUTPUT_LIMIT}-character collection limit.`
-              }
-            }
-          : {})
-      });
-      reject(new GuardedCommandError(action, failure));
-    });
-    child.on("close", (code, signal) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      const durationMs = Date.now() - started;
-
-      if (code !== 0 || signal || timedOut || outputLimitExceeded) {
-        const failure = normalizeCommandFailure({
-          exitCode: code,
-          signal,
-          timedOut,
-          stdout: output,
-          stderr: errored,
-          ...(outputLimitExceeded
-            ? {
-                errorOverride: {
-                  code: "COMMAND_OUTPUT_LIMIT_EXCEEDED",
-                  message: `Command ${outputLimitExceeded} exceeded the ${COMMAND_STREAM_OUTPUT_LIMIT}-character collection limit.`
-                }
-              }
-            : {})
-        });
-        reject(new GuardedCommandError(action, failure));
-        return;
-      }
-
-      resolve(parseControlCommandOutput(output, durationMs, requestId));
-    });
-  });
-};
-
-let commandRunner: CommandRunner = runCommandViaSpawn;
-let openOrdersFetcher: OpenOrdersFetcher = listAlpacaOpenOrders;
-
-export const setControlCommandRunner = (runner: CommandRunner | null) => {
-  commandRunner = runner || runCommandViaSpawn;
-};
-
-export const setOpenOrdersFetcher = (fetcher: OpenOrdersFetcher | null) => {
-  openOrdersFetcher = fetcher || listAlpacaOpenOrders;
-};
-
-export const resetControlTestHooks = () => {
-  commandRunner = runCommandViaSpawn;
-  openOrdersFetcher = listAlpacaOpenOrders;
-};
-
-const command = (
-  script: string,
-  args: string[],
-  timeoutMs: number,
-  requestId: string,
-  action: string,
-  options?: {
-    env?: Record<string, string>;
-  }
-) => commandRunner(script, args, timeoutMs, requestId, action, options);
-
-const researchRunEnv = (requestId: string, correlationId: string) => ({
-  ALPACA_REQUEST_TIMEOUT_MS:
-    process.env.VPS_RESEARCH_REQUEST_TIMEOUT_MS?.trim() || "10000",
-  ALPACA_MAX_RETRIES:
-    process.env.VPS_RESEARCH_MAX_RETRIES?.trim() || "0",
-  RESEARCH_REQUEST_ID: requestId,
-  RESEARCH_CORRELATION_ID: correlationId
+const queryAdapter = (queryable: {
+  query: (sql: string, values?: unknown[]) => Promise<unknown>;
+}): PostgresDashboardQuery => ({
+  query: (sql, values) => queryable.query(sql, values ? [...values] : undefined) as never
 });
 
-const healthRunEnv = () => ({
-  ALPACA_HEALTH_OPERATION_TIMEOUT_MS:
-    process.env.VPS_HEALTH_OPERATION_TIMEOUT_MS?.trim() || "9000",
-  ALPACA_HEALTH_COMPLETION_MARGIN_MS:
-    process.env.VPS_HEALTH_COMPLETION_MARGIN_MS?.trim() || "750"
+const defaultDependencies = (): ControlDependencies => ({
+  authorityStatus: async () => {
+    const database = postgresPool();
+    await database.query("SELECT 1 AS postgres_authority_available");
+    const status = await readPostgresAuthorityStatus(database);
+    if (!status.latestCheckpoint || status.latestCheckpoint.status !== "passed") {
+      throw new ControlRouteError(
+        "POSTGRES_AUTHORITY_BASELINE_REQUIRED",
+        503,
+        "A passed PostgreSQL authority baseline is required."
+      );
+    }
+    return status;
+  },
+  account: getAlpacaAccountSnapshot,
+  positions: listAlpacaPositions,
+  openOrders: listAlpacaOpenOrders,
+  query: () => queryAdapter(postgresPool()),
+  workerHealth: () => readPostgresWorkerHealth(queryAdapter(postgresPool())),
+  dashboardData: (limit = 25) => readPostgresDashboardData(queryAdapter(postgresPool()), limit),
+  zeroDteSummary: (limit = 25) => readPostgresZeroDteDashboardSummary({
+    query: queryAdapter(postgresPool()),
+    limit
+  })
 });
 
-const safeInteger = (value: unknown, fallback: number, min = 1, max = 50) => {
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    return fallback;
-  }
-  const parsed = Math.floor(value);
-  return Math.min(max, Math.max(min, parsed));
+const dependencies = () => testDependencies ?? defaultDependencies();
+
+export const setControlDependenciesForTests = (value: ControlDependencies | null) => {
+  testDependencies = value;
 };
 
-const normalizeBoolean = (value: unknown, fallback = false) => {
-  if (value === "true") {
-    return true;
-  }
-  if (value === "false") {
-    return false;
-  }
-  return typeof value === "boolean" ? value : fallback;
-};
+const authorityStatus = async () => dependencies().authorityStatus();
 
-const buildEnvironmentGuardState = (payload?: Record<string, unknown>): EnvironmentGuardState => {
-  const checks = buildRuntimePreflightChecks(payload || {});
-
-  return {
-    ...checks,
-    paperOrderExecutionEnabled: checks.paperExecutionEnabled
-  };
-};
-
-class EnvironmentGuardError extends Error {
-  code: string;
-  status: number;
-  guard: EnvironmentGuardState;
-  checks: RuntimePreflightChecks;
-  failedChecks: string[];
-
-  constructor(
-    code: string,
-    message: string,
-    guard: EnvironmentGuardState,
-    status = 403,
-    failedChecks: string[] = []
+const assertPaperRuntime = () => {
+  const safety = getTradingSafetyState();
+  if (
+    safety.alpacaEnv !== "paper" ||
+    String(process.env.TRADING_MODE || "paper").toLowerCase() !== "paper" ||
+    safety.liveTradingEnabled
   ) {
-    super(message);
-    this.name = "EnvironmentGuardError";
-    this.code = code;
-    this.status = status;
-    this.guard = guard;
-    this.checks = guard;
-    this.failedChecks = failedChecks;
+    throw new ControlRouteError(
+      "PAPER_RUNTIME_REQUIRED",
+      503,
+      "Dashboard control actions require paper mode with live trading disabled."
+    );
   }
-}
-
-const parseAssetClass = (value: unknown): AssetClass => {
-  return value === "equity" || value === "option" ? value : "all";
 };
 
-const normalizeRiskProfile = (value: unknown): RiskProfile => {
-  return value === "moderate" || value === "conservative" ? value : "aggressive";
-};
-
-const parseInput = (raw: unknown): ControlInput => {
-  const body = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+const normalizeInput = (value: unknown): ControlInput => {
+  const body = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const riskProfile = body.riskProfile === "moderate" || body.riskProfile === "conservative"
+    ? body.riskProfile
+    : "aggressive";
+  const maxCandidates = Number(body.maxCandidates);
+  const dte = Number(body.dte);
+  const quantity = Number(body.quantity);
+  const numberOrUndefined = (entry: unknown) => {
+    const parsed = Number(entry);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  };
   return {
-    riskProfile: normalizeRiskProfile(body.riskProfile),
-    optionsEnabled: normalizeBoolean(body.optionsEnabled, true),
-    maxCandidates: safeInteger(body.maxCandidates, 10),
-    assetClass: parseAssetClass(body.assetClass),
-    confirmPaper: normalizeBoolean(body.confirmPaper, false),
+    riskProfile,
+    optionsEnabled: body.optionsEnabled !== false,
+    maxCandidates: Number.isSafeInteger(maxCandidates) && maxCandidates > 0
+      ? Math.min(50, maxCandidates)
+      : 10,
+    assetClass: body.assetClass === "equity" || body.assetClass === "option"
+      ? body.assetClass
+      : "all",
+    confirmPaper: body.confirmPaper === true,
     expectedPayloadSignature:
       typeof body.expectedPayloadSignature === "string"
-        ? body.expectedPayloadSignature
+        ? body.expectedPayloadSignature.trim() || undefined
         : undefined,
+    sections: typeof body.sections === "string" ? body.sections : undefined,
     underlying:
       typeof body.underlying === "string" && body.underlying.trim()
         ? body.underlying.trim().toUpperCase()
         : "SPY",
-    dte: safeInteger(body.dte, 0, 0, 30),
-    quantity: typeof body.quantity === "number" ? Math.max(1, Math.floor(body.quantity)) : undefined,
-    reviewId: typeof body.reviewId === "string" && body.reviewId.trim() ? body.reviewId.trim() : undefined,
-    symbol: typeof body.symbol === "string" && body.symbol.trim() ? body.symbol.trim().toUpperCase() : undefined,
+    dte: Number.isSafeInteger(dte) && dte >= 0 ? Math.min(730, dte) : 0,
+    quantity: Number.isFinite(quantity) && quantity > 0 ? Math.floor(quantity) : undefined,
+    reviewId: typeof body.reviewId === "string" ? body.reviewId.trim() || undefined : undefined,
+    symbol: typeof body.symbol === "string" ? body.symbol.trim().toUpperCase() || undefined : undefined,
     expirationDate: typeof body.expirationDate === "string" ? body.expirationDate : undefined,
-    entryPrice: typeof body.entryPrice === "number" ? body.entryPrice : undefined,
-    currentPrice: typeof body.currentPrice === "number" ? body.currentPrice : undefined,
+    entryPrice: numberOrUndefined(body.entryPrice),
+    currentPrice: numberOrUndefined(body.currentPrice),
     entryAt: typeof body.entryAt === "string" ? body.entryAt : undefined,
     asOf: typeof body.asOf === "string" ? body.asOf : undefined,
-    staleThesis: normalizeBoolean(body.staleThesis, false),
-    riskNormalizationObservations: typeof body.riskNormalizationObservations === "number" ? body.riskNormalizationObservations : undefined
+    staleThesis: body.staleThesis === true,
+    riskNormalizationObservations: numberOrUndefined(body.riskNormalizationObservations)
   };
 };
 
-const readBody = async (request: IncomingMessage) => {
+const readBody = async (request: IncomingMessage): Promise<unknown> => {
   const chunks: Buffer[] = [];
-  let totalBytes = 0;
-
+  let bytes = 0;
   for await (const chunk of request) {
-    const chunkSize = Buffer.from(chunk).byteLength;
-    totalBytes += chunkSize;
-    if (totalBytes > 100_000) {
-      throw new Error("Request body too large.");
+    const buffer = Buffer.from(chunk);
+    bytes += buffer.byteLength;
+    if (bytes > MAX_REQUEST_BODY_BYTES) {
+      throw new ControlRouteError("CONTROL_INPUT_TOO_LARGE", 413, "Request body is too large.");
     }
-    chunks.push(Buffer.from(chunk));
+    chunks.push(buffer);
   }
-
-  const text = Buffer.concat(chunks).toString("utf8");
-  if (!text.trim()) {
-    return {};
-  }
-
+  const text = Buffer.concat(chunks).toString("utf8").trim();
+  if (!text) return {};
   try {
     return JSON.parse(text);
   } catch {
-    throw new Error("Invalid JSON body.");
+    throw new ControlRouteError("CONTROL_INPUT_INVALID", 400, "Request body must be valid JSON.");
   }
 };
 
-const summarize = (value: unknown) => {
-  if (Array.isArray(value)) {
-    return `array:${value.length}`;
-  }
-  if (value && typeof value === "object") {
-    if ("status" in value && typeof value.status === "string") {
-      return `status:${String(value.status)}`;
+const queryFor = () => dependencies().query?.() || queryAdapter(postgresPool());
+
+const readCurrentSummary = async () => {
+  const runtime = dependencies();
+  const [authority, account, positions, openOrders, dashboard, worker] = await Promise.all([
+    runtime.authorityStatus(),
+    runtime.account(),
+    runtime.positions(),
+    runtime.openOrders(),
+    runtime.dashboardData?.(25) || readPostgresDashboardData(queryFor(), 25),
+    runtime.workerHealth?.() || readPostgresWorkerHealth(queryFor())
+  ]);
+  const readyIntentCount = dashboard.readyIntentCount;
+  return {
+    paperOnly: true,
+    environment: "paper",
+    liveTradingEnabled: false,
+    generatedAt: new Date().toISOString(),
+    mode: "postgres-only-authority",
+    historicalDataAvailable: true,
+    durableStorageConfigured: true,
+    historicalWarning: null,
+    durableStorageWarning: null,
+    authority,
+    account: { ok: true, label: "account", data: account },
+    positions: { ok: true, label: "positions", data: positions },
+    openOrders: { ok: true, label: "openOrders", data: openOrders },
+    runtime: { ok: true, label: "runtime", data: worker },
+    plan: {
+      ok: true,
+      label: "plan",
+      data: { plan: dashboard.latestPaperPlans, planSummary: { count: dashboard.latestPaperPlans.length } }
+    },
+    review: {
+      ok: true,
+      label: "review",
+      data: {
+        review: dashboard.reviews[0] ?? { status: "blocked", blockers: ["NO_POSTGRES_REVIEW"] },
+        planSummary: { plannedOrders: readyIntentCount }
+      }
+    },
+    dryRun: {
+      ok: true,
+      label: "dryRun",
+      data: {
+        summary: { wouldSubmitCount: readyIntentCount, payloadsBlocked: 0 },
+        assetClass: "all"
+      }
+    },
+    latestResearch: dashboard.latestResearch,
+    latestPaperPlans: dashboard.latestPaperPlans,
+    snapshots: dashboard.optionContracts,
+    executions: { ok: true, label: "executions", data: dashboard.executions },
+    learningSummary: {
+      ok: true,
+      label: "learningSummary",
+      data: { authority: "postgres", status: "available_through_postgres_commands" }
+    },
+    promotionReadiness: [],
+    optionContracts: dashboard.optionContracts,
+    requestIds: dashboard.requestIds,
+    hedge: {
+      ok: true,
+      label: "hedge",
+      data: { paperOnly: true, status: "blocked", blockers: ["NO_POSTGRES_HEDGE_STATE"] }
     }
-    if ("plan" in value && Array.isArray((value as { plan?: unknown }).plan)) {
-      return `plan:${(value as { plan: unknown[] }).plan.length}`;
-    }
-    if ("review" in value && "planSummary" in value) {
-      return "review:present";
-    }
-  }
-  return "result";
+  };
 };
 
-const authorize = (request: IncomingMessage) => {
-  const token = request.headers.authorization;
-  if (typeof token !== "string") {
-    return false;
-  }
-  if (!token.toLowerCase().startsWith("bearer ")) {
-    return false;
-  }
-  const presented = token.slice(7).trim();
-  const configured = getControlToken();
-  return safeTokenEquals(presented, configured);
-};
-
-const requestIdFromRequest = (request: IncomingMessage) =>
-  String(
-    Array.isArray(request.headers["x-correlation-id"])
-      ? request.headers["x-correlation-id"][0] ?? randomUUID()
-      : request.headers["x-correlation-id"] || request.headers["x-request-id"] || randomUUID()
+const readDryRun = async () => {
+  await authorityStatus();
+  const result = await queryFor().query(
+    `SELECT COUNT(*) AS ready_count
+     FROM order_intents
+     WHERE status = 'ready_for_submission' AND environment = 'paper'`,
+    []
   );
-
-const logEntry = (entry: AuditEntry) => {
-  try {
-    const logPath = getLogPath();
-    mkdirSync(dirname(logPath), { recursive: true });
-    appendFileSync(logPath, `${JSON.stringify(redactSensitiveData(entry))}\n`);
-  } catch {
-    // Logging is best-effort only.
-  }
+  const readyCount = Number(result.rows[0]?.ready_count ?? 0);
+  return {
+    paperOnly: true,
+    environment: "paper",
+    liveTradingEnabled: false,
+    status: "completed",
+    summary: { wouldSubmitCount: Number.isSafeInteger(readyCount) ? readyCount : 0, payloadsBlocked: 0 },
+    assetClass: "all",
+    mutationAttempted: false
+  };
 };
 
-const wrapSuccess = (
-  action: string,
-  requestId: string,
-  correlationId: string,
-  data: unknown,
-  params: Record<string, unknown>,
-  timing: {
-    startedAt: string;
-    finishedAt: string;
-    durationMs: number;
-  }
-): Envelope => ({
-  ok: true,
-  status:
-    data && typeof data === "object" && "status" in data
-      ? String((data as { status?: unknown }).status || "success")
-      : "success",
-  action,
-  requestId,
-  correlationId,
-  startedAt: timing.startedAt,
-  finishedAt: timing.finishedAt,
-  durationMs: timing.durationMs,
-  ...(data && typeof data === "object" && "summary" in data
-    ? { summary: (data as { summary?: unknown }).summary }
-    : {}),
-  ...(data && typeof data === "object" && "details" in data
-    ? { details: (data as { details?: unknown }).details }
-    : {}),
-  ...(data && typeof data === "object" && "blockers" in data
-    ? { blockers: (data as { blockers?: unknown }).blockers }
-    : {}),
-  ...(data && typeof data === "object" && "warnings" in data
-    ? { warnings: (data as { warnings?: unknown }).warnings }
-    : {}),
-  data,
-  params
-});
-
-const wrapError = (action: string, requestId: string, code: string, message: string): ErrorEnvelope => ({
-  ok: false,
-  action,
-  requestId,
-  error: {
-    code,
-    message
-  }
-});
-
-const wrapRouteError = (
-  action: string,
-  requestId: string,
-  correlationId: string,
-  code: string,
-  message: string,
-  guard?: EnvironmentGuardState,
-  failedChecks: string[] = [],
-  commandFailure?: GuardedCommandFailure
-): ErrorEnvelope => ({
-  ok: false,
-  action,
-  requestId,
-  correlationId,
-  error: {
-    code,
-    message: redactSensitiveText(message)
-  },
-  ...(guard ? { guard, checks: guard, failedChecks } : {}),
-  ...(commandFailure ? { command: commandFailure } : {})
-});
-
-type MutabilityRequirement = {
-  requireAggressiveMode?: boolean;
-  requireOptionsExecution?: boolean;
-  actionType?: RuntimeMutationActionType;
-  confirmPaper?: boolean;
-};
-
-const verifyPaperMutability = async (requirements: MutabilityRequirement = {}) => {
-  const health = await command(
-    "alpaca:health",
-    ["--format=json"],
-    TIMEOUT_DEFAULT_MS,
-    randomUUID(),
-    "health",
-    { env: healthRunEnv() }
-  );
-  if (!health || typeof health !== "object") {
-    throw new Error("Health check output was not parseable JSON.");
-  }
-
-  const payload = health as Record<string, unknown>;
-  const guard = buildEnvironmentGuardState(payload);
-  try {
-    assertRuntimeMutationPreflight(
-      {
-        actionType: requirements.actionType || "research",
-        confirmPaper: requirements.confirmPaper,
-        requireOptionsExecution: requirements.requireOptionsExecution
-      },
-      payload
-    );
-  } catch (error) {
-    if (error instanceof RuntimePreflightError) {
-      throw new EnvironmentGuardError(
-        error.code,
-        error.message,
-        buildEnvironmentGuardState(error.checks),
-        error.status,
-        error.failedChecks
+const runScheduledCommand = async (command: string, context: ControlContext) => {
+  const injected = dependencies().scheduledCommand;
+  if (injected) return injected(command, context);
+  return runPostgresScheduledCommand({
+    command,
+    action: context.requestId,
+    sections: context.input.sections,
+    operation: async (scheduledContext) => {
+      if (!scheduledContext) throw new ControlRouteError(
+        "POSTGRES_SCHEDULER_CONTEXT_REQUIRED",
+        503,
+        "A PostgreSQL scheduler context is required."
+      );
+      const query = queryAdapter(scheduledContext.pool);
+      if (command === "research:daily") {
+        return runPostgresResearchWorkflow({
+          query,
+          fence: scheduledContext.fence,
+          riskProfile: context.input.riskProfile,
+          optionsEnabled: context.input.optionsEnabled,
+          maxCandidates: context.input.maxCandidates
+        });
+      }
+      if ([
+        "paper:review",
+        "paper:portfolio:review",
+        "paper:options:discover",
+        "paper:ops:review",
+        "paper:exit:review",
+        "hedge:review",
+        "hedge:exit:review",
+        "zero-dte:exit:review"
+      ].includes(command)) {
+        return runPostgresReviewWorkflow({
+          command,
+          query,
+          fence: scheduledContext.fence,
+          underlying: context.input.underlying,
+          dte: context.input.dte
+        });
+      }
+      if (command === "paper:learn" || command === "system:recover") {
+        return runAutonomousPostgresCommand({
+          command,
+          query,
+          fence: scheduledContext.fence
+        });
+      }
+      if ([
+        "paper:execute:reviewed",
+        "paper:exit:execute",
+        "hedge:exit:execute",
+        "zero-dte:engine"
+      ].includes(command)) {
+        const safety = paperSubmitConfiguration();
+        return runAutonomousPostgresExecutionCommand({
+          command,
+          query,
+          transaction: (operation) => withPostgresTransaction(
+            scheduledContext.pool,
+            scheduledContext.config,
+            (client) => operation(queryAdapter(client) as never)
+          ),
+          marketOpen: async () => Boolean((await getAlpacaMarketClock()).isOpen),
+          captureBrokerSnapshot: capturePostgresAuthorityBrokerSnapshot,
+          submitOrder: submitPaperOrder,
+          fence: scheduledContext.fence,
+          safety: {
+            environment: safety.environment,
+            tradingMode: safety.tradingMode,
+            liveTradingEnabled: safety.liveTradingEnabled,
+            paperOrderExecutionEnabled: safety.paperOrderExecutionEnabled,
+            paperOptionsExecutionEnabled: safety.paperOptionsExecutionEnabled,
+            quoteMaxAgeSeconds: safety.quoteMaxAgeSeconds
+          },
+          confirmPaper: context.input.confirmPaper,
+          expectedPayloadSignature: context.input.expectedPayloadSignature
+        });
+      }
+      throw new ControlRouteError(
+        "POSTGRES_COMMAND_UNSUPPORTED",
+        503,
+        `PostgreSQL command ${command} is not supported by the dashboard bridge.`
       );
     }
-    throw error;
-  }
-
-  if (payload.accountStatus !== "ACTIVE") {
-    throw new EnvironmentGuardError(
-      "PAPER_ACCOUNT_NOT_ACTIVE",
-      `Blocked by safety guard: paper account status ${String(payload.accountStatus || "unknown")} blocks operation.`,
-      guard
-    );
-  }
-
-  if (requirements.requireAggressiveMode && process.env.ENABLE_AGGRESSIVE_PAPER_STRATEGIES !== "true") {
-    throw new EnvironmentGuardError(
-      "AGGRESSIVE_PAPER_MODE_DISABLED",
-      "Blocked by safety guard: aggressive paper mode is disabled.",
-      guard
-    );
-  }
-
+  });
 };
 
-const executeDryRunHandler = (input: ControlInput, requestId: string) =>
-  command(
-    "paper:execute",
-    [
-      "--dryRun",
-      `--riskProfile=${input.riskProfile}`,
-      `--optionsEnabled=${String(input.optionsEnabled)}`,
-      `--maxCandidates=${input.maxCandidates}`,
-      `--assetClass=${input.assetClass}`,
-      "--format=json"
-    ],
-    120_000,
-    requestId,
-    "execute.dry-run"
-  );
-
-const learnRunHandler = (_input: ControlInput, requestId: string) =>
-  command(
-    "paper:learn",
-    ["--format=json"],
-    120_000,
-    requestId,
-    "learn.run"
-  );
-
-const portfolioReviewHandler = (_input: ControlInput, requestId: string) =>
-  command(
-    "paper:portfolio:review",
-    ["--format=json"],
-    60_000,
-    requestId,
-    "portfolio.review"
-  );
-
-const optionsDiscoverHandler = (input: ControlInput, requestId: string) =>
-  command(
-    "paper:options:discover",
-    [
-      `--underlying=${input.underlying}`,
-      `--dte=${input.dte}`,
-      "--format=json"
-    ],
-    60_000,
-    requestId,
-    "options.discover"
-  );
-
-const opsReviewHandler = (_input: ControlInput, requestId: string) =>
-  command(
-    "paper:ops:review",
-    ["--format=json"],
-    120_000,
-    requestId,
-    "paper.ops.review"
-  );
-
-const executeReviewedHandler = async (input: ControlInput, requestId: string) => {
-  if (input.confirmPaper !== true) {
-    return {
-      paperOnly: true,
-      status: "blocked",
-      reason: "CONFIRM_PAPER_REQUIRED",
-      summary: {
-        eligiblePayloads: 0,
-        submitted: 0,
-        blocked: 1,
-        errors: 0
-      },
-      blockers: ["CONFIRM_PAPER_REQUIRED"],
-      warnings: []
-    };
-  }
-
-  const readiness = latestReviewArtifactReadiness();
-  if (!readiness.ready) {
-    return {
-      paperOnly: true,
-      status: readiness.status,
-      reason: readiness.reason,
-      summary: {
-        eligiblePayloads: readiness.artifact?.payloadCount ?? 0,
-        submitted: 0,
-        blocked: readiness.status === "blocked" ? 1 : 0,
-        errors: 0
-      },
-      blockers: readiness.status === "blocked" ? [readiness.reason] : [],
-      warnings: readiness.status === "warning" ? [readiness.reason] : [],
-      artifact: readiness.artifact ?? null
-    };
-  }
-
-  await openOrdersFetcher();
-  return command(
-    "paper:execute:reviewed",
-    [
-      "--confirmPaper",
-      `--expectedPayloadSignature=${readiness.artifact.payloadSignature}`,
-      "--format=json"
-    ],
-    120_000,
-    requestId,
-    "execute.reviewed"
-  );
-};
-
-const hedgeReviewHandler = (_input: ControlInput, requestId: string) =>
-  command("hedge:review", ["--format=json"], 120_000, requestId, "hedge.review");
-
-const hedgeExecuteHandler = (input: ControlInput, requestId: string) => {
-  if (input.confirmPaper !== true) {
-    return Promise.resolve({ paperOnly: true, status: "blocked", blockers: ["CONFIRM_PAPER_REQUIRED"] });
-  }
-  if (!input.reviewId) {
-    return Promise.resolve({ paperOnly: true, status: "blocked", blockers: ["HEDGE_REVIEW_ID_REQUIRED"] });
-  }
-  return command(
-    "hedge:execute",
-    [`--reviewId=${input.reviewId}`, "--confirmPaper", "--format=json"],
-    120_000,
-    requestId,
-    "hedge.execute"
-  );
-};
-
-const hedgeExitReviewHandler = (input: ControlInput, requestId: string) => {
-  if (!input.symbol || !input.expirationDate || input.entryPrice === undefined || input.currentPrice === undefined) {
-    return Promise.resolve({ paperOnly: true, environment: "paper", status: "blocked", blockers: ["HEDGE_EXIT_INPUT_REQUIRED"] });
-  }
-  return command(
-    "hedge:exit:review",
-    [
-      `--symbol=${input.symbol}`,
-      `--underlying=${input.underlying}`,
-      `--quantity=${input.quantity || 1}`,
-      `--entryPrice=${input.entryPrice}`,
-      `--currentPrice=${input.currentPrice}`,
-      `--expirationDate=${input.expirationDate}`,
-      `--entryAt=${input.entryAt || new Date().toISOString()}`,
-      ...(input.asOf ? [`--asOf=${input.asOf}`] : []),
-      ...(input.staleThesis ? ["--staleThesis"] : []),
-      `--riskNormalizationObservations=${input.riskNormalizationObservations || 0}`,
-      "--format=json"
-    ],
-    60_000,
-    requestId,
-    "hedge.exit.review"
-  );
-};
-
-const hedgeExitExecuteHandler = (input: ControlInput, requestId: string) => {
-  if (input.confirmPaper !== true) {
-    return Promise.resolve({ paperOnly: true, status: "blocked", blockers: ["CONFIRM_PAPER_REQUIRED"] });
-  }
-  if (!input.reviewId) {
-    return Promise.resolve({ paperOnly: true, status: "blocked", blockers: ["HEDGE_REVIEW_ID_REQUIRED"] });
-  }
-  return command(
-    "hedge:exit:execute",
-    [`--reviewId=${input.reviewId}`, "--confirmPaper", "--format=json"],
-    120_000,
-    requestId,
-    "hedge.exit.execute"
-  );
-};
+const blockedResult = (code: string) => ({
+  paperOnly: true,
+  environment: "paper",
+  liveTradingEnabled: false,
+  status: "blocked",
+  code,
+  blockers: [code],
+  mutationAttempted: false
+});
 
 const actionHandlers: Record<string, ActionConfig> = {
   "/api/v1/health": {
     method: "GET",
-    timeoutMs: 10_000,
     requireAdminToken: false,
-    requireMutationPrecheck: false,
     action: "health",
-    handler: async (_input, requestId) =>
-      command("alpaca:health", ["--format=json"], 10_000, requestId, "health", {
-        env: healthRunEnv()
-      })
-  },
-  "/api/v1/hedge/recommendation": {
-    method: "GET",
-    timeoutMs: 30_000,
-    requireAdminToken: false,
-    requireMutationPrecheck: false,
-    action: "hedge.recommendation",
-    handler: async () =>
-      latestHedgeRecommendationForCurrentConfig() ?? {
-        paperOnly: true,
-        effectiveStatus: "blocked",
-        recommendationStatus: "blocked",
-        warnings: ["NO_HEDGE_RECOMMENDATION"],
-        blockers: ["NO_HEDGE_RECOMMENDATION"]
-      }
-  },
-  "/api/v1/hedge/risk": {
-    method: "GET",
-    timeoutMs: 30_000,
-    requireAdminToken: false,
-    requireMutationPrecheck: false,
-    action: "hedge.risk",
-    handler: async () =>
-      buildPersistedHedgeRiskRead(latestHedgeRecommendationForCurrentConfig())
-  },
-  "/api/v1/hedge/regime": {
-    method: "GET",
-    timeoutMs: 30_000,
-    requireAdminToken: false,
-    requireMutationPrecheck: false,
-    action: "hedge.regime",
     handler: async () => {
-      const recommendation = latestHedgeRecommendationForCurrentConfig();
+      const worker = dependencies().workerHealth
+        ? await dependencies().workerHealth!()
+        : await readPostgresWorkerHealth(queryFor());
       return {
         paperOnly: true,
-        effectiveStatus: recommendation?.effectiveStatus ?? "blocked",
-        generatedAt: recommendation?.generatedAt ?? null,
-        expiresAt: recommendation?.expiresAt ?? null,
-        regime: recommendation?.regime ?? null,
-        warnings: recommendation?.integrityWarnings ?? ["NO_HEDGE_RECOMMENDATION"],
-        blockers: recommendation ? [] : ["NO_HEDGE_RECOMMENDATION"]
+        environment: "paper",
+        liveTradingEnabled: false,
+        authority: await authorityStatus(),
+        dashboardControl: "ready",
+        autonomousWorker: worker.status,
+        worker
       };
     }
   },
-  "/api/v1/hedge/review": {
-    method: "POST",
-    timeoutMs: 120_000,
-    requireAdminToken: true,
-    requireMutationPrecheck: true,
-    requireHedgeDashboardMutations: true,
-    runtimePreflight: { actionType: "review" },
-    action: "hedge.review",
-    handler: hedgeReviewHandler
-  },
-  "/api/v1/hedge/execute": {
-    method: "POST",
-    timeoutMs: 120_000,
-    requireAdminToken: true,
-    requireMutationPrecheck: false,
-    requireHedgeDashboardMutations: true,
-    runtimePreflight: {
-      actionType: "confirmed-paper-execution",
-      confirmPaperFromInput: true,
-      requireOptionsExecution: true
-    },
-    action: "hedge.execute",
-    handler: hedgeExecuteHandler
-  },
-  "/api/v1/hedge/exit/review": {
-    method: "POST",
-    timeoutMs: 60_000,
-    requireAdminToken: true,
-    requireMutationPrecheck: true,
-    requireHedgeDashboardMutations: true,
-    runtimePreflight: { actionType: "review" },
-    action: "hedge.exit.review",
-    handler: hedgeExitReviewHandler
-  },
-  "/api/v1/hedge/exit/execute": {
-    method: "POST",
-    timeoutMs: 120_000,
-    requireAdminToken: true,
-    requireMutationPrecheck: false,
-    requireHedgeDashboardMutations: true,
-    runtimePreflight: {
-      actionType: "confirmed-paper-execution",
-      confirmPaperFromInput: true,
-      requireOptionsExecution: true
-    },
-    action: "hedge.exit.execute",
-    handler: hedgeExitExecuteHandler
-  },
-  "/api/v1/hedge/execution": {
+  "/api/v1/postgres-authority/status": {
     method: "GET",
-    timeoutMs: 30_000,
     requireAdminToken: false,
-    requireMutationPrecheck: false,
-    action: "hedge.execution",
-    handler: async () => ({ paperOnly: true, environment: "paper", entries: listPaperExecutionLedgerEntries(100) })
-  },
-  "/api/v1/hedge/learning": {
-    method: "GET",
-    timeoutMs: 30_000,
-    requireAdminToken: false,
-    requireMutationPrecheck: false,
-    action: "hedge.learning",
-    handler: async (input) => ({
-      paperOnly: true,
-      environment: "paper",
-      reviewId: input.reviewId || null,
-      evaluation: input.reviewId ? evaluateHedgeLearning(input.reviewId) : null,
-      events: listRecentHedgeLearningEvents(100)
-    })
+    action: "postgres-authority.status",
+    handler: async () => authorityStatus()
   },
   "/api/v1/account": {
     method: "GET",
-    timeoutMs: 30_000,
     requireAdminToken: false,
-    requireMutationPrecheck: false,
     action: "account",
-    handler: async (_input, requestId) =>
-      getAlpacaAccountSnapshot().then((snapshot) => ({
-        paperOnly: true,
-        environment: "paper",
-        ...snapshot,
-        _controlRequestId: requestId
-      }))
+    handler: async () => {
+      await authorityStatus();
+      return dependencies().account();
+    }
   },
   "/api/v1/positions": {
     method: "GET",
-    timeoutMs: 30_000,
     requireAdminToken: false,
-    requireMutationPrecheck: false,
     action: "positions",
-    handler: async () => listAlpacaPositions()
+    handler: async () => {
+      await authorityStatus();
+      return dependencies().positions();
+    }
   },
   "/api/v1/orders": {
     method: "GET",
-    timeoutMs: 30_000,
     requireAdminToken: false,
-    requireMutationPrecheck: false,
-    action: "orders",
-    handler: async () => listAlpacaOpenOrders()
-  },
-  "/api/v1/research/latest": {
-    method: "GET",
-    timeoutMs: 30_000,
-    requireAdminToken: false,
-    requireMutationPrecheck: false,
-    action: "research.latest",
-    handler: async () => latestResearchRuns(10)
-  },
-  "/api/v1/review/latest": {
-    method: "GET",
-    timeoutMs: 60_000,
-    requireAdminToken: false,
-    requireMutationPrecheck: false,
-    action: "review.latest",
-    handler: async (input) => runPaperReview(input)
-  },
-  "/api/v1/plan/latest": {
-    method: "GET",
-    timeoutMs: 30_000,
-    requireAdminToken: false,
-    requireMutationPrecheck: false,
-    action: "plan.latest",
-    handler: async () => latestPaperPlans(25)
-  },
-  "/api/v1/executions": {
-    method: "GET",
-    timeoutMs: 30_000,
-    requireAdminToken: false,
-    requireMutationPrecheck: false,
-    action: "executions",
-    handler: async () => latestPaperExecutions(100)
-  },
-  "/api/v1/research/run": {
-    method: "POST",
-    timeoutMs: 420_000,
-    requireAdminToken: true,
-    requireMutationPrecheck: true,
-    runtimePreflight: { actionType: "research" },
-    action: "research.run",
-    handler: async (input, requestId, correlationId) =>
-      command(
-        "research:daily",
-        [
-          `--riskProfile=${input.riskProfile}`,
-          `--optionsEnabled=${String(input.optionsEnabled)}`,
-          `--maxCandidates=${input.maxCandidates}`,
-          "--useAlpacaAssets=true",
-          "--barLookbackDays=120",
-          "--format=json"
-        ],
-        420_000,
-        requestId,
-        "research.run",
-        {
-          env: researchRunEnv(requestId, correlationId)
-        }
-      )
-  },
-  "/api/v1/actions/research/run": {
-    method: "POST",
-    timeoutMs: 420_000,
-    requireAdminToken: true,
-    requireMutationPrecheck: true,
-    runtimePreflight: { actionType: "research" },
-    action: "paper.actions.research.run",
-    handler: async (input, requestId, correlationId) =>
-      command(
-        "paper:research",
-        [
-          `--riskProfile=${input.riskProfile}`,
-          `--optionsEnabled=${String(input.optionsEnabled)}`,
-          `--maxCandidates=${input.maxCandidates}`,
-          "--useAlpacaAssets=true",
-          "--barLookbackDays=120",
-          "--format=json"
-        ],
-        420_000,
-        requestId,
-        "paper.actions.research.run",
-        {
-          env: researchRunEnv(requestId, correlationId)
-        }
-      )
-  },
-  "/api/v1/actions/learn/run": {
-    method: "POST",
-    timeoutMs: 120_000,
-    requireAdminToken: true,
-    requireMutationPrecheck: true,
-    runtimePreflight: { actionType: "learning" },
-    action: "paper.actions.learn.run",
-    handler: learnRunHandler
-  },
-  "/api/v1/actions/portfolio/review": {
-    method: "POST",
-    timeoutMs: 60_000,
-    requireAdminToken: true,
-    requireMutationPrecheck: true,
-    runtimePreflight: { actionType: "portfolio-review" },
-    action: "paper.actions.portfolio.review",
-    handler: portfolioReviewHandler
-  },
-  "/api/v1/actions/options/discover": {
-    method: "POST",
-    timeoutMs: 60_000,
-    requireAdminToken: true,
-    requireMutationPrecheck: true,
-    runtimePreflight: { actionType: "options-discovery" },
-    action: "paper.actions.options.discover",
-    handler: optionsDiscoverHandler
-  },
-  "/api/v1/actions/review": {
-    method: "POST",
-    timeoutMs: 120_000,
-    requireAdminToken: true,
-    requireMutationPrecheck: true,
-    runtimePreflight: { actionType: "review" },
-    action: "paper.actions.review",
-    handler: opsReviewHandler
-  },
-  "/api/v1/actions/execute": {
-    method: "POST",
-    timeoutMs: 120_000,
-    requireAdminToken: true,
-    requireMutationPrecheck: false,
-    runtimePreflight: {
-      actionType: "confirmed-paper-execution",
-      confirmPaperFromInput: true,
-      requireOptionsExecution: true
-    },
-    action: "paper.actions.execute",
-    handler: executeReviewedHandler
-  },
-  "/api/v1/actions/history": {
-    method: "GET",
-    timeoutMs: 30_000,
-    requireAdminToken: false,
-    requireMutationPrecheck: false,
-    action: "paper.actions.history",
-    handler: async () => ({
-      status: "success",
-      summary: {
-        operations: listPaperOperations(25).length,
-        reviewReady: latestReviewArtifactReadiness().ready
-      },
-      operations: listPaperOperations(25),
-      reviewReadiness: latestReviewArtifactReadiness(),
-      blockers: [],
-      warnings: []
-    })
-  },
-  "/api/v1/review/run": {
-    method: "POST",
-    timeoutMs: 60_000,
-    requireAdminToken: true,
-    requireMutationPrecheck: true,
-    runtimePreflight: { actionType: "review" },
-    action: "review.run",
-    handler: async (input, requestId) =>
-      command(
-        "paper:review",
-        [
-          `--riskProfile=${input.riskProfile}`,
-          `--optionsEnabled=${String(input.optionsEnabled)}`,
-          `--maxCandidates=${input.maxCandidates}`,
-          "--format=json"
-        ],
-        60_000,
-        requestId,
-        "review.run"
-      )
-  },
-  "/api/v1/plan/run": {
-    method: "POST",
-    timeoutMs: 60_000,
-    requireAdminToken: true,
-    requireMutationPrecheck: true,
-    runtimePreflight: { actionType: "review" },
-    action: "plan.run",
-    handler: async (input, requestId) =>
-      command(
-        "paper:plan",
-        [
-          `--riskProfile=${input.riskProfile}`,
-          `--optionsEnabled=${String(input.optionsEnabled)}`,
-          `--maxCandidates=${input.maxCandidates}`,
-          "--format=json"
-        ],
-        60_000,
-        requestId,
-        "plan.run"
-      )
-  },
-  "/api/v1/execute/dry-run": {
-    method: "POST",
-    timeoutMs: 120_000,
-    requireAdminToken: true,
-    requireMutationPrecheck: false,
-    runtimePreflight: { actionType: "dry-run-execution" },
-    action: "execute.dry-run",
-    handler: executeDryRunHandler
-  },
-  "/api/v1/execute/dry-run/latest": {
-    method: "GET",
-    timeoutMs: 120_000,
-    requireAdminToken: false,
-    requireMutationPrecheck: false,
-    action: "execute.dry-run.latest",
-    handler: executeDryRunHandler
-  },
-  "/api/v1/execute/confirm": {
-    method: "POST",
-    timeoutMs: 120_000,
-    requireAdminToken: true,
-    requireMutationPrecheck: false,
-    runtimePreflight: {
-      actionType: "confirmed-paper-execution",
-      confirmPaperFromInput: true,
-      requireOptionsExecution: true
-    },
-    action: "execute.confirm",
-    handler: executeReviewedHandler
-  },
-  "/api/v1/zero-dte/summary": {
-    method: "GET",
-    timeoutMs: 30_000,
-    requireAdminToken: false,
-    requireMutationPrecheck: false,
-    action: "zero-dte.summary",
-    handler: async () => buildZeroDteDashboardSummary({ limit: 25 })
+    action: "orders.open",
+    handler: async () => {
+      await authorityStatus();
+      return dependencies().openOrders();
+    }
   },
   "/api/v1/summary": {
     method: "GET",
-    timeoutMs: 30_000,
     requireAdminToken: false,
-    requireMutationPrecheck: false,
     action: "summary",
-    handler: async () => buildCachedDashboardSnapshot()
+    handler: async () => readCurrentSummary()
   },
-  "/api/v1/refresh": {
-    method: "POST",
-    timeoutMs: 60_000,
-    requireAdminToken: true,
-    requireMutationPrecheck: false,
-    runtimePreflight: { actionType: "review" },
-    action: "refresh",
-    handler: async (input, requestId) =>
-      command(
-        "paper:runtime",
-        [
-          `--riskProfile=${input.riskProfile}`,
-          `--optionsEnabled=${String(input.optionsEnabled)}`,
-          `--maxCandidates=${input.maxCandidates}`,
-          "--format=json"
-        ],
-        60_000,
-        requestId,
-        "refresh"
-      )
+  "/api/v1/research/latest": {
+    method: "GET",
+    requireAdminToken: false,
+    action: "research.latest",
+    handler: async () => {
+      await authorityStatus();
+      return (dependencies().dashboardData
+        ? (await dependencies().dashboardData!(10)).latestResearch
+        : (await readPostgresDashboardData(queryFor(), 10)).latestResearch);
+    }
+  },
+  "/api/v1/review/latest": {
+    method: "GET",
+    requireAdminToken: false,
+    action: "review.latest",
+    handler: async () => {
+      await authorityStatus();
+      return (dependencies().dashboardData
+        ? (await dependencies().dashboardData!(10)).reviews
+        : (await readPostgresDashboardData(queryFor(), 10)).reviews);
+    }
+  },
+  "/api/v1/plan/latest": {
+    method: "GET",
+    requireAdminToken: false,
+    action: "plan.latest",
+    handler: async () => {
+      await authorityStatus();
+      return (dependencies().dashboardData
+        ? (await dependencies().dashboardData!(25)).latestPaperPlans
+        : (await readPostgresDashboardData(queryFor(), 25)).latestPaperPlans);
+    }
+  },
+  "/api/v1/executions": {
+    method: "GET",
+    requireAdminToken: false,
+    action: "executions",
+    handler: async () => {
+      await authorityStatus();
+      return (dependencies().dashboardData
+        ? (await dependencies().dashboardData!(100)).executions
+        : (await readPostgresDashboardData(queryFor(), 100)).executions);
+    }
+  },
+  "/api/v1/execute/dry-run/latest": {
+    method: "GET",
+    requireAdminToken: false,
+    action: "execute.dry-run.latest",
+    handler: async () => readDryRun()
+  },
+  "/api/v1/zero-dte/summary": {
+    method: "GET",
+    requireAdminToken: false,
+    action: "zero-dte.summary",
+    handler: async () => {
+      await authorityStatus();
+      return dependencies().zeroDteSummary
+        ? dependencies().zeroDteSummary!(25)
+        : readPostgresZeroDteDashboardSummary({ query: queryFor(), limit: 25 });
+    }
+  },
+  "/api/v1/hedge/recommendation": {
+    method: "GET",
+    requireAdminToken: false,
+    action: "hedge.recommendation",
+    handler: async () => blockedResult("NO_POSTGRES_HEDGE_STATE")
+  },
+  "/api/v1/hedge/risk": {
+    method: "GET",
+    requireAdminToken: false,
+    action: "hedge.risk",
+    handler: async () => blockedResult("NO_POSTGRES_HEDGE_STATE")
+  },
+  "/api/v1/hedge/regime": {
+    method: "GET",
+    requireAdminToken: false,
+    action: "hedge.regime",
+    handler: async () => blockedResult("NO_POSTGRES_HEDGE_STATE")
+  },
+  "/api/v1/hedge/execution": {
+    method: "GET",
+    requireAdminToken: false,
+    action: "hedge.execution",
+    handler: async () => blockedResult("NO_POSTGRES_HEDGE_STATE")
+  },
+  "/api/v1/hedge/learning": {
+    method: "GET",
+    requireAdminToken: false,
+    action: "hedge.learning",
+    handler: async () => blockedResult("NO_POSTGRES_HEDGE_STATE")
+  },
+  "/api/v1/actions/history": {
+    method: "GET",
+    requireAdminToken: false,
+    action: "paper.actions.history",
+    handler: async () => {
+      await authorityStatus();
+      const data = dependencies().dashboardData
+        ? await dependencies().dashboardData!(25)
+        : await readPostgresDashboardData(queryFor(), 25);
+      return {
+        paperOnly: true,
+        status: "completed",
+        operations: data.executions,
+        reviewReadiness: data.reviews[0] ?? null
+      };
+    }
   }
 };
+
+const addPostRoute = (
+  path: string,
+  action: string,
+  handler: Handler
+) => {
+  actionHandlers[path] = {
+    method: "POST",
+    requireAdminToken: true,
+    action,
+    handler
+  };
+};
+
+const runReviewRoute = (command: string): Handler => async (context) => {
+  assertPaperRuntime();
+  await authorityStatus();
+  return runScheduledCommand(command, context);
+};
+
+const runExecutionRoute = (command: string): Handler => async (context) => {
+  assertPaperRuntime();
+  await authorityStatus();
+  if (!context.input.confirmPaper) return blockedResult("PAPER_CONFIRMATION_REQUIRED");
+  return runScheduledCommand(command, context);
+};
+
+addPostRoute("/api/v1/actions/research/run", "paper.actions.research.run", runReviewRoute("research:daily"));
+addPostRoute("/api/v1/research/run", "research.run", runReviewRoute("research:daily"));
+addPostRoute("/api/v1/actions/learn/run", "paper.actions.learn.run", runReviewRoute("paper:learn"));
+addPostRoute("/api/v1/actions/portfolio/review", "paper.actions.portfolio.review", runReviewRoute("paper:portfolio:review"));
+addPostRoute("/api/v1/actions/options/discover", "paper.actions.options.discover", runReviewRoute("paper:options:discover"));
+addPostRoute("/api/v1/actions/review", "paper.actions.review", runReviewRoute("paper:ops:review"));
+addPostRoute("/api/v1/review/run", "review.run", runReviewRoute("paper:review"));
+addPostRoute("/api/v1/plan/run", "plan.run", runReviewRoute("paper:review"));
+addPostRoute("/api/v1/actions/execute", "paper.actions.execute", runExecutionRoute("paper:execute:reviewed"));
+addPostRoute("/api/v1/execute/confirm", "execute.confirm", runExecutionRoute("paper:execute:reviewed"));
+addPostRoute("/api/v1/execute/dry-run", "execute.dry-run", async () => readDryRun());
+addPostRoute("/api/v1/refresh", "refresh", async () => {
+  assertPaperRuntime();
+  return readCurrentSummary();
+});
+addPostRoute("/api/v1/hedge/review", "hedge.review", runReviewRoute("hedge:review"));
+addPostRoute("/api/v1/hedge/exit/review", "hedge.exit.review", runReviewRoute("hedge:exit:review"));
+addPostRoute("/api/v1/hedge/exit/execute", "hedge.exit.execute", runExecutionRoute("hedge:exit:execute"));
+addPostRoute("/api/v1/hedge/execute", "hedge.execute", async () => blockedResult("POSTGRES_HEDGE_ENTRY_EXECUTION_UNSUPPORTED"));
 
 export const ACTION_HANDLERS = actionHandlers;
 
-const parseError = (error: unknown) =>
-  redactSensitiveText(
-    error instanceof GuardedCommandError
-      ? error.result.error.message
-      : error instanceof Error
-        ? error.message
-        : String(error || "Control request failed.")
-  );
+const auditPath = () =>
+  process.env.VPS_CONTROL_AUDIT_PATH?.trim() ||
+  process.env.DASHBOARD_CONTROL_LOG_PATH?.trim() ||
+  "./logs/dashboard-control-audit.jsonl";
 
-const classifyErrorCode = (message: string) =>
-  message.includes("token")
-    ? "CONTROL_TOKEN_INVALID"
-    : message.includes("timeout")
-      ? "CONTROL_ACTION_TIMEOUT"
-      : message.includes("not parse")
-        ? "CONTROL_INPUT_INVALID"
-        : "CONTROL_ACTION_ERROR";
-
-const routeErrorCode = (error: unknown, message: string) =>
-  error instanceof EnvironmentGuardError
-    ? error.code
-    : error instanceof GuardedCommandError
-      ? error.code
-      : classifyErrorCode(message);
-
-const routeErrorStatus = (error: unknown, code: string) =>
-  error instanceof EnvironmentGuardError
-    ? error.status
-    : code === "CONTROL_TOKEN_INVALID"
-      ? 401
-      : 500;
-
-const runtimePreflightForConfig = (
-  config: ActionConfig,
-  input: ControlInput
-): MutabilityRequirement | null => {
-  if (config.runtimePreflight) {
-    return {
-      actionType: config.runtimePreflight.actionType,
-      confirmPaper: config.runtimePreflight.confirmPaperFromInput
-        ? input.confirmPaper === true
-        : config.runtimePreflight.confirmPaper,
-      requireOptionsExecution: config.runtimePreflight.requireOptionsExecution
-    };
+const audit = (payload: Record<string, unknown>) => {
+  try {
+    const path = auditPath();
+    mkdirSync(dirname(path), { recursive: true });
+    appendFileSync(path, `${JSON.stringify(redactSensitiveData(payload))}\n`, { mode: 0o600 });
+  } catch {
+    // Audit-file failures must not expose secrets or change route responses.
   }
-
-  if (config.requireMutationPrecheck) {
-    return { actionType: "research" };
-  }
-
-  return null;
 };
 
-const routeHandler = async (request: IncomingMessage, response: any, config: ActionConfig) => {
-  const startMs = Date.now();
-  const startedAt = new Date(startMs).toISOString();
-  const correlationId = requestIdFromRequest(request);
+const authorize = (request: IncomingMessage) => {
+  const configured = process.env.VPS_CONTROL_TOKEN?.trim() || "";
+  const authorization = request.headers.authorization || "";
+  const supplied = authorization.startsWith("Bearer ")
+    ? authorization.slice("Bearer ".length)
+    : String(request.headers["x-dashboard-bridge-token"] || "");
+  return Boolean(configured && supplied && safeTokenEquals(configured, supplied));
+};
+
+const correlationId = (request: IncomingMessage) =>
+  String(request.headers["x-correlation-id"] || "").trim().slice(0, 128) || randomUUID();
+
+const respond = (response: ServerResponse, status: number, payload: unknown) => {
+  response.statusCode = status;
+  response.setHeader("content-type", "application/json");
+  response.setHeader("cache-control", "no-store");
+  response.end(JSON.stringify(redactSensitiveData(payload)));
+};
+
+const requestListener = async (request: IncomingMessage, response: ServerResponse) => {
+  const startedAt = Date.now();
   const requestId = randomUUID();
-
-  try {
-    if (config.requireAdminToken && !authorize(request)) {
-      throw new Error("Missing or invalid control token.");
-    }
-    if (config.requireHedgeDashboardMutations && process.env.HEDGE_DASHBOARD_MUTATIONS_ENABLED !== "true") {
-      throw new EnvironmentGuardError(
-        "HEDGE_DASHBOARD_MUTATIONS_DISABLED",
-        "Hedge dashboard mutation controls are disabled.",
-        buildEnvironmentGuardState()
-      );
-    }
-
-    const body = request.method === "POST" ? await readBody(request) : {};
-    const input = parseInput(body);
-    const preflight = runtimePreflightForConfig(config, input);
-    if (preflight) {
-      await verifyPaperMutability(preflight);
-    }
-
-    const data = await config.handler(input, requestId, correlationId);
-    const durationMs = Date.now() - startMs;
-    const finishedAt = new Date(startMs + durationMs).toISOString();
-    const payload = wrapSuccess(
-      config.action,
+  const requestCorrelationId = correlationId(request);
+  const url = new URL(request.url || "/", `http://localhost:${CONTROL_PORT}`);
+  const path = url.pathname.replace(/\/$/, "");
+  const route = actionHandlers[path];
+  if (!route) {
+    respond(response, 404, {
+      ok: false,
       requestId,
-      correlationId,
-      data,
-      {
-        riskProfile: input.riskProfile,
-        optionsEnabled: input.optionsEnabled,
-        maxCandidates: input.maxCandidates,
-        assetClass: input.assetClass,
-        confirmPaper: input.confirmPaper,
-        underlying: input.underlying,
-        dte: input.dte,
-        ...(input.reviewId ? { reviewId: input.reviewId } : {})
-      },
-      {
-        startedAt,
-        finishedAt,
-        durationMs
-      }
-    );
-
-    logEntry({
-      timestamp: new Date().toISOString(),
-      action: config.action,
-      method: request.method || "GET",
-      requestId,
-      correlationId,
-      params: payload.params || {},
-      status: "success",
-      durationMs,
-      resultSummary: summarize(data)
+      error: { code: "CONTROL_ROUTE_NOT_FOUND", message: "Unknown control action." }
     });
-
-    response.statusCode = 200;
-    response.setHeader("content-type", "application/json");
-    response.setHeader("cache-control", "no-store");
-    response.end(JSON.stringify(payload));
-  } catch (error) {
-    const message = parseError(error);
-    const code = routeErrorCode(error, message);
-    const status = routeErrorStatus(error, code);
-    const payload = wrapRouteError(
-      config.action,
-      requestId,
-      correlationId,
-      code,
-      message,
-      error instanceof EnvironmentGuardError ? error.guard : undefined,
-      error instanceof EnvironmentGuardError ? error.failedChecks : [],
-      error instanceof GuardedCommandError ? error.result : undefined
-    );
-    const durationMs = Date.now() - startMs;
-
-    logEntry({
-      timestamp: new Date().toISOString(),
-      action: config.action,
-      method: request.method || "GET",
-      requestId: payload.requestId,
-      correlationId,
-      params: {
-        path: request.url || "",
-        method: request.method || "GET"
-      },
-      status: "error",
-      durationMs,
-      resultSummary: "error",
-      error: redactSensitiveText(message)
-    });
-
-    response.statusCode = status;
-    response.setHeader("content-type", "application/json");
-    response.setHeader("cache-control", "no-store");
-    response.end(JSON.stringify(payload));
+    return;
   }
-};
-
-const requestListener = async (request: IncomingMessage, response: any) => {
+  if ((request.method || "").toUpperCase() !== route.method) {
+    respond(response, 405, {
+      ok: false,
+      requestId,
+      error: { code: "CONTROL_METHOD_NOT_ALLOWED", message: "Method not allowed." }
+    });
+    return;
+  }
   try {
-    const url = new URL(request.url || "/", `http://localhost:${CONTROL_PORT}`);
-    const routePath = url.pathname.replace(/\/$/, "");
-    const config = actionHandlers[routePath];
-    if (!config) {
-      response.statusCode = 404;
-      response.setHeader("content-type", "application/json");
-      response.end(
-        JSON.stringify(
-          wrapError("unknown", randomUUID(), "CONTROL_ROUTE_NOT_FOUND", "Unknown control action.")
-        )
-      );
-      return;
+    if (route.requireAdminToken && !authorize(request)) {
+      throw new ControlRouteError("CONTROL_TOKEN_INVALID", 401, "Missing or invalid control token.");
     }
-
-    if ((request.method || "").toUpperCase() !== config.method) {
-      response.statusCode = 405;
-      response.setHeader("allow", config.method);
-      response.setHeader("content-type", "application/json");
-      response.end(
-        JSON.stringify(
-          wrapError(
-            "unknown",
-            randomUUID(),
-            "CONTROL_METHOD_NOT_ALLOWED",
-            "Method not allowed for this endpoint."
-          )
-        )
-      );
-      return;
-    }
-
-    await routeHandler(request, response, config);
+    const input = request.method === "POST" ? normalizeInput(await readBody(request)) : normalizeInput({});
+    const data = await route.handler({ input, requestId, correlationId: requestCorrelationId });
+    const dataStatus = data && typeof data === "object" && !Array.isArray(data) &&
+      typeof (data as Record<string, unknown>).status === "string"
+      ? String((data as Record<string, unknown>).status)
+      : "success";
+    respond(response, 200, {
+      ok: true,
+      status: dataStatus,
+      action: route.action,
+      requestId,
+      correlationId: requestCorrelationId,
+      data
+    });
+    audit({
+      timestamp: new Date().toISOString(),
+      action: route.action,
+      method: route.method,
+      requestId,
+      correlationId: requestCorrelationId,
+      status: "success",
+      durationMs: Date.now() - startedAt
+    });
   } catch (error) {
-    response.statusCode = 500;
-    response.setHeader("content-type", "application/json");
-    response.setHeader("cache-control", "no-store");
-    response.end(
-      JSON.stringify(
-        wrapError(
-          "unknown",
-          randomUUID(),
-          "CONTROL_ROUTE_HANDLER_ERROR",
-          redactSensitiveText(error instanceof Error ? error.message : "Request handler failed.")
-        )
-      )
+    const code = error instanceof ControlRouteError
+      ? error.code
+      : typeof (error as { code?: unknown })?.code === "string"
+        ? String((error as { code: string }).code)
+        : "POSTGRES_AUTHORITY_UNAVAILABLE";
+    const status = error instanceof ControlRouteError
+      ? error.status
+      : code === "CONTROL_TOKEN_INVALID"
+        ? 401
+        : 503;
+    const message = redactSensitiveText(
+      error instanceof Error ? error.message : "PostgreSQL authority is unavailable."
     );
+    respond(response, status, {
+      ok: false,
+      action: route.action,
+      requestId,
+      correlationId: requestCorrelationId,
+      error: { code, message }
+    });
+    audit({
+      timestamp: new Date().toISOString(),
+      action: route.action,
+      method: route.method,
+      requestId,
+      correlationId: requestCorrelationId,
+      status: "error",
+      durationMs: Date.now() - startedAt,
+      error: message
+    });
   }
 };
 
@@ -1461,13 +768,28 @@ export const createControlServer = () => createServer(requestListener);
 
 const server = createControlServer();
 
-export const closeControlServer = () =>
-  new Promise((resolve) => {
-    server.close(() => resolve(undefined));
+export const closeControlServer = async () => {
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+  if (pool) {
+    await pool.end();
+    pool = null;
+  }
+};
+
+const start = async () => {
+  await defaultDependencies().authorityStatus();
+  server.listen(CONTROL_PORT, CONTROL_HOST, () => {
+    process.stdout.write(`Dashboard control API listening on ${CONTROL_HOST}:${CONTROL_PORT}\n`);
   });
+};
 
 if (process.env.DASHBOARD_CONTROL_NO_START !== "1") {
-  server.listen(CONTROL_PORT, CONTROL_HOST, () => {
-    console.log(`Dashboard control API listening on ${CONTROL_HOST}:${CONTROL_PORT}`);
+  void start().catch((error) => {
+    process.stderr.write(`${JSON.stringify({
+      event: "dashboard_control_start_failed",
+      code: "POSTGRES_AUTHORITY_UNAVAILABLE",
+      message: redactSensitiveText(error instanceof Error ? error.message : "Startup failed.")
+    })}\n`);
+    process.exitCode = 1;
   });
 }

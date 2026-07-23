@@ -28,6 +28,8 @@ import type {
 import type { DecisionId } from "../../types.js";
 import { parseOptionSymbol } from "../optionSymbolService.js";
 import { getTradingSafetyState } from "../tradingSafetyService.js";
+import { assertScheduledWriteFenceActive } from "../controlPlaneRuntimeContext.js";
+import { executionStateProjectionService } from "../executionStateProjectionService.js";
 import {
   insertZeroDteLifecycleEventRow,
   serializeZeroDteJson,
@@ -244,6 +246,7 @@ const appendExitEvent = (input: {
   reasonCode: string;
   details: Record<string, unknown>;
 }) => {
+  assertScheduledWriteFenceActive();
   const eventId = `zlev_${canonicalJsonHash({
     eventType: input.eventType,
     paperTradeId: input.trade.paper_trade_id,
@@ -279,6 +282,7 @@ const ensureExitLedger = (input: {
   limitPrice?: number | null;
   estimatedPremium?: number | null;
 }) => {
+  assertScheduledWriteFenceActive();
   let entry = findPaperExecutionByClientOrderId(input.details.clientOrderId);
   let linkageChanged = false;
   if (!entry) {
@@ -536,6 +540,7 @@ const recordPaperExitOutcome = (input: {
   details: ExitOrderDetails;
   evaluatedAt: string;
 }) => {
+  assertScheduledWriteFenceActive();
   if (input.state.fillPrice === null || input.state.filledAt === null) {
     throw new Error("EXIT_FILL_EVIDENCE_MISSING");
   }
@@ -673,6 +678,24 @@ const linkExecution = (input: {
 }): ZeroDteExitLink[] => {
   const links: ZeroDteExitLink[] = [];
   const bySymbol = new Map(input.candidates.map((candidate) => [normalizedSymbol(candidate.symbol), candidate]));
+  if (executionStateProjectionService.isAuthorityActive()) {
+    for (const order of input.execution.submittedOrders) {
+      const symbol = normalizedSymbol(order.symbol);
+      if (!bySymbol.has(symbol)) continue;
+      links.push({
+        symbol,
+        paperTradeId: null,
+        candidateId: null,
+        decisionId: null,
+        brokerOrderId: safeString(order.alpacaOrderId),
+        clientOrderId: safeString(order.clientOrderId),
+        status: safeString(order.status),
+        reasonCode: safeString(order.reason)
+      });
+    }
+    return links;
+  }
+  assertScheduledWriteFenceActive();
   for (const order of input.execution.submittedOrders) {
     const symbol = normalizedSymbol(order.symbol);
     const candidate = bySymbol.get(symbol);
@@ -772,6 +795,7 @@ export const reconcileZeroDteExitOrders = async (input: {
     outcomesRecorded: 0,
     errors: []
   };
+  if (executionStateProjectionService.isAuthorityActive()) return result;
   const rows = getDb().prepare(
     `SELECT t.paper_trade_id, t.candidate_id, t.decision_id, t.trading_date,
             t.underlying_symbol, t.option_symbol, t.quantity, t.entry_premium,

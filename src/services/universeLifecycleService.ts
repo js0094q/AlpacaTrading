@@ -17,6 +17,7 @@ import {
   getUniverseSymbol,
   seedInitialUniverse
 } from "./universeService.js";
+import { assertScheduledWriteFenceActive } from "./controlPlaneRuntimeContext.js";
 
 const lifecycleStates: UniverseLifecycleState[] = [
   "discovered",
@@ -239,6 +240,7 @@ const writeEvent = (
     occurredAt: string;
   }
 ) => {
+  assertScheduledWriteFenceActive();
   getDb().prepare(
     "INSERT INTO universe_lifecycle_events(" +
       "id, run_id, symbol, from_state, to_state, reason_code, evidence_json, " +
@@ -268,6 +270,7 @@ const transitionSymbol = (
   evidence: Record<string, unknown>,
   occurredAt: string
 ) => {
+  assertScheduledWriteFenceActive();
   if (row.lifecycleState === toState) {
     return false;
   }
@@ -309,6 +312,7 @@ const recordBaseline = (
   row: UniverseSymbolRow,
   occurredAt: string
 ) => {
+  assertScheduledWriteFenceActive();
   if (
     count("SELECT COUNT(*) AS count FROM universe_lifecycle_events WHERE symbol = ?", [
       row.symbol
@@ -340,6 +344,7 @@ const recordBaseline = (
 };
 
 const updateAssetMetadata = (symbol: string, asset: AlpacaAssetSnapshot, occurredAt: string) => {
+  assertScheduledWriteFenceActive();
   const attributes = asset.attributes ?? [];
   getDb().prepare(
     "UPDATE universe_symbols SET tradable = ?, asset_id = ?, asset_status = ?, exchange = ?, " +
@@ -368,6 +373,7 @@ const insertDiscoveredSymbol = (
   asset: AlpacaAssetSnapshot,
   occurredAt: string
 ) => {
+  assertScheduledWriteFenceActive();
   const symbol = normalizeSymbol(asset.symbol);
   if (!symbol || getUniverseSymbol(symbol)) {
     return null;
@@ -434,6 +440,7 @@ const createRun = (input: {
   configVersion: string;
   configHash: string;
 }) => {
+  assertScheduledWriteFenceActive();
   getDb().prepare(
     "INSERT INTO universe_lifecycle_runs(" +
       "id, started_at, status, discovery_cursor_start, discovery_cursor_end, " +
@@ -460,6 +467,7 @@ const finishRun = (input: {
   transitionsApplied: number;
   errorSummary?: string | null;
 }) => {
+  assertScheduledWriteFenceActive();
   getDb().prepare(
     "UPDATE universe_lifecycle_runs SET completed_at = ?, status = ?, discovery_cursor_end = ?, " +
       "assets_scanned = ?, assets_discovered = ?, symbols_assessed = ?, transitions_applied = ?, " +
@@ -478,6 +486,7 @@ const finishRun = (input: {
 };
 
 const recoverIncompleteRuns = (recoveredAt: string) => {
+  assertScheduledWriteFenceActive();
   getDb().prepare(
     "UPDATE universe_lifecycle_runs SET status = 'failed', completed_at = COALESCE(completed_at, ?), " +
       "error_summary = COALESCE(error_summary, 'RECOVERED_INCOMPLETE_RUN') WHERE status = 'running'"

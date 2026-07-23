@@ -24,6 +24,7 @@ import {
 } from "../src/services/paperExecutionLedgerService.js";
 import { buildPaperReviewedPayloadExecutionReport } from "../src/services/paperReviewedPayloadExecutionService.js";
 import type { PaperSubmitStateAttestation } from "../src/services/paperSubmitStateService.js";
+import { withExecutionAuthority } from "./helpers/executionAuthorityRuntime.js";
 
 const entrySubmitState = (
   overrides: Partial<PaperSubmitStateAttestation> = {}
@@ -393,6 +394,181 @@ describe("reviewed payload execution", () => {
     assert.equal(reservation.decision_linkage_status, "EXACT");
     assert.equal(reservation.decision_id !== null, true);
     assert.match(String(reservation.payload_json), /submitValidation/);
+  });
+
+  test("PostgreSQL execution authority bypasses SQLite reservation state and writes no ledger row", async () => {
+    const reviewedState = entrySubmitState({
+      payloadIntents: [{
+        ...entrySubmitState().payloadIntents[0]!,
+        notional: 400,
+        quantity: null
+      }]
+    });
+    createPaperReviewArtifact({
+      id: "review-postgres-authority-entry",
+      sourceAction: "paper.ops.review",
+      status: "success",
+      createdAt: "2026-07-08T14:00:00.000Z",
+      maxAgeMinutes: 60,
+      payloadSections: {
+        equityBuys: [{
+          assetClass: "equity",
+          symbol: "AAPL",
+          side: "buy",
+          type: "market",
+          time_in_force: "day",
+          notional: "400",
+          client_order_id: "postgres-authority-entry-aapl",
+          sourceCandidateId: "candidate-aapl",
+          dedupeKey: "postgres-authority-entry-aapl"
+        }],
+        equityAdds: [],
+        equitySells: [],
+        optionBuys: [],
+        optionSellToCloseExits: []
+      },
+      submitState: reviewedState,
+      summary: {}
+    });
+    insertPaperExecutionLedgerEntry({
+      mode: "concurrentPaperReservation",
+      assetClass: "equity",
+      symbol: "MSFT",
+      side: "buy",
+      orderType: "market",
+      timeInForce: "day",
+      notional: "100",
+      dedupeKey: "sqlite-only-reservation",
+      clientOrderId: "sqlite-only-reservation",
+      status: "reserved",
+      sourcePlanId: "sqlite-only-review",
+      sourceCandidateId: "candidate-msft",
+      payload: {}
+    });
+    const authorizedClientOrderIds: string[] = [];
+
+    const report = await withExecutionAuthority(() =>
+      buildPaperReviewedPayloadExecutionReport(
+        { confirmPaper: true, sections: ["equityBuys"] },
+        {
+          now: () => "2026-07-08T14:05:00.000Z",
+          getAccount: async () => ({
+            data: { status: "ACTIVE" },
+            status: 200,
+            url: "account"
+          }),
+          captureSubmitState: async () => reviewedState,
+          storeExecutionEvidence: async () => ({ status: "authority_stored" }),
+          authorizeExecution: async (ledger) => {
+            authorizedClientOrderIds.push(ledger.clientOrderId);
+            return {
+              status: "authority_reserved",
+              brokerAllowed: true,
+              reservationId: "reservation-authority-entry",
+              orderIntentId: "intent-authority-entry"
+            };
+          },
+          recordExecutionResult: async () => ({
+            status: "authority_recorded",
+            replay: false
+          }),
+          submitPaperOrder: async (payload) => ({
+            data: {
+              id: "broker-authority-entry",
+              client_order_id: payload.client_order_id,
+              symbol: payload.symbol,
+              status: "accepted"
+            },
+            requestId: "request-authority-entry",
+            status: 200,
+            url: "orders"
+          })
+        }
+      )
+    );
+
+    assert.equal(report.status, "submitted");
+    assert.deepEqual(authorizedClientOrderIds, ["postgres-authority-entry-aapl"]);
+    assert.equal(
+      (getDb().prepare(
+        "SELECT COUNT(*) AS count FROM paper_execution_ledger WHERE client_order_id = ?"
+      ).get("postgres-authority-entry-aapl") as { count: number }).count,
+      0
+    );
+  });
+
+  test("PostgreSQL authority reserves exact market-quantity exposure from current evidence", async () => {
+    const reviewedState = entrySubmitState();
+    createPaperReviewArtifact({
+      id: "review-postgres-authority-market-quantity",
+      sourceAction: "paper.ops.review",
+      status: "success",
+      createdAt: "2026-07-08T14:00:00.000Z",
+      maxAgeMinutes: 60,
+      payloadSections: {
+        equityBuys: [{
+          assetClass: "equity",
+          symbol: "AAPL",
+          side: "buy",
+          type: "market",
+          time_in_force: "day",
+          qty: "2",
+          client_order_id: "postgres-authority-market-quantity-aapl",
+          sourceCandidateId: "candidate-aapl",
+          dedupeKey: "postgres-authority-market-quantity-aapl"
+        }],
+        equityAdds: [],
+        equitySells: [],
+        optionBuys: [],
+        optionSellToCloseExits: []
+      },
+      submitState: reviewedState,
+      summary: {}
+    });
+    let reservedRisk: number | null = null;
+
+    const report = await withExecutionAuthority(() =>
+      buildPaperReviewedPayloadExecutionReport(
+        { confirmPaper: true, sections: ["equityBuys"] },
+        {
+          now: () => "2026-07-08T14:05:00.000Z",
+          getAccount: async () => ({
+            data: { status: "ACTIVE" },
+            status: 200,
+            url: "account"
+          }),
+          captureSubmitState: async () => reviewedState,
+          storeExecutionEvidence: async () => ({ status: "authority_stored" }),
+          authorizeExecution: async (ledger) => {
+            reservedRisk = ledger.maxRisk;
+            return {
+              status: "authority_reserved",
+              brokerAllowed: true,
+              reservationId: "reservation-authority-market-quantity",
+              orderIntentId: "intent-authority-market-quantity"
+            };
+          },
+          recordExecutionResult: async () => ({
+            status: "authority_recorded",
+            replay: false
+          }),
+          submitPaperOrder: async (payload) => ({
+            data: {
+              id: "broker-authority-market-quantity",
+              client_order_id: payload.client_order_id,
+              symbol: payload.symbol,
+              status: "accepted"
+            },
+            requestId: "request-authority-market-quantity",
+            status: 200,
+            url: "orders"
+          })
+        }
+      )
+    );
+
+    assert.equal(report.status, "submitted");
+    assert.equal(reservedRisk, 400);
   });
 
   test("rejects a tampered signed artifact before any broker call", async () => {

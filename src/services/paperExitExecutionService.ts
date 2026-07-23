@@ -3,11 +3,14 @@ import {
   AlpacaApiError,
   type AlpacaPaperOrderRequest
 } from "./alpacaClient.js";
+import { canonicalJsonHash } from "../lib/canonicalJson.js";
 import {
   buildPaperExitReviewResult,
   type PaperExitReviewInput
 } from "./paperExitReviewService.js";
 import { getTradingSafetyState } from "./tradingSafetyService.js";
+import { executionStateProjectionService } from "./executionStateProjectionService.js";
+import type { PaperExecutionLedgerEntry } from "./paperExecutionLedgerService.js";
 import type {
   PaperExitExecutionResult,
   PaperExitOrderPayload,
@@ -21,6 +24,9 @@ export interface PaperExitExecutionInput extends PaperExitReviewInput {
 interface PaperExitExecutionDeps {
   buildReview?: typeof buildPaperExitReviewResult;
   submitPaperOrder?: typeof submitPaperOrder;
+  authorizeExecution?: typeof executionStateProjectionService.reserveOrderIntent;
+  recordExecutionResult?: typeof executionStateProjectionService.recordBrokerResult;
+  storeExecutionEvidence?: typeof executionStateProjectionService.storePaperExitEvidence;
 }
 
 const paperOrderExecutionEnabled = () =>
@@ -53,6 +59,48 @@ const toAlpacaPayload = (payload: PaperExitOrderPayload): AlpacaPaperOrderReques
   position_intent: payload.assetClass === "us_option" ? "sell_to_close" : undefined
 });
 
+const executionProjectionSource = (
+  candidate: PaperExitReviewResult["exitCandidates"][number],
+  createdAt: string
+): PaperExecutionLedgerEntry => ({
+  id: -1,
+  createdAt,
+  updatedAt: createdAt,
+  mode: "paper-exit",
+  assetClass: candidate.assetClass === "us_option" ? "option" : "equity",
+  symbol: candidate.symbol,
+  underlyingSymbol: null,
+  strategy: "paper-exit",
+  side: "sell",
+  orderType: candidate.orderPayload.orderType,
+  timeInForce: candidate.orderPayload.timeInForce,
+  qty: candidate.orderPayload.qty,
+  notional: null,
+  limitPrice: candidate.orderPayload.limitPrice ?? null,
+  estimatedPremium: null,
+  maxRisk: null,
+  dedupeKey: candidate.orderPayload.clientOrderId,
+  clientOrderId: candidate.orderPayload.clientOrderId,
+  alpacaOrderId: null,
+  alpacaStatus: null,
+  requestId: null,
+  sourcePlanId: `paper_exit_review_${canonicalJsonHash({
+    generatedAt: createdAt,
+    clientOrderId: candidate.orderPayload.clientOrderId
+  })}`,
+  sourceCandidateId: null,
+  decisionId: null,
+  positionLifecycleId: null,
+  decisionLinkageStatus: "LEGACY_UNLINKED",
+  status: "attempted",
+  reason: null,
+  blockedReason: null,
+  errorMessage: null,
+  payloadJson: JSON.stringify({ reason: candidate.reason }),
+  rawPayloadJson: JSON.stringify(toAlpacaPayload(candidate.orderPayload)),
+  rawResponseJson: null
+});
+
 export const buildPaperExitExecutionResult = async (
   input: PaperExitExecutionInput = {},
   deps: PaperExitExecutionDeps = {}
@@ -78,6 +126,12 @@ export const buildPaperExitExecutionResult = async (
   }
 
   const submitOrder = deps.submitPaperOrder ?? submitPaperOrder;
+  const authorizeExecution = deps.authorizeExecution ??
+    executionStateProjectionService.reserveOrderIntent;
+  const recordExecutionResult = deps.recordExecutionResult ??
+    executionStateProjectionService.recordBrokerResult;
+  const storeExecutionEvidence = deps.storeExecutionEvidence ??
+    executionStateProjectionService.storePaperExitEvidence;
   const submittedOrders: PaperExitExecutionResult["submittedOrders"] = [];
   const errors: Array<Record<string, unknown>> = [];
   let mutationAttempted = false;
@@ -91,29 +145,64 @@ export const buildPaperExitExecutionResult = async (
       continue;
     }
 
+    const projectionSource = executionProjectionSource(candidate, review.generatedAt);
+    await storeExecutionEvidence(projectionSource, {
+      generatedAt: review.generatedAt,
+      orderIntent: toAlpacaPayload(candidate.orderPayload) as unknown as Record<string, unknown>,
+      reason: candidate.reason
+    });
+    const postgresAuthorization = await authorizeExecution(projectionSource);
+    if (!postgresAuthorization.brokerAllowed) {
+      errors.push({
+        symbol: candidate.symbol,
+        reason: postgresAuthorization.blockers?.[0] ??
+          "POSTGRES_EXECUTION_INTENT_BLOCKED"
+      });
+      continue;
+    }
+    let response: Awaited<ReturnType<typeof submitPaperOrder>>;
     try {
       mutationAttempted = true;
-      const response = await submitOrder(toAlpacaPayload(candidate.orderPayload));
-      submittedOrders.push({
-        symbol: candidate.symbol,
-        side: "sell",
-        qty: candidate.orderPayload.qty,
-        assetClass: candidate.assetClass,
-        positionIntent: candidate.orderPayload.positionIntent,
-        reason: candidate.reason,
-        alpacaOrderId: response.data.id,
-        clientOrderId: response.data.client_order_id || candidate.orderPayload.clientOrderId,
-        alpacaRequestId: response.requestId,
-        status: response.data.status
-      });
+      response = await submitOrder(toAlpacaPayload(candidate.orderPayload));
     } catch (error) {
+      await recordExecutionResult({
+        ...projectionSource,
+        updatedAt: new Date().toISOString(),
+        status: "failed",
+        requestId: error instanceof AlpacaApiError ? error.requestId ?? null : null,
+        reason: "ALPACA_PAPER_ORDER_SUBMISSION_FAILED",
+        blockedReason: "ALPACA_PAPER_ORDER_SUBMISSION_FAILED",
+        errorMessage: error instanceof Error ? error.message : "Paper exit order submission failed."
+      });
       errors.push({
         symbol: candidate.symbol,
         reason: "ALPACA_PAPER_ORDER_SUBMISSION_FAILED",
         message: error instanceof Error ? error.message : "Paper exit order submission failed.",
         requestId: error instanceof AlpacaApiError ? error.requestId : undefined
       });
+      continue;
     }
+    await recordExecutionResult({
+      ...projectionSource,
+      updatedAt: new Date().toISOString(),
+      status: response.data.status === "accepted" ? "accepted" : "submitted",
+      alpacaOrderId: response.data.id ?? null,
+      alpacaStatus: response.data.status ?? null,
+      requestId: response.requestId ?? null,
+      rawResponseJson: JSON.stringify(response.data)
+    });
+    submittedOrders.push({
+      symbol: candidate.symbol,
+      side: "sell",
+      qty: candidate.orderPayload.qty,
+      assetClass: candidate.assetClass,
+      positionIntent: candidate.orderPayload.positionIntent,
+      reason: candidate.reason,
+      alpacaOrderId: response.data.id,
+      clientOrderId: response.data.client_order_id || candidate.orderPayload.clientOrderId,
+      alpacaRequestId: response.requestId,
+      status: response.data.status
+    });
   }
 
   return {

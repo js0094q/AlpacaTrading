@@ -26,10 +26,33 @@ export const POSTGRES_SCHEDULER_JOBS = {
   },
   exitReview: { jobName: "exit-review", workstream: "exit_review" },
   paperExit: { jobName: "paper-exit", workstream: "paper_exit" },
+  paperExecution: {
+    jobName: "paper-execution",
+    workstream: "paper_execution"
+  },
   allocation: { jobName: "allocation", workstream: "allocation" },
   marketDataRefresh: {
     jobName: "market-data-refresh",
     workstream: "market_data_refresh"
+  },
+  universeLifecycle: {
+    jobName: "universe-lifecycle",
+    workstream: "universe_lifecycle"
+  },
+  autonomousRecovery: {
+    jobName: "autonomous-recovery",
+    workstream: "autonomous_recovery"
+  },
+  optionDiscovery: {
+    jobName: "option-discovery",
+    workstream: "option_discovery"
+  },
+  hedgeReview: { jobName: "hedge-review", workstream: "hedge_review" },
+  hedgeExit: { jobName: "hedge-exit", workstream: "hedge_exit" },
+  learning: { jobName: "learning", workstream: "learning" },
+  autonomousWorkerState: {
+    jobName: "autonomous-worker-state",
+    workstream: "autonomous_worker_state"
   }
 } as const satisfies Record<string, PostgresSchedulerJob>;
 
@@ -105,14 +128,14 @@ const requireNonempty = (value: string, code: string) => {
 
 const validateInput = <T>(input: RunWithPostgresSchedulerLeaseInput<T>) => {
   if (
-    (!input.config.features.controlPlaneAuthority &&
+    (!input.config.features.schedulerAuthority &&
       !input.config.features.shadowComparison) ||
     !input.config.features.postgresReads ||
     !input.config.features.postgresWrites
   ) {
     throw new PostgresSchedulerExecutionError(
       "POSTGRES_CONTROL_PLANE_AUTHORITY_REQUIRED",
-      "PostgreSQL shadow comparison or control-plane authority is required for scheduler execution."
+      "PostgreSQL shadow comparison or scheduler authority is required for scheduler execution."
     );
   }
   requireNonempty(input.job.jobName, "SCHEDULER_JOB_NAME_REQUIRED");

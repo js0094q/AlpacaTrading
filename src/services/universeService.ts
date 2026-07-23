@@ -7,6 +7,7 @@ import {
   getAlpacaAsset,
   type AlpacaAssetSnapshot
 } from "./alpacaAssetService.js";
+import { assertScheduledWriteFenceActive } from "./controlPlaneRuntimeContext.js";
 
 const now = () => nowIso();
 
@@ -159,6 +160,7 @@ export const addTicker = async (symbol: string, assetClass = "stock", source = "
     tradable = 1;
   }
   const nowTs = now();
+  assertScheduledWriteFenceActive();
   if (existing) {
     getDb()
       .prepare(
@@ -183,6 +185,7 @@ export const addTicker = async (symbol: string, assetClass = "stock", source = "
 };
 
 export const removeTicker = (symbol: string): void => {
+  assertScheduledWriteFenceActive();
   const normalized = normalizeSymbol(symbol);
   getDb()
     .prepare("DELETE FROM universe_symbols WHERE symbol = ?")
@@ -207,6 +210,7 @@ export const setTickerEnabled = async (symbol: string, enabled: boolean) => {
       tradable = Number(row.tradable ?? 1);
     }
   }
+  assertScheduledWriteFenceActive();
   getDb()
     .prepare(
       `
@@ -278,6 +282,7 @@ export const refreshUniverseAssetMetadata = async (input: {
       const status = asset.status ?? null;
       const active = status === "active" && asset.tradable === true;
       const validatedAt = now();
+      assertScheduledWriteFenceActive();
       getDb()
         .prepare(`
           UPDATE universe_symbols
@@ -327,6 +332,7 @@ export const refreshUniverseAssetMetadata = async (input: {
 };
 
 export const seedInitialUniverse = async () => {
+  assertScheduledWriteFenceActive();
   const nowTs = now();
   const symbols = dedupeSymbols(seedUniverse);
   const normalizedExisting = new Set(getAllUniverse().map((row) => row.symbol));

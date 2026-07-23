@@ -237,7 +237,7 @@ describe("options diagnostic service", () => {
     const report = await buildOptionsDiagnosticReport({
       underlyings: ["SPY", "QQQ"],
       asOfDate: "2026-07-06",
-      leapsMinDte: 180,
+      leapsMinDte: 170,
       leapsMaxDte: 730
     });
 
@@ -264,7 +264,7 @@ describe("options diagnostic service", () => {
     const report = await buildOptionsDiagnosticReport({
       underlyings: ["SPY"],
       asOfDate: "2026-07-06",
-      leapsMinDte: 180,
+      leapsMinDte: 170,
       leapsMaxDte: 730,
       sampleSize: 1
     });

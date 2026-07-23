@@ -21,6 +21,8 @@ import type {
   PaperAccountReconciliationReport,
   PaperReconciliationEventType
 } from "../src/services/paperAccountReconciliationService.js";
+import { withExecutionAuthority } from "./helpers/executionAuthorityRuntime.js";
+import type { StockPriceBatchResponse } from "../src/services/stockMarketDataAccessor.js";
 
 const generatedAt = "2026-07-07T15:00:00.000Z";
 const eodAt = "2026-07-07T18:30:00.000Z";
@@ -174,6 +176,7 @@ const reviewWith = async (
     orders?: AlpacaSubmittedOrder[];
     account?: AlpacaAccountRaw;
     optionSnapshots?: Record<string, AlpacaOptionSnapshotRaw>;
+    stockPrices?: (symbols: string[]) => Promise<StockPriceBatchResponse>;
     reconcile?: ReturnType<typeof reconciliationReport>;
     knownLeapsOptionSymbols?: string[] | Set<string>;
     input?: Parameters<typeof buildPaperExitReviewResult>[0];
@@ -207,6 +210,7 @@ const reviewWith = async (
       status: 200,
       urls: []
     }),
+    ...(values.stockPrices ? { getLatestStockPrices: values.stockPrices } : {}),
     getLatestOptionSnapshots: async () => ({
       data: optionSnapshots,
       requestIds: Object.keys(optionSnapshots).length ? ["option-snapshot-request-id"] : [],
@@ -421,6 +425,23 @@ describe("paper exit review 0DTE options", () => {
     assert.equal(result.exitCandidates[0]?.reason, "LEAPS_DTE_DECAY_EXIT");
   });
 
+  test("PostgreSQL authority does not use SQLite-derived LEAPS classification", async () => {
+    const symbol = "SPY261001C00810000";
+    const result = await withExecutionAuthority(() => reviewWith([
+      optionPosition({ symbol, unrealized_plpc: "0.05" })
+    ], {
+      input: { includeLEAPS: true },
+      knownLeapsOptionSymbols: {
+        [Symbol.iterator]() {
+          throw new Error("SQLite-derived LEAPS evidence must not be read");
+        }
+      } as unknown as Set<string>
+    }));
+
+    assert.equal(result.exitCandidates.length, 0);
+    assert.equal(result.skipped[0]?.positionClass, "option_short_dated");
+  });
+
   test("LEAPS below min sellable value is skipped", async () => {
     const symbol = "SPY270115C00810000";
     const result = await reviewWith([
@@ -471,6 +492,30 @@ describe("paper exit review 0DTE options", () => {
 });
 
 describe("paper exit review equities", () => {
+  test("fresh SIP stream price is used for the current equity price", async () => {
+    const result = await reviewWith(
+      [equityPosition({ unrealized_plpc: "-0.06", current_price: "94.00" })],
+      {
+        stockPrices: async () => ({
+          data: {
+            AAPL: {
+              symbol: "AAPL",
+              price: 101.25,
+              timestamp: generatedAt,
+              receivedAt: generatedAt,
+              feed: "sip",
+              source: "alpaca_sip_stream",
+              sourceTimestamp: generatedAt
+            }
+          },
+          requestIds: []
+        })
+      }
+    );
+
+    assert.equal(result.exitCandidates[0]?.currentPrice, 101.25);
+  });
+
   test("equity down more than 5% creates sell payload", async () => {
     const result = await reviewWith([equityPosition({ unrealized_plpc: "-0.06" })]);
     assert.equal(result.exitCandidates[0]?.reason, "EQUITY_STOP_LOSS_5");

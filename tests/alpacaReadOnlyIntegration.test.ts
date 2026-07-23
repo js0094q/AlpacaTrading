@@ -382,6 +382,19 @@ describe("alpaca read-only services", () => {
     assert.equal(snapshot.requestId, "mock-request-id");
   });
 
+  test("does not treat a malformed positions payload as an empty portfolio", async () => {
+    setMockFetch(async (input) =>
+      input.includes("/v2/positions")
+        ? makeMockResponse({ positions: [] })
+        : makeMockResponse({})
+    );
+
+    await assert.rejects(
+      () => listAlpacaPositions(),
+      /BROKER_POSITION_RESPONSE_INVALID/
+    );
+  });
+
   test("maps open-order payload", async () => {
     const snapshot = await listAlpacaOpenOrders();
     assert.equal(snapshot.orders.length, 1);

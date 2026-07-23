@@ -4,6 +4,7 @@ import type { Pool } from "pg";
 
 import { loadDatabaseConfig, type DatabaseConfig } from "../lib/database/config.js";
 import { createPostgresPool } from "../lib/database/postgres.js";
+import type { SchedulerFence } from "../repositories/contracts/common.js";
 import { assertControlPlaneFenceActive, withControlPlaneRuntimeContext } from "./controlPlaneRuntimeContext.js";
 import {
   resolvePostgresSchedulerJob,
@@ -14,8 +15,17 @@ import {
   type RunWithPostgresSchedulerLeaseInput
 } from "./postgresSchedulerExecutionService.js";
 
+export type PostgresScheduledCommandOperationContext = {
+  readonly pool: Pool;
+  readonly config: DatabaseConfig;
+  readonly fence: SchedulerFence;
+  readonly signal: AbortSignal;
+};
+
 export type PostgresScheduledCommandInput<T> = PostgresSchedulerCommandInput & {
-  readonly operation: () => Promise<T>;
+  readonly operation: (
+    context?: PostgresScheduledCommandOperationContext
+  ) => Promise<T>;
 };
 
 export interface PostgresScheduledCommandDependencies {
@@ -49,15 +59,12 @@ export const runPostgresScheduledCommand = async <T>(
   dependencies: PostgresScheduledCommandDependencies = defaultDependencies
 ): Promise<T> => {
   const job = resolvePostgresSchedulerJob(input);
-  if (!job) return input.operation();
+  if (!job) return input.operation(undefined);
 
   const config = dependencies.loadConfig();
   const schedulerEnabled =
-    config.features.shadowComparison || config.features.controlPlaneAuthority;
-  if (!schedulerEnabled) return input.operation();
-  if (job.workstream !== "research") {
-    return input.operation();
-  }
+    config.features.shadowComparison || config.features.schedulerAuthority;
+  if (!schedulerEnabled) return input.operation(undefined);
 
   const pool = dependencies.createPool(config);
   const schedulerInvocationId = dependencies.invocationId();
@@ -94,7 +101,7 @@ export const runPostgresScheduledCommand = async <T>(
             async () => {
               assertControlPlaneFenceActive();
               operationStarted = true;
-              const result = await input.operation();
+              const result = await input.operation({ pool, config, fence, signal });
               operationResult = result;
               operationCompleted = true;
               assertControlPlaneFenceActive();
@@ -111,7 +118,7 @@ export const runPostgresScheduledCommand = async <T>(
       }
       dependencies.reportShadowFailure("POSTGRES_SCHEDULER_SHADOW_FAILED");
       if (operationCompleted) return operationResult as T;
-      return input.operation();
+      return input.operation(undefined);
     }
   } finally {
     await pool.end();

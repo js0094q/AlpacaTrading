@@ -1,8 +1,32 @@
+import { config as loadDotenv } from "dotenv";
+
+import { canonicalJsonHash } from "../../lib/canonicalJson.js";
 import { recordApiRequest } from "../apiLog.js";
-import { config } from "../../config.js";
 import { assertReadOnlyAlpacaAccessAllowed } from "../tradingSafetyService.js";
 import type { Timeframe } from "../../types.js";
 import type { StockSnapshotRaw } from "../stockSnapshotNormalizer.js";
+
+loadDotenv();
+loadDotenv({ path: ".env.txt", override: false });
+
+const firstEnv = (...names: string[]) => {
+  for (const name of names) {
+    const value = process.env[name]?.trim();
+    if (value) return value;
+  }
+  return "";
+};
+const marketConfig = {
+  paperKey: firstEnv("ALPACA_PAPER_API_KEY", "ALPACA_PAPER_KEY", "ALPACA_API_KEY"),
+  paperSecret: firstEnv("ALPACA_PAPER_SECRET_KEY", "ALPACA_PAPER_SECRET", "ALPACA_SECRET_KEY"),
+  paperBaseUrl: firstEnv("ALPACA_PAPER_BASE_URL") || "https://paper-api.alpaca.markets",
+  dataBaseUrl: firstEnv("ALPACA_DATA_BASE_URL") || "https://data.alpaca.markets",
+  stockDataFeed: process.env.ALPACA_STOCK_DATA_FEED?.trim() || "sip",
+  optionDataFeed: process.env.ALPACA_OPTION_DATA_FEED?.trim() || "opra",
+  requestTimeoutMs: Number.parseInt(process.env.ALPACA_REQUEST_TIMEOUT_MS || "15000", 10) || 15000,
+  maxRetries: Math.max(0, Number.parseInt(process.env.ALPACA_MAX_RETRIES || "2", 10) || 0),
+  userAgent: process.env.ALPACA_USER_AGENT || "alpaca-research-cli"
+};
 
 export interface RawBar {
   t: string;
@@ -19,8 +43,8 @@ export interface ApiResponse<T> {
 }
 
 const getAuthHeaders = (): Record<string, string> => {
-  const key = config.paperByDefault ? config.alpaca.paperKey : config.alpaca.liveKey;
-  const secret = config.paperByDefault ? config.alpaca.paperSecret : config.alpaca.liveSecret;
+  const key = marketConfig.paperKey;
+  const secret = marketConfig.paperSecret;
   return key && secret
     ? {
         "APCA-API-KEY-ID": key,
@@ -76,10 +100,10 @@ const requestJson = async <T>(
 ): Promise<ApiResponse<T>> => {
   assertReadOnlyAlpacaAccessAllowed();
   const apiRoot = baseUrl === "trade"
-    ? (config.paperByDefault ? config.alpaca.paperBaseUrl : config.alpaca.liveBaseUrl)
-    : config.alpaca.dataBaseUrl;
-  const timeoutMs = config.alpaca.requestTimeoutMs;
-  const maxRetries = config.alpaca.maxRetries;
+    ? marketConfig.paperBaseUrl
+    : marketConfig.dataBaseUrl;
+  const timeoutMs = marketConfig.requestTimeoutMs;
+  const maxRetries = marketConfig.maxRetries;
   let response: Response | null = null;
   let lastError: unknown = null;
 
@@ -92,7 +116,7 @@ const requestJson = async <T>(
             ...(options.headers || {}),
             ...getAuthHeaders(),
             "Content-Type": "application/json",
-            "User-Agent": config.alpaca.userAgent
+            "User-Agent": marketConfig.userAgent
           },
           signal
         })
@@ -182,6 +206,8 @@ export interface OptionChainFilters {
 
 export interface OptionContractRaw {
   requestId?: string | null;
+  retrievedAt?: string;
+  id?: string | null;
   symbol?: string;
   underlying_symbol?: string;
   root_symbol?: string;
@@ -195,6 +221,11 @@ export interface OptionContractRaw {
   tradable?: boolean;
   tradeable?: boolean;
   status?: string;
+  style?: string | null;
+  exercise_style?: string | null;
+  open_interest_date?: string | null;
+  close_price?: number | string | null;
+  close_price_date?: string | null;
 }
 
 interface OptionSnapshotComponentRaw {
@@ -209,6 +240,13 @@ interface OptionSnapshotComponentRaw {
   as?: number | null;
   p?: number | null;
   s?: number | null;
+  o?: number | null;
+  h?: number | null;
+  l?: number | null;
+  c?: number | null;
+  v?: number | null;
+  vw?: number | null;
+  n?: number | null;
   delta?: number | null;
   gamma?: number | null;
   theta?: number | null;
@@ -232,8 +270,29 @@ export interface OptionSnapshotRaw {
   latestQuote?: OptionSnapshotComponentRaw;
   latest_trade?: OptionSnapshotComponentRaw;
   latestTrade?: OptionSnapshotComponentRaw;
+  daily_bar?: OptionSnapshotComponentRaw;
+  dailyBar?: OptionSnapshotComponentRaw;
   implied_volatility?: number | null;
   impliedVolatility?: number | null;
+}
+
+export interface FetchedOptionChainSnapshot {
+  symbol: string;
+  raw: OptionSnapshotRaw;
+  requestId: string | null;
+  endpoint: string;
+  underlyingSymbol: string;
+  requestedFeed: string;
+  effectiveFeed: string | null;
+  validationBasis?: "request_feed_opra";
+  pageToken: string | null;
+  retrievedAt: string;
+}
+
+export interface FetchedOptionChain {
+  underlyingSymbol: string;
+  pagesConsumed: number;
+  snapshots: FetchedOptionChainSnapshot[];
 }
 
 export interface OptionQuoteRaw {
@@ -413,7 +472,7 @@ export const fetchBars = async (options: ProviderOptions): Promise<{ symbol: str
     timeframe,
     start: options.start,
     end: options.end,
-    feed: options.feed,
+    feed: options.feed || marketConfig.stockDataFeed,
     page_token: options.pageToken,
     limit: 1000
   });
@@ -455,7 +514,7 @@ export const fetchAllBars = async (
       timeframe: options.timeframe || "1Day",
       start: options.start,
       end: options.end,
-      feed: options.feed,
+      feed: options.feed || marketConfig.stockDataFeed,
       page_token: pageToken ?? undefined,
       limit: 1000
     });
@@ -522,9 +581,11 @@ export const fetchOptionContracts = async (
       next_page_token?: string | null;
       page_token?: string | null;
     }>(endpoint, { method: "GET" }, "trade");
+    const retrievedAt = new Date().toISOString();
     const pageContracts = parseOptionContractPayload(response.data).map((contract) => ({
       ...contract,
-      requestId: response.requestId
+      requestId: response.requestId,
+      retrievedAt
     }));
     const remaining = requestedLimit === null
       ? pageContracts
@@ -585,7 +646,10 @@ export const fetchOptionSnapshots = async (
   const chunkSize = 100;
   for (let index = 0; index < optionSymbols.length; index += chunkSize) {
     const chunk = optionSymbols.slice(index, index + chunkSize);
-    const endpoint = `/v1beta1/options/snapshots?${toSearchParams({ symbols: chunk.join(",") })}`;
+    const endpoint = `/v1beta1/options/snapshots?${toSearchParams({
+      symbols: chunk.join(","),
+      feed: marketConfig.optionDataFeed
+    })}`;
     const response = await requestJson<unknown>(endpoint);
     results.push(
       ...parseOptionSnapshotPayload(response.data).map((row) => ({
@@ -595,6 +659,90 @@ export const fetchOptionSnapshots = async (
     );
   }
   return results;
+};
+
+export const fetchOptionChainSnapshots = async (
+  underlyingSymbol: string,
+  options: { feed?: string } = {}
+): Promise<FetchedOptionChain> => {
+  const normalizedUnderlying = underlyingSymbol.trim().toUpperCase();
+  if (!normalizedUnderlying) {
+    throw new Error("Alpaca option-chain underlying symbol is required.");
+  }
+  const requestedFeed = (options.feed || marketConfig.optionDataFeed).trim().toLowerCase();
+  if (requestedFeed !== "opra") {
+    throw new Error(`Alpaca option-chain feed must be opra: ${requestedFeed || "missing"}`);
+  }
+
+  const snapshots = new Map<string, FetchedOptionChainSnapshot>();
+  const seenTokens = new Set<string>();
+  let pageToken: string | null = null;
+  let pagesConsumed = 0;
+
+  while (true) {
+    pagesConsumed += 1;
+    if (pagesConsumed > MAX_MARKET_DATA_PAGES) {
+      throw new Error(
+        `Alpaca option-chain pagination exceeded safety cap (${MAX_MARKET_DATA_PAGES} pages).`
+      );
+    }
+    const endpoint: string = `/v1beta1/options/snapshots/${encodeURIComponent(normalizedUnderlying)}?${toSearchParams({
+      feed: requestedFeed,
+      limit: 1000,
+      page_token: pageToken ?? undefined
+    })}`;
+    const response: ApiResponse<{
+      snapshots?: Record<string, OptionSnapshotRaw>;
+      data?: Record<string, OptionSnapshotRaw>;
+      options?: Record<string, OptionSnapshotRaw>;
+      feed?: string | null;
+      next_page_token?: string | null;
+    }> = await requestJson(endpoint, { method: "GET" });
+    const observedFeed = typeof response.data.feed === "string"
+      ? response.data.feed.trim().toLowerCase()
+      : null;
+    if (observedFeed && observedFeed !== requestedFeed) {
+      throw new Error(`ALPACA_OPTION_CHAIN_FEED_MISMATCH:${response.data.feed}`);
+    }
+    const retrievedAt = new Date().toISOString();
+    for (const row of parseOptionSnapshotPayload(response.data)) {
+      const symbol = row.symbol.trim().toUpperCase();
+      if (!symbol) continue;
+      const existing = snapshots.get(symbol);
+      if (existing && canonicalJsonHash(existing.raw) !== canonicalJsonHash(row.data)) {
+        throw new Error(`ALPACA_OPTION_CHAIN_DUPLICATE_CONFLICT:${symbol}`);
+      }
+      snapshots.set(symbol, {
+        symbol,
+        raw: row.data,
+        requestId: response.requestId,
+        endpoint,
+        underlyingSymbol: normalizedUnderlying,
+        requestedFeed,
+        effectiveFeed: observedFeed,
+        validationBasis: "request_feed_opra",
+        pageToken,
+        retrievedAt
+      });
+    }
+
+    const next: string | null = response.data.next_page_token ?? null;
+    if (!next) break;
+    if (typeof next !== "string" || next.length === 0) {
+      throw new Error(`Alpaca option-chain pagination returned invalid next token: ${String(next)}`);
+    }
+    if (seenTokens.has(next)) {
+      throw new Error(`Alpaca option-chain pagination repeated token: ${next}`);
+    }
+    seenTokens.add(next);
+    pageToken = next;
+  }
+
+  return {
+    underlyingSymbol: normalizedUnderlying,
+    pagesConsumed,
+    snapshots: [...snapshots.values()]
+  };
 };
 
 export const fetchOptionQuotes = async (
@@ -607,7 +755,10 @@ export const fetchOptionQuotes = async (
   const chunkSize = 100;
   for (let index = 0; index < optionSymbols.length; index += chunkSize) {
     const chunk = optionSymbols.slice(index, index + chunkSize);
-    const endpoint = `/v1beta1/options/quotes/latest?${toSearchParams({ symbols: chunk.join(",") })}`;
+    const endpoint = `/v1beta1/options/quotes/latest?${toSearchParams({
+      symbols: chunk.join(","),
+      feed: marketConfig.optionDataFeed
+    })}`;
     const response = await requestJson<unknown>(endpoint);
     results.push(
       ...parseOptionQuotePayload(response.data).map((row) => ({
@@ -626,6 +777,7 @@ export interface FetchedStockSnapshot {
   effectiveFeed: string;
   currency: string | null;
   requestId: string | null;
+  retrievedAt?: string;
   error?: "SOURCE_SYMBOL_MISSING" | "STOCK_SNAPSHOT_REQUEST_FAILED";
 }
 
@@ -651,6 +803,7 @@ export const fetchStockSnapshots = async (input: {
     })}`;
     try {
       const response = await requestJson<unknown>(endpoint, { method: "GET" });
+      const retrievedAt = new Date().toISOString();
       const snapshots = parseStockSnapshotPayload(response.data);
       for (const symbol of chunk) {
         const raw = snapshots[symbol] ?? null;
@@ -661,11 +814,13 @@ export const fetchStockSnapshots = async (input: {
           effectiveFeed: requestedFeed,
           currency,
           requestId: response.requestId,
+          retrievedAt,
           ...(raw ? {} : { error: "SOURCE_SYMBOL_MISSING" as const })
         });
       }
     } catch {
       for (const symbol of chunk) {
+        const retrievedAt = new Date().toISOString();
         results.push({
           symbol,
           raw: null,
@@ -673,6 +828,7 @@ export const fetchStockSnapshots = async (input: {
           effectiveFeed: requestedFeed,
           currency,
           requestId: null,
+          retrievedAt,
           error: "STOCK_SNAPSHOT_REQUEST_FAILED"
         });
       }

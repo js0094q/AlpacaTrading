@@ -53,13 +53,21 @@ test("research, observatory, and market-data aliases converge on stable jobs", (
   );
 });
 
-test("0DTE engine and reconciliation commands resolve to distinct stable jobs", () => {
-  assert.strictEqual(
-    resolve("zero-dte:engine"),
+test("0DTE lifecycle commands and reconciliation resolve to stable jobs", () => {
+  assertAliasesResolveTo(
+    [
+      { command: "zero-dte:engine" },
+      { command: "zero-dte:exit:review" },
+      { command: "zero-dte:eod" }
+    ],
     POSTGRES_SCHEDULER_JOBS.zeroDte
   );
   assert.strictEqual(
     resolve("zero-dte:reconcile"),
+    POSTGRES_SCHEDULER_JOBS.reconciliation
+  );
+  assert.strictEqual(
+    resolve("paper:reconcile:external-order"),
     POSTGRES_SCHEDULER_JOBS.reconciliation
   );
 });
@@ -80,7 +88,7 @@ test("paper exit-review aliases converge on the exit-review job", () => {
   );
 });
 
-test("direct and reviewed paper exit executors converge on the paper-exit job", () => {
+test("direct paper exits and reviewed execution use explicit stable jobs", () => {
   assertAliasesResolveTo(
     [
       { command: "paper:exit:execute" },
@@ -96,42 +104,72 @@ test("direct and reviewed paper exit executors converge on the paper-exit job", 
     ],
     POSTGRES_SCHEDULER_JOBS.paperExit
   );
+  assertAliasesResolveTo(
+    [
+      { command: "paper:execute" }
+    ],
+    POSTGRES_SCHEDULER_JOBS.paperExecution
+  );
 });
 
-test("reviewed entry execution and unrelated read-only commands are not registered", () => {
+test("allocation, universe, and recovery timers cannot bypass scheduler leasing", () => {
+  assertAliasesResolveTo(
+    [
+      { command: "paper:review" },
+      { command: "paper:portfolio:review" },
+      { command: "paper:ops:morning" },
+      { command: "paper:ops:midday" }
+    ],
+    POSTGRES_SCHEDULER_JOBS.allocation
+  );
+  assert.strictEqual(
+    resolve("universe:lifecycle"),
+    POSTGRES_SCHEDULER_JOBS.universeLifecycle
+  );
+  assert.strictEqual(
+    resolve("system:recover"),
+    POSTGRES_SCHEDULER_JOBS.autonomousRecovery
+  );
+});
+
+test("all reviewed execution section combinations use one execution lease", () => {
+  assertAliasesResolveTo(
+    [
+      { command: "paper:execute:reviewed" },
+      {
+        command: "paper:execute:reviewed",
+        sections: "equityBuys,equityAdds,optionBuys"
+      },
+      {
+        command: "paper:execute:reviewed",
+        sections: "equitySells,optionBuys"
+      }
+    ],
+    POSTGRES_SCHEDULER_JOBS.paperExecution
+  );
+});
+
+test("unrelated read-only commands are not registered", () => {
   const unmapped: readonly PostgresSchedulerCommandInput[] = [
     { command: undefined },
     { command: "paper:runtime" },
     { command: "paper", action: "runtime" },
     { command: "options:diagnose" },
     { command: "zero-dte:summary" },
-    { command: "zero-dte:eod" },
-    { command: "zero-dte:exit:review" },
-    { command: "paper:ops:morning" },
-    { command: "paper:ops:midday" },
-    { command: "paper:execute:reviewed" },
-    {
-      command: "paper:execute:reviewed",
-      sections: "equityBuys,equityAdds,optionBuys"
-    },
-    {
-      command: "paper:execute:reviewed",
-      sections: "equitySells,optionBuys"
-    },
     { command: "allocation:run" }
   ];
 
   for (const command of unmapped) {
     assert.equal(resolvePostgresSchedulerJob(command), null);
   }
-  assert.equal(
-    (POSTGRES_SCHEDULER_COMMAND_REGISTRY.map(
+  const registeredJobNames = new Set(
+    POSTGRES_SCHEDULER_COMMAND_REGISTRY.map(
       (registration) => registration.job.jobName
-    ) as readonly string[]).includes(
-      POSTGRES_SCHEDULER_JOBS.allocation.jobName
-    ),
-    false
+    ) as readonly string[]
   );
+  for (const job of Object.values(POSTGRES_SCHEDULER_JOBS)) {
+    assert.equal(registeredJobNames.has(job.jobName), true);
+  }
 });
 
 test("scheduler invocation identity remains separate from domain run identity", () => {

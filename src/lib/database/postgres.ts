@@ -2,6 +2,7 @@ import { Pool, type PoolConfig } from "pg";
 
 import type { DatabaseConfig } from "./config.js";
 import { DatabaseConfigurationError } from "./config.js";
+import { sanitizeDatabaseError } from "./redaction.js";
 
 export type PostgresConnectionMode = "pooled" | "direct";
 
@@ -96,5 +97,14 @@ export const createPostgresPool = (
     ...(options.sessionOptions ? { options: options.sessionOptions } : {})
   };
 
-  return new Pool(poolConfig);
+  const pool = new Pool(poolConfig);
+  pool.on("error", (error) => {
+    const sanitized = sanitizeDatabaseError(error);
+    process.stderr.write(`${JSON.stringify({
+      event: "postgres_pool_error",
+      code: sanitized.code,
+      message: sanitized.message
+    })}\n`);
+  });
+  return pool;
 };

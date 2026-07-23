@@ -4,7 +4,17 @@ export const POSTGRES_OPERATIONAL_TABLES = [
   "schema_migrations",
   "accounts",
   "account_snapshots",
+  "market_data_ingestion_runs",
+  "universe_symbols",
+  "market_bars",
+  "stock_snapshots",
+  "option_contracts",
+  "option_snapshots",
+  "feature_snapshots",
+  "target_snapshots",
+  "options_strategy_snapshots",
   "research_runs",
+  "research_evidence",
   "candidates",
   "candidate_lifecycle_events",
   "scheduler_leases",
@@ -30,9 +40,20 @@ export const POSTGRES_OPERATIONAL_INDEXES = [
   "accounts_status_idx",
   "account_snapshots_account_observed_idx",
   "account_snapshots_request_idx",
+  "market_data_ingestion_runs_status_started_idx",
+  "market_data_ingestion_runs_cycle_symbol_idx",
+  "universe_symbols_enabled_idx",
+  "market_bars_symbol_time_idx",
+  "stock_snapshots_symbol_observed_idx",
+  "option_contracts_underlying_expiration_idx",
+  "option_snapshots_underlying_observed_idx",
+  "option_snapshots_option_observed_idx",
+  "feature_snapshots_symbol_observed_idx",
+  "target_snapshots_profile_confidence_idx",
   "research_runs_one_active_workstream_idx",
   "research_runs_status_started_idx",
   "research_runs_request_idx",
+  "research_evidence_run_observed_idx",
   "candidates_run_rank_idx",
   "candidates_symbol_status_idx",
   "candidates_active_idx",
@@ -93,7 +114,29 @@ export const POSTGRES_RELEASE_3_COLUMNS = [
   "workstream_events.processing_started_at",
   "workstream_events.attempts",
   "reconciliation_discrepancies.id",
-  "reconciliation_discrepancies.checkpoint_id"
+  "reconciliation_discrepancies.checkpoint_id",
+  "option_contracts.contract_id",
+  "option_contracts.status",
+  "option_contracts.exercise_style",
+  "option_contracts.open_interest",
+  "option_contracts.open_interest_date",
+  "option_contracts.close_price",
+  "option_contracts.close_price_date",
+  "option_contracts.evidence",
+  "market_data_ingestion_runs.cycle_id",
+  "market_data_ingestion_runs.workstream",
+  "market_data_ingestion_runs.symbol",
+  "market_data_ingestion_runs.provider_endpoint",
+  "market_data_ingestion_runs.pages_retrieved",
+  "market_data_ingestion_runs.newest_provider_timestamp",
+  "market_data_ingestion_runs.oldest_provider_timestamp",
+  "market_data_ingestion_runs.newest_provider_age_seconds",
+  "market_data_ingestion_runs.records_accepted",
+  "market_data_ingestion_runs.records_stale",
+  "market_data_ingestion_runs.records_rejected",
+  "market_data_ingestion_runs.freshness_threshold_seconds",
+  "market_data_ingestion_runs.rejection_reason",
+  "market_data_ingestion_runs.persistence_result"
 ] as const;
 
 export const POSTGRES_RELEASE_3_CONSTRAINTS = [
@@ -101,11 +144,13 @@ export const POSTGRES_RELEASE_3_CONSTRAINTS = [
   "workstream_events_attempts_nonnegative",
   "workstream_events_processing_timestamp_order",
   "workstream_events_processing_started_required",
-  "workstream_events_processed_timestamp_order"
+  "workstream_events_processed_timestamp_order",
+  "option_contracts_evidence_object"
 ] as const;
 
 export const POSTGRES_RELEASE_3_NOT_NULL_COLUMNS = [
-  "candidates.decision_id"
+  "candidates.decision_id",
+  "option_contracts.evidence"
 ] as const;
 
 const release3ConstraintDefinitions: Readonly<
@@ -138,6 +183,10 @@ const release3ConstraintDefinitions: Readonly<
   workstream_events_processed_timestamp_order: {
     table: "workstream_events",
     fragments: ["processed_at is null", "processed_at >= processing_started_at"]
+  },
+  option_contracts_evidence_object: {
+    table: "option_contracts",
+    fragments: ["jsonb_typeof(evidence) = 'object'::text"]
   }
 };
 

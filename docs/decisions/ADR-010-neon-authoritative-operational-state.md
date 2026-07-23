@@ -1,157 +1,106 @@
-# ADR-010: Neon PostgreSQL owns concurrent operational state
+# ADR-010: PostgreSQL is the sole runtime authority
 
 ## Status
 
-Accepted 2026-07-15. Authority changes are staged and require the reconciliation gates below.
+Accepted 2026-07-15; amended and made final 2026-07-20.
 
-Release 2 implements the non-authoritative `pg` foundation, explicit migration
-tooling, version 1 operational schema, redacted connectivity checks, and domain
-repository contracts. Release 3 adds schema version 2, fenced scheduler leases,
-control-plane repositories, a resumable SQLite snapshot/backfill/reconciliation
-path, paper-only shadow comparison, and feature-flagged research authority.
-Defaults still preserve SQLite authority until production reconciliation and
-shadow gates pass. Execution-state authority remains explicitly disabled until
-Release 4.
+The 2026-07-20 amendment ends the staged SQLite migration. Historical SQLite
+reconciliation is not a prerequisite for current paper runtime authority and
+will not continue.
 
 ## Context
 
-The VPS currently runs multiple paper-only research, observatory, reconciliation,
-exit, and 0DTE workstreams against one SQLite file. `SQLITE_BUSY` failures have
-occurred on short lifecycle writes while another scheduled writer held the
-single SQLite writer slot. Bounded transactions and retries reduce symptoms but
-cannot provide distributed scheduler ownership, cross-strategy capital
-allocation, or durable multi-worker coordination.
+The earlier staged design used SQLite snapshots, backfill, shadow comparison,
+and feature flags to move operational domains incrementally into Neon
+PostgreSQL. The semantic snapshot-identity repair was deployed, but the
+historical execution-state backfill remained blocked on conflicting historical
+risk-limit state. Current PostgreSQL state and current Alpaca paper state can be
+validated directly without inventing or importing additional history.
 
-Vercel has an attached Neon PostgreSQL integration with pooled and direct
-connection variables. The VPS is a separate runtime and must receive its own
-protected configuration; Vercel variables are not implicitly available there.
+Keeping SQLite migration, fallback, shadow, and dual-write paths after deciding
+that PostgreSQL owns current runtime state would create competing authority and
+an unsafe startup dependency on an abandoned historical reconciliation.
 
 ## Decision
 
-Neon PostgreSQL becomes the authoritative store for state that requires
-concurrent access, transactional consistency, distributed ownership, or
-cross-workstream coordination. This includes scheduler leases, research-run
-control, candidates and lifecycle events, idempotency and workstream events,
-reconciliation checkpoints, accounts, positions, order intents and orders,
-broker events, reservations, allocations, exposure, risk limits, execution
-reviews, confirmation evidence, and lifecycle fingerprints.
+PostgreSQL is the only production runtime database. It owns scheduler leases,
+research control, candidates and lifecycle events, accounts and snapshots,
+positions, order intents and orders, broker events, reservations, strategy
+allocations, exposure, risk limits, reviews and confirmation evidence,
+learning/recovery state, idempotency, workstream events, and current authority
+checkpoints.
 
-SQLite may remain only for append-only research observations, derived features
-and signals, scoring traces, replay data, diagnostics, caches, and transient
-ingestion spools. Workstreams that retain local SQLite publish immutable,
-idempotent events to PostgreSQL. They do not own independently mutable copies of
-positions, orders, reservations, allocations, or execution authorization.
+Production requires the full PostgreSQL authority flag set and a working pooled
+connection. It fails closed if PostgreSQL is unavailable or if any SQLite
+shadow, fallback, audit-mirror, or partial-authority configuration is enabled.
+Production code may not open SQLite. Explicit isolated test fixtures may retain
+SQLite solely to verify legacy logic while it is removed.
 
-Application code uses domain repositories. PostgreSQL transactions use one
-checked-out `pg` client for every statement from `BEGIN` through `COMMIT` or
-`ROLLBACK`. PostgreSQL-specific implementations may use row locks, advisory
-locks, conditional writes, fencing tokens, and optimistic versions.
+The cutover is established from current broker truth:
 
-Scheduler ownership moves from process-local lock files to PostgreSQL leases
-with atomic acquisition, expiration, heartbeat, monotonic fencing tokens,
-owner/run/workstream identity, and conditional writes. A stale token cannot
-commit after a newer owner acquires the lease.
+- Alpaca paper is read for the current account, positions, and open orders;
+- installed allocation and risk-policy fingerprints must match before state is
+  synchronized;
+- only stale/invalid PostgreSQL lifecycle state is closed through supported
+  repository transitions;
+- a new `fresh_postgresql_authority_cutover` checkpoint records the verified
+  current baseline and explicitly states that historical reconciliation is
+  incomplete and was not attempted;
+- historical reconciliation checkpoints are preserved as immutable evidence
+  but never grant or block current authority.
 
-Release 3 may enable PostgreSQL scheduler authority only for workstreams whose
-control-plane writes carry and validate the current fencing token. Only
-research meets that boundary in Release 3. `zero_dte`, `observatory`,
-`reconciliation`, `exit_review`, `paper_exit`, `allocation`, and
-`market_data_refresh` stay outside PostgreSQL scheduler authority until their
-state transitions are fence-aware. This is a fail-closed cutover boundary, not
-a process-lock fallback for distributed authority.
+The cutover must not submit, replace, or cancel paper or live orders. It must not
+change strategy logic, risk limits, execution caps, or broker state.
 
-During the Release 3 research cutover, SQLite candidate/run projection may be
-enabled only as the temporary compatibility audit mirror required by remaining
-Release 4 readers. PostgreSQL commits first and remains authoritative; a failed
-PostgreSQL authoritative write never falls back to SQLite. The projection is
-removed when execution-state readers move in Release 4.
+Dashboard-control is read-only and starts only after a passed current
+PostgreSQL authority checkpoint. All autonomous and trading workers remain
+stopped until a separate evidence-utilization and runtime audit is approved.
 
-Reservation and allocation decisions execute atomically under the applicable
-PostgreSQL account or portfolio lock. Broker submission is split into two
-transactions: the first validates evidence and commits an idempotent intent and
-reservation transition; the external Alpaca paper request occurs with no open
-database transaction; the second stores the broker response idempotently.
-Ambiguous network results reconcile by deterministic client order ID before
-resubmission.
+## Connection and transaction policy
 
-Authority changes proceed through explicit schema creation, backfill,
-reconciliation, bounded paper-only shadow comparison, control-plane cutover,
-execution-state cutover, and SQLite retirement. No stage creates indefinite
-mutable dual authority.
-
-## Connection and secret policy
-
-- Pooled Neon connections serve ordinary Vercel and application traffic.
-- A bounded `pg` pool serves long-running VPS processes.
-- Direct or unpooled connections serve migrations and controlled backfill.
-- Connection variables are discovered from actual Vercel/VPS/local
-  configuration and are never hard-coded.
-- URLs, passwords, tokens, and environment-file contents never appear in logs,
-  errors, tests, fixtures, screenshots, documentation, pull-request text, or
-  completion reports.
-- PostgreSQL startup fails closed when its selected mode lacks a required key;
-  errors identify only the missing variable name.
-
-## SQLite transition policy
-
-SQLite journal mode is not changed from DELETE merely because WAL permits more
-reader concurrency. WAL may be adopted temporarily only after a copied
-production database passes journal, checkpoint, fsync, backup, concurrent
-reader/writer, termination recovery, integrity, foreign-key, filesystem, and
-deployment-script tests on the real VPS storage. The source database is never
-altered by that test.
-
-Retry remains a bounded transition guard, not the architecture. Only explicitly
-idempotent or rollback-safe operations may retry `SQLITE_BUSY` or
-`SQLITE_LOCKED`, using finite attempts, exponential backoff with jitter, and a
-total deadline. Validation, constraint, corruption, and application failures
-are never retried.
-
-Ordinary CLI commands, services, timers, and health checks never apply SQLite or
-PostgreSQL migrations. Schema mutation uses dedicated commands before dependent
-services start. Runtime may perform read-only compatibility checks. Node test
-fixtures may explicitly initialize scratch databases.
+- Pooled PostgreSQL connections serve ordinary VPS and Vercel application
+  traffic.
+- Direct/unpooled connections serve explicit schema migration only.
+- One checked-out `pg` client owns each transaction from `BEGIN` through
+  completion.
+- Scheduler mutations require a current fencing token in the same transaction.
+- No transaction spans broker or market-data I/O.
+- Secret values never appear in logs, errors, tests, documentation, or reports.
 
 ## Alternatives considered
 
-- Separate mutable databases per workstream followed by asynchronous merge:
-  rejected because risk state and event ordering would be stale or ambiguous,
-  and reservations could conflict or duplicate.
-- Process-local mutexes or lock files as authoritative ownership: rejected
-  because they do not fence distributed or restarted workers.
-- Indefinite dual writes: rejected because failures can create competing
-  authority and unrecoverable partial divergence.
-- SQLite WAL as the long-term solution: rejected because it retains one writer
-  and cannot provide the required distributed transactional controls.
+- Continue historical SQLite reconciliation: rejected because it does not
+  improve current broker correctness and perpetuates the abandoned authority
+  dependency.
+- Keep SQLite as a read fallback or audit mirror: rejected because an outage or
+  partial write could silently revive stale authority.
+- Indefinite dual writes: rejected because partial divergence cannot be made
+  safe for capital and execution state.
+- Manually fabricate a historical-complete checkpoint: rejected because it
+  would misrepresent provenance and weaken the authority gate.
 
 ## Consequences
 
-The system gains database-enforced ownership, idempotency, and atomic capital
-coordination. Migration complexity increases: both control-plane and execution
-domains require explicit field mappings, resumable backfill, reconciliation,
-shadow comparison, and deployment evidence. Connection pools and transaction
-timeouts become operational dependencies. SQLite remains available for local
-evidence but cannot authorize or represent canonical trading state after final
-cutover.
+Runtime availability now depends on PostgreSQL and its fenced repository
+contracts. A PostgreSQL outage stops the application instead of degrading to
+local state. Historical SQLite artifacts may remain offline until a separately
+authorized deletion confirms that no process has them open and no supported
+runtime path references them.
 
-## Validation and cutover gates
+The fresh authority checkpoint proves current runtime readiness, not historical
+parity. Future reviews must evaluate PostgreSQL state and broker evidence
+directly.
 
-Control-plane authority requires reconciled counts, identifiers, status
-distributions, active runs, candidates by run, lifecycle ordering, idempotency
-records, leases, and checkpoints. Execution authority additionally requires
-reconciled accounts, snapshots, positions, open orders, intents, broker/client
-IDs, reservations, allocations, reserve/exposure totals, reviews, confirmation
-evidence, fingerprints, duplicates, and orphans.
+## Validation
 
-Any unexplained discrepancy blocks the next authority expansion. Final
-acceptance requires exact GitHub/Vercel/VPS SHAs, verified connectivity and
-migration version, overlapping paper workflows without SQLite lock failures or
-duplicates, no credential leakage, no committed environment file, and live
-trading disabled.
+Acceptance requires focused PostgreSQL-only tests, Release 4 tests, the full
+test suite, typecheck, build, independent review, exact commit deployment, a
+clean VPS checkout, stable PostgreSQL connectivity, paper mode with both live
+flags off, no active SQLite access, a passed fresh checkpoint, read-only
+dashboard-control health, autonomous worker stopped, and zero submitted orders.
 
 ## Conditions for reconsideration
 
-Reconsider the client or lock strategy only with runtime evidence that the
-selected Neon endpoint, pool, transaction semantics, or fencing design cannot
-meet bounded paper-runtime concurrency and safety requirements. Such a change
-requires a new ADR and must not reintroduce independently mutable authority.
+Changing the sole-authority design requires a new ADR and explicit safety
+review. A PostgreSQL availability issue does not authorize SQLite fallback or
+dual authority.

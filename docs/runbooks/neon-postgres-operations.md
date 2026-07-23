@@ -1,153 +1,149 @@
-# Neon PostgreSQL operations
+# PostgreSQL-only runtime operations
 
 ## Scope and safety
 
-This runbook covers the staged Neon operational-state migration. It never
-authorizes live trading or broker mutation. Vercel and VPS validation remains
-paper-only. Do not print, copy into documentation, or commit connection values.
-Do not source an environment file into diagnostic output.
+PostgreSQL is the sole production runtime authority. This runbook does not
+authorize broker mutation, paper order submission, live trading, strategy
+changes, risk-limit changes, or execution-cap changes. Never display database
+URLs, credentials, tokens, or the protected environment file.
 
-Release 3 adds the control-plane schema, repositories, fenced scheduler,
-snapshot/backfill/reconciliation commands, shadow comparison, and authority
-routing. SQLite remains authoritative until the runtime gates below pass, and
-these defaults stay in force:
+Historical SQLite migration, backfill, reconciliation, shadow comparison,
+dual-write, and fallback workflows are retired. Do not run or recreate them.
+
+## Required authority configuration
 
 ```text
-DATABASE_BACKEND=sqlite
-POSTGRES_READS_ENABLED=false
-POSTGRES_WRITES_ENABLED=false
+DATABASE_BACKEND=postgres
+POSTGRES_READS_ENABLED=true
+POSTGRES_WRITES_ENABLED=true
 POSTGRES_SHADOW_COMPARE_ENABLED=false
-POSTGRES_CONTROL_PLANE_AUTHORITY_ENABLED=false
-POSTGRES_EXECUTION_STATE_AUTHORITY_ENABLED=false
+POSTGRES_CONTROL_PLANE_AUTHORITY_ENABLED=true
+POSTGRES_SCHEDULER_AUTHORITY_ENABLED=true
+POSTGRES_EXECUTION_STATE_SHADOW_ENABLED=false
+POSTGRES_EXECUTION_STATE_AUTHORITY_ENABLED=true
 SQLITE_AUDIT_MIRROR_ENABLED=false
+AUTONOMOUS_RUNTIME_AUDIT_APPROVED=false
 ```
 
-## Canonical connection variables
+Production application startup rejects any other combination. A missing pooled
+connection or failed PostgreSQL query is terminal; no SQLite fallback exists.
 
-- `DATABASE_URL`: pooled endpoint for Vercel and ordinary application traffic.
-- `DATABASE_URL_UNPOOLED`: direct endpoint for migrations and controlled
-  backfill.
+## Connections and timeouts
 
-The Vercel integration may also expose `POSTGRES_URL`,
-`POSTGRES_PRISMA_URL`, or `POSTGRES_URL_NON_POOLING`. Configuration accepts those
-as ordered fallbacks but does not create duplicates. The selected variable name,
-never its value, appears in diagnostics.
+- `DATABASE_URL`: pooled endpoint for ordinary application traffic.
+- `DATABASE_URL_UNPOOLED`: direct endpoint for explicit schema migration.
 
-When TLS is required, the client rejects URL modes that disable verification,
-removes accepted integration SSL hints before `pg` parses them, and supplies
-`rejectUnauthorized: true` directly to the pool. This prevents connection-string
-parameters from weakening certificate and host verification.
+The selected variable name, never its value, may appear in diagnostics. TLS
+certificate and host verification must remain enabled.
 
-Before local use, require the Desktop source file to exist with mode `0600` and
-check only whether the two canonical names have non-empty values. Never copy the
-source file into the repository.
+Every transaction checks out one client, executes `BEGIN`, all statements, and
+`COMMIT` or `ROLLBACK`, then releases in `finally`. Do not perform Alpaca,
+market-data, other HTTP, sleeps, file I/O, or scoring inside a transaction.
 
-## Pool and timeout policy
-
-| Runtime | Endpoint | Max | Idle | Connect | Statement | Lock | Idle transaction | Transaction |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Vercel application | pooled | 1 | 1 s | 10 s | 15 s | 5 s | 15 s | 30 s |
-| VPS application | pooled | 5 | 30 s | 10 s | 15 s | 5 s | 15 s | 30 s |
-| Local application | pooled | 3 | 10 s | 10 s | 15 s | 5 s | 15 s | 30 s |
-| Migration/backfill | direct | 1 | 1 s | 10 s | 120 s | 10 s | 60 s | 180 s |
-
-Every transaction checks out one client, executes `BEGIN`, all statements,
-`COMMIT` or `ROLLBACK`, and releases in `finally`. Transactions must not contain
-Alpaca, market-data, other HTTP, sleeps, file I/O, scoring, or retry delays.
-
-Retry only PostgreSQL serialization failure `40001`, deadlock `40P01`, or an
-explicitly idempotent transient connection failure. Retries are bounded by
-attempt count, exponential jitter, and a total deadline. Constraint,
-validation, corruption, and application errors are not retryable.
-
-## Explicit commands
+## Supported commands
 
 ```bash
 npm run db:postgres:connectivity
 npm run db:postgres:connectivity -- --mode=direct
 npm run db:postgres:status
 npm run db:postgres:migrate
-npm run db:postgres:migrate
 npm run db:postgres:verify
-npm run test:postgres:integration
-npm run db:postgres:control-plane:snapshot -- --source /path/to/source.db --destination /protected/snapshot-directory
-npm run db:postgres:control-plane:backfill -- --snapshot /protected/snapshot-directory/source-snapshot.db
-npm run db:postgres:control-plane:reconcile -- --snapshot /protected/snapshot-directory/source-snapshot.db
-npm run db:postgres:control-plane:shadow -- --snapshot /protected/snapshot-directory/source-snapshot.db
-npm run db:postgres:control-plane:status
+npm run db:postgres:authority:cutover
+npm run db:postgres:authority:status
 ```
 
-Connectivity must report TLS enabled and a supported transaction timeout.
-Migration uses the direct connection, a session advisory lock, one transaction
-per version, and a checksum ledger. The second migration invocation must apply
-nothing. Verification must report no pending version, no checksum mismatch, all
-23 expected tables, all 59 named indexes, Release 3 columns and constraints,
-and the scheduler fencing sequence. The integration test creates a uniquely
-named isolated schema, applies the full migration twice, exercises concurrent
-lease acquisition/takeover and stale-fence rejection, verifies its catalogs,
-and removes only that test schema.
+Application, service, timer, and health startup never run schema migrations.
+`db:postgres:migrate` uses the direct endpoint and a session advisory lock.
+`db:postgres:verify` must report the expected migration checksum, 23 tables, 59
+indexes, required constraints, and scheduler fencing sequence.
 
-Application, timer, service, and health startup never run migrations. The
-protected Vercel `GET /api/paper/database/health` endpoint performs one read-only
-pooled connectivity query and requires the dashboard admin token.
+## Pre-cutover preservation
 
-## VPS secret installation
+1. Record the local and VPS branch, exact commit, and clean/dirty state.
+2. Stop dashboard-control, the autonomous worker, and all paper/autonomous
+   timers. Record their state before changing units.
+3. Confirm no migration, backfill, reconciliation, research, or application
+   process is active.
+4. Confirm no application SQLite file is open. An unrelated system SQLite file,
+   such as fail2ban state, is outside this application boundary.
+5. Do not delete or modify old SQLite files.
+6. Back up the protected environment file without printing its contents and
+   preserve ownership/mode.
 
-1. Record the current target owner and mode without displaying content.
-2. Create a mode-`0600` local transfer fragment containing only the two
-   canonical variables:
-   `node scripts/manage-postgres-env.mjs extract --source <desktop-path> --target <new-temp-path>`.
-3. Transfer the fragment over the existing SSH channel to a new mode-`0600`
-   temporary VPS path. Do not pass values as command arguments.
-4. Merge with an unused backup path:
-   `sudo node scripts/manage-postgres-env.mjs merge --source <remote-temp> --target /opt/alpaca-investing/secrets/alpaca.env --backup <protected-backup-path>`.
-5. Verify only name presence, target ownership/mode, backup mode `0400`, and
-   paper/live-disabled flag names. Remove the temporary fragment.
-6. Restart only `alpaca-dashboard-control.service`. Run pooled and direct
-   redacted connectivity commands as the runtime user. Check journald for secret
-   patterns without displaying matching lines.
+## Fresh current-state cutover
 
-Do not overwrite unrelated VPS variables. Do not copy Desktop values to Vercel;
-the integration is the deployment source of truth.
+Run pooled connectivity and schema verification first. Then run:
 
-## Authority and rollback
+```bash
+npm run db:postgres:authority:cutover
+npm run db:postgres:authority:status
+```
 
-Schema presence does not grant authority. Control-plane authority requires its
-backfill, reconciliation, shadow comparison, and fencing tests. Execution-state
-authority requires the later financial reconciliation gate. Any unexplained
-discrepancy leaves SQLite authoritative for that domain.
+The cutover obtains a fenced PostgreSQL scheduler lease, reads the Alpaca paper
+account, and synchronizes current account, position, and open-order truth. It
+requires existing risk-limit and strategy-allocation configuration fingerprints
+to match the current captured configuration before it makes changes.
 
-Before backfill, quiesce SQLite writers and create a timestamped snapshot with
-`db:postgres:control-plane:snapshot`. The command uses SQLite online backup,
-records the source checksum and table counts, runs integrity and foreign-key
-checks, and changes only the copy to mode `0400`. Preserve the original.
+Only these stale PostgreSQL lifecycle transitions are supported during cutover:
 
-Control-plane backfill requires migration version 2 and a clean schema
-verification. It maps candidate lifecycle only from candidate-linked
-`decision_snapshots` and `decision_lifecycle_events`; non-candidate decision
-lifecycle belongs to Release 4. It is resumable, conflict-checking,
-dependency-ordered, transactionally bounded, and non-destructive. Reconciliation
-compares row counts, identifiers, decision linkage, lifecycle status/order,
-idempotency and provenance, active research, candidates by run, active leases,
-and checkpoints. Any unexplained discrepancy returns a non-zero status and
-blocks authority.
+- expired active reservations become expired;
+- expired current reviews and confirmations become expired;
+- stale running research becomes recovered with explicit recovery evidence.
 
-Use this progression after schema and backfill validation:
+The command verifies current account/snapshot; exact position identity,
+quantity, available quantity, entry/current price, market value, cost basis,
+and unrealized P/L; exact open/pending order identity and terms; active
+reservations; allocations; risk limits; one-to-one current review/confirmation
+evidence; complete learning state; required recovery state; retryable failures;
+and held leases. Any policy drift, missing required state, broker discrepancy,
+or unclassified condition rolls back and fails closed.
 
-1. Keep all PostgreSQL feature flags off while migration version 2 is applied
-   twice and verified.
-2. Enable reads, writes, and shadow comparison with SQLite still authoritative;
-   run overlapping paper-only workflows and require zero unexplained
-   discrepancies.
-3. Set `DATABASE_BACKEND=postgres` and enable control-plane authority only
-   after reconciliation and shadow gates pass. Keep execution-state authority
-   false. Enable the temporary SQLite audit mirror only while Release 4 readers
-   require its compatibility projection.
-4. Release 3 PostgreSQL scheduler authority is limited to `research`. Do not
-   grant it to `zero_dte`, `observatory`, `reconciliation`, `exit_review`,
-   `paper_exit`, `allocation`, or `market_data_refresh` until their durable
-   writes validate the current fencing token.
+A fenced `running` checkpoint is written before broker capture. Stale-state
+cleanup, broker-state projection, validation, and the `passed` transition then
+run in one serializable transaction. A validation error rolls that transaction
+back and terminalizes the checkpoint as sanitized `blocked` evidence.
 
-In authority mode, PostgreSQL failures never fall back to SQLite. Roll back
-application flags/code while leaving additive schema version 2 in place; do
-not drop tables or delete the original SQLite database.
+On success it writes a checkpoint with:
+
+- source `alpaca_paper_current_state`;
+- target `postgres_only_runtime_authority`;
+- baseline type `fresh_postgresql_authority_cutover`;
+- `historicalReconciliationComplete=false`;
+- `historicalReconciliationAttempted=false`;
+- `brokerMutationAttempted=false` and `ordersSubmitted=0`.
+
+Never relabel an older historical checkpoint as passed.
+
+## Service startup
+
+Install the exact validated dashboard-control unit, reload systemd, and start
+only `alpaca-dashboard-control.service`. Verify its authenticated local health,
+status, account, positions, orders, and summary routes.
+
+Keep the autonomous worker and every trading/research timer stopped and disabled.
+`AUTONOMOUS_RUNTIME_AUDIT_APPROVED=false` is a mandatory fail-closed gate until
+the separate evidence-utilization and runtime audit is complete.
+
+## Post-deploy verification
+
+- VPS checkout is clean and equals the validated commit.
+- Paper mode is enabled.
+- `ALPACA_LIVE_TRADE=false` and `LIVE_TRADING_ENABLED=false`.
+- Full PostgreSQL authority flags match the required configuration.
+- Pooled connectivity remains stable across repeated checks.
+- The fresh authority checkpoint is passed and current.
+- Dashboard-control is active and local-only.
+- Autonomous worker and paper/autonomous timers are stopped.
+- No application process has an SQLite file open.
+- No migration, backfill, or historical reconciliation process is active.
+- Alpaca open-order count and `ordersSubmitted` remain unchanged by cutover.
+
+## Failure behavior
+
+Stop on any failed gate. Do not re-enable SQLite, weaken an authority flag,
+change policy, edit database rows manually, alter broker state, or fabricate a
+checkpoint. Preserve the exact failure evidence for diagnosis.
+
+Old SQLite files may be deleted only under a separately authorized operation
+after proving that no process has them open and no supported runtime path
+references them. Deletion is not part of this cutover.

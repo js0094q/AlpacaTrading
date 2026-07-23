@@ -1,5 +1,5 @@
 import { recordApiRequest } from "./apiLog.js";
-import { config } from "../config.js";
+import { alpacaRuntimeConfig } from "./alpacaRuntimeConfig.js";
 import {
   assertLiveTradingDisabled,
   assertReadOnlyAlpacaAccessAllowed,
@@ -63,6 +63,7 @@ export interface AlpacaSubmittedOrder {
   time_in_force?: string;
   position_intent?: string;
   limit_price?: string;
+  stop_price?: string;
   status?: string;
   filled_qty?: string;
   filled_avg_price?: string;
@@ -70,6 +71,9 @@ export interface AlpacaSubmittedOrder {
   created_at?: string;
   submitted_at?: string;
   updated_at?: string;
+  replaced_at?: string;
+  replaced_by?: string;
+  replaces?: string;
 }
 
 export interface AlpacaAccountRaw {
@@ -212,8 +216,8 @@ const firstEnv = (...names: string[]) => {
 export const getAlpacaPaperCredentials = () => {
   const apiKey = firstEnv("ALPACA_PAPER_API_KEY", "ALPACA_PAPER_KEY", "ALPACA_API_KEY");
   const secretKey = firstEnv("ALPACA_PAPER_SECRET_KEY", "ALPACA_PAPER_SECRET", "ALPACA_SECRET_KEY");
-  const baseUrl = firstEnv("ALPACA_PAPER_BASE_URL") || config.alpaca.paperBaseUrl;
-  const dataBaseUrl = firstEnv("ALPACA_DATA_BASE_URL") || config.alpaca.dataBaseUrl;
+  const baseUrl = firstEnv("ALPACA_PAPER_BASE_URL") || alpacaRuntimeConfig.paperBaseUrl;
+  const dataBaseUrl = firstEnv("ALPACA_DATA_BASE_URL") || alpacaRuntimeConfig.dataBaseUrl;
 
   if (!apiKey || !secretKey) {
     throw new Error(
@@ -328,7 +332,7 @@ const requestPaperTradingJson = async <T>(
           headers: {
             "APCA-API-KEY-ID": credentials.apiKey,
             "APCA-API-SECRET-KEY": credentials.secretKey,
-            "User-Agent": config.alpaca.userAgent,
+            "User-Agent": alpacaRuntimeConfig.userAgent,
             "Content-Type": "application/json",
             ...(options.headers || {})
           },
@@ -420,6 +424,15 @@ export const getPaperOrder = async (
   );
 };
 
+export const getPaperOrderByClientOrderId = async (
+  clientOrderId: string
+): Promise<AlpacaApiResponse<AlpacaSubmittedOrder>> => {
+  const params = new URLSearchParams({ client_order_id: clientOrderId });
+  return requestPaperTradingJson<AlpacaSubmittedOrder>(
+    `/v2/orders:by_client_order_id?${params.toString()}`
+  );
+};
+
 export const replacePaperOrder = async (
   orderId: string,
   payload: { qty?: string; limit_price?: string }
@@ -499,6 +512,7 @@ const parseSnapshotMap = <T>(payload: unknown): Record<string, T> => {
 const getBatchedDataSnapshots = async <T>(
   endpoint: string,
   symbols: string[],
+  feed: string,
   chunkSize = 100
 ): Promise<AlpacaBatchedSnapshotResponse<T>> => {
   const uniqueSymbols = [...new Set(symbols.map((symbol) => symbol.trim().toUpperCase()).filter(Boolean))];
@@ -509,7 +523,10 @@ const getBatchedDataSnapshots = async <T>(
 
   for (let index = 0; index < uniqueSymbols.length; index += chunkSize) {
     const chunk = uniqueSymbols.slice(index, index + chunkSize);
-    const params = new URLSearchParams({ symbols: chunk.join(",") });
+    const params = new URLSearchParams({
+      symbols: chunk.join(","),
+      feed
+    });
     const response = await getAlpacaDataEndpoint<unknown>(`${endpoint}?${params.toString()}`);
     Object.assign(data, parseSnapshotMap<T>(response.data));
     if (response.requestId) {
@@ -530,12 +547,20 @@ const getBatchedDataSnapshots = async <T>(
 export const getLatestStockSnapshots = async (
   symbols: string[]
 ): Promise<AlpacaBatchedSnapshotResponse<AlpacaStockSnapshotRaw>> =>
-  getBatchedDataSnapshots<AlpacaStockSnapshotRaw>("/v2/stocks/snapshots", symbols);
+  getBatchedDataSnapshots<AlpacaStockSnapshotRaw>(
+    "/v2/stocks/snapshots",
+    symbols,
+    alpacaRuntimeConfig.stockDataFeed
+  );
 
 export const getLatestOptionSnapshots = async (
   symbols: string[]
 ): Promise<AlpacaBatchedSnapshotResponse<AlpacaOptionSnapshotRaw>> =>
-  getBatchedDataSnapshots<AlpacaOptionSnapshotRaw>("/v1beta1/options/snapshots", symbols);
+  getBatchedDataSnapshots<AlpacaOptionSnapshotRaw>(
+    "/v1beta1/options/snapshots",
+    symbols,
+    alpacaRuntimeConfig.optionDataFeed
+  );
 
 const requestJson = async <T>(
   endpoint: string,
@@ -576,7 +601,7 @@ const requestJson = async <T>(
             headers: {
               "APCA-API-KEY-ID": credentials.apiKey,
               "APCA-API-SECRET-KEY": credentials.secretKey,
-              "User-Agent": config.alpaca.userAgent,
+              "User-Agent": alpacaRuntimeConfig.userAgent,
               "Content-Type": "application/json"
             },
             signal

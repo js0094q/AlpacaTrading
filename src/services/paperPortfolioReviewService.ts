@@ -16,10 +16,10 @@ import {
   type AlpacaOpenOrderSnapshot
 } from "./alpacaOrderReadService.js";
 import {
-  listActivePaperNewRiskReservations,
-  type PaperExecutionLedgerEntry
+  listActivePaperNewRiskReservations
 } from "./paperExecutionLedgerService.js";
 import { loadPaperPlanConfig } from "./paperPlanService.js";
+import { executionStateProjectionService } from "./executionStateProjectionService.js";
 
 export type PaperPortfolioRecommendationType =
   | "BUY_NEW_EQUITY"
@@ -103,12 +103,25 @@ interface CandidateRow {
   research_run_id: string;
 }
 
+interface ScaleInReservation {
+  assetClass: string;
+  symbol: string;
+  side: string | null;
+  status: string;
+  qty?: string | null;
+  quantity?: number | null;
+  notional?: string | number | null;
+  estimatedPremium?: number | null;
+  limitPrice?: string | number | null;
+}
+
 interface PaperPortfolioReviewDeps {
   listPositions?: typeof listAlpacaPositions;
   getAccount?: typeof getAlpacaAccountSnapshot;
   getCandidates?: () => Promise<CandidateRow[]> | CandidateRow[];
   listOpenOrders?: typeof listAlpacaOpenOrders;
-  listReservations?: () => PaperExecutionLedgerEntry[];
+  listReservations?: () => ScaleInReservation[];
+  resolveReservations?: typeof executionStateProjectionService.resolveReservations;
   evaluateLeapsExit?: typeof evaluateLeapsExit;
   now?: () => string;
 }
@@ -395,15 +408,17 @@ const openOrderRisk = (order: AlpacaOpenOrderSnapshot): number | null => {
   return Math.abs(quantity * price * (orderIsOption(order) ? 100 : 1));
 };
 
-const reservationRisk = (reservation: PaperExecutionLedgerEntry): number | null => {
+const reservationRisk = (reservation: ScaleInReservation): number | null => {
   if (reservation.assetClass === "option") {
+    const estimatedPremium = reservation.estimatedPremium;
     if (
-      reservation.estimatedPremium !== null &&
-      Number.isFinite(reservation.estimatedPremium)
+      estimatedPremium !== null &&
+      estimatedPremium !== undefined &&
+      Number.isFinite(estimatedPremium)
     ) {
-      return Math.abs(reservation.estimatedPremium);
+      return Math.abs(estimatedPremium);
     }
-    const quantity = numeric(reservation.qty ?? undefined);
+    const quantity = numeric(reservation.qty ?? reservation.quantity ?? undefined);
     const price = numeric(reservation.limitPrice ?? undefined);
     return quantity === null || price === null
       ? null
@@ -411,7 +426,7 @@ const reservationRisk = (reservation: PaperExecutionLedgerEntry): number | null 
   }
   const notional = numeric(reservation.notional ?? undefined);
   if (notional !== null) return Math.abs(notional);
-  const quantity = numeric(reservation.qty ?? undefined);
+  const quantity = numeric(reservation.qty ?? reservation.quantity ?? undefined);
   const price = numeric(reservation.limitPrice ?? undefined);
   return quantity === null || price === null
     ? null
@@ -422,7 +437,7 @@ const buildScaleInCapitalEvidence = (input: {
   account: Awaited<ReturnType<typeof getAlpacaAccountSnapshot>>;
   positions: AlpacaPositionSnapshot[];
   openOrders: AlpacaOpenOrderSnapshot[] | null;
-  reservations: PaperExecutionLedgerEntry[] | null;
+  reservations: ScaleInReservation[] | null;
 }): ScaleInCapitalEvidence => {
   const equity = numeric(input.account.equity);
   const cash = numeric(input.account.cash);
@@ -614,6 +629,7 @@ export const buildPaperPortfolioReviewReport = async (
   const cfg = paperPortfolioReviewConfig();
   const planConfig = loadPaperPlanConfig();
   const state = getTradingSafetyState();
+  const postgresAuthority = executionStateProjectionService.isAuthorityActive();
   const blockers: string[] = [];
   const warnings: string[] = [];
 
@@ -633,10 +649,12 @@ export const buildPaperPortfolioReviewReport = async (
     Promise.resolve(deps.getCandidates ? deps.getCandidates() : latestCandidates()),
     openOrdersPromise
   ]);
-  let reservations: PaperExecutionLedgerEntry[] | null = [];
+  let reservations: ScaleInReservation[] | null = [];
   if (cfg.equityScaleInEnabled) {
     try {
-      reservations = (deps.listReservations ?? listActivePaperNewRiskReservations)();
+      reservations = postgresAuthority
+        ? await (deps.resolveReservations ?? executionStateProjectionService.resolveReservations)([])
+        : (deps.listReservations ?? listActivePaperNewRiskReservations)();
     } catch {
       reservations = null;
     }
@@ -664,7 +682,7 @@ export const buildPaperPortfolioReviewReport = async (
     const unrealizedPlPercent = pctFromPosition(position.unrealizedPlpc);
     const optionMetadata = optionSymbolMetadata(symbol);
     const brokerSymbolKey = symbol;
-    const possibleLifecycles = state.paperOnly
+    const possibleLifecycles = state.paperOnly && !postgresAuthority
       ? queryAll<{ position_lifecycle_id: string }>(
           `
           SELECT position_lifecycle_id
