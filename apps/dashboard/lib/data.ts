@@ -556,16 +556,16 @@ const normalizeBridgeOptionContractRow = (value: unknown): OptionContractDashboa
   const row = recordValue(value);
   const quoteStatus = inferredQuoteStatus(row);
   return normalizeOptionContractDashboardRow({
-    underlying_symbol: textOrNull(row.underlying_symbol ?? row.underlyingSymbol) ?? "-"(:
-    option_symbol: textOrNull(row.option_symbol ?? row.optionSymbol) ?? "-"
-    type: textOrNull(row.type ?? row.optionType) ?? "-"
-    expiration_date: textOrNull(row.expiration_date ?? row.expirationDate) ?? "-"
-    strike: numberOrNull(row.strike)
-    tradable: booleanFlag(row.tradable) ? 1 : 0
-    bid: numberOrNull(row.bid)
-    ask: numberOrNull(row.ask)
-    midpoint: numberOrNull(row.midpoint)
-    last: numberOrNull(row.last)
+    underlying_symbol: textOrNull(row.underlying_symbol ?? row.underlyingSymbol) ?? "-",
+    option_symbol: textOrNull(row.option_symbol ?? row.optionSymbol) ?? "-",
+    type: textOrNull(row.type ?? row.optionType) ?? "-",
+    expiration_date: textOrNull(row.expiration_date ?? row.expirationDate) ?? "-",
+    strike: numberOrNull(row.strike),
+    tradable: booleanFlag(row.tradable) ? 1 : 0,
+    bid: numberOrNull(row.bid),
+    ask: numberOrNull(row.ask),
+    midpoint: numberOrNull(row.midpoint),
+    last: numberOrNull(row.last),
     quote_status: quoteStatus,
     executable: booleanFlag(row.executable) ? 1 : 0,
     executable_price: numberOrNull(row.executable_price ?? row.executablePrice),
@@ -577,7 +577,6 @@ const normalizeBridgeOptionContractRow = (value: unknown): OptionContractDashboa
 };
 
 export const latestOptionContracts = async (limit = 10) =>
-codex/option-greek-observability
   shouldUseVercelReadOnlyFallback()
     ? []
     : isPaperDashboardBridgeEnabled()
