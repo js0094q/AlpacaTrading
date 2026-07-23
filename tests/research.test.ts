@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { resetSqliteTestDb } from "./helpers/sqliteTestDb.js";
+import { withExecutionAuthority } from "./helpers/executionAuthorityRuntime.js";
 
 process.env.RESEARCH_DB_PATH = join(mkdtempSync(join(tmpdir(), "alpaca-research-test-")), "research.db");
 process.env.TRADING_MODE = "paper";
@@ -316,9 +317,9 @@ describe("Market bar persistence", () => {
     assert.equal(runtimeConfig.alpaca.maxRetries, 0);
   });
 
-  test("configures SQLite busy timeout for transient writer contention", () => {
+  test("configures a bounded SQLite busy timeout below control-route deadlines", () => {
     const row = getDb().prepare("PRAGMA busy_timeout").get() as Record<string, number>;
-    assert.equal(Object.values(row)[0], 5000);
+    assert.equal(Object.values(row)[0], 5_000);
   });
 
   test("stores bars without duplicate rows", () => {
@@ -867,6 +868,108 @@ describe("Alpaca provider pagination", () => {
 });
 
 describe("Research orchestration", () => {
+  test("returns already_running without network work when a fresh research lease exists", async () => {
+    const startedAt = new Date().toISOString();
+    getDb()
+      .prepare(`
+        INSERT INTO research_runs(
+          id, started_at, heartbeat_at, status, risk_profile, options_enabled,
+          universe_size, targets_generated, candidates_selected, config_json
+        ) VALUES ('active-research', ?, ?, 'running', 'moderate', 0, 0, 0, 0, '{}')
+      `)
+      .run(startedAt, startedAt);
+    let fetchCalls = 0;
+    globalThis.fetch = async () => {
+      fetchCalls += 1;
+      return makeMockResponse({});
+    };
+
+    const result = await runResearchDaily({
+      riskProfile: "moderate",
+      optionsEnabled: false,
+      maxCandidates: 4
+    });
+
+    assert.deepEqual(result, {
+      status: "already_running",
+      runId: "active-research",
+      activeRunId: "active-research",
+      startedAt,
+      heartbeatAt: startedAt,
+      riskProfile: "moderate",
+      optionsEnabled: false,
+      universeSize: 0,
+      targetsGenerated: 0,
+      candidatesSelected: 0,
+      barLookbackDays: 365,
+      barLookbackStart: result.barLookbackStart,
+      warnings: ["RESEARCH_ALREADY_RUNNING"]
+    });
+    assert.equal(fetchCalls, 0);
+    assert.equal(
+      readCount("SELECT COUNT(*) AS count FROM research_runs WHERE status = 'running'"),
+      1
+    );
+  });
+
+  test("stops before candidate writes when the research lease is lost", async () => {
+    let leaseRevoked = false;
+    globalThis.fetch = async (input: string | Request | URL) => {
+      const target = String(input);
+      if (target.includes("/v2/stocks/bars")) {
+        const activeRun = getDb()
+          .prepare("SELECT id, status FROM research_runs ORDER BY started_at DESC LIMIT 1")
+          .get() as { id: string; status: string };
+        if (!leaseRevoked) {
+          assert.equal(activeRun.status, "running");
+          getDb()
+            .prepare(`
+              UPDATE research_runs
+              SET status = 'failed', completed_at = ?, recovery_reason = 'TEST_LEASE_RECOVERY'
+              WHERE id = ? AND status = 'running'
+            `)
+            .run(new Date().toISOString(), activeRun.id);
+          leaseRevoked = true;
+        }
+
+        const endpoint = new URL(target);
+        const symbols = (endpoint.searchParams.get("symbols") || "")
+          .split(",")
+          .filter(Boolean)
+          .map((value) => value.toUpperCase());
+        return makeMockResponse({
+          bars: buildBarsPayload(symbols).barsBySymbol
+        });
+      }
+      return makeMockResponse({});
+    };
+
+    await assert.rejects(
+      () => runResearchDaily({ riskProfile: "moderate", optionsEnabled: false, maxCandidates: 4 }),
+      (error: unknown) =>
+        error instanceof Error &&
+        (error as Error & { code?: string }).code === "RESEARCH_RUN_LEASE_LOST"
+    );
+
+    const recovered = getDb()
+      .prepare("SELECT id, status, recovery_reason FROM research_runs ORDER BY started_at DESC LIMIT 1")
+      .get() as { id: string; status: string; recovery_reason: string };
+    assert.equal(recovered.status, "failed");
+    assert.equal(recovered.recovery_reason, "TEST_LEASE_RECOVERY");
+    assert.equal(
+      readCount(
+        `SELECT COUNT(*) AS count FROM paper_trade_candidates WHERE research_run_id = '${recovered.id}'`
+      ),
+      0
+    );
+    assert.equal(
+      readCount(
+        `SELECT COUNT(*) AS count FROM paper_trade_plans WHERE research_run_id = '${recovered.id}'`
+      ),
+      0
+    );
+  });
+
   test("completes when bars response includes next_page_token null", async () => {
     setMockFetchForSuccess(false, null, null);
     const result = await runResearchDaily({ riskProfile: "moderate", optionsEnabled: false, maxCandidates: 4 });
@@ -926,11 +1029,15 @@ describe("Research orchestration", () => {
     const candidateCount = readCount(
       `SELECT COUNT(*) AS count FROM paper_trade_candidates WHERE research_run_id = '${result.runId}'`
     );
+    const selectedCandidateCount = readCount(
+      `SELECT COUNT(*) AS count FROM paper_trade_candidates WHERE research_run_id = '${result.runId}' AND decision = 'selected'`
+    );
     const planCount = readCount(
       `SELECT COUNT(*) AS count FROM paper_trade_plans WHERE research_run_id = '${result.runId}'`
     );
-    assert.equal(candidateCount, result.candidatesSelected);
-    assert.equal(planCount, candidateCount);
+    assert.equal(selectedCandidateCount, result.candidatesSelected);
+    assert.equal(planCount, selectedCandidateCount);
+    assert.equal(candidateCount >= selectedCandidateCount, true);
     assert.ok(planCount > 0);
   });
 
@@ -1381,6 +1488,79 @@ describe("Candidate ranking", () => {
 });
 
 describe("Paper plan and evaluation", () => {
+  test("PostgreSQL control-plane authority does not project research plans into SQLite", async () => {
+    getDb()
+      .prepare(
+        `INSERT INTO target_snapshots(
+          symbol, as_of, direction, horizon, entry_reference, upside_target,
+          downside_risk, stop_loss, take_profit, confidence, expected_return,
+          volatility_adjusted_score, risk_profile, preferred_expression, rationale
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        "SPY",
+        ts(10),
+        "long",
+        "1d",
+        110,
+        114,
+        108,
+        107,
+        114,
+        0.78,
+        0.04,
+        1.1,
+        "aggressive",
+        "shares",
+        JSON.stringify(["authority projection guard"])
+      );
+
+    await withExecutionAuthority(async () => {
+      const plans = buildPaperTradePlans({
+        researchRunId: "postgres-only-run",
+        riskProfile: "aggressive",
+        candidates: [
+          {
+            id: "postgres-only-candidate",
+            symbol: "SPY",
+            asOf: ts(10),
+            rank: 1,
+            direction: "long",
+            horizon: "1d",
+            riskProfile: "aggressive",
+            preferredExpression: "shares",
+            score: 80,
+            confidence: 0.78,
+            expectedReturn: 0.04,
+            estimatedMaxLoss: 100,
+            estimatedMaxProfit: 200,
+            rationale: ["authority projection guard"],
+            optionSymbol: null,
+            strike: null,
+            shortStrike: null,
+            relevantBacktestRunId: null,
+            historicalWinRate: null,
+            historicalAvgReturn: null,
+            historicalMaxDrawdown: null,
+            similarSetupCount: null,
+            optionLiquidityScore: null,
+            volatilityAdjustedScore: 1.1,
+            signalFreshnessDays: 0,
+            recentLearningAdjustment: 0,
+            directionalAccuracy: null,
+            optionOutperformanceAccuracy: null
+          }
+        ]
+      });
+      assert.deepEqual(plans, []);
+    });
+
+    assert.equal(
+      readCount("SELECT COUNT(*) AS count FROM paper_trade_plans"),
+      0
+    );
+  });
+
   test("creates paper plans with thesis, invalidation, and learning objective", () => {
     getDb()
       .prepare(

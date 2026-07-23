@@ -183,6 +183,53 @@ describe("alpaca client behavior", () => {
     );
   });
 
+  test("times out while reading an Alpaca response body", async () => {
+    const previousTimeout = process.env.ALPACA_REQUEST_TIMEOUT_MS;
+    const previousRetries = process.env.ALPACA_MAX_RETRIES;
+    process.env.ALPACA_REQUEST_TIMEOUT_MS = "20";
+    process.env.ALPACA_MAX_RETRIES = "0";
+    setMockFetch(async (_input, init) => {
+      const signal = init?.signal as AbortSignal | undefined;
+      return {
+        ok: true,
+        status: 200,
+        headers: {
+          get: () => null
+        },
+        text: () =>
+          new Promise<string>((_resolve, reject) => {
+            signal?.addEventListener(
+              "abort",
+              () => reject(new DOMException("body stream aborted", "AbortError")),
+              { once: true }
+            );
+          })
+      } as unknown as Response;
+    });
+
+    try {
+      const outcome = await Promise.race([
+        getAlpacaPaperEndpoint<{ status: string }>("/v2/assets?status=all").then(
+          () => "resolved",
+          (error: unknown) => error instanceof Error ? error.message : "rejected"
+        ),
+        new Promise<string>((resolve) => setTimeout(() => resolve("pending"), 250))
+      ]);
+      assert.match(outcome, /timed out after 20ms/);
+    } finally {
+      if (previousTimeout === undefined) {
+        delete process.env.ALPACA_REQUEST_TIMEOUT_MS;
+      } else {
+        process.env.ALPACA_REQUEST_TIMEOUT_MS = previousTimeout;
+      }
+      if (previousRetries === undefined) {
+        delete process.env.ALPACA_MAX_RETRIES;
+      } else {
+        process.env.ALPACA_MAX_RETRIES = previousRetries;
+      }
+    }
+  });
+
   test("missing paper credentials fail clearly", async () => {
     process.env.ALPACA_PAPER_API_KEY = "";
     process.env.ALPACA_PAPER_SECRET_KEY = "";

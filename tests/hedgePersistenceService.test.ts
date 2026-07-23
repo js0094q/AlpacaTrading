@@ -26,6 +26,7 @@ import {
   writeBetaCache
 } from "../src/services/hedgePersistenceService.js";
 import { createHedgeExecutionReview } from "../src/services/hedgeExecutionReviewService.js";
+import { buildHedgeCapitalEvidence } from "../src/services/hedgeCapitalEvidenceService.js";
 import type { HedgeRecommendationRecord } from "../src/services/hedgeTypes.js";
 import type { PortfolioRiskSnapshot } from "../src/services/portfolioRiskService.js";
 
@@ -265,6 +266,13 @@ const recommendation = (): HedgeRecommendationRecord => ({
   regime: { regime: "neutral" },
   score: { total: 20, band: "low" },
   sizing: { netProtectionTarget: 0 },
+  capitalEvidence: buildHedgeCapitalEvidence({
+    asOf: now,
+    allowedUnderlyings: ["SPY", "QQQ"],
+    positions: [],
+    orders: [],
+    ledger: []
+  }),
   leaps: { trimRecommendations: [] },
   candidates: [],
   warnings: [],
@@ -652,6 +660,13 @@ test("persists and verifies an HMAC hedge review on every read", () => {
     configurationFingerprint: "config_hash",
     generatedAt: now,
     signingKey: "persistence-test-key",
+    capitalEvidence: buildHedgeCapitalEvidence({
+      asOf: now,
+      allowedUnderlyings: ["SPY", "QQQ"],
+      positions: [],
+      orders: [],
+      ledger: []
+    }),
     candidate: {
       candidateId: "candidate-1",
       rank: 1,
@@ -670,6 +685,18 @@ test("persists and verifies an HMAC hedge review on every read", () => {
   });
   persistHedgeExecutionReview(review);
 
+  const linkage = getDb().prepare(`
+    SELECT her.decision_id, her.decision_role, her.decision_linkage_status,
+           ds.origin_type, ds.decision_status
+    FROM hedge_execution_reviews her
+    JOIN decision_snapshots ds ON ds.decision_id = her.decision_id
+    WHERE her.review_id = ?
+  `).get(review.reviewId) as Record<string, unknown>;
+  assert.equal(linkage.decision_role, "entry");
+  assert.equal(linkage.decision_linkage_status, "EXACT");
+  assert.equal(linkage.origin_type, "hedge_execution_review");
+  assert.equal(linkage.decision_status, "REVIEWED");
+
   const valid = readHedgeExecutionReview({
     reviewId: review.reviewId,
     signingKey: "persistence-test-key",
@@ -681,6 +708,22 @@ test("persists and verifies an HMAC hedge review on every read", () => {
   assert.equal(valid.verification.valid, true);
   assert.equal(valid.review?.clientOrderId, review.clientOrderId);
 
+  getDb().prepare(
+    "UPDATE hedge_execution_reviews SET decision_linkage_status = 'AMBIGUOUS' WHERE review_id = ?"
+  ).run(review.reviewId);
+  const lineageMismatch = readHedgeExecutionReview({
+    reviewId: review.reviewId,
+    signingKey: "persistence-test-key",
+    asOf: "2026-07-10T14:00:01.000Z"
+  });
+  assert.equal(lineageMismatch.verification.valid, false);
+  assert.ok(
+    lineageMismatch.verification.blockers.includes("HEDGE_REVIEW_PERSISTENCE_MISMATCH")
+  );
+  getDb().prepare(
+    "UPDATE hedge_execution_reviews SET decision_linkage_status = 'EXACT' WHERE review_id = ?"
+  ).run(review.reviewId);
+
   const invalid = readHedgeExecutionReview({
     reviewId: review.reviewId,
     signingKey: "wrong-key",
@@ -688,4 +731,28 @@ test("persists and verifies an HMAC hedge review on every read", () => {
   });
   assert.equal(invalid.verification.valid, false);
   assert.ok(invalid.verification.blockers.includes("HEDGE_REVIEW_SIGNATURE_INVALID"));
+
+  getDb().prepare(
+    "UPDATE hedge_execution_reviews SET client_order_id = ? WHERE review_id = ?"
+  ).run("hedge-entry-row-tampered", review.reviewId);
+  const rowMismatch = readHedgeExecutionReview({
+    reviewId: review.reviewId,
+    signingKey: "persistence-test-key",
+    asOf: "2026-07-10T14:00:01.000Z"
+  });
+  assert.equal(rowMismatch.verification.valid, false);
+  assert.ok(
+    rowMismatch.verification.blockers.includes("HEDGE_REVIEW_PERSISTENCE_MISMATCH")
+  );
+
+  getDb().prepare(
+    "UPDATE hedge_execution_reviews SET client_order_id = ?, status = 'consumed' WHERE review_id = ?"
+  ).run(review.clientOrderId, review.reviewId);
+  const consumed = readHedgeExecutionReview({
+    reviewId: review.reviewId,
+    signingKey: "persistence-test-key",
+    asOf: "2026-07-10T14:00:01.000Z"
+  });
+  assert.equal(consumed.verification.valid, false);
+  assert.ok(consumed.verification.blockers.includes("HEDGE_REVIEW_ALREADY_CONSUMED"));
 });

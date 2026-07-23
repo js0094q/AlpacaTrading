@@ -7,7 +7,11 @@ import { tmpdir } from "node:os";
 
 import { normalizeOptionSnapshot } from "../src/services/optionSnapshotNormalizer.js";
 import { toSnapshotRow } from "../src/services/optionsService.js";
-import { closeDbForTests, getDb } from "../src/lib/db.js";
+import {
+  closeDbForTests,
+  getDb,
+  initializeDatabaseHandle
+} from "../src/lib/db.js";
 
 describe("option snapshot normalizer", () => {
   test("normalizes the complete current snapshot shape", () => {
@@ -369,6 +373,9 @@ describe("option snapshot normalizer", () => {
 
     try {
       process.env.RESEARCH_DB_PATH = dbPath;
+      const migration = new DatabaseSync(dbPath);
+      initializeDatabaseHandle(migration);
+      migration.close();
       const first = getDb();
       const firstColumns = first.prepare("PRAGMA table_info(option_snapshots)").all() as Array<{ name: string }>;
       const preserved = first.prepare(`
@@ -387,6 +394,9 @@ describe("option snapshot normalizer", () => {
       });
 
       closeDbForTests();
+      const idempotencyMigration = new DatabaseSync(dbPath);
+      initializeDatabaseHandle(idempotencyMigration);
+      idempotencyMigration.close();
       const second = getDb();
       const secondColumns = second.prepare("PRAGMA table_info(option_snapshots)").all() as Array<{ name: string }>;
       assert.equal(

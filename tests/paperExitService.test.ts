@@ -21,6 +21,7 @@ import type {
   PaperAccountReconciliationReport,
   PaperReconciliationEventType
 } from "../src/services/paperAccountReconciliationService.js";
+import { withExecutionAuthority } from "./helpers/executionAuthorityRuntime.js";
 import type { StockPriceBatchResponse } from "../src/services/stockMarketDataAccessor.js";
 
 const generatedAt = "2026-07-07T15:00:00.000Z";
@@ -422,6 +423,23 @@ describe("paper exit review 0DTE options", () => {
     assert.equal(result.exitCandidates.length, 1);
     assert.equal(result.exitCandidates[0]?.positionClass, "option_leaps");
     assert.equal(result.exitCandidates[0]?.reason, "LEAPS_DTE_DECAY_EXIT");
+  });
+
+  test("PostgreSQL authority does not use SQLite-derived LEAPS classification", async () => {
+    const symbol = "SPY261001C00810000";
+    const result = await withExecutionAuthority(() => reviewWith([
+      optionPosition({ symbol, unrealized_plpc: "0.05" })
+    ], {
+      input: { includeLEAPS: true },
+      knownLeapsOptionSymbols: {
+        [Symbol.iterator]() {
+          throw new Error("SQLite-derived LEAPS evidence must not be read");
+        }
+      } as unknown as Set<string>
+    }));
+
+    assert.equal(result.exitCandidates.length, 0);
+    assert.equal(result.skipped[0]?.positionClass, "option_short_dated");
   });
 
   test("LEAPS below min sellable value is skipped", async () => {
