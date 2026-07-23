@@ -1,8 +1,20 @@
 import { config as loadDotenv } from "dotenv";
 loadDotenv();
 loadDotenv({ path: ".env.txt", override: false });
-import { addTicker, getActiveUniverse, getAllUniverse, removeTicker, setTickerEnabled, seedInitialUniverse } from "./services/universeService.js";
+import {
+  addTicker,
+  getActiveUniverse,
+  getAllUniverse,
+  removeTicker,
+  setTickerEnabled,
+  seedInitialUniverse
+} from "./services/universeService.js";
+import {
+  getUniverseLifecycleStatus,
+  runAutonomousUniverseLifecycle
+} from "./services/universeLifecycleService.js";
 import { ingestBars } from "./services/marketDataIngest.js";
+import { runStockObservation } from "./services/stockObservationService.js";
 import { ingestOptionContracts, ingestOptionSnapshots } from "./services/optionsService.js";
 import { buildFeatures } from "./services/featureService.js";
 import { generateTargets, getTargets } from "./services/targetService.js";
@@ -46,14 +58,13 @@ import {
   formatPaperReviewReportAsTable
 } from "./services/paperReviewService.js";
 import {
-  buildPaperExecuteConfirmPaperReport,
   buildPaperExecuteDryRunReport,
-  formatPaperExecuteConfirmReportAsTable,
   formatPaperExecuteDryRunReportAsTable
 } from "./services/paperExecuteDryRunService.js";
 import { buildPaperReviewedPayloadExecutionReport } from "./services/paperReviewedPayloadExecutionService.js";
 import {
   isReviewedPayloadSectionName,
+  latestPaperReviewArtifact,
   type ReviewedPayloadSectionName
 } from "./services/paperReviewArtifactService.js";
 import {
@@ -89,10 +100,22 @@ import {
   evaluatePaperLearningRecords,
   paperLearningSummary
 } from "./services/paperLearningLedgerService.js";
+import {
+  applyPaperLearningGovernance,
+  getPaperLearningGovernanceStatus
+} from "./services/learningGovernanceService.js";
+import {
+  applyAutonomousRecovery,
+  getAutonomousRecoveryStatus
+} from "./services/autonomousRecoveryService.js";
 import { config } from "./config.js";
 import { redactSensitiveData } from "./lib/securityRedaction.js";
 import { normalizeSymbol } from "./lib/utils.js";
 import { AlpacaApiError } from "./services/alpacaClient.js";
+import {
+  AlpacaOperationDeadlineError,
+  createOperationDeadline
+} from "./services/operationDeadline.js";
 import { buildPortfolioRiskSnapshot } from "./services/portfolioRiskService.js";
 import { classifyMarketRegime } from "./services/marketRegimeService.js";
 import {
@@ -105,6 +128,35 @@ import {
   executeReviewedPaperHedgeExit
 } from "./services/hedgeExitService.js";
 import { evaluateHedgeLearning } from "./services/hedgeLearningLifecycleService.js";
+import {
+  databaseConfigDiagnostics,
+  loadDatabaseConfig
+} from "./lib/database/config.js";
+import { createPostgresPool, type PostgresConnectionMode } from "./lib/database/postgres.js";
+import { checkPostgresConnectivity } from "./lib/database/postgresConnectivity.js";
+import {
+  getPostgresMigrationStatus,
+  runPostgresMigrations
+} from "./lib/database/postgresMigrations.js";
+import { verifyPostgresSchema } from "./lib/database/postgresSchema.js";
+import {
+  isPaperExitReviewCommand,
+  isPaperPortfolioReviewCommand
+} from "./lib/cliCommandRouting.js";
+import { buildMarketDecisionTrace } from "./services/marketDecisionTraceService.js";
+import {
+  buildZeroDteSummary,
+  runZeroDteEodSummary,
+  runZeroDteEngine,
+  runZeroDteReconciliation
+} from "./services/zeroDte/zeroDteEngineService.js";
+import { reviewZeroDteExits } from "./services/zeroDte/zeroDteExitService.js";
+import { runPostgresScheduledCommand } from "./services/postgresScheduledCommandService.js";
+import { assertPostgresOnlyCliCommand } from "./lib/database/postgresOnlyRuntime.js";
+import {
+  readPostgresAuthorityStatus,
+  runPostgresAuthorityCutover
+} from "./services/postgresAuthorityCutoverService.js";
 
 const parseArg = (input: string): Record<string, string> | null => {
   const [rawKey, rawValue] = input.split("=", 2);
@@ -116,13 +168,14 @@ const parseArg = (input: string): Record<string, string> | null => {
 
 const parseArgs = (argv: string[]) => {
   const output: Record<string, string | undefined> = {};
-  argv.forEach((item) => {
+  argv.forEach((item, index) => {
     const parsed = parseArg(item);
     if (!parsed) {
       return;
     }
     const [key, value] = Object.entries(parsed)[0]!;
-    output[key] = value;
+    const following = argv[index + 1];
+    output[key] = value || (following && !following.startsWith("--") ? following : value);
   });
   return output;
 };
@@ -265,6 +318,536 @@ const formatPadded = (
 const buildSafeBoolean = (value?: boolean) => (value ? "true" : "false");
 
 const run = async () => {
+  assertPostgresOnlyCliCommand(command);
+  const packagedControlPlaneCommands = new Set([
+    "db:postgres:control-plane:snapshot",
+    "db:postgres:control-plane:backfill",
+    "db:postgres:control-plane:reconcile",
+    "db:postgres:control-plane:shadow",
+    "db:postgres:control-plane:status"
+  ]);
+  if (
+    command &&
+    packagedControlPlaneCommands.has(command) &&
+    process.env.npm_lifecycle_event !== command
+  ) {
+    throw new Error("CONTROL_PLANE_PACKAGED_CLI_REQUIRED");
+  }
+  const packagedExecutionStateCommands = new Set([
+    "db:postgres:execution-state:backfill",
+    "db:postgres:execution-state:reconcile",
+    "db:postgres:execution-state:shadow",
+    "db:postgres:execution-state:status"
+  ]);
+  if (
+    command &&
+    packagedExecutionStateCommands.has(command) &&
+    process.env.npm_lifecycle_event !== command
+  ) {
+    throw new Error("EXECUTION_STATE_PACKAGED_CLI_REQUIRED");
+  }
+  if (command === "db:postgres:connectivity") {
+    const mode: PostgresConnectionMode = args.mode === "direct" ? "direct" : "pooled";
+    const purpose = mode === "direct" ? "migration" : "application";
+    const databaseConfig = loadDatabaseConfig(
+      { ...process.env, DATABASE_BACKEND: "postgres" },
+      { purpose }
+    );
+    print({
+      config: databaseConfigDiagnostics(databaseConfig),
+      connectivity: await checkPostgresConnectivity(databaseConfig, { mode })
+    });
+    return;
+  }
+
+  if (command === "db:postgres:migrate") {
+    const databaseConfig = loadDatabaseConfig(
+      { ...process.env, DATABASE_BACKEND: "postgres" },
+      { purpose: "migration" }
+    );
+    const pool = createPostgresPool(databaseConfig, "direct");
+    try {
+      print({
+        config: databaseConfigDiagnostics(databaseConfig),
+        migration: await runPostgresMigrations(pool, databaseConfig)
+      });
+    } finally {
+      await pool.end();
+    }
+    return;
+  }
+
+  if (command === "db:postgres:status") {
+    const databaseConfig = loadDatabaseConfig(
+      { ...process.env, DATABASE_BACKEND: "postgres" },
+      { purpose: "migration" }
+    );
+    const pool = createPostgresPool(databaseConfig, "direct");
+    try {
+      print({
+        config: databaseConfigDiagnostics(databaseConfig),
+        migration: await getPostgresMigrationStatus(pool)
+      });
+    } finally {
+      await pool.end();
+    }
+    return;
+  }
+
+  if (command === "db:postgres:verify") {
+    const databaseConfig = loadDatabaseConfig(
+      { ...process.env, DATABASE_BACKEND: "postgres" },
+      { purpose: "migration" }
+    );
+    const pool = createPostgresPool(databaseConfig, "direct");
+    try {
+      const [migration, schema] = await Promise.all([
+        getPostgresMigrationStatus(pool),
+        verifyPostgresSchema(pool)
+      ]);
+      const verificationPassed =
+        migration.pending.length === 0 &&
+        migration.checksumMismatches.length === 0 &&
+        migration.unexpectedAppliedVersions.length === 0 &&
+        schema.verificationPassed;
+      print({
+        config: databaseConfigDiagnostics(databaseConfig),
+        verificationPassed,
+        migration,
+        schema
+      });
+      if (!verificationPassed) process.exitCode = 1;
+    } finally {
+      await pool.end();
+    }
+    return;
+  }
+
+  if (command === "db:postgres:authority:cutover") {
+    const result = await runPostgresAuthorityCutover();
+    print(result);
+    if (result.status !== "passed") process.exitCode = 1;
+    return;
+  }
+
+  if (command === "db:postgres:authority:status") {
+    const databaseConfig = loadDatabaseConfig(process.env, { purpose: "application" });
+    const pool = createPostgresPool(databaseConfig, "pooled");
+    try {
+      print({
+        config: databaseConfigDiagnostics(databaseConfig),
+        authority: await readPostgresAuthorityStatus(pool)
+      });
+    } finally {
+      await pool.end();
+    }
+    return;
+  }
+
+  if (command === "db:postgres:control-plane:snapshot") {
+    const [{ createReadConsistentSqliteSnapshot }, { getResearchDbPath }] =
+      await Promise.all([
+        import("./services/controlPlaneMigrationService.js"),
+        import("./lib/db.js")
+      ]);
+    const timestamp = new Date().toISOString().replace(/[-:.]/g, "");
+    const destinationDirectory =
+      args.destination ||
+      process.env.RESEARCH_DB_BACKUP_DIR?.trim() ||
+      `${process.cwd()}/data/backups/control-plane-${timestamp}`;
+    const snapshot = await createReadConsistentSqliteSnapshot({
+      sourcePath: args.source || getResearchDbPath(),
+      destinationDirectory
+    });
+    print({
+      snapshot: {
+        path: snapshot.path,
+        sha256: snapshot.sha256,
+        integrityCheck: snapshot.integrityCheck,
+        foreignKeyViolationCount: snapshot.foreignKeyViolationCount,
+        tableCounts: snapshot.tableCounts,
+        readOnly: true
+      }
+    });
+    return;
+  }
+
+  if (command === "db:postgres:control-plane:backfill") {
+    const { backfillControlPlaneSnapshot } =
+      await import("./services/controlPlaneMigrationService.js");
+    if (!args.snapshot) throw new Error("CONTROL_PLANE_SNAPSHOT_PATH_REQUIRED");
+    const databaseConfig = loadDatabaseConfig(
+      { ...process.env, DATABASE_BACKEND: "postgres" },
+      { purpose: "migration" }
+    );
+    const pool = createPostgresPool(databaseConfig, "direct");
+    try {
+      const [migration, schema] = await Promise.all([
+        getPostgresMigrationStatus(pool),
+        verifyPostgresSchema(pool)
+      ]);
+      if (
+        migration.pending.length > 0 ||
+        migration.checksumMismatches.length > 0 ||
+        migration.unexpectedAppliedVersions.length > 0 ||
+        (migration.latestAppliedVersion ?? 0) < 2 ||
+        !schema.verificationPassed
+      ) {
+        throw new Error("CONTROL_PLANE_POSTGRES_PREFLIGHT_FAILED");
+      }
+      const backfill = await backfillControlPlaneSnapshot({
+        snapshotPath: args.snapshot,
+        pool,
+        config: databaseConfig,
+        batchSize: toInt(args.batchSize, 250)
+      });
+      const mutationCount = Object.values(backfill.insertedRows)
+        .reduce((total, count) => total + count, 0);
+      print({
+        operation: "control_plane_backfill",
+        status: "completed",
+        snapshotSha256: backfill.snapshotSha256,
+        postgresMigrationVersion: migration.latestAppliedVersion,
+        sourceRows: backfill.sourceRows,
+        insertedRows: backfill.insertedRows,
+        mutationCount,
+        idempotentReplay: mutationCount === 0
+      });
+    } finally {
+      await pool.end();
+    }
+    return;
+  }
+
+  if (
+    command === "db:postgres:control-plane:reconcile" ||
+    command === "db:postgres:control-plane:shadow"
+  ) {
+    const {
+      assertDurableControlPlaneCheckpoint,
+      reconcileControlPlaneSnapshot
+    } = await import("./services/controlPlaneMigrationService.js");
+    if (!args.snapshot) throw new Error("CONTROL_PLANE_SNAPSHOT_PATH_REQUIRED");
+    const databaseConfig = loadDatabaseConfig(
+      { ...process.env, DATABASE_BACKEND: "postgres" },
+      { purpose: "migration" }
+    );
+    const pool = createPostgresPool(databaseConfig, "direct");
+    try {
+      const result = await reconcileControlPlaneSnapshot({
+        snapshotPath: args.snapshot,
+        pool,
+        config: databaseConfig,
+        checkpointId: args.checkpointId,
+        dryRun: flagArg(args.dryRun) || flagArg(args["dry-run"])
+      });
+      let durableCheckpointVerified = false;
+      if (!result.dryRun) {
+        const checkpoint = await pool.query<{
+          status: string;
+          source_checksum: string | null;
+          discrepancy_count: number | string;
+          cursor_value: Record<string, unknown> | string;
+          source_aggregates: Record<string, unknown> | string;
+          target_aggregates: Record<string, unknown> | string;
+          discrepancy_report: Record<string, unknown> | string;
+          completed_at: Date | string | null;
+        }>(
+          `SELECT status, source_checksum, discrepancy_count, cursor_value,
+                  source_aggregates, target_aggregates, discrepancy_report, completed_at
+           FROM reconciliation_checkpoints
+           WHERE id = $1`,
+          [result.checkpointId]
+        );
+        durableCheckpointVerified = assertDurableControlPlaneCheckpoint(
+          checkpoint.rows[0],
+          result
+        );
+      }
+      const discrepancyCategories = Object.fromEntries(
+        Object.entries(result.discrepancies.reduce<Record<string, number>>((counts, row) => {
+          const category = `${row.domain}:${row.discrepancyType}`;
+          counts[category] = (counts[category] ?? 0) + 1;
+          return counts;
+        }, {})).sort(([left], [right]) => left.localeCompare(right))
+      );
+      print({
+        operation: result.operation,
+        status: result.dryRun ? `dry_run_${result.status}` : result.status,
+        checkpointId: result.checkpointId,
+        snapshotSha256: result.snapshotSha256,
+        postgresMigrationVersion: result.postgresMigrationVersion,
+        mappingVersion: result.mappingVersion,
+        sourceCounts: result.sourceAggregates,
+        targetCounts: result.targetAggregates,
+        candidateNumericClassification: result.candidateNumericClassification,
+        discrepancyCount: result.discrepancyCount,
+        discrepancyCategories,
+        candidateMutationCount: result.candidateMutationCount,
+        checkpointMutationCount: result.checkpointMutationCount,
+        mutationCount: result.mutationCount,
+        idempotentReplay: result.idempotentReplay,
+        durableCheckpointVerified
+      });
+      if (result.status !== "passed") process.exitCode = 1;
+    } finally {
+      await pool.end();
+    }
+    return;
+  }
+
+  if (command === "db:postgres:control-plane:status") {
+    const databaseConfig = loadDatabaseConfig(
+      { ...process.env, DATABASE_BACKEND: "postgres" },
+      { purpose: "application" }
+    );
+    const pool = createPostgresPool(databaseConfig, "pooled");
+    try {
+      const [checkpoint, activeLeases] = await Promise.all([
+        pool.query<{
+          id: string;
+          status: string;
+          source_checksum: string | null;
+          source_row_count: string | number | null;
+          target_row_count: string | number | null;
+          discrepancy_count: string | number;
+          completed_at: Date | string | null;
+        }>(
+          `SELECT id, status, source_checksum, source_row_count, target_row_count,
+                  discrepancy_count, completed_at
+           FROM reconciliation_checkpoints
+           WHERE workstream = 'control_plane'
+           ORDER BY completed_at DESC NULLS LAST, created_at DESC
+           LIMIT 1`
+        ),
+        pool.query<{ job_name: string; workstream: string; fencing_token: string }>(
+          `SELECT job_name, workstream, fencing_token::text AS fencing_token
+           FROM scheduler_leases
+           WHERE status = 'held' AND expires_at > statement_timestamp()
+           ORDER BY job_name`
+        )
+      ]);
+      print({
+        config: databaseConfigDiagnostics(databaseConfig),
+        latestCheckpoint: checkpoint.rows[0] || null,
+        activeSchedulerLeases: activeLeases.rows
+      });
+    } finally {
+      await pool.end();
+    }
+    return;
+  }
+
+  if (command === "db:postgres:execution-state:backfill") {
+    const { backfillExecutionStateSnapshot } =
+      await import("./services/executionStateMigrationService.js");
+    if (!args.snapshot) throw new Error("EXECUTION_STATE_SNAPSHOT_PATH_REQUIRED");
+    const databaseConfig = loadDatabaseConfig(
+      { ...process.env, DATABASE_BACKEND: "postgres" },
+      { purpose: "migration" }
+    );
+    const pool = createPostgresPool(databaseConfig, "direct");
+    try {
+      const [migration, schema] = await Promise.all([
+        getPostgresMigrationStatus(pool),
+        verifyPostgresSchema(pool)
+      ]);
+      if (
+        migration.pending.length > 0 ||
+        migration.checksumMismatches.length > 0 ||
+        migration.unexpectedAppliedVersions.length > 0 ||
+        migration.latestAppliedVersion !== 2 ||
+        !schema.verificationPassed
+      ) {
+        throw new Error("EXECUTION_STATE_POSTGRES_PREFLIGHT_FAILED");
+      }
+      const backfill = await backfillExecutionStateSnapshot({
+        snapshotPath: args.snapshot,
+        pool,
+        config: databaseConfig,
+        batchSize: toInt(args.batchSize, 100)
+      });
+      const durable = await pool.query<{ count: number | string }>(
+        `SELECT COUNT(*) AS count
+         FROM reconciliation_checkpoints
+         WHERE workstream = 'execution_state_backfill'
+           AND status = 'passed'
+           AND source_checksum = $1
+           AND cursor_value->>'mappingVersion' = $2`,
+        [backfill.snapshotSha256, backfill.mappingVersion]
+      );
+      const durableBatchCheckpointCount = Number(durable.rows[0]?.count ?? 0);
+      const durableBatchCheckpointsVerified =
+        Number.isSafeInteger(durableBatchCheckpointCount) &&
+        durableBatchCheckpointCount >= backfill.batchCount;
+      if (!durableBatchCheckpointsVerified) {
+        throw new Error("EXECUTION_STATE_BACKFILL_DURABLE_CHECKPOINT_REQUIRED");
+      }
+      print({
+        operation: backfill.operation,
+        status: backfill.status,
+        snapshotSha256: backfill.snapshotSha256,
+        postgresMigrationVersion: backfill.postgresMigrationVersion,
+        mappingVersion: backfill.mappingVersion,
+        sourceRows: backfill.sourceRows,
+        insertedRows: backfill.insertedRows,
+        rowMutationCount: backfill.rowMutationCount,
+        checkpointMutationCount: backfill.checkpointMutationCount,
+        mutationCount: backfill.mutationCount,
+        idempotentReplay: backfill.idempotentReplay,
+        identityReuses: backfill.identityReuses,
+        mutableStateDifferences: backfill.mutableStateDifferences,
+        durableBatchCheckpointCount,
+        durableBatchCheckpointsVerified
+      });
+    } finally {
+      await pool.end();
+    }
+    return;
+  }
+
+  if (
+    command === "db:postgres:execution-state:reconcile" ||
+    command === "db:postgres:execution-state:shadow"
+  ) {
+    const {
+      assertDurableExecutionStateCheckpoint,
+      reconcileExecutionStateSnapshot
+    } = await import("./services/executionStateMigrationService.js");
+    if (!args.snapshot) throw new Error("EXECUTION_STATE_SNAPSHOT_PATH_REQUIRED");
+    const databaseConfig = loadDatabaseConfig(
+      { ...process.env, DATABASE_BACKEND: "postgres" },
+      { purpose: "migration" }
+    );
+    const pool = createPostgresPool(databaseConfig, "direct");
+    try {
+      const [migration, schema] = await Promise.all([
+        getPostgresMigrationStatus(pool),
+        verifyPostgresSchema(pool)
+      ]);
+      if (
+        migration.pending.length > 0 ||
+        migration.checksumMismatches.length > 0 ||
+        migration.unexpectedAppliedVersions.length > 0 ||
+        migration.latestAppliedVersion !== 2 ||
+        !schema.verificationPassed
+      ) {
+        throw new Error("EXECUTION_STATE_POSTGRES_PREFLIGHT_FAILED");
+      }
+      const result = await reconcileExecutionStateSnapshot({
+        snapshotPath: args.snapshot,
+        pool,
+        config: databaseConfig,
+        checkpointId: args.checkpointId,
+        dryRun:
+          command === "db:postgres:execution-state:shadow" ||
+          flagArg(args.dryRun) ||
+          flagArg(args["dry-run"])
+      });
+      let durableCheckpointVerified = false;
+      if (!result.dryRun) {
+        const checkpoint = await pool.query<{
+          status: string;
+          source_checksum: string | null;
+          discrepancy_count: number | string;
+          cursor_value: unknown;
+          source_aggregates: unknown;
+          target_aggregates: unknown;
+          discrepancy_report: unknown;
+          completed_at: Date | string | null;
+        }>(
+          `SELECT status, source_checksum, discrepancy_count, cursor_value,
+                  source_aggregates, target_aggregates, discrepancy_report, completed_at
+           FROM reconciliation_checkpoints WHERE id = $1`,
+          [result.checkpointId]
+        );
+        durableCheckpointVerified = assertDurableExecutionStateCheckpoint(
+          checkpoint.rows[0],
+          result
+        );
+      }
+      print({
+        operation: result.operation,
+        status: result.dryRun ? `dry_run_${result.status}` : result.status,
+        checkpointId: result.checkpointId,
+        snapshotSha256: result.snapshotSha256,
+        postgresMigrationVersion: result.postgresMigrationVersion,
+        mappingVersion: result.mappingVersion,
+        tableComparisons: result.tableComparisons,
+        discrepancyCount: result.discrepancyCount,
+        discrepancyCategories: result.discrepancyCategories,
+        classifiedStateDifferences: result.classifiedStateDifferences,
+        authorityOnlyRows: result.authorityOnlyRows,
+        duplicateCount: result.duplicateCount,
+        orphanCount: result.orphanCount,
+        lifecycleOrderingCount: result.lifecycleOrderingCount,
+        reservationAllocationInvariantCount: result.reservationAllocationInvariantCount,
+        rowMutationCount: result.rowMutationCount,
+        checkpointMutationCount: result.checkpointMutationCount,
+        mutationCount: result.mutationCount,
+        idempotentReplay: result.idempotentReplay,
+        durableCheckpointVerified
+      });
+      if (result.status !== "passed") process.exitCode = 1;
+    } finally {
+      await pool.end();
+    }
+    return;
+  }
+
+  if (command === "db:postgres:execution-state:status") {
+    const databaseConfig = loadDatabaseConfig(
+      { ...process.env, DATABASE_BACKEND: "postgres" },
+      { purpose: "application" }
+    );
+    const pool = createPostgresPool(databaseConfig, "pooled");
+    try {
+      const checkpoint = await pool.query<{
+        id: string;
+        status: string;
+        source_checksum: string | null;
+        source_row_count: string | number | null;
+        target_row_count: string | number | null;
+        discrepancy_count: string | number;
+        completed_at: Date | string | null;
+      }>(
+        `SELECT id, status, source_checksum, source_row_count, target_row_count,
+                discrepancy_count, completed_at
+         FROM reconciliation_checkpoints
+         WHERE workstream = 'execution_state'
+         ORDER BY completed_at DESC NULLS LAST, created_at DESC
+         LIMIT 1`
+      );
+      print({
+        config: databaseConfigDiagnostics(databaseConfig),
+        latestCheckpoint: checkpoint.rows[0] || null
+      });
+    } finally {
+      await pool.end();
+    }
+    return;
+  }
+
+  if (command === "db:migrate") {
+    const { migrateDatabaseFile } = await import("./services/databaseMaintenanceService.js");
+    print(migrateDatabaseFile(args.database || undefined));
+    return;
+  }
+
+  if (command === "db:verify") {
+    const { verifyDatabaseFile } = await import("./services/databaseMaintenanceService.js");
+    print(verifyDatabaseFile(args.database || undefined));
+    return;
+  }
+
+  if (command === "paper:trace") {
+    if (!args.decisionId) {
+      throw new Error("PAPER_TRACE_DECISION_ID_REQUIRED");
+    }
+    print(buildMarketDecisionTrace(args.decisionId));
+    return;
+  }
+
   if (command === "universe") {
     if (action === "seed") {
       const result = await seedInitialUniverse();
@@ -273,6 +856,14 @@ const run = async () => {
     }
     if (action === "get") {
       print({ universe: getAllUniverse() });
+      return;
+    }
+    if (action === "lifecycle") {
+      print(await runAutonomousUniverseLifecycle());
+      return;
+    }
+    if (action === "lifecycle-status") {
+      print(getUniverseLifecycleStatus());
       return;
     }
     if (action === "add") {
@@ -306,6 +897,19 @@ const run = async () => {
       end: args.end
     });
     print(result);
+    return;
+  }
+
+  if (command === "observatory" && action === "collect") {
+    const result = await runStockObservation({
+      symbols: parseList(args.symbols),
+      feed: args.feed,
+      currency: args.currency
+    });
+    print(result);
+    if (result.status === "failed") {
+      process.exitCode = 1;
+    }
     return;
   }
 
@@ -437,6 +1041,16 @@ const run = async () => {
       });
       return;
     }
+    if (result.status === "already_running") {
+      print([
+        `Research already running: ${result.activeRunId}`,
+        `Started at: ${result.startedAt}`,
+        `Last heartbeat: ${result.heartbeatAt}`,
+        "Paper only: true",
+        "Environment: paper"
+      ].join("\n"));
+      return;
+    }
     const lines = [
       `Research run completed: ${result.runId}`,
       `Paper only: true`,
@@ -481,8 +1095,27 @@ const run = async () => {
     const format = args.format;
     const state = getTradingSafetyState();
     const diagnostic = buildAlpacaConfigDiagnostic();
-    const account = await getAlpacaAccountSnapshot();
-    const clock = await getAlpacaMarketClock();
+    const configuredTimeout = Number.parseInt(
+      process.env.ALPACA_HEALTH_OPERATION_TIMEOUT_MS || "9000",
+      10
+    );
+    const configuredMargin = Number.parseInt(
+      process.env.ALPACA_HEALTH_COMPLETION_MARGIN_MS || "750",
+      10
+    );
+    const deadline = createOperationDeadline({
+      timeoutMs:
+        Number.isFinite(configuredTimeout) && configuredTimeout > 0
+          ? configuredTimeout
+          : 9000,
+      completionMarginMs:
+        Number.isFinite(configuredMargin) && configuredMargin >= 0
+          ? configuredMargin
+          : 750
+    });
+    const requestContext = { deadline };
+    const account = await getAlpacaAccountSnapshot(requestContext);
+    const clock = await getAlpacaMarketClock(requestContext);
 
     if (format === "json") {
       print({
@@ -806,6 +1439,26 @@ const run = async () => {
     return;
   }
 
+  if (command === "paper:governance:status") {
+    print(getPaperLearningGovernanceStatus());
+    return;
+  }
+
+  if (command === "paper:governance") {
+    print(applyPaperLearningGovernance());
+    return;
+  }
+
+  if (command === "system:recover:status") {
+    print(getAutonomousRecoveryStatus());
+    return;
+  }
+
+  if (command === "system:recover") {
+    print(applyAutonomousRecovery());
+    return;
+  }
+
   if (command === "paper:learn" || (command === "paper" && (action === "learn" || action === "learning"))) {
     const format = args.format;
     const evaluation = evaluatePaperLearningRecords({
@@ -910,11 +1563,7 @@ const run = async () => {
     return;
   }
 
-  if (
-    command === "paper:portfolio:review" ||
-    command === "paper:exit:review" ||
-    (command === "paper" && action === "portfolio" && subaction === "review")
-  ) {
+  if (isPaperPortfolioReviewCommand(command, action, subaction)) {
     const format = args.format;
     const result = await buildPaperPortfolioReviewReport({
       moment:
@@ -1014,6 +1663,57 @@ const run = async () => {
       return;
     }
     print(formatPaperOpsWorkflowReportAsTable(result));
+    return;
+  }
+
+  if (command === "zero-dte:engine") {
+    const result = await runZeroDteEngine({
+      now: args.now,
+      dryRun: flagArg(args.dryRun) || flagArg(args["dry-run"]),
+      confirmPaper: flagArg(args.confirmPaper)
+    });
+    print(result);
+    if (result.status === "blocked" || result.status === "failed") {
+      process.exitCode = 1;
+    }
+    return;
+  }
+
+  if (command === "zero-dte:exit:review") {
+    const result = await reviewZeroDteExits({
+      now: args.now,
+      confirmPaper: flagArg(args.confirmPaper)
+    });
+    print(result);
+    if (result.status === "blocked" || result.status === "error") {
+      process.exitCode = 1;
+    }
+    return;
+  }
+
+  if (command === "zero-dte:reconcile") {
+    const result = await runZeroDteReconciliation({ now: args.now });
+    print(result);
+    if (result.errors.length > 0) {
+      process.exitCode = 1;
+    }
+    return;
+  }
+
+  if (command === "zero-dte:eod") {
+    const result = await runZeroDteEodSummary({ now: args.now });
+    print(result);
+    if (result.reconciliation.errors.length > 0) {
+      process.exitCode = 1;
+    }
+    return;
+  }
+
+  if (command === "zero-dte:summary") {
+    print(buildZeroDteSummary({
+      tradingDate: args.tradingDate,
+      limit: toInt(args.limit, 20)
+    }));
     return;
   }
 
@@ -1247,13 +1947,27 @@ const run = async () => {
     };
 
     if (confirmPaper) {
-      const result = await buildPaperExecuteConfirmPaperReport(executeInput);
+      const artifact = latestPaperReviewArtifact();
+      const result = await buildPaperReviewedPayloadExecutionReport({
+        confirmPaper: true,
+        expectedPayloadSignature: artifact?.payloadSignature
+      });
       if (format === "json") {
         print(result);
       } else {
-        print(formatPaperExecuteConfirmReportAsTable(result));
+        print([
+          "Paper Execute Reviewed Payloads",
+          `Status: ${result.status}`,
+          `Reason: ${result.reason || "none"}`,
+          `Artifact: ${result.artifactId || "none"}`,
+          `Reviewed payloads: ${result.summary.reviewedPayloads}`,
+          `Submitted: ${result.summary.submitted}`,
+          `Blocked: ${result.summary.blocked}`,
+          `Errors: ${result.summary.errors}`,
+          "Reviewed-payload execution is paper-only and requires --confirmPaper."
+        ].join("\n"));
       }
-      if (result.errors.length > 0) {
+      if (result.status === "blocked" || result.errors.length > 0) {
         process.exitCode = 1;
       }
       return;
@@ -1273,7 +1987,7 @@ const run = async () => {
     return;
   }
 
-  if (command === "paper:exit:review" || (command === "paper" && action === "exit-review")) {
+  if (isPaperExitReviewCommand(command, action)) {
     const format = normalizePaperPlanFormat(args.format) || "table";
     const result = await buildPaperExitReviewResult({
       includeEquities: optionalBoolArg(args.includeEquities),
@@ -1452,7 +2166,7 @@ const run = async () => {
 
   print({
     error:
-      "Unknown command. See README for available commands including db:migrate/db:verify/universe/data/options/features/targets/backtest/learn/research/alpaca:config/paper (including paper:analytics, paper:learn, paper:execute, paper:execute:reviewed, paper:review, paper:plan, paper:portfolio:review, paper:exit:review, paper:exit:execute, paper:options:discover, paper:ops:morning, paper:ops:midday, paper:ops:late-day, paper:snapshots, paper:trends, paper:runtime, paper:intel).",
+      "Unknown command. See README for available commands including db:migrate/db:verify/universe/data/options/features/targets/backtest/learn/research/alpaca:config/paper/zero-dte (including paper:analytics, paper:learn, paper:trace, paper:execute, paper:execute:reviewed, paper:review, paper:plan, paper:portfolio:review, paper:exit:review, paper:exit:execute, paper:options:discover, paper:ops:morning, paper:ops:midday, paper:ops:late-day, paper:snapshots, paper:trends, paper:runtime, paper:intel, zero-dte:engine, zero-dte:exit:review, zero-dte:reconcile, zero-dte:eod, zero-dte:summary).",
     command,
     action,
     config
@@ -1461,8 +2175,26 @@ const run = async () => {
 };
 
 try {
-  await run();
+  await runPostgresScheduledCommand({
+    command,
+    action,
+    subaction,
+    sections: args.sections,
+    operation: run
+  });
 } catch (error) {
+  if (error instanceof AlpacaOperationDeadlineError) {
+    print({
+      error: {
+        code: error.code,
+        message: error.message
+      },
+      timedOut: error.metadata.timedOut,
+      deadline: error.metadata
+    });
+    process.exit(1);
+  }
+
   if (error instanceof AlpacaApiError) {
     print({
       error: error.message,

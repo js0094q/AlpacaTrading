@@ -7,18 +7,44 @@ import {
   type AlpacaApiResponse
 } from "./alpacaClient.js";
 import {
+  applyPaperExecutionLedgerUpdate,
+  buildPaperExecutionLedgerEntry,
   findPaperExecutionByDedupeKey,
+  findPaperExecutionById,
   insertPaperExecutionLedgerEntry,
+  listActivePaperNewRiskReservations,
+  paperNewRiskLedgerMutationFingerprint,
+  reserveReviewedPaperExecutions,
+  type PaperExecutionLedgerEntry,
+  type PaperExecutionLedgerInput,
   updatePaperExecutionLedgerEntry
 } from "./paperExecutionLedgerService.js";
+import { executionStateProjectionService } from "./executionStateProjectionService.js";
 import {
-  isPaperReviewArtifactFresh,
+  findPaperReviewPayloadDecision,
   isReviewedPayloadSectionName,
   latestPaperReviewArtifact,
+  verifyPaperReviewArtifact,
   type PaperReviewArtifact,
   type ReviewedPayloadSectionName
 } from "./paperReviewArtifactService.js";
+import { appendDecisionLifecycleEvent } from "./marketDecisionEvidenceService.js";
+import {
+  closePaperPositionFromFill,
+  persistPaperPositionOutcome,
+  reconcilePaperEntryFill
+} from "./paperPositionLifecycleService.js";
+import type { DecisionId, PositionLifecycleId } from "../types.js";
 import { getTradingSafetyState } from "./tradingSafetyService.js";
+import {
+  capturePaperSubmitState,
+  normalizePaperSubmitReservations,
+  paperSubmitReservationFingerprint,
+  validatePaperSubmitState,
+  validatePaperSubmitReservationHeadroom,
+  type PaperSubmitStateAttestation,
+  type PaperSubmitStateValidation
+} from "./paperSubmitStateService.js";
 
 export type PaperReviewedExecutionStatus =
   | "submitted"
@@ -80,6 +106,9 @@ interface PaperReviewedExecutionInput {
 
 interface NormalizedReviewedPayload {
   section: ReviewedPayloadSectionName;
+  payloadIndex: number;
+  decisionId: DecisionId | null;
+  positionLifecycleId: PositionLifecycleId | null;
   assetClass: "equity" | "option";
   symbol: string;
   side: "buy" | "sell";
@@ -100,8 +129,18 @@ interface PaperReviewedExecutionDeps {
   getAccount?: typeof getAccount;
   submitPaperOrder?: typeof submitPaperOrder;
   latestArtifact?: typeof latestPaperReviewArtifact;
+  captureSubmitState?: typeof capturePaperSubmitState;
+  authorizeExecution?: typeof executionStateProjectionService.reserveOrderIntent;
+  recordExecutionResult?: typeof executionStateProjectionService.recordBrokerResult;
+  storeExecutionEvidence?: typeof executionStateProjectionService.storePaperReviewEvidence;
   now?: () => string;
 }
+
+const ENTRY_SECTIONS = new Set<ReviewedPayloadSectionName>([
+  "equityBuys",
+  "equityAdds",
+  "optionBuys"
+]);
 
 const parseBoolean = (name: string) =>
   process.env[name] === "true" || process.env[name] === "1";
@@ -114,6 +153,29 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 
 const stringField = (value: unknown): string | undefined =>
   typeof value === "string" && value.trim() ? value.trim() : undefined;
+
+const numberField = (value: unknown): number | null => {
+  if (value === null || value === undefined || value === "") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const isPaperSubmitStateAttestation = (
+  value: unknown
+): value is PaperSubmitStateAttestation =>
+  isRecord(value) &&
+  value.version === "paper-submit-state-v1" &&
+  Array.isArray(value.payloadIntents) &&
+  Array.isArray(value.positions) &&
+  Array.isArray(value.openOrders) &&
+  Array.isArray(value.reservations) &&
+  Array.isArray(value.marketEvidence) &&
+  isRecord(value.allocationAttestation) &&
+  value.allocationAttestation.identity === "baseline-v1" &&
+  value.allocationAttestation.allocatorControlled === false;
+
+const isEntryPayload = (payload: NormalizedReviewedPayload) =>
+  ENTRY_SECTIONS.has(payload.section);
 
 const normalizeType = (value: unknown): "market" | "limit" =>
   value === "limit" ? "limit" : "market";
@@ -166,8 +228,17 @@ const normalizePayload = (
     };
   }
 
+  const reviewDecision = findPaperReviewPayloadDecision({
+    artifactId: artifact.id,
+    section,
+    payloadIndex: index
+  });
+
   return {
     section,
+    payloadIndex: index,
+    decisionId: reviewDecision?.decision_id ?? null,
+    positionLifecycleId: reviewDecision?.position_lifecycle_id ?? null,
     assetClass,
     symbol,
     side,
@@ -321,13 +392,21 @@ export const buildPaperReviewedPayloadExecutionReport = async (
       artifact
     });
   }
-  if (!isPaperReviewArtifactFresh(artifact, generatedAt)) {
+  const artifactVerification = verifyPaperReviewArtifact({
+    artifact,
+    asOf: generatedAt
+  });
+  if (!artifactVerification.valid) {
+    const verificationBlockers = artifactVerification.blockers.map((reason) => ({
+      reason
+    }));
     return emptyReport({
       generatedAt,
       environment: state.alpacaEnv,
-      status: "warning",
-      reason: "REVIEW_STALE_OR_PAYLOAD_CHANGED",
-      artifact
+      status: "blocked",
+      reason: artifactVerification.blockers[0] ?? "REVIEW_ARTIFACT_SIGNATURE_INVALID",
+      artifact,
+      blocked: verificationBlockers
     });
   }
   if (
@@ -337,9 +416,10 @@ export const buildPaperReviewedPayloadExecutionReport = async (
     return emptyReport({
       generatedAt,
       environment: state.alpacaEnv,
-      status: "warning",
+      status: "blocked",
       reason: "REVIEW_STALE_OR_PAYLOAD_CHANGED",
-      artifact
+      artifact,
+      blocked: [{ reason: "REVIEW_STALE_OR_PAYLOAD_CHANGED" }]
     });
   }
   if (artifact.payloadCount <= 0) {
@@ -398,10 +478,120 @@ export const buildPaperReviewedPayloadExecutionReport = async (
       });
       continue;
     }
+    if (
+      isEntryPayload(result) &&
+      (!(["success", "warning"] as string[]).includes(artifact.status) ||
+        artifact.artifact.blockers.length > 0)
+    ) {
+      blocked.push({
+        section: result.section,
+        symbol: result.symbol,
+        clientOrderId: result.clientOrderId,
+        reason: "REVIEW_ARTIFACT_ENTRY_BLOCKED",
+        explanation:
+          artifact.artifact.blockers.join(", ") ||
+          `Signed review artifact status is ${artifact.status}.`
+      });
+      continue;
+    }
+    if (
+      isEntryPayload(result) &&
+      (result.side !== "buy" || !result.sourceCandidateId || !result.decisionId)
+    ) {
+      blocked.push({
+        section: result.section,
+        symbol: result.symbol,
+        clientOrderId: result.clientOrderId,
+        reason: "REVIEW_ENTRY_SOURCE_IDENTITY_MISSING",
+        explanation:
+          "Reviewed new-risk payloads require exact candidate and decision linkage."
+      });
+      continue;
+    }
     normalized.push(result);
   }
 
   if (!normalized.length) {
+    return emptyReport({
+      generatedAt,
+      environment: state.alpacaEnv,
+      status: blocked.length ? "blocked" : "no_op",
+      reason: blocked[0]?.reason ?? "NO_ELIGIBLE_REVIEWED_PAYLOADS",
+      artifact,
+      blocked,
+      reviewedPayloads: reviewedPayloadRows.length
+    });
+  }
+
+  let eligiblePayloads = normalized;
+  const postgresAuthority = executionStateProjectionService.isAuthorityActive();
+  let submitValidation: PaperSubmitStateValidation | null = null;
+  let currentSubmitState: PaperSubmitStateAttestation | null = null;
+  let expectedNewRiskLedgerFingerprint: string | null = null;
+  const entryPayloads = normalized.filter(isEntryPayload);
+  if (entryPayloads.length) {
+    const reviewedSubmitState = artifact.artifact.submitState;
+    let stateBlockers: string[] = [];
+    if (!isPaperSubmitStateAttestation(reviewedSubmitState)) {
+      stateBlockers = [
+        "REVIEW_SUBMIT_STATE_MISSING",
+        "FRESH_REVIEW_REQUIRED"
+      ];
+    } else {
+      try {
+        const ledgerFingerprintBefore = postgresAuthority
+          ? null
+          : paperNewRiskLedgerMutationFingerprint();
+        const capture =
+          deps.captureSubmitState ??
+          ((captureInput: Parameters<typeof capturePaperSubmitState>[0]) =>
+            capturePaperSubmitState(captureInput, {
+              getAccount: deps.getAccount
+            }));
+        currentSubmitState = await capture({
+          capturedAt: generatedAt,
+          payloadSections: artifact.artifact.payloadSections
+        });
+        expectedNewRiskLedgerFingerprint = postgresAuthority
+          ? null
+          : paperNewRiskLedgerMutationFingerprint();
+        submitValidation = validatePaperSubmitState({
+          reviewed: reviewedSubmitState,
+          current: currentSubmitState,
+          sections: [
+            ...new Set(entryPayloads.map((payload) => payload.section))
+          ]
+        });
+        stateBlockers = [
+          ...submitValidation.blockers,
+          ...(!postgresAuthority &&
+            ledgerFingerprintBefore !== expectedNewRiskLedgerFingerprint
+            ? ["SUBMIT_LEDGER_STATE_DRIFT", "FRESH_REVIEW_REQUIRED"]
+            : [])
+        ];
+      } catch {
+        stateBlockers = [
+          "SUBMIT_STATE_CAPTURE_FAILED",
+          "FRESH_REVIEW_REQUIRED"
+        ];
+      }
+    }
+    if (stateBlockers.length) {
+      const explanation = [...new Set(stateBlockers)].join(", ");
+      for (const payload of entryPayloads) {
+        blocked.push({
+          section: payload.section,
+          symbol: payload.symbol,
+          clientOrderId: payload.clientOrderId,
+          reason: "FRESH_REVIEW_REQUIRED",
+          explanation
+        });
+      }
+      eligiblePayloads = normalized.filter((payload) => !isEntryPayload(payload));
+    }
+  }
+
+  if (!eligiblePayloads.length) {
     return emptyReport({
       generatedAt,
       environment: state.alpacaEnv,
@@ -426,13 +616,162 @@ export const buildPaperReviewedPayloadExecutionReport = async (
     });
   }
 
+  const reservationRiskFor = (payload: NormalizedReviewedPayload) => {
+    const explicit = numberField(payload.raw.maxRisk) ??
+      numberField(payload.raw.estimatedPremium) ??
+      numberField(payload.notional);
+    if (explicit !== null && explicit > 0) return explicit;
+    const quantity = numberField(payload.qty);
+    if (quantity === null || quantity <= 0) return null;
+    const limitPrice = numberField(payload.limitPrice);
+    const referencePrice = limitPrice ?? currentSubmitState?.marketEvidence.find(
+      (evidence) =>
+        evidence.symbol === payload.symbol &&
+        evidence.assetClass === payload.assetClass
+    )?.referencePrice ?? null;
+    if (referencePrice === null || referencePrice <= 0) return null;
+    return quantity * referencePrice * (payload.assetClass === "option" ? 100 : 1);
+  };
+
+  const reservedEntriesByClient = new Map<string, PaperExecutionLedgerEntry>();
+  const entryPayloadsToReserve = eligiblePayloads.filter(isEntryPayload);
+  if (entryPayloadsToReserve.length && !postgresAuthority) {
+    if (!currentSubmitState) {
+      for (const payload of entryPayloadsToReserve) {
+        blocked.push({
+          section: payload.section,
+          symbol: payload.symbol,
+          clientOrderId: payload.clientOrderId,
+          reason: "FRESH_REVIEW_REQUIRED",
+          explanation: "SUBMIT_STATE_CAPTURE_FAILED"
+        });
+      }
+      eligiblePayloads = eligiblePayloads.filter((payload) => !isEntryPayload(payload));
+    } else {
+      const expectedReservationFingerprint = paperSubmitReservationFingerprint(
+        currentSubmitState.reservations
+      );
+      const reservation = reserveReviewedPaperExecutions({
+        inputs: entryPayloadsToReserve.map((payload) => ({
+          assetClass: payload.assetClass,
+          symbol: payload.symbol,
+          side: "buy" as const,
+          orderType: payload.type,
+          timeInForce: payload.timeInForce,
+          qty: payload.qty ?? null,
+          notional: payload.notional ?? null,
+          limitPrice: payload.limitPrice ?? null,
+          estimatedPremium: numberField(payload.raw.estimatedPremium),
+          maxRisk: reservationRiskFor(payload),
+          dedupeKey: payload.dedupeKey,
+          clientOrderId: payload.clientOrderId,
+          sourcePlanId: artifact.id,
+          sourceCandidateId: payload.sourceCandidateId!,
+          decisionId: payload.decisionId!,
+          section: payload.section,
+          payloadIndex: payload.payloadIndex,
+          payload: {
+            reviewedPayload: payload.raw,
+            submitValidation
+          },
+          rawPayload: toAlpacaPayload(payload)
+        })),
+        validateBeforeInsert: () => {
+          const currentReservations = normalizePaperSubmitReservations(
+            listActivePaperNewRiskReservations()
+          );
+          if (
+            !expectedNewRiskLedgerFingerprint ||
+            paperNewRiskLedgerMutationFingerprint() !==
+              expectedNewRiskLedgerFingerprint ||
+            paperSubmitReservationFingerprint(currentReservations) !==
+            expectedReservationFingerprint
+          ) {
+            return [
+              "SUBMIT_RESERVATION_STATE_DRIFT",
+              "FRESH_REVIEW_REQUIRED"
+            ];
+          }
+          const headroomBlockers = validatePaperSubmitReservationHeadroom({
+            state: currentSubmitState!,
+            sections: [
+              ...new Set(entryPayloadsToReserve.map((payload) => payload.section))
+            ],
+            reservations: currentReservations
+          });
+          return headroomBlockers.length
+            ? [...headroomBlockers, "FRESH_REVIEW_REQUIRED"]
+            : [];
+        }
+      });
+      if (!reservation.reserved) {
+        const reason = reservation.blockers[0] ?? "SUBMIT_RESERVATION_FAILED";
+        for (const payload of entryPayloadsToReserve) {
+          blocked.push({
+            section: payload.section,
+            symbol: payload.symbol,
+            clientOrderId: payload.clientOrderId,
+            reason,
+            explanation: reservation.blockers.join(", ")
+          });
+        }
+        eligiblePayloads = eligiblePayloads.filter((payload) => !isEntryPayload(payload));
+      } else {
+        reservation.entries.forEach((entry) => {
+          reservedEntriesByClient.set(entry.clientOrderId, entry);
+        });
+      }
+    }
+  }
+
   const submitted: PaperReviewedExecutionReport["submitted"] = [];
   const errors: PaperReviewedExecutionReport["errors"] = [];
   const submit = deps.submitPaperOrder ?? submitPaperOrder;
+  const authorizeExecution = deps.authorizeExecution ??
+    executionStateProjectionService.reserveOrderIntent;
+  const recordExecutionResult = deps.recordExecutionResult ??
+    executionStateProjectionService.recordBrokerResult;
+  const storeExecutionEvidence = deps.storeExecutionEvidence ??
+    executionStateProjectionService.storePaperReviewEvidence;
 
-  for (const payload of normalized) {
-    const existingExecution = findPaperExecutionByDedupeKey(payload.dedupeKey);
+  const ledgerInputFor = (
+    payload: NormalizedReviewedPayload,
+    status: "reserved" | "attempted"
+  ): PaperExecutionLedgerInput => ({
+    mode: "reviewedConfirmPaper",
+    assetClass: payload.assetClass,
+    symbol: payload.symbol,
+    side: payload.side,
+    orderType: payload.type,
+    timeInForce: payload.timeInForce,
+    qty: payload.qty ?? null,
+    notional: payload.notional ?? null,
+    limitPrice: payload.limitPrice ?? null,
+    estimatedPremium: numberField(payload.raw.estimatedPremium),
+    maxRisk: reservationRiskFor(payload),
+    dedupeKey: payload.dedupeKey,
+    clientOrderId: payload.clientOrderId,
+    status,
+    sourcePlanId: artifact.id,
+    sourceCandidateId: payload.sourceCandidateId ?? null,
+    decisionId: payload.decisionId,
+    decisionLinkageStatus: payload.decisionId ? "EXACT" : "LEGACY_UNLINKED",
+    payload: {
+      artifactId: artifact.id,
+      section: payload.section,
+      payloadIndex: payload.payloadIndex,
+      reviewedPayload: payload.raw,
+      ...(submitValidation ? { submitValidation } : {})
+    },
+    rawPayload: toAlpacaPayload(payload)
+  });
+
+  for (const payload of eligiblePayloads) {
+    const existingExecution = postgresAuthority
+      ? null
+      : findPaperExecutionByDedupeKey(payload.dedupeKey);
     if (
+      !isEntryPayload(payload) &&
       existingExecution &&
       existingExecution.status !== "blocked" &&
       existingExecution.status !== "duplicate_blocked"
@@ -447,38 +786,208 @@ export const buildPaperReviewedPayloadExecutionReport = async (
       continue;
     }
 
-    const ledger = insertPaperExecutionLedgerEntry({
-      mode: "reviewedConfirmPaper",
-      assetClass: payload.assetClass,
-      symbol: payload.symbol,
-      side: payload.side,
-      orderType: payload.type,
-      timeInForce: payload.timeInForce,
-      qty: payload.qty ?? null,
-      notional: payload.notional ?? null,
-      limitPrice: payload.limitPrice ?? null,
-      dedupeKey: payload.dedupeKey,
-      clientOrderId: payload.clientOrderId,
-      status: "attempted",
-      sourcePlanId: artifact.id,
-      sourceCandidateId: payload.sourceCandidateId ?? null,
-      payload: payload.raw,
-      rawPayload: toAlpacaPayload(payload)
-    });
+    let ledger: PaperExecutionLedgerEntry;
+    if (postgresAuthority) {
+      ledger = buildPaperExecutionLedgerEntry(
+        ledgerInputFor(payload, isEntryPayload(payload) ? "reserved" : "attempted"),
+        { createdAt: generatedAt }
+      );
+    } else if (isEntryPayload(payload)) {
+      const reservedEntry = reservedEntriesByClient.get(payload.clientOrderId);
+      if (!reservedEntry) {
+        blocked.push({
+          section: payload.section,
+          symbol: payload.symbol,
+          clientOrderId: payload.clientOrderId,
+          reason: "SUBMIT_RESERVATION_FAILED",
+          explanation: "Atomic reviewed reservation was not available."
+        });
+        continue;
+      }
+      ledger = reservedEntry;
+      updatePaperExecutionLedgerEntry(ledger.id, {
+        status: "attempted",
+        reason: null,
+        blockedReason: null
+      });
+    } else {
+      ledger = insertPaperExecutionLedgerEntry(ledgerInputFor(payload, "attempted"));
+    }
 
+    await storeExecutionEvidence(artifact, ledger);
+    const postgresAuthorization = await authorizeExecution(ledger);
+    if (!postgresAuthorization.brokerAllowed) {
+      const reason = postgresAuthorization.blockers?.[0] ??
+        "POSTGRES_EXECUTION_RESERVATION_BLOCKED";
+      if (!postgresAuthority) {
+        updatePaperExecutionLedgerEntry(ledger.id, {
+          status: "released",
+          reason,
+          blockedReason: reason
+        });
+      }
+      blocked.push({
+        section: payload.section,
+        symbol: payload.symbol,
+        clientOrderId: payload.clientOrderId,
+        reason,
+        explanation: "PostgreSQL execution authority rejected the order intent."
+      });
+      continue;
+    }
+
+    if (payload.decisionId && !postgresAuthority) {
+      appendDecisionLifecycleEvent({
+        decisionId: payload.decisionId,
+        status: "PAPER_ELIGIBLE",
+        reasonCodes: ["REVIEWED_PAYLOAD_ELIGIBLE"],
+        sourceType: "paper_review_artifact",
+        sourceId: `${artifact.id}:${payload.section}:${payload.payloadIndex}:eligible`,
+        evidence: { artifactId: artifact.id, ledgerId: ledger.id }
+      });
+    }
+
+    let response: AlpacaApiResponse<AlpacaSubmittedOrder>;
     try {
-      const response: AlpacaApiResponse<AlpacaSubmittedOrder> = await submit(toAlpacaPayload(payload));
+      response = await submit(toAlpacaPayload(payload));
+    } catch (error) {
+      const requestId = error instanceof AlpacaApiError ? error.requestId : undefined;
+      const update = {
+        status: "failed",
+        requestId,
+        reason: "ALPACA_PAPER_ORDER_SUBMISSION_FAILED",
+        errorMessage:
+          error instanceof Error ? error.message : "Alpaca paper order submission failed.",
+        rawResponse: error instanceof AlpacaApiError ? error.responseBody : undefined
+      } as const;
+      if (postgresAuthority) {
+        ledger = applyPaperExecutionLedgerUpdate(ledger, update);
+        await recordExecutionResult(ledger);
+      } else {
+        updatePaperExecutionLedgerEntry(ledger.id, update);
+        const failedLedger = findPaperExecutionById(ledger.id);
+        if (failedLedger) await recordExecutionResult(failedLedger);
+      }
+      blocked.push({
+        section: payload.section,
+        symbol: payload.symbol,
+        clientOrderId: payload.clientOrderId,
+        reason: "ALPACA_PAPER_ORDER_SUBMISSION_FAILED",
+        explanation: error instanceof Error ? error.message : "Alpaca paper order submission failed."
+      });
+      errors.push({
+        symbol: payload.symbol,
+        reason: "ALPACA_PAPER_ORDER_SUBMISSION_FAILED",
+        message: error instanceof Error ? error.message : "Alpaca paper order submission failed.",
+        requestId
+      });
+      continue;
+    }
+
       const order = response.data;
       const status = order.status || "submitted";
       const ledgerStatus = status === "accepted" ? "accepted" : status === "rejected" ? "rejected" : "submitted";
-      updatePaperExecutionLedgerEntry(ledger.id, {
+      const update = {
         status: ledgerStatus,
         alpacaOrderId: order.id,
         alpacaStatus: status,
         requestId: response.requestId,
         reason: null,
         rawResponse: order
-      });
+      } as const;
+      if (postgresAuthority) {
+        ledger = applyPaperExecutionLedgerUpdate(ledger, update);
+        await recordExecutionResult(ledger);
+      } else {
+        updatePaperExecutionLedgerEntry(ledger.id, update);
+        const submittedLedger = findPaperExecutionById(ledger.id);
+        if (submittedLedger) await recordExecutionResult(submittedLedger);
+      }
+      if (payload.decisionId && !postgresAuthority) {
+        appendDecisionLifecycleEvent({
+          decisionId: payload.decisionId,
+          status: status === "filled" ? "FILLED" : "SUBMITTED",
+          reasonCodes: [
+            status === "filled" ? "BROKER_CONFIRMED_FILL" : "BROKER_ORDER_ACCEPTED"
+          ],
+          sourceType: "paper_execution_ledger",
+          sourceId: String(ledger.id),
+          evidence: {
+            alpacaOrderId: order.id,
+            alpacaStatus: status,
+            requestId: response.requestId ?? null
+          }
+        });
+      }
+      if (!postgresAuthority && ["filled", "partially_filled"].includes(status)) {
+        try {
+          const brokerOrderId = stringField(order.id);
+          const filledQuantity = Number.parseFloat(order.filled_qty ?? "");
+          const filledAveragePrice = Number.parseFloat(order.filled_avg_price ?? "");
+          if (
+            !brokerOrderId ||
+            !Number.isFinite(filledQuantity) ||
+            !Number.isFinite(filledAveragePrice)
+          ) {
+            throw new Error("BROKER_FILL_EVIDENCE_INCOMPLETE");
+          }
+          const observedAt = order.filled_at ?? generatedAt;
+          if (
+            payload.section === "equitySells" ||
+            payload.section === "optionSellToCloseExits"
+          ) {
+            if (!payload.decisionId || !payload.positionLifecycleId) {
+              throw new Error("BROKER_EXIT_LINEAGE_NOT_EXACT");
+            }
+            closePaperPositionFromFill({
+              positionLifecycleId: payload.positionLifecycleId,
+              exitDecisionId: payload.decisionId,
+              brokerOrderId,
+              status,
+              filledQuantity,
+              filledAveragePrice,
+              observedAt,
+              exitReasonCode:
+                stringField(payload.raw.reason) ?? "BROKER_CONFIRMED_EXIT",
+              brokerRequestId: response.requestId ?? null,
+              underlyingPrice:
+                typeof payload.raw.underlyingPrice === "number"
+                  ? payload.raw.underlyingPrice
+                  : null
+            });
+            persistPaperPositionOutcome({
+              positionLifecycleId: payload.positionLifecycleId,
+              exitReasonCode:
+                stringField(payload.raw.reason) ?? "BROKER_CONFIRMED_EXIT"
+            });
+          } else {
+            reconcilePaperEntryFill({
+              ledgerId: ledger.id,
+              brokerOrderId,
+              clientOrderId: payload.clientOrderId,
+              status,
+              filledQuantity,
+              filledAveragePrice,
+              observedAt,
+              brokerRequestId: response.requestId ?? null,
+              underlyingPrice:
+                typeof payload.raw.underlyingPrice === "number"
+                  ? payload.raw.underlyingPrice
+                  : null
+            });
+          }
+        } catch (reconciliationError) {
+          errors.push({
+            symbol: payload.symbol,
+            reason: "ANALYTICAL_RECONCILIATION_FAILED",
+            message:
+              reconciliationError instanceof Error
+                ? reconciliationError.message
+                : "Analytical fill reconciliation failed.",
+            requestId: response.requestId
+          });
+        }
+      }
       submitted.push({
         section: payload.section,
         assetClass: payload.assetClass,
@@ -493,30 +1002,6 @@ export const buildPaperReviewedPayloadExecutionReport = async (
         status,
         requestId: response.requestId
       });
-    } catch (error) {
-      const requestId = error instanceof AlpacaApiError ? error.requestId : undefined;
-      updatePaperExecutionLedgerEntry(ledger.id, {
-        status: "failed",
-        requestId,
-        reason: "ALPACA_PAPER_ORDER_SUBMISSION_FAILED",
-        errorMessage:
-          error instanceof Error ? error.message : "Alpaca paper order submission failed.",
-        rawResponse: error instanceof AlpacaApiError ? error.responseBody : undefined
-      });
-      blocked.push({
-        section: payload.section,
-        symbol: payload.symbol,
-        clientOrderId: payload.clientOrderId,
-        reason: "ALPACA_PAPER_ORDER_SUBMISSION_FAILED",
-        explanation: error instanceof Error ? error.message : "Alpaca paper order submission failed."
-      });
-      errors.push({
-        symbol: payload.symbol,
-        reason: "ALPACA_PAPER_ORDER_SUBMISSION_FAILED",
-        message: error instanceof Error ? error.message : "Alpaca paper order submission failed.",
-        requestId
-      });
-    }
   }
 
   return {
@@ -539,7 +1024,7 @@ export const buildPaperReviewedPayloadExecutionReport = async (
     errors,
     summary: {
       reviewedPayloads: reviewedPayloadRows.length,
-      eligiblePayloads: normalized.length,
+      eligiblePayloads: eligiblePayloads.length,
       submitted: submitted.length,
       blocked: blocked.length,
       errors: errors.length

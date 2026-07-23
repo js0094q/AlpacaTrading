@@ -1,0 +1,304 @@
+import { randomUUID } from "node:crypto";
+
+import { seedUniverse } from "../config/universe.seed.js";
+import { canonicalJsonHash } from "../lib/canonicalJson.js";
+import type { SchedulerFence } from "../repositories/contracts/common.js";
+import { PostgresMarketDataRepository } from "../repositories/postgres/postgresMarketDataRepository.js";
+import type { FencedPostgresRepositoryContext } from "../repositories/postgres/postgresRepositorySupport.js";
+import type { RiskProfile } from "../types.js";
+import { buildPostgresFeaturesAndTargets } from "./postgresFeatureTargetService.js";
+import { refreshPostgresMarketData } from "./postgresMarketDataService.js";
+
+export type PostgresResearchQuery = {
+  query: (sql: string, values?: readonly unknown[]) => Promise<{
+    rows: Record<string, unknown>[];
+    rowCount: number | null;
+  }>;
+};
+
+type MarketResult = Awaited<ReturnType<typeof refreshPostgresMarketData>>;
+type FeatureTargetResult = Awaited<ReturnType<typeof buildPostgresFeaturesAndTargets>>;
+
+type ResearchDependencies = {
+  symbols: readonly string[];
+  refreshMarketData: typeof refreshPostgresMarketData;
+  buildFeaturesAndTargets: typeof buildPostgresFeaturesAndTargets;
+};
+
+const dependencies: ResearchDependencies = {
+  symbols: seedUniverse,
+  refreshMarketData: refreshPostgresMarketData,
+  buildFeaturesAndTargets: buildPostgresFeaturesAndTargets
+};
+
+const fenceSql = (start: number) => `EXISTS (
+  SELECT 1 FROM scheduler_leases lease
+  WHERE lease.job_name = $${start} AND lease.workstream = $${start + 1}
+    AND lease.owner_id = $${start + 2} AND lease.run_id = $${start + 3}
+    AND lease.fencing_token = $${start + 4} AND lease.status = 'held'
+    AND lease.expires_at > now()
+)`;
+
+const fenceValues = (fence: SchedulerFence) => [
+  fence.jobName, fence.workstream, fence.ownerId, fence.runId, fence.fencingToken
+];
+
+const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+
+const newYorkDate = (date: Date) => {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit"
+  }).formatToParts(date);
+  const value = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${value.year}-${value.month}-${value.day}`;
+};
+
+const executableOption = (target: FeatureTargetResult["targets"][number]) => {
+  const raw = target.optionsStrategy?.optionsCandidate;
+  const option = raw && typeof raw === "object" ? raw as Record<string, unknown> : null;
+  const expectedType = target.preferredExpression === "long_call"
+    ? "call"
+    : target.preferredExpression === "long_put"
+      ? "put"
+      : null;
+  return expectedType && option?.type === expectedType && typeof option.optionSymbol === "string"
+    ? option
+    : null;
+};
+
+const scoreTarget = (target: FeatureTargetResult["targets"][number], now: Date) => {
+  const ageDays = Math.max(0, (now.getTime() - Date.parse(target.asOf)) / 86_400_000);
+  const freshness = clamp(15 - clamp(ageDays * 0.8, 0, 15), 0, 15);
+  const option = target.optionsStrategy?.optionsCandidate as { liquidityScore?: unknown } | null | undefined;
+  const liquidity = Number(option?.liquidityScore ?? 0);
+  let score = target.confidence * 42;
+  score += clamp((target.expectedReturn ?? 0) * 100, -10, 20) * 1.7;
+  score += clamp((target.volatilityAdjustedScore ?? 1) * 3, -4, 8);
+  score += freshness;
+  if (target.preferredExpression !== "shares") score += clamp(liquidity * 18, 0, 18) + 4;
+  if (target.riskProfile === "aggressive") score += 6;
+  return clamp(score, 0, 100);
+};
+
+const persistEvidence = async (input: {
+  query: PostgresResearchQuery;
+  fence: SchedulerFence;
+  researchRunId: string;
+  market: MarketResult;
+  features: FeatureTargetResult["features"];
+  targets: FeatureTargetResult["targets"];
+  now: string;
+}) => {
+  const latestBars = new Map<string, MarketResult["bars"][number]>();
+  for (const bar of input.market.bars) {
+    const existing = latestBars.get(bar.symbol);
+    if (!existing || Date.parse(existing.observedAt) < Date.parse(bar.observedAt)) latestBars.set(bar.symbol, bar);
+  }
+  const latestFeatures = new Map<string, FeatureTargetResult["features"][number]>();
+  for (const feature of input.features) {
+    const existing = latestFeatures.get(feature.symbol);
+    if (!existing || Date.parse(existing.observedAt) < Date.parse(feature.observedAt)) {
+      latestFeatures.set(feature.symbol, feature);
+    }
+  }
+  const rows = [
+    ...[...latestBars.values()].map((row) => ({ type: "market_bar", symbol: row.symbol, observedAt: row.observedAt, table: "market_bars", key: `${row.symbol}:${row.timeframe}:${row.observedAt}`, fingerprint: canonicalJsonHash(row), payload: row })),
+    ...input.market.stockSnapshots.map((row) => ({ type: "stock_snapshot", symbol: row.symbol, observedAt: row.sourceTimestamp ?? row.observedAt, table: "stock_snapshots", key: row.id, fingerprint: canonicalJsonHash(row.evidence), payload: row.evidence })),
+    ...input.market.optionSnapshots.map((row) => ({ type: "option_snapshot", symbol: row.underlyingSymbol, observedAt: row.quoteTimestamp ?? row.observedAt, table: "option_snapshots", key: `${row.optionSymbol}:${row.observedAt}`, fingerprint: canonicalJsonHash(row.evidence), payload: row.evidence })),
+    ...[...latestFeatures.values()].map((row) => ({ type: "feature_snapshot", symbol: row.symbol, observedAt: row.observedAt, table: "feature_snapshots", key: `${row.symbol}:${row.observedAt}`, fingerprint: row.sourceFingerprint, payload: row.features })),
+    ...input.targets.map((row) => ({ type: "target_snapshot", symbol: row.symbol, observedAt: row.asOf, table: "target_snapshots", key: `${row.symbol}:${row.asOf}:${row.riskProfile}`, fingerprint: row.sourceFingerprint, payload: row }))
+  ];
+  for (const row of rows) {
+    const id = `research_evidence_${canonicalJsonHash({ run: input.researchRunId, type: row.type, key: row.key, fingerprint: row.fingerprint })}`;
+    const result = await input.query.query(
+      `INSERT INTO research_evidence(
+         id, research_run_id, evidence_type, symbol, observed_at, source_table,
+         source_key, source_fingerprint, payload, created_at
+       ) SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10
+         WHERE ${fenceSql(11)}
+       ON CONFLICT (id) DO NOTHING`,
+      [id, input.researchRunId, row.type, row.symbol, row.observedAt, row.table,
+        row.key, row.fingerprint, JSON.stringify(row.payload), input.now,
+        ...fenceValues(input.fence)]
+    );
+    if (result.rowCount !== 1 && result.rowCount !== 0) throw new Error("POSTGRES_RESEARCH_EVIDENCE_PERSISTENCE_FAILED");
+  }
+  return rows.length;
+};
+
+const persistCandidates = async (input: {
+  query: PostgresResearchQuery;
+  fence: SchedulerFence;
+  researchRunId: string;
+  targets: FeatureTargetResult["targets"];
+  maxCandidates: number;
+  now: Date;
+}) => {
+  const selected = input.targets
+    .filter((target) => target.direction !== "neutral" && target.preferredExpression !== "none")
+    .flatMap((target) => {
+      const option = executableOption(target);
+      if (target.preferredExpression !== "shares" && !option) return [];
+      const optionSymbol = typeof option?.optionSymbol === "string" ? option.optionSymbol : null;
+      const expirationDate = typeof option?.expirationDate === "string" ? option.expirationDate : null;
+      const strategyFamily = optionSymbol
+        ? target.symbol === "SPY" && expirationDate === newYorkDate(input.now)
+          ? "zero_dte_spy"
+          : "standard_option"
+        : "equity";
+      return [{ target, option, optionSymbol, strategyFamily, score: scoreTarget(target, input.now) }];
+    })
+    .sort((left, right) => right.score - left.score)
+    .slice(0, input.maxCandidates);
+  for (let index = 0; index < selected.length; index += 1) {
+    const { target, option, optionSymbol, strategyFamily, score } = selected[index]!;
+    const id = `candidate_${canonicalJsonHash({ run: input.researchRunId, source: target.sourceFingerprint })}`;
+    const signalInputs = {
+      targetSourceFingerprint: target.sourceFingerprint,
+      marketEvidenceTimestamp: target.asOf,
+      entryReference: target.entryReference,
+      stopLoss: target.stopLoss,
+      takeProfit: target.takeProfit,
+      marketDecisionInputs: {
+        ...(target.optionsStrategy?.decisionInputs as Record<string, unknown> | undefined),
+        option: option?.decisionInputs ?? null
+      }
+    };
+    const result = await input.query.query(
+      `INSERT INTO candidates(
+         id, decision_id, research_run_id, candidate_key, symbol, underlying_symbol,
+         option_symbol, asset_class, as_of, rank, direction, horizon,
+         risk_profile, preferred_expression, strategy_family, score, confidence,
+         expected_return, estimated_max_loss, estimated_max_profit,
+         option_liquidity_score, volatility_score, strike, decision,
+         lifecycle_status, decision_reason, rationale, signal_inputs,
+         data_quality_status, created_at, updated_at
+       ) SELECT $1, $1, $2, $1, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                $13, $14, $15, $16, $17, $18, $19, $20, $21,
+                'selected', 'selected', 'RANKED_SELECTED', $22::jsonb,
+                $23::jsonb, 'CURRENT_POSTGRES_MARKET_EVIDENCE', $24, $24
+         WHERE ${fenceSql(25)}
+       ON CONFLICT (id) DO NOTHING`,
+      [
+        id, input.researchRunId, target.symbol, optionSymbol ? target.symbol : null,
+        optionSymbol, optionSymbol ? "option" : "equity", target.asOf, index + 1,
+        target.direction, target.horizon, target.riskProfile,
+        target.preferredExpression, strategyFamily, score, target.confidence, target.expectedReturn,
+        target.stopLoss === null ? null : Math.abs(target.entryReference - target.stopLoss),
+        target.takeProfit === null ? null : Math.abs(target.takeProfit - target.entryReference),
+        Number(option?.liquidityScore ?? 0), target.volatilityAdjustedScore,
+        typeof option?.strike === "number" ? option.strike : null,
+        JSON.stringify(target.rationale), JSON.stringify(signalInputs),
+        input.now.toISOString(), ...fenceValues(input.fence)
+      ]
+    );
+    if (result.rowCount !== 1 && result.rowCount !== 0) throw new Error("POSTGRES_CANDIDATE_PERSISTENCE_FAILED");
+  }
+  return selected.length;
+};
+
+export const runPostgresResearchWorkflow = async (input: {
+  query: PostgresResearchQuery;
+  fence: SchedulerFence;
+  riskProfile: RiskProfile;
+  optionsEnabled: boolean;
+  maxCandidates: number;
+  now?: Date;
+  dependencies?: Partial<ResearchDependencies>;
+}) => {
+  const deps = { ...dependencies, ...input.dependencies };
+  const now = input.now ?? new Date();
+  const nowIso = now.toISOString();
+  const runId = `research_${randomUUID()}`;
+  const config = {
+    riskProfile: input.riskProfile,
+    optionsEnabled: input.optionsEnabled,
+    maxCandidates: input.maxCandidates,
+    barLookbackDays: 365,
+    marketDataAuthority: "postgres",
+    stockFeed: "sip",
+    optionFeed: "opra"
+  };
+  const reserved = await input.query.query(
+    `INSERT INTO research_runs(
+       id, workstream, run_key, status, risk_profile, options_enabled, config,
+       worker_identity, scheduler_job_name, scheduler_fencing_token,
+       started_at, heartbeat_at, created_at, updated_at
+     ) SELECT $1, 'research', $1, 'running', $2, $3, $4::jsonb, $5,
+              $7, $11, $6, $6, $6, $6
+       WHERE ${fenceSql(7)}
+     RETURNING version`,
+    [runId, input.riskProfile, input.optionsEnabled, JSON.stringify(config),
+      input.fence.ownerId, nowIso, ...fenceValues(input.fence)]
+  );
+  if (!reserved.rows[0]) throw new Error("POSTGRES_RESEARCH_RESERVATION_FAILED");
+
+  const repository = new PostgresMarketDataRepository();
+  const context = {
+    transaction: input.query,
+    operationId: `research:${runId}`,
+    actorId: input.fence.ownerId,
+    schedulerFence: input.fence
+  } as unknown as FencedPostgresRepositoryContext;
+  try {
+    const market = await deps.refreshMarketData({
+      symbols: deps.symbols,
+      timeframe: "1Day",
+      start: new Date(now.getTime() - 365 * 86_400_000).toISOString(),
+      end: nowIso,
+      optionsEnabled: input.optionsEnabled,
+      now,
+      repository,
+      context
+    });
+    const generated = await deps.buildFeaturesAndTargets({
+      bars: market.bars,
+      stockSnapshots: market.stockSnapshots,
+      optionContracts: market.optionContracts,
+      optionSnapshots: market.optionSnapshots,
+      riskProfile: input.riskProfile,
+      optionsEnabled: input.optionsEnabled,
+      repository,
+      context
+    });
+    const evidenceStored = await persistEvidence({
+      query: input.query, fence: input.fence, researchRunId: runId,
+      market, features: generated.features, targets: generated.targets, now: nowIso
+    });
+    const candidatesSelected = await persistCandidates({
+      query: input.query, fence: input.fence, researchRunId: runId,
+      targets: generated.targets, maxCandidates: input.maxCandidates, now
+    });
+    const completed = await input.query.query(
+      `UPDATE research_runs
+       SET status = 'completed', universe_size = $2, targets_generated = $3,
+           candidates_selected = $4, summary = $5::jsonb, completed_at = $6,
+           heartbeat_at = $6, updated_at = $6, version = version + 1
+       WHERE id = $1 AND status = 'running' AND ${fenceSql(7)}`,
+      [runId, deps.symbols.length, generated.targets.length, candidatesSelected,
+        JSON.stringify({ ...market.summary, evidenceStored }), nowIso,
+        ...fenceValues(input.fence)]
+    );
+    if (completed.rowCount !== 1) throw new Error("POSTGRES_RESEARCH_COMPLETION_FAILED");
+    return {
+      status: "completed" as const,
+      runId,
+      universeSize: deps.symbols.length,
+      targetsGenerated: generated.targets.length,
+      candidatesSelected,
+      evidenceStored,
+      market: market.summary
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message.slice(0, 240) : "POSTGRES_RESEARCH_FAILED";
+    await input.query.query(
+      `UPDATE research_runs
+       SET status = 'failed', error_code = $2, error_message = $3,
+           completed_at = $4, heartbeat_at = $4, updated_at = $4,
+           version = version + 1
+       WHERE id = $1 AND status = 'running' AND ${fenceSql(5)}`,
+      [runId, message.split(":", 1)[0], message, new Date().toISOString(), ...fenceValues(input.fence)]
+    );
+    throw error;
+  }
+};

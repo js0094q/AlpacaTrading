@@ -1,6 +1,7 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 
 import { canonicalJsonHash } from "../lib/canonicalJson.js";
+import type { HedgeCapitalEvidence } from "./hedgeCapitalEvidenceService.js";
 import type { HedgeCandidate } from "./hedgeTypes.js";
 
 export interface HedgeExecutionOrderIntent {
@@ -59,6 +60,7 @@ export interface HedgeExecutionReviewInput {
   generatedAt: string;
   signingKey: string;
   candidate: HedgeCandidate;
+  capitalEvidence?: HedgeCapitalEvidence;
   reviewType?: "entry" | "exit";
   orderSide?: "buy_to_open" | "sell_to_close";
   reviewTtlSeconds?: number;
@@ -82,6 +84,15 @@ const numberDetail = (candidate: HedgeCandidate, key: string, fallback: number |
 
 const unsignedPayload = (review: HedgeExecutionReview) => {
   const {
+    payloadHash: _payloadHash,
+    signature: _signature,
+    ...payload
+  } = review;
+  return payload;
+};
+
+const identifierPayload = (review: HedgeExecutionReview) => {
+  const {
     reviewId: _reviewId,
     clientOrderId: _clientOrderId,
     payloadHash: _payloadHash,
@@ -89,6 +100,20 @@ const unsignedPayload = (review: HedgeExecutionReview) => {
     ...payload
   } = review;
   return payload;
+};
+
+const deterministicReviewIdentifiers = (
+  payload: ReturnType<typeof identifierPayload>
+) => {
+  const identityHash = canonicalJsonHash(payload);
+  const clientOrderId = `hedge-${payload.reviewType}-${identityHash.slice(0, 24)}`;
+  return {
+    clientOrderId,
+    reviewId: `hedge_review_${canonicalJsonHash({
+      payloadHash: identityHash,
+      clientOrderId
+    }).slice(0, 24)}`
+  };
 };
 
 const signPayload = (payloadHash: string, signingKey: string) =>
@@ -126,6 +151,12 @@ export const createHedgeExecutionReview = (
   }
   const createdAt = input.generatedAt;
   const reviewType = input.reviewType ?? "entry";
+  if (
+    reviewType === "entry" &&
+    (!input.capitalEvidence || !input.capitalEvidence.complete)
+  ) {
+    throw new Error("HEDGE_CAPITAL_EVIDENCE_INCOMPLETE");
+  }
   const orderSide = input.orderSide ?? (reviewType === "exit" ? "sell_to_close" : "buy_to_open");
   const ttlSeconds = Math.max(1, Math.floor(input.reviewTtlSeconds ?? 300));
   const expiresAt = new Date(Date.parse(createdAt) + ttlSeconds * 1000).toISOString();
@@ -170,7 +201,9 @@ export const createHedgeExecutionReview = (
       marketValueDeltaCoveragePct: details.marketValueDeltaCoveragePct ?? null,
       portfolioBeta: details.portfolioBeta ?? null,
       grossExposure: details.grossExposure ?? null,
-      netExposure: details.netExposure ?? null
+      netExposure: details.netExposure ?? null,
+      capitalEvidence: input.capitalEvidence ?? null,
+      capitalEvidenceFingerprint: input.capitalEvidence?.fingerprint ?? null
     },
     caps: {
       maxQuantity: quantity,
@@ -184,19 +217,18 @@ export const createHedgeExecutionReview = (
     requestId: input.requestId ?? `hedge_review_${canonicalJsonHash({ input: input.sourceRecommendationId, createdAt }).slice(0, 20)}`,
     correlationId: input.correlationId ?? null
   };
-  const payloadHash = canonicalJsonHash(reviewBase);
-  const clientOrderId = `hedge-${reviewType}-${payloadHash.slice(0, 24)}`;
-  const review = {
+  const identifiers = deterministicReviewIdentifiers(reviewBase);
+  const signedPayload = {
     ...reviewBase,
-    clientOrderId,
+    ...identifiers
+  };
+  const payloadHash = canonicalJsonHash(signedPayload);
+  return {
+    ...signedPayload,
     payloadHash,
     signature: signPayload(payloadHash, input.signingKey),
     signatureAlgorithm: "hmac-sha256" as const
-  } satisfies Omit<HedgeExecutionReview, "reviewId">;
-  return {
-    ...review,
-    reviewId: `hedge_review_${canonicalJsonHash({ payloadHash, clientOrderId }).slice(0, 24)}`
-  };
+  } satisfies HedgeExecutionReview;
 };
 
 export const verifyHedgeExecutionReview = (input: {
@@ -206,13 +238,23 @@ export const verifyHedgeExecutionReview = (input: {
   accountHash?: string;
   configurationFingerprint?: string;
   sourceSnapshotId?: string;
+  capitalEvidenceFingerprint?: string;
 }): HedgeExecutionReviewVerification => {
   const blockers: string[] = [];
   const calculatedPayloadHash = canonicalJsonHash(unsignedPayload(input.review));
+  const expectedIdentifiers = deterministicReviewIdentifiers(
+    identifierPayload(input.review)
+  );
   if (input.review.recordType !== "hedge_execution_review") blockers.push("HEDGE_REVIEW_SCHEMA_INVALID");
   if (!["entry", "exit"].includes(input.review.reviewType)) blockers.push("HEDGE_REVIEW_TYPE_INVALID");
   if (input.review.environment !== "paper" || input.review.paperOnly !== true) blockers.push("HEDGE_ENVIRONMENT_NOT_PAPER");
   if (input.review.liveTradingEnabled !== false) blockers.push("HEDGE_LIVE_TRADING_ENABLED");
+  if (input.review.reviewId !== expectedIdentifiers.reviewId) {
+    blockers.push("HEDGE_REVIEW_ID_MISMATCH");
+  }
+  if (input.review.clientOrderId !== expectedIdentifiers.clientOrderId) {
+    blockers.push("HEDGE_CLIENT_ORDER_ID_MISMATCH");
+  }
   if (calculatedPayloadHash !== input.review.payloadHash) blockers.push("HEDGE_PAYLOAD_CHANGED");
   if (!input.signingKey.trim() || !signaturesEqual(input.review.signature, signPayload(input.review.payloadHash, input.signingKey))) {
     blockers.push("HEDGE_REVIEW_SIGNATURE_INVALID");
@@ -222,6 +264,31 @@ export const verifyHedgeExecutionReview = (input: {
   if (input.accountHash !== undefined && input.accountHash !== input.review.accountHash) blockers.push("HEDGE_ACCOUNT_IDENTITY_MISMATCH");
   if (input.configurationFingerprint !== undefined && input.configurationFingerprint !== input.review.configurationFingerprint) blockers.push("HEDGE_CONFIGURATION_MISMATCH");
   if (input.sourceSnapshotId !== undefined && input.sourceSnapshotId !== input.review.sourceSnapshotId) blockers.push("HEDGE_SOURCE_SNAPSHOT_MISMATCH");
+  if (input.review.reviewType === "entry") {
+    const reviewedCapitalEvidence = input.review.portfolioEvidence.capitalEvidence;
+    const reviewedCapitalFingerprint =
+      input.review.portfolioEvidence.capitalEvidenceFingerprint;
+    const embeddedCapitalFingerprint =
+      reviewedCapitalEvidence && typeof reviewedCapitalEvidence === "object"
+        ? (reviewedCapitalEvidence as { fingerprint?: unknown }).fingerprint
+        : null;
+    if (
+      !reviewedCapitalEvidence ||
+      typeof reviewedCapitalEvidence !== "object" ||
+      (reviewedCapitalEvidence as { complete?: unknown }).complete !== true ||
+      typeof reviewedCapitalFingerprint !== "string" ||
+      !reviewedCapitalFingerprint ||
+      embeddedCapitalFingerprint !== reviewedCapitalFingerprint
+    ) {
+      blockers.push("HEDGE_CAPITAL_EVIDENCE_INCOMPLETE");
+    }
+    if (
+      input.capitalEvidenceFingerprint !== undefined &&
+      input.capitalEvidenceFingerprint !== reviewedCapitalFingerprint
+    ) {
+      blockers.push("HEDGE_CAPITAL_EVIDENCE_CHANGED", "FRESH_REVIEW_REQUIRED");
+    }
+  }
   const expectedSide = input.review.reviewType === "exit" ? "sell_to_close" : "buy_to_open";
   if (input.review.orderIntent.structure !== "long_put" || input.review.orderIntent.side !== expectedSide) blockers.push("MULTI_LEG_EXECUTION_UNSUPPORTED");
   if (input.review.orderIntent.quantity < 1 || input.review.orderIntent.quantity > input.review.caps.maxQuantity) blockers.push("HEDGE_QUANTITY_CAP_EXCEEDED");

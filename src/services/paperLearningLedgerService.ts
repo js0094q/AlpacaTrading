@@ -1,5 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { getDb, queryAll } from "../lib/db.js";
+import { getDb, queryAll, queryOne } from "../lib/db.js";
+import type {
+  DecisionId,
+  LinkageStatus,
+  OutcomeCompletenessStatus,
+  PositionLifecycleId
+} from "../types.js";
 
 export type PaperStrategyFamily =
   | "zero_dte_spy"
@@ -71,6 +77,14 @@ export interface PaperLearningRecord {
   sourceResearchRunId: string | null;
   sourceCandidateId: string | null;
   sourcePlanTimestamp: string | null;
+  decisionId: DecisionId | null;
+  entryDecisionId: DecisionId | null;
+  exitDecisionId: DecisionId | null;
+  positionLifecycleId: PositionLifecycleId | null;
+  outcomeId: string | null;
+  effectiveOutcomeRevisionId: string | null;
+  outcomeCompletenessStatus: OutcomeCompletenessStatus | null;
+  decisionLinkageStatus: LinkageStatus;
 }
 
 interface PaperLearningRow {
@@ -99,6 +113,14 @@ interface PaperLearningRow {
   source_research_run_id: string | null;
   source_candidate_id: string | null;
   source_plan_timestamp: string | null;
+  decision_id: DecisionId | null;
+  entry_decision_id: DecisionId | null;
+  exit_decision_id: DecisionId | null;
+  position_lifecycle_id: PositionLifecycleId | null;
+  outcome_id: string | null;
+  effective_outcome_revision_id: string | null;
+  outcome_completeness_status: OutcomeCompletenessStatus | null;
+  decision_linkage_status: LinkageStatus;
 }
 
 interface LatestOptionSnapshotRow {
@@ -133,6 +155,14 @@ interface LearningInsertInput {
   sourceResearchRunId?: string | null;
   sourceCandidateId?: string | null;
   sourcePlanTimestamp?: string | null;
+  decisionId?: DecisionId | null;
+  entryDecisionId?: DecisionId | null;
+  exitDecisionId?: DecisionId | null;
+  positionLifecycleId?: PositionLifecycleId | null;
+  outcomeId?: string | null;
+  effectiveOutcomeRevisionId?: string | null;
+  outcomeCompletenessStatus?: OutcomeCompletenessStatus | null;
+  decisionLinkageStatus?: LinkageStatus;
 }
 
 export interface PaperLearningEvaluationResult {
@@ -185,7 +215,15 @@ const mapRow = (row: PaperLearningRow): PaperLearningRecord => ({
   promotionBlockReason: row.promotion_block_reason,
   sourceResearchRunId: row.source_research_run_id,
   sourceCandidateId: row.source_candidate_id,
-  sourcePlanTimestamp: row.source_plan_timestamp
+  sourcePlanTimestamp: row.source_plan_timestamp,
+  decisionId: row.decision_id,
+  entryDecisionId: row.entry_decision_id,
+  exitDecisionId: row.exit_decision_id,
+  positionLifecycleId: row.position_lifecycle_id,
+  outcomeId: row.outcome_id,
+  effectiveOutcomeRevisionId: row.effective_outcome_revision_id,
+  outcomeCompletenessStatus: row.outcome_completeness_status,
+  decisionLinkageStatus: row.decision_linkage_status
 });
 
 const jsonOrNull = (value: unknown | null | undefined) =>
@@ -240,6 +278,32 @@ const latestOptionSnapshot = (optionSymbol: string) => {
 export const insertPaperLearningRecord = (input: LearningInsertInput): PaperLearningRecord => {
   const createdAt = input.createdAt ?? new Date().toISOString();
   const id = input.id ?? `plr_${randomUUID()}`;
+  const candidateSnapshots = input.sourceCandidateId
+    ? queryAll<{ decision_id: DecisionId; decision_role: string }>(
+        `
+        SELECT decision_id, decision_role
+        FROM decision_snapshots
+        WHERE candidate_id = ?
+        ORDER BY created_at, decision_id
+        `,
+        [input.sourceCandidateId]
+      )
+    : [];
+  const entrySnapshots = candidateSnapshots.filter(
+    (snapshot) => snapshot.decision_role === "entry"
+  );
+  const exactCandidateDecision =
+    entrySnapshots.length === 1
+      ? entrySnapshots[0]
+      : candidateSnapshots.length === 1
+        ? candidateSnapshots[0]
+        : null;
+  const decisionId = input.decisionId ?? exactCandidateDecision?.decision_id ?? null;
+  const entryDecisionId =
+    input.entryDecisionId ??
+    (entrySnapshots.length === 1 ? entrySnapshots[0].decision_id : null);
+  const decisionLinkageStatus =
+    input.decisionLinkageStatus ?? (decisionId ? "EXACT" : "LEGACY_UNLINKED");
   getDb()
     .prepare(
       `
@@ -266,8 +330,16 @@ export const insertPaperLearningRecord = (input: LearningInsertInput): PaperLear
         promotion_block_reason,
         source_research_run_id,
         source_candidate_id,
-        source_plan_timestamp
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        source_plan_timestamp,
+        decision_id,
+        entry_decision_id,
+        exit_decision_id,
+        position_lifecycle_id,
+        outcome_id,
+        effective_outcome_revision_id,
+        outcome_completeness_status,
+        decision_linkage_status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `
     )
     .run(
@@ -293,7 +365,15 @@ export const insertPaperLearningRecord = (input: LearningInsertInput): PaperLear
       input.promotionBlockReason ?? "NOT_EVALUATED",
       input.sourceResearchRunId ?? null,
       input.sourceCandidateId ?? null,
-      input.sourcePlanTimestamp ?? null
+      input.sourcePlanTimestamp ?? null,
+      decisionId,
+      entryDecisionId,
+      input.exitDecisionId ?? null,
+      input.positionLifecycleId ?? null,
+      input.outcomeId ?? null,
+      input.effectiveOutcomeRevisionId ?? null,
+      input.outcomeCompletenessStatus ?? null,
+      decisionLinkageStatus
     );
 
   return {
@@ -321,8 +401,60 @@ export const insertPaperLearningRecord = (input: LearningInsertInput): PaperLear
     promotionBlockReason: input.promotionBlockReason ?? "NOT_EVALUATED",
     sourceResearchRunId: input.sourceResearchRunId ?? null,
     sourceCandidateId: input.sourceCandidateId ?? null,
-    sourcePlanTimestamp: input.sourcePlanTimestamp ?? null
+    sourcePlanTimestamp: input.sourcePlanTimestamp ?? null,
+    decisionId,
+    entryDecisionId,
+    exitDecisionId: input.exitDecisionId ?? null,
+    positionLifecycleId: input.positionLifecycleId ?? null,
+    outcomeId: input.outcomeId ?? null,
+    effectiveOutcomeRevisionId: input.effectiveOutcomeRevisionId ?? null,
+    outcomeCompletenessStatus: input.outcomeCompletenessStatus ?? null,
+    decisionLinkageStatus
   };
+};
+
+export const linkPaperLearningRecordsToOutcome = (input: {
+  entryDecisionId: DecisionId;
+  exitDecisionId: DecisionId | null;
+  positionLifecycleId: PositionLifecycleId;
+  outcomeId: string;
+  completenessStatus: OutcomeCompletenessStatus;
+}) => {
+  const result = getDb().prepare(`
+    UPDATE paper_learning_records
+    SET updated_at = ?,
+        decision_id = COALESCE(decision_id, ?),
+        entry_decision_id = ?,
+        exit_decision_id = ?,
+        position_lifecycle_id = ?,
+        outcome_id = ?,
+        outcome_completeness_status = ?,
+        decision_linkage_status = 'EXACT'
+    WHERE entry_decision_id = ? OR decision_id = ?
+  `).run(
+    new Date().toISOString(),
+    input.entryDecisionId,
+    input.entryDecisionId,
+    input.exitDecisionId,
+    input.positionLifecycleId,
+    input.outcomeId,
+    input.completenessStatus,
+    input.entryDecisionId,
+    input.entryDecisionId
+  );
+  return Number(result.changes);
+};
+
+export const linkPaperLearningRecordsToOutcomeRevision = (input: {
+  outcomeId: string;
+  revisionId: string;
+}) => {
+  const result = getDb().prepare(`
+    UPDATE paper_learning_records
+    SET updated_at = ?, effective_outcome_revision_id = ?
+    WHERE outcome_id = ?
+  `).run(new Date().toISOString(), input.revisionId, input.outcomeId);
+  return Number(result.changes);
 };
 
 export const listPaperLearningRecords = (input: {

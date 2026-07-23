@@ -32,6 +32,7 @@ import {
   reconcilePaperAccountBeforeExecution,
   type PaperAccountReconciliationReport
 } from "./paperAccountReconciliationService.js";
+import { executionStateProjectionService } from "./executionStateProjectionService.js";
 import { optionsQuoteConfig, roundOptionLimitPrice } from "./optionQuoteNormalizer.js";
 import { optionDaysToExpiration } from "./optionSymbolService.js";
 import type { RiskProfile } from "../types.js";
@@ -52,6 +53,7 @@ export type PaperExecuteBlockerCode =
   | "LIVE_TRADING_ENABLED"
   | "LIVE_TRADING_MUST_BE_DISABLED"
   | "PAPER_ORDER_EXECUTION_DISABLED"
+  | "POSTGRES_EXECUTION_REVIEW_REQUIRED"
   | "PAPER_OPTIONS_EXECUTION_DISABLED"
   | "OPTIONS_EXECUTION_REQUIRES_EXPLICIT_OPTIONS_ENABLED"
   | "OPTIONS_EXECUTION_REQUIRES_EXPLICIT_RISK_PROFILE"
@@ -201,6 +203,7 @@ const BLOCKER_ORDER: PaperExecuteBlockerCode[] = [
   "LIVE_TRADING_ENABLED",
   "LIVE_TRADING_MUST_BE_DISABLED",
   "PAPER_ORDER_EXECUTION_DISABLED",
+  "POSTGRES_EXECUTION_REVIEW_REQUIRED",
   "PAPER_OPTIONS_EXECUTION_DISABLED",
   "OPTIONS_EXECUTION_REQUIRES_EXPLICIT_OPTIONS_ENABLED",
   "OPTIONS_EXECUTION_REQUIRES_EXPLICIT_RISK_PROFILE",
@@ -1394,6 +1397,18 @@ export const buildPaperExecuteConfirmPaperReport = async (
       generatedAt,
       environment: state.alpacaEnv,
       assetClass,
+      errors
+    });
+  }
+
+  if (executionStateProjectionService.isAuthorityActive()) {
+    pushConfirmError(errors, "POSTGRES_EXECUTION_REVIEW_REQUIRED");
+    return emptyConfirmReport({
+      generatedAt,
+      environment: state.alpacaEnv,
+      assetClass,
+      status: "blocked",
+      reason: "POSTGRES_EXECUTION_REVIEW_REQUIRED",
       errors
     });
   }

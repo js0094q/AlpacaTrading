@@ -1,5 +1,10 @@
 # Paper-Only VPS Research Deployment
 
+> Retired runtime procedure as of 2026-07-20. PostgreSQL is the sole production
+> authority, SQLite-backed research workflows are disabled, and all research or
+> trading timers remain stopped pending the evidence-utilization and runtime
+> audit. Use `docs/runbooks/neon-postgres-operations.md` for current operations.
+
 ## Purpose
 
 This guide documents running the paper-only Alpaca research loop on a VPS for scheduled execution.
@@ -26,11 +31,15 @@ At minimum:
 
 ```bash
 ALPACA_ENV=paper
+TRADING_MODE=paper
+ALPACA_LIVE_TRADE=false
 ALPACA_PAPER_API_KEY=replace_me
 ALPACA_PAPER_SECRET_KEY=replace_me
 ALPACA_PAPER_BASE_URL=https://paper-api.alpaca.markets
 ALPACA_DATA_BASE_URL=https://data.alpaca.markets
 LIVE_TRADING_ENABLED=false
+PAPER_REVIEW_SIGNING_KEY=replace_with_random_secret
+HEDGE_REVIEW_SIGNING_KEY=replace_with_independent_random_secret
 PAPER_ORDER_EXECUTION_ENABLED=false
 PAPER_OPTIONS_EXECUTION_ENABLED=false
 PAPER_EQUITY_NOTIONAL_PER_ORDER=1000
@@ -62,6 +71,7 @@ AUTOMATED_PAPER_EXECUTION_ENABLED=false
 PAPER_0DTE_DISCOVERY_ENABLED=true
 PAPER_OPTION_EXIT_REVIEW_ENABLED=true
 PAPER_EQUITY_SCALE_IN_ENABLED=false
+PAPER_SUBMIT_MAX_PRICE_DRIFT_PCT=10
 ALPACA_REQUEST_TIMEOUT_MS=15000
 ALPACA_MAX_RETRIES=2
 VPS_RESEARCH_REQUEST_TIMEOUT_MS=10000
@@ -70,6 +80,26 @@ ALPACA_USER_AGENT=alpaca-research-cli
 ```
 
 Keep a real `.env` file local to the VPS runtime user and exclude it from version control.
+
+The two review signers belong only in the VPS runtime secret file. Provision
+independent random values through the server's approved secret-management or
+interactive editing process; never print, log, copy into the repository, or send
+either value to Vercel. Preserve ownership `alpaca:alpaca` and mode `0600`.
+Presence-only checks are safe because they emit no value. The final two checks
+also reject the checked-in illustrative placeholders:
+
+```bash
+test "$(stat -c '%a:%U:%G' /opt/alpaca-investing/secrets/alpaca.env)" = "600:alpaca:alpaca"
+grep -Eq '^PAPER_REVIEW_SIGNING_KEY=.+$' /opt/alpaca-investing/secrets/alpaca.env
+grep -Eq '^HEDGE_REVIEW_SIGNING_KEY=.+$' /opt/alpaca-investing/secrets/alpaca.env
+! grep -Eq '^PAPER_REVIEW_SIGNING_KEY=(replace_me|replace_with_random_secret)$' /opt/alpaca-investing/secrets/alpaca.env
+! grep -Eq '^HEDGE_REVIEW_SIGNING_KEY=(replace_me|replace_with_independent_random_secret)$' /opt/alpaca-investing/secrets/alpaca.env
+```
+
+`PAPER_REVIEW_SIGNING_KEY` authenticates general review artifacts and 0DTE
+submit attestations. `HEDGE_REVIEW_SIGNING_KEY` independently authenticates
+hedge reviews. Legacy unsigned artifacts and reviews are intentionally
+non-executable and must be regenerated after signer provisioning.
 
 The CLI loads `.env` first, then `.env.txt` as fallback when keys are missing. If both files exist, `.env` values take precedence over `.env.txt`.
 
@@ -128,7 +158,7 @@ Current allowlist:
 - POST `/api/v1/actions/execute`
 - GET `/api/v1/actions/history`
 
-The `/api/v1/actions/*` routes are fixed command mappings. The dashboard never sends arbitrary shell commands to the VPS. `actions.execute` requires `confirmPaper: true`, loads the latest reviewed payload artifact, verifies it is fresh, verifies the payload signature, and refuses to run when the artifact is stale, empty, missing, or changed.
+The `/api/v1/actions/*` routes are fixed command mappings. The dashboard never sends arbitrary shell commands to the VPS. `actions.execute` requires `confirmPaper: true` and dispatches only the exact latest HMAC-signed reviewed payload. New-risk sections must have a successful signed review with no blockers, then pass fresh account, configuration, portfolio, source, market, 0DTE activity, cap, and atomic reservation checks. A stale, unsigned, empty, missing, consumed, or changed review fails closed and requires a fresh review. A fresh signed mixed artifact with a blocked entry section may still be dispatched when it contains a valid exit section; the section-aware executor keeps the signed entry blockers binding and applies the exit's independent gates.
 
 On the VPS, those historical views use local SQLite at `RESEARCH_DB_PATH` or `./data/research.db`. The VPS remains the owner of the scheduler, CLI runtime, research history, execution ledger, and local persistence.
 
@@ -176,10 +206,12 @@ Vercel dashboard deployments are read-only by default. They do not create `apps/
 
 On the VPS, install dependencies, keep secrets in `/opt/alpaca-investing/secrets/alpaca.env`, and start the control API service after cloning this repo:
 
+The systemd unit reads that protected file directly. Do not copy `.env.example`
+over an existing runtime file or copy the protected secret file into the Git
+checkout.
+
 ```bash
 cd /home/alpaca/Alpaca-Trading
-cp .env.example .env
-cp /opt/alpaca-investing/secrets/alpaca.env .env
 npm ci
 cp server/systemd/dashboard-control.service /opt/alpaca-investing/systemd/alpaca-dashboard-control.service
 cp /opt/alpaca-investing/systemd/alpaca-dashboard-control.service /etc/systemd/system/alpaca-dashboard-control.service
@@ -257,17 +289,18 @@ npm run paper:exit:review -- --format=json
 npm run paper:options:discover -- --underlying=SPY --dte=0 --format=json
 npm run paper:ops:review -- --format=json
 npm run paper:execute -- --dryRun --riskProfile=aggressive --optionsEnabled=true --format=json
-npm run paper:execute -- --confirmPaper --assetClass=all --riskProfile=aggressive --optionsEnabled=true --format=json
 npm run dashboard:build
 ```
 
+This validation set is read-only with respect to broker orders. Confirmed paper
+execution is deliberately excluded; release validation must not invoke any
+`--confirmPaper` executor or an execution timer.
+
 ## Required runtime validation command set
 
-From a shell with real credentials in `.env`:
-
-```bash
-cp .env.example .env
-```
+Run these commands only from a shell that already has the real protected runtime
+environment loaded. Do not create, replace, or seed the runtime environment from
+`.env.example`; its values are illustrative placeholders.
 
 Then run:
 
@@ -290,8 +323,11 @@ npm run paper:exit:review -- --format=json
 npm run paper:options:discover -- --underlying=SPY --dte=0 --format=json
 npm run paper:ops:review -- --format=json
 npm run paper:execute -- --dryRun --riskProfile=aggressive --optionsEnabled=true --format=json
-npm run paper:execute -- --confirmPaper --assetClass=all --riskProfile=aggressive --optionsEnabled=true --format=json
 ```
+
+This runtime validation command set is also read-only. A signed review can be
+created and inspected without dispatching it; do not add a confirmed executor to
+deployment validation.
 
 ## Read-only paper intelligence checks
 
@@ -363,19 +399,101 @@ npm run paper:execute -- --dryRun --format=json
 ### Paper execute confirm-paper command
 
 ```bash
-npm run paper:execute -- --confirmPaper
-npm run paper:execute -- --confirmPaper --assetClass=equity
-npm run paper:execute -- --confirmPaper --assetClass=option --format=json
+npm run paper:execute -- --confirmPaper --format=json
 ```
 
-`paper:execute --confirmPaper` submits to Alpaca paper endpoints only after hard gates pass:
+`paper:execute --confirmPaper` is a compatibility alias for exact latest signed
+reviewed-payload execution. It does not accept asset-class, planning, candidate,
+or sizing authority at confirmation time and never rebuilds a plan. It submits
+to Alpaca paper endpoints only after hard gates pass:
 
 - `ALPACA_ENV=paper`
+- `TRADING_MODE=paper`
+- `ALPACA_LIVE_TRADE=false`
 - `LIVE_TRADING_ENABLED=false`
 - `PAPER_ORDER_EXECUTION_ENABLED=true`
 - `PAPER_OPTIONS_EXECUTION_ENABLED=true` for option payloads
+- an explicit `--confirmPaper`
+- the required signer and a valid, fresh, successful, unblocked artifact
+- unchanged source/account/configuration/portfolio/market/activity evidence
+- unchanged shared-cap headroom, active reservations, and all-buy-side ledger-
+  lifecycle fingerprint inside an atomic reservation transaction
+
+Fresh option evidence may block on quote identity or configured review-to-submit
+price drift, but confirmation never reprices or resizes the reviewed order. Broker
+statuses such as `held` and `pending_cancel` consume exposure; an unrecognized
+non-terminal status is retained as active evidence and blocks new risk rather
+than disappearing.
+
+The ledger-lifecycle fingerprint includes terminal transitions, so a concurrent
+reservation cannot evade the submit window by becoming `filled` between fresh
+evidence collection and the atomic reservation check.
 
 ## Scheduled Paper Ops Automation
+
+### Explicit database migration and runtime deployment
+
+Before changing runtime state, verify the merged target SHA, paper/live flags,
+active services/timers/locks, database path, disk space, broker-order baseline,
+and current SQLite integrity without displaying secret files.
+
+Stop affected SQLite writers and create a timestamped backup. Apply the migration
+twice to a controlled copy, then verify it:
+
+```bash
+npm run db:migrate -- --database /path/to/copied-research.db
+npm run db:migrate -- --database /path/to/copied-research.db
+npm run db:verify -- --database /path/to/copied-research.db
+```
+
+After the copy passes, migrate production exactly once and verify it before
+restoring writers. Ordinary CLI startup must not be used as a migration path;
+an existing pending database returns `DATABASE_MIGRATION_REQUIRED`. Confirm all
+required migrations, required tables/columns/indexes, retained legacy row
+counts, no new exact-linkage orphans, `PRAGMA integrity_check`,
+`PRAGMA foreign_key_check`, `PRAGMA journal_mode`, `PRAGMA busy_timeout`,
+`PRAGMA foreign_keys`, and `PRAGMA synchronous`. Deploy only the
+merged SHA with fast-forward-only Git operations, install/build, reinstall the
+checked-in units, restore the prior service/timer state, and enable:
+
+The steady-state concurrency repair adds the named `runtime_write_leases`
+table through the migration ledger. It leaves `journal_mode=delete` unchanged.
+Only research option persistence and the 0DTE engine persistence batch use the
+`research-options-and-zero-dte-engine` lease; option normalization and network
+work remain outside write transactions. Finite `SQLITE_BUSY` retry is limited
+to explicitly idempotent lifecycle, lease-maintenance, and rollback-safe batch
+writes. Contention logs include operation, transaction duration, retry count,
+process identity, and run/correlation ID; they do not claim a historical
+lock-holder PID.
+
+```bash
+sudo systemctl enable --now alpaca-market-observatory.timer
+systemctl status alpaca-market-observatory.timer --no-pager
+systemctl list-timers 'alpaca-market-observatory*' --no-pager
+```
+
+The acceptance run must account for all 51 symbols. Use `COMPLETE` only when all
+51 observations persist; use `PARTIAL` when every bounded failure has a structured
+reason and all successful symbols persist. Outside regular hours, verify
+`SKIPPED_MARKET_CLOSED`, service/timer/schema/migration health, universe size,
+paper-only Alpaca access, and a safe bounded probe. Record regular-session
+collection as pending; never fabricate market-open evidence or force a paper trade.
+
+After restart, run `npm run system:recover -- --format=json` before research.
+Confirm the known stale research row is terminal and audited, then invoke one
+guarded dashboard research request. A duplicate request while the first is
+active must return `already_running` without a second worker. Require the
+research run to reach a successful terminal state with targets and candidates
+persisted while the normal staggered timers remain enabled. Only after that
+success may a separately authorized paper review be run; do not invoke
+`--confirmPaper`, paper execution, exit execution, or any order-producing
+command as a repair probe.
+
+Rollback the application to the immediately prior SHA, rebuild, and restart only
+the affected services while restoring the recorded timer state. The migration
+is additive: nullable research lifecycle columns and the recovery count coexist
+with the prior application. Do not delete migration rows or recovery evidence,
+and do not reverse the database schema during application rollback.
 
 Use systemd timers for VPS automation. Before enabling timers, set the VPS timezone to New York market time or adjust the `OnCalendar` entries:
 

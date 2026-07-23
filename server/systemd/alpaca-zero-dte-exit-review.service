@@ -1,0 +1,20 @@
+[Unit]
+Description=Alpaca Paper 0DTE Level 2 Exit Review
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=alpaca
+Group=alpaca
+WorkingDirectory=/home/alpaca/Alpaca-Trading
+EnvironmentFile=/opt/alpaca-investing/secrets/alpaca.env
+Environment=PATH=/usr/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=NODE_ENV=production
+Environment=AUTOMATED_PAPER_EXECUTION_ENABLED=false
+ExecStart=/usr/bin/npm run paper:monitor -- --task=zero-dte-exit-review
+ExecStopPost=-/usr/bin/rm -f /tmp/alpaca-zero-dte-exit-review.lock
+TimeoutStartSec=300
+SyslogIdentifier=alpaca-zero-dte-exit-review
+StandardOutput=journal
+StandardError=journal

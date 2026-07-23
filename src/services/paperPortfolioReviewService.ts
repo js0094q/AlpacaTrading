@@ -10,6 +10,16 @@ import {
 } from "./leapsExitReviewService.js";
 import { parseOptionSymbol } from "./optionSymbolService.js";
 import { getTradingSafetyState } from "./tradingSafetyService.js";
+import { capturePaperPositionObservation } from "./paperPositionLifecycleService.js";
+import {
+  listAlpacaOpenOrders,
+  type AlpacaOpenOrderSnapshot
+} from "./alpacaOrderReadService.js";
+import {
+  listActivePaperNewRiskReservations
+} from "./paperExecutionLedgerService.js";
+import { loadPaperPlanConfig } from "./paperPlanService.js";
+import { executionStateProjectionService } from "./executionStateProjectionService.js";
 
 export type PaperPortfolioRecommendationType =
   | "BUY_NEW_EQUITY"
@@ -39,6 +49,7 @@ export interface PaperPortfolioReviewPayload {
   reasonCodes?: string[];
   leapsExitEvaluation?: LeapsExitEvaluation;
   sourceReviewId: string;
+  sourceCandidateId?: string;
 }
 
 export interface PaperPortfolioRecommendation {
@@ -82,6 +93,7 @@ export interface PaperPortfolioReviewReport {
 }
 
 interface CandidateRow {
+  id: string;
   symbol: string;
   rank: number;
   confidence: number | null;
@@ -91,10 +103,25 @@ interface CandidateRow {
   research_run_id: string;
 }
 
+interface ScaleInReservation {
+  assetClass: string;
+  symbol: string;
+  side: string | null;
+  status: string;
+  qty?: string | null;
+  quantity?: number | null;
+  notional?: string | number | null;
+  estimatedPremium?: number | null;
+  limitPrice?: string | number | null;
+}
+
 interface PaperPortfolioReviewDeps {
   listPositions?: typeof listAlpacaPositions;
   getAccount?: typeof getAlpacaAccountSnapshot;
   getCandidates?: () => Promise<CandidateRow[]> | CandidateRow[];
+  listOpenOrders?: typeof listAlpacaOpenOrders;
+  listReservations?: () => ScaleInReservation[];
+  resolveReservations?: typeof executionStateProjectionService.resolveReservations;
   evaluateLeapsExit?: typeof evaluateLeapsExit;
   now?: () => string;
 }
@@ -183,6 +210,7 @@ const latestCandidates = () =>
   queryAll<CandidateRow>(
     `
     SELECT
+      c.id,
       c.symbol,
       c.rank,
       c.confidence,
@@ -199,17 +227,21 @@ const latestCandidates = () =>
       LIMIT 1
     ) latest
       ON latest.id = c.research_run_id
+    WHERE c.decision = 'selected'
     ORDER BY c.rank ASC
     LIMIT 50
     `
   );
 
-const optionSymbolMetadata = (symbol: string): { expirationDate: string; side: "call" | "put" } | null => {
+const optionSymbolMetadata = (
+  symbol: string
+): { underlying: string; expirationDate: string; side: "call" | "put" } | null => {
   const parsed = parseOptionSymbol(symbol);
   if (!parsed.ok) {
     return null;
   }
   return {
+    underlying: parsed.underlying,
     expirationDate: parsed.expirationDate,
     side: parsed.optionType
   };
@@ -263,6 +295,7 @@ const equityPayload = (input: {
   notional?: number;
   reason: string;
   reviewId: string;
+  sourceCandidateId?: string;
 }): PaperPortfolioReviewPayload => ({
   orderAction: input.action,
   assetClass: "equity",
@@ -279,7 +312,10 @@ const equityPayload = (input: {
     symbol: input.symbol
   }),
   reason: input.reason,
-  sourceReviewId: input.reviewId
+  sourceReviewId: input.reviewId,
+  ...(input.sourceCandidateId
+    ? { sourceCandidateId: input.sourceCandidateId }
+    : {})
 });
 
 const optionExitPayload = (input: {
@@ -330,6 +366,257 @@ const firstLeapsSkipReason = (evaluation: LeapsExitEvaluation): string =>
   ) ??
   (evaluation.hardExit ? "LEAPS_EXIT_NOT_EXECUTABLE" : "LEAPS_REVIEW_ONLY");
 
+type ScaleInBlocker =
+  | "SCALE_IN_POSITION_EVIDENCE_INCOMPLETE"
+  | "SCALE_IN_CAPITAL_EVIDENCE_INCOMPLETE"
+  | "SCALE_IN_SOURCE_IDENTITY_MISSING"
+  | "SCALE_IN_DUPLICATE_ORDER_OR_RESERVATION"
+  | "SCALE_IN_ORDER_CAP_EXCEEDED"
+  | "SCALE_IN_TOTAL_PLAN_CAP_EXCEEDED"
+  | "SCALE_IN_BUYING_POWER_EXCEEDED"
+  | "SCALE_IN_CASH_RESERVE_EXCEEDED"
+  | "SCALE_IN_PORTFOLIO_DEPLOYMENT_CAP_EXCEEDED"
+  | "SCALE_IN_POSITION_CAP_EXCEEDED";
+
+interface ScaleInCapitalEvidence {
+  complete: boolean;
+  accountIdentityAvailable: boolean;
+  accountStatus: string | null;
+  accountTradingBlocked: boolean | null;
+  accountBlocked: boolean | null;
+  equity: number | null;
+  cash: number | null;
+  buyingPower: number | null;
+  currentEquityDeployment: number | null;
+  openRisk: number | null;
+  openEquityRisk: number | null;
+  reservedRisk: number | null;
+  reservedEquityRisk: number | null;
+  duplicateSymbols: Set<string>;
+}
+
+const orderIsOption = (order: AlpacaOpenOrderSnapshot) =>
+  String(order.assetClass ?? "").toLowerCase().includes("option") ||
+  optionSymbolMetadata(order.symbol) !== null;
+
+const openOrderRisk = (order: AlpacaOpenOrderSnapshot): number | null => {
+  const notional = numeric(order.notional);
+  if (notional !== null) return Math.abs(notional);
+  const quantity = numeric(order.qty);
+  const price = numeric(order.limitPrice) ?? numeric(order.filledAvgPrice);
+  if (quantity === null || price === null) return null;
+  return Math.abs(quantity * price * (orderIsOption(order) ? 100 : 1));
+};
+
+const reservationRisk = (reservation: ScaleInReservation): number | null => {
+  if (reservation.assetClass === "option") {
+    const estimatedPremium = reservation.estimatedPremium;
+    if (
+      estimatedPremium !== null &&
+      estimatedPremium !== undefined &&
+      Number.isFinite(estimatedPremium)
+    ) {
+      return Math.abs(estimatedPremium);
+    }
+    const quantity = numeric(reservation.qty ?? reservation.quantity ?? undefined);
+    const price = numeric(reservation.limitPrice ?? undefined);
+    return quantity === null || price === null
+      ? null
+      : Math.abs(quantity * price * 100);
+  }
+  const notional = numeric(reservation.notional ?? undefined);
+  if (notional !== null) return Math.abs(notional);
+  const quantity = numeric(reservation.qty ?? reservation.quantity ?? undefined);
+  const price = numeric(reservation.limitPrice ?? undefined);
+  return quantity === null || price === null
+    ? null
+    : Math.abs(quantity * price);
+};
+
+const buildScaleInCapitalEvidence = (input: {
+  account: Awaited<ReturnType<typeof getAlpacaAccountSnapshot>>;
+  positions: AlpacaPositionSnapshot[];
+  openOrders: AlpacaOpenOrderSnapshot[] | null;
+  reservations: ScaleInReservation[] | null;
+}): ScaleInCapitalEvidence => {
+  const equity = numeric(input.account.equity);
+  const cash = numeric(input.account.cash);
+  const buyingPower = numeric(input.account.buyingPower);
+  const accountTradingBlocked =
+    typeof input.account.tradingBlocked === "boolean"
+      ? input.account.tradingBlocked
+      : null;
+  const accountBlocked =
+    typeof input.account.accountBlocked === "boolean"
+      ? input.account.accountBlocked
+      : null;
+  const equityPositions = input.positions.filter((position) => !isOptionPosition(position));
+  const positionValues = equityPositions.map((position) => numeric(position.marketValue));
+  const currentEquityDeployment = positionValues.some((value) => value === null)
+    ? null
+    : positionValues.reduce<number>((sum, value) => sum + Math.abs(value!), 0);
+  const duplicateSymbols = new Set<string>();
+
+  let openRisk: number | null = input.openOrders === null ? null : 0;
+  let openEquityRisk: number | null = input.openOrders === null ? null : 0;
+  for (const order of input.openOrders ?? []) {
+    const side = String(order.side ?? "").toLowerCase();
+    if (
+      !order.id ||
+      !order.symbol ||
+      !order.status ||
+      (side !== "buy" && side !== "sell")
+    ) {
+      openRisk = null;
+      openEquityRisk = null;
+      continue;
+    }
+    if (side !== "buy") continue;
+    duplicateSymbols.add(order.symbol.toUpperCase());
+    const risk = openOrderRisk(order);
+    if (risk === null) {
+      openRisk = null;
+      if (!orderIsOption(order)) openEquityRisk = null;
+      continue;
+    }
+    if (openRisk !== null) openRisk += risk;
+    if (!orderIsOption(order) && openEquityRisk !== null) openEquityRisk += risk;
+  }
+
+  let reservedRisk: number | null = input.reservations === null ? null : 0;
+  let reservedEquityRisk: number | null = input.reservations === null ? null : 0;
+  for (const reservation of input.reservations ?? []) {
+    const side = String(reservation.side ?? "").toLowerCase();
+    if (!reservation.symbol || !reservation.status || (side !== "buy" && side !== "sell")) {
+      reservedRisk = null;
+      reservedEquityRisk = null;
+      continue;
+    }
+    if (side !== "buy") continue;
+    duplicateSymbols.add(reservation.symbol.toUpperCase());
+    const risk = reservationRisk(reservation);
+    if (risk === null) {
+      reservedRisk = null;
+      if (reservation.assetClass !== "option") reservedEquityRisk = null;
+      continue;
+    }
+    if (reservedRisk !== null) reservedRisk += risk;
+    if (reservation.assetClass !== "option" && reservedEquityRisk !== null) {
+      reservedEquityRisk += risk;
+    }
+  }
+
+  const accountIdentityAvailable = Boolean(input.account.id?.trim());
+  const accountStatus = input.account.status?.trim().toUpperCase() ?? null;
+  const complete =
+    accountIdentityAvailable &&
+    accountStatus === "ACTIVE" &&
+    accountTradingBlocked === false &&
+    accountBlocked === false &&
+    equity !== null &&
+    equity > 0 &&
+    cash !== null &&
+    cash >= 0 &&
+    buyingPower !== null &&
+    buyingPower >= 0 &&
+    currentEquityDeployment !== null &&
+    openRisk !== null &&
+    openEquityRisk !== null &&
+    reservedRisk !== null &&
+    reservedEquityRisk !== null;
+
+  return {
+    complete,
+    accountIdentityAvailable,
+    accountStatus,
+    accountTradingBlocked,
+    accountBlocked,
+    equity,
+    cash,
+    buyingPower,
+    currentEquityDeployment,
+    openRisk,
+    openEquityRisk,
+    reservedRisk,
+    reservedEquityRisk,
+    duplicateSymbols
+  };
+};
+
+const scaleInBlocker = (input: {
+  symbol: string;
+  quantity: number | null;
+  marketValue: number | null;
+  sourceCandidateId: string | null;
+  requestedNotional: number;
+  capital: ScaleInCapitalEvidence;
+  plan: ReturnType<typeof loadPaperPlanConfig>;
+}): ScaleInBlocker | null => {
+  if (
+    input.quantity === null ||
+    !Number.isFinite(input.quantity) ||
+    input.quantity <= 0 ||
+    input.marketValue === null ||
+    !Number.isFinite(input.marketValue) ||
+    input.marketValue <= 0
+  ) {
+    return "SCALE_IN_POSITION_EVIDENCE_INCOMPLETE";
+  }
+  if (!input.capital.complete) {
+    return "SCALE_IN_CAPITAL_EVIDENCE_INCOMPLETE";
+  }
+  if (!input.sourceCandidateId) {
+    return "SCALE_IN_SOURCE_IDENTITY_MISSING";
+  }
+  if (!Number.isFinite(input.requestedNotional) || input.requestedNotional <= 0) {
+    return "SCALE_IN_ORDER_CAP_EXCEEDED";
+  }
+  if (input.capital.duplicateSymbols.has(input.symbol)) {
+    return "SCALE_IN_DUPLICATE_ORDER_OR_RESERVATION";
+  }
+
+  const equity = input.capital.equity!;
+  const activeRisk = input.capital.openRisk! + input.capital.reservedRisk!;
+  const activeEquityRisk =
+    input.capital.openEquityRisk! + input.capital.reservedEquityRisk!;
+  if (
+    input.requestedNotional > input.plan.equityMaxNotionalPerOrder ||
+    input.requestedNotional > input.plan.maxPositionNotional
+  ) {
+    return "SCALE_IN_ORDER_CAP_EXCEEDED";
+  }
+  if (input.requestedNotional + activeRisk > input.plan.maxTotalPlanNotional) {
+    return "SCALE_IN_TOTAL_PLAN_CAP_EXCEEDED";
+  }
+  if (input.requestedNotional + activeRisk > input.capital.buyingPower!) {
+    return "SCALE_IN_BUYING_POWER_EXCEEDED";
+  }
+  const minimumCashReserve = equity * (input.plan.equityMinCashReservePct / 100);
+  if (
+    input.capital.cash! - input.requestedNotional - activeRisk <
+    minimumCashReserve
+  ) {
+    return "SCALE_IN_CASH_RESERVE_EXCEEDED";
+  }
+  const maximumDeployment = equity * (input.plan.equityMaxPortfolioDeployPct / 100);
+  if (
+    input.capital.currentEquityDeployment! +
+      activeEquityRisk +
+      input.requestedNotional >
+    maximumDeployment
+  ) {
+    return "SCALE_IN_PORTFOLIO_DEPLOYMENT_CAP_EXCEEDED";
+  }
+  const maximumPosition = Math.min(
+    input.plan.maxPositionNotional,
+    equity * (input.plan.equityMaxPositionPct / 100)
+  );
+  if (Math.abs(input.marketValue) + input.requestedNotional > maximumPosition) {
+    return "SCALE_IN_POSITION_CAP_EXCEEDED";
+  }
+  return null;
+};
+
 export const buildPaperPortfolioReviewReport = async (
   input: {
     moment?: PaperPortfolioReviewMoment;
@@ -340,7 +627,9 @@ export const buildPaperPortfolioReviewReport = async (
   const generatedAt = deps.now?.() || new Date().toISOString();
   const reviewId = input.reviewId || `ppr_${generatedAt.replace(/[^0-9]/g, "")}`;
   const cfg = paperPortfolioReviewConfig();
+  const planConfig = loadPaperPlanConfig();
   const state = getTradingSafetyState();
+  const postgresAuthority = executionStateProjectionService.isAuthorityActive();
   const blockers: string[] = [];
   const warnings: string[] = [];
 
@@ -348,26 +637,85 @@ export const buildPaperPortfolioReviewReport = async (
     blockers.push("PAPER_ENV_REQUIRED");
   }
 
-  const [positionResult, account, candidates] = await Promise.all([
+  const openOrdersPromise: Promise<AlpacaOpenOrderSnapshot[] | null> =
+    cfg.equityScaleInEnabled
+      ? (deps.listOpenOrders ?? listAlpacaOpenOrders)()
+          .then((result) => result.orders)
+          .catch(() => null)
+      : Promise.resolve([]);
+  const [positionResult, account, candidates, openOrders] = await Promise.all([
     (deps.listPositions ?? listAlpacaPositions)(),
     (deps.getAccount ?? getAlpacaAccountSnapshot)(),
-    Promise.resolve(deps.getCandidates ? deps.getCandidates() : latestCandidates())
+    Promise.resolve(deps.getCandidates ? deps.getCandidates() : latestCandidates()),
+    openOrdersPromise
   ]);
+  let reservations: ScaleInReservation[] | null = [];
+  if (cfg.equityScaleInEnabled) {
+    try {
+      reservations = postgresAuthority
+        ? await (deps.resolveReservations ?? executionStateProjectionService.resolveReservations)([])
+        : (deps.listReservations ?? listActivePaperNewRiskReservations)();
+    } catch {
+      reservations = null;
+    }
+  }
 
   const positions = positionResult.positions || [];
   const candidateMap = new Map(candidates.map((candidate) => [candidate.symbol.toUpperCase(), candidate]));
   const heldSymbols = new Set(positions.map((position) => position.symbol.toUpperCase()));
   const buyingPower = numeric(account.buyingPower) ?? numeric(account.cash) ?? 0;
-  const accountEquity = numeric(account.equity) ?? numeric(account.buyingPower) ?? 0;
+  const scaleInCapital = buildScaleInCapitalEvidence({
+    account,
+    positions,
+    openOrders,
+    reservations
+  });
   const recommendations: PaperPortfolioRecommendation[] = [];
   const leapsExitEvaluations: LeapsExitEvaluation[] = [];
 
   for (const position of positions) {
     const symbol = position.symbol.toUpperCase();
-    const qty = Math.abs(numeric(position.qty) ?? 0);
+    const positionQuantity = numeric(position.qty);
+    const qty = Math.abs(positionQuantity ?? 0);
     const marketValue = numeric(position.marketValue);
     const unrealizedPl = numeric(position.unrealizedPl);
     const unrealizedPlPercent = pctFromPosition(position.unrealizedPlpc);
+    const optionMetadata = optionSymbolMetadata(symbol);
+    const brokerSymbolKey = symbol;
+    const possibleLifecycles = state.paperOnly && !postgresAuthority
+      ? queryAll<{ position_lifecycle_id: string }>(
+          `
+          SELECT position_lifecycle_id
+          FROM paper_positions
+          WHERE status = 'OPEN'
+            AND UPPER(COALESCE(option_symbol, symbol)) = ?
+          ORDER BY opened_at, position_lifecycle_id
+          `,
+          [brokerSymbolKey]
+        )
+      : [];
+    if (possibleLifecycles.length) {
+      capturePaperPositionObservation({
+        brokerSymbolKey,
+        symbol: optionMetadata?.underlying ?? symbol,
+        optionSymbol: optionMetadata ? symbol : null,
+        observedAt: generatedAt,
+        sourceTimestamp: generatedAt,
+        brokerRequestId: positionResult.requestId ?? null,
+        feed: "alpaca_paper_position",
+        mark: numeric(position.currentPrice),
+        quantity: qty,
+        marketValue,
+        unrealizedPnl: unrealizedPl,
+        unrealizedReturn: unrealizedPlPercent,
+        dataQualityStatus:
+          numeric(position.currentPrice) === null ? "MISSING_MARK" : "COMPLETE",
+        portfolioState: {
+          assetClass: position.assetClass ?? null,
+          side: position.side ?? null
+        }
+      });
+    }
 
     if (isOptionPosition(position)) {
       const leapsEvaluation = (deps.evaluateLeapsExit ?? evaluateLeapsExit)(position, {
@@ -488,17 +836,23 @@ export const buildPaperPortfolioReviewReport = async (
       continue;
     }
 
-    const maxPositionValue =
-      accountEquity > 0 ? (accountEquity * cfg.equityMaxPositionPct) / 100 : null;
-    const scaleInAllowed =
+    const scaleInCandidateEligible =
       cfg.equityScaleInEnabled &&
       candidate !== undefined &&
       rank !== null &&
-      rank <= cfg.equityScaleInMaxRank &&
-      buyingPower >= cfg.equityScaleInNotional &&
-      (maxPositionValue === null ||
-        marketValue === null ||
-        marketValue + cfg.equityScaleInNotional <= maxPositionValue);
+      rank <= cfg.equityScaleInMaxRank;
+    const scaleInFailure = scaleInCandidateEligible
+      ? scaleInBlocker({
+          symbol,
+          quantity: positionQuantity,
+          marketValue,
+          sourceCandidateId: candidate?.id ?? null,
+          requestedNotional: cfg.equityScaleInNotional,
+          capital: scaleInCapital,
+          plan: planConfig
+        })
+      : null;
+    const scaleInAllowed = scaleInCandidateEligible && scaleInFailure === null;
 
     if (scaleInAllowed) {
       const reason = "EQUITY_SCALE_IN_RULES_ALLOW_ADD";
@@ -518,7 +872,8 @@ export const buildPaperPortfolioReviewReport = async (
           symbol,
           notional: cfg.equityScaleInNotional,
           reason,
-          reviewId
+          reviewId,
+          sourceCandidateId: candidate.id
         }),
         skippedReason: null
       });
@@ -534,10 +889,17 @@ export const buildPaperPortfolioReviewReport = async (
       unrealizedPl,
       unrealizedPlPercent,
       signalRank: rank,
-      reason: candidate ? "EQUITY_HELD_WITH_ACTIVE_CANDIDATE" : "EQUITY_HELD_NO_EXIT_TRIGGER",
+      reason: scaleInFailure
+        ? "EQUITY_SCALE_IN_BLOCKED"
+        : candidate
+          ? "EQUITY_HELD_WITH_ACTIVE_CANDIDATE"
+          : "EQUITY_HELD_NO_EXIT_TRIGGER",
+      ...(scaleInFailure ? { reasonCodes: [scaleInFailure] } : {}),
       confidence,
       eligiblePayload: null,
-      skippedReason: cfg.equityScaleInEnabled ? "SCALE_IN_RULES_NOT_MET" : "SCALE_IN_DISABLED"
+      skippedReason: cfg.equityScaleInEnabled
+        ? scaleInFailure ?? "SCALE_IN_RULES_NOT_MET"
+        : "SCALE_IN_DISABLED"
     });
   }
 
@@ -566,7 +928,8 @@ export const buildPaperPortfolioReviewReport = async (
             symbol,
             notional,
             reason,
-            reviewId
+            reviewId,
+            sourceCandidateId: candidate.id
           })
         : null,
       skippedReason: eligible ? null : "BUYING_POWER_UNAVAILABLE"

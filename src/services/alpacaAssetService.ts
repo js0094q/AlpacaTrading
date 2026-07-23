@@ -90,6 +90,11 @@ const buildUntradableResult = (asset: AlpacaAssetSnapshot, requestId?: string): 
   requestId
 });
 
+export interface AlpacaAssetsListInput {
+  status?: "active" | "inactive" | "all";
+  assetClass?: "us_equity" | "crypto";
+}
+
 export const getAlpacaAsset = async (symbol: string): Promise<AlpacaAssetSnapshot> => {
   const normalizedSymbol = normalizeSymbol(symbol);
   const response: AlpacaApiResponse<ApiAssetPayload> =
@@ -102,6 +107,29 @@ export const getAlpacaAsset = async (symbol: string): Promise<AlpacaAssetSnapsho
     asset.requestId = response.requestId;
   }
   return asset;
+};
+
+export const listAlpacaAssets = async (
+  input: AlpacaAssetsListInput = {}
+): Promise<AlpacaAssetSnapshot[]> => {
+  const params = new URLSearchParams({
+    status: input.status ?? "active",
+    asset_class: input.assetClass ?? "us_equity"
+  });
+  const response: AlpacaApiResponse<ApiAssetPayload[]> =
+    await getAlpacaPaperEndpoint<ApiAssetPayload[]>("/v2/assets?" + params.toString());
+  if (!Array.isArray(response.data)) {
+    return [];
+  }
+  return response.data
+    .map((row) => {
+      const asset = mapAsset(row);
+      if (response.requestId) {
+        asset.requestId = response.requestId;
+      }
+      return asset;
+    })
+    .filter((asset) => Boolean(normalizeSymbol(asset.symbol)));
 };
 
 export const checkAlpacaSymbolTradability = async (

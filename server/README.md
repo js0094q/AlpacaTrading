@@ -1,5 +1,25 @@
 # Alpaca Investing VPS Bootstrap
 
+## Current PostgreSQL-only runtime boundary (2026-07-20)
+
+PostgreSQL is the sole production runtime authority. Do not run historical
+SQLite migration, backfill, reconciliation, shadow, dual-write, or fallback
+workflows. Production requires full PostgreSQL control-plane, scheduler, and
+execution-state authority with both shadow flags and the SQLite audit mirror
+off. PostgreSQL failure is terminal.
+
+After a passed fresh PostgreSQL authority checkpoint and migration 003, the
+checked-in `alpaca-autonomous-paper.service` is the sole autonomous scheduler.
+It runs all 16 workstreams through the PostgreSQL-only CLI and persists worker
+lifecycle evidence. Keep every legacy paper, research, observatory, and 0DTE
+timer disabled. Dashboard-control remains bound to `127.0.0.1:4100`.
+
+Before enabling the worker, run current SIP/OPRA market-data ingestion, verify
+the PostgreSQL market/feature/target/research rows, and reconcile against the
+Alpaca paper account. Missing or stale evidence is terminal for the workstream;
+unresolved ambiguous submissions remain pending. The unit hard-codes paper
+mode and live-off flags and must never be changed to a live environment.
+
 This directory prepares a Njalla-hosted Ubuntu LTS VPS for a future paper-first Alpaca investing platform. It hardens the host before any trading code, secrets, public UI, or live execution path exists.
 
 Nothing here connects to Alpaca, requests API keys, deploys trading logic, submits orders, or enables live trading.
@@ -143,9 +163,38 @@ ALPACA_LIVE_SECRET=
 ALPACA_PAPER_BASE_URL=https://paper-api.alpaca.markets
 ALPACA_LIVE_BASE_URL=https://api.alpaca.markets
 LIVE_TRADING_ENABLED=false
+PAPER_REVIEW_SIGNING_KEY=
+HEDGE_REVIEW_SIGNING_KEY=
 ```
 
 Do not store Alpaca keys in shell history, README files, logs, tests, frontend code, or prompts. Rotate any live keys that were already uploaded, pasted, or exposed before future live use.
+
+### Signed-review deployment cutover
+
+`PAPER_REVIEW_SIGNING_KEY` is a VPS-only HMAC secret for general reviewed
+payloads and 0DTE submit attestations. `HEDGE_REVIEW_SIGNING_KEY` remains the
+independent hedge-review signer. Before deploying the safety floor, stop the
+affected control service and paper/0DTE timers, add or preserve a
+cryptographically random general signer without printing it, restore
+`alpaca:alpaca` ownership and mode `0600`, and report only presence or a SHA-256
+fingerprint. Never copy either signer to Vercel.
+
+After restart, all unsigned general artifacts are intentionally invalid. Create
+a new review with `npm run paper:ops:review -- --format=json`. Do not run an
+execution command as a cutover check. A later entry submit re-fetches paper
+account, position, order, reservation, market, and cap evidence; material drift
+returns `FRESH_REVIEW_REQUIRED` and requires another review. Compatibility CLI
+and HTTP confirm paths now dispatch reviewed execution only and never supply
+confirmation implicitly.
+
+The checked-in ordinary equity defaults remain `$1,000` per order, `$5,000`
+maximum per order, and `$50,000` total plan notional, with a `20%` cash reserve,
+`50%` portfolio deployment cap, and `10%` position cap. Scale-in remains
+disabled by default with a `$250` add size. A redacted 2026-07-14 pre-deploy
+inspection found no selected VPS sizing overrides, so these source defaults
+were runtime-effective; the objective's `$100`/`$300` figures were neither
+installed nor adopted. Hedge environment percentages are `0.75`, `2`, and `1`,
+which normalize to `0.0075`, `0.02`, and `0.01` of equity.
 
 ## Docker
 
@@ -191,9 +240,33 @@ changing deployment artifacts, secrets, or security-relevant environment values:
 
 ```bash
 sudo systemctl stop alpaca-dashboard-control.service
+sudo systemctl stop alpaca-market-observatory.timer
 sudo systemctl stop paper-ops-morning.timer paper-ops-midday.timer paper-ops-late-day.timer
+sudo systemctl stop alpaca-paper-review.timer alpaca-paper-execute.timer alpaca-paper-exit-review.timer alpaca-paper-exit-execute.timer
+sudo systemctl stop alpaca-zero-dte-engine.timer alpaca-zero-dte-exit-review.timer alpaca-zero-dte-reconcile.timer alpaca-zero-dte-eod.timer
 docker compose -f /opt/alpaca-investing/app/docker-compose.yml down
 ```
+
+For a schema-bearing release, record the prior timer state and keep every
+application service stopped. Run `db:postgres:migrate` through the direct
+connection, then `db:postgres:verify`, before running the fresh authority
+cutover. Ordinary runtime commands never apply schema migrations.
+
+Neon configuration is independent of Vercel and belongs in the protected VPS
+environment file. Install only canonical `DATABASE_URL` and
+`DATABASE_URL_UNPOOLED` values from a mode-`0600` transfer fragment. Use
+`scripts/manage-postgres-env.mjs merge` with an unused protected backup path; the
+script preserves unrelated lines, ownership, and mode and prints no values.
+Delete the transfer fragment after a presence-only check. Set
+`DATABASE_BACKEND=postgres`, enable PostgreSQL reads/writes plus control-plane,
+scheduler, and execution-state authority, and disable both shadow flags and the
+SQLite audit mirror. Run the fresh current-state authority cutover before
+starting only `alpaca-dashboard-control.service`.
+
+The historical continuous-monitor units remain checked in for audit, but the
+PostgreSQL-only production command gate prevents them from running. Do not
+install or enable them during this cutover. See `server/systemd/README.md` for
+the current service boundary.
 
 ## Intentionally Not Implemented
 

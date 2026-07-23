@@ -19,6 +19,13 @@ import {
   type NormalizedRiskPosition,
   type PortfolioRiskSnapshot
 } from "./portfolioRiskService.js";
+import {
+  buildHedgeCapitalEvidence,
+  type HedgeCapitalEvidence
+} from "./hedgeCapitalEvidenceService.js";
+import { listRecentPaperOrders } from "./alpacaClient.js";
+import { listPaperExecutionLedgerEntries } from "./paperExecutionLedgerService.js";
+import { executionStateProjectionService } from "./executionStateProjectionService.js";
 
 export interface OptionHedgeCandidateEvidence {
   optionSymbol: string;
@@ -49,9 +56,13 @@ export interface HedgeRecommendationEvidence {
     recommendation: string;
     reasons: string[];
   }>;
-  existingHedgePremium?: number;
-  dailyHedgePremium?: number;
+  capitalEvidence: HedgeCapitalEvidence;
 }
+
+export type HedgeMarketRecommendationEvidence = Omit<
+  HedgeRecommendationEvidence,
+  "capitalEvidence"
+>;
 
 export interface HedgeSizingSummary {
   targetScenarioDeclinePct: 5 | 8 | 10 | 15;
@@ -500,6 +511,7 @@ export const recommendHedgeFromEvidence = (
     risk,
     regime,
     score,
+    capitalEvidence: evidence.capitalEvidence,
     requestId: metadata.requestId ?? `hedge_req_${canonicalJsonHash({ generatedAt, snapshot: risk.snapshotId }).slice(0, 20)}`,
     correlationId: metadata.correlationId ?? null
   };
@@ -532,6 +544,35 @@ export const recommendHedgeFromEvidence = (
   const materialOptionCoverageMissing =
     risk.optionDataCoverage.materialCoverageMissing ||
     score.measurementStatus === "indeterminate";
+  if (!evidence.capitalEvidence.complete) {
+    return {
+      ...base,
+      recommendationId,
+      recommendationStatus: "monitoring",
+      decision: "monitor",
+      sizing: emptySizing(scenarioDeclinePct),
+      leaps: {
+        trimRecommendations: [],
+        observedUnrealizedGain: 0,
+        profitFundedPremiumBudget: 0,
+        unrealizedGainFundingProxy: true,
+        existingExitRecommendations: evidence.existingLeapsExitRecommendations,
+        warnings: []
+      },
+      candidates: [],
+      warnings: unique([
+        ...risk.warnings,
+        ...regime.warnings,
+        ...evidence.capitalEvidence.blockers,
+        "HEDGE_CAPITAL_EVIDENCE_INCOMPLETE"
+      ]),
+      blockers: unique([
+        ...risk.blockers,
+        ...regime.blockers,
+        ...evidence.capitalEvidence.blockers
+      ])
+    };
+  }
   const scenario = risk.scenarios.find(
     (entry) => entry.benchmarkDeclinePct === scenarioDeclinePct
   );
@@ -597,17 +638,21 @@ export const recommendHedgeFromEvidence = (
       Math.max(
         0,
         equity * config.executionPolicy.maxTotalHedgePremiumPctEquity -
-          Math.max(0, evidence.existingHedgePremium ?? 0)
+          Math.max(0, evidence.capitalEvidence.existingHedgePremium ?? 0) -
+          Math.max(0, evidence.capitalEvidence.reservedHedgePremium ?? 0)
       ),
       Math.max(
         0,
         equity * config.executionPolicy.maxDailyHedgePremiumPctEquity -
-          Math.max(0, evidence.dailyHedgePremium ?? 0)
+          Math.max(0, evidence.capitalEvidence.dailyHedgePremiumUsed ?? 0)
       )
     )
   );
   let candidates: HedgeCandidate[] = [];
-  if (netProtectionTarget > 0 && score.total >= 45) {
+  const hedgeOrderCapacityAvailable =
+    (evidence.capitalEvidence.openHedgeOrderCount ?? 0) <
+      config.executionPolicy.maxOrdersPerRun;
+  if (netProtectionTarget > 0 && score.total >= 45 && hedgeOrderCapacityAvailable) {
     const puts = rankHedgeCandidates({
       options: evidence.optionCandidates,
       netProtectionTarget,
@@ -670,7 +715,8 @@ export const recommendHedgeFromEvidence = (
       ...leaps.warnings,
       ...(decision === "monitor" && netProtectionTarget > 0
         ? ["NO_SUPPORTED_HEDGE_CANDIDATE"]
-        : [])
+        : []),
+      ...(!hedgeOrderCapacityAvailable ? ["HEDGE_OPEN_ORDER_CAP_REACHED"] : [])
     ]),
     blockers: unique([...risk.blockers, ...regime.blockers])
   };
@@ -704,7 +750,7 @@ const latestPrice = (symbol: string) =>
 export const discoverHedgeRecommendationEvidence = (
   config: HedgeConfig,
   asOf = new Date().toISOString()
-): HedgeRecommendationEvidence => {
+): HedgeMarketRecommendationEvidence => {
   const rows = queryAll<CandidateRow>(
     `
     SELECT c.option_symbol, c.underlying_symbol, c.expiration_date, c.strike,
@@ -762,7 +808,54 @@ export interface HedgeRecommendationDeps {
   buildRisk?: typeof buildPortfolioRiskSnapshot;
   classifyRegime?: typeof classifyMarketRegime;
   discoverEvidence?: typeof discoverHedgeRecommendationEvidence;
+  buildCapitalEvidence?: (
+    risk: PortfolioRiskSnapshot,
+    config: HedgeConfig,
+    asOf: string
+  ) => Promise<HedgeCapitalEvidence> | HedgeCapitalEvidence;
 }
+
+const buildRecommendationCapitalEvidence = async (
+  risk: PortfolioRiskSnapshot,
+  config: HedgeConfig,
+  asOf: string
+) => {
+  try {
+    const orders = await listRecentPaperOrders({ limit: 500 });
+    return buildHedgeCapitalEvidence({
+      asOf,
+      allowedUnderlyings: config.executionPolicy.allowedUnderlyings,
+      positions: risk.positions,
+      orders: Array.isArray(orders.data) ? orders.data : [],
+      ledger: (executionStateProjectionService.isAuthorityActive()
+        ? []
+        : listPaperExecutionLedgerEntries(500)).map((entry) => ({
+        ledgerId: entry.id,
+        mode: entry.mode,
+        strategy: entry.strategy,
+        symbol: entry.symbol,
+        side: entry.side,
+        status: entry.status,
+        quantity: entry.qty,
+        limitPrice: entry.limitPrice,
+        estimatedPremium: entry.estimatedPremium,
+        clientOrderId: entry.clientOrderId,
+        brokerOrderId: entry.alpacaOrderId,
+        createdAt: entry.createdAt,
+        rawResponseJson: entry.rawResponseJson
+      }))
+    });
+  } catch {
+    return buildHedgeCapitalEvidence({
+      asOf,
+      allowedUnderlyings: config.executionPolicy.allowedUnderlyings,
+      positions: [],
+      orders: [],
+      ledger: [],
+      sourcesAvailable: false
+    });
+  }
+};
 
 export const buildHedgeRecommendation = async (
   input: {
@@ -783,10 +876,17 @@ export const buildHedgeRecommendation = async (
     asOf: generatedAt
   });
   const score = scorePortfolioRisk(risk, regime);
-  const evidence = (deps.discoverEvidence ?? discoverHedgeRecommendationEvidence)(
+  const marketEvidence = (deps.discoverEvidence ?? discoverHedgeRecommendationEvidence)(
     config,
     generatedAt
   );
+  const capitalEvidence = await (
+    deps.buildCapitalEvidence ?? buildRecommendationCapitalEvidence
+  )(risk, config, generatedAt);
+  const evidence: HedgeRecommendationEvidence = {
+    ...marketEvidence,
+    capitalEvidence
+  };
   return recommendHedgeFromEvidence(risk, regime, score, evidence, config, {
     generatedAt,
     requestId: input.requestId,

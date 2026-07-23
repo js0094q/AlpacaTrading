@@ -1,108 +1,99 @@
-# systemd Units
+# systemd units
 
-Systemd unit templates for future app services live in this directory.
+## Current service boundary
 
-The repository now includes a paper control service template for the VPS dashboard control API:
+PostgreSQL is the sole production runtime authority. Complete the fresh
+authority cutover, migration 003, current market-data ingestion, and paper
+account reconciliation before starting `alpaca-autonomous-paper.service`.
+The autonomous worker is the sole scheduler; all legacy timers remain stopped
+and disabled.
 
-- `dashboard-control.service` — runs `server/dashboard-control/server.ts` as `alpaca` using `.env` from
-  `/opt/alpaca-investing/secrets/alpaca.env`.
-- `paper-ops-morning.service` / `.timer` — runs `npm run paper:ops:morning -- --format=json`
-  on weekdays around 8:30 AM ET.
-- `paper-ops-midday.service` / `.timer` — runs `npm run paper:ops:midday -- --format=json`
-  on weekdays around 12:00 PM ET.
-- `paper-ops-late-day.service` / `.timer` — runs `npm run paper:ops:late-day -- --format=json`
-  on weekdays around 3:15 PM ET.
-- `alpaca-paper-review.service` / `.timer` — runs `npm run paper:monitor -- --task=review`
-  every 30 minutes during weekday market-hour windows.
-- `alpaca-paper-execute.service` / `.timer` — runs reviewed entry execution through
-  `npm run paper:monitor -- --task=execute`.
-- `alpaca-paper-exit-review.service` / `.timer` — runs reviewed exit checks for equities,
-  generic options, LEAPS, and final-hour 0DTE exits every 15 minutes and every 5 minutes
-  during the final hour.
-- `alpaca-paper-exit-execute.service` / `.timer` — runs reviewed exit execution through
-  `npm run paper:monitor -- --task=exit-execute`.
+Historical timer templates remain in this directory as deployment evidence,
+but production command gating rejects their application paths with
+`POSTGRES_ONLY_RUNTIME_PATH_DISABLED`. They must not be installed or enabled as
+part of this cutover.
 
-## Installing and enabling the control API service
+## Dashboard-control installation
 
-Use this flow only after cloning the repo on the VPS, installing dependencies, and loading paper-only environment.
+Use this only after the exact validated commit is checked out, dependencies are
+installed, PostgreSQL schema verification passes, and the fresh authority
+checkpoint is passed:
 
 ```bash
-sudo mkdir -p /opt/alpaca-investing/systemd
-sudo cp /home/alpaca/Alpaca-Trading/server/systemd/dashboard-control.service /opt/alpaca-investing/systemd/alpaca-dashboard-control.service
-sudo cp /opt/alpaca-investing/systemd/alpaca-dashboard-control.service /etc/systemd/system/alpaca-dashboard-control.service
+sudo install -d -m 755 /opt/alpaca-investing/systemd
+sudo install -m 644 \
+  /home/alpaca/Alpaca-Trading/server/systemd/dashboard-control.service \
+  /etc/systemd/system/alpaca-dashboard-control.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now alpaca-dashboard-control.service
 sudo systemctl status alpaca-dashboard-control.service --no-pager
 ```
 
-After install, verify control API health:
+The unit hardcodes the PostgreSQL-only authority flags and binds to
+`127.0.0.1`. Its API is read-only. Authenticated mutation routes fail closed and
+never invoke legacy CLI workflows.
+
+Verify authenticated local health without displaying the token:
 
 ```bash
-curl -sS -H "Authorization: Bearer $VPS_CONTROL_TOKEN" http://127.0.0.1:4100/api/v1/health | cat
+curl -fsS -H "Authorization: Bearer $VPS_CONTROL_TOKEN" \
+  http://127.0.0.1:4100/api/v1/health
 ```
 
-## Installing paper ops timers
+## Autonomous-worker installation
 
-Set or confirm the VPS timezone before enabling timer units:
+The autonomous worker unit hardcodes:
 
-```bash
-timedatectl status
-sudo timedatectl set-timezone America/New_York
+```text
+DATABASE_BACKEND=postgres
+POSTGRES_SHADOW_COMPARE_ENABLED=false
+POSTGRES_EXECUTION_STATE_SHADOW_ENABLED=false
+SQLITE_AUDIT_MIRROR_ENABLED=false
+AUTONOMOUS_RUNTIME_AUDIT_APPROVED=true
 ```
 
-Install timers:
+The worker requires full PostgreSQL authority and validates the checked-in
+17-command contract (16 workstreams plus lifecycle state). Install the unit and
+leave its retired timer disabled:
 
 ```bash
-sudo cp /home/alpaca/Alpaca-Trading/server/systemd/paper-ops-morning.service /etc/systemd/system/paper-ops-morning.service
-sudo cp /home/alpaca/Alpaca-Trading/server/systemd/paper-ops-morning.timer /etc/systemd/system/paper-ops-morning.timer
-sudo cp /home/alpaca/Alpaca-Trading/server/systemd/paper-ops-midday.service /etc/systemd/system/paper-ops-midday.service
-sudo cp /home/alpaca/Alpaca-Trading/server/systemd/paper-ops-midday.timer /etc/systemd/system/paper-ops-midday.timer
-sudo cp /home/alpaca/Alpaca-Trading/server/systemd/paper-ops-late-day.service /etc/systemd/system/paper-ops-late-day.service
-sudo cp /home/alpaca/Alpaca-Trading/server/systemd/paper-ops-late-day.timer /etc/systemd/system/paper-ops-late-day.timer
+sudo install -m 644 \
+  /home/alpaca/Alpaca-Trading/server/systemd/alpaca-autonomous-paper.service \
+  /etc/systemd/system/alpaca-autonomous-paper.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now paper-ops-morning.timer paper-ops-midday.timer paper-ops-late-day.timer
-systemctl list-timers 'paper-ops-*' --no-pager
-```
-
-Timer services set `AUTOMATED_PAPER_EXECUTION_ENABLED=false`, so scheduled workflows stop at review payload generation.
-
-## Installing continuous paper monitor timers
-
-The continuous monitor uses reviewed artifacts only and separates entry execution from exit execution by payload section.
-
-```bash
-sudo bash /home/alpaca/Alpaca-Trading/scripts/install-paper-monitoring-systemd.sh
-systemctl list-timers 'alpaca-paper-*' --no-pager
-```
-
-Disable:
-
-```bash
+sudo systemctl enable --now alpaca-autonomous-paper.service
+sudo systemctl disable --now alpaca-autonomous-paper.timer 2>/dev/null || true
 sudo bash /home/alpaca/Alpaca-Trading/scripts/disable-paper-monitoring-systemd.sh
 ```
 
-The monitor runner fails closed unless the runtime env remains paper-only and live-off. Execution services set
-`AUTOMATED_PAPER_EXECUTION_ENABLED=true`, but the runner also requires `PAPER_ORDER_EXECUTION_ENABLED=true`,
-`PAPER_OPTIONS_EXECUTION_ENABLED=true`, and the reviewed executor's `--confirmPaper` boundary.
+Do not set the audit approval flag in the shared environment; the validated
+worker unit supplies it locally after the preceding gates pass.
 
-## Service operating guidance
+## Deployment verification
 
-- Run as `alpaca`.
-- Read secrets from `/opt/alpaca-investing/secrets/alpaca.env`.
-- Keep `LIVE_TRADING_ENABLED=false` and paper-only guardrails enabled unless explicitly changed.
-- Keep `VPS_CONTROL_BIND_HOST=127.0.0.1` unless reverse proxy exposure is configured.
-- `research.run` defaults to bounded control-action settings: `--barLookbackDays=120`,
-  `ALPACA_REQUEST_TIMEOUT_MS=10000`, and `ALPACA_MAX_RETRIES=0`. Override only with
-  `VPS_RESEARCH_REQUEST_TIMEOUT_MS` and `VPS_RESEARCH_MAX_RETRIES` when the public route has been retested.
-- Preserve local paper scheduling, CLI runtime, and credentials ownership on the VPS.
-- Stop the unit before changing deployment artifacts or security-relevant env values.
+Verify all of the following without printing secrets:
 
-## Future unit pattern
+- repository checkout is clean and equals the validated commit;
+- `ALPACA_ENV=paper` and `TRADING_MODE=paper`;
+- `ALPACA_LIVE_TRADE=false` and `LIVE_TRADING_ENABLED=false`;
+- PostgreSQL reads/writes and all three authority flags are true;
+- both shadow flags and `SQLITE_AUDIT_MIRROR_ENABLED` are false;
+- pooled PostgreSQL connectivity succeeds repeatedly;
+- `db:postgres:authority:status` reports a passed
+  `fresh_postgresql_authority_cutover` checkpoint;
+- dashboard-control is active;
+- autonomous worker is active and has persisted one complete successful cycle;
+- all legacy trading/research timers are inactive;
+- no application SQLite database is open;
+- no migration, backfill, or reconciliation process is active;
+- the cutover submitted zero orders.
 
-Future units should:
+## Security boundary
 
-- run as `alpaca`
-- read secrets only from `/opt/alpaca-investing/secrets/alpaca.env`
-- bind application services to localhost or a Docker internal network
-- preserve `LIVE_TRADING_ENABLED=false` until the user explicitly requests live trading
-- be stopped before changing secrets or deployment artifacts
+- Run the application as `alpaca`.
+- Read secrets only from `/opt/alpaca-investing/secrets/alpaca.env` with mode
+  `0600` and owner `alpaca:alpaca`.
+- Keep `VPS_CONTROL_BIND_HOST=127.0.0.1`.
+- Do not display database URLs, broker keys, signing keys, or control tokens.
+- Stop dashboard-control before changing deployment artifacts or environment
+  values.

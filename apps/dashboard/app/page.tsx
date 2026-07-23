@@ -3,7 +3,14 @@ import {
   HedgePanel,
   type HedgeDashboardRecommendation
 } from "./components/HedgePanel";
-import { buildDashboardSnapshot, dashboardMoney, type DashboardSnapshot } from "../lib/data";
+import ZeroDtePanel from "./components/ZeroDtePanel";
+import {
+  buildDashboardSnapshot,
+  dashboardMoney,
+  latestZeroDteSummary,
+  type DashboardSnapshot,
+  type ZeroDteDashboardSummary
+} from "../lib/data";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -143,11 +150,18 @@ const optionCategoryCount = (
 export default async function DashboardPage() {
   let snapshot: DashboardSnapshot | null = null;
   let guardError: string | null = null;
+  let zeroDteSummary: ZeroDteDashboardSummary | null = null;
+  let zeroDteError: string | null = null;
 
   try {
     snapshot = await buildDashboardSnapshot();
   } catch (error) {
     guardError = error instanceof Error ? error.message : "Dashboard guard failed.";
+  }
+  try {
+    zeroDteSummary = await latestZeroDteSummary(25);
+  } catch (error) {
+    zeroDteError = error instanceof Error ? error.message : "0DTE summary unavailable.";
   }
   const loadError = guardError ? dashboardLoadError(guardError) : null;
 
@@ -222,6 +236,8 @@ export default async function DashboardPage() {
 
       <section className="grid">
         <ActionPanel readOnly={vercelReadOnly} />
+
+        <ZeroDtePanel summary={zeroDteSummary} error={zeroDteError} />
 
         <div className="panel">
           <h2>Environment</h2>

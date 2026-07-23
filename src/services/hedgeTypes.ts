@@ -1,4 +1,5 @@
 import type { PortfolioRiskSnapshot } from "./portfolioRiskService.js";
+import type { HedgeCapitalEvidence } from "./hedgeCapitalEvidenceService.js";
 
 export const HEDGE_RISK_MODEL_VERSION = "portfolio-risk-v1";
 export const HEDGE_REGIME_MODEL_VERSION = "market-regime-v1";
@@ -100,6 +101,7 @@ export interface HedgeRecommendationRecord {
   regime: object;
   score: object;
   sizing: object;
+  capitalEvidence: HedgeCapitalEvidence;
   leaps: object;
   candidates: HedgeCandidate[];
   warnings: string[];

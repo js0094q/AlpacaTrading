@@ -1,5 +1,6 @@
 import { config as loadDotenv } from "dotenv";
 import { buildHedgeConfig } from "./services/hedgeConfigService.js";
+import { loadZeroDteConfig } from "./services/zeroDte/zeroDteConfigService.js";
 import { seedUniverse } from "./config/universe.seed.js";
 
 loadDotenv();
@@ -113,6 +114,8 @@ const paperLeapsMaxOrderNotional = parseNumber(
   1500
 );
 
+export const zeroDteConfig = loadZeroDteConfig();
+
 export const paperLeapsExitConfig = () => ({
   minDteAtEntry: Math.max(1, parseInteger(process.env.LEAPS_MIN_DTE_AT_ENTRY, 270)),
   dteExitThreshold: Math.max(0, parseInteger(process.env.LEAPS_DTE_EXIT_THRESHOLD, 180)),
@@ -221,10 +224,85 @@ export const config = {
     )
   },
   paperLeapsExit: paperLeapsExitConfig(),
+  zeroDte: zeroDteConfig,
   hedge: buildHedgeConfig(),
   enableAggressivePaperStrategies:
     process.env.ENABLE_AGGRESSIVE_PAPER_STRATEGIES === "true",
   enableShortResearch: process.env.ENABLE_SHORT_RESEARCH !== "false",
+  universeLifecycle: {
+    configVersion:
+      process.env.UNIVERSE_LIFECYCLE_CONFIG_VERSION?.trim() || "2026-07-14-v1",
+    discoveryScanLimit: Math.max(
+      1,
+      parseInteger(process.env.UNIVERSE_LIFECYCLE_DISCOVERY_SCAN_LIMIT, 250)
+    ),
+    discoveryMaxNewSymbols: Math.max(
+      1,
+      parseInteger(process.env.UNIVERSE_LIFECYCLE_MAX_NEW_SYMBOLS, 10)
+    ),
+    assessmentMaxSymbols: Math.max(
+      1,
+      parseInteger(process.env.UNIVERSE_LIFECYCLE_MAX_ASSESSED_SYMBOLS, 80)
+    ),
+    approvedExchanges: parseSymbolList(
+      process.env.UNIVERSE_LIFECYCLE_APPROVED_EXCHANGES,
+      ["AMEX", "ARCA", "BATS", "NASDAQ", "NYSE", "NYSEARCA"]
+    ),
+    minimumPrice: Math.max(0.01, parseNumber(process.env.UNIVERSE_LIFECYCLE_MIN_PRICE, 5)),
+    minimumDailyDollarVolume: Math.max(
+      0,
+      parseNumber(process.env.UNIVERSE_LIFECYCLE_MIN_DAILY_DOLLAR_VOLUME, 5_000_000)
+    ),
+    maximumSpreadPct: Math.max(
+      0,
+      parseNumber(process.env.UNIVERSE_LIFECYCLE_MAX_SPREAD_PCT, 2)
+    ),
+    minimumHistoryBars: Math.max(
+      1,
+      parseInteger(process.env.UNIVERSE_LIFECYCLE_MIN_HISTORY_BARS, 120)
+    ),
+    minimumGoodObservations: Math.max(
+      1,
+      parseInteger(process.env.UNIVERSE_LIFECYCLE_MIN_GOOD_OBSERVATIONS, 3)
+    ),
+    maximumObservationAgeHours: Math.max(
+      1,
+      parseInteger(process.env.UNIVERSE_LIFECYCLE_MAX_OBSERVATION_AGE_HOURS, 36)
+    ),
+    evidenceLookbackDays: Math.max(
+      1,
+      parseInteger(process.env.UNIVERSE_LIFECYCLE_EVIDENCE_LOOKBACK_DAYS, 90)
+    ),
+    dataFailureLookbackDays: Math.max(
+      1,
+      parseInteger(process.env.UNIVERSE_LIFECYCLE_DATA_FAILURE_LOOKBACK_DAYS, 7)
+    ),
+    requiredResearchSelections: Math.max(
+      1,
+      parseInteger(process.env.UNIVERSE_LIFECYCLE_REQUIRED_RESEARCH_SELECTIONS, 1)
+    ),
+    requireOptions: parseBoolean(process.env.UNIVERSE_LIFECYCLE_REQUIRE_OPTIONS),
+    maximumDataFailures: Math.max(
+      1,
+      parseInteger(process.env.UNIVERSE_LIFECYCLE_MAX_DATA_FAILURES, 3)
+    ),
+    maximumExecutionFailures: Math.max(
+      1,
+      parseInteger(process.env.UNIVERSE_LIFECYCLE_MAX_EXECUTION_FAILURES, 3)
+    ),
+    maximumUnderperformingOutcomes: Math.max(
+      1,
+      parseInteger(process.env.UNIVERSE_LIFECYCLE_MAX_UNDERPERFORMING_OUTCOMES, 3)
+    ),
+    underperformanceReturnPct: parseSignedNumber(
+      process.env.UNIVERSE_LIFECYCLE_UNDERPERFORMANCE_RETURN_PCT,
+      -20
+    ),
+    suspensionRetirementDays: Math.max(
+      1,
+      parseInteger(process.env.UNIVERSE_LIFECYCLE_SUSPENSION_RETIREMENT_DAYS, 30)
+    )
+  },
   safeMode: defaultSafeMode(),
   alpaca: {
     paperKey: firstEnv(

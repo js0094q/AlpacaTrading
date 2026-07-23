@@ -1,0 +1,27 @@
+[Unit]
+Description=Alpaca Autonomous Recovery and Self-Healing Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=alpaca
+Group=alpaca
+WorkingDirectory=/home/alpaca/Alpaca-Trading
+EnvironmentFile=/opt/alpaca-investing/secrets/alpaca.env
+Environment=PATH=/usr/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=NODE_ENV=production
+Environment=TRADING_MODE=paper
+Environment=ALPACA_ENV=paper
+Environment=ALPACA_LIVE_TRADE=false
+Environment=LIVE_TRADING_ENABLED=false
+Environment=AUTOMATED_PAPER_EXECUTION_ENABLED=false
+ExecStart=/usr/bin/npm run system:recover -- --format=json
+TimeoutStartSec=60
+TimeoutStopSec=30
+KillMode=control-group
+NoNewPrivileges=true
+PrivateTmp=true
+SyslogIdentifier=alpaca-autonomous-recovery
+StandardOutput=journal
+StandardError=journal

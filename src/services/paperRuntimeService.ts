@@ -107,7 +107,7 @@ export const listLatestRunCandidates = (input: { runId: string; maxCandidates?: 
       estimated_max_loss,
       estimated_max_profit
     FROM paper_trade_candidates
-    WHERE research_run_id = ?
+    WHERE research_run_id = ? AND decision = 'selected'
     ORDER BY rank ASC
     LIMIT ?
     `,

@@ -1,4 +1,8 @@
-import { getAlpacaPaperEndpoint, type AlpacaApiResponse } from "./alpacaClient.js";
+import {
+  getAlpacaPaperEndpoint,
+  type AlpacaApiResponse,
+  type AlpacaRequestContext
+} from "./alpacaClient.js";
 
 export interface AlpacaMarketClockSnapshot {
   timestamp?: string;
@@ -15,9 +19,11 @@ type ApiClockPayload = {
   next_close?: string;
 };
 
-export const getAlpacaMarketClock = async (): Promise<AlpacaMarketClockSnapshot> => {
+export const getAlpacaMarketClock = async (
+  context: AlpacaRequestContext = {}
+): Promise<AlpacaMarketClockSnapshot> => {
   const response: AlpacaApiResponse<ApiClockPayload> =
-    await getAlpacaPaperEndpoint<ApiClockPayload>("/v2/clock");
+    await getAlpacaPaperEndpoint<ApiClockPayload>("/v2/clock", context);
   return {
     timestamp: response.data.timestamp,
     isOpen: response.data.is_open,

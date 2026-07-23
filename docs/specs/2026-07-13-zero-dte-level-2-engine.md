@@ -1,7 +1,7 @@
 # 0DTE Level 2 Engine
 
 Date: 2026-07-13
-Status: approved design; implementation pending
+Status: implemented; paper-only operational acceptance in progress
 Initial design checkpoint: branch `0DTE` at `a9d8e60`
 Implementation baseline after the resolved paper-exit cherry-pick: `main` at `d4431f9`
 
@@ -84,6 +84,10 @@ Expected modules:
 - `zeroDteOutcomeService.ts`: missed-opportunity horizons, production outcomes, and daily learning summary.
 - `zeroDteEngineService.ts`: cycle orchestration and non-overlap handling.
 
+Direct snapshot adapters must normalize both wrapped Alpaca snapshot objects and top-level symbol maps before applying freshness or liquidity filters. A valid response shape must not be silently interpreted as an empty underlying universe.
+
+Intraday underlying bar requests must explicitly select Alpaca's paper-compatible `iex` feed instead of relying on an account-dependent default feed.
+
 Pure scoring and ranking functions must be usable without a broker or database so focused tests can use deterministic fixtures.
 
 ## Identity and persistence
@@ -97,6 +101,8 @@ trading date + underlying + option symbol + playbook + direction + expiration + 
 ```
 
 The canonical identity string is hashed into a stable `candidate_id`. Repeated minute-level observations update the same candidate. Different playbooks remain separately attributable even when they select the same contract and direction.
+
+Each engine cycle persists its candidate, observation, evaluation, and queue-rank writes in one local SQLite transaction after market-data collection. This keeps the minute-level cycle bounded on durable VPS storage while preserving atomic rollback; broker reads and mutations remain outside that transaction.
 
 ### Configuration identity
 
@@ -161,16 +167,19 @@ The market-data adapter must:
 
 - validate the exchange session using the existing market-clock/calendar conventions;
 - determine same-session expiration from an explicit trading date;
-- load only configured underlyings and a narrow strike band;
+- read a bounded same-day contract chain and then load only configured underlyings and the nearest narrow strike band;
 - normalize bid/ask/midpoint, volume, open interest, IV, and available Greeks;
 - preserve source timestamps separately from ingestion timestamps;
 - mark missing, stale, crossed, or incomplete data explicitly.
+
+Alpaca session volume is read from the option snapshot daily bar. Open interest is read from the option contract record when the snapshot omits it. Missing values remain null and continue to fail the existing liquidity gates.
 
 Default discovery settings are configurable and paper-safe:
 
 ```text
 ZERO_DTE_UNDERLYINGS=SPY,QQQ,IWM
 ZERO_DTE_MAX_STRIKES_EACH_SIDE=5
+ZERO_DTE_UNDERLYING_MAX_AGE_MS=60000
 ZERO_DTE_MIN_OPTION_VOLUME=100
 ZERO_DTE_MIN_OPEN_INTEREST=250
 ZERO_DTE_MAX_SPREAD_PCT=15
@@ -215,6 +224,8 @@ Minimum paper-entry eligibility requires:
 - a conclusive paper-account verification through the paper endpoint;
 - valid market session, fresh underlying data, fresh option quote, eligible playbook, score threshold, confirmation observations, liquidity, position, daily-loss, daily-trade, and buying-power checks;
 - no equivalent open position, open order, ledger reservation, or prior same-day action.
+
+The engine may advance an eligible candidate to the persisted `selected` state before invoking execution; that state transition must not invalidate the candidate, and the execution service must reapply every runtime, account, quote, liquidity, sizing, duplicate, and risk gate. `ZERO_DTE_MAX_OPEN_POSITIONS` counts active same-day option positions, not unrelated equities or long-dated options. Exact-contract duplicate checks remain independent.
 
 The implementation must reuse existing paper execution preflight, option validation, paper-only client routing, and execution ledger behavior. New Level 2 records link to the existing ledger without exposing raw credentials or unnecessary broker payloads.
 
@@ -273,6 +284,12 @@ Add CLI entry points following existing repository conventions:
 - `zero-dte:eod` for the persisted daily learning summary;
 - `zero-dte:summary` for a sanitized queue/health read model.
 
+Immediate submission responses and reconciliation must use the same exact broker-order, client-order, option-symbol, quantity, average-price, and fill-time validation. Reconciliation must read non-terminal Level 2 paper orders back from the paper broker; persist filled, partially filled, and zero-fill or partial-fill terminal states from validated evidence; append the corresponding lifecycle events once; and backfill an exact decision link on the shared execution-ledger row. The transactional write must re-read current local state and enforce monotonic fill progress so a stale pending or lower-quantity partial response cannot regress a confirmed fill. Invalid or incomplete broker evidence must leave the order recoverable for a later exact reconciliation and must not fabricate fill values. Position marks and active paper-position read models must exclude intended or submitted orders until a partial or full fill is verified. Reconciliation must not submit, replace, or cancel an order.
+
+Terminal entry-ledger rows are reusable only for the exact same deterministic client order and candidate identity and only before a broker order is attached. A later candidate or different client order for the same reservation key must create a new ledger row rather than overwrite prior-attempt lineage. If a previously deployed execution linked a submitted trade to a terminal row from a different candidate, reconciliation may repair that local linkage only after the paper broker exactly matches the persisted broker order ID, client order ID, option symbol, `buy`, `buy_to_open`, limit/day order shape, quantity, and positive limit price. The repair must preserve the old ledger row, create or reuse only an exact new client-order ledger row, atomically relink the trade, and then run the normal fill validator. Missing or conflicting evidence remains fail-closed.
+
+The same read-only reconciliation command must resolve Level 2 exit orders from persisted exit-request lifecycle identity. Exit reconciliation validates `sell`, `sell_to_close`, broker/client order IDs, option symbol, requested and filled quantity, average fill price, and fill timestamp before closing a trade. The response must still match the latest exit-request generation when the transaction begins, any existing execution-ledger broker/order/trade/candidate identity must match before update, and fill timestamps before entry or request or after reconciliation must fail closed. A validated full exit updates the exact shared-ledger row, persists realized result and holding duration when entry evidence is complete, appends fill/close/terminal-outcome events once, and writes the terminal paper outcome in the same transaction. A mismatched existing terminal outcome must abort that transaction. Pending or partial exits remain explicit; zero-fill terminal exits return the trade to an open state for a future fresh review; partial terminal or identity-mismatched responses remain fail-closed for operator reconciliation. An immediate submission status alone must never substitute the reviewed quote for a broker fill.
+
 Add existing-pattern systemd services/timers for:
 
 - primary engine every 60 seconds during configured weekday/session windows;
@@ -280,7 +297,7 @@ Add existing-pattern systemd services/timers for:
 - reconciliation every 5 minutes;
 - one end-of-day summary after the configured cutoff.
 
-The runner must use the existing non-overlap lock pattern, session gate, paper-runtime gate, and redacted structured logging. Outside market hours it records a skipped/closed-session run rather than treating the condition as an error.
+The runner must use the existing non-overlap lock pattern, session gate, paper-runtime gate, and redacted structured logging. Database-heavy timer wakeups must be staggered from the quarter-hour observatory write, and transient SQLite writer contention must use a bounded busy timeout. Outside market hours it records a skipped/closed-session run rather than treating the condition as an error; the read-only end-of-day task may run after a valid weekday session closes.
 
 ## Dashboard
 

@@ -1,16 +1,32 @@
 import { recordApiRequest } from "./apiLog.js";
-import { config } from "../config.js";
+import { alpacaRuntimeConfig } from "./alpacaRuntimeConfig.js";
 import {
   assertLiveTradingDisabled,
   assertReadOnlyAlpacaAccessAllowed,
   getTradingSafetyState
 } from "./tradingSafetyService.js";
+import {
+  AlpacaOperationDeadlineError,
+  getRemainingNetworkBudgetMs,
+  getRequestTimeoutMs,
+  getRetryDelayMs,
+  waitForRetry,
+  type OperationDeadline
+} from "./operationDeadline.js";
 
 export interface AlpacaApiResponse<T> {
   data: T;
   requestId?: string;
   status: number;
   url: string;
+}
+
+export interface AlpacaRequestContext {
+  deadline?: OperationDeadline;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  maxRetries?: number;
+  retryBaseDelayMs?: number;
 }
 
 export class AlpacaApiError extends Error {
@@ -47,6 +63,7 @@ export interface AlpacaSubmittedOrder {
   time_in_force?: string;
   position_intent?: string;
   limit_price?: string;
+  stop_price?: string;
   status?: string;
   filled_qty?: string;
   filled_avg_price?: string;
@@ -54,6 +71,9 @@ export interface AlpacaSubmittedOrder {
   created_at?: string;
   submitted_at?: string;
   updated_at?: string;
+  replaced_at?: string;
+  replaced_by?: string;
+  replaces?: string;
 }
 
 export interface AlpacaAccountRaw {
@@ -87,6 +107,8 @@ export interface AlpacaOptionContractRaw {
   style?: string;
   strike_price?: string | number;
   multiplier?: string | number;
+  open_interest?: string | number | null;
+  openInterest?: string | number | null;
 }
 
 export interface AlpacaPositionRaw {
@@ -125,6 +147,12 @@ export interface AlpacaStockSnapshotRaw {
 }
 
 export interface AlpacaOptionSnapshotRaw {
+  dailyBar?: {
+    v?: number | string | null;
+  };
+  daily_bar?: {
+    v?: number | string | null;
+  };
   latest_quote?: {
     t?: string | null;
     bp?: number | string | null;
@@ -188,8 +216,8 @@ const firstEnv = (...names: string[]) => {
 export const getAlpacaPaperCredentials = () => {
   const apiKey = firstEnv("ALPACA_PAPER_API_KEY", "ALPACA_PAPER_KEY", "ALPACA_API_KEY");
   const secretKey = firstEnv("ALPACA_PAPER_SECRET_KEY", "ALPACA_PAPER_SECRET", "ALPACA_SECRET_KEY");
-  const baseUrl = firstEnv("ALPACA_PAPER_BASE_URL") || config.alpaca.paperBaseUrl;
-  const dataBaseUrl = firstEnv("ALPACA_DATA_BASE_URL") || config.alpaca.dataBaseUrl;
+  const baseUrl = firstEnv("ALPACA_PAPER_BASE_URL") || alpacaRuntimeConfig.paperBaseUrl;
+  const dataBaseUrl = firstEnv("ALPACA_DATA_BASE_URL") || alpacaRuntimeConfig.dataBaseUrl;
 
   if (!apiKey || !secretKey) {
     throw new Error(
@@ -215,6 +243,11 @@ const parseRetryCount = (): number => {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 2;
 };
 
+const parseRetryBaseDelayMs = (): number => {
+  const parsed = Number.parseInt(process.env.ALPACA_RETRY_BASE_DELAY_MS || "250", 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.min(parsed, 5_000) : 250;
+};
+
 const parseResponseBody = async (response: Response): Promise<unknown> => {
   const raw = await response.text();
   if (!raw) {
@@ -229,9 +262,16 @@ const parseResponseBody = async (response: Response): Promise<unknown> => {
 
 const executeWithTimeout = async <T>(
   timeoutMs: number,
-  task: (signal: AbortSignal) => Promise<T>
+  task: (signal: AbortSignal) => Promise<T>,
+  parentSignal?: AbortSignal
 ): Promise<T> => {
   const controller = new AbortController();
+  const abortFromParent = () => controller.abort(parentSignal?.reason);
+  if (parentSignal?.aborted) {
+    abortFromParent();
+  } else {
+    parentSignal?.addEventListener("abort", abortFromParent, { once: true });
+  }
   const timeout = setTimeout(() => {
     controller.abort();
   }, timeoutMs);
@@ -240,15 +280,22 @@ const executeWithTimeout = async <T>(
     return await task(controller.signal);
   } finally {
     clearTimeout(timeout);
+    parentSignal?.removeEventListener("abort", abortFromParent);
   }
 };
 
-export const getAlpacaPaperEndpoint = async <T>(endpoint: string): Promise<AlpacaApiResponse<T>> => {
-  return requestJson<T>(endpoint, "trade");
+export const getAlpacaPaperEndpoint = async <T>(
+  endpoint: string,
+  context: AlpacaRequestContext = {}
+): Promise<AlpacaApiResponse<T>> => {
+  return requestJson<T>(endpoint, "trade", context);
 };
 
-export const getAlpacaDataEndpoint = async <T>(endpoint: string): Promise<AlpacaApiResponse<T>> => {
-  return requestJson<T>(endpoint, "data");
+export const getAlpacaDataEndpoint = async <T>(
+  endpoint: string,
+  context: AlpacaRequestContext = {}
+): Promise<AlpacaApiResponse<T>> => {
+  return requestJson<T>(endpoint, "data", context);
 };
 
 const assertPaperTradingEndpointAllowed = () => {
@@ -285,7 +332,7 @@ const requestPaperTradingJson = async <T>(
           headers: {
             "APCA-API-KEY-ID": credentials.apiKey,
             "APCA-API-SECRET-KEY": credentials.secretKey,
-            "User-Agent": config.alpaca.userAgent,
+            "User-Agent": alpacaRuntimeConfig.userAgent,
             "Content-Type": "application/json",
             ...(options.headers || {})
           },
@@ -377,6 +424,15 @@ export const getPaperOrder = async (
   );
 };
 
+export const getPaperOrderByClientOrderId = async (
+  clientOrderId: string
+): Promise<AlpacaApiResponse<AlpacaSubmittedOrder>> => {
+  const params = new URLSearchParams({ client_order_id: clientOrderId });
+  return requestPaperTradingJson<AlpacaSubmittedOrder>(
+    `/v2/orders:by_client_order_id?${params.toString()}`
+  );
+};
+
 export const replacePaperOrder = async (
   orderId: string,
   payload: { qty?: string; limit_price?: string }
@@ -440,7 +496,17 @@ const parseSnapshotMap = <T>(payload: unknown): Record<string, T> => {
     snapshots?: Record<string, T>;
     data?: Record<string, T>;
   };
-  return value.snapshots || value.data || {};
+  const nested = value.snapshots || value.data;
+  if (nested) return nested;
+  return Object.fromEntries(
+    Object.entries(payload)
+      .filter(([symbol, snapshot]) =>
+        symbol.trim().length > 0 &&
+        snapshot !== null &&
+        typeof snapshot === "object" &&
+        !Array.isArray(snapshot)
+      )
+  ) as Record<string, T>;
 };
 
 const getBatchedDataSnapshots = async <T>(
@@ -484,7 +550,7 @@ export const getLatestStockSnapshots = async (
   getBatchedDataSnapshots<AlpacaStockSnapshotRaw>(
     "/v2/stocks/snapshots",
     symbols,
-    config.alpaca.stockDataFeed
+    alpacaRuntimeConfig.stockDataFeed
   );
 
 export const getLatestOptionSnapshots = async (
@@ -493,12 +559,13 @@ export const getLatestOptionSnapshots = async (
   getBatchedDataSnapshots<AlpacaOptionSnapshotRaw>(
     "/v1beta1/options/snapshots",
     symbols,
-    config.alpaca.optionDataFeed
+    alpacaRuntimeConfig.optionDataFeed
   );
 
 const requestJson = async <T>(
   endpoint: string,
-  baseUrl: "trade" | "data"
+  baseUrl: "trade" | "data",
+  context: AlpacaRequestContext = {}
 ): Promise<AlpacaApiResponse<T>> => {
   assertReadOnlyAlpacaAccessAllowed();
   assertLiveTradingDisabled();
@@ -506,30 +573,46 @@ const requestJson = async <T>(
   const credentials = getAlpacaPaperCredentials();
   const rootUrl = baseUrl === "trade" ? credentials.baseUrl : credentials.dataBaseUrl;
   const url = `${rootUrl}${endpoint}`;
-  const timeoutMs = parseTimeoutMs();
-  const maxRetries = parseRetryCount();
+  const timeoutMs = context.timeoutMs ?? parseTimeoutMs();
+  const maxRetries = context.maxRetries ?? parseRetryCount();
+  const retryBaseDelayMs = context.retryBaseDelayMs ?? parseRetryBaseDelayMs();
 
   let lastError: unknown = null;
 
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
-    let response: Response;
+    if (context.signal?.aborted && context.deadline) {
+      throw new AlpacaOperationDeadlineError(
+        "ALPACA_OPERATION_ABORTED",
+        context.deadline
+      );
+    }
+    const attemptTimeoutMs = context.deadline
+      ? getRequestTimeoutMs(context.deadline, timeoutMs)
+      : timeoutMs;
+    const deadlineBoundAttempt = context.deadline
+      ? attemptTimeoutMs >= getRemainingNetworkBudgetMs(context.deadline)
+      : false;
     try {
-      response = await executeWithTimeout(timeoutMs, (signal) =>
-        fetch(url, {
-          method: "GET",
-          headers: {
-            "APCA-API-KEY-ID": credentials.apiKey,
-            "APCA-API-SECRET-KEY": credentials.secretKey,
-            "User-Agent": config.alpaca.userAgent,
-            "Content-Type": "application/json"
-          },
-          signal
-        })
+      const { response, parsedBody } = await executeWithTimeout(
+        attemptTimeoutMs,
+        async (signal) => {
+          const response = await fetch(url, {
+            method: "GET",
+            headers: {
+              "APCA-API-KEY-ID": credentials.apiKey,
+              "APCA-API-SECRET-KEY": credentials.secretKey,
+              "User-Agent": alpacaRuntimeConfig.userAgent,
+              "Content-Type": "application/json"
+            },
+            signal
+          });
+          return { response, parsedBody: await parseResponseBody(response) };
+        },
+        context.signal
       );
 
       const requestId = response.headers.get("x-request-id") || undefined;
       const status = response.status;
-      const parsedBody = await parseResponseBody(response);
 
       recordApiRequest({
         provider: "alpaca",
@@ -557,8 +640,23 @@ const requestJson = async <T>(
         url
       };
     } catch (error) {
+      if (error instanceof AlpacaOperationDeadlineError) {
+        throw error;
+      }
       if (error instanceof DOMException && error.name === "AbortError") {
-        lastError = new Error(`Alpaca request timed out after ${timeoutMs}ms.`);
+        if (context.signal?.aborted && context.deadline) {
+          throw new AlpacaOperationDeadlineError(
+            "ALPACA_OPERATION_ABORTED",
+            context.deadline
+          );
+        }
+        if (context.deadline && deadlineBoundAttempt) {
+          throw new AlpacaOperationDeadlineError(
+            "ALPACA_OPERATION_DEADLINE_EXCEEDED",
+            context.deadline
+          );
+        }
+        lastError = new Error(`Alpaca request timed out after ${attemptTimeoutMs}ms.`);
       } else {
         lastError = error;
       }
@@ -570,6 +668,21 @@ const requestJson = async <T>(
       if (attempt >= maxRetries) {
         throw lastError;
       }
+
+      const proposedDelayMs = retryBaseDelayMs * 2 ** attempt;
+      const retryDelayMs = context.deadline
+        ? getRetryDelayMs(context.deadline, proposedDelayMs, 100)
+        : proposedDelayMs;
+      if (retryDelayMs === null && context.deadline) {
+        throw new AlpacaOperationDeadlineError(
+          "ALPACA_OPERATION_DEADLINE_EXCEEDED",
+          context.deadline
+        );
+      }
+      await waitForRetry(retryDelayMs || 0, {
+        deadline: context.deadline,
+        signal: context.signal
+      });
     }
   }
 

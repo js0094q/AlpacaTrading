@@ -10,6 +10,11 @@ import {
 import { dirname } from "node:path";
 
 const TASKS = {
+  observatory: {
+    command: ["npm", ["run", "observatory:collect"]],
+    lockFile: "/tmp/alpaca-market-observatory.lock",
+    requireExecution: false
+  },
   review: {
     command: ["npm", ["run", "paper:ops:morning", "--", "--format=json"]],
     lockFile: "/tmp/alpaca-paper-monitor-review.lock",
@@ -50,6 +55,30 @@ const TASKS = {
     ],
     lockFile: "/tmp/alpaca-paper-monitor-exit-execute.lock",
     requireExecution: true
+  },
+  "zero-dte-engine": {
+    command: [
+      "npm",
+      ["run", "zero-dte:engine", "--", "--confirmPaper", "--format=json"]
+    ],
+    lockFile: "/tmp/alpaca-zero-dte-engine.lock",
+    requireExecution: true
+  },
+  "zero-dte-exit-review": {
+    command: ["npm", ["run", "zero-dte:exit:review", "--", "--format=json"]],
+    lockFile: "/tmp/alpaca-zero-dte-exit-review.lock",
+    requireExecution: false
+  },
+  "zero-dte-reconcile": {
+    command: ["npm", ["run", "zero-dte:reconcile", "--", "--format=json"]],
+    lockFile: "/tmp/alpaca-zero-dte-reconcile.lock",
+    requireExecution: false
+  },
+  "zero-dte-eod": {
+    command: ["npm", ["run", "zero-dte:eod", "--", "--format=json"]],
+    lockFile: "/tmp/alpaca-zero-dte-eod.lock",
+    requireExecution: false,
+    allowAfterMarketClose: true
   }
 };
 
@@ -165,12 +194,15 @@ const marketWindowStatus = (date = new Date()) => {
   const weekend = parts.weekday === "Sat" || parts.weekday === "Sun";
   const holiday = marketHolidayKeys(parts.year).has(key);
   const minutes = parts.hour * 60 + parts.minute;
-  const open = !weekend && !holiday && minutes >= 9 * 60 + 30 && minutes < 16 * 60;
+  const sessionDay = !weekend && !holiday;
+  const open = sessionDay && minutes >= 9 * 60 + 30 && minutes < 16 * 60;
   return {
     open,
     reason: open ? null : "MARKET_CLOSED",
     holiday,
     weekend,
+    sessionDay,
+    afterMarketClose: sessionDay && minutes >= 16 * 60,
     finalHour: open && minutes >= 15 * 60,
     nowEt: `${key} ${String(parts.hour).padStart(2, "0")}:${String(parts.minute).padStart(2, "0")}:${String(parts.second).padStart(2, "0")}`
   };
@@ -184,6 +216,23 @@ const guardFailures = (task) => {
   if (!isFalse(process.env.ALPACA_LIVE_TRADE) || !isFalse(process.env.LIVE_TRADING_ENABLED)) {
     failures.push("LIVE_TRADING_DISABLED_REQUIRED");
   }
+  if (
+    process.env.DATABASE_BACKEND !== "postgres" ||
+    !isTrue(process.env.POSTGRES_READS_ENABLED) ||
+    !isTrue(process.env.POSTGRES_WRITES_ENABLED) ||
+    !isTrue(process.env.POSTGRES_CONTROL_PLANE_AUTHORITY_ENABLED) ||
+    !isTrue(process.env.POSTGRES_SCHEDULER_AUTHORITY_ENABLED) ||
+    !isTrue(process.env.POSTGRES_EXECUTION_STATE_AUTHORITY_ENABLED) ||
+    !isFalse(process.env.POSTGRES_SHADOW_COMPARE_ENABLED) ||
+    !isFalse(process.env.POSTGRES_EXECUTION_STATE_SHADOW_ENABLED) ||
+    !isFalse(process.env.SQLITE_AUDIT_MIRROR_ENABLED)
+  ) {
+    failures.push("POSTGRES_ONLY_AUTHORITY_REQUIRED");
+  }
+  if (!isTrue(process.env.AUTONOMOUS_RUNTIME_AUDIT_APPROVED)) {
+    failures.push("EVIDENCE_UTILIZATION_RUNTIME_AUDIT_REQUIRED");
+  }
+  failures.push("POSTGRES_ONLY_RUNTIME_PATH_DISABLED");
   if (task.requireExecution) {
     if (
       !isTrue(process.env.PAPER_ORDER_EXECUTION_ENABLED) ||
@@ -244,6 +293,18 @@ const market = marketWindowStatus(now);
 const selectedCommand = task.finalHourCommand && market.finalHour ? task.finalHourCommand : task.command;
 const scriptName = selectedCommand[1][1];
 
+const failedChecks = guardFailures({ ...task, command: selectedCommand });
+if (failedChecks.length) {
+  jsonLine({
+    ok: false,
+    status: "blocked",
+    reason: failedChecks[0],
+    task: taskName,
+    failedChecks
+  });
+  process.exit(1);
+}
+
 if (!loadPackageScripts().includes(scriptName)) {
   jsonLine({
     ok: false,
@@ -255,7 +316,7 @@ if (!loadPackageScripts().includes(scriptName)) {
   process.exit(1);
 }
 
-if (!market.open) {
+if (!market.open && !(task.allowAfterMarketClose && market.afterMarketClose)) {
   jsonLine({
     ok: true,
     status: "no_op",
@@ -264,18 +325,6 @@ if (!market.open) {
     market
   });
   process.exit(0);
-}
-
-const failedChecks = guardFailures({ ...task, command: selectedCommand });
-if (failedChecks.length) {
-  jsonLine({
-    ok: false,
-    status: "blocked",
-    reason: failedChecks[0],
-    task: taskName,
-    failedChecks
-  });
-  process.exit(1);
 }
 
 const releaseLock = acquireLock(task.lockFile);

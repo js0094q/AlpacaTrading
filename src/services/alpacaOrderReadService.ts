@@ -7,6 +7,7 @@ export interface AlpacaOpenOrderSnapshot {
   assetClass?: string;
   qty?: string;
   notional?: string;
+  limitPrice?: string;
   side?: string;
   type?: string;
   timeInForce?: string;
@@ -14,6 +15,7 @@ export interface AlpacaOpenOrderSnapshot {
   submittedAt?: string;
   filledQty?: string;
   filledAvgPrice?: string;
+  positionIntent?: string;
 }
 
 type ApiOrderPayload = {
@@ -23,6 +25,7 @@ type ApiOrderPayload = {
   asset_class?: string;
   qty?: string;
   notional?: string;
+  limit_price?: string;
   side?: string;
   type?: string;
   time_in_force?: string;
@@ -30,6 +33,7 @@ type ApiOrderPayload = {
   submitted_at?: string;
   filled_qty?: string;
   filled_avg_price?: string;
+  position_intent?: string;
 };
 
 const mapOrder = (row: ApiOrderPayload): AlpacaOpenOrderSnapshot => ({
@@ -39,13 +43,15 @@ const mapOrder = (row: ApiOrderPayload): AlpacaOpenOrderSnapshot => ({
   assetClass: row.asset_class,
   qty: row.qty,
   notional: row.notional,
+  limitPrice: row.limit_price,
   side: row.side,
   type: row.type,
   timeInForce: row.time_in_force,
   status: row.status,
   submittedAt: row.submitted_at,
   filledQty: row.filled_qty,
-  filledAvgPrice: row.filled_avg_price
+  filledAvgPrice: row.filled_avg_price,
+  positionIntent: row.position_intent
 });
 
 export const listAlpacaOpenOrders = async (): Promise<{
