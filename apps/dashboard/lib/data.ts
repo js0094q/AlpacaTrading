@@ -409,7 +409,32 @@ const optionDisplayCategory = (input: {
   }
   return "Discovered";
 };
+const inferredQuoteStatus = (row: Record<string, unknown>) => {
+  const explicit = textOrNull(row.quote_status ?? row.quoteStatus);
+  if (explicit) return quoteStatusForDashboard(explicit);
 
+  const timestamp = textOrNull(
+    row.quote_timestamp ??
+      row.quoteTimestamp ??
+      row.observed_at ??
+      row.timestamp
+  );
+
+  const bid = numberOrNull(row.bid);
+  const ask = numberOrNull(row.ask);
+
+  if (
+    timestamp &&
+    bid !== null &&
+    ask !== null &&
+    bid >= 0 &&
+    ask >= bid
+  ) {
+    return "valid" as const;
+  }
+
+  return timestamp ? "invalid" as const : "missing" as const;
+};
 export const normalizeOptionContractDashboardRow = (row: {
   underlying_symbol: string;
   option_symbol: string;
