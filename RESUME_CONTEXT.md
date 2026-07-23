@@ -71,6 +71,11 @@ checkpoints.
   ambiguous submissions must remain non-terminal for a later lookup.
 - Install, enable, and start `alpaca-autonomous-paper.service`; require a
   persisted `cycle_completed` lifecycle event for one complete 16-workstream cycle.
+- Require a `workstream_heartbeat` event every 30 seconds while a workstream is
+  running. Each workstream must retain its own process group; timeout or worker
+  shutdown sends `SIGTERM` to the group and escalates surviving descendants to
+  `SIGKILL` after five seconds. `worker_stopping` and `workstream_timeout`
+  events are operational telemetry only and do not relax any trading gate.
 - Keep all paper execution/review/research/observatory/0DTE timers disabled.
 - Dashboard reads and guarded paper actions require the PostgreSQL-backed VPS
   bridge and return `503` when PostgreSQL or the passed authority baseline is

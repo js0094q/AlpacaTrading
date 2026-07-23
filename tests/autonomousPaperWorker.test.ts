@@ -131,7 +131,8 @@ if (existsSync(process.env.WORKER_ACTIVE_PATH)) {
   appendFileSync(process.env.WORKER_OVERLAP_PATH, command + "\\n");
 }
 writeFileSync(process.env.WORKER_ACTIVE_PATH, command);
-Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+const workstreamDelayMs = Number(process.env.WORKER_WORKSTREAM_DELAY_MS || 5);
+Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, workstreamDelayMs);
 rmSync(process.env.WORKER_ACTIVE_PATH, { force: true });
 if (command === process.env.WORKER_FAIL_COMMAND) {
   process.stdout.write(process.env.WORKER_FAIL_OUTPUT || JSON.stringify({ status: "failed", reason: "EXPECTED_TEST_FAILURE", token: "worker-test-secret" }));
@@ -174,6 +175,135 @@ process.stdout.write(JSON.stringify({ status: "success" }));
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+};
+
+const outputEvents = (output: string): Array<Record<string, unknown>> =>
+  output
+    .split("\n")
+    .filter((line) => line.startsWith("{"))
+    .flatMap((line) => {
+      try {
+        return [JSON.parse(line) as Record<string, unknown>];
+      } catch {
+        return [];
+      }
+    });
+
+const processIsAlive = (pid: number) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+};
+
+const waitUntil = async (condition: () => boolean, timeoutMs: number) => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (condition()) return true;
+    await waitFor(10);
+  }
+  return condition();
+};
+
+const startNestedWorkstreamWorker = (
+  workerArguments: string[],
+  descendantIgnoresSigterm = false
+) => {
+  const directory = mkdtempSync(join(tmpdir(), "autonomous-paper-worker-tree-"));
+  const statesPath = join(directory, "states.jsonl");
+  const startedPath = join(directory, "workstream-started");
+  const commandPidPath = join(directory, "command-pid");
+  const descendantPidPath = join(directory, "descendant-pid");
+  const descendantReadyPath = join(directory, "descendant-ready");
+  const fakeNpm = join(directory, "npm");
+  writeFileSync(
+    fakeNpm,
+    `#!/usr/bin/env node
+const { appendFileSync, writeFileSync } = require("node:fs");
+const { spawn } = require("node:child_process");
+const command = process.argv[3];
+const args = process.argv.slice(4);
+if (command === "worker:state") {
+  const value = (name) => args.find((entry) => entry.startsWith("--" + name + "="))?.slice(name.length + 3);
+  appendFileSync(process.env.WORKER_STATES_PATH, JSON.stringify({
+    cycleId: value("cycleId"),
+    eventType: value("eventType"),
+    occurredAt: value("occurredAt"),
+    payload: JSON.parse(Buffer.from(value("payload"), "base64url").toString("utf8"))
+  }) + "\\n");
+  process.stdout.write(JSON.stringify({ status: "persisted" }));
+  process.exit(0);
+}
+const descendantSource = process.env.WORKER_DESCENDANT_IGNORES_SIGTERM === "true"
+  ? "const { writeFileSync } = require('node:fs'); process.on('SIGTERM', () => {}); process.on('SIGINT', () => {}); writeFileSync(process.env.WORKER_DESCENDANT_READY_PATH, 'ready'); setInterval(() => {}, 1000);"
+  : "const { writeFileSync } = require('node:fs'); process.on('SIGTERM', () => process.exit(0)); process.on('SIGINT', () => process.exit(0)); writeFileSync(process.env.WORKER_DESCENDANT_READY_PATH, 'ready'); setInterval(() => {}, 1000);";
+const descendant = spawn(
+  process.execPath,
+  ["-e", descendantSource],
+  { stdio: "ignore" }
+);
+writeFileSync(process.env.WORKER_COMMAND_PID_PATH, String(process.pid));
+writeFileSync(process.env.WORKER_DESCENDANT_PID_PATH, String(descendant.pid));
+writeFileSync(process.env.WORKER_STARTED_PATH, command);
+process.on("SIGTERM", () => process.exit(0));
+process.on("SIGINT", () => process.exit(0));
+setInterval(() => {}, 1000);
+`,
+    { mode: 0o700 }
+  );
+  chmodSync(fakeNpm, 0o700);
+
+  let stdout = "";
+  let stderr = "";
+  const child = spawn(process.execPath, [workerPath, ...workerArguments], {
+    cwd: repoRoot,
+    env: {
+      ...completePostgresOnlyEnvironment,
+      PATH: `${directory}:${process.env.PATH}`,
+      WORKER_STATES_PATH: statesPath,
+      WORKER_STARTED_PATH: startedPath,
+      WORKER_COMMAND_PID_PATH: commandPidPath,
+      WORKER_DESCENDANT_PID_PATH: descendantPidPath,
+      WORKER_DESCENDANT_READY_PATH: descendantReadyPath,
+      WORKER_DESCENDANT_IGNORES_SIGTERM: String(descendantIgnoresSigterm)
+    },
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  child.stdout?.on("data", (chunk) => { stdout += String(chunk); });
+  child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
+  const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+    child.once("close", (code, signal) => resolve({ code, signal }));
+  });
+
+  const cleanup = () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    for (const path of [commandPidPath, descendantPidPath]) {
+      if (!existsSync(path)) continue;
+      const pid = Number(readFileSync(path, "utf8"));
+      if (!Number.isSafeInteger(pid) || !processIsAlive(pid)) continue;
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      }
+    }
+    rmSync(directory, { recursive: true, force: true });
+  };
+
+  return {
+    child,
+    closed,
+    startedPath,
+    commandPidPath,
+    descendantPidPath,
+    descendantReadyPath,
+    statesPath,
+    stdout: () => stdout,
+    stderr: () => stderr,
+    cleanup
+  };
 };
 
 test("autonomous worker rejects an unapproved runtime before invoking npm", () => {
@@ -232,6 +362,42 @@ test("approved worker validates the production contract and persists a complete 
   assert.match(result.stdout, /"event":"cycle_completed"/);
   assert.match(result.stdout, /"event":"worker_stopped"/);
   assert.doesNotMatch(result.stdout + result.stderr, /worker-test-secret/);
+});
+
+test("a running workstream emits a 30-second heartbeat with cycle and child identity", () => {
+  const directory = mkdtempSync(join(tmpdir(), "autonomous-paper-worker-heartbeat-"));
+  const preloadPath = join(directory, "accelerate-heartbeat.mjs");
+  writeFileSync(
+    preloadPath,
+    `const realSetInterval = globalThis.setInterval;
+globalThis.setInterval = (callback, delay, ...args) =>
+  realSetInterval(callback, delay === 30_000 ? 20 : delay, ...args);
+`
+  );
+  try {
+    const nodeOptions = [process.env.NODE_OPTIONS, `--import=${preloadPath}`]
+      .filter(Boolean)
+      .join(" ");
+    const { result } = runWorker({
+      environment: {
+        NODE_OPTIONS: nodeOptions,
+        WORKER_WORKSTREAM_DELAY_MS: "75"
+      }
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const heartbeat = outputEvents(result.stdout).find(
+      (event) => event.event === "workstream_heartbeat"
+    );
+    assert.ok(heartbeat, result.stdout);
+    assert.equal(heartbeat.cycle, 1);
+    assert.equal(heartbeat.position, 1);
+    assert.equal(heartbeat.workstream, "research:daily");
+    assert.match(String(heartbeat.cycleId), /^[0-9a-f-]{36}$/i);
+    assert.equal(Number.isSafeInteger(heartbeat.childPid), true);
+    assert.equal(typeof heartbeat.elapsedMs, "number");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("an ordinary workstream failure fails fast with durable terminal state", () => {
@@ -389,6 +555,99 @@ process.stdout.write(JSON.stringify({ status: "persisted" }));
   } finally {
     if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("SIGTERM emits worker_stopping and terminates the active workstream process group", async () => {
+  const worker = startNestedWorkstreamWorker(["--cycle-delay-ms=0"], true);
+  try {
+    assert.equal(
+      await waitUntil(
+        () => existsSync(worker.startedPath) && existsSync(worker.descendantReadyPath),
+        3_000
+      ),
+      true,
+      worker.stderr() || worker.stdout()
+    );
+    const descendantPid = Number(readFileSync(worker.descendantPidPath, "utf8"));
+    const commandPid = Number(readFileSync(worker.commandPidPath, "utf8"));
+    assert.equal(processIsAlive(descendantPid), true);
+
+    worker.child.kill("SIGTERM");
+    const outcome = await Promise.race([
+      worker.closed,
+      waitFor(10_000).then(() => ({ code: null, signal: "SIGALRM" as NodeJS.Signals }))
+    ]);
+
+    assert.equal(outcome.code, 0, worker.stderr() || worker.stdout());
+    assert.equal(outcome.signal, null, worker.stderr() || worker.stdout());
+    assert.equal(
+      await waitUntil(() => !processIsAlive(descendantPid), 3_000),
+      true,
+      `descendant ${descendantPid} survived worker shutdown`
+    );
+    const events = outputEvents(worker.stdout());
+    const stopping = events.find((event) => event.event === "worker_stopping");
+    assert.ok(stopping, worker.stdout());
+    assert.equal(stopping.signal, "SIGTERM");
+    assert.equal(stopping.activeChildPid, commandPid);
+    assert.equal(events.some((event) => event.event === "worker_stopped"), true);
+    assert.deepEqual(
+      readJsonLines<FakeState>(worker.statesPath).map((state) => state.eventType),
+      ["cycle_started", "workstream_started", "worker_stopped"]
+    );
+  } finally {
+    worker.cleanup();
+  }
+});
+
+test("workstream timeout emits telemetry and terminates the full process group", async () => {
+  const worker = startNestedWorkstreamWorker(
+    [
+      "--once",
+      "--cycle-delay-ms=0",
+      "--workstream-timeout-ms=1000"
+    ],
+    true
+  );
+  try {
+    assert.equal(
+      await waitUntil(
+        () => existsSync(worker.startedPath) && existsSync(worker.descendantReadyPath),
+        3_000
+      ),
+      true,
+      worker.stderr() || worker.stdout()
+    );
+    const descendantPid = Number(readFileSync(worker.descendantPidPath, "utf8"));
+    const commandPid = Number(readFileSync(worker.commandPidPath, "utf8"));
+    const outcome = await Promise.race([
+      worker.closed,
+      waitFor(10_000).then(() => ({ code: null, signal: "SIGALRM" as NodeJS.Signals }))
+    ]);
+
+    assert.equal(outcome.code, 1, worker.stderr() || worker.stdout());
+    assert.equal(outcome.signal, null, worker.stderr() || worker.stdout());
+    assert.equal(
+      await waitUntil(() => !processIsAlive(descendantPid), 3_000),
+      true,
+      `descendant ${descendantPid} survived workstream timeout`
+    );
+    const timeout = outputEvents(worker.stdout()).find(
+      (event) => event.event === "workstream_timeout"
+    );
+    assert.ok(timeout, worker.stdout());
+    assert.equal(timeout.cycle, 1);
+    assert.equal(timeout.position, 1);
+    assert.equal(timeout.workstream, "research:daily");
+    assert.equal(timeout.childPid, commandPid);
+    assert.equal(typeof timeout.elapsedMs, "number");
+    assert.deepEqual(
+      readJsonLines<FakeState>(worker.statesPath).map((state) => state.eventType),
+      ["cycle_started", "workstream_started", "workstream_failed", "cycle_failed"]
+    );
+  } finally {
+    worker.cleanup();
   }
 });
 

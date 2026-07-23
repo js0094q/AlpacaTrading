@@ -10,6 +10,7 @@ const DEFAULT_WORKSTREAM_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_WORKSTREAM_TIMEOUT_MS = 6 * 60 * 60 * 1000;
 const STATE_PERSIST_TIMEOUT_MS = 60_000;
 const FORCE_KILL_DELAY_MS = 5_000;
+const WORKSTREAM_HEARTBEAT_MS = 30_000;
 const EXPECTED_DEFERRED_REASON_PATTERN = /\b(POSTGRES_OPTION_SNAPSHOTS_CURRENT_MISSING|POSTGRES_DECISION_MARKET_SESSION_INELIGIBLE|NO_ELIGIBLE_POSTGRES_CANDIDATES|NO_READY_POSTGRES_ORDER_INTENTS)\b/;
 const configuredMaxCandidates = Number(process.env.PAPER_EXPLORATION_MAX_CANDIDATES ?? 25);
 const PAPER_EXPLORATION_MAX_CANDIDATES =
@@ -53,7 +54,30 @@ const EXPECTED_CONTRACT_ENTRY = {
 const normalized = (value) => String(value ?? "").trim().toLowerCase();
 const isTrue = (value) => ["true", "1"].includes(normalized(value));
 const isFalse = (value) => ["false", "0"].includes(normalized(value));
-const log = (payload) => process.stdout.write(`${JSON.stringify(payload)}\n`);
+const emitEvent = (event) => {
+  process.stdout.write(`${JSON.stringify(event)}\n`);
+};
+
+const killProcessGroup = (child, signal = "SIGTERM") => {
+  if (!child?.pid) return;
+  try {
+    process.kill(-child.pid, signal);
+  } catch (error) {
+    if (error?.code !== "ESRCH") throw error;
+  }
+};
+
+const processGroupExists = (child) => {
+  if (!child?.pid) return false;
+  try {
+    process.kill(-child.pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") return false;
+    if (error?.code === "EPERM") return true;
+    throw error;
+  }
+};
 
 const codedError = (code) => {
   const error = new Error(code);
@@ -180,16 +204,43 @@ let activeChildPurpose = null;
 let wakeDelay = null;
 let stopRequested = false;
 let stopSignal = null;
-for (const signal of ["SIGTERM", "SIGINT"]) {
-  process.on(signal, () => {
-    stopRequested = true;
-    stopSignal = signal;
-    if (activeChildPurpose === "workstream") activeChild?.kill("SIGTERM");
-    wakeDelay?.();
-  });
-}
+let shutdownForceKillTimer = null;
+let shutdownForceKillChild = null;
 
-const runNpmCommand = (script, args, timeoutMs, purpose, environment = {}) =>
+const stopWorker = (signal) => {
+  if (stopRequested) return;
+  stopRequested = true;
+  stopSignal = signal;
+  emitEvent({
+    event: "worker_stopping",
+    signal,
+    activeChildPid: activeChild?.pid ?? null
+  });
+  if (activeChildPurpose === "workstream" && activeChild) {
+    const child = activeChild;
+    shutdownForceKillChild = child;
+    killProcessGroup(child, "SIGTERM");
+    shutdownForceKillTimer = setTimeout(() => {
+      killProcessGroup(child, "SIGKILL");
+      shutdownForceKillTimer = null;
+      shutdownForceKillChild = null;
+    }, FORCE_KILL_DELAY_MS);
+    shutdownForceKillTimer.unref?.();
+  }
+  wakeDelay?.();
+};
+
+process.once("SIGTERM", () => stopWorker("SIGTERM"));
+process.once("SIGINT", () => stopWorker("SIGINT"));
+
+const runNpmCommand = (
+  script,
+  args,
+  timeoutMs,
+  purpose,
+  environment = {},
+  workstreamContext = null
+) =>
   new Promise((resolve) => {
     const startedAt = Date.now();
     let stdout = "";
@@ -199,11 +250,24 @@ const runNpmCommand = (script, args, timeoutMs, purpose, environment = {}) =>
     let settled = false;
     let forceKillTimer = null;
     const child = spawn("npm", ["run", script, "--", ...args], {
+      cwd: process.cwd(),
       env: { ...process.env, ...environment },
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: purpose === "workstream"
     });
     activeChild = child;
     activeChildPurpose = purpose;
+    const heartbeat = purpose === "workstream" && workstreamContext
+      ? setInterval(() => {
+          emitEvent({
+            event: "workstream_heartbeat",
+            ...workstreamContext,
+            childPid: child.pid,
+            elapsedMs: Date.now() - startedAt
+          });
+        }, WORKSTREAM_HEARTBEAT_MS)
+      : null;
+    heartbeat?.unref?.();
     child.stdout?.on("data", (chunk) => {
       stdout = appendBounded(stdout, chunk);
     });
@@ -215,16 +279,50 @@ const runNpmCommand = (script, args, timeoutMs, purpose, environment = {}) =>
     });
     const timeout = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGTERM");
-      forceKillTimer = setTimeout(() => child.kill("SIGKILL"), FORCE_KILL_DELAY_MS);
+      if (purpose === "workstream" && workstreamContext) {
+        emitEvent({
+          event: "workstream_timeout",
+          ...workstreamContext,
+          childPid: child.pid,
+          elapsedMs: Date.now() - startedAt
+        });
+        killProcessGroup(child, "SIGTERM");
+      } else {
+        child.kill("SIGTERM");
+      }
+      forceKillTimer = setTimeout(() => {
+        if (purpose === "workstream") {
+          killProcessGroup(child, "SIGKILL");
+        } else {
+          child.kill("SIGKILL");
+        }
+        forceKillTimer = null;
+      }, FORCE_KILL_DELAY_MS);
       forceKillTimer.unref?.();
     }, timeoutMs);
     timeout.unref?.();
-    child.on("close", (code) => {
+    child.once("close", (code) => {
       if (settled) return;
       settled = true;
+      if (heartbeat) clearInterval(heartbeat);
       clearTimeout(timeout);
-      if (forceKillTimer) clearTimeout(forceKillTimer);
+      if (forceKillTimer) {
+        if (purpose === "workstream" && processGroupExists(child)) {
+          forceKillTimer.ref?.();
+        } else {
+          clearTimeout(forceKillTimer);
+          forceKillTimer = null;
+        }
+      }
+      if (shutdownForceKillTimer && shutdownForceKillChild === child) {
+        if (processGroupExists(child)) {
+          shutdownForceKillTimer.ref?.();
+        } else {
+          clearTimeout(shutdownForceKillTimer);
+          shutdownForceKillTimer = null;
+          shutdownForceKillChild = null;
+        }
+      }
       if (activeChild === child) {
         activeChild = null;
         activeChildPurpose = null;
@@ -281,10 +379,15 @@ const classify = ({ exitCode, output, spawnError, timedOut }) => {
   return { classification: "failed", code: "WORKSTREAM_COMMAND_FAILED" };
 };
 
-const runWorkstream = async (script, args, timeoutMs, cycleId) => {
+const runWorkstream = async (script, args, timeoutMs, cycle, cycleId, position) => {
   const raw = await runNpmCommand(script, args, timeoutMs, "workstream", {
     AUTONOMOUS_CYCLE_ID: cycleId,
     AUTONOMOUS_WORKSTREAM: script
+  }, {
+    cycle,
+    cycleId,
+    position,
+    workstream: script
   });
   const result = classify(raw);
   return {
@@ -345,13 +448,13 @@ const main = async () => {
       message: "The autonomous production command contract is invalid.",
       paperOnly: true
     });
-    log({ event: "preflight_failed", cycleId: preflightCycleId, code });
+    emitEvent({ event: "preflight_failed", cycleId: preflightCycleId, code });
     throw error;
   }
 
   let cycle = 0;
   let lastCycleId = preflightCycleId;
-  log({ event: "worker_started", paperOnly: true, workstreamCount: WORKSTREAMS.length });
+  emitEvent({ event: "worker_started", paperOnly: true, workstreamCount: WORKSTREAMS.length });
   while (!stopRequested) {
     cycle += 1;
     const cycleId = cycle === 1 ? preflightCycleId : randomUUID();
@@ -360,7 +463,7 @@ const main = async () => {
       workerPid: process.pid,
       workstreamCount: WORKSTREAMS.length
     }));
-    log({ event: "cycle_started", cycle, cycleId, workstreamCount: WORKSTREAMS.length });
+    emitEvent({ event: "cycle_started", cycle, cycleId, workstreamCount: WORKSTREAMS.length });
 
     for (let index = 0; index < WORKSTREAMS.length; index += 1) {
       if (stopRequested) break;
@@ -370,7 +473,7 @@ const main = async () => {
         workstream: script
       });
       await persistState(cycleId, "workstream_started", basePayload);
-      log({ event: "workstream_started", cycle, cycleId, position: index + 1, workstream: script });
+      emitEvent({ event: "workstream_started", cycle, cycleId, position: index + 1, workstream: script });
       if (stopRequested) {
         await persistState(cycleId, "worker_stopped", statePayload(cycle, {
           reason: "signal",
@@ -378,10 +481,17 @@ const main = async () => {
           position: index + 1,
           workstream: script
         }));
-        log({ event: "worker_stopped", cycle, cycleId, reason: "signal" });
+        emitEvent({ event: "worker_stopped", cycle, cycleId, reason: "signal" });
         return;
       }
-      const result = await runWorkstream(script, args, workstreamTimeoutMs, cycleId);
+      const result = await runWorkstream(
+        script,
+        args,
+        workstreamTimeoutMs,
+        cycle,
+        cycleId,
+        index + 1
+      );
 
       if (stopRequested) {
         await persistState(cycleId, "worker_stopped", statePayload(cycle, {
@@ -390,7 +500,7 @@ const main = async () => {
           position: index + 1,
           workstream: script
         }));
-        log({ event: "worker_stopped", cycle, cycleId, reason: "signal" });
+        emitEvent({ event: "worker_stopped", cycle, cycleId, reason: "signal" });
         return;
       }
 
@@ -404,7 +514,7 @@ const main = async () => {
           message: "A required autonomous workstream failed."
         };
         await persistState(cycleId, "workstream_failed", failurePayload);
-        log({ event: "workstream_failed", cycle, cycleId, position: index + 1, workstream: script, ...result });
+        emitEvent({ event: "workstream_failed", cycle, cycleId, position: index + 1, workstream: script, ...result });
         await persistState(cycleId, "cycle_failed", statePayload(cycle, {
           classification: result.classification,
           code: result.code,
@@ -412,13 +522,13 @@ const main = async () => {
           failedPosition: index + 1,
           failedWorkstream: script
         }));
-        log({ event: "cycle_failed", cycle, cycleId, code: result.code, failedWorkstream: script });
+        emitEvent({ event: "cycle_failed", cycle, cycleId, code: result.code, failedWorkstream: script });
         throw codedError(result.code);
       }
 
       const completionPayload = { ...basePayload, ...result };
       await persistState(cycleId, "workstream_completed", completionPayload);
-      log({ event: "workstream_completed", cycle, cycleId, position: index + 1, workstream: script, ...result });
+      emitEvent({ event: "workstream_completed", cycle, cycleId, position: index + 1, workstream: script, ...result });
     }
 
     if (stopRequested) break;
@@ -426,10 +536,10 @@ const main = async () => {
       workstreamCount: WORKSTREAMS.length,
       failed: 0
     }));
-    log({ event: "cycle_completed", cycle, cycleId, workstreamCount: WORKSTREAMS.length, failed: 0 });
+    emitEvent({ event: "cycle_completed", cycle, cycleId, workstreamCount: WORKSTREAMS.length, failed: 0 });
     if (once) {
       await persistState(cycleId, "worker_stopped", statePayload(cycle, { reason: "once" }));
-      log({ event: "worker_stopped", cycle, cycleId, reason: "once" });
+      emitEvent({ event: "worker_stopped", cycle, cycleId, reason: "once" });
       return;
     }
     await wait(cycleDelayMs);
@@ -439,10 +549,10 @@ const main = async () => {
     reason: "signal",
     signal: stopSignal
   }));
-  log({ event: "worker_stopped", cycle, cycleId: lastCycleId, reason: "signal" });
+  emitEvent({ event: "worker_stopped", cycle, cycleId: lastCycleId, reason: "signal" });
 };
 
 main().catch((error) => {
-  log({ event: "worker_failed", code: codeOf(error) });
+  emitEvent({ event: "worker_failed", code: codeOf(error) });
   process.exitCode = 1;
 });

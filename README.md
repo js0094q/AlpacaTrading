@@ -24,6 +24,13 @@ Repeated entry-review workstreams skip a candidate and account-snapshot identity
 that already has a persisted entry review, preserving the database client-order
 uniqueness contract across continuously refreshed market evidence.
 
+Each running workstream emits a structured `workstream_heartbeat` event every
+30 seconds with its cycle, position, child PID, and elapsed time. Workstreams
+run in separate process groups so timeout and worker-shutdown handling can send
+`SIGTERM`, then escalate the surviving group to `SIGKILL` after five seconds.
+The worker emits `workstream_timeout` and `worker_stopping` events without
+changing research, market-data, review, or execution eligibility.
+
 ## Paper exploration profile (2026-07-23)
 
 The autonomous PostgreSQL path uses a reversible paper-only exploration profile.
