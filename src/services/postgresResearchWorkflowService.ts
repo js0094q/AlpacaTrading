@@ -73,6 +73,30 @@ const RESEARCH_EVIDENCE_INSERT_SQL = `INSERT INTO research_evidence(
     source_table text, source_key text, source_fingerprint text, payload jsonb)
   WHERE ${fenceSql(4)}
 ON CONFLICT (id) DO NOTHING`;
+const RESEARCH_FEATURE_EVIDENCE_INSERT_SQL = `INSERT INTO research_evidence(
+  id, research_run_id, evidence_type, symbol, observed_at, source_table,
+  source_key, source_fingerprint, payload, created_at
+) SELECT $1, $2, 'feature_snapshot', f.symbol, f.observed_at,
+         'feature_snapshots', $3, f.source_fingerprint, f.features, $4
+  FROM feature_snapshots f
+  WHERE f.symbol = $5
+    AND f.observed_at = $6::timestamptz
+    AND f.source_fingerprint = $7
+    AND ${fenceSql(8)}
+ON CONFLICT (id) DO NOTHING
+RETURNING id, pg_column_size(payload)::bigint AS source_payload_bytes`;
+const RESEARCH_FEATURE_EVIDENCE_REPLAY_SQL = `SELECT
+  EXISTS(
+    SELECT 1 FROM research_evidence WHERE id = $1
+  ) AS evidence_exists,
+  EXISTS(
+    SELECT 1
+    FROM feature_snapshots
+    WHERE symbol = $2
+      AND observed_at = $3::timestamptz
+      AND source_fingerprint = $4
+  ) AS source_exists
+WHERE ${fenceSql(5)}`;
 
 type ResearchEvidenceRow = {
   type: string;
@@ -83,6 +107,8 @@ type ResearchEvidenceRow = {
   fingerprint: string;
   payload: unknown;
 };
+
+type ResearchFeatureEvidenceRow = Omit<ResearchEvidenceRow, "payload">;
 
 const evidenceBatches = (rows: readonly Record<string, unknown>[]) => {
   const batches: Array<{
@@ -281,11 +307,11 @@ const persistEvidence = async (input: {
     });
     if ((index + 1) % EVIDENCE_BATCH_SIZE === 0) await yieldToEventLoop();
   }
-  rows.push(...[...latestFeatures.values()].map((row) => ({
+  const featureRows: ResearchFeatureEvidenceRow[] = [...latestFeatures.values()].map((row) => ({
     type: "feature_snapshot", symbol: row.symbol, observedAt: row.observedAt,
     table: "feature_snapshots", key: `${row.symbol}:${row.observedAt}`,
-    fingerprint: row.sourceFingerprint, payload: row.features
-  })));
+    fingerprint: row.sourceFingerprint
+  }));
   rows.push(...input.targets.map((row) => ({
     type: "target_snapshot", symbol: row.symbol, observedAt: row.asOf,
     table: "target_snapshots", key: `${row.symbol}:${row.asOf}:${row.riskProfile}`,
@@ -303,9 +329,21 @@ const persistEvidence = async (input: {
     if ((index + 1) % EVIDENCE_BATCH_SIZE === 0) await yieldToEventLoop();
   }
   const unique = [...uniqueById.values()];
-  const batches = evidenceBatches(unique);
-  for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
-    const batch = batches[batchIndex]!;
+  const uniqueFeatureById = new Map<string, ResearchFeatureEvidenceRow & { id: string }>();
+  for (const row of featureRows) {
+    const id = `research_evidence_${canonicalJsonHash({
+      run: input.researchRunId,
+      type: row.type,
+      key: row.key,
+      fingerprint: row.fingerprint
+    })}`;
+    uniqueFeatureById.set(id, { ...row, id });
+  }
+  const uniqueFeatures = [...uniqueFeatureById.values()];
+  const inlineBatches = evidenceBatches(unique);
+  const batchCount = inlineBatches.length + uniqueFeatures.length;
+  for (let batchIndex = 0; batchIndex < inlineBatches.length; batchIndex += 1) {
+    const batch = inlineBatches[batchIndex]!;
     const batchNumber = batchIndex + 1;
     const startedAt = performance.now();
     try {
@@ -328,7 +366,7 @@ const persistEvidence = async (input: {
         event: "postgres_research_evidence_batch",
         researchRunId: input.researchRunId,
         batchNumber,
-        batchCount: batches.length,
+        batchCount,
         batchSize: batch.rows.length,
         payloadBytes: batch.bytes,
         rowsAttempted: batch.rows.length,
@@ -344,7 +382,7 @@ const persistEvidence = async (input: {
         event: "postgres_research_evidence_batch",
         researchRunId: input.researchRunId,
         batchNumber,
-        batchCount: batches.length,
+        batchCount,
         batchSize: batch.rows.length,
         payloadBytes: batch.bytes,
         rowsAttempted: batch.rows.length,
@@ -364,7 +402,103 @@ const persistEvidence = async (input: {
       throw error;
     }
   }
-  return unique.length;
+  for (let featureIndex = 0; featureIndex < uniqueFeatures.length; featureIndex += 1) {
+    const feature = uniqueFeatures[featureIndex]!;
+    const batchNumber = inlineBatches.length + featureIndex + 1;
+    const startedAt = performance.now();
+    try {
+      const fence = await input.query.query(
+        `SELECT 1 WHERE ${fenceSql(1)}`,
+        fenceValues(input.fence)
+      );
+      if (fence.rowCount !== 1) throw new Error("POSTGRES_RESEARCH_EVIDENCE_FENCE_REJECTED");
+      const result = await input.query.query(
+        RESEARCH_FEATURE_EVIDENCE_INSERT_SQL,
+        [
+          feature.id,
+          input.researchRunId,
+          feature.key,
+          input.now,
+          feature.symbol,
+          feature.observedAt,
+          feature.fingerprint,
+          ...fenceValues(input.fence)
+        ]
+      );
+      let outcome = "committed";
+      if (result.rowCount === 0) {
+        const replay = await input.query.query(
+          RESEARCH_FEATURE_EVIDENCE_REPLAY_SQL,
+          [
+            feature.id,
+            feature.symbol,
+            feature.observedAt,
+            feature.fingerprint,
+            ...fenceValues(input.fence)
+          ]
+        );
+        const state = replay.rows[0];
+        if (!state) throw new Error("POSTGRES_RESEARCH_EVIDENCE_FENCE_REJECTED");
+        if (state.source_exists !== true) {
+          throw new Error(
+            `POSTGRES_RESEARCH_FEATURE_EVIDENCE_SOURCE_MISSING:${feature.symbol}`
+          );
+        }
+        if (state.evidence_exists !== true) {
+          throw new Error("POSTGRES_RESEARCH_EVIDENCE_PERSISTENCE_FAILED");
+        }
+        outcome = "already_persisted";
+      } else if (result.rowCount !== 1) {
+        throw new Error("POSTGRES_RESEARCH_EVIDENCE_PERSISTENCE_FAILED");
+      }
+      const sourcePayloadBytes = Number(result.rows[0]?.source_payload_bytes);
+      input.emitTelemetry?.({
+        event: "postgres_research_evidence_batch",
+        researchRunId: input.researchRunId,
+        evidenceType: "feature_snapshot",
+        batchNumber,
+        batchCount,
+        batchSize: 1,
+        symbol: feature.symbol,
+        rowsAttempted: 1,
+        rowsCommitted: result.rowCount ?? 0,
+        sourcePayloadBytes: Number.isFinite(sourcePayloadBytes)
+          ? sourcePayloadBytes
+          : null,
+        transactionDurationMs: performance.now() - startedAt,
+        leaseOwner: input.fence.ownerId,
+        fencingToken: input.fence.fencingToken,
+        statementName: "research_feature_evidence_server_copy",
+        outcome,
+        ...readPostgresQueryTelemetry(result)
+      });
+    } catch (error) {
+      input.emitTelemetry?.({
+        event: "postgres_research_evidence_batch",
+        researchRunId: input.researchRunId,
+        evidenceType: "feature_snapshot",
+        batchNumber,
+        batchCount,
+        batchSize: 1,
+        symbol: feature.symbol,
+        rowsAttempted: 1,
+        rowsCommitted: 0,
+        transactionDurationMs: performance.now() - startedAt,
+        leaseOwner: input.fence.ownerId,
+        fencingToken: input.fence.fencingToken,
+        statementName: "research_feature_evidence_server_copy",
+        outcome: "failed",
+        ...readPostgresQueryTelemetry(error)
+      });
+      input.emitTelemetry?.(postgresErrorTelemetry(error, {
+        failingStatement: RESEARCH_FEATURE_EVIDENCE_INSERT_SQL,
+        batchNumber,
+        symbol: feature.symbol
+      }));
+      throw error;
+    }
+  }
+  return unique.length + uniqueFeatures.length;
 };
 
 const persistCandidates = async (input: {

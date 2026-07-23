@@ -80,8 +80,9 @@ checkpoints.
   250-row batch before proceeding. Preserve batch count, commit/readback,
   insert/update, query/pool timing, query-plan, and scheduler-fence telemetry.
   Count or evidence mismatches fail closed with the exact batch and symbol.
-  Preserve every downstream research-evidence row while limiting each insert to
-  250 rows and 4 MB of serialized JSON.
+  Preserve every downstream research-evidence row: limit inline client payloads
+  to 250 rows and 4 MB, and copy large feature payloads from
+  `feature_snapshots` inside PostgreSQL one row at a time.
 - Keep all paper execution/review/research/observatory/0DTE timers disabled.
 - Dashboard reads and guarded paper actions require the PostgreSQL-backed VPS
   bridge and return `503` when PostgreSQL or the passed authority baseline is

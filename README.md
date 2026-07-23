@@ -38,7 +38,9 @@ timing, and scheduler-fence telemetry; count or evidence mismatches fail with an
 explicit batch and symbol diagnostic. The first production readback also emits
 an `EXPLAIN ANALYZE` summary with planner time, execution time, returned rows,
 and index usage. Downstream `research_evidence` inserts retain every evidence
-row while bounding each serialized PostgreSQL payload to 250 rows and 4 MB.
+row: inline payloads are bounded to 250 rows and 4 MB, while large feature
+payloads are copied from `feature_snapshots` inside PostgreSQL one row at a
+time instead of being retransmitted in a multi-row client parameter.
 
 ## Paper exploration profile (2026-07-23)
 

@@ -385,18 +385,32 @@ test("research evidence is inserted in bounded batches", async () => {
   assert.match(evidence[0]!, /jsonb_to_recordset/);
 });
 
-test("research evidence batching is bounded by serialized bytes as well as row count", async () => {
-  const evidencePayloadSizes: number[] = [];
-  const oversized = "x".repeat(2_200_000);
+test("research evidence keeps inline batches byte-bounded and copies oversized features server-side", async () => {
+  const inlinePayloadSizes: number[] = [];
+  const featureStatements: string[] = [];
+  const featureParameters: Array<readonly unknown[]> = [];
+  const inlineLarge = "y".repeat(2_200_000);
+  const oversized = "x".repeat(4_500_000);
   const result = await runPostgresResearchWorkflow({
     query: {
       query: async (statement: string, values?: readonly unknown[]) => {
         if (statement.includes("INSERT INTO research_runs")) {
           return { rows: [{ version: "1" }], rowCount: 1 };
         }
+        if (
+          statement.includes("INSERT INTO research_evidence") &&
+          statement.includes("FROM feature_snapshots f")
+        ) {
+          featureStatements.push(statement);
+          featureParameters.push(values ?? []);
+          return {
+            rows: [{ source_payload_bytes: String(oversized.length) }],
+            rowCount: 1
+          };
+        }
         if (statement.includes("INSERT INTO research_evidence")) {
           const payload = String(values?.[0] ?? "");
-          evidencePayloadSizes.push(Buffer.byteLength(payload));
+          inlinePayloadSizes.push(Buffer.byteLength(payload));
           return { rows: [], rowCount: JSON.parse(payload).length };
         }
         return { rows: [], rowCount: 1 };
@@ -410,7 +424,30 @@ test("research evidence batching is bounded by serialized bytes as well as row c
     dependencies: {
       refreshMarketData: async () => ({
         bars: [],
-        stockSnapshots: [],
+        stockSnapshots: [
+          {
+            id: "stock-spy",
+            symbol: "SPY",
+            observedAt: "2026-07-20T21:59:58.000Z",
+            sourceTimestamp: "2026-07-20T21:59:58.000Z",
+            requestedFeed: "sip",
+            effectiveFeed: "sip",
+            source: "alpaca",
+            requestId: "stock-spy",
+            evidence: { payload: inlineLarge }
+          },
+          {
+            id: "stock-qqq",
+            symbol: "QQQ",
+            observedAt: "2026-07-20T21:59:59.000Z",
+            sourceTimestamp: "2026-07-20T21:59:59.000Z",
+            requestedFeed: "sip",
+            effectiveFeed: "sip",
+            source: "alpaca",
+            requestId: "stock-qqq",
+            evidence: { payload: inlineLarge }
+          }
+        ],
         optionContracts: [],
         optionSnapshots: [],
         summary: {}
@@ -437,8 +474,24 @@ test("research evidence batching is bounded by serialized bytes as well as row c
   });
 
   assert.equal(result.status, "completed");
-  assert.equal(evidencePayloadSizes.length, 2);
-  assert.equal(evidencePayloadSizes.every((bytes) => bytes <= 4_000_000), true);
+  assert.equal(result.evidenceStored, 4);
+  assert.equal(inlinePayloadSizes.length, 2);
+  assert.equal(inlinePayloadSizes.every((bytes) => bytes <= 4_000_000), true);
+  assert.equal(featureParameters.length, 2);
+  assert.equal(
+    featureStatements.every((statement) =>
+      /f\.observed_at = \$6::timestamptz/.test(statement) &&
+      /f\.source_fingerprint = \$7/.test(statement) &&
+      /FROM scheduler_leases/.test(statement)
+    ),
+    true
+  );
+  assert.equal(
+    featureParameters.every((parameters) =>
+      parameters.every((value) => typeof value !== "string" || value.length < 1_000)
+    ),
+    true
+  );
 });
 
 test("rejected evidence fence prevents any batch insert", async () => {
