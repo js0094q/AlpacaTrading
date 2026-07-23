@@ -289,6 +289,68 @@ test("aborts the operation and fails closed when a heartbeat loses the fence", a
   assert.equal(fake.active.size, 0);
 });
 
+test("external termination aborts the operation before releasing its lease as failed", async () => {
+  const fake = createTransactionPool();
+  const currentLease = lease();
+  const externalAbort = new AbortController();
+  const releaseReasons: string[] = [];
+  const repository: PostgresSchedulerLeaseStore = {
+    async acquire() {
+      return { status: "acquired", lease: currentLease };
+    },
+    async heartbeat() {
+      return { status: "updated", lease: currentLease };
+    },
+    async release(input) {
+      const releaseReason = input.releaseReason ?? null;
+      if (!releaseReason) throw new Error("expected release reason");
+      releaseReasons.push(releaseReason);
+      return {
+        status: "updated",
+        lease: {
+          ...currentLease,
+          status: "released",
+          releaseReason,
+          releasedAt: "2026-07-15T20:00:01.000Z",
+          version: 2
+        }
+      };
+    }
+  };
+  const input = {
+    pool: fake.pool,
+    config: config(),
+    job: POSTGRES_SCHEDULER_JOBS.research,
+    ownerId: "worker-a",
+    runId: "run-a",
+    operationId: "research-run-a",
+    leaseDurationMs: 60_000,
+    heartbeatIntervalMs: 10_000,
+    externalSignal: externalAbort.signal,
+    operation: async ({ signal }: { signal: AbortSignal }) => {
+      externalAbort.abort(new Error("SIGTERM"));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (signal.aborted) throw signal.reason;
+      return "not-aborted";
+    }
+  };
+
+  await assert.rejects(
+    () =>
+      runWithPostgresSchedulerLease(input, {
+        repository,
+        now: () => new Date("2026-07-15T20:00:00.000Z"),
+        wait: abortableWaitAfterFirstTick(),
+        emit: () => undefined
+      }),
+    (error) =>
+      error instanceof PostgresSchedulerExecutionError &&
+      error.code === "SCHEDULER_COMMAND_TERMINATED"
+  );
+  assert.deepEqual(releaseReasons, ["failed"]);
+  assert.equal(fake.active.size, 0);
+});
+
 test("rejects execution when control-plane authority is not enabled", async () => {
   const fake = createTransactionPool();
   let operationCalled = false;

@@ -27,6 +27,14 @@ Alpaca paper account. Missing or stale evidence is terminal for the workstream;
 unresolved ambiguous submissions remain pending. The unit hard-codes paper
 mode and live-off flags and must never be changed to a live environment.
 
+On a systemd stop, scheduler-registered commands cooperatively abort their
+fenced operation, terminalize domain lifecycle state, and release the
+PostgreSQL lease before exiting. The worker records `worker_stopped` only after
+the complete detached workstream process group is gone. After a stop or
+restart, require zero active abandoned research runs and zero held stale leases;
+do not delete lifecycle evidence or disable concurrency indexes to obtain that
+state.
+
 This directory prepares a Njalla-hosted Ubuntu LTS VPS for a future paper-first Alpaca investing platform. It hardens the host before any trading code, secrets, public UI, or live execution path exists.
 
 Nothing here connects to Alpaca, requests API keys, deploys trading logic, submits orders, or enables live trading.

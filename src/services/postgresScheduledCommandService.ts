@@ -23,6 +23,7 @@ export type PostgresScheduledCommandOperationContext = {
 };
 
 export type PostgresScheduledCommandInput<T> = PostgresSchedulerCommandInput & {
+  readonly externalSignal?: AbortSignal;
   readonly operation: (
     context?: PostgresScheduledCommandOperationContext
   ) => Promise<T>;
@@ -86,6 +87,7 @@ export const runPostgresScheduledCommand = async <T>(
         correlationId,
         leaseDurationMs: 60_000,
         heartbeatIntervalMs: 15_000,
+        externalSignal: input.externalSignal,
         operation: async ({ fence, signal }) =>
           withControlPlaneRuntimeContext(
             {

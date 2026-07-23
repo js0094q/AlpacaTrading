@@ -1,5 +1,19 @@
 # Resume Context: Alpaca Trading Research Infra
 
+## Autonomous PostgreSQL lifecycle shutdown repair (2026-07-23)
+
+- The autonomous worker now waits for the complete detached workstream process
+  group to exit before persisting `worker_stopped`.
+- Scheduler-registered PostgreSQL CLI commands convert `SIGTERM` and `SIGINT`
+  into a fenced operation abort. Domain failure cleanup runs before the
+  scheduler releases the lease with reason `failed` and the CLI exits.
+- Successful `blocked` and `no_op` command results keep their exact domain
+  `reasonCode` under `WORKSTREAM_BLOCKED`; cycle continuation no longer hides
+  the underlying PostgreSQL no-op reason.
+- The repair preserves lifecycle rows, fencing, and
+  `research_runs_one_active_workstream_idx`. It does not delete active history,
+  disable the uniqueness constraint, or weaken paper/account safety gates.
+
 ## Option-Greek observability vertical slice (2026-07-18 checkpoint)
 
 - Implementation is complete on isolated branch `codex/option-greek-observability`

@@ -42,6 +42,7 @@ import {
   runPostgresScheduledCommand,
   type PostgresScheduledCommandOperationContext
 } from "./services/postgresScheduledCommandService.js";
+import { resolvePostgresSchedulerJob } from "./services/postgresSchedulerCommandRegistry.js";
 import {
   AUTONOMOUS_WORKER_EVENT_TYPES,
   decodeAutonomousWorkerStatePayload,
@@ -60,6 +61,28 @@ import { getTradingSafetyState } from "./services/tradingSafetyService.js";
 
 const command = process.argv[2];
 const rawArgs = process.argv.slice(3);
+const terminationController = new AbortController();
+const handleTermination = (signal: NodeJS.Signals) => {
+  const error = new Error(
+    `SCHEDULER_COMMAND_TERMINATED: received ${signal} before command completion.`
+  );
+  terminationController.abort(error);
+};
+const handleSigterm = () => handleTermination("SIGTERM");
+const handleSigint = () => handleTermination("SIGINT");
+let terminationHandlersInstalled = false;
+const installTerminationHandlers = () => {
+  if (terminationHandlersInstalled) return;
+  process.once("SIGTERM", handleSigterm);
+  process.once("SIGINT", handleSigint);
+  terminationHandlersInstalled = true;
+};
+const removeTerminationHandlers = () => {
+  if (!terminationHandlersInstalled) return;
+  process.removeListener("SIGTERM", handleSigterm);
+  process.removeListener("SIGINT", handleSigint);
+  terminationHandlersInstalled = false;
+};
 const args = Object.fromEntries(rawArgs.flatMap((entry, index) => {
   if (!entry.startsWith("--")) return [];
   const [key, inline] = entry.slice(2).split("=", 2);
@@ -471,8 +494,22 @@ const run = async (scheduledContext?: PostgresScheduledCommandOperationContext) 
 
 try {
   assertPostgresOnlyCliCommand(command);
-  await runPostgresScheduledCommand({ command, operation: run });
+  if (resolvePostgresSchedulerJob({
+    command,
+    action: String(args.action || ""),
+    subaction: String(args.subaction || ""),
+    sections: String(args.sections || "")
+  })) {
+    installTerminationHandlers();
+  }
+  await runPostgresScheduledCommand({
+    command,
+    externalSignal: terminationController.signal,
+    operation: run
+  });
+  removeTerminationHandlers();
 } catch (error) {
+  removeTerminationHandlers();
   if (error instanceof AlpacaOperationDeadlineError) {
     print({ error: { code: error.code, message: error.message }, deadline: error.metadata });
     process.exit(1);

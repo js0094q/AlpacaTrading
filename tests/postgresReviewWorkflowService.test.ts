@@ -6,6 +6,7 @@ import type { Pool } from "pg";
 import { loadDatabaseConfig } from "../src/lib/database/config.js";
 import { createPostgresPool } from "../src/lib/database/postgres.js";
 import { runPostgresMigrations } from "../src/lib/database/postgresMigrations.js";
+import { PAPER_EXPLORATION_V2_THRESHOLDS } from "../src/services/paperExplorationConfig.js";
 import { runPostgresReviewWorkflow } from "../src/services/postgresReviewWorkflowService.js";
 
 const fence = {
@@ -54,6 +55,7 @@ test("entry review persists signed PostgreSQL review and unconfirmed pending int
     fence,
     signingKey: "test-signing-key-with-sufficient-length",
     maxCandidates: 25,
+    explorationThresholds: PAPER_EXPLORATION_V2_THRESHOLDS,
     now: new Date("2026-07-20T22:00:00.000Z")
   });
 
@@ -64,7 +66,10 @@ test("entry review persists signed PostgreSQL review and unconfirmed pending int
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO order_intents")), true);
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO confirmation_evidence")), false);
   assert.equal(sql.some((statement) => /'created'/.test(statement) && statement.includes("order_intents")), true);
-  assert.equal(intentValues[13], 250);
+  assert.equal(
+    intentValues[13],
+    PAPER_EXPLORATION_V2_THRESHOLDS.maxOrderNotional
+  );
   assert.equal(candidateUpdateValues[1], "sized");
   assert.equal(candidateUpdateValues[2], "PAPER_ORDER_INTENT_CREATED");
   assert.match(sourceSql, /LIMIT 25$/);

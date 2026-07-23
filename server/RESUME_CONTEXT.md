@@ -33,6 +33,10 @@ shadow, mirror, fallback, or historical import command.
 12. Confirm the checkout is clean, the deployed SHA is exact, PostgreSQL is
     reachable, no application process has a SQLite file open, dashboard-control
     is healthy, and paper/live-off safety flags remain exact.
+13. Exercise one controlled service stop during an active workstream. Require
+    the workstream process group to exit before `worker_stopped`, its domain
+    lifecycle row to be terminal, its scheduler lease to be released, and the
+    following restart to acquire the lease without preflight recovery.
 
 Do not delete old SQLite files during this cutover. Deletion requires a later,
 separate confirmation that no process has them open and no supported runtime

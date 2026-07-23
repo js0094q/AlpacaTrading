@@ -31,6 +31,16 @@ run in separate process groups so timeout and worker-shutdown handling can send
 The worker emits `workstream_timeout` and `worker_stopping` events without
 changing research, market-data, review, or execution eligibility.
 
+Scheduler-registered CLI commands handle `SIGTERM` and `SIGINT` as cooperative
+abort requests. The abort reaches the fenced operation, the domain workflow
+terminalizes its current lifecycle row, and the scheduler releases its lease as
+failed before the command exits. The parent worker does not persist
+`worker_stopped` until the detached workstream process group is gone. Successful
+PostgreSQL `blocked` and `no_op` results retain their exact domain `reasonCode`
+beneath the stable `WORKSTREAM_BLOCKED` classification, so a completed cycle
+does not erase why a workstream performed no mutation. Lifecycle audit rows and
+the active-workstream uniqueness index remain intact.
+
 OPRA snapshot persistence commits symbol-scoped batches of at most 250 rows and
 immediately reads each exact identity back before the next batch begins. Each
 batch emits committed/readback counts, insert/update counts, query and pool

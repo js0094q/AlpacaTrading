@@ -72,6 +72,7 @@ type FakeState = {
   eventType: string;
   occurredAt: string;
   payload: Record<string, unknown>;
+  workstreamProcessGroupAlive?: boolean;
 };
 
 const readJsonLines = <T>(path: string): T[] => {
@@ -235,11 +236,22 @@ const command = process.argv[3];
 const args = process.argv.slice(4);
 if (command === "worker:state") {
   const value = (name) => args.find((entry) => entry.startsWith("--" + name + "="))?.slice(name.length + 3);
+  let workstreamProcessGroupAlive = false;
+  if (value("eventType") === "worker_stopped") {
+    try {
+      const commandPid = Number(require("node:fs").readFileSync(process.env.WORKER_COMMAND_PID_PATH, "utf8"));
+      process.kill(-commandPid, 0);
+      workstreamProcessGroupAlive = true;
+    } catch (error) {
+      if (error?.code !== "ESRCH" && error?.code !== "ENOENT") throw error;
+    }
+  }
   appendFileSync(process.env.WORKER_STATES_PATH, JSON.stringify({
     cycleId: value("cycleId"),
     eventType: value("eventType"),
     occurredAt: value("occurredAt"),
-    payload: JSON.parse(Buffer.from(value("payload"), "base64url").toString("utf8"))
+    payload: JSON.parse(Buffer.from(value("payload"), "base64url").toString("utf8")),
+    workstreamProcessGroupAlive
   }) + "\\n");
   process.stdout.write(JSON.stringify({ status: "persisted" }));
   process.exit(0);
@@ -504,6 +516,24 @@ test("expected closed-market readiness conditions defer without stopping the wor
   }
 });
 
+test("successful PostgreSQL no-op output preserves its exact blocked reason", () => {
+  const { result, states } = runWorker({
+    successCommand: "paper:portfolio:review",
+    successOutput: JSON.stringify({
+      status: "no_op",
+      code: "NO_OPEN_POSTGRES_POSITIONS"
+    })
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const completion = states.find((state) =>
+    state.eventType === "workstream_completed" &&
+    state.payload.workstream === "paper:portfolio:review"
+  );
+  assert.equal(completion?.payload.classification, "blocked");
+  assert.equal(completion?.payload.code, "WORKSTREAM_BLOCKED");
+  assert.equal(completion?.payload.reasonCode, "NO_OPEN_POSTGRES_POSITIONS");
+});
+
 test("a worker-state persistence failure is fatal before the workstream starts", () => {
   const { result, calls, states } = runWorker({ failStateEvent: "workstream_started" });
   assert.notEqual(result.status, 0, result.stderr || result.stdout);
@@ -632,9 +662,15 @@ test("SIGTERM emits worker_stopping and terminates the active workstream process
     assert.equal(stopping.signal, "SIGTERM");
     assert.equal(stopping.activeChildPid, commandPid);
     assert.equal(events.some((event) => event.event === "worker_stopped"), true);
+    const states = readJsonLines<FakeState>(worker.statesPath);
     assert.deepEqual(
-      readJsonLines<FakeState>(worker.statesPath).map((state) => state.eventType),
+      states.map((state) => state.eventType),
       ["cycle_started", "workstream_started", "worker_stopped"]
+    );
+    assert.equal(
+      states.at(-1)?.workstreamProcessGroupAlive,
+      false,
+      "worker_stopped must not be persisted while the workstream process group is alive"
     );
   } finally {
     worker.cleanup();

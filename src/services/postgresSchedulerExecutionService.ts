@@ -89,6 +89,7 @@ export type RunWithPostgresSchedulerLeaseInput<T> = {
   readonly correlationId?: string | null;
   readonly leaseDurationMs: number;
   readonly heartbeatIntervalMs: number;
+  readonly externalSignal?: AbortSignal;
   readonly operation: (
     context: PostgresSchedulerOperationContext
   ) => Promise<T>;
@@ -263,6 +264,24 @@ export const runWithPostgresSchedulerLease = async <T>(
   const heartbeatStop = new AbortController();
   const operationAbort = new AbortController();
   let heartbeatFailure: PostgresSchedulerExecutionError | undefined;
+  let terminationFailure: PostgresSchedulerExecutionError | undefined;
+  const abortForExternalTermination = () => {
+    terminationFailure = new PostgresSchedulerExecutionError(
+      "SCHEDULER_COMMAND_TERMINATED",
+      "The scheduled PostgreSQL command was terminated before completion.",
+      input.externalSignal?.reason
+    );
+    operationAbort.abort(terminationFailure);
+  };
+  if (input.externalSignal?.aborted) {
+    abortForExternalTermination();
+  } else {
+    input.externalSignal?.addEventListener(
+      "abort",
+      abortForExternalTermination,
+      { once: true }
+    );
+  }
 
   const heartbeatLoop = async () => {
     while (!heartbeatStop.signal.aborted) {
@@ -352,6 +371,13 @@ export const runWithPostgresSchedulerLease = async <T>(
   } finally {
     heartbeatStop.abort();
     await heartbeatPromise;
+    input.externalSignal?.removeEventListener(
+      "abort",
+      abortForExternalTermination
+    );
+  }
+  if (terminationFailure && operationError === undefined) {
+    operationError = terminationFailure;
   }
 
   const releasedAt = now();
@@ -410,6 +436,7 @@ export const runWithPostgresSchedulerLease = async <T>(
 
   if (heartbeatFailure) throw heartbeatFailure;
   if (releaseFailure) throw releaseFailure;
+  if (terminationFailure) throw terminationFailure;
   if (operationError !== undefined) throw operationError;
   return value as T;
 };

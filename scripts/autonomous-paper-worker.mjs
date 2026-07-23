@@ -104,6 +104,18 @@ const processGroupExists = (child) => {
   }
 };
 
+const waitForProcessGroupExit = (child) =>
+  new Promise((resolve) => {
+    const check = () => {
+      if (!processGroupExists(child)) {
+        resolve();
+        return;
+      }
+      setTimeout(check, 25);
+    };
+    check();
+  });
+
 const codedError = (code) => {
   const error = new Error(code);
   error.code = code;
@@ -338,47 +350,68 @@ const runNpmCommand = (
     }, timeoutMs);
     timeout.unref?.();
     child.once("close", (code) => {
-      if (settled) return;
-      settled = true;
-      if (purpose === "workstream" && workstreamContext && stdoutLineBuffer) {
-        forwardWorkstreamTelemetryLine(
-          stdoutLineBuffer,
-          workstreamContext,
-          child.pid
-        );
-      }
-      if (heartbeat) clearInterval(heartbeat);
-      clearTimeout(timeout);
-      if (forceKillTimer) {
+      void (async () => {
+        if (settled) return;
+        settled = true;
+        if (purpose === "workstream" && workstreamContext && stdoutLineBuffer) {
+          forwardWorkstreamTelemetryLine(
+            stdoutLineBuffer,
+            workstreamContext,
+            child.pid
+          );
+        }
+        if (heartbeat) clearInterval(heartbeat);
+        clearTimeout(timeout);
+        if (forceKillTimer) {
+          if (purpose === "workstream" && processGroupExists(child)) {
+            forceKillTimer.ref?.();
+          } else {
+            clearTimeout(forceKillTimer);
+            forceKillTimer = null;
+          }
+        }
+        if (shutdownForceKillTimer && shutdownForceKillChild === child) {
+          if (processGroupExists(child)) {
+            shutdownForceKillTimer.ref?.();
+          } else {
+            clearTimeout(shutdownForceKillTimer);
+            shutdownForceKillTimer = null;
+            shutdownForceKillChild = null;
+          }
+        }
         if (purpose === "workstream" && processGroupExists(child)) {
-          forceKillTimer.ref?.();
-        } else {
+          await waitForProcessGroupExit(child);
+        }
+        if (forceKillTimer) {
           clearTimeout(forceKillTimer);
           forceKillTimer = null;
         }
-      }
-      if (shutdownForceKillTimer && shutdownForceKillChild === child) {
-        if (processGroupExists(child)) {
-          shutdownForceKillTimer.ref?.();
-        } else {
+        if (shutdownForceKillTimer && shutdownForceKillChild === child) {
           clearTimeout(shutdownForceKillTimer);
           shutdownForceKillTimer = null;
           shutdownForceKillChild = null;
         }
-      }
-      if (activeChild === child) {
-        activeChild = null;
-        activeChildPurpose = null;
-      }
-      resolve({
-        exitCode: Number.isInteger(code) ? code : 1,
-        durationMs: Date.now() - startedAt,
-        output: `${stdout}\n${stderr}`,
-        spawnError,
-        timedOut
-      });
+        if (activeChild === child) {
+          activeChild = null;
+          activeChildPurpose = null;
+        }
+        resolve({
+          exitCode: Number.isInteger(code) ? code : 1,
+          durationMs: Date.now() - startedAt,
+          output: `${stdout}\n${stderr}`,
+          spawnError,
+          timedOut
+        });
+      })();
     });
   });
+
+const structuredReasonCode = (output) => {
+  const matches = [...output.matchAll(
+    /"(?:code|reasonCode)"\s*:\s*"([A-Z][A-Z0-9_]+)"/g
+  )];
+  return matches.at(-1)?.[1] ?? null;
+};
 
 const classify = ({ exitCode, output, spawnError, timedOut }) => {
   if (spawnError) return { classification: "runner_unavailable", code: "WORKSTREAM_RUNNER_UNAVAILABLE" };
@@ -388,7 +421,11 @@ const classify = ({ exitCode, output, spawnError, timedOut }) => {
       return { classification: "failed", code: "WORKSTREAM_COMMAND_FAILED" };
     }
     if (/"status"\s*:\s*"(blocked|no_op)"|NO_CANDIDATE|NO_RUNTIME_CANDIDATES/i.test(output)) {
-      return { classification: "blocked", code: "WORKSTREAM_BLOCKED" };
+      return {
+        classification: "blocked",
+        code: "WORKSTREAM_BLOCKED",
+        reasonCode: structuredReasonCode(output)
+      };
     }
     if (/"status"\s*:\s*"skipped"/i.test(output)) {
       return { classification: "skipped", code: "WORKSTREAM_SKIPPED" };
