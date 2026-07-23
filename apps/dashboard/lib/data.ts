@@ -945,7 +945,6 @@ export const latestHedgeLearningStatus = async () => {
 };
 
 export const buildCachedDashboardSnapshot = async (): Promise<DashboardSnapshot> => {
-<
   const state = assertPaperDashboardAccess();
 
   const [account, positions, openOrders, latestResearch, latestPlans, executions, snapshots, requestIds, optionContracts] =
