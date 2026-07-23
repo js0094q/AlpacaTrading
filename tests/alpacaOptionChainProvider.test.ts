@@ -68,6 +68,44 @@ test("option contract pagination consumes every Alpaca page when no result cap i
   });
 });
 
+test("option contract requests abort immediately when the scheduler cancels the operation", async () => {
+  const previous = globalThis.fetch;
+  const cancellation = new AbortController();
+  const cancellationError = new Error("SCHEDULER_COMMAND_TERMINATED:test cancellation");
+  let requestStarted = false;
+  globalThis.fetch = (async (
+    _input: string | URL | Request,
+    init?: RequestInit
+  ) => new Promise<Response>((resolve, reject) => {
+    requestStarted = true;
+    const timer = setTimeout(() => {
+      resolve(new Response(JSON.stringify({
+        option_contracts: [],
+        next_page_token: null
+      }), { status: 200 }));
+    }, 75);
+    init?.signal?.addEventListener("abort", () => {
+      clearTimeout(timer);
+      reject(init.signal?.reason);
+    }, { once: true });
+  })) as typeof fetch;
+
+  try {
+    const request = fetchOptionContracts({
+      underlyingSymbols: ["SPY"],
+      expirationDate: "2026-07-24",
+      status: "active",
+      limit: null,
+      signal: cancellation.signal
+    });
+    while (!requestStarted) await new Promise((resolve) => setImmediate(resolve));
+    cancellation.abort(cancellationError);
+    await assert.rejects(request, (error: unknown) => error === cancellationError);
+  } finally {
+    globalThis.fetch = previous;
+  }
+});
+
 test("OPRA option-chain pagination consumes all pages, retains provenance, and deduplicates contracts", async () => {
   await withMockedFetch([
     {

@@ -249,6 +249,7 @@ export const refreshPostgresMarketData = async (input: {
   readonly now?: Date;
   readonly maxBarAgeHours?: number;
   readonly maxOptionSnapshotAgeSeconds?: number;
+  readonly signal?: AbortSignal;
   readonly repository?: MarketDataWriter;
   readonly context: FencedPostgresRepositoryContext;
   readonly dependencies?: Partial<MarketDataDependencies>;
@@ -283,7 +284,8 @@ export const refreshPostgresMarketData = async (input: {
     timeframe: input.timeframe as never,
     start: input.start,
     end: input.end,
-    feed: "sip"
+    feed: "sip",
+    signal: input.signal
   });
   const barRows: PostgresMarketBar[] = fetchedBars.flatMap((entry) => {
     const open = number(entry.bar.o);
@@ -325,7 +327,8 @@ export const refreshPostgresMarketData = async (input: {
   const fetchedStocks = await dependencies.fetchStockSnapshots({
     symbols: requestedSymbols,
     feed: "sip",
-    currency: "USD"
+    currency: "USD",
+    signal: input.signal
   });
   const stockRows: PostgresStockSnapshot[] = [];
   for (const symbol of requestedSymbols) {
@@ -387,7 +390,8 @@ export const refreshPostgresMarketData = async (input: {
         minDaysToExpiration: 0,
         maxDaysToExpiration: 730,
         status: "active",
-        limit: null
+        limit: null,
+        signal: input.signal
       });
       for (const raw of rawContracts) {
         const row = contractRow(raw, nowIso);
@@ -431,8 +435,16 @@ export const refreshPostgresMarketData = async (input: {
       const requestStartedAt = nowIso;
       let chain: Awaited<ReturnType<typeof fetchOptionChainSnapshots>>;
       try {
-        chain = await dependencies.fetchOptionChainSnapshots(underlying, { feed: optionFeed });
+        chain = await dependencies.fetchOptionChainSnapshots(underlying, {
+          feed: optionFeed,
+          signal: input.signal
+        });
       } catch (error) {
+        if (input.signal?.aborted) {
+          throw input.signal.reason instanceof Error
+            ? input.signal.reason
+            : new Error("SCHEDULER_COMMAND_TERMINATED: market-data refresh cancelled.");
+        }
         const providerCode = error instanceof Error
           ? error.message.split(":", 1)[0]
           : "OPTION_PROVIDER_REQUEST_FAILED";

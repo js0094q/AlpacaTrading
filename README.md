@@ -27,15 +27,20 @@ uniqueness contract across continuously refreshed market evidence.
 Each running workstream emits a structured `workstream_heartbeat` event every
 30 seconds with its cycle, position, child PID, and elapsed time. Workstreams
 run in separate process groups so timeout and worker-shutdown handling can send
-`SIGTERM`, then escalate the surviving group to `SIGKILL` after five seconds.
-The worker emits `workstream_timeout` and `worker_stopping` events without
-changing research, market-data, review, or execution eligibility.
+`SIGTERM`, then escalate the surviving group to `SIGKILL` after a bounded
+20-second default grace period. `AUTONOMOUS_WORKER_FORCE_KILL_DELAY_MS` may
+configure 1–25 seconds for controlled tests or operations while remaining below
+the unit's 30-second stop timeout. The worker emits `workstream_timeout` and
+`worker_stopping` events without changing research, market-data, review, or
+execution eligibility.
 
 Scheduler-registered CLI commands handle `SIGTERM` and `SIGINT` as cooperative
-abort requests. The abort reaches the fenced operation, the domain workflow
-terminalizes its current lifecycle row, and the scheduler releases its lease as
-failed before the command exits. The parent worker does not persist
-`worker_stopped` until the detached workstream process group is gone. Successful
+abort requests. Research propagates that abort through SIP/OPRA provider
+requests; a cancelled request is rethrown and is never downgraded to optional
+provider unavailability. The domain workflow terminalizes its current lifecycle
+row, and the scheduler releases its lease as failed before the command exits.
+The parent worker does not persist `worker_stopped` until the detached
+workstream process group is gone. Successful
 PostgreSQL `blocked` and `no_op` results retain their exact domain `reasonCode`
 beneath the stable `WORKSTREAM_BLOCKED` classification, so a completed cycle
 does not erase why a workstream performed no mutation. Lifecycle audit rows and

@@ -620,6 +620,7 @@ export const runPostgresResearchWorkflow = async (input: {
   optionsEnabled: boolean;
   maxCandidates: number;
   now?: Date;
+  signal?: AbortSignal;
   dependencies?: Partial<ResearchDependencies>;
   explorationThresholds?: PaperExplorationThresholds;
   emitTelemetry?: (event: Record<string, unknown>) => void;
@@ -690,6 +691,7 @@ export const runPostgresResearchWorkflow = async (input: {
       end: nowIso,
       optionsEnabled: input.optionsEnabled,
       now,
+      signal: input.signal,
       repository,
       context
     });

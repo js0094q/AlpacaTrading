@@ -421,6 +421,7 @@ const run = async (scheduledContext?: PostgresScheduledCommandOperationContext) 
       riskProfile,
       optionsEnabled: ["true", "1"].includes(String(args.optionsEnabled).toLowerCase()),
       maxCandidates,
+      signal: context.signal,
       emitTelemetry: emitRuntimeTelemetry
     });
     print({ ...paperEnvelope(), command, ...result });

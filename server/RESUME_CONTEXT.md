@@ -36,7 +36,9 @@ shadow, mirror, fallback, or historical import command.
 13. Exercise one controlled service stop during an active workstream. Require
     the workstream process group to exit before `worker_stopped`, its domain
     lifecycle row to be terminal, its scheduler lease to be released, and the
-    following restart to acquire the lease without preflight recovery.
+    following restart to acquire the lease without preflight recovery. Confirm
+    the scheduler abort cancelled any in-flight SIP/OPRA request and the worker
+    remained inside the unit's 30-second stop timeout.
 
 Do not delete old SQLite files during this cutover. Deletion requires a later,
 separate confirmation that no process has them open and no supported runtime

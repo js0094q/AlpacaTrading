@@ -60,9 +60,16 @@ const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 const executeWithTimeout = async <T>(
   timeoutMs: number,
-  task: (signal: AbortSignal) => Promise<T>
+  task: (signal: AbortSignal) => Promise<T>,
+  parentSignal?: AbortSignal
 ): Promise<T> => {
   const controller = new AbortController();
+  const abortFromParent = () => controller.abort(parentSignal?.reason);
+  if (parentSignal?.aborted) {
+    abortFromParent();
+  } else {
+    parentSignal?.addEventListener("abort", abortFromParent, { once: true });
+  }
   const timeout = setTimeout(() => {
     controller.abort();
   }, timeoutMs);
@@ -71,11 +78,19 @@ const executeWithTimeout = async <T>(
     return await task(controller.signal);
   } finally {
     clearTimeout(timeout);
+    parentSignal?.removeEventListener("abort", abortFromParent);
   }
 };
 
 const isAbortError = (error: unknown) =>
   error instanceof DOMException && error.name === "AbortError";
+
+const cancellationReason = (signal?: AbortSignal | null) => {
+  if (!signal?.aborted) return null;
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new Error("SCHEDULER_COMMAND_TERMINATED: market-data request cancelled.");
+};
 
 const normalizeBarsPayload = (
   value: unknown
@@ -109,20 +124,25 @@ const requestJson = async <T>(
 
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
     try {
-      response = await executeWithTimeout(timeoutMs, (signal) =>
-        fetch(`${apiRoot}${endpoint}`, {
-          ...options,
-          headers: {
-            ...(options.headers || {}),
-            ...getAuthHeaders(),
-            "Content-Type": "application/json",
-            "User-Agent": marketConfig.userAgent
-          },
-          signal
-        })
+      response = await executeWithTimeout(
+        timeoutMs,
+        (signal) =>
+          fetch(`${apiRoot}${endpoint}`, {
+            ...options,
+            headers: {
+              ...(options.headers || {}),
+              ...getAuthHeaders(),
+              "Content-Type": "application/json",
+              "User-Agent": marketConfig.userAgent
+            },
+            signal
+          }),
+        options.signal ?? undefined
       );
       break;
     } catch (error) {
+      const cancellation = cancellationReason(options.signal);
+      if (cancellation) throw cancellation;
       lastError = isAbortError(error)
         ? new Error(`Alpaca request timed out after ${timeoutMs}ms.`)
         : error;
@@ -189,6 +209,7 @@ export interface ProviderOptions {
   end?: string;
   feed?: string;
   pageToken?: string | null;
+  signal?: AbortSignal;
 }
 
 export interface OptionChainFilters {
@@ -202,6 +223,7 @@ export interface OptionChainFilters {
   maxDelta?: number | null;
   status?: "active" | "inactive" | null;
   limit?: number | null;
+  signal?: AbortSignal;
 }
 
 export interface OptionContractRaw {
@@ -480,7 +502,7 @@ export const fetchBars = async (options: ProviderOptions): Promise<{ symbol: str
   const endpoint = `/v2/stocks/bars${params ? `?${params}` : ""}`;
   const response = await requestJson<{ bars?: Record<string, RawBar[]>; next_page_token?: string }>(
     endpoint,
-    { method: "GET" }
+    { method: "GET", signal: options.signal }
   );
   const bars = response.data.bars || {};
   return Object.entries(bars).map(([symbol, rows]) => ({
@@ -520,7 +542,7 @@ export const fetchAllBars = async (
     });
     const response = await requestJson<{ bars?: Record<string, RawBar[]>; next_page_token?: string }>(
       `/v2/stocks/bars${params ? `?${params}` : ""}`,
-      { method: "GET" }
+      { method: "GET", signal: options.signal }
     );
     const bars = normalizeBarsPayload(response.data?.bars);
     const hasBars = Object.values(bars).some((rows) => rows.length > 0);
@@ -580,7 +602,7 @@ export const fetchOptionContracts = async (
       contracts?: OptionContractRaw[];
       next_page_token?: string | null;
       page_token?: string | null;
-    }>(endpoint, { method: "GET" }, "trade");
+    }>(endpoint, { method: "GET", signal: filters.signal }, "trade");
     const retrievedAt = new Date().toISOString();
     const pageContracts = parseOptionContractPayload(response.data).map((contract) => ({
       ...contract,
@@ -637,7 +659,8 @@ export const fetchOptionContracts = async (
 };
 
 export const fetchOptionSnapshots = async (
-  optionSymbols: string[]
+  optionSymbols: string[],
+  options: { signal?: AbortSignal } = {}
 ): Promise<{ symbol: string; raw: OptionSnapshotRaw }[]> => {
   if (!optionSymbols.length) {
     return [];
@@ -650,7 +673,7 @@ export const fetchOptionSnapshots = async (
       symbols: chunk.join(","),
       feed: marketConfig.optionDataFeed
     })}`;
-    const response = await requestJson<unknown>(endpoint);
+    const response = await requestJson<unknown>(endpoint, { signal: options.signal });
     results.push(
       ...parseOptionSnapshotPayload(response.data).map((row) => ({
         symbol: row.symbol,
@@ -663,7 +686,7 @@ export const fetchOptionSnapshots = async (
 
 export const fetchOptionChainSnapshots = async (
   underlyingSymbol: string,
-  options: { feed?: string } = {}
+  options: { feed?: string; signal?: AbortSignal } = {}
 ): Promise<FetchedOptionChain> => {
   const normalizedUnderlying = underlyingSymbol.trim().toUpperCase();
   if (!normalizedUnderlying) {
@@ -697,7 +720,7 @@ export const fetchOptionChainSnapshots = async (
       options?: Record<string, OptionSnapshotRaw>;
       feed?: string | null;
       next_page_token?: string | null;
-    }> = await requestJson(endpoint, { method: "GET" });
+    }> = await requestJson(endpoint, { method: "GET", signal: options.signal });
     const observedFeed = typeof response.data.feed === "string"
       ? response.data.feed.trim().toLowerCase()
       : null;
@@ -746,7 +769,8 @@ export const fetchOptionChainSnapshots = async (
 };
 
 export const fetchOptionQuotes = async (
-  optionSymbols: string[]
+  optionSymbols: string[],
+  options: { signal?: AbortSignal } = {}
 ): Promise<{ symbol: string; raw: OptionQuoteRaw }[]> => {
   if (!optionSymbols.length) {
     return [];
@@ -759,7 +783,7 @@ export const fetchOptionQuotes = async (
       symbols: chunk.join(","),
       feed: marketConfig.optionDataFeed
     })}`;
-    const response = await requestJson<unknown>(endpoint);
+    const response = await requestJson<unknown>(endpoint, { signal: options.signal });
     results.push(
       ...parseOptionQuotePayload(response.data).map((row) => ({
         symbol: row.symbol,
@@ -785,6 +809,7 @@ export const fetchStockSnapshots = async (input: {
   symbols: string[];
   feed: string;
   currency?: string;
+  signal?: AbortSignal;
 }): Promise<FetchedStockSnapshot[]> => {
   const symbols = Array.from(
     new Set(input.symbols.map((symbol) => symbol.trim().toUpperCase()).filter(Boolean))
@@ -802,7 +827,10 @@ export const fetchStockSnapshots = async (input: {
       currency
     })}`;
     try {
-      const response = await requestJson<unknown>(endpoint, { method: "GET" });
+      const response = await requestJson<unknown>(endpoint, {
+        method: "GET",
+        signal: input.signal
+      });
       const retrievedAt = new Date().toISOString();
       const snapshots = parseStockSnapshotPayload(response.data);
       for (const symbol of chunk) {
@@ -818,7 +846,9 @@ export const fetchStockSnapshots = async (input: {
           ...(raw ? {} : { error: "SOURCE_SYMBOL_MISSING" as const })
         });
       }
-    } catch {
+    } catch (error) {
+      const cancellation = cancellationReason(input.signal);
+      if (cancellation) throw cancellation;
       for (const symbol of chunk) {
         const retrievedAt = new Date().toISOString();
         results.push({

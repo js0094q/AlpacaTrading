@@ -5,8 +5,14 @@
 - The autonomous worker now waits for the complete detached workstream process
   group to exit before persisting `worker_stopped`.
 - Scheduler-registered PostgreSQL CLI commands convert `SIGTERM` and `SIGINT`
-  into a fenced operation abort. Domain failure cleanup runs before the
-  scheduler releases the lease with reason `failed` and the CLI exits.
+  into a fenced operation abort. Research passes that signal through SIP bars,
+  SIP stock snapshots, option-contract discovery, and OPRA chain requests;
+  cancellation is rethrown instead of becoming degraded option availability.
+  Domain failure cleanup runs before the scheduler releases the lease with
+  reason `failed` and the CLI exits.
+- The worker gives cooperative domain and lease cleanup a bounded 20-second
+  default grace period before process-group `SIGKILL`, below systemd's
+  30-second `TimeoutStopSec`.
 - Successful `blocked` and `no_op` command results keep their exact domain
   `reasonCode` under `WORKSTREAM_BLOCKED`; cycle continuation no longer hides
   the underlying PostgreSQL no-op reason.

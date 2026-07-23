@@ -37,6 +37,8 @@ const target = {
 test("research persists current PostgreSQL evidence and selected candidates before completing", async () => {
   const sql: string[] = [];
   let candidateValues: readonly unknown[] = [];
+  const cancellation = new AbortController();
+  let observedSignal: AbortSignal | undefined;
   const result = await runPostgresResearchWorkflow({
     query: {
       query: async (statement: string, values?: readonly unknown[]) => {
@@ -53,17 +55,21 @@ test("research persists current PostgreSQL evidence and selected candidates befo
     optionsEnabled: false,
     maxCandidates: 10,
     now: new Date("2026-07-20T22:00:00.000Z"),
+    signal: cancellation.signal,
     dependencies: {
-      refreshMarketData: async () => ({
-        bars: [bar],
-        stockSnapshots: [{
-          id: "stock-1", symbol: "SPY", observedAt: "2026-07-20T22:00:00.000Z",
-          sourceTimestamp: "2026-07-20T20:00:00.000Z", requestedFeed: "sip",
-          effectiveFeed: "sip", source: "alpaca", requestId: "stock-request",
-          evidence: { symbol: "SPY", marketReferencePrice: 555 }
-        }],
-        optionContracts: [], optionSnapshots: [], summary: { symbolCount: 1 }
-      }) as never,
+      refreshMarketData: async (input) => {
+        observedSignal = input.signal;
+        return {
+          bars: [bar],
+          stockSnapshots: [{
+            id: "stock-1", symbol: "SPY", observedAt: "2026-07-20T22:00:00.000Z",
+            sourceTimestamp: "2026-07-20T20:00:00.000Z", requestedFeed: "sip",
+            effectiveFeed: "sip", source: "alpaca", requestId: "stock-request",
+            evidence: { symbol: "SPY", marketReferencePrice: 555 }
+          }],
+          optionContracts: [], optionSnapshots: [], summary: { symbolCount: 1 }
+        } as never;
+      },
       buildFeaturesAndTargets: async () => ({
         features: [{
           symbol: "SPY", observedAt: bar.observedAt,
@@ -80,6 +86,7 @@ test("research persists current PostgreSQL evidence and selected candidates befo
   });
 
   assert.equal(result.status, "completed");
+  assert.equal(observedSignal, cancellation.signal);
   assert.equal(result.candidatesSelected, 1);
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO research_evidence")), true);
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO candidates")), true);

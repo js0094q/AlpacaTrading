@@ -591,6 +591,72 @@ test("an unavailable OPRA endpoint records the failure and does not block curren
   });
 });
 
+test("scheduler cancellation is rethrown instead of being degraded to unavailable OPRA data", async () => {
+  const cancellation = new AbortController();
+  const cancellationError = new Error("SCHEDULER_COMMAND_TERMINATED:test cancellation");
+  cancellation.abort(cancellationError);
+
+  await assert.rejects(
+    refreshPostgresMarketData({
+      symbols: ["SPY"],
+      timeframe: "1Day",
+      start: "2026-01-01T00:00:00.000Z",
+      end: "2026-07-20T23:59:59.999Z",
+      optionsEnabled: true,
+      now: new Date("2026-07-20T20:05:00.000Z"),
+      signal: cancellation.signal,
+      repository: {
+        upsertUniverseSymbols: async (rows: unknown[]) => ({ stored: rows.length }),
+        upsertBars: async (rows: unknown[]) => ({ stored: rows.length }),
+        upsertStockSnapshots: async (rows: unknown[]) => ({ stored: rows.length }),
+        upsertOptionContracts: async (rows: unknown[]) => ({ stored: rows.length }),
+        upsertOptionSnapshots: async (rows: unknown[]) => ({ stored: rows.length }),
+        listOptionContractsBySymbols: async () => [],
+        listOptionSnapshotsByIdentity: async () => []
+      } as never,
+      context,
+      dependencies: {
+        fetchAllBars: async () => [{
+          symbol: "SPY",
+          bar: {
+            t: "2026-07-20T20:00:00.000Z",
+            o: 620,
+            h: 625,
+            l: 618,
+            c: 624,
+            v: 1_000_000
+          },
+          requestIds: ["request-bars"]
+        }],
+        fetchStockSnapshots: async () => [{
+          symbol: "SPY",
+          raw: stockRaw,
+          requestedFeed: "sip",
+          effectiveFeed: "sip",
+          currency: "USD",
+          requestId: "request-stocks"
+        }],
+        fetchOptionContracts: async () => [{
+          symbol: "SPY260720C00625000",
+          underlying_symbol: "SPY",
+          type: "call",
+          expiration_date: "2026-07-20",
+          strike_price: "625",
+          multiplier: "100",
+          status: "active",
+          tradable: true
+        }],
+        fetchOptionSnapshots: async () => [],
+        fetchOptionChainSnapshots: async (_underlying, options) => {
+          assert.equal(options?.signal, cancellation.signal);
+          throw cancellationError;
+        }
+      }
+    }),
+    (error: unknown) => error === cancellationError
+  );
+});
+
 test("refresh ingests complete OPRA chains per underlying and persists documented fields without synthetic defaults", async () => {
   const contractCalls: string[][] = [];
   const chainCalls: string[] = [];
