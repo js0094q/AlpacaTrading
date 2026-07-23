@@ -274,12 +274,12 @@ describe("Phase 1B decision identity migration", () => {
     assert.deepEqual(report.missingIndexes, []);
   });
 
-  test("package exposes explicit database migration and verification commands", () => {
+  test("SQLite schema verification remains test-only and has no runtime command", () => {
     const packageJson = JSON.parse(
       readFileSync(join(process.cwd(), "package.json"), "utf8")
     ) as { scripts: Record<string, string> };
-    assert.equal(packageJson.scripts["db:migrate"], "tsx src/cli.ts db:migrate");
-    assert.equal(packageJson.scripts["db:verify"], "tsx src/cli.ts db:verify");
+    assert.equal(packageJson.scripts["db:migrate"], undefined);
+    assert.equal(packageJson.scripts["db:verify"], undefined);
     assert.match(
       packageJson.scripts.pretest,
       /tests\/marketDecisionTraceability\.test\.ts/

@@ -109,7 +109,6 @@ import {
   getAutonomousRecoveryStatus
 } from "./services/autonomousRecoveryService.js";
 import { config } from "./config.js";
-import { getResearchDbPath } from "./lib/db.js";
 import { redactSensitiveData } from "./lib/securityRedaction.js";
 import { normalizeSymbol } from "./lib/utils.js";
 import { AlpacaApiError } from "./services/alpacaClient.js";
@@ -129,10 +128,6 @@ import {
   executeReviewedPaperHedgeExit
 } from "./services/hedgeExitService.js";
 import { evaluateHedgeLearning } from "./services/hedgeLearningLifecycleService.js";
-import {
-  migrateDatabaseFile,
-  verifyDatabaseFile
-} from "./services/databaseMaintenanceService.js";
 import {
   databaseConfigDiagnostics,
   loadDatabaseConfig
@@ -157,17 +152,11 @@ import {
 } from "./services/zeroDte/zeroDteEngineService.js";
 import { reviewZeroDteExits } from "./services/zeroDte/zeroDteExitService.js";
 import { runPostgresScheduledCommand } from "./services/postgresScheduledCommandService.js";
+import { assertPostgresOnlyCliCommand } from "./lib/database/postgresOnlyRuntime.js";
 import {
-  assertDurableControlPlaneCheckpoint,
-  backfillControlPlaneSnapshot,
-  createReadConsistentSqliteSnapshot,
-  reconcileControlPlaneSnapshot
-} from "./services/controlPlaneMigrationService.js";
-import {
-  assertDurableExecutionStateCheckpoint,
-  backfillExecutionStateSnapshot,
-  reconcileExecutionStateSnapshot
-} from "./services/executionStateMigrationService.js";
+  readPostgresAuthorityStatus,
+  runPostgresAuthorityCutover
+} from "./services/postgresAuthorityCutoverService.js";
 
 const parseArg = (input: string): Record<string, string> | null => {
   const [rawKey, rawValue] = input.split("=", 2);
@@ -329,6 +318,7 @@ const formatPadded = (
 const buildSafeBoolean = (value?: boolean) => (value ? "true" : "false");
 
 const run = async () => {
+  assertPostgresOnlyCliCommand(command);
   const packagedControlPlaneCommands = new Set([
     "db:postgres:control-plane:snapshot",
     "db:postgres:control-plane:backfill",
@@ -433,7 +423,33 @@ const run = async () => {
     return;
   }
 
+  if (command === "db:postgres:authority:cutover") {
+    const result = await runPostgresAuthorityCutover();
+    print(result);
+    if (result.status !== "passed") process.exitCode = 1;
+    return;
+  }
+
+  if (command === "db:postgres:authority:status") {
+    const databaseConfig = loadDatabaseConfig(process.env, { purpose: "application" });
+    const pool = createPostgresPool(databaseConfig, "pooled");
+    try {
+      print({
+        config: databaseConfigDiagnostics(databaseConfig),
+        authority: await readPostgresAuthorityStatus(pool)
+      });
+    } finally {
+      await pool.end();
+    }
+    return;
+  }
+
   if (command === "db:postgres:control-plane:snapshot") {
+    const [{ createReadConsistentSqliteSnapshot }, { getResearchDbPath }] =
+      await Promise.all([
+        import("./services/controlPlaneMigrationService.js"),
+        import("./lib/db.js")
+      ]);
     const timestamp = new Date().toISOString().replace(/[-:.]/g, "");
     const destinationDirectory =
       args.destination ||
@@ -457,6 +473,8 @@ const run = async () => {
   }
 
   if (command === "db:postgres:control-plane:backfill") {
+    const { backfillControlPlaneSnapshot } =
+      await import("./services/controlPlaneMigrationService.js");
     if (!args.snapshot) throw new Error("CONTROL_PLANE_SNAPSHOT_PATH_REQUIRED");
     const databaseConfig = loadDatabaseConfig(
       { ...process.env, DATABASE_BACKEND: "postgres" },
@@ -505,6 +523,10 @@ const run = async () => {
     command === "db:postgres:control-plane:reconcile" ||
     command === "db:postgres:control-plane:shadow"
   ) {
+    const {
+      assertDurableControlPlaneCheckpoint,
+      reconcileControlPlaneSnapshot
+    } = await import("./services/controlPlaneMigrationService.js");
     if (!args.snapshot) throw new Error("CONTROL_PLANE_SNAPSHOT_PATH_REQUIRED");
     const databaseConfig = loadDatabaseConfig(
       { ...process.env, DATABASE_BACKEND: "postgres" },
@@ -617,6 +639,8 @@ const run = async () => {
   }
 
   if (command === "db:postgres:execution-state:backfill") {
+    const { backfillExecutionStateSnapshot } =
+      await import("./services/executionStateMigrationService.js");
     if (!args.snapshot) throw new Error("EXECUTION_STATE_SNAPSHOT_PATH_REQUIRED");
     const databaseConfig = loadDatabaseConfig(
       { ...process.env, DATABASE_BACKEND: "postgres" },
@@ -671,6 +695,8 @@ const run = async () => {
         checkpointMutationCount: backfill.checkpointMutationCount,
         mutationCount: backfill.mutationCount,
         idempotentReplay: backfill.idempotentReplay,
+        identityReuses: backfill.identityReuses,
+        mutableStateDifferences: backfill.mutableStateDifferences,
         durableBatchCheckpointCount,
         durableBatchCheckpointsVerified
       });
@@ -684,6 +710,10 @@ const run = async () => {
     command === "db:postgres:execution-state:reconcile" ||
     command === "db:postgres:execution-state:shadow"
   ) {
+    const {
+      assertDurableExecutionStateCheckpoint,
+      reconcileExecutionStateSnapshot
+    } = await import("./services/executionStateMigrationService.js");
     if (!args.snapshot) throw new Error("EXECUTION_STATE_SNAPSHOT_PATH_REQUIRED");
     const databaseConfig = loadDatabaseConfig(
       { ...process.env, DATABASE_BACKEND: "postgres" },
@@ -746,6 +776,8 @@ const run = async () => {
         tableComparisons: result.tableComparisons,
         discrepancyCount: result.discrepancyCount,
         discrepancyCategories: result.discrepancyCategories,
+        classifiedStateDifferences: result.classifiedStateDifferences,
+        authorityOnlyRows: result.authorityOnlyRows,
         duplicateCount: result.duplicateCount,
         orphanCount: result.orphanCount,
         lifecycleOrderingCount: result.lifecycleOrderingCount,
@@ -797,11 +829,13 @@ const run = async () => {
   }
 
   if (command === "db:migrate") {
+    const { migrateDatabaseFile } = await import("./services/databaseMaintenanceService.js");
     print(migrateDatabaseFile(args.database || undefined));
     return;
   }
 
   if (command === "db:verify") {
+    const { verifyDatabaseFile } = await import("./services/databaseMaintenanceService.js");
     print(verifyDatabaseFile(args.database || undefined));
     return;
   }

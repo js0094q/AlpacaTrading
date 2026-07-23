@@ -106,6 +106,19 @@ const metric = (label: string, value: string | number) => (
   </div>
 );
 
+export const formatLabel = (value: unknown): string => {
+  if (typeof value !== "string" || value.trim() === "") {
+    return "UNKNOWN";
+  }
+  return value.toUpperCase();
+};
+
+const normalizeStatus = (value: unknown): HedgeDashboardStatus =>
+  value === "current" || value === "monitoring" || value === "stale" ||
+  value === "expired" || value === "blocked"
+    ? value
+    : "blocked";
+
 const statusCopy = (status: HedgeDashboardStatus) => {
   if (status === "current") {
     return "Current recommendation";
@@ -212,7 +225,8 @@ export const HedgePanel = ({
     );
   }
 
-  const status = recommendation.effectiveStatus;
+  const rawStatus = recommendation.effectiveStatus as unknown;
+  const status = normalizeStatus(rawStatus);
   const scenarios = recommendation.risk?.scenarios ?? [];
   const trims = recommendation.leaps?.trimRecommendations ?? [];
   const candidates = recommendation.candidates ?? [];
@@ -243,7 +257,7 @@ export const HedgePanel = ({
           </p>
         </div>
         <span className={`hedge-status hedge-status-${status}`}>
-          {status.toUpperCase()}
+          {formatLabel(rawStatus)}
         </span>
       </div>
 

@@ -92,6 +92,109 @@ interface TableSpec {
   readonly accountColumn?: string;
 }
 
+interface UniqueIdentitySpec {
+  readonly columns: readonly string[];
+  readonly mutableColumns: readonly string[];
+}
+
+interface ForeignKeyAlias {
+  readonly column: string;
+  readonly parentTable: string;
+}
+
+export interface ExecutionStateIdentityReuse {
+  readonly table: string;
+  readonly sourceId: string;
+  readonly targetId: string;
+  readonly identityColumns: readonly string[];
+  readonly mutableDifferences: readonly string[];
+  readonly classification?: "provenance_only" | "mutable_singleton_advancement";
+}
+
+const uniqueIdentitySpecs: Readonly<Record<string, UniqueIdentitySpec>> = {
+  account_snapshots: {
+    columns: ["account_id", "snapshot_fingerprint"],
+    mutableColumns: ["observed_at", "created_at"]
+  },
+  buying_power_reservations: {
+    columns: ["account_id", "idempotency_key"],
+    mutableColumns: [
+      "status", "scheduler_job_name", "scheduler_fencing_token", "committed_at",
+      "released_at", "release_reason", "version", "updated_at"
+    ]
+  },
+  order_intents: {
+    columns: ["account_id", "idempotency_key"],
+    mutableColumns: [
+      "status", "ready_at", "submitted_at", "terminal_at", "version", "updated_at"
+    ]
+  }
+};
+
+const mutableStateColumnsByTable: Readonly<Record<string, readonly string[]>> = {
+  accounts: ["status", "version", "updated_at"],
+  account_snapshots: ["observed_at", "created_at"],
+  risk_limits: [
+    "status", "cash_reserve_amount", "cash_reserve_ratio", "max_deployment_amount",
+    "max_deployment_ratio", "max_gross_exposure", "max_net_exposure",
+    "max_open_order_exposure", "max_position_notional", "max_symbol_notional",
+    "max_position_count", "max_order_count", "config_version", "config_fingerprint",
+    "effective_from", "effective_to", "version", "updated_at"
+  ],
+  strategy_allocations: [
+    "status", "allocation_amount", "allocation_ratio", "reserved_amount",
+    "deployed_amount", "config_version", "config_fingerprint", "effective_from",
+    "effective_to", "version", "updated_at"
+  ],
+  portfolio_exposure: [
+    "gross_exposure", "net_exposure", "long_exposure", "short_exposure",
+    "open_order_exposure", "active_reservation_amount", "deployed_amount",
+    "cash_reserve_amount", "available_buying_power", "position_count",
+    "open_order_count", "observed_at"
+  ],
+  execution_reviews: ["status", "consumed_at", "version", "updated_at"],
+  confirmation_evidence: ["status", "consumed_at", "revoked_at", "version", "updated_at"],
+  buying_power_reservations: uniqueIdentitySpecs.buying_power_reservations.mutableColumns,
+  order_intents: uniqueIdentitySpecs.order_intents.mutableColumns,
+  orders: [
+    "status", "filled_quantity", "filled_average_price", "accepted_at", "filled_at",
+    "cancelled_at", "expired_at", "last_broker_update_at", "raw_status", "version",
+    "updated_at"
+  ],
+  positions: [
+    "status", "quantity", "available_quantity", "current_price", "market_value",
+    "unrealized_pnl", "realized_pnl", "closed_at", "last_reconciled_at", "version",
+    "updated_at"
+  ]
+};
+
+const foreignKeyAliases: Readonly<Record<string, readonly ForeignKeyAlias[]>> = {
+  portfolio_exposure: [
+    { column: "account_snapshot_id", parentTable: "account_snapshots" }
+  ],
+  buying_power_reservations: [
+    { column: "account_snapshot_id", parentTable: "account_snapshots" }
+  ],
+  order_intents: [
+    { column: "reservation_id", parentTable: "buying_power_reservations" }
+  ],
+  orders: [
+    { column: "order_intent_id", parentTable: "order_intents" }
+  ],
+  positions: [
+    { column: "opening_order_id", parentTable: "orders" },
+    { column: "closing_order_id", parentTable: "orders" },
+    { column: "source_account_snapshot_id", parentTable: "account_snapshots" }
+  ],
+  broker_events: [
+    { column: "order_id", parentTable: "orders" },
+    { column: "order_intent_id", parentTable: "order_intents" }
+  ],
+  lifecycle_fingerprints: [
+    { column: "order_intent_id", parentTable: "order_intents" }
+  ]
+};
+
 type NumericDefinition = Readonly<{ precision: number; scale: number }>;
 
 const money = { precision: 28, scale: 8 } as const;
@@ -340,6 +443,27 @@ const parseJson = (value: unknown): unknown => {
   return JSON.parse(value) as unknown;
 };
 
+const comparableAccountSnapshotEvidence = (value: unknown) => {
+  const parsed = parseJson(value);
+  if (!isRecord(parsed)) return canonicalJsonHash(parsed ?? null);
+  const hasMarketEvidenceFingerprint = Object.prototype.hasOwnProperty.call(
+    parsed,
+    "marketEvidenceFingerprint"
+  );
+  const marketEvidenceFingerprint = parsed.marketEvidenceFingerprint;
+  const { marketEvidenceFingerprint: _ignored, ...identityEvidence } = parsed;
+  return canonicalJsonHash({
+    identityEvidence,
+    marketEvidenceFingerprint: typeof marketEvidenceFingerprint === "string" &&
+      marketEvidenceFingerprint.trim()
+      ? "present"
+      : {
+          present: hasMarketEvidenceFingerprint,
+          value: marketEvidenceFingerprint ?? null
+        }
+  });
+};
+
 const stringValue = (value: unknown, code: string) => {
   if (typeof value !== "string" || !value.trim()) throw new Error(code);
   return value;
@@ -553,6 +677,450 @@ const normalizeJsonColumn = (row: TargetRow, spec: TableSpec) => {
           )
         : row[column] ?? null
   ]));
+};
+
+const comparableValue = (spec: TableSpec, column: string, value: unknown) => {
+  if (value === null || value === undefined) return null;
+  if (["accounts", "risk_limits", "strategy_allocations"].includes(spec.table) && column === "version") {
+    try {
+      return BigInt(String(value)).toString();
+    } catch {
+      return value;
+    }
+  }
+  if (spec.table === "account_snapshots" && column === "evidence") {
+    return comparableAccountSnapshotEvidence(value);
+  }
+  if (spec.jsonColumns?.includes(column)) return canonicalJsonHash(parseJson(value) ?? null);
+  const numeric = numericColumnsByTable[spec.table]?.[column];
+  if (numeric) {
+    return canonicalizePostgresNumeric(
+      value as number | string,
+      numeric.precision,
+      numeric.scale
+    );
+  }
+  if (value instanceof Date) return value.toISOString();
+  if (column.endsWith("_at") || column === "effective_from" || column === "effective_to") {
+    const parsed = Date.parse(String(value));
+    if (Number.isFinite(parsed)) return new Date(parsed).toISOString();
+  }
+  return value;
+};
+
+const rowDifferences = (
+  spec: TableSpec,
+  expected: TargetRow,
+  actual: TargetRow,
+  excludedColumns: ReadonlySet<string> = new Set()
+) => {
+  const mutableColumns = new Set(mutableStateColumnsByTable[spec.table] ?? []);
+  const material: string[] = [];
+  const mutable: string[] = [];
+  for (const column of spec.columns) {
+    if (excludedColumns.has(column)) continue;
+    const expectedComparable = comparableValue(spec, column, expected[column]);
+    const actualComparable = comparableValue(spec, column, actual[column]);
+    if (expectedComparable === actualComparable) {
+      if (
+        spec.table === "account_snapshots" &&
+        column === "evidence" &&
+        canonicalJsonHash(parseJson(expected[column]) ?? null) !==
+          canonicalJsonHash(parseJson(actual[column]) ?? null)
+      ) {
+        mutable.push("evidence.marketEvidenceFingerprint");
+      }
+      continue;
+    }
+    if (mutableColumns.has(column)) mutable.push(column);
+    else material.push(column);
+  }
+  return { material, mutable };
+};
+
+const accountPrimaryReplayClassification = (
+  expected: TargetRow,
+  actual: TargetRow
+): "reuse" | "stale" | "conflict" => {
+  let expectedVersion: bigint;
+  let actualVersion: bigint;
+  try {
+    expectedVersion = BigInt(String(expected.version));
+    actualVersion = BigInt(String(actual.version));
+  } catch {
+    return "conflict";
+  }
+  const expectedUpdatedAt = Date.parse(String(expected.updated_at));
+  const actualUpdatedAt = Date.parse(String(actual.updated_at));
+  if (!Number.isFinite(expectedUpdatedAt) || !Number.isFinite(actualUpdatedAt)) {
+    return "conflict";
+  }
+  if (actualVersion < expectedVersion || actualUpdatedAt < expectedUpdatedAt) {
+    return "stale";
+  }
+  if (actualVersion === expectedVersion && actualUpdatedAt === expectedUpdatedAt) {
+    return "conflict";
+  }
+  return "reuse";
+};
+
+const riskLimitIdentityColumns = [
+  "id", "account_id", "scope_type", "scope_key", "config_fingerprint"
+] as const;
+const riskLimitBaseIdentityColumns = [
+  "id", "account_id", "scope_type", "scope_key"
+] as const;
+
+const riskLimitPolicyColumns = [
+  "currency", "cash_reserve_amount", "cash_reserve_ratio", "max_deployment_amount",
+  "max_deployment_ratio", "max_gross_exposure", "max_net_exposure",
+  "max_open_order_exposure", "max_position_notional", "max_symbol_notional",
+  "max_position_count", "max_order_count", "config_version", "config_fingerprint"
+] as const;
+
+const riskLimitLifecycleColumns = ["status", "effective_to", "version"] as const;
+const riskLimitProvenanceColumns = ["effective_from", "created_at", "updated_at"] as const;
+
+type RiskLimitReplayClassification = Readonly<{
+  classification: "equivalent" | "provenance_only" | "conflict";
+  conflict?: "IDENTITY" | "POLICY" | "LIFECYCLE" | "MALFORMED" | "PROVENANCE_ORDER";
+  provenanceDifferences: readonly string[];
+}>;
+
+const positiveInteger = (value: unknown): string | null => {
+  if (
+    (typeof value !== "number" && typeof value !== "string") ||
+    !/^[0-9]+$/.test(String(value))
+  ) return null;
+  try {
+    const parsed = BigInt(String(value));
+    return parsed > 0n ? parsed.toString() : null;
+  } catch {
+    return null;
+  }
+};
+
+const riskLimitTimestamp = (value: unknown): number | null => {
+  if (value === null || value === undefined) return null;
+  const parsed = value instanceof Date ? value.getTime() : Date.parse(String(value));
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const validRiskLimitRow = (row: TargetRow) => {
+  const requiredStrings = [
+    "id", "account_id", "scope_type", "scope_key", "status", "currency",
+    "config_version", "config_fingerprint"
+  ];
+  if (requiredStrings.some((column) =>
+    typeof row[column] !== "string" || String(row[column]).trim() === ""
+  )) return false;
+  if (!["portfolio", "strategy", "symbol", "position"].includes(String(row.scope_type))) {
+    return false;
+  }
+  if (!["active", "superseded", "disabled"].includes(String(row.status))) return false;
+  if (!/^[A-Z]{3}$/.test(String(row.currency))) return false;
+  if (positiveInteger(row.version) === null) return false;
+  for (const column of ["max_position_count", "max_order_count"] as const) {
+    if (row[column] !== null && row[column] !== undefined && positiveInteger(row[column]) === null) {
+      return false;
+    }
+  }
+  try {
+    for (const [column, definition] of Object.entries(numericColumnsByTable.risk_limits ?? {})) {
+      const value = row[column];
+      if (value === null || value === undefined) continue;
+      const normalized = canonicalizePostgresNumeric(
+        value as number | string,
+        definition.precision,
+        definition.scale
+      );
+      if (normalized === null || Number(normalized) < 0) return false;
+      if (["cash_reserve_ratio", "max_deployment_ratio"].includes(column)) {
+        const ratioValue = Number(normalized);
+        if (!Number.isFinite(ratioValue) || ratioValue > 1) return false;
+      }
+    }
+  } catch {
+    return false;
+  }
+  const effectiveFrom = riskLimitTimestamp(row.effective_from);
+  const createdAt = riskLimitTimestamp(row.created_at);
+  const updatedAt = riskLimitTimestamp(row.updated_at);
+  const effectiveTo = riskLimitTimestamp(row.effective_to);
+  if (effectiveFrom === null || createdAt === null || updatedAt === null) return false;
+  if (row.effective_to !== null && row.effective_to !== undefined && effectiveTo === null) {
+    return false;
+  }
+  if (effectiveTo !== null && effectiveTo <= effectiveFrom) return false;
+  if (updatedAt < createdAt) return false;
+  return true;
+};
+
+const riskLimitColumnValue = (column: string, value: unknown) => {
+  if (column === "version" || column === "max_position_count" || column === "max_order_count") {
+    return value === null || value === undefined ? null : positiveInteger(value);
+  }
+  const numeric = numericColumnsByTable.risk_limits?.[column];
+  if (numeric) {
+    return canonicalizePostgresNumeric(
+      value as number | string | null,
+      numeric.precision,
+      numeric.scale
+    );
+  }
+  if (column === "effective_from" || column === "effective_to" || column.endsWith("_at")) {
+    const parsed = riskLimitTimestamp(value);
+    return parsed === null ? null : new Date(parsed).toISOString();
+  }
+  return value ?? null;
+};
+
+const classifyRiskLimitPrimaryReplay = (
+  expected: TargetRow,
+  actual: TargetRow
+): RiskLimitReplayClassification => {
+  if (!validRiskLimitRow(expected) || !validRiskLimitRow(actual)) {
+    return { classification: "conflict", conflict: "MALFORMED", provenanceDifferences: [] };
+  }
+  if (riskLimitBaseIdentityColumns.some((column) =>
+    riskLimitColumnValue(column, expected[column]) !==
+      riskLimitColumnValue(column, actual[column])
+  )) {
+    return { classification: "conflict", conflict: "IDENTITY", provenanceDifferences: [] };
+  }
+  if (riskLimitPolicyColumns.some((column) =>
+    riskLimitColumnValue(column, expected[column]) !==
+      riskLimitColumnValue(column, actual[column])
+  )) {
+    return { classification: "conflict", conflict: "POLICY", provenanceDifferences: [] };
+  }
+  if (riskLimitLifecycleColumns.some((column) =>
+    riskLimitColumnValue(column, expected[column]) !==
+      riskLimitColumnValue(column, actual[column])
+  )) {
+    return { classification: "conflict", conflict: "LIFECYCLE", provenanceDifferences: [] };
+  }
+  const provenanceDifferences = riskLimitProvenanceColumns.filter((column) =>
+    riskLimitColumnValue(column, expected[column]) !==
+      riskLimitColumnValue(column, actual[column])
+  );
+  if (provenanceDifferences.some((column) =>
+    riskLimitTimestamp(actual[column])! > riskLimitTimestamp(expected[column])!
+  )) {
+    return {
+      classification: "conflict",
+      conflict: "PROVENANCE_ORDER",
+      provenanceDifferences
+    };
+  }
+  return {
+    classification: provenanceDifferences.length ? "provenance_only" : "equivalent",
+    provenanceDifferences
+  };
+};
+
+const strategyAllocationIdentityColumns = [
+  "id", "account_id", "strategy_key", "config_fingerprint"
+] as const;
+const strategyAllocationBaseIdentityColumns = [
+  "id", "account_id", "strategy_key"
+] as const;
+const strategyAllocationPolicyColumns = [
+  "currency", "allocation_amount", "allocation_ratio", "config_version",
+  "config_fingerprint"
+] as const;
+const strategyAllocationLifecycleColumns = ["status", "effective_to"] as const;
+const strategyAllocationMutableColumns = [
+  "reserved_amount", "deployed_amount", "version", "updated_at"
+] as const;
+const strategyAllocationAuthorityStateColumns = [
+  "reserved_amount", "deployed_amount", "version"
+] as const;
+const strategyAllocationProvenanceColumns = ["effective_from", "created_at"] as const;
+
+type StrategyAllocationReplayClassification = Readonly<{
+  classification: "equivalent" | "mutable_singleton_advancement" | "conflict";
+  conflict?: "IDENTITY" | "POLICY" | "LIFECYCLE" | "MALFORMED" |
+    "STALE" | "STATE_REGRESSION" | "PROVENANCE_ORDER";
+  differences: readonly string[];
+}>;
+
+const validStrategyAllocationRow = (row: TargetRow) => {
+  const requiredStrings = [
+    "id", "account_id", "strategy_key", "status", "currency",
+    "config_version", "config_fingerprint"
+  ];
+  if (requiredStrings.some((column) =>
+    typeof row[column] !== "string" || String(row[column]).trim() === ""
+  )) return false;
+  if (!["active", "superseded", "disabled"].includes(String(row.status))) return false;
+  if (!/^[A-Z]{3}$/.test(String(row.currency))) return false;
+  if (positiveInteger(row.version) === null) return false;
+  if (
+    (row.allocation_amount === null || row.allocation_amount === undefined) &&
+    (row.allocation_ratio === null || row.allocation_ratio === undefined)
+  ) return false;
+  if (
+    row.reserved_amount === null || row.reserved_amount === undefined ||
+    row.deployed_amount === null || row.deployed_amount === undefined
+  ) return false;
+  try {
+    for (const [column, definition] of Object.entries(
+      numericColumnsByTable.strategy_allocations ?? {}
+    )) {
+      const value = row[column];
+      if (value === null || value === undefined) continue;
+      const normalized = canonicalizePostgresNumeric(
+        value as number | string,
+        definition.precision,
+        definition.scale
+      );
+      if (normalized === null || normalized.startsWith("-")) return false;
+      if (
+        column === "allocation_ratio" &&
+        BigInt(normalized.replace(".", "")) > 10_000_000_000n
+      ) return false;
+    }
+  } catch {
+    return false;
+  }
+  const effectiveFrom = riskLimitTimestamp(row.effective_from);
+  const createdAt = riskLimitTimestamp(row.created_at);
+  const updatedAt = riskLimitTimestamp(row.updated_at);
+  const effectiveTo = riskLimitTimestamp(row.effective_to);
+  if (effectiveFrom === null || createdAt === null || updatedAt === null) return false;
+  if (row.effective_to !== null && row.effective_to !== undefined && effectiveTo === null) {
+    return false;
+  }
+  if (effectiveTo !== null && effectiveTo <= effectiveFrom) return false;
+  if (updatedAt < createdAt) return false;
+  return true;
+};
+
+const strategyAllocationColumnValue = (column: string, value: unknown) => {
+  if (column === "version") {
+    return value === null || value === undefined ? null : positiveInteger(value);
+  }
+  const numeric = numericColumnsByTable.strategy_allocations?.[column];
+  if (numeric) {
+    return canonicalizePostgresNumeric(
+      value as number | string | null,
+      numeric.precision,
+      numeric.scale
+    );
+  }
+  if (column === "effective_from" || column === "effective_to" || column.endsWith("_at")) {
+    const parsed = riskLimitTimestamp(value);
+    return parsed === null ? null : new Date(parsed).toISOString();
+  }
+  return value ?? null;
+};
+
+const classifyStrategyAllocationPrimaryReplay = (
+  expected: TargetRow,
+  actual: TargetRow
+): StrategyAllocationReplayClassification => {
+  if (!validStrategyAllocationRow(expected) || !validStrategyAllocationRow(actual)) {
+    return { classification: "conflict", conflict: "MALFORMED", differences: [] };
+  }
+  if (strategyAllocationBaseIdentityColumns.some((column) =>
+    strategyAllocationColumnValue(column, expected[column]) !==
+      strategyAllocationColumnValue(column, actual[column])
+  )) {
+    return { classification: "conflict", conflict: "IDENTITY", differences: [] };
+  }
+  if (strategyAllocationPolicyColumns.some((column) =>
+    strategyAllocationColumnValue(column, expected[column]) !==
+      strategyAllocationColumnValue(column, actual[column])
+  )) {
+    return { classification: "conflict", conflict: "POLICY", differences: [] };
+  }
+  if (strategyAllocationLifecycleColumns.some((column) =>
+    strategyAllocationColumnValue(column, expected[column]) !==
+      strategyAllocationColumnValue(column, actual[column])
+  )) {
+    return { classification: "conflict", conflict: "LIFECYCLE", differences: [] };
+  }
+  const differences = [
+    ...strategyAllocationMutableColumns,
+    ...strategyAllocationProvenanceColumns
+  ].filter((column) =>
+    strategyAllocationColumnValue(column, expected[column]) !==
+      strategyAllocationColumnValue(column, actual[column])
+  ).sort((left, right) =>
+    tableSpecs.find((spec) => spec.table === "strategy_allocations")!.columns.indexOf(left) -
+      tableSpecs.find((spec) => spec.table === "strategy_allocations")!.columns.indexOf(right)
+  );
+  if (differences.length === 0) {
+    return { classification: "equivalent", differences };
+  }
+  if (strategyAllocationProvenanceColumns.some((column) =>
+    riskLimitTimestamp(actual[column])! > riskLimitTimestamp(expected[column])!
+  )) {
+    return { classification: "conflict", conflict: "PROVENANCE_ORDER", differences };
+  }
+  const stateDifferences = strategyAllocationAuthorityStateColumns.filter((column) =>
+    differences.includes(column)
+  );
+  if (stateDifferences.length === 0) {
+    return { classification: "conflict", conflict: "STALE", differences };
+  }
+  const expectedVersion = BigInt(positiveInteger(expected.version)!);
+  const actualVersion = BigInt(positiveInteger(actual.version)!);
+  const expectedUpdatedAt = riskLimitTimestamp(expected.updated_at)!;
+  const actualUpdatedAt = riskLimitTimestamp(actual.updated_at)!;
+  if (actualVersion <= expectedVersion || actualUpdatedAt <= expectedUpdatedAt) {
+    return { classification: "conflict", conflict: "STALE", differences };
+  }
+  const deployedDefinition = numericColumnsByTable.strategy_allocations!.deployed_amount!;
+  const expectedDeployed = canonicalizePostgresNumeric(
+    expected.deployed_amount as number | string,
+    deployedDefinition.precision,
+    deployedDefinition.scale
+  )!;
+  const actualDeployed = canonicalizePostgresNumeric(
+    actual.deployed_amount as number | string,
+    deployedDefinition.precision,
+    deployedDefinition.scale
+  )!;
+  if (
+    BigInt(actualDeployed.replace(".", "")) <
+      BigInt(expectedDeployed.replace(".", ""))
+  ) {
+    return { classification: "conflict", conflict: "STATE_REGRESSION", differences };
+  }
+  return { classification: "mutable_singleton_advancement", differences };
+};
+
+type ExecutionStateIdAliases = Map<string, Map<string, string>>;
+
+const resolveAliasedRow = (
+  spec: TableSpec,
+  row: TargetRow,
+  aliases: ExecutionStateIdAliases
+) => {
+  const resolved = { ...row };
+  for (const alias of foreignKeyAliases[spec.table] ?? []) {
+    const sourceId = row[alias.column];
+    if (sourceId === null || sourceId === undefined) continue;
+    const targetId = aliases.get(alias.parentTable)?.get(String(sourceId));
+    if (targetId) resolved[alias.column] = targetId;
+  }
+  return resolved;
+};
+
+const recordAlias = (
+  aliases: ExecutionStateIdAliases,
+  table: string,
+  sourceId: unknown,
+  targetId: unknown
+) => {
+  if (sourceId === null || sourceId === undefined || targetId === null || targetId === undefined) {
+    return;
+  }
+  const tableAliases = aliases.get(table) ?? new Map<string, string>();
+  tableAliases.set(String(sourceId), String(targetId));
+  aliases.set(table, tableAliases);
 };
 
 const evidenceRows = (input: ExecutionEvidenceInput, ledger: PaperExecutionLedgerEntry) => {
@@ -1330,31 +1898,211 @@ const parameter = (spec: TableSpec, column: string, index: number) =>
 const rowValues = (spec: TableSpec, row: TargetRow) =>
   spec.columns.map((column) => row[column] ?? null);
 
+interface InsertTargetRowResult {
+  readonly inserted: number;
+  readonly resolvedId: string;
+  readonly identityReuse: ExecutionStateIdentityReuse | null;
+}
+
+const selectTargetRow = async (
+  client: PoolClient,
+  spec: TableSpec,
+  where: string,
+  values: readonly unknown[]
+) => {
+  const result = await client.query<TargetRow>(
+    `SELECT ${spec.columns.join(", ")} FROM ${spec.table} WHERE ${where}`,
+    [...values]
+  );
+  return result.rows[0];
+};
+
 const insertTargetRow = async (
   client: PoolClient,
   spec: TableSpec,
-  row: TargetRow
-) => {
-  const values = rowValues(spec, row);
+  row: TargetRow,
+  aliases: ExecutionStateIdAliases
+): Promise<InsertTargetRowResult> => {
+  const resolvedRow = resolveAliasedRow(spec, row, aliases);
+  const values = rowValues(spec, resolvedRow);
+  const identity = uniqueIdentitySpecs[spec.table];
+  const conflictClause = identity ? "ON CONFLICT DO NOTHING" : `ON CONFLICT (${spec.key}) DO NOTHING`;
   const write = await client.query(
     `INSERT INTO ${spec.table}(${spec.columns.join(", ")})
      VALUES (${spec.columns.map((column, index) => parameter(spec, column, index + 1)).join(", ")})
-     ON CONFLICT (${spec.key}) DO NOTHING`,
+     ${conflictClause}`,
     values
-  );
-  if ((write.rowCount ?? 0) === 1) return 1;
-  const replay = await client.query<{ matches: boolean }>(
-    `SELECT (${spec.columns.map((column, index) =>
-      `${column} IS NOT DISTINCT FROM ${parameter(spec, column, index + 1)}`
-    ).join(" AND ")}) AS matches
-     FROM ${spec.table}
-     WHERE ${spec.key} = $${spec.columns.length + 1}`,
-    [...values, row[spec.key]]
-  );
-  if (replay.rows[0]?.matches !== true) {
-    throw new Error(`EXECUTION_STATE_BACKFILL_CONFLICT:${spec.table}`);
+  ).catch((error: unknown) => {
+    if (
+      spec.table === "accounts" &&
+      error !== null &&
+      typeof error === "object" &&
+      "code" in error &&
+      error.code === "23505"
+    ) {
+      throw new Error("EXECUTION_STATE_BACKFILL_IDENTITY_CONFLICT:accounts");
+    }
+    if (
+      spec.table === "risk_limits" &&
+      error !== null &&
+      typeof error === "object" &&
+      "code" in error &&
+      error.code === "23505"
+    ) {
+      throw new Error("EXECUTION_STATE_BACKFILL_RISK_LIMIT_CONFLICT:CURRENT_SCOPE");
+    }
+    if (
+      spec.table === "strategy_allocations" &&
+      error !== null &&
+      typeof error === "object" &&
+      "code" in error &&
+      error.code === "23505"
+    ) {
+      throw new Error(
+        "EXECUTION_STATE_BACKFILL_STRATEGY_ALLOCATION_CONFLICT:CURRENT_STRATEGY"
+      );
+    }
+    throw error;
+  });
+  const sourceId = String(row[spec.key]);
+  if ((write.rowCount ?? 0) === 1) {
+    recordAlias(aliases, spec.table, row[spec.key], resolvedRow[spec.key]);
+    return { inserted: 1, resolvedId: sourceId, identityReuse: null };
   }
-  return 0;
+
+  const primary = await selectTargetRow(
+    client,
+    spec,
+    `${spec.key} = $1`,
+    [resolvedRow[spec.key]]
+  );
+  if (primary) {
+    if (spec.table === "risk_limits") {
+      const classification = classifyRiskLimitPrimaryReplay(resolvedRow, primary);
+      if (classification.classification === "conflict") {
+        throw new Error(
+          `EXECUTION_STATE_BACKFILL_RISK_LIMIT_CONFLICT:${classification.conflict}`
+        );
+      }
+      recordAlias(aliases, spec.table, row[spec.key], primary[spec.key]);
+      if (classification.classification === "provenance_only") {
+        return {
+          inserted: 0,
+          resolvedId: String(primary[spec.key]),
+          identityReuse: {
+            table: spec.table,
+            sourceId,
+            targetId: String(primary[spec.key]),
+            identityColumns: riskLimitIdentityColumns,
+            mutableDifferences: classification.provenanceDifferences,
+            classification: "provenance_only"
+          }
+        };
+      }
+      return {
+        inserted: 0,
+        resolvedId: String(primary[spec.key]),
+        identityReuse: null
+      };
+    }
+    if (spec.table === "strategy_allocations") {
+      const classification = classifyStrategyAllocationPrimaryReplay(resolvedRow, primary);
+      if (classification.classification === "conflict") {
+        throw new Error(
+          `EXECUTION_STATE_BACKFILL_STRATEGY_ALLOCATION_CONFLICT:${classification.conflict}`
+        );
+      }
+      recordAlias(aliases, spec.table, row[spec.key], primary[spec.key]);
+      if (classification.classification !== "equivalent") {
+        return {
+          inserted: 0,
+          resolvedId: String(primary[spec.key]),
+          identityReuse: {
+            table: spec.table,
+            sourceId,
+            targetId: String(primary[spec.key]),
+            identityColumns: strategyAllocationIdentityColumns,
+            mutableDifferences: classification.differences,
+            classification: classification.classification
+          }
+        };
+      }
+      return {
+        inserted: 0,
+        resolvedId: String(primary[spec.key]),
+        identityReuse: null
+      };
+    }
+    const differences = rowDifferences(spec, resolvedRow, primary);
+    if (spec.table === "accounts" && differences.material.length > 0) {
+      throw new Error("EXECUTION_STATE_BACKFILL_IDENTITY_CONFLICT:accounts");
+    }
+    if (spec.table === "accounts" && differences.mutable.length > 0) {
+      const classification = accountPrimaryReplayClassification(resolvedRow, primary);
+      if (classification === "stale") {
+        throw new Error("EXECUTION_STATE_BACKFILL_STALE_IDENTITY_CONFLICT:accounts");
+      }
+      if (classification === "conflict") {
+        throw new Error("EXECUTION_STATE_BACKFILL_IDENTITY_CONFLICT:accounts");
+      }
+      recordAlias(aliases, spec.table, row[spec.key], primary[spec.key]);
+      return {
+        inserted: 0,
+        resolvedId: String(primary[spec.key]),
+        identityReuse: {
+          table: spec.table,
+          sourceId,
+          targetId: String(primary[spec.key]),
+          identityColumns: [spec.key],
+          mutableDifferences: differences.mutable
+        }
+      };
+    }
+    if (differences.material.length > 0 || differences.mutable.length > 0) {
+      throw new Error(`EXECUTION_STATE_BACKFILL_CONFLICT:${spec.table}`);
+    }
+    recordAlias(aliases, spec.table, row[spec.key], primary[spec.key]);
+    return {
+      inserted: 0,
+      resolvedId: String(primary[spec.key]),
+      identityReuse: null
+    };
+  }
+
+  if (identity) {
+    const identityValues = identity.columns.map((column) => resolvedRow[column]);
+    const identityRow = await selectTargetRow(
+      client,
+      spec,
+      identity.columns.map((column, index) => `${column} = $${index + 1}`).join(" AND "),
+      identityValues
+    );
+    if (identityRow) {
+      const differences = rowDifferences(
+        spec,
+        resolvedRow,
+        identityRow,
+        new Set([spec.key])
+      );
+      if (differences.material.length > 0) {
+        throw new Error(`EXECUTION_STATE_BACKFILL_IDENTITY_CONFLICT:${spec.table}`);
+      }
+      recordAlias(aliases, spec.table, row[spec.key], identityRow[spec.key]);
+      return {
+        inserted: 0,
+        resolvedId: String(identityRow[spec.key]),
+        identityReuse: {
+          table: spec.table,
+          sourceId,
+          targetId: String(identityRow[spec.key]),
+          identityColumns: identity.columns,
+          mutableDifferences: differences.mutable
+        }
+      };
+    }
+  }
+
+  throw new Error(`EXECUTION_STATE_BACKFILL_CONFLICT:${spec.table}`);
 };
 
 const parseRecord = (value: unknown): Record<string, unknown> | null => {
@@ -1466,6 +2214,8 @@ export interface ExecutionStateBackfillResult {
   readonly checkpointMutationCount: number;
   readonly mutationCount: number;
   readonly idempotentReplay: boolean;
+  readonly identityReuses: readonly ExecutionStateIdentityReuse[];
+  readonly mutableStateDifferences: Readonly<Record<string, number>>;
 }
 
 export const backfillExecutionStateSnapshot = async (input: {
@@ -1493,6 +2243,9 @@ export const backfillExecutionStateSnapshot = async (input: {
     ].join(",")}`);
   }
   const insertedRows: Record<string, number> = {};
+  const identityReuses: ExecutionStateIdentityReuse[] = [];
+  const mutableStateDifferences: Record<string, number> = {};
+  const aliases: ExecutionStateIdAliases = new Map();
   let checkpointMutationCount = 0;
   let batchCount = 0;
   const client = await input.pool.connect();
@@ -1520,7 +2273,12 @@ export const backfillExecutionStateSnapshot = async (input: {
               `${MIGRATION_LOCK_KEY}:${spec.table}`
             ]);
             let inserted = 0;
-            for (const row of batch) inserted += await insertTargetRow(transaction, spec, row);
+            const batchIdentityReuses: ExecutionStateIdentityReuse[] = [];
+            for (const row of batch) {
+              const result = await insertTargetRow(transaction, spec, row, aliases);
+              inserted += result.inserted;
+              if (result.identityReuse) batchIdentityReuses.push(result.identityReuse);
+            }
             const checkpoint = await writeBatchCheckpoint({
               client: transaction,
               snapshotSha256: source.snapshotSha256,
@@ -1530,11 +2288,18 @@ export const backfillExecutionStateSnapshot = async (input: {
               tableRowCount: rows.length,
               observedAt
             });
-            return { inserted, checkpoint };
+            return { inserted, checkpoint, identityReuses: batchIdentityReuses };
           }
         );
         insertedRows[spec.table] += mutations.inserted;
         checkpointMutationCount += mutations.checkpoint;
+        identityReuses.push(...mutations.identityReuses);
+        for (const reuse of mutations.identityReuses) {
+          for (const column of reuse.mutableDifferences) {
+            const key = `${reuse.table}:${column}`;
+            mutableStateDifferences[key] = (mutableStateDifferences[key] ?? 0) + 1;
+          }
+        }
       }
     }
     if (await hashFile(input.snapshotPath) !== source.snapshotSha256) {
@@ -1565,7 +2330,9 @@ export const backfillExecutionStateSnapshot = async (input: {
     rowMutationCount,
     checkpointMutationCount,
     mutationCount,
-    idempotentReplay: mutationCount === 0
+    idempotentReplay: mutationCount === 0,
+    identityReuses,
+    mutableStateDifferences: sortedCounts(mutableStateDifferences)
   };
 };
 
@@ -1573,9 +2340,13 @@ export interface ExecutionTableComparison {
   readonly source: number;
   readonly target: number;
   readonly exact: number;
+  readonly identityEquivalent: number;
+  readonly mutableStateDifference: number;
   readonly missing: number;
   readonly mismatch: number;
   readonly unexpected: number;
+  readonly authorityOnly: number;
+  readonly mutableDifferences: Readonly<Record<string, number>>;
 }
 
 interface AggregateDiscrepancy {
@@ -1594,50 +2365,135 @@ const compareTargetTable = async (
   client: PoolClient,
   spec: TableSpec,
   expectedRows: readonly TargetRow[],
-  accountId: string | null
+  accountId: string | null,
+  observedAt: string,
+  aliases: ExecutionStateIdAliases
 ): Promise<ExecutionTableComparison> => {
   let exact = 0;
+  let identityEquivalent = 0;
+  let mutableStateDifference = 0;
   let missing = 0;
   let mismatch = 0;
-  let present = 0;
-  for (const row of expectedRows) {
-    const values = rowValues(spec, row);
-    const result = await client.query<{ matches: boolean }>(
-      `SELECT (${spec.columns.map((column, index) =>
-        `${column} IS NOT DISTINCT FROM ${parameter(spec, column, index + 1)}`
-      ).join(" AND ")}) AS matches
-       FROM ${spec.table}
-       WHERE ${spec.key} = $${spec.columns.length + 1}`,
-      [...values, row[spec.key]]
-    );
-    if (!result.rows[0]) {
-      missing += 1;
-      continue;
-    }
-    present += 1;
-    if (result.rows[0].matches) exact += 1;
-    else mismatch += 1;
-  }
+  const mutableDifferences: Record<string, number> = {};
+  const matchedTargetIds = new Set<string>();
+  const identity = uniqueIdentitySpecs[spec.table];
   const scope = spec.table === "accounts"
     ? accountId === null ? "" : " WHERE id = $1"
     : spec.accountColumn && accountId !== null
       ? ` WHERE ${spec.accountColumn} = $1`
       : "";
-  const count = await client.query<{ count: number | string }>(
-    `SELECT COUNT(*) AS count FROM ${spec.table}${scope}`,
+  const targetResult = await client.query<TargetRow>(
+    `SELECT ${spec.columns.join(", ")} FROM ${spec.table}${scope}`,
     scope ? [accountId] : []
   );
-  const target = countResult(
-    count.rows[0]?.count,
-    `EXECUTION_STATE_TARGET_COUNT_INVALID:${spec.table}`
-  );
+  const targetRows = targetResult.rows;
+  for (const row of expectedRows) {
+    const resolvedRow = resolveAliasedRow(spec, row, aliases);
+    let actual = targetRows.find((candidate) =>
+      comparableValue(spec, spec.key, candidate[spec.key]) ===
+      comparableValue(spec, spec.key, resolvedRow[spec.key])
+    );
+    let identityMatch = false;
+    if (!actual && identity) {
+      actual = targetRows.find((candidate) => identity.columns.every((column) =>
+        comparableValue(spec, column, candidate[column]) ===
+        comparableValue(spec, column, resolvedRow[column])
+      ));
+      if (actual) {
+        identityMatch = true;
+        recordAlias(aliases, spec.table, row[spec.key], actual[spec.key]);
+      }
+    }
+    if (!actual) {
+      missing += 1;
+      continue;
+    }
+    matchedTargetIds.add(String(actual[spec.key]));
+    if (spec.table === "risk_limits" && !identityMatch) {
+      const classification = classifyRiskLimitPrimaryReplay(resolvedRow, actual);
+      if (classification.classification === "conflict") {
+        mismatch += 1;
+      } else if (classification.classification === "provenance_only") {
+        mutableStateDifference += 1;
+        for (const column of classification.provenanceDifferences) {
+          mutableDifferences[column] = (mutableDifferences[column] ?? 0) + 1;
+        }
+      } else {
+        exact += 1;
+      }
+      continue;
+    }
+    if (spec.table === "strategy_allocations" && !identityMatch) {
+      const classification = classifyStrategyAllocationPrimaryReplay(resolvedRow, actual);
+      if (classification.classification === "conflict") {
+        mismatch += 1;
+      } else if (classification.classification === "equivalent") {
+        exact += 1;
+      } else {
+        mutableStateDifference += 1;
+        for (const column of classification.differences) {
+          mutableDifferences[column] = (mutableDifferences[column] ?? 0) + 1;
+        }
+      }
+      continue;
+    }
+    const differences = rowDifferences(
+      spec,
+      resolvedRow,
+      actual,
+      identityMatch ? new Set([spec.key]) : new Set()
+    );
+    if (differences.material.length > 0) {
+      mismatch += 1;
+    } else if (differences.mutable.length > 0) {
+      mutableStateDifference += 1;
+      for (const column of differences.mutable) {
+        mutableDifferences[column] = (mutableDifferences[column] ?? 0) + 1;
+      }
+    } else if (identityMatch) {
+      identityEquivalent += 1;
+    } else {
+      exact += 1;
+    }
+  }
+  const observedAtMs = Date.parse(observedAt);
+  const authorityOnly = targetRows.filter((row) => {
+    if (matchedTargetIds.has(String(row[spec.key])) || accountId === null) return false;
+    if (
+      (spec.table === "risk_limits" || spec.table === "strategy_allocations") &&
+      row.status === "superseded" &&
+      row.effective_to !== null &&
+      (spec.table === "risk_limits"
+        ? validRiskLimitRow(row)
+        : validStrategyAllocationRow(row)) &&
+      riskLimitTimestamp(row.effective_to)! <= observedAtMs
+    ) {
+      return true;
+    }
+    const timestampColumns = [
+      "updated_at", "observed_at", "received_at", "occurred_at", "created_at",
+      "captured_at", "effective_from"
+    ];
+    return timestampColumns.some((column) => {
+      const value = row[column];
+      if (value === null || value === undefined) return false;
+      const parsed = Date.parse(String(value));
+      return Number.isFinite(parsed) && Number.isFinite(observedAtMs) && parsed > observedAtMs;
+    });
+  }).length;
+  const target = targetRows.length;
+  const unexplainedTargetRows = Math.max(0, target - matchedTargetIds.size - authorityOnly);
   return {
     source: expectedRows.length,
     target,
     exact,
+    identityEquivalent,
+    mutableStateDifference,
     missing,
     mismatch,
-    unexpected: Math.max(0, target - present)
+    unexpected: unexplainedTargetRows,
+    authorityOnly,
+    mutableDifferences: sortedCounts(mutableDifferences)
   };
 };
 
@@ -1873,6 +2729,8 @@ export interface ExecutionStateReconciliationResult {
   readonly sourceAggregates: Readonly<Record<string, unknown>>;
   readonly targetAggregates: Readonly<Record<string, unknown>>;
   readonly discrepancyCategories: Readonly<Record<string, number>>;
+  readonly classifiedStateDifferences: Readonly<Record<string, number>>;
+  readonly authorityOnlyRows: Readonly<Record<string, number>>;
   readonly discrepancyCount: number;
   readonly duplicateCount: number;
   readonly orphanCount: number;
@@ -1927,7 +2785,9 @@ export const assertDurableExecutionStateCheckpoint = (
     canonicalJsonHash(targetAggregates) !== canonicalJsonHash(expected.targetAggregates) ||
     !discrepancyReport ||
     canonicalJsonHash(discrepancyReport) !== canonicalJsonHash({
-      discrepancyCategories: expected.discrepancyCategories
+      discrepancyCategories: expected.discrepancyCategories,
+      classifiedStateDifferences: expected.classifiedStateDifferences,
+      authorityOnlyRows: expected.authorityOnlyRows
     }) ||
     completedAt !== expected.completedAt
   ) {
@@ -1972,12 +2832,15 @@ export const reconcileExecutionStateSnapshot = async (input: {
         await client.query("LOCK TABLE reconciliation_checkpoints IN SHARE ROW EXCLUSIVE MODE");
       }
       const tableComparisons: Record<string, ExecutionTableComparison> = {};
+      const aliases: ExecutionStateIdAliases = new Map();
       for (const spec of tableSpecs) {
         tableComparisons[spec.table] = await compareTargetTable(
           client,
           spec,
           source.rows.get(spec.table) ?? [],
-          source.accountId
+          source.accountId,
+          source.observedAt,
+          aliases
         );
       }
       const duplicateCounts = await runCountChecks(
@@ -2030,6 +2893,22 @@ export const reconcileExecutionStateSnapshot = async (input: {
       for (const [domain, count] of Object.entries(integrityCounts)) {
         if (count > 0) discrepancyRecords.push({ domain, type: "INVARIANT", count });
       }
+      const classifiedStateDifferences = sortedCounts(
+        Object.entries(tableComparisons).reduce<Record<string, number>>(
+          (counts, [table, comparison]) => {
+            for (const [column, count] of Object.entries(comparison.mutableDifferences)) {
+              counts[`${table}:${column}`] = count;
+            }
+            return counts;
+          },
+          {}
+        )
+      );
+      const authorityOnlyRows = sortedCounts(
+        Object.fromEntries(Object.entries(tableComparisons).map(
+          ([table, comparison]) => [table, comparison.authorityOnly]
+        ))
+      );
       const discrepancyCategories = sortedCounts(discrepancyRecords.reduce<Record<string, number>>(
         (counts, discrepancy) => {
           const key = `${discrepancy.domain}:${discrepancy.type}`;
@@ -2054,13 +2933,15 @@ export const reconcileExecutionStateSnapshot = async (input: {
       const sourceAggregates = {
         tables: sortedCounts(sourceTables),
         sourceIssues: sortedCounts(sourceIssueCounts),
-        sourceTableCounts: source.sourceCounts
+        sourceTableCounts: source.sourceCounts,
+        classifiedStateDifferences
       };
       const targetAggregates = {
         tables: sortedCounts(targetTables),
         duplicates: sortedCounts(duplicateCounts),
         orphans: sortedCounts(orphanCounts),
-        invariants: sortedCounts(integrityCounts)
+        invariants: sortedCounts(integrityCounts),
+        authorityOnlyRows
       };
       const duplicateCount = sumCounts(duplicateCounts);
       const orphanCount = sumCounts(orphanCounts);
@@ -2085,6 +2966,8 @@ export const reconcileExecutionStateSnapshot = async (input: {
         sourceAggregates,
         targetAggregates,
         discrepancyCategories,
+        classifiedStateDifferences,
+        authorityOnlyRows,
         discrepancyCount,
         duplicateCount,
         orphanCount,
@@ -2155,7 +3038,11 @@ export const reconcileExecutionStateSnapshot = async (input: {
           JSON.stringify(cursor),
           JSON.stringify(sourceAggregates),
           JSON.stringify(targetAggregates),
-          JSON.stringify({ discrepancyCategories }),
+          JSON.stringify({
+            discrepancyCategories,
+            classifiedStateDifferences,
+            authorityOnlyRows
+          }),
           lastEventOccurredAt,
           observedAt
         ]

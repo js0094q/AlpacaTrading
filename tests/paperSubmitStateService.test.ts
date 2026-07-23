@@ -555,6 +555,52 @@ describe("paper submit state validation", () => {
     assert.equal(projected, captured);
   });
 
+  test("captures and projects an authoritative empty portfolio when there are no reviewed intents", async () => {
+    let projected: PaperSubmitStateAttestation | null = null;
+    const captured = await withPaperEnv(() =>
+      capturePaperSubmitState(
+        {
+          capturedAt,
+          payloadSections: {
+            equityBuys: [],
+            equityAdds: [],
+            equitySells: [],
+            optionBuys: [],
+            optionSellToCloseExits: []
+          }
+        },
+        {
+          getAccount: async () => ({
+            data: {
+              id: "paper-account-123",
+              status: "ACTIVE",
+              cash: "94040.99",
+              equity: "94040.99",
+              buying_power: "376163.96",
+              options_buying_power: "94040.99",
+              options_approved_level: 3,
+              trading_blocked: false,
+              account_blocked: false
+            },
+            status: 200,
+            url: "account"
+          }),
+          listPositions: async () => ({ data: [], status: 200, url: "positions" }),
+          listOrders: async () => ({ data: [], status: 200, url: "orders" }),
+          listReservations: () => [],
+          projectExecutionState: async (attestation) => {
+            projected = attestation;
+          }
+        }
+      )
+    );
+
+    assert.equal(captured.complete, true);
+    assert.equal(captured.accountIdentityHash !== null, true);
+    assert.deepEqual(captured.positions, []);
+    assert.equal(projected, captured);
+  });
+
   test("PostgreSQL authority resolves reservations without consulting SQLite first", async () => {
     let resolved = 0;
     const captured = await withExecutionAuthority(() =>

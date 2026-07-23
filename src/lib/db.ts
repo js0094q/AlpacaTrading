@@ -1,4 +1,5 @@
-import { DatabaseSync, type DatabaseSync as DbHandle } from "node:sqlite";
+import { createRequire } from "node:module";
+import type { DatabaseSync as DbHandle } from "node:sqlite";
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { isVercelRuntime } from "./runtime.js";
@@ -15,6 +16,11 @@ import {
   runSqliteConcurrencyMigration,
   SQLITE_CONCURRENCY_MIGRATION_VERSION
 } from "./sqliteConcurrencySchema.js";
+import {
+  RUNTIME_SQLITE_DISABLED,
+  PostgresOnlyRuntimeError,
+  sqliteTestFixtureInitializationEnabled
+} from "./database/postgresOnlyRuntime.js";
 
 export { SQLITE_CONCURRENCY_MIGRATION_VERSION } from "./sqliteConcurrencySchema.js";
 
@@ -1370,14 +1376,19 @@ const initialize = (): DbHandle => {
     return database;
   }
 
+  if (!sqliteTestFixtureInitializationEnabled()) {
+    throw new PostgresOnlyRuntimeError(
+      RUNTIME_SQLITE_DISABLED,
+      `${RUNTIME_SQLITE_DISABLED}: SQLite is available only to isolated test fixtures.`
+    );
+  }
+
   const dbPath = getResearchDbPath();
   if (isVercelRuntime() && isVercelBundlePath(dbPath)) {
     throw new LocalSqliteUnavailableError(dbPath);
   }
 
-  const testFixtureInitializationEnabled = (
-    globalThis as typeof globalThis & { [key: symbol]: unknown }
-  )[Symbol.for("alpaca.sqlite.test-fixture-initialization")] === true;
+  const testFixtureInitializationEnabled = sqliteTestFixtureInitializationEnabled();
 
   if (!testFixtureInitializationEnabled && !existsSync(dbPath)) {
     throw new DatabaseMigrationRequiredError([
@@ -1386,8 +1397,11 @@ const initialize = (): DbHandle => {
   }
 
   mkdirSync(dirname(dbPath), { recursive: true });
+  const require = createRequire(import.meta.url);
+  const { DatabaseSync } = require("node:sqlite") as typeof import("node:sqlite");
   const opened = new DatabaseSync(dbPath);
   try {
+    configureDatabaseConnection(opened);
     // Only the explicitly preloaded test-fixture helper may build a scratch
     // schema. Every ordinary CLI, service, timer, and health-check process must
     // use the explicit db:migrate command before startup.

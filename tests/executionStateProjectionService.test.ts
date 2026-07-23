@@ -134,6 +134,151 @@ test("maps paper submit state into deterministic PostgreSQL execution domains", 
   assert.equal(projection.exposure.activeReservationAmount, "200.00000000");
 });
 
+test("refreshes positions from the current broker snapshot before PostgreSQL projection", async () => {
+  const projected: { value: ReturnType<typeof mapPaperSubmitStateToExecutionProjection> | null } = { value: null };
+  const repository = {
+    async syncAccountState(input: ReturnType<typeof mapPaperSubmitStateToExecutionProjection>) {
+      projected.value = input;
+      return {
+        status: "synced" as const,
+        accountId: input.accountId,
+        snapshotId: input.accountSnapshotId
+      };
+    }
+  } as unknown as ExecutionStateRepository<PoolClient>;
+  const service = createExecutionStateProjectionService({
+    currentRuntime: () => ({
+      config: config({ authority: true }),
+      pool: {} as Pool,
+      fence: {
+        jobName: "paper-execution",
+        workstream: "paper_execution",
+        ownerId: "worker-1",
+        runId: "run-1",
+        fencingToken: "1"
+      },
+      signal: new AbortController().signal,
+      operationId: "operation-1",
+      requestId: null,
+      correlationId: null,
+      researchRunVersions: new Map()
+    }),
+    repository,
+    listCurrentPositions: async () => ({ positions: [], requestId: "fresh-position-read" }),
+    transaction: async (_pool, _config, operation) => operation({} as PoolClient),
+    reportDiscrepancy: () => undefined
+  });
+
+  const result = await service.syncAccountState(state);
+
+  assert.equal(result.status, "authority_synced");
+  assert.ok(projected.value);
+  const resultProjection = projected.value;
+  assert.equal(resultProjection.positions.length, 0);
+  assert.equal(resultProjection.exposure.grossExposure, "0.00000000");
+  assert.equal(resultProjection.exposure.netExposure, "0.00000000");
+  assert.equal(resultProjection.exposure.longExposure, "0.00000000");
+  assert.equal(resultProjection.exposure.shortExposure, "0.00000000");
+  assert.equal(resultProjection.exposure.deployedAmount, "0.00000000");
+  assert.equal(resultProjection.exposure.positionCount, 0);
+  assert.equal(resultProjection.exposure.openOrderExposure, "450.00000000");
+  assert.equal(resultProjection.exposure.activeReservationAmount, "200.00000000");
+});
+
+test("newer broker positions override stale attestation positions", async () => {
+  const projected: { value: ReturnType<typeof mapPaperSubmitStateToExecutionProjection> | null } = { value: null };
+  const repository = {
+    async syncAccountState(input: ReturnType<typeof mapPaperSubmitStateToExecutionProjection>) {
+      projected.value = input;
+      return {
+        status: "synced" as const,
+        accountId: input.accountId,
+        snapshotId: input.accountSnapshotId
+      };
+    }
+  } as unknown as ExecutionStateRepository<PoolClient>;
+  const service = createExecutionStateProjectionService({
+    currentRuntime: () => ({
+      config: config({ authority: true }),
+      pool: {} as Pool,
+      fence: {
+        jobName: "paper-execution",
+        workstream: "paper_execution",
+        ownerId: "worker-1",
+        runId: "run-1",
+        fencingToken: "1"
+      },
+      signal: new AbortController().signal,
+      operationId: "operation-1",
+      requestId: null,
+      correlationId: null,
+      researchRunVersions: new Map()
+    }),
+    repository,
+    listCurrentPositions: async () => ({
+      positions: [{
+        symbol: "AAPL",
+        assetClass: "us_equity",
+        qty: "3",
+        marketValue: "600",
+        currentPrice: "200"
+      }],
+      requestId: "newer-position-read"
+    }),
+    transaction: async (_pool, _config, operation) => operation({} as PoolClient),
+    reportDiscrepancy: () => undefined
+  });
+
+  await service.syncAccountState(state);
+
+  assert.ok(projected.value);
+  const resultProjection = projected.value;
+  assert.deepEqual(resultProjection.positions.map((position) => position.symbol), ["AAPL"]);
+  assert.equal(resultProjection.positions[0]?.quantity, "3.000000000000");
+  assert.equal(resultProjection.exposure.deployedAmount, "600.00000000");
+  assert.equal(resultProjection.exposure.positionCount, 1);
+});
+
+test("fails closed when the current broker position read fails", async () => {
+  let repositoryCalls = 0;
+  const repository = {
+    async syncAccountState() {
+      repositoryCalls += 1;
+      return { status: "synced" as const, accountId: "account-1", snapshotId: "snapshot-1" };
+    }
+  } as unknown as ExecutionStateRepository<PoolClient>;
+  const service = createExecutionStateProjectionService({
+    currentRuntime: () => ({
+      config: config({ authority: true }),
+      pool: {} as Pool,
+      fence: {
+        jobName: "paper-execution",
+        workstream: "paper_execution",
+        ownerId: "worker-1",
+        runId: "run-1",
+        fencingToken: "1"
+      },
+      signal: new AbortController().signal,
+      operationId: "operation-1",
+      requestId: null,
+      correlationId: null,
+      researchRunVersions: new Map()
+    }),
+    repository,
+    listCurrentPositions: async () => {
+      throw new Error("broker position request failed");
+    },
+    transaction: async (_pool, _config, operation) => operation({} as PoolClient),
+    reportDiscrepancy: () => undefined
+  });
+
+  await assert.rejects(
+    service.syncAccountState(state),
+    (error: unknown) => error instanceof Error && error.message === "EXECUTION_BROKER_POSITION_EVIDENCE_UNAVAILABLE"
+  );
+  assert.equal(repositoryCalls, 0);
+});
+
 test("execution-state shadow reports a discrepancy without changing the caller result", async () => {
   const reports: string[] = [];
   const repository = {

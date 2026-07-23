@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { resetSqliteTestDb } from "./helpers/sqliteTestDb.js";
+import { withExecutionAuthority } from "./helpers/executionAuthorityRuntime.js";
 
 process.env.RESEARCH_DB_PATH = join(mkdtempSync(join(tmpdir(), "alpaca-research-test-")), "research.db");
 process.env.TRADING_MODE = "paper";
@@ -1487,6 +1488,79 @@ describe("Candidate ranking", () => {
 });
 
 describe("Paper plan and evaluation", () => {
+  test("PostgreSQL control-plane authority does not project research plans into SQLite", async () => {
+    getDb()
+      .prepare(
+        `INSERT INTO target_snapshots(
+          symbol, as_of, direction, horizon, entry_reference, upside_target,
+          downside_risk, stop_loss, take_profit, confidence, expected_return,
+          volatility_adjusted_score, risk_profile, preferred_expression, rationale
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        "SPY",
+        ts(10),
+        "long",
+        "1d",
+        110,
+        114,
+        108,
+        107,
+        114,
+        0.78,
+        0.04,
+        1.1,
+        "aggressive",
+        "shares",
+        JSON.stringify(["authority projection guard"])
+      );
+
+    await withExecutionAuthority(async () => {
+      const plans = buildPaperTradePlans({
+        researchRunId: "postgres-only-run",
+        riskProfile: "aggressive",
+        candidates: [
+          {
+            id: "postgres-only-candidate",
+            symbol: "SPY",
+            asOf: ts(10),
+            rank: 1,
+            direction: "long",
+            horizon: "1d",
+            riskProfile: "aggressive",
+            preferredExpression: "shares",
+            score: 80,
+            confidence: 0.78,
+            expectedReturn: 0.04,
+            estimatedMaxLoss: 100,
+            estimatedMaxProfit: 200,
+            rationale: ["authority projection guard"],
+            optionSymbol: null,
+            strike: null,
+            shortStrike: null,
+            relevantBacktestRunId: null,
+            historicalWinRate: null,
+            historicalAvgReturn: null,
+            historicalMaxDrawdown: null,
+            similarSetupCount: null,
+            optionLiquidityScore: null,
+            volatilityAdjustedScore: 1.1,
+            signalFreshnessDays: 0,
+            recentLearningAdjustment: 0,
+            directionalAccuracy: null,
+            optionOutperformanceAccuracy: null
+          }
+        ]
+      });
+      assert.deepEqual(plans, []);
+    });
+
+    assert.equal(
+      readCount("SELECT COUNT(*) AS count FROM paper_trade_plans"),
+      0
+    );
+  });
+
   test("creates paper plans with thesis, invalidation, and learning objective", () => {
     getDb()
       .prepare(

@@ -105,7 +105,7 @@ const abortableWaitAfterFirstTick = () => {
   };
 };
 
-test("exports bounded scheduler mappings for Release 3 workstreams", () => {
+test("exports bounded scheduler mappings for the restored autonomous workstreams", () => {
   assert.deepEqual(Object.keys(POSTGRES_SCHEDULER_JOBS), [
     "research",
     "zeroDte",
@@ -117,7 +117,12 @@ test("exports bounded scheduler mappings for Release 3 workstreams", () => {
     "allocation",
     "marketDataRefresh",
     "universeLifecycle",
-    "autonomousRecovery"
+    "autonomousRecovery",
+    "optionDiscovery",
+    "hedgeReview",
+    "hedgeExit",
+    "learning",
+    "autonomousWorkerState"
   ]);
   assert.deepEqual(POSTGRES_SCHEDULER_JOBS.marketDataRefresh, {
     jobName: "market-data-refresh",
@@ -136,7 +141,12 @@ test("exports bounded scheduler mappings for Release 3 workstreams", () => {
       "allocation",
       "market_data_refresh",
       "universe_lifecycle",
-      "autonomous_recovery"
+      "autonomous_recovery",
+      "option_discovery",
+      "hedge_review",
+      "hedge_exit",
+      "learning",
+      "autonomous_worker_state"
     ]
   );
 });
@@ -144,6 +154,7 @@ test("exports bounded scheduler mappings for Release 3 workstreams", () => {
 test("uses separate checked-out transactions for acquire, heartbeat, and release", async () => {
   const fake = createTransactionPool();
   const currentLease = lease();
+  const schedulerTelemetry: Array<Record<string, unknown>> = [];
   let heartbeatFinished!: () => void;
   const heartbeatObserved = new Promise<void>((resolve) => {
     heartbeatFinished = resolve;
@@ -194,8 +205,9 @@ test("uses separate checked-out transactions for acquire, heartbeat, and release
     {
       repository,
       now: () => new Date("2026-07-15T20:00:00.000Z"),
-      wait: abortableWaitAfterFirstTick()
-    }
+      wait: abortableWaitAfterFirstTick(),
+      emit: (event: Record<string, unknown>) => schedulerTelemetry.push(event)
+    } as never
   );
 
   assert.equal(value, "complete");
@@ -206,6 +218,18 @@ test("uses separate checked-out transactions for acquire, heartbeat, and release
     fake.events.filter((event) => /^(ACQUIRE|HEARTBEAT|RELEASE_LEASE):/.test(event)),
     ["ACQUIRE:1", "HEARTBEAT:2", "RELEASE_LEASE:3"]
   );
+  assert.deepEqual(
+    schedulerTelemetry.map((event) => event.event),
+    [
+      "postgres_scheduler_lease_acquired",
+      "postgres_scheduler_fence_renewed",
+      "postgres_scheduler_lease_released"
+    ]
+  );
+  assert.equal(schedulerTelemetry[0]?.leaseOwner, "worker-a");
+  assert.equal(schedulerTelemetry[0]?.remainingLeaseMs, 60_000);
+  assert.equal(schedulerTelemetry[1]?.fencingToken, "9007199254740993");
+  assert.equal(typeof schedulerTelemetry[1]?.renewalLatencyMs, "number");
   assert.equal(fake.active.size, 0);
 });
 

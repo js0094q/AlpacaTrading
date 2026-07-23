@@ -11,16 +11,28 @@ import {
   preparePostgresConnectionString
 } from "../src/lib/database/postgres.js";
 
+Object.defineProperty(
+  globalThis,
+  Symbol.for("alpaca.sqlite.test-fixture-initialization"),
+  { configurable: true, value: true, writable: true }
+);
+
 const base = {
   DATABASE_URL: "postgresql://synthetic-user:synthetic-password@pooled.example.invalid/db",
   DATABASE_URL_UNPOOLED:
     "postgresql://synthetic-user:synthetic-password@direct.example.invalid/db"
 };
 
-test("database configuration defaults to SQLite with every PostgreSQL authority flag off", () => {
-  const config = loadDatabaseConfig({}, { runtime: "local" });
+test("database configuration defaults to PostgreSQL and fails closed without a pooled URL", () => {
+  assert.throws(
+    () => loadDatabaseConfig({}, { runtime: "local" }),
+    (error) =>
+      error instanceof DatabaseConfigurationError &&
+      error.code === "POSTGRES_POOLED_URL_REQUIRED"
+  );
+  const config = loadDatabaseConfig(base, { runtime: "test" });
 
-  assert.equal(config.backend, "sqlite");
+  assert.equal(config.backend, "postgres");
   assert.deepEqual(config.features, {
     postgresReads: false,
     postgresWrites: false,
@@ -31,8 +43,8 @@ test("database configuration defaults to SQLite with every PostgreSQL authority 
     executionStateAuthority: false,
     sqliteAuditMirror: false
   });
-  assert.equal(config.pooledUrl, undefined);
-  assert.equal(config.directUrl, undefined);
+  assert.equal(config.pooledUrl, base.DATABASE_URL);
+  assert.equal(config.directUrl, base.DATABASE_URL_UNPOOLED);
 });
 
 test("selects actual pooled and direct variables by documented precedence", () => {
@@ -158,7 +170,7 @@ test("shadow comparison is a non-authoritative read-write prerequisite stage", (
     POSTGRES_WRITES_ENABLED: "true",
     POSTGRES_SHADOW_COMPARE_ENABLED: "true"
   });
-  assert.equal(config.backend, "sqlite");
+  assert.equal(config.backend, "postgres");
   assert.equal(config.features.controlPlaneAuthority, false);
   assert.equal(config.features.schedulerAuthority, false);
   assert.equal(config.features.executionStateShadow, false);

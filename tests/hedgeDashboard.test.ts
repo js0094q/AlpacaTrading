@@ -31,12 +31,8 @@ let serverModule: {
   ACTION_HANDLERS: Record<string, {
     method: string;
     requireAdminToken: boolean;
-    requireMutationPrecheck: boolean;
-    handler: (input: unknown, requestId: string) => Promise<unknown>;
+    handler: () => Promise<unknown>;
   }>;
-  setControlCommandRunner: (runner: (...args: unknown[]) => Promise<unknown>) => void;
-  setOpenOrdersFetcher: (fetcher: () => Promise<unknown>) => void;
-  resetControlTestHooks: () => void;
 };
 
 before(async () => {
@@ -45,7 +41,6 @@ before(async () => {
 });
 
 after(async () => {
-  serverModule.resetControlTestHooks();
   const { closeDbForTests } = await import("../src/lib/db.js");
   closeDbForTests();
   rmSync(dbDir, { recursive: true, force: true });
@@ -60,32 +55,24 @@ test("dashboard hedge route files expose GET only", () => {
   }
 });
 
-test("control hedge routes are cached GET reads with no command or order calls", async () => {
-  let commandCalls = 0;
-  let orderCalls = 0;
-  serverModule.setControlCommandRunner(async () => {
-    commandCalls += 1;
-    return {};
-  });
-  serverModule.setOpenOrdersFetcher(async () => {
-    orderCalls += 1;
-    return [];
-  });
-
+test("control hedge reads return PostgreSQL-only blocked results instead of falling back to SQLite", async () => {
   for (const path of [
     "/api/v1/hedge/risk",
     "/api/v1/hedge/regime",
     "/api/v1/hedge/recommendation"
   ]) {
-    const route = serverModule.ACTION_HANDLERS[path];
-    assert.equal(route?.method, "GET");
-    assert.equal(route?.requireAdminToken, false);
-    assert.equal(route?.requireMutationPrecheck, false);
-    await route.handler({}, "hedge-dashboard-request");
+    assert.equal(serverModule.ACTION_HANDLERS[path]?.method, "GET");
+    const result = await serverModule.ACTION_HANDLERS[path]!.handler();
+    assert.deepEqual(result, {
+      paperOnly: true,
+      environment: "paper",
+      liveTradingEnabled: false,
+      status: "blocked",
+      code: "NO_POSTGRES_HEDGE_STATE",
+      blockers: ["NO_POSTGRES_HEDGE_STATE"],
+      mutationAttempted: false
+    });
   }
-
-  assert.equal(commandCalls, 0);
-  assert.equal(orderCalls, 0);
 });
 
 test("expired recommendation remains expired through the Vercel bridge", async () => {
@@ -263,6 +250,18 @@ test("dashboard labels expired hedge recommendations as not current", () => {
   assert.match(html, /EXPIRED/);
   assert.match(html, /This recommendation is not current/);
   assert.doesNotMatch(html, /Current recommendation/);
+});
+
+test("dashboard does not crash when a bridge recommendation omits effective status", () => {
+  const recommendation = {
+    ...dashboardRecommendation("blocked"),
+    effectiveStatus: undefined
+  } as unknown as HedgeDashboardRecommendation;
+
+  const html = renderToStaticMarkup(createElement(HedgePanel, { recommendation }));
+
+  assert.match(html, /UNKNOWN/);
+  assert.match(html, /This recommendation is not current/);
 });
 
 test("dashboard renders current risk, regime, LEAPS, sizing, and blocker details", () => {

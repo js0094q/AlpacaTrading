@@ -1,180 +1,125 @@
 # Architecture
 
-## Market Observatory and Paper Decision Lifecycle
+## Runtime authority
 
-The PostgreSQL control-plane release provides fenced scheduler ownership,
-research-run control, candidates and candidate lifecycle events, idempotency,
-workstream events and failures, and reconciliation checkpoints in Neon. These
-paths remain feature-gated until backfill, reconciliation, and paper shadow
-comparison pass in the target runtime. Market observations, reviewed paper
-execution, broker reconciliation, analytical outcomes, and learning remain on
-SQLite until Release 4. Alpaca positions/orders remain broker truth; internal
-records add attribution and never override broker state.
+PostgreSQL is the sole production runtime authority. The VPS application,
+dashboard-control service, scheduler fencing, and execution-state repositories
+use the pooled PostgreSQL connection. PostgreSQL schema changes use the direct
+connection and the explicit migration command.
 
-### Data flow
+Production startup requires all of these conditions:
 
-1. `universe_symbols` defines the enabled/tradable research universe.
-2. `stock_snapshots` stores append-only Alpaca market evidence. The latest record
-   may enrich only the latest feature row.
-3. Every scored candidate is persisted. `decision_snapshots` stores immutable
-   decision-time evidence, while `decision_lifecycle_events` appends later states.
-4. `paper_review_artifacts` stores the latest canonical HMAC-signed reviewed
-   payload, a `baseline-v1` allocation attestation, and normalized account,
-   configuration, portfolio, order, reservation, and market fingerprints.
-   `paper_review_decisions` joins exact artifact section indexes to entry or
-   exit decisions.
-5. General entry execution verifies the artifact and exact caller payload hash,
-   refreshes paper account/portfolio/market evidence, compares it to the signed
-   state, reapplies current caps, and atomically reserves the artifact's selected
-   entry batch in the execution ledger before broker submission. The transaction
-   rechecks active reservations, shared-cap headroom, and an all-buy-side ledger
-   lifecycle fingerprint captured before fresh evidence collection. A concurrent
-   reservation-to-filled transition therefore cannot disappear between checks.
-   It never resizes or reallocates inline. Compatibility confirm routes dispatch
-   this same executor only.
-6. 0DTE derives complete New York-day activity across broker positions/orders,
-   the execution ledger, Level 2 trades, and generic outcomes. Immediately
-   before an order request it refreshes option price evidence, persists and
-   rechecks an append-only signed submit attestation, and reserves capacity in an
-   immediate transaction. Generic reviewed 0DTE discoveries share those same
-   cross-path counters. Hedge entry reviews independently bind deterministic
-   review/client-order identity and complete long-put exposure, reservation,
-   fill, daily-premium, open-order, and price-drift evidence; the review is
-   consumed atomically with its ledger reservation.
-7. A confirmed paper fill with exact execution-ledger lineage creates one
-   `paper_positions` analytical lifecycle. Observations are append-only. A single
-   possible lifecycle links exactly; multiple possible netted lifecycles link as
-   ambiguous and suppress per-decision analytics.
-8. Terminal outcomes are derived only from persisted exact observations. The
-   original is unique and immutable; corrections are revision rows.
-9. Learning records reference candidate, entry/exit decisions, lifecycle,
-   original outcome, effective revision, completeness, and linkage status.
+- `DATABASE_BACKEND=postgres`;
+- PostgreSQL reads and writes enabled;
+- control-plane, scheduler, and execution-state authority enabled;
+- both PostgreSQL shadow modes disabled;
+- the SQLite audit mirror disabled;
+- a pooled PostgreSQL connection available.
 
-### Identity and ownership
+Failure of any condition is terminal. There is no SQLite read, write, fallback,
+dual-write, shadow, migration, or reconciliation path in production. SQLite is
+available only to explicitly marked isolated test fixtures. Old SQLite files are
+historical artifacts and must not be opened by supported runtime commands.
+
+## Runtime topology
+
+- The VPS owns the paper-only Alpaca credentials, PostgreSQL application pool,
+  scheduler leases, current operational state, and dashboard-control service.
+- Neon PostgreSQL owns accounts, snapshots, positions, orders, broker events,
+  reservations, strategy allocations, risk limits, reviews, confirmation
+  evidence, learning/recovery state, and scheduler/workstream state.
+- Alpaca paper remains broker truth for the current account, positions, and
+  orders. PostgreSQL records the exact current observation and internal
+  attribution; it never overrides broker state.
+- Vercel is a read-only bridge to dashboard-control. It owns no local database,
+  does not fall back to bundled state, and cannot execute broker mutations.
+- `alpaca-dashboard-control.service` is the only application service enabled by
+  the fresh cutover. Autonomous and trading timers remain disabled until the
+  separately authorized evidence-utilization and runtime audit passes.
+
+## Fresh authority cutover
+
+`npm run db:postgres:authority:cutover` is the supported one-time operational
+cutover workflow. It is paper-only and broker-read-only. Under a fenced
+PostgreSQL scheduler lease it:
+
+1. captures current Alpaca paper account, position, and open-order state;
+2. verifies the installed risk-limit and allocation-policy fingerprints before
+   changing runtime state;
+3. synchronizes current broker truth into PostgreSQL;
+4. expires only stale reservations, reviews, confirmations, and stale research
+   runs through their supported PostgreSQL lifecycle transitions;
+5. verifies required allocation, risk, evidence, learning, and recovery state;
+6. writes a passed checkpoint with baseline type
+   `fresh_postgresql_authority_cutover`.
+
+The checkpoint explicitly records that historical reconciliation is not
+complete and was not attempted. Existing historical SQLite reconciliation
+checkpoints remain immutable historical evidence and do not gate startup.
+
+`npm run db:postgres:authority:status` is the read-only gate used by
+dashboard-control. A missing, failed, or stale baseline fails closed.
+
+## State and transaction boundaries
+
+Domain repositories preserve scheduler fencing, optimistic versions,
+idempotency, event order, and one transaction scope. They do not expose a
+generic backend-neutral interface.
+
+Every PostgreSQL transaction uses one checked-out `pg` client from `BEGIN`
+through `COMMIT` or `ROLLBACK`. Transactions must not span Alpaca, market-data,
+or other network I/O. Broker evidence is collected first; bounded fenced
+transactions then persist and verify it.
+
+Scheduler acquisition and takeover use database time, row locks, expiration,
+heartbeats, and monotonically increasing fencing tokens. A stale worker cannot
+heartbeat, release, or commit fenced state after a newer owner takes over.
+
+## Decision and execution identity
 
 - Candidate ID: researched opportunity.
 - Decision ID: immutable entry, exit, or non-executable decision.
-- Position lifecycle ID: broker-confirmed analytical position lifecycle.
+- Position lifecycle ID: broker-confirmed analytical lifecycle.
 - Alpaca: broker order and net-position truth.
-- Execution ledger: order-attempt and broker-response audit.
+- PostgreSQL execution ledger: order-attempt and broker-response audit.
 - Analytical lifecycle tables: attribution and longitudinal evidence.
 
-### Trust and safety boundaries
+Broker submission remains split into two database transactions around the
+external paper request. The first validates evidence and commits an idempotent
+intent/reservation; the second records the response. Ambiguous results reconcile
+by deterministic client-order identity before any retry. The authority cutover
+and status commands never submit, replace, or cancel orders.
 
-All order paths are hard-bound to paper endpoints and require existing explicit
-gates. Observatory, migration verification, and trace commands are read-only with
-respect to the broker. Provenance hashes use explicit configuration allowlists;
-full environments and secret-bearing payloads are excluded. The trace command
-does not return raw request, response, model-input, or environment JSON.
+## Trust and safety boundaries
+
+All broker-mutating paths remain hard-bound to the paper endpoint and their
+existing explicit confirmation, review, evidence, risk, and execution gates.
+Neither the cutover nor dashboard-control exposes a mutating route.
 
 `PAPER_REVIEW_SIGNING_KEY` authenticates general review artifacts and 0DTE
-submit attestations. It exists only in the VPS runtime secret file and is never
-sent to Vercel. `HEDGE_REVIEW_SIGNING_KEY` remains independent. Missing keys,
-unsigned/tampered artifacts, incomplete material evidence, or material drift
-fail closed with structured blockers such as `FRESH_REVIEW_REQUIRED`. Exit,
-protection, recovery, and reconciliation sections retain their domain gates and
-do not depend on positive entry allocation room.
+submit attestations. `HEDGE_REVIEW_SIGNING_KEY` remains independent. Secrets
+exist only in the protected VPS environment file and are excluded from logs,
+responses, provenance payloads, and repository files.
 
-Broker order classification is centralized for new-risk evidence. `held` and
-`pending_cancel` are active. An unknown non-terminal status is conservatively
-retained as active exposure and blocks submission until it can be classified.
-A signed artifact with blocked status or signed blockers cannot authorize entry
-sections, even when its signature is valid. A fresh signed mixed artifact with a
-valid exit section may still reach the section-aware executor; its signed entry
-blockers remain binding while the exit retains its independent safety gates.
+The safety floor does not redefine strategy weights, budgets, risk limits,
+position caps, execution caps, or exit policy. The PostgreSQL-only cutover
+verifies installed configuration fingerprints and stops on drift instead of
+silently changing policy.
 
-The safety floor does not define allocator weights, an optimization objective,
-strategy budgets, an allocator mode, or allocator-owned exits. `baseline-v1`
-records only the absence of allocator ownership. Ordinary equity, scale-in,
-0DTE, and hedge caps remain owned by their existing configuration services.
+## Schema and operational commands
 
-### Runtime topology
+PostgreSQL schema mutation belongs only to `npm run db:postgres:migrate`, using
+the direct connection and a session advisory lock. Application startup never
+runs migrations. Supported production database commands are:
 
-The VPS currently runs the SQLite-backed CLI/control service and systemd timers. The
-observatory timer wakes every 15 minutes during weekday market windows through the
-existing locked monitor runner and performs a second market-clock check. Vercel is
-only a dashboard/control bridge and does not execute orders or own SQLite state.
-Both runtimes use bounded `pg` pools. Vercel may use one pooled connection for
-the protected read-only Neon health check; the VPS uses a bounded long-lived
-pool. Release 3 adds feature-gated control-plane reads, writes, shadow
-comparison, and authority. All are off by default and may be enabled only after
-the corresponding migration and reconciliation gate passes.
-Late-day paper operations write a fresh signed artifact with
-`sourceAction=paper.ops.late_day` and the normal 30-minute artifact TTL before
-the separately scheduled reviewed exit executor runs.
+```bash
+npm run db:postgres:connectivity
+npm run db:postgres:status
+npm run db:postgres:migrate
+npm run db:postgres:verify
+npm run db:postgres:authority:cutover
+npm run db:postgres:authority:status
+```
 
-### Runtime schema and command boundaries
-
-SQLite schema mutation belongs to the explicit `db:migrate` deployment path.
-Ordinary CLI startup configures connection-local foreign keys and a bounded
-busy timeout, reads the migration ledger, and fails closed with
-`DATABASE_MIGRATION_REQUIRED` when the database is empty or not current. It does
-not execute DDL or enter a migration writer transaction. Node test-runner
-fixtures may initialize isolated scratch databases through the transactional
-migration runner. Each pending migration group rechecks its ledger state after
-acquiring `BEGIN IMMEDIATE`, so explicit concurrent migration processes do not
-apply a migration twice.
-
-PostgreSQL schema mutation belongs only to `db:postgres:migrate`, using the
-direct connection and a session advisory lock. `db:postgres:status` is read-only;
-`db:postgres:verify` compares the migration checksum plus the expected tables,
-indexes, control-plane columns and constraints, and scheduler fencing sequence.
-Application startup never invokes these commands. Ordinary traffic uses the
-pooled endpoint. Every transaction checks
-out one `pg` client and uses that client from `BEGIN` through `COMMIT` or
-`ROLLBACK`, with statement, lock, idle-in-transaction, and transaction timeouts.
-No transaction may span broker or market-data I/O.
-
-Domain repository contracts preserve scheduler fencing, optimistic versions,
-idempotency, event order, and one transaction scope. They intentionally do not
-expose a generic backend-neutral query interface. Release 3 PostgreSQL
-implementations require a current, unexpired fencing token in the same
-transaction as fenced control-plane writes.
-
-Scheduler acquisition and takeover use database time, row locks, expiration,
-heartbeats, and monotonically increasing decimal-string fencing tokens. A stale
-worker cannot heartbeat, release, or commit fenced control-plane state after a
-new owner takes over. Only research may use this authority in Release 3 because
-its control-plane writes validate the current token. Observatory,
-market-data-refresh, and execution-state workstreams remain outside this
-authority until their durable writes are fence-aware.
-
-Research authority never keeps a PostgreSQL transaction open while collecting
-market or Alpaca evidence. It computes first, then persists runs, candidates,
-and initial lifecycle events in bounded transactions. Shadow mode keeps SQLite
-authoritative and records sanitized discrepancies. Authority mode writes
-PostgreSQL first and has no SQLite fallback. A temporary, explicitly enabled
-SQLite audit projection supports legacy Release 4 readers and does not create
-dual authority.
-
-On command failure, the dashboard control runner retains bounded, redacted
-stdout and stderr as separate fields. Structured stdout failures remain causal;
-Node warnings are secondary diagnostics. Successful structured command JSON is
-kept intact through parsing within a 4,194,304-character per-stream collection cap;
-an over-limit child is terminated with `COMMAND_OUTPUT_LIMIT_EXCEEDED`. The
-10-second Alpaca health child receives a 9-second
-monotonic operation budget with a completion margin, and its sequential account
-and clock requests share that deadline.
-
-Paper research uses a SQLite-backed single-flight reservation. A fresh
-`research_runs` lease returns `already_running` before market-data work starts.
-Heartbeats advance between major stages; failure to renew the persisted
-`running` lease aborts the worker before candidate or plan writes. The final
-lease check and those writes share one local transaction. Autonomous recovery
-and research preflight use the same 15-minute stale rule; stale rows transition to the
-existing `failed` state with worker/request/correlation evidence and
-`WORKER_TERMINATED_OR_HEARTBEAT_EXPIRED`. Recovery never submits or retries an
-order or source workload.
-
-Steady-state writer contention is scoped to the two evidenced heavy persistence
-scopes: research option contracts/snapshots and the 0DTE engine persistence
-batch. They coordinate through the additive `runtime_write_leases` table and
-the finite `research-options-and-zero-dte-engine` lease. Option rows are
-normalized outside the lease and written in bounded idempotent transactions;
-the engine keeps its deterministic identities and wraps only its existing
-rollback-safe batch. Lifecycle updates, lease maintenance, and those batches
-may use bounded `SQLITE_BUSY` retry after rollback. Structured contention logs
-include operation, transaction duration, retry count, process identity, and
-run/correlation IDs. The historical lock-holder PID is unknown; the 0DTE batch
-is the closest proven competing scope. Reads, review, reconciliation, and
-execution are not globally serialized.
+SQLite migration, backfill, reconciliation, shadow, and status commands are
+retired and absent from the production package scripts.

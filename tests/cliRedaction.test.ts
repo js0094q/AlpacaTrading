@@ -9,7 +9,7 @@ describe("CLI output redaction", () => {
     const controlToken = "CLI_REDACTION_TEST_CONTROL";
     const result = spawnSync(
       process.execPath,
-      ["--import", "tsx", "src/cli.ts", "paper:runtime", "--format=json"],
+      ["--import", "tsx", "src/postgresOnlyCli.ts", "paper:runtime", "--format=json"],
       {
         cwd: process.cwd(),
         encoding: "utf8",
@@ -24,7 +24,7 @@ describe("CLI output redaction", () => {
     const output = String(result.stdout);
 
     assert.equal(result.status, 1);
-    assert.match(output, /Unknown command/);
+    assert.match(output, /POSTGRES_ONLY_RUNTIME_PATH_DISABLED/);
     assert.equal(output.includes(paperKey), false);
     assert.equal(output.includes(paperSecret), false);
     assert.equal(output.includes(controlToken), false);

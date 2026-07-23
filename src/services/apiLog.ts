@@ -1,6 +1,3 @@
-import { isVercelRuntime } from "../lib/runtime.js";
-import { nowIso } from "../lib/utils.js";
-
 export interface ApiRequestLogInput {
   provider: string;
   endpoint: string;
@@ -9,37 +6,7 @@ export interface ApiRequestLogInput {
   requestId?: string | null;
 }
 
-const dbModule = isVercelRuntime() ? null : await import("../lib/db.js");
-
-export const recordApiRequest = (input: ApiRequestLogInput) => {
-  if (isVercelRuntime()) {
-    return;
-  }
-
-  const db = dbModule?.getDb();
-  if (!db) {
-    return;
-  }
-
-  db
-    .prepare(
-      `
-      INSERT INTO api_request_log(
-        provider,
-        endpoint,
-        method,
-        status,
-        request_id,
-        created_at
-      ) VALUES (?, ?, ?, ?, ?, ?)
-      `
-    )
-    .run(
-      input.provider,
-      input.endpoint,
-      input.method,
-      input.status,
-      input.requestId ?? null,
-      nowIso()
-    );
-};
+// Runtime SQLite request logging was retired with the PostgreSQL-only cutover.
+// Broker request evidence continues to be returned to callers through request IDs;
+// a future durable request-log sink must be PostgreSQL-backed before it is enabled.
+export const recordApiRequest = (_input: ApiRequestLogInput) => undefined;

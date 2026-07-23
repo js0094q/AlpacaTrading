@@ -3,7 +3,10 @@ import test from "node:test";
 import type { PoolClient, QueryResult } from "pg";
 
 import { PostgresExecutionStateRepository } from "../src/repositories/postgres/postgresExecutionStateRepository.js";
-import type { ExecutionEvidenceInput } from "../src/repositories/contracts/executionStateRepository.js";
+import type {
+  ExecutionAccountProjection,
+  ExecutionEvidenceInput
+} from "../src/repositories/contracts/executionStateRepository.js";
 
 const fence = {
   jobName: "paper-execution",
@@ -90,6 +93,66 @@ const brokerResultInput = {
   receivedAt: "2026-07-16T16:00:01.000Z"
 };
 
+const emptyProjection: ExecutionAccountProjection = {
+  accountId: "account-empty",
+  brokerAccountId: "broker-account-empty",
+  accountSnapshotId: "snapshot-empty",
+  observedAt: "2026-07-22T15:30:00.000Z",
+  accountStatus: "ACTIVE",
+  currency: "USD",
+  cash: "94040.99000000",
+  portfolioValue: "94040.99000000",
+  equity: "94040.99000000",
+  buyingPower: "376163.96000000",
+  optionsBuyingPower: "94040.99000000",
+  optionsApprovedLevel: 3,
+  tradingBlocked: false,
+  accountBlocked: false,
+  snapshotFingerprint: "snapshot-fingerprint-empty",
+  evidence: {},
+  positions: [],
+  riskLimit: {
+    id: "risk-empty",
+    cashReserveAmount: null,
+    cashReserveRatio: "0.2000000000",
+    maxDeploymentAmount: "50000.00000000",
+    maxDeploymentRatio: "0.5000000000",
+    maxGrossExposure: "50000.00000000",
+    maxNetExposure: "50000.00000000",
+    maxOpenOrderExposure: "50000.00000000",
+    maxPositionNotional: "5000.00000000",
+    maxSymbolNotional: "5000.00000000",
+    maxPositionCount: null,
+    maxOrderCount: null,
+    configVersion: "paper-submit-state-v1",
+    configFingerprint: "config-empty"
+  },
+  strategyAllocation: {
+    id: "allocation-empty",
+    strategyKey: "baseline-v1",
+    allocationAmount: "50000.00000000",
+    allocationRatio: "0.5000000000",
+    configVersion: "paper-submit-state-v1",
+    configFingerprint: "config-empty"
+  },
+  exposure: {
+    id: "exposure-empty",
+    grossExposure: "0.00000000",
+    netExposure: "0.00000000",
+    longExposure: "0.00000000",
+    shortExposure: "0.00000000",
+    openOrderExposure: "0.00000000",
+    activeReservationAmount: "0.00000000",
+    deployedAmount: "0.00000000",
+    cashReserveAmount: "18808.19800000",
+    availableBuyingPower: "376163.96000000",
+    positionCount: 0,
+    openOrderCount: 0,
+    fingerprint: "exposure-fingerprint-empty",
+    evidence: {}
+  }
+};
+
 test("0DTE activity state is read under the current scheduler fence", async () => {
   const queries: string[] = [];
   const client = {
@@ -135,6 +198,41 @@ test("0DTE activity state is read under the current scheduler fence", async () =
     });
   }
   assert.equal(queries.length, 3);
+});
+
+test("empty broker projection closes stale positions and keeps allocation and exposure at zero in one sync", async () => {
+  const queries: Array<{ text: string; params?: readonly unknown[] }> = [];
+  const client = {
+    query: async (text: string, params?: readonly unknown[]) => {
+      queries.push({ text, params });
+      if (text.includes("FROM scheduler_leases") && text.includes("FOR UPDATE")) {
+        return { rows: [currentFence] } as unknown as QueryResult;
+      }
+      return { rows: [], rowCount: 1 } as unknown as QueryResult;
+    }
+  } as unknown as PoolClient;
+
+  const result = await new PostgresExecutionStateRepository().syncAccountState(
+    emptyProjection,
+    contextFor(client)
+  );
+
+  assert.deepEqual(result, {
+    status: "synced",
+    accountId: "account-empty",
+    snapshotId: "snapshot-empty"
+  });
+  const closePositions = queries.find((query) => query.text.startsWith("UPDATE positions"));
+  const allocationInsert = queries.find((query) => query.text.startsWith("INSERT INTO strategy_allocations"));
+  const exposureInsert = queries.find((query) => query.text.startsWith("INSERT INTO portfolio_exposure"));
+  assert.ok(closePositions);
+  assert.ok(allocationInsert);
+  assert.ok(exposureInsert);
+  assert.deepEqual(closePositions.params?.[2], []);
+  assert.equal(allocationInsert.params?.[7], "0.00000000");
+  assert.equal(exposureInsert.params?.[10], "0.00000000");
+  assert.ok(queries.indexOf(closePositions) < queries.indexOf(allocationInsert));
+  assert.ok(queries.indexOf(allocationInsert) < queries.indexOf(exposureInsert));
 });
 
 test("broker reconciliation targets require the current scheduler fence", async () => {
