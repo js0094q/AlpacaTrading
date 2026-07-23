@@ -996,6 +996,68 @@ test("refresh fails closed when a required underlying has no active contracts", 
   }), /POSTGRES_OPTION_CONTRACTS_MISSING:SPY/);
 });
 
+test("option-contract provider timeout degrades options without aborting equity research", async () => {
+  const ingestionRuns: Record<string, unknown>[] = [];
+  const result = await refreshPostgresMarketData({
+    symbols: ["SPY"],
+    timeframe: "1Day",
+    start: "2026-01-01T00:00:00.000Z",
+    end: "2026-07-21T13:42:00.000Z",
+    optionsEnabled: true,
+    now: new Date("2026-07-21T13:42:00.000Z"),
+    repository: {
+      upsertUniverseSymbols: async (rows: unknown[]) => ({ stored: rows.length }),
+      upsertBars: async (rows: unknown[]) => ({ stored: rows.length }),
+      upsertStockSnapshots: async (rows: unknown[]) => ({ stored: rows.length }),
+      recordMarketDataIngestionRun: async (row: Record<string, unknown>) => {
+        ingestionRuns.push(row);
+        return { stored: 1 };
+      }
+    } as never,
+    context,
+    dependencies: {
+      fetchAllBars: async () => [{
+        symbol: "SPY",
+        bar: { t: "2026-07-21T13:41:00.000Z", o: 620, h: 625, l: 618, c: 624, v: 1_000_000 },
+        requestIds: ["bars-SPY"]
+      }],
+      fetchStockSnapshots: async () => [{
+        symbol: "SPY",
+        raw: {
+          ...stockRaw,
+          latestTrade: { ...stockRaw.latestTrade, t: "2026-07-21T13:41:58.000Z" },
+          latestQuote: { ...stockRaw.latestQuote, t: "2026-07-21T13:41:58.000Z" },
+          minuteBar: { ...stockRaw.minuteBar, t: "2026-07-21T13:41:00.000Z" },
+          dailyBar: { ...stockRaw.dailyBar, t: "2026-07-21T13:41:00.000Z" }
+        },
+        requestedFeed: "sip", effectiveFeed: "sip", currency: "USD", requestId: "stocks-SPY"
+      }],
+      fetchOptionContracts: async () => {
+        throw new Error("Alpaca request timed out after 15000ms.");
+      },
+      fetchOptionSnapshots: async () => [],
+      fetchOptionChainSnapshots: async () => {
+        throw new Error("OPTION_CHAIN_MUST_NOT_RUN_WITHOUT_CONTRACTS");
+      }
+    } as never
+  });
+
+  assert.equal(result.bars.length, 1);
+  assert.equal(result.stockSnapshots.length, 1);
+  assert.equal(result.optionContracts.length, 0);
+  assert.equal(result.optionSnapshots.length, 0);
+  assert.equal(result.summary.optionDataStatus, "degraded");
+  assert.deepEqual(result.summary.optionDataRejectionReasons, [
+    "POSTGRES_OPTION_CONTRACT_PROVIDER_UNAVAILABLE:SPY:ALPACA_REQUEST_TIMEOUT"
+  ]);
+  assert.equal(ingestionRuns.length, 1);
+  assert.equal(
+    ingestionRuns[0]?.rejectionReason,
+    "POSTGRES_OPTION_CONTRACT_PROVIDER_UNAVAILABLE:SPY:ALPACA_REQUEST_TIMEOUT"
+  );
+  assert.equal(ingestionRuns[0]?.persistenceResult, "not_persisted_provider_unavailable");
+});
+
 test("required underlying without fresh OPRA snapshots degrades only option-dependent paths", async () => {
   const result = await refreshPostgresMarketData({
     symbols: ["SPY"],

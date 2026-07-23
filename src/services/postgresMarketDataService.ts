@@ -91,6 +91,15 @@ const record = (value: unknown): Record<string, unknown> =>
 const text = (value: unknown) =>
   typeof value === "string" && value.trim() ? value.trim() : null;
 
+const providerFailureCode = (error: unknown) => {
+  const message = error instanceof Error ? error.message.trim() : "";
+  if (/timed out/i.test(message)) return "ALPACA_REQUEST_TIMEOUT";
+  const candidate = message.split(":", 1)[0]?.trim() ?? "";
+  return /^[A-Z][A-Z0-9_]+$/.test(candidate)
+    ? candidate
+    : "OPTION_PROVIDER_REQUEST_FAILED";
+};
+
 const retrievalTimestamp = (value: unknown, fallback: string) => {
   const candidate = text(value);
   const parsed = candidate ? Date.parse(candidate) : Number.NaN;
@@ -385,14 +394,57 @@ export const refreshPostgresMarketData = async (input: {
     if (optionFeed !== "opra") throw new Error(`POSTGRES_OPTION_FEED_INVALID:${optionFeed}`);
     const contractsBySymbol = new Map<string, PostgresOptionContract>();
     for (const underlying of requestedSymbols) {
-      const rawContracts = await dependencies.fetchOptionContracts({
-        underlyingSymbols: [underlying],
-        minDaysToExpiration: 0,
-        maxDaysToExpiration: 730,
-        status: "active",
-        limit: null,
-        signal: input.signal
-      });
+      const requestStartedAt = nowIso;
+      let rawContracts: Awaited<ReturnType<typeof fetchOptionContracts>>;
+      try {
+        rawContracts = await dependencies.fetchOptionContracts({
+          underlyingSymbols: [underlying],
+          minDaysToExpiration: 0,
+          maxDaysToExpiration: 730,
+          status: "active",
+          limit: null,
+          signal: input.signal
+        });
+      } catch (error) {
+        if (input.signal?.aborted) {
+          throw input.signal.reason instanceof Error
+            ? input.signal.reason
+            : new Error("SCHEDULER_COMMAND_TERMINATED: option-contract refresh cancelled.");
+        }
+        const rejectionReason =
+          `POSTGRES_OPTION_CONTRACT_PROVIDER_UNAVAILABLE:${underlying}:${providerFailureCode(error)}`;
+        optionContractsByUnderlying[underlying] = 0;
+        optionSnapshotsByUnderlying[underlying] = 0;
+        freshOptionSnapshotsByUnderlying[underlying] = 0;
+        optionDataRejectionReasons.push(rejectionReason);
+        ingestionRuns.push({
+          cycleId: process.env.AUTONOMOUS_CYCLE_ID?.trim() || null,
+          workstream:
+            process.env.AUTONOMOUS_WORKSTREAM?.trim() ||
+            input.context.schedulerFence.workstream,
+          symbol: underlying,
+          provider: "alpaca",
+          endpoint: "/v2/options/contracts",
+          requestedFeed: null,
+          effectiveFeed: null,
+          requestStartedAt,
+          requestCompletedAt: nowIso,
+          pagesRetrieved: 0,
+          rowsReceived: 0,
+          newestProviderTimestamp: null,
+          oldestProviderTimestamp: null,
+          newestProviderAgeSeconds: null,
+          acceptedRows: 0,
+          staleRows: 0,
+          rejectedRows: 0,
+          freshnessThresholdSeconds:
+            (input.maxOptionSnapshotAgeSeconds ?? 1_200),
+          rejectionReason,
+          persistenceResult: "not_persisted_provider_unavailable",
+          requestIds: []
+        });
+        continue;
+      }
       for (const raw of rawContracts) {
         const row = contractRow(raw, nowIso);
         if (!row) continue;
@@ -418,10 +470,17 @@ export const refreshPostgresMarketData = async (input: {
       }
     }
     optionContracts = [...contractsBySymbol.values()];
-    if (optionContracts.length === 0) {
+    if (
+      optionContracts.length === 0 &&
+      !optionDataRejectionReasons.some((reason) =>
+        reason.startsWith("POSTGRES_OPTION_CONTRACT_PROVIDER_UNAVAILABLE:")
+      )
+    ) {
       throw new Error("POSTGRES_OPTION_CONTRACTS_MISSING");
     }
-    await repository.upsertOptionContracts(optionContracts, input.context);
+    if (optionContracts.length > 0) {
+      await repository.upsertOptionContracts(optionContracts, input.context);
+    }
     const snapshotsByIdentity = new Map<string, PostgresOptionSnapshot>();
     const maxOptionAgeMs = (input.maxOptionSnapshotAgeSeconds ?? 1_200) * 1_000;
     for (const underlying of requestedSymbols) {
