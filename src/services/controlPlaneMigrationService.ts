@@ -697,7 +697,8 @@ export const readControlPlaneSnapshot = async (
       : "NULL AS correlation_id";
     const decisionRows = database
       .prepare(
-        `SELECT decision_id, candidate_id, position_lifecycle_id,
+        `SELECT decision_id, origin_type, decision_role,
+                candidate_id, position_lifecycle_id,
                 ${requestIdExpression}, ${correlationIdExpression}
          FROM decision_snapshots
          ORDER BY decision_id`
