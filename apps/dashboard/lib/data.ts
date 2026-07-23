@@ -176,6 +176,17 @@ const clampRows = <T>(rows: unknown, limit: number): T[] => {
   return rows.slice(0, safeLimit(limit, rows.length > 0 ? rows.length : 1, 200)) as T[];
 };
 
+const recordValue = (value: unknown): Record<string, unknown> =>
+  value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+
+const textOrNull = (value: unknown): string | null =>
+  typeof value === "string" && value.trim() ? value.trim() : null;
+
+const booleanFlag = (value: unknown) =>
+  value === true || value === 1 || value === "1" || value === "true";
+
 const bridgeUrlForPath = (path: string) => {
   const base = (resolveVpsControlBaseUrl() || "").trim();
   if (!base) {
@@ -367,6 +378,16 @@ const optionDisplayCategory = (input: {
   return "Discovered";
 };
 
+const inferredQuoteStatus = (row: Record<string, unknown>) => {
+  const explicit = textOrNull(row.quote_status ?? row.quoteStatus);
+  if (explicit) return quoteStatusForDashboard(explicit);
+  const timestamp = textOrNull(row.quote_timestamp ?? row.quoteTimestamp ?? row.observed_at ?? row.timestamp);
+  const bid = numberOrNull(row.bid);
+  const ask = numberOrNull(row.ask);
+  if (timestamp && bid !== null && ask !== null && bid >= 0 && ask >= bid) return "valid" as const;
+  return timestamp ? "invalid" as const : "missing" as const;
+};
+
 const normalizeOptionContractDashboardRow = (row: {
   underlying_symbol: string;
   option_symbol: string;
@@ -425,9 +446,35 @@ const normalizeOptionContractDashboardRow = (row: {
   };
 };
 
+const normalizeBridgeOptionContractRow = (value: unknown): OptionContractDashboardRow => {
+  const row = recordValue(value);
+  const quoteStatus = inferredQuoteStatus(row);
+  return normalizeOptionContractDashboardRow({
+    underlying_symbol: textOrNull(row.underlying_symbol ?? row.underlyingSymbol) ?? "-",
+    option_symbol: textOrNull(row.option_symbol ?? row.optionSymbol) ?? "-",
+    type: textOrNull(row.type ?? row.optionType) ?? "-",
+    expiration_date: textOrNull(row.expiration_date ?? row.expirationDate) ?? "-",
+    strike: numberOrNull(row.strike),
+    tradable: booleanFlag(row.tradable) ? 1 : 0,
+    bid: numberOrNull(row.bid),
+    ask: numberOrNull(row.ask),
+    midpoint: numberOrNull(row.midpoint),
+    last: numberOrNull(row.last),
+    quote_status: quoteStatus,
+    executable: booleanFlag(row.executable) ? 1 : 0,
+    executable_price: numberOrNull(row.executable_price ?? row.executablePrice),
+    executable_price_source: textOrNull(row.executable_price_source ?? row.executablePriceSource),
+    rejection_reason: textOrNull(row.rejection_reason ?? row.rejectionReason),
+    quote_timestamp: textOrNull(row.quote_timestamp ?? row.quoteTimestamp),
+    timestamp: textOrNull(row.timestamp ?? row.observed_at ?? row.observedAt)
+  });
+};
+
 export const latestOptionContracts = async (limit = 10) =>
   isPaperDashboardBridgeEnabled()
-    ? getPaperBridgeSummary().then((summary) => clampRows(summary.optionContracts, limit))
+    ? getPaperBridgeSummary().then((summary) =>
+        clampRows(summary.optionContracts, limit).map(normalizeBridgeOptionContractRow)
+      )
     : [];
 
 export const latestOpenOrders = async (limit = 12) =>
@@ -523,28 +570,73 @@ const cachedPlanResult = (latestPlans: unknown[]): DashboardSnapshot["plan"] => 
   label: "plan",
   data: {
     plan: latestPlans.map((row, index) => {
-      const record = row && typeof row === "object" ? row as Record<string, unknown> : {};
-      const strategy = [record.direction, record.expression, record.option_symbol]
-        .map((entry) => typeof entry === "string" ? entry : "")
+      const record = recordValue(row);
+      const strategy = [
+        record.strategy,
+        record.direction,
+        record.expression ?? record.preferred_expression,
+        record.strategy_family ?? record.option_symbol
+      ]
+        .map((entry) => textOrNull(entry) ?? "")
         .filter(Boolean)
         .join(" / ");
       return {
-        symbol: typeof record.symbol === "string" ? record.symbol : "-",
+        symbol: textOrNull(record.symbol ?? record.option_symbol) ?? "-",
         decision:
-          typeof record.status === "string"
-            ? record.status
-            : typeof record.direction === "string"
-              ? record.direction
-              : "-",
+          textOrNull(record.decision ?? record.status ?? record.direction) ?? "-",
         latestRank: index + 1,
         strategy: strategy || null,
         estimatedNotional:
+          numberOrNull(record.estimatedNotional) ??
+          numberOrNull(record.estimated_notional) ??
           numberOrNull(record.estimated_max_loss) ??
           numberOrNull(record.estimated_max_profit)
       };
     })
   }
 });
+
+const planRowsFromBridgeValue = (value: unknown, fallback: unknown[]) => {
+  const result = recordValue(value);
+  const data = recordValue(result.data);
+  return Array.isArray(data.plan) ? data.plan : fallback;
+};
+
+const normalizeBridgeHedgeResult = (value: unknown): DashboardSnapshot["hedge"] => {
+  const result = recordValue(value);
+  if (result.ok === false) {
+    return {
+      ok: false,
+      label: textOrNull(result.label) ?? "hedge",
+      error: textOrNull(result.error) ?? "Unavailable"
+    };
+  }
+  const data = recordValue(result.ok === true ? result.data : value);
+  const status = textOrNull(data.effectiveStatus ?? data.status);
+  return {
+    ok: true,
+    label: textOrNull(result.label) ?? "hedge",
+    data: {
+      ...data,
+      effectiveStatus:
+        status === "current" || status === "monitoring" || status === "stale" ||
+        status === "expired" || status === "blocked"
+          ? status
+          : "blocked"
+    }
+  };
+};
+
+export const normalizeDashboardBridgeSummary = (summary: PaperBridgeSummary): PaperBridgeSummary => {
+  const latestPlans = clampRows(summary.latestPaperPlans, 100);
+  return {
+    ...summary,
+    latestPaperPlans: latestPlans,
+    plan: cachedPlanResult(planRowsFromBridgeValue(summary.plan, latestPlans)),
+    optionContracts: clampRows(summary.optionContracts, 100).map(normalizeBridgeOptionContractRow),
+    hedge: normalizeBridgeHedgeResult(summary.hedge)
+  };
+};
 
 const cachedReviewAndDryRun = async (): Promise<{
   review: DashboardSnapshot["review"];
@@ -664,7 +756,7 @@ export const buildDashboardSnapshot = async (): Promise<DashboardSnapshot> => {
   assertPaperDashboardAccess();
 
   if (isPaperDashboardBridgeEnabled()) {
-    const bridgeSummary = await getPaperBridgeSummary();
+    const bridgeSummary = normalizeDashboardBridgeSummary(await getPaperBridgeSummary());
     return {
       ...bridgeSummary,
       generatedAt: bridgeSummary.generatedAt || new Date().toISOString(),
