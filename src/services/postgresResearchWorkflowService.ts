@@ -2,6 +2,10 @@ import { randomUUID } from "node:crypto";
 
 import { seedUniverse } from "../config/universe.seed.js";
 import { canonicalJsonHash } from "../lib/canonicalJson.js";
+import {
+  postgresErrorTelemetry,
+  readPostgresQueryTelemetry
+} from "../lib/database/postgresTelemetry.js";
 import type { SchedulerFence } from "../repositories/contracts/common.js";
 import { PostgresMarketDataRepository } from "../repositories/postgres/postgresMarketDataRepository.js";
 import type { FencedPostgresRepositoryContext } from "../repositories/postgres/postgresRepositorySupport.js";
@@ -15,6 +19,7 @@ import { buildPostgresFeaturesAndTargets } from "./postgresFeatureTargetService.
 import { refreshPostgresMarketData } from "./postgresMarketDataService.js";
 
 export type PostgresResearchQuery = {
+  telemetryEnabled?: boolean;
   query: (sql: string, values?: readonly unknown[]) => Promise<{
     rows: Record<string, unknown>[];
     rowCount: number | null;
@@ -56,7 +61,42 @@ const fenceValues = (fence: SchedulerFence) => [
 ];
 
 const EVIDENCE_BATCH_SIZE = 250;
+export const POSTGRES_RESEARCH_EVIDENCE_BATCH_MAX_BYTES = 4_000_000;
 const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
+const RESEARCH_EVIDENCE_INSERT_SQL = `INSERT INTO research_evidence(
+  id, research_run_id, evidence_type, symbol, observed_at, source_table,
+  source_key, source_fingerprint, payload, created_at
+) SELECT r.id, $2, r.evidence_type, r.symbol, r.observed_at::timestamptz,
+         r.source_table, r.source_key, r.source_fingerprint, r.payload::jsonb, $3
+  FROM jsonb_to_recordset($1::jsonb) AS r(
+    id text, evidence_type text, symbol text, observed_at text,
+    source_table text, source_key text, source_fingerprint text, payload jsonb)
+  WHERE ${fenceSql(4)}
+ON CONFLICT (id) DO NOTHING`;
+const RESEARCH_FEATURE_EVIDENCE_INSERT_SQL = `INSERT INTO research_evidence(
+  id, research_run_id, evidence_type, symbol, observed_at, source_table,
+  source_key, source_fingerprint, payload, created_at
+) SELECT $1, $2, 'feature_snapshot', f.symbol, f.observed_at,
+         'feature_snapshots', $3, f.source_fingerprint, f.features, $4
+  FROM feature_snapshots f
+  WHERE f.symbol = $5
+    AND f.observed_at = $6::timestamptz
+    AND f.source_fingerprint = $7
+    AND ${fenceSql(8)}
+ON CONFLICT (id) DO NOTHING
+RETURNING id, pg_column_size(payload)::bigint AS source_payload_bytes`;
+const RESEARCH_FEATURE_EVIDENCE_REPLAY_SQL = `SELECT
+  EXISTS(
+    SELECT 1 FROM research_evidence WHERE id = $1
+  ) AS evidence_exists,
+  EXISTS(
+    SELECT 1
+    FROM feature_snapshots
+    WHERE symbol = $2
+      AND observed_at = $3::timestamptz
+      AND source_fingerprint = $4
+  ) AS source_exists
+WHERE ${fenceSql(5)}`;
 
 type ResearchEvidenceRow = {
   type: string;
@@ -66,6 +106,52 @@ type ResearchEvidenceRow = {
   key: string;
   fingerprint: string;
   payload: unknown;
+};
+
+type ResearchFeatureEvidenceRow = Omit<ResearchEvidenceRow, "payload">;
+
+const evidenceBatches = (rows: readonly Record<string, unknown>[]) => {
+  const batches: Array<{
+    rows: Record<string, unknown>[];
+    payload: string;
+    bytes: number;
+  }> = [];
+  let currentRows: Record<string, unknown>[] = [];
+  let serializedRows: string[] = [];
+  let currentBytes = 2;
+  const flush = () => {
+    if (!currentRows.length) return;
+    const payload = `[${serializedRows.join(",")}]`;
+    batches.push({
+      rows: currentRows,
+      payload,
+      bytes: Buffer.byteLength(payload)
+    });
+    currentRows = [];
+    serializedRows = [];
+    currentBytes = 2;
+  };
+  for (const row of rows) {
+    const serialized = JSON.stringify(row);
+    const serializedBytes = Buffer.byteLength(serialized);
+    if (serializedBytes + 2 > POSTGRES_RESEARCH_EVIDENCE_BATCH_MAX_BYTES) {
+      throw new Error(
+        `POSTGRES_RESEARCH_EVIDENCE_ROW_TOO_LARGE:bytes=${serializedBytes}:max=${POSTGRES_RESEARCH_EVIDENCE_BATCH_MAX_BYTES}`
+      );
+    }
+    const addedBytes = serializedBytes + (currentRows.length > 0 ? 1 : 0);
+    if (
+      currentRows.length >= EVIDENCE_BATCH_SIZE ||
+      currentBytes + addedBytes > POSTGRES_RESEARCH_EVIDENCE_BATCH_MAX_BYTES
+    ) {
+      flush();
+    }
+    currentRows.push(row);
+    serializedRows.push(serialized);
+    currentBytes += serializedBytes + (currentRows.length > 1 ? 1 : 0);
+  }
+  flush();
+  return batches;
 };
 
 const failResearchRun = async (input: {
@@ -183,6 +269,7 @@ const persistEvidence = async (input: {
   features: FeatureTargetResult["features"];
   targets: FeatureTargetResult["targets"];
   now: string;
+  emitTelemetry?: (event: Record<string, unknown>) => void;
 }) => {
   const latestBars = new Map<string, MarketResult["bars"][number]>();
   for (const bar of input.market.bars) {
@@ -220,11 +307,11 @@ const persistEvidence = async (input: {
     });
     if ((index + 1) % EVIDENCE_BATCH_SIZE === 0) await yieldToEventLoop();
   }
-  rows.push(...[...latestFeatures.values()].map((row) => ({
+  const featureRows: ResearchFeatureEvidenceRow[] = [...latestFeatures.values()].map((row) => ({
     type: "feature_snapshot", symbol: row.symbol, observedAt: row.observedAt,
     table: "feature_snapshots", key: `${row.symbol}:${row.observedAt}`,
-    fingerprint: row.sourceFingerprint, payload: row.features
-  })));
+    fingerprint: row.sourceFingerprint
+  }));
   rows.push(...input.targets.map((row) => ({
     type: "target_snapshot", symbol: row.symbol, observedAt: row.asOf,
     table: "target_snapshots", key: `${row.symbol}:${row.asOf}:${row.riskProfile}`,
@@ -242,34 +329,176 @@ const persistEvidence = async (input: {
     if ((index + 1) % EVIDENCE_BATCH_SIZE === 0) await yieldToEventLoop();
   }
   const unique = [...uniqueById.values()];
-  for (let offset = 0; offset < unique.length; offset += EVIDENCE_BATCH_SIZE) {
-    const batch = unique.slice(offset, offset + EVIDENCE_BATCH_SIZE);
-    const fence = await input.query.query(
-      `SELECT 1 WHERE ${fenceSql(1)}`,
-      fenceValues(input.fence)
-    );
-    if (fence.rowCount !== 1) throw new Error("POSTGRES_RESEARCH_EVIDENCE_FENCE_REJECTED");
-    const result = await input.query.query(
-      `INSERT INTO research_evidence(
-         id, research_run_id, evidence_type, symbol, observed_at, source_table,
-         source_key, source_fingerprint, payload, created_at
-       ) SELECT r.id, $2, r.evidence_type, r.symbol, r.observed_at::timestamptz,
-                r.source_table, r.source_key, r.source_fingerprint, r.payload::jsonb, $3
-         FROM jsonb_to_recordset($1::jsonb) AS r(
-           id text, evidence_type text, symbol text, observed_at text,
-           source_table text, source_key text, source_fingerprint text, payload jsonb)
-         WHERE ${fenceSql(4)}
-       ON CONFLICT (id) DO NOTHING`,
-      [JSON.stringify(batch), input.researchRunId, input.now, ...fenceValues(input.fence)]
-    );
-    if (result.rowCount === 0 && batch.length > 0) {
-      const stillHeld = await input.query.query(`SELECT 1 WHERE ${fenceSql(1)}`, fenceValues(input.fence));
-      if (stillHeld.rowCount !== 1) throw new Error("POSTGRES_RESEARCH_EVIDENCE_FENCE_REJECTED");
-    } else if (result.rowCount === null || result.rowCount > batch.length) {
-      throw new Error("POSTGRES_RESEARCH_EVIDENCE_PERSISTENCE_FAILED");
+  const uniqueFeatureById = new Map<string, ResearchFeatureEvidenceRow & { id: string }>();
+  for (const row of featureRows) {
+    const id = `research_evidence_${canonicalJsonHash({
+      run: input.researchRunId,
+      type: row.type,
+      key: row.key,
+      fingerprint: row.fingerprint
+    })}`;
+    uniqueFeatureById.set(id, { ...row, id });
+  }
+  const uniqueFeatures = [...uniqueFeatureById.values()];
+  const inlineBatches = evidenceBatches(unique);
+  const batchCount = inlineBatches.length + uniqueFeatures.length;
+  for (let batchIndex = 0; batchIndex < inlineBatches.length; batchIndex += 1) {
+    const batch = inlineBatches[batchIndex]!;
+    const batchNumber = batchIndex + 1;
+    const startedAt = performance.now();
+    try {
+      const fence = await input.query.query(
+        `SELECT 1 WHERE ${fenceSql(1)}`,
+        fenceValues(input.fence)
+      );
+      if (fence.rowCount !== 1) throw new Error("POSTGRES_RESEARCH_EVIDENCE_FENCE_REJECTED");
+      const result = await input.query.query(
+        RESEARCH_EVIDENCE_INSERT_SQL,
+        [batch.payload, input.researchRunId, input.now, ...fenceValues(input.fence)]
+      );
+      if (result.rowCount === 0 && batch.rows.length > 0) {
+        const stillHeld = await input.query.query(`SELECT 1 WHERE ${fenceSql(1)}`, fenceValues(input.fence));
+        if (stillHeld.rowCount !== 1) throw new Error("POSTGRES_RESEARCH_EVIDENCE_FENCE_REJECTED");
+      } else if (result.rowCount === null || result.rowCount > batch.rows.length) {
+        throw new Error("POSTGRES_RESEARCH_EVIDENCE_PERSISTENCE_FAILED");
+      }
+      input.emitTelemetry?.({
+        event: "postgres_research_evidence_batch",
+        researchRunId: input.researchRunId,
+        batchNumber,
+        batchCount,
+        batchSize: batch.rows.length,
+        payloadBytes: batch.bytes,
+        rowsAttempted: batch.rows.length,
+        rowsCommitted: result.rowCount ?? 0,
+        transactionDurationMs: performance.now() - startedAt,
+        leaseOwner: input.fence.ownerId,
+        fencingToken: input.fence.fencingToken,
+        statementName: "research_evidence_batch_insert",
+        ...readPostgresQueryTelemetry(result)
+      });
+    } catch (error) {
+      input.emitTelemetry?.({
+        event: "postgres_research_evidence_batch",
+        researchRunId: input.researchRunId,
+        batchNumber,
+        batchCount,
+        batchSize: batch.rows.length,
+        payloadBytes: batch.bytes,
+        rowsAttempted: batch.rows.length,
+        rowsCommitted: 0,
+        transactionDurationMs: performance.now() - startedAt,
+        leaseOwner: input.fence.ownerId,
+        fencingToken: input.fence.fencingToken,
+        statementName: "research_evidence_batch_insert",
+        outcome: "failed",
+        ...readPostgresQueryTelemetry(error)
+      });
+      input.emitTelemetry?.(postgresErrorTelemetry(error, {
+        failingStatement: RESEARCH_EVIDENCE_INSERT_SQL,
+        batchNumber,
+        symbol: null
+      }));
+      throw error;
     }
   }
-  return unique.length;
+  for (let featureIndex = 0; featureIndex < uniqueFeatures.length; featureIndex += 1) {
+    const feature = uniqueFeatures[featureIndex]!;
+    const batchNumber = inlineBatches.length + featureIndex + 1;
+    const startedAt = performance.now();
+    try {
+      const fence = await input.query.query(
+        `SELECT 1 WHERE ${fenceSql(1)}`,
+        fenceValues(input.fence)
+      );
+      if (fence.rowCount !== 1) throw new Error("POSTGRES_RESEARCH_EVIDENCE_FENCE_REJECTED");
+      const result = await input.query.query(
+        RESEARCH_FEATURE_EVIDENCE_INSERT_SQL,
+        [
+          feature.id,
+          input.researchRunId,
+          feature.key,
+          input.now,
+          feature.symbol,
+          feature.observedAt,
+          feature.fingerprint,
+          ...fenceValues(input.fence)
+        ]
+      );
+      let outcome = "committed";
+      if (result.rowCount === 0) {
+        const replay = await input.query.query(
+          RESEARCH_FEATURE_EVIDENCE_REPLAY_SQL,
+          [
+            feature.id,
+            feature.symbol,
+            feature.observedAt,
+            feature.fingerprint,
+            ...fenceValues(input.fence)
+          ]
+        );
+        const state = replay.rows[0];
+        if (!state) throw new Error("POSTGRES_RESEARCH_EVIDENCE_FENCE_REJECTED");
+        if (state.source_exists !== true) {
+          throw new Error(
+            `POSTGRES_RESEARCH_FEATURE_EVIDENCE_SOURCE_MISSING:${feature.symbol}`
+          );
+        }
+        if (state.evidence_exists !== true) {
+          throw new Error("POSTGRES_RESEARCH_EVIDENCE_PERSISTENCE_FAILED");
+        }
+        outcome = "already_persisted";
+      } else if (result.rowCount !== 1) {
+        throw new Error("POSTGRES_RESEARCH_EVIDENCE_PERSISTENCE_FAILED");
+      }
+      const sourcePayloadBytes = Number(result.rows[0]?.source_payload_bytes);
+      input.emitTelemetry?.({
+        event: "postgres_research_evidence_batch",
+        researchRunId: input.researchRunId,
+        evidenceType: "feature_snapshot",
+        batchNumber,
+        batchCount,
+        batchSize: 1,
+        symbol: feature.symbol,
+        rowsAttempted: 1,
+        rowsCommitted: result.rowCount ?? 0,
+        sourcePayloadBytes: Number.isFinite(sourcePayloadBytes)
+          ? sourcePayloadBytes
+          : null,
+        transactionDurationMs: performance.now() - startedAt,
+        leaseOwner: input.fence.ownerId,
+        fencingToken: input.fence.fencingToken,
+        statementName: "research_feature_evidence_server_copy",
+        outcome,
+        ...readPostgresQueryTelemetry(result)
+      });
+    } catch (error) {
+      input.emitTelemetry?.({
+        event: "postgres_research_evidence_batch",
+        researchRunId: input.researchRunId,
+        evidenceType: "feature_snapshot",
+        batchNumber,
+        batchCount,
+        batchSize: 1,
+        symbol: feature.symbol,
+        rowsAttempted: 1,
+        rowsCommitted: 0,
+        transactionDurationMs: performance.now() - startedAt,
+        leaseOwner: input.fence.ownerId,
+        fencingToken: input.fence.fencingToken,
+        statementName: "research_feature_evidence_server_copy",
+        outcome: "failed",
+        ...readPostgresQueryTelemetry(error)
+      });
+      input.emitTelemetry?.(postgresErrorTelemetry(error, {
+        failingStatement: RESEARCH_FEATURE_EVIDENCE_INSERT_SQL,
+        batchNumber,
+        symbol: feature.symbol
+      }));
+      throw error;
+    }
+  }
+  return unique.length + uniqueFeatures.length;
 };
 
 const persistCandidates = async (input: {
@@ -393,6 +622,7 @@ export const runPostgresResearchWorkflow = async (input: {
   now?: Date;
   dependencies?: Partial<ResearchDependencies>;
   explorationThresholds?: PaperExplorationThresholds;
+  emitTelemetry?: (event: Record<string, unknown>) => void;
 }) => {
   const deps = { ...dependencies, ...input.dependencies };
   const now = input.now ?? new Date();
@@ -448,7 +678,9 @@ export const runPostgresResearchWorkflow = async (input: {
     transaction: input.query,
     operationId: `research:${runId}`,
     actorId: input.fence.ownerId,
-    schedulerFence: input.fence
+    schedulerFence: input.fence,
+    emitTelemetry: input.emitTelemetry,
+    profileOptionReadbackQuery: input.query.telemetryEnabled === true
   } as unknown as FencedPostgresRepositoryContext;
   try {
     const market = await deps.refreshMarketData({
@@ -474,7 +706,8 @@ export const runPostgresResearchWorkflow = async (input: {
     });
     const evidenceStored = await persistEvidence({
       query: input.query, fence: input.fence, researchRunId: runId,
-      market, features: generated.features, targets: generated.targets, now: nowIso
+      market, features: generated.features, targets: generated.targets, now: nowIso,
+      emitTelemetry: input.emitTelemetry
     });
     const candidateDecisions = await persistCandidates({
       query: input.query, fence: input.fence, researchRunId: runId,

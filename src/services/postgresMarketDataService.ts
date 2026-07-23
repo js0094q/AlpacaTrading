@@ -29,7 +29,16 @@ type MarketDataWriter = Pick<
   | "upsertOptionSnapshots"
   | "listOptionContractsBySymbols"
   | "listOptionSnapshotsByIdentity"
-> & Partial<Pick<PostgresMarketDataRepository, "recordMarketDataIngestionRun">>;
+> & {
+  recordMarketDataIngestionRun?: PostgresMarketDataRepository["recordMarketDataIngestionRun"];
+  persistOptionSnapshotsWithReadback?: (
+    rows: readonly PostgresOptionSnapshot[],
+    context: FencedPostgresRepositoryContext
+  ) => Promise<{
+    stored: number;
+    persistedRows: PostgresOptionSnapshot[];
+  }>;
+};
 
 type MarketDataDependencies = {
   fetchAllBars: typeof fetchAllBars;
@@ -619,15 +628,24 @@ export const refreshPostgresMarketData = async (input: {
     }
     optionSnapshots = [...snapshotsByIdentity.values()];
     if (optionSnapshots.length > 0) {
-      await repository.upsertOptionSnapshots(optionSnapshots, input.context);
+      let persistedSnapshots: PostgresOptionSnapshot[];
+      if (repository.persistOptionSnapshotsWithReadback) {
+        const snapshotPersistence = await repository.persistOptionSnapshotsWithReadback(
+          optionSnapshots,
+          input.context
+        );
+        persistedSnapshots = snapshotPersistence.persistedRows;
+      } else {
+        await repository.upsertOptionSnapshots(optionSnapshots, input.context);
+        persistedSnapshots = await repository.listOptionSnapshotsByIdentity({
+          identities: optionSnapshots.map((row) => ({
+            optionSymbol: row.optionSymbol,
+            observedAt: row.observedAt
+          }))
+        }, input.context);
+      }
       const persistedContracts = await repository.listOptionContractsBySymbols({
         optionSymbols: optionContracts.map((row) => row.optionSymbol)
-      }, input.context);
-      const persistedSnapshots = await repository.listOptionSnapshotsByIdentity({
-        identities: optionSnapshots.map((row) => ({
-          optionSymbol: row.optionSymbol,
-          observedAt: row.observedAt
-        }))
       }, input.context);
       if (persistedContracts.length !== optionContracts.length) {
         throw new Error("POSTGRES_OPTION_CONTRACT_READBACK_INCOMPLETE");

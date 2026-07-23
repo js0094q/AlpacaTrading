@@ -76,6 +76,13 @@ checkpoints.
   shutdown sends `SIGTERM` to the group and escalates surviving descendants to
   `SIGKILL` after five seconds. `worker_stopping` and `workstream_timeout`
   events are operational telemetry only and do not relax any trading gate.
+- OPRA snapshot persistence must commit and read back each symbol-scoped,
+  250-row batch before proceeding. Preserve batch count, commit/readback,
+  insert/update, query/pool timing, query-plan, and scheduler-fence telemetry.
+  Count or evidence mismatches fail closed with the exact batch and symbol.
+  Preserve every downstream research-evidence row: limit inline client payloads
+  to 250 rows and 4 MB, and copy large feature payloads from
+  `feature_snapshots` inside PostgreSQL one row at a time.
 - Keep all paper execution/review/research/observatory/0DTE timers disabled.
 - Dashboard reads and guarded paper actions require the PostgreSQL-backed VPS
   bridge and return `503` when PostgreSQL or the passed authority baseline is

@@ -85,6 +85,8 @@ const runWorker = (options: {
   failCommand?: string;
   failOutput?: string;
   failStateEvent?: string;
+  successCommand?: string;
+  successOutput?: string;
   environment?: Record<string, string>;
 } = {}) => {
   const directory = mkdtempSync(join(tmpdir(), "autonomous-paper-worker-"));
@@ -138,6 +140,10 @@ if (command === process.env.WORKER_FAIL_COMMAND) {
   process.stdout.write(process.env.WORKER_FAIL_OUTPUT || JSON.stringify({ status: "failed", reason: "EXPECTED_TEST_FAILURE", token: "worker-test-secret" }));
   process.exit(1);
 }
+if (command === process.env.WORKER_SUCCESS_COMMAND) {
+  process.stdout.write(process.env.WORKER_SUCCESS_OUTPUT || JSON.stringify({ status: "success" }));
+  process.exit(0);
+}
 process.stdout.write(JSON.stringify({ status: "success" }));
 `,
     { mode: 0o700 }
@@ -160,7 +166,9 @@ process.stdout.write(JSON.stringify({ status: "success" }));
           WORKER_OVERLAP_PATH: overlapPath,
           WORKER_FAIL_COMMAND: options.failCommand ?? "",
           WORKER_FAIL_OUTPUT: options.failOutput ?? "",
-          WORKER_FAIL_STATE_EVENT: options.failStateEvent ?? ""
+          WORKER_FAIL_STATE_EVENT: options.failStateEvent ?? "",
+          WORKER_SUCCESS_COMMAND: options.successCommand ?? "",
+          WORKER_SUCCESS_OUTPUT: options.successOutput ?? ""
         },
         encoding: "utf8",
         timeout: 15_000
@@ -398,6 +406,38 @@ globalThis.setInterval = (callback, delay, ...args) =>
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("successful workstreams forward structured PostgreSQL telemetry with cycle identity", () => {
+  const { result } = runWorker({
+    successCommand: "research:daily",
+    successOutput: [
+      JSON.stringify({
+        event: "postgres_option_snapshot_batch",
+        batchNumber: 1,
+        symbol: "SPY",
+        rowsCommitted: 250,
+        rowsReadBack: 250,
+        outcome: "committed_and_read_back"
+      }),
+      JSON.stringify({ status: "success", token: "worker-test-secret-success-output" })
+    ].join("\n")
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const events = outputEvents(result.stdout);
+  const batch = events.find(
+    (event) => event.event === "postgres_option_snapshot_batch"
+  );
+  assert.ok(batch, result.stdout);
+  assert.equal(batch.cycle, 1);
+  assert.equal(batch.position, 1);
+  assert.equal(batch.workstream, "research:daily");
+  assert.match(String(batch.cycleId), /^[0-9a-f-]{36}$/i);
+  assert.equal(batch.batchNumber, 1);
+  assert.equal(batch.symbol, "SPY");
+  assert.equal(batch.rowsCommitted, 250);
+  assert.equal(batch.rowsReadBack, 250);
+  assert.doesNotMatch(result.stdout + result.stderr, /worker-test-secret-success-output/);
 });
 
 test("an ordinary workstream failure fails fast with durable terminal state", () => {

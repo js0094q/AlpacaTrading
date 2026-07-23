@@ -1,4 +1,5 @@
 import { config as loadDotenv } from "dotenv";
+import type { Pool, PoolClient, QueryResult } from "pg";
 
 loadDotenv();
 loadDotenv({ path: ".env.txt", override: false });
@@ -16,6 +17,10 @@ import {
 import { assertPostgresOnlyCliCommand } from "./lib/database/postgresOnlyRuntime.js";
 import { verifyPostgresSchema } from "./lib/database/postgresSchema.js";
 import { withPostgresTransaction } from "./lib/database/postgresTransaction.js";
+import {
+  attachPostgresQueryTelemetry,
+  type PostgresQueryTelemetry
+} from "./lib/database/postgresTelemetry.js";
 import { redactSensitiveData } from "./lib/securityRedaction.js";
 import { normalizeSymbol } from "./lib/utils.js";
 import { getAlpacaAccountSnapshot } from "./services/alpacaAccountService.js";
@@ -66,6 +71,10 @@ const print = (payload: unknown) => {
   process.stdout.write(`${JSON.stringify(redactSensitiveData(payload), null, 2)}\n`);
 };
 
+const emitRuntimeTelemetry = (event: Record<string, unknown>) => {
+  process.stdout.write(`${JSON.stringify(redactSensitiveData(event))}\n`);
+};
+
 const paperEnvelope = () => {
   const safety = getTradingSafetyState();
   return {
@@ -107,10 +116,64 @@ const requireScheduledContext = (
   return context;
 };
 
-const queryAdapter = (queryable: { query: (sql: string, values?: unknown[]) => Promise<unknown> }) => ({
-  query: (sql: string, values?: readonly unknown[]) =>
-    queryable.query(sql, values ? [...values] : undefined) as never
-});
+type PostgresQueryable = Pool | PoolClient;
+
+const queryAdapter = (queryable: PostgresQueryable) => {
+  const pool = typeof (queryable as PoolClient).release === "function"
+    ? null
+    : queryable as Pool;
+  return {
+    telemetryEnabled: pool !== null,
+    query: async (sql: string, values?: readonly unknown[]) => {
+      if (!pool) {
+        return queryable.query(sql, values ? [...values] : undefined) as never;
+      }
+      const acquisitionStartedAt = performance.now();
+      const saturatedAtStart = pool.idleCount === 0 &&
+        pool.totalCount >= (pool.options.max ?? Number.POSITIVE_INFINITY);
+      const waitingAtStart = pool.waitingCount;
+      let client: PoolClient;
+      try {
+        client = await pool.connect();
+      } catch (error) {
+        const acquisitionMs = performance.now() - acquisitionStartedAt;
+        attachPostgresQueryTelemetry(error, {
+          connectionAcquisitionMs: acquisitionMs,
+          poolWaitMs: waitingAtStart > 0 || saturatedAtStart ? acquisitionMs : 0,
+          queryDurationMs: 0,
+          poolTotalConnections: pool.totalCount,
+          poolIdleConnections: pool.idleCount,
+          poolWaitingRequests: pool.waitingCount
+        });
+        throw error;
+      }
+      const connectionAcquisitionMs = performance.now() - acquisitionStartedAt;
+      const queryStartedAt = performance.now();
+      const telemetry = (): PostgresQueryTelemetry => ({
+        connectionAcquisitionMs,
+        poolWaitMs: waitingAtStart > 0 || saturatedAtStart
+          ? connectionAcquisitionMs
+          : 0,
+        queryDurationMs: performance.now() - queryStartedAt,
+        poolTotalConnections: pool.totalCount,
+        poolIdleConnections: pool.idleCount,
+        poolWaitingRequests: pool.waitingCount
+      });
+      try {
+        const result = await client.query(
+          sql,
+          values ? [...values] : undefined
+        ) as QueryResult;
+        return attachPostgresQueryTelemetry(result, telemetry()) as never;
+      } catch (error) {
+        attachPostgresQueryTelemetry(error, telemetry());
+        throw error;
+      } finally {
+        client.release();
+      }
+    }
+  };
+};
 
 const run = async (scheduledContext?: PostgresScheduledCommandOperationContext) => {
   assertPostgresOnlyCliCommand(command);
@@ -324,16 +387,18 @@ const run = async (scheduledContext?: PostgresScheduledCommandOperationContext) 
 
   if (command === "research:daily") {
     const context = requireScheduledContext(scheduledContext);
+    const researchQuery = queryAdapter(context.pool);
     const riskProfile = ["aggressive", "moderate", "conservative"].includes(String(args.riskProfile))
       ? String(args.riskProfile) as "aggressive" | "moderate" | "conservative"
       : "moderate";
     const maxCandidates = Math.max(1, Math.min(25, Number.parseInt(String(args.maxCandidates || "10"), 10) || 10));
     const result = await runPostgresResearchWorkflow({
-      query: queryAdapter(context.pool),
+      query: researchQuery,
       fence: context.fence,
       riskProfile,
       optionsEnabled: ["true", "1"].includes(String(args.optionsEnabled).toLowerCase()),
-      maxCandidates
+      maxCandidates,
+      emitTelemetry: emitRuntimeTelemetry
     });
     print({ ...paperEnvelope(), command, ...result });
     return;
