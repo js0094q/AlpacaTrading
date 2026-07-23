@@ -2,6 +2,7 @@ import { createHmac } from "node:crypto";
 
 import { canonicalJsonHash } from "../lib/canonicalJson.js";
 import type { SchedulerFence } from "../repositories/contracts/common.js";
+import { parseOptionSymbol } from "./optionSymbolService.js";
 import {
   paperExplorationProfile,
   paperExplorationThresholds,
@@ -44,6 +45,8 @@ type ReviewSourceRow = Record<string, unknown> & {
   market_price: string | number;
   market_timestamp: Date | string;
   market_request_id: string | null;
+  signal_inputs?: unknown;
+  market_evidence?: unknown;
   open_position_count: string | number;
   open_order_count: string | number;
 };
@@ -82,6 +85,57 @@ const positiveOrInfinity = (value: unknown) => {
   const parsed = finite(value);
   return parsed !== null && parsed >= 0 ? parsed : Number.POSITIVE_INFINITY;
 };
+const jsonRecord = (value: unknown): Record<string, unknown> => {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  if (typeof value === "string" && value.trim()) {
+    try {
+      const parsed = JSON.parse(value);
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? parsed as Record<string, unknown>
+        : {};
+    } catch {
+      return {};
+    }
+  }
+  return {};
+};
+const optionDecisionInputs = (row: ReviewSourceRow) => {
+  const signalInputs = jsonRecord(row.signal_inputs);
+  const marketDecisionInputs = jsonRecord(signalInputs.marketDecisionInputs);
+  return jsonRecord(marketDecisionInputs.option);
+};
+const optionSizingScale = (row: ReviewSourceRow) => {
+  if (row.asset_class !== "option") return 1;
+  const decisionInputs = optionDecisionInputs(row);
+  const selectionScore = finite(decisionInputs.selectionScore);
+  return selectionScore === null
+    ? 1
+    : Math.max(0.25, Math.min(1, selectionScore));
+};
+
+const newYorkParts = (date: Date) => {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23"
+  }).formatToParts(date);
+  return Object.fromEntries(parts.map((part) => [part.type, part.value]));
+};
+
+const isFinalThirtyMinutesForZeroDte = (optionSymbol: string, now: Date) => {
+  const parsed = parseOptionSymbol(optionSymbol);
+  if (!parsed.ok) return false;
+  const parts = newYorkParts(now);
+  const tradingDate = `${parts.year}-${parts.month}-${parts.day}`;
+  const minutes = Number(parts.hour) * 60 + Number(parts.minute);
+  return parsed.expirationDate === tradingDate && minutes >= 15 * 60 + 30 && minutes <= 16 * 60;
+};
 
 const persistCandidateStage = async (input: {
   query: PostgresReviewQuery;
@@ -117,6 +171,7 @@ const entrySourceSql = (command: string, maxCandidates: number) => `WITH latest_
 SELECT candidate.id AS candidate_id, candidate.symbol, candidate.asset_class,
        candidate.option_symbol, candidate.preferred_expression,
        candidate.direction, candidate.confidence, candidate.as_of AS candidate_as_of,
+       candidate.signal_inputs,
        account.id AS account_id, snapshot.id AS account_snapshot_id,
        snapshot.snapshot_fingerprint,
        snapshot.evidence->>'structuralPortfolioFingerprint' AS structural_fingerprint,
@@ -127,7 +182,7 @@ SELECT candidate.id AS candidate_id, candidate.symbol, candidate.asset_class,
        limits.max_symbol_notional::text, limits.max_deployment_amount::text,
        limits.cash_reserve_amount::text, limits.cash_reserve_ratio::text,
        market.market_price::text, market.market_timestamp,
-       market.market_request_id,
+       market.market_request_id, market.market_evidence,
        (SELECT COUNT(*) FROM positions position
          WHERE position.account_id = account.id AND position.status IN ('open', 'closing')
            AND (position.symbol = candidate.symbol OR position.option_symbol = candidate.option_symbol)
@@ -157,12 +212,30 @@ JOIN LATERAL (
 ) limits ON true
 JOIN LATERAL (
   SELECT option_market.market_price, option_market.market_timestamp,
-         option_market.market_request_id
+         option_market.market_request_id, option_market.market_evidence
   FROM (
     SELECT COALESCE(option_snapshot.midpoint, option_snapshot.ask, option_snapshot.last) AS market_price,
            COALESCE(option_snapshot.quote_timestamp, option_snapshot.snapshot_timestamp,
                     option_snapshot.trade_timestamp, option_snapshot.observed_at) AS market_timestamp,
-           option_snapshot.request_id AS market_request_id
+           option_snapshot.request_id AS market_request_id,
+           jsonb_build_object(
+             'bid', option_snapshot.bid,
+             'ask', option_snapshot.ask,
+             'midpoint', option_snapshot.midpoint,
+             'last', option_snapshot.last,
+             'volume', option_snapshot.volume,
+             'openInterest', option_snapshot.open_interest,
+             'impliedVolatility', option_snapshot.implied_volatility,
+             'delta', option_snapshot.delta,
+             'gamma', option_snapshot.gamma,
+             'theta', option_snapshot.theta,
+             'vega', option_snapshot.vega,
+             'rho', option_snapshot.rho,
+             'requestedFeed', option_snapshot.evidence->>'requestedFeed',
+             'effectiveFeed', option_snapshot.evidence->>'effectiveFeed',
+             'spread', option_snapshot.evidence->'spread',
+             'spreadPct', option_snapshot.evidence->'spreadPct'
+           ) AS market_evidence
     FROM option_snapshots option_snapshot
     WHERE candidate.option_symbol IS NOT NULL
       AND option_snapshot.option_symbol = candidate.option_symbol
@@ -170,7 +243,7 @@ JOIN LATERAL (
   ) option_market
   UNION ALL
   SELECT stock_market.market_price, stock_market.market_timestamp,
-         stock_market.market_request_id
+         stock_market.market_request_id, stock_market.market_evidence
   FROM (
     SELECT COALESCE(
              (stock.evidence->>'midpoint')::numeric,
@@ -180,7 +253,8 @@ JOIN LATERAL (
              bar.close
            ) AS market_price,
            COALESCE(stock.source_timestamp, bar.observed_at) AS market_timestamp,
-           COALESCE(stock.request_id, bar.request_id) AS market_request_id
+           COALESCE(stock.request_id, bar.request_id) AS market_request_id,
+           COALESCE(stock.evidence, '{}'::jsonb) AS market_evidence
     FROM market_bars bar
     LEFT JOIN LATERAL (
       SELECT * FROM stock_snapshots WHERE symbol = candidate.symbol
@@ -300,8 +374,12 @@ const runExitReview = async (input: {
     }
     const directionalReturn = (price / entry - 1) * (row.side === "short" ? -1 : 1);
     const option = row.asset_class === "option";
+    const forceZeroDteExit = option &&
+      isFinalThirtyMinutesForZeroDte(String(row.order_symbol), input.now);
     const reason = option
-      ? directionalReturn <= -0.5 ? "ODTE_STOP_LOSS_50" : directionalReturn >= 0.5 ? "ODTE_TAKE_PROFIT_50" : null
+      ? forceZeroDteExit
+        ? "ODTE_FORCE_EXIT_BEFORE_CLOSE"
+        : directionalReturn <= -0.5 ? "ODTE_STOP_LOSS_50" : directionalReturn >= 0.5 ? "ODTE_TAKE_PROFIT_50" : null
       : directionalReturn <= -0.05 ? "EQUITY_STOP_LOSS_5" : directionalReturn >= 0.08 ? "EQUITY_TAKE_PROFIT_8" : null;
     return reason ? [{ row, price, quantity, timestamp, option, reason, directionalReturn }] : [];
   });
@@ -327,9 +405,17 @@ const runExitReview = async (input: {
       requestId: row.market_request_id ?? null,
       source: item.option ? "postgres.option_snapshots" : "postgres.stock_snapshots"
     }];
+    if (item.option && row.side !== "long") {
+      throw new Error(`POSTGRES_OPTION_CLOSE_SIDE_UNSUPPORTED:${orderSymbol}`);
+    }
+    const exitSide = item.option
+      ? "sell_to_close"
+      : row.side === "short"
+        ? "buy"
+        : "sell";
     const orderIntent = {
       symbol: orderSymbol, underlyingSymbol: item.option ? String(row.symbol) : null,
-      assetClass: String(row.asset_class), side: item.option ? "sell_to_close" : "sell",
+      assetClass: String(row.asset_class), side: exitSide,
       orderType: item.option ? "limit" : "market", timeInForce: "day",
       quantity: item.quantity, notional: null, limitPrice: item.option ? item.price : null,
       clientOrderId, strategyKey: String(row.strategy_key), reason: item.reason
@@ -369,7 +455,12 @@ const runExitReview = async (input: {
       [reviewId, accountId, candidateId, clientOrderId, structural, snapshotId,
         canonicalJsonHash({ reason: item.reason }), payloadFingerprint, signature,
         JSON.stringify(orderIntent), JSON.stringify(marketEvidence),
-        JSON.stringify({ snapshotId, portfolioFingerprint: portfolio, structuralPortfolioFingerprint: structural }),
+        JSON.stringify({
+          snapshotId,
+          portfolioFingerprint: portfolio,
+          structuralPortfolioFingerprint: structural,
+          trigger: payload.trigger
+        }),
         expiresAt, nowIso, ...fenceValues(input.fence)]
     );
     const reviewOutcome = review.rowCount === 1 ? review.rows[0] : undefined;
@@ -404,7 +495,7 @@ const runExitReview = async (input: {
       [`intent_${intentFingerprint}`, accountId, candidateId, reviewId, clientOrderId,
         `review:${payloadFingerprint}`, String(row.strategy_key), orderSymbol,
         item.option ? String(row.symbol) : null, String(row.asset_class),
-        item.option ? "sell_to_close" : "sell", item.option ? "limit" : "market",
+        exitSide, item.option ? "limit" : "market",
         item.quantity, item.option ? item.price : null,
         item.option ? item.price * 100 * item.quantity : null,
         item.option ? item.price * 100 * item.quantity : item.price * item.quantity,
@@ -442,7 +533,7 @@ const sizing = (
     ? finite(row.cash_reserve_amount) ?? 0
     : equity * (finite(row.cash_reserve_ratio) ?? 0);
   const amount = Math.floor(Math.min(
-    maxOrderNotional,
+    maxOrderNotional * optionSizingScale(row),
     buyingPower,
     Math.max(0, cash - cashReserve),
     allocationRemaining,
@@ -543,6 +634,13 @@ export const runPostgresReviewWorkflow = async (input: {
     if (row.asset_class === "option" && !Math.floor(amount / (price * 100))) {
       throw new Error(`POSTGRES_REVIEW_OPTION_CAPACITY_INSUFFICIENT:${row.symbol}`);
     }
+    if (
+      row.asset_class === "equity" &&
+      row.direction === "short" &&
+      !Math.floor(amount / price)
+    ) {
+      throw new Error(`POSTGRES_REVIEW_SHORT_CAPACITY_INSUFFICIENT:${row.symbol}`);
+    }
     eligibleRows.push(row);
   }
   for (const row of skippedRows) {
@@ -586,8 +684,17 @@ export const runPostgresReviewWorkflow = async (input: {
     const amount = sizing(row, exploration.maxOrderNotional);
     if (amount === null) continue;
     const option = row.asset_class === "option";
-    const quantity = option ? Math.floor(amount / (price * 100)) : null;
+    const shortEquity = !option && row.direction === "short";
+    const quantity = option
+      ? Math.floor(amount / (price * 100))
+      : shortEquity
+        ? Math.floor(amount / price)
+        : null;
     if (option && (!quantity || quantity <= 0)) throw new Error(`POSTGRES_REVIEW_OPTION_CAPACITY_INSUFFICIENT:${row.symbol}`);
+    if (shortEquity && (!quantity || quantity <= 0)) {
+      throw new Error(`POSTGRES_REVIEW_SHORT_CAPACITY_INSUFFICIENT:${row.symbol}`);
+    }
+    const effectiveRisk = shortEquity ? price * (quantity ?? 0) : amount;
     const orderSymbol = row.option_symbol ?? row.symbol;
     const clientOrderId = `pg-${canonicalJsonHash({ account: row.account_id, candidate: row.candidate_id, snapshot: row.account_snapshot_id }).slice(0, 32)}`;
     const marketEvidence = [{
@@ -596,17 +703,20 @@ export const runPostgresReviewWorkflow = async (input: {
       referencePrice: price,
       timestamp: marketTimestamp,
       requestId: row.market_request_id,
-      source: option ? "postgres.option_snapshots" : "postgres.stock_snapshots"
+      source: option ? "postgres.option_snapshots" : "postgres.stock_snapshots",
+      ...jsonRecord(row.market_evidence),
+      ...(option ? optionDecisionInputs(row) : {})
     }];
+    const entrySide = option ? "buy_to_open" : row.direction === "short" ? "sell" : "buy";
     const orderIntent = {
       symbol: orderSymbol,
       underlyingSymbol: option ? row.symbol : null,
       assetClass: row.asset_class,
-      side: option ? "buy_to_open" : "buy",
+      side: entrySide,
       orderType: option ? "limit" : "market",
       timeInForce: "day",
       quantity,
-      notional: option ? null : amount,
+      notional: option || shortEquity ? null : amount,
       limitPrice: option ? price : null,
       clientOrderId,
       strategyKey: row.strategy_key
@@ -670,10 +780,11 @@ export const runPostgresReviewWorkflow = async (input: {
        ON CONFLICT (account_id, intent_fingerprint) DO NOTHING`,
       [intentId, row.account_id, row.candidate_id, reviewId, clientOrderId,
         `review:${payloadFingerprint}`, row.strategy_key, orderSymbol,
-        option ? row.symbol : null, row.asset_class, option ? "buy_to_open" : "buy",
-        option ? "limit" : "market", quantity, option ? null : amount,
+        option ? row.symbol : null, row.asset_class, entrySide,
+        option ? "limit" : "market", quantity,
+        option || shortEquity ? null : amount,
         option ? price : null, option ? price * 100 * (quantity ?? 0) : null,
-        amount, intentFingerprint, canonicalJsonHash({ status: "created", at: now.toISOString() }),
+        effectiveRisk, intentFingerprint, canonicalJsonHash({ status: "created", at: now.toISOString() }),
         JSON.stringify(orderIntent), now.toISOString(), ...fenceValues(input.fence)]
     );
     if (intentResult.rowCount !== 1 && intentResult.rowCount !== 0) throw new Error("POSTGRES_ORDER_INTENT_PERSISTENCE_FAILED");

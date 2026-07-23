@@ -23,6 +23,7 @@ const workstreams = [
   "paper:portfolio:review",
   "paper:options:discover",
   "paper:ops:review",
+  "zero-dte:exit:review",
   "paper:exit:review",
   "paper:exit:execute",
   "paper:execute:reviewed",
@@ -30,7 +31,6 @@ const workstreams = [
   "hedge:exit:review",
   "hedge:exit:execute",
   "zero-dte:engine",
-  "zero-dte:exit:review",
   "zero-dte:reconcile",
   "paper:learn",
   "system:recover"
@@ -359,11 +359,11 @@ test("approved worker validates the production contract and persists a complete 
   assert.ok(calls.every((call) => call.safety.tradingMode === "paper"));
   assert.ok(calls.every((call) => call.safety.alpacaLiveTrade === "false"));
   assert.ok(calls.every((call) => call.safety.liveTradingEnabled === "false"));
-  for (const index of [6, 7, 10, 11]) {
+  for (const index of [7, 8, 11, 12]) {
     assert.equal(workstreamCalls[index]!.args.includes("--confirmPaper"), true);
   }
   assert.equal(
-    workstreamCalls[7]!.args.includes("--sections=equityBuys,equityAdds,optionBuys"),
+    workstreamCalls[8]!.args.includes("--sections=equityBuys,equityAdds,optionBuys"),
     true
   );
 

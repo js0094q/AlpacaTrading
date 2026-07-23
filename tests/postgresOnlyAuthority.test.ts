@@ -125,6 +125,7 @@ test("production CLI allows only broker reads, PostgreSQL authority, and audited
   assert.doesNotThrow(() => assertPostgresOnlyCliCommand("alpaca:positions"));
   assert.doesNotThrow(() => assertPostgresOnlyCliCommand("db:postgres:authority:status"));
   assert.doesNotThrow(() => assertPostgresOnlyCliCommand("paper:reconcile:external-order"));
+  assert.doesNotThrow(() => assertPostgresOnlyCliCommand("paper:order:cancel"));
   for (const command of [
     "db:migrate",
     "db:postgres:control-plane:backfill",
@@ -145,7 +146,8 @@ test("production CLI allows only broker reads, PostgreSQL authority, and audited
     "paper:exit:execute", "paper:execute:reviewed", "hedge:review",
     "hedge:exit:review", "hedge:exit:execute", "zero-dte:engine",
     "zero-dte:exit:review", "zero-dte:reconcile", "paper:learn",
-    "paper:reconcile:external-order", "system:recover", "worker:state"
+    "paper:reconcile:external-order", "paper:order:cancel",
+    "system:recover", "worker:state"
   ]);
   assert.ok(listSafePostgresOnlyCliCommands().every((command) =>
     command.startsWith("alpaca:") || command.startsWith("db:postgres:") ||

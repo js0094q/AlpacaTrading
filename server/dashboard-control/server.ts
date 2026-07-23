@@ -20,6 +20,7 @@ import { readPostgresAuthorityStatus } from "../../src/services/postgresAuthorit
 import { runPostgresScheduledCommand } from "../../src/services/postgresScheduledCommandService.js";
 import { runPostgresResearchWorkflow } from "../../src/services/postgresResearchWorkflowService.js";
 import { runPostgresReviewWorkflow } from "../../src/services/postgresReviewWorkflowService.js";
+import { runPostgresPaperOrderCancellation } from "../../src/services/postgresOrderCancellationService.js";
 import { runAutonomousPostgresCommand } from "../../src/services/autonomousPostgresCommandService.js";
 import { runAutonomousPostgresExecutionCommand } from "../../src/services/autonomousPostgresExecutionService.js";
 import { capturePostgresAuthorityBrokerSnapshot } from "../../src/services/postgresAuthorityBrokerSnapshot.js";
@@ -56,6 +57,8 @@ type ControlInput = {
   asOf?: string;
   staleThesis?: boolean;
   riskNormalizationObservations?: number;
+  brokerOrderId?: string;
+  clientOrderId?: string;
 };
 
 type ControlContext = {
@@ -218,7 +221,15 @@ const normalizeInput = (value: unknown): ControlInput => {
     entryAt: typeof body.entryAt === "string" ? body.entryAt : undefined,
     asOf: typeof body.asOf === "string" ? body.asOf : undefined,
     staleThesis: body.staleThesis === true,
-    riskNormalizationObservations: numberOrUndefined(body.riskNormalizationObservations)
+    riskNormalizationObservations: numberOrUndefined(body.riskNormalizationObservations),
+    brokerOrderId:
+      typeof body.brokerOrderId === "string"
+        ? body.brokerOrderId.trim() || undefined
+        : undefined,
+    clientOrderId:
+      typeof body.clientOrderId === "string"
+        ? body.clientOrderId.trim() || undefined
+        : undefined
   };
 };
 
@@ -408,6 +419,15 @@ const runScheduledCommand = async (command: string, context: ControlContext) => 
           },
           confirmPaper: context.input.confirmPaper,
           expectedPayloadSignature: context.input.expectedPayloadSignature
+        });
+      }
+      if (command === "paper:order:cancel") {
+        return runPostgresPaperOrderCancellation({
+          query,
+          fence: scheduledContext.fence,
+          brokerOrderId: context.input.brokerOrderId,
+          clientOrderId: context.input.clientOrderId,
+          confirmPaper: context.input.confirmPaper
         });
       }
       throw new ControlRouteError(
@@ -634,6 +654,7 @@ addPostRoute("/api/v1/review/run", "review.run", runReviewRoute("paper:review"))
 addPostRoute("/api/v1/plan/run", "plan.run", runReviewRoute("paper:review"));
 addPostRoute("/api/v1/actions/execute", "paper.actions.execute", runExecutionRoute("paper:execute:reviewed"));
 addPostRoute("/api/v1/execute/confirm", "execute.confirm", runExecutionRoute("paper:execute:reviewed"));
+addPostRoute("/api/v1/orders/cancel", "orders.cancel", runExecutionRoute("paper:order:cancel"));
 addPostRoute("/api/v1/execute/dry-run", "execute.dry-run", async () => readDryRun());
 addPostRoute("/api/v1/refresh", "refresh", async () => {
   assertPaperRuntime();

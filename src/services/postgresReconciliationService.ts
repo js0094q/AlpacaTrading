@@ -9,6 +9,10 @@ import {
   type AlpacaSubmittedOrder
 } from "./alpacaClient.js";
 import { paperSubmitConfiguration } from "./paperSubmitSafetyConfig.js";
+import {
+  capturePostgresAuthorityBrokerSnapshot,
+  type PostgresAuthorityBrokerSnapshot
+} from "./postgresAuthorityBrokerSnapshot.js";
 
 type ReconciliationQuery = {
   query: (sql: string, values?: readonly unknown[]) => Promise<{
@@ -22,6 +26,8 @@ type Target = Record<string, unknown> & {
   account_id: string;
   client_order_id: string;
   broker_order_id: string | null;
+  reservation_id: string | null;
+  strategy_key: string;
   symbol: string;
   asset_class: "equity" | "option";
   side: "buy" | "sell" | "buy_to_open" | "sell_to_close";
@@ -54,6 +60,7 @@ const optional = (value: unknown) => value === null || value === undefined || va
 
 const targetsSql = `SELECT intent.id AS order_intent_id, intent.account_id,
        intent.client_order_id, broker_order.broker_order_id,
+       intent.reservation_id, intent.strategy_key,
        intent.symbol, intent.asset_class, intent.side, intent.order_type,
        intent.time_in_force, intent.quantity::text, intent.notional::text,
        intent.limit_price::text, intent.status AS intent_status
@@ -74,6 +81,169 @@ type ExternalOrderObservation = {
   status: string;
   provenance: "external_order_without_postgres_intent";
   recorded: boolean;
+};
+
+const syncBrokerAccountAndPositions = async (input: {
+  query: ReconciliationQuery;
+  fence: SchedulerFence;
+  snapshot: PostgresAuthorityBrokerSnapshot;
+}) => {
+  const snapshot = input.snapshot;
+  if (
+    snapshot.configuration.environment !== "paper" ||
+    snapshot.configuration.tradingMode !== "paper" ||
+    snapshot.configuration.liveTradingEnabled
+  ) {
+    throw new Error("POSTGRES_RECONCILIATION_PAPER_SNAPSHOT_REQUIRED");
+  }
+  const accountId = `account_${snapshot.accountIdentityHash}`;
+  const account = await input.query.query(
+    `INSERT INTO accounts(
+       id, broker_account_id, environment, status, currency, created_at, updated_at
+     ) SELECT $1, $2, 'paper', $3, $4, $5, $5
+       WHERE ${fenceSql(6)}
+     ON CONFLICT (id) DO UPDATE SET
+       status = EXCLUDED.status, currency = EXCLUDED.currency,
+       version = accounts.version + 1, updated_at = EXCLUDED.updated_at`,
+    [
+      accountId,
+      snapshot.accountIdentityHash,
+      snapshot.account.status,
+      snapshot.account.currency,
+      snapshot.capturedAt,
+      ...fenceValues(input.fence)
+    ]
+  );
+  if (account.rowCount !== 1) {
+    throw new Error("POSTGRES_RECONCILIATION_ACCOUNT_PERSISTENCE_FAILED");
+  }
+  const accountSnapshotId = `snapshot_${canonicalJsonHash({
+    accountId,
+    capturedAt: snapshot.capturedAt,
+    portfolioFingerprint: snapshot.portfolioFingerprint
+  })}`;
+  const evidence = {
+    source: "alpaca_paper_api",
+    configurationFingerprint: snapshot.configurationFingerprint,
+    structuralPortfolioFingerprint: snapshot.structuralPortfolioFingerprint,
+    portfolioFingerprint: snapshot.portfolioFingerprint,
+    brokerOpenOrderCount: snapshot.orders.length,
+    brokerPositionCount: snapshot.positions.length,
+    reconciledAt: snapshot.capturedAt
+  };
+  const accountSnapshot = await input.query.query(
+    `INSERT INTO account_snapshots(
+       id, account_id, observed_at, account_status, currency, cash,
+       portfolio_value, equity, buying_power, options_buying_power,
+       options_approved_level, trading_blocked, account_blocked,
+       snapshot_fingerprint, evidence, created_at
+     ) SELECT $1, $2, $3, $4, $5, $6, $7, $7, $8, $9, $10, $11, $12,
+              $13, $14::jsonb, $3
+       WHERE ${fenceSql(15)}
+     ON CONFLICT (account_id, snapshot_fingerprint) DO NOTHING`,
+    [
+      accountSnapshotId,
+      accountId,
+      snapshot.capturedAt,
+      snapshot.account.status,
+      snapshot.account.currency,
+      snapshot.account.cash,
+      snapshot.account.equity,
+      snapshot.account.buyingPower,
+      snapshot.account.optionsBuyingPower,
+      snapshot.account.optionsApprovalLevel,
+      snapshot.account.tradingBlocked,
+      snapshot.account.accountBlocked,
+      snapshot.portfolioFingerprint,
+      JSON.stringify(evidence),
+      ...fenceValues(input.fence)
+    ]
+  );
+  if (accountSnapshot.rowCount !== 0 && accountSnapshot.rowCount !== 1) {
+    throw new Error("POSTGRES_RECONCILIATION_ACCOUNT_SNAPSHOT_PERSISTENCE_FAILED");
+  }
+  const activeKeys = snapshot.positions.map((position) => position.brokerPositionKey);
+  const closed = await input.query.query(
+    `UPDATE positions
+     SET status = 'closed', quantity = 0, available_quantity = 0,
+         closed_at = $2, last_reconciled_at = $2,
+         version = version + 1, updated_at = $2
+     WHERE account_id = $1 AND status IN ('open', 'closing')
+       AND NOT (broker_position_key = ANY($3::text[]))
+       AND ${fenceSql(4)}`,
+    [accountId, snapshot.capturedAt, activeKeys, ...fenceValues(input.fence)]
+  );
+  if (closed.rowCount === null) {
+    throw new Error("POSTGRES_RECONCILIATION_POSITION_CLOSE_FAILED");
+  }
+  let positionsUpserted = 0;
+  for (const position of snapshot.positions) {
+    const positionId = `position_${canonicalJsonHash({
+      accountId,
+      brokerPositionKey: position.brokerPositionKey
+    })}`;
+    const stored = await input.query.query(
+      `INSERT INTO positions(
+         id, account_id, broker_position_key, candidate_id, opening_order_id,
+         closing_order_id, symbol, underlying_symbol, option_symbol,
+         asset_class, side, status, quantity, available_quantity,
+         average_entry_price, current_price, market_value, cost_basis,
+         unrealized_pnl, source_account_snapshot_id, opened_at,
+         last_reconciled_at, created_at, updated_at
+       ) SELECT $1, $2, $3, NULL, NULL, NULL, $4, $5, $6, $7, $8, 'open',
+                $9, $10, $11, $12, $13, $14, $15, $16, $17, $17, $17, $17
+         WHERE ${fenceSql(18)}
+       ON CONFLICT (account_id, broker_position_key) DO UPDATE SET
+         symbol = EXCLUDED.symbol,
+         underlying_symbol = EXCLUDED.underlying_symbol,
+         option_symbol = EXCLUDED.option_symbol,
+         asset_class = EXCLUDED.asset_class,
+         side = EXCLUDED.side,
+         status = 'open',
+         quantity = EXCLUDED.quantity,
+         available_quantity = EXCLUDED.available_quantity,
+         average_entry_price = EXCLUDED.average_entry_price,
+         current_price = EXCLUDED.current_price,
+         market_value = EXCLUDED.market_value,
+         cost_basis = EXCLUDED.cost_basis,
+         unrealized_pnl = EXCLUDED.unrealized_pnl,
+         source_account_snapshot_id = EXCLUDED.source_account_snapshot_id,
+         closed_at = NULL,
+         last_reconciled_at = EXCLUDED.last_reconciled_at,
+         version = positions.version + 1,
+         updated_at = EXCLUDED.updated_at`,
+      [
+        positionId,
+        accountId,
+        position.brokerPositionKey,
+        position.symbol,
+        position.underlyingSymbol,
+        position.optionSymbol,
+        position.assetClass,
+        position.side,
+        position.quantity,
+        position.availableQuantity,
+        position.averageEntryPrice,
+        position.currentPrice,
+        position.marketValue,
+        position.costBasis,
+        position.unrealizedPnl,
+        accountSnapshotId,
+        snapshot.capturedAt,
+        ...fenceValues(input.fence)
+      ]
+    );
+    if (stored.rowCount !== 1) {
+      throw new Error("POSTGRES_RECONCILIATION_POSITION_PERSISTENCE_FAILED");
+    }
+    positionsUpserted += 1;
+  }
+  return {
+    accountId,
+    accountSnapshotStored: accountSnapshot.rowCount === 1,
+    positionsObserved: snapshot.positions.length,
+    positionsUpserted
+  };
 };
 
 const observeExternalBrokerOrder = async (input: {
@@ -228,6 +398,10 @@ export const reconcilePostgresPaperOrders = async (input: {
   getOrderById?: (orderId: string) => Promise<AlpacaApiResponse<AlpacaSubmittedOrder>>;
   getAccountSnapshot?: () => Promise<{ id?: string }>;
   safety?: { environment: string; tradingMode: string; liveTradingEnabled: boolean };
+  syncBrokerState?: boolean;
+  captureBrokerSnapshot?: (
+    capturedAt?: string
+  ) => Promise<PostgresAuthorityBrokerSnapshot>;
 }) => {
   const now = input.now ?? new Date();
   const externalObservation = input.externalBrokerOrderId
@@ -252,6 +426,7 @@ export const reconcilePostgresPaperOrders = async (input: {
     filled: 0,
     partial: 0,
     terminal: 0,
+    brokerState: null as Awaited<ReturnType<typeof syncBrokerAccountAndPositions>> | null,
     errors: [] as Array<{ orderIntentId: string; code: string }>
   };
   const lookup = input.getOrderByClientOrderId ?? getPaperOrderByClientOrderId;
@@ -330,6 +505,50 @@ export const reconcilePostgresPaperOrders = async (input: {
           now.toISOString(), ...fenceValues(input.fence)]
       );
       if (updated.rowCount !== 1) throw new Error("POSTGRES_RECONCILIATION_INTENT_PERSISTENCE_FAILED");
+      if (terminalStatuses.has(status) && target.reservation_id) {
+        const reservation = await input.query.query(
+          `WITH released AS (
+             UPDATE buying_power_reservations reservation
+             SET status = 'released', released_at = $3,
+                 release_reason = 'broker_terminal:' || $2,
+                 updated_at = $3, version = reservation.version + 1
+             WHERE reservation.id = $1
+               AND reservation.status IN ('active', 'committed')
+               AND ${fenceSql(4)}
+             RETURNING reservation.account_id, reservation.strategy_key,
+                       reservation.amount
+           ), adjusted AS (
+             UPDATE strategy_allocations allocation
+             SET reserved_amount = GREATEST(0, allocation.reserved_amount - released.amount),
+                 deployed_amount = allocation.deployed_amount +
+                   CASE WHEN $2 = 'filled' THEN released.amount ELSE 0 END,
+                 updated_at = $3, version = allocation.version + 1
+             FROM released
+             WHERE allocation.account_id = released.account_id
+               AND allocation.strategy_key = released.strategy_key
+               AND allocation.status = 'active' AND allocation.effective_to IS NULL
+             RETURNING allocation.id
+           )
+           SELECT
+             (SELECT COUNT(*) FROM released)::text AS released_reservation_count,
+             (SELECT COUNT(*) FROM adjusted)::text AS adjusted_allocation_count`,
+          [
+            target.reservation_id,
+            status,
+            now.toISOString(),
+            ...fenceValues(input.fence)
+          ]
+        );
+        const releasedCount = Number(
+          reservation.rows[0]?.released_reservation_count ?? 0
+        );
+        const adjustedCount = Number(
+          reservation.rows[0]?.adjusted_allocation_count ?? 0
+        );
+        if (releasedCount !== 1 || adjustedCount !== 1) {
+          throw new Error("POSTGRES_RECONCILIATION_RESERVATION_RELEASE_FAILED");
+        }
+      }
       if (event.rowCount === 0) result.replayed += 1;
       else result.recorded += 1;
       if (status === "filled") result.filled += 1;
@@ -339,6 +558,25 @@ export const reconcilePostgresPaperOrders = async (input: {
       result.errors.push({
         orderIntentId: target.order_intent_id,
         code: error instanceof Error ? error.message.split(":", 1)[0] : "POSTGRES_RECONCILIATION_FAILED"
+      });
+    }
+  }
+  if (input.syncBrokerState !== false) {
+    try {
+      const snapshot = await (
+        input.captureBrokerSnapshot ?? capturePostgresAuthorityBrokerSnapshot
+      )(now.toISOString());
+      result.brokerState = await syncBrokerAccountAndPositions({
+        query: input.query,
+        fence: input.fence,
+        snapshot
+      });
+    } catch (error) {
+      result.errors.push({
+        orderIntentId: "__broker_state__",
+        code: error instanceof Error
+          ? error.message.split(":", 1)[0]
+          : "POSTGRES_RECONCILIATION_BROKER_STATE_FAILED"
       });
     }
   }

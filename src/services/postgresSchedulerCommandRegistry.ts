@@ -43,6 +43,7 @@ export const POSTGRES_SCHEDULER_COMMAND_REGISTRY = [
     aliases: [
       "zero-dte:reconcile",
       "paper:reconcile:external-order",
+      "paper:order:cancel",
       "db:postgres:authority:cutover"
     ]
   },

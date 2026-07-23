@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import { seedUniverse } from "../config/universe.seed.js";
 import { canonicalJsonHash } from "../lib/canonicalJson.js";
+import { optionDaysToExpiration } from "./optionSymbolService.js";
 import {
   postgresErrorTelemetry,
   readPostgresQueryTelemetry
@@ -232,6 +233,18 @@ const newYorkDate = (date: Date) => {
   }).formatToParts(date);
   const value = Object.fromEntries(parts.map((part) => [part.type, part.value]));
   return `${value.year}-${value.month}-${value.day}`;
+};
+
+export const postgresLeapsPolicy = (env: NodeJS.ProcessEnv = process.env) => {
+  const configuredMin = Number.parseInt(String(env.PAPER_LEAPS_MIN_DTE || "180"), 10);
+  const configuredMax = Number.parseInt(String(env.PAPER_LEAPS_MAX_DTE || "730"), 10);
+  const minDte = Number.isSafeInteger(configuredMin) && configuredMin >= 180
+    ? configuredMin
+    : 180;
+  const maxDte = Number.isSafeInteger(configuredMax) && configuredMax >= minDte
+    ? configuredMax
+    : 730;
+  return { minDte, maxDte };
 };
 
 const executableOption = (target: FeatureTargetResult["targets"][number]) => {
@@ -521,15 +534,25 @@ const persistCandidates = async (input: {
       }
       const optionSymbol = typeof option?.optionSymbol === "string" ? option.optionSymbol : null;
       const expirationDate = typeof option?.expirationDate === "string" ? option.expirationDate : null;
+      const optionDte = expirationDate
+        ? optionDaysToExpiration(expirationDate, input.now.toISOString())
+        : null;
+      const leapsPolicy = postgresLeapsPolicy();
       const strategyFamily = optionSymbol
         ? target.symbol === "SPY" && expirationDate === newYorkDate(input.now)
           ? "zero_dte_spy"
-          : "standard_option"
+          : optionDte !== null &&
+              optionDte >= leapsPolicy.minDte &&
+              optionDte <= leapsPolicy.maxDte
+            ? "leaps"
+            : "standard_option"
         : "equity";
       return {
         target,
         option,
         optionSymbol,
+        optionDte,
+        leapsPolicy,
         strategyFamily,
         score: scoreTarget(target, input.now),
         reasons
@@ -554,7 +577,17 @@ const persistCandidates = async (input: {
     ? await resolvePostgresLearningModelCapability(input.query, input.now.toISOString())
     : null;
   for (let index = 0; index < decisions.length; index += 1) {
-    const { target, option, optionSymbol, strategyFamily, score, selected, reasons } = decisions[index]!;
+    const {
+      target,
+      option,
+      optionSymbol,
+      optionDte,
+      leapsPolicy,
+      strategyFamily,
+      score,
+      selected,
+      reasons
+    } = decisions[index]!;
     const id = `candidate_${canonicalJsonHash({ run: input.researchRunId, source: target.sourceFingerprint })}`;
     const signalInputs = {
       targetSourceFingerprint: target.sourceFingerprint,
@@ -565,6 +598,12 @@ const persistCandidates = async (input: {
       marketDecisionInputs: {
         ...(target.optionsStrategy?.decisionInputs as Record<string, unknown> | undefined),
         option: option?.decisionInputs ?? null
+      },
+      strategyClassification: {
+        family: strategyFamily,
+        daysToExpiration: optionDte,
+        leapsMinDte: leapsPolicy.minDte,
+        leapsMaxDte: leapsPolicy.maxDte
       },
       decisionGates: {
         profile: paperExplorationProfile(input.explorationThresholds),

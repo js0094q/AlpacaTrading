@@ -310,6 +310,48 @@ describe("Vercel dashboard VPS bridge mode", () => {
     );
   });
 
+  test("paper cancellation bridge preserves broker and client order identity", async () => {
+    process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
+    process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
+    setMockFetchResponse({
+      ok: true,
+      action: "orders.cancel",
+      data: { status: "canceled" }
+    });
+    const { POST } = await importRoute<{
+      POST: (request: Request) => Promise<Response> | Response;
+    }>("apps/dashboard/app/api/paper/orders/cancel/route.ts");
+
+    const response = await POST(new Request("http://localhost/api/paper/orders/cancel", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer dashboard-admin-secret"
+      },
+      body: JSON.stringify({
+        brokerOrderId: "paper-order-123",
+        clientOrderId: "E2E-CANCEL-123",
+        confirmPaper: true
+      })
+    }));
+
+    assert.equal(response.status, 200);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, "https://vps.internal:4100/api/v1/orders/cancel");
+    assert.deepEqual(JSON.parse(String(calls[0].init.body)), {
+      riskProfile: "aggressive",
+      optionsEnabled: true,
+      maxCandidates: 10,
+      assetClass: "all",
+      confirmPaper: true,
+      underlying: "SPY",
+      dte: 0,
+      staleThesis: false,
+      brokerOrderId: "paper-order-123",
+      clientOrderId: "E2E-CANCEL-123"
+    });
+  });
+
   test("paper execution route fails closed before bridge when dashboard execution flag is disabled", async () => {
     process.env.PAPER_OPTIONS_EXECUTION_ENABLED = "true";
     const { POST } = await importRoute<{

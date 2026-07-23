@@ -140,6 +140,7 @@ describe("PostgreSQL-only dashboard control", () => {
       "/api/v1/actions/review",
       "/api/v1/actions/execute",
       "/api/v1/execute/confirm",
+      "/api/v1/orders/cancel",
       "/api/v1/refresh"
     ]) {
       assert.equal(module.ACTION_HANDLERS[path]?.method, "POST");
@@ -231,6 +232,21 @@ describe("PostgreSQL-only dashboard control", () => {
       "PAPER_CONFIRMATION_REQUIRED"
     );
     assert.deepEqual(scheduledCommands, []);
+  });
+
+  test("routes confirmed paper cancellation through the PostgreSQL workflow", async () => {
+    const response = await call(
+      "/api/v1/orders/cancel",
+      "POST",
+      "synthetic-control-token",
+      {
+        brokerOrderId: "paper-order-123",
+        clientOrderId: "E2E-CANCEL-123",
+        confirmPaper: true
+      }
+    );
+    assert.equal(response.status, 200);
+    assert.deepEqual(scheduledCommands, ["paper:order:cancel"]);
   });
 
   test("non-mutating guarded refresh returns current PostgreSQL summary", async () => {

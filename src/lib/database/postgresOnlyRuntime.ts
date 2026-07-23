@@ -20,6 +20,7 @@ const SAFE_PRODUCTION_CLI_COMMANDS = new Set([
   "paper:learn",
   "paper:ops:review",
   "paper:options:discover",
+  "paper:order:cancel",
   "paper:portfolio:review",
   "paper:reconcile:external-order",
   "paper:review",

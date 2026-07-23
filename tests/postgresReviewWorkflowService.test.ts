@@ -75,6 +75,117 @@ test("entry review persists signed PostgreSQL review and unconfirmed pending int
   assert.match(sourceSql, /LIMIT 25$/);
 });
 
+test("entry review maps a selected equity short to a sell order intent", async () => {
+  let reviewOrderIntent: Record<string, unknown> | undefined;
+  let intentValues: readonly unknown[] = [];
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("FROM candidates candidate")) {
+          return {
+            rows: [{ ...candidate, candidate_id: "candidate-short", direction: "short" }],
+            rowCount: 1
+          };
+        }
+        if (statement.includes("INSERT INTO execution_reviews")) {
+          reviewOrderIntent = JSON.parse(String(values?.[9])) as Record<string, unknown>;
+        }
+        if (statement.includes("INSERT INTO order_intents")) intentValues = values ?? [];
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.status, "completed");
+  assert.equal(reviewOrderIntent?.side, "sell");
+  assert.equal(reviewOrderIntent?.quantity, 1);
+  assert.equal(reviewOrderIntent?.notional, null);
+  assert.equal(intentValues[10], "sell");
+  assert.equal(intentValues[12], 1);
+  assert.equal(intentValues[13], null);
+});
+
+test("option review sizing is conservatively scaled by premium Alpaca decision evidence", async () => {
+  let intentValues: readonly unknown[] = [];
+  let persistedMarketEvidence: Array<Record<string, unknown>> = [];
+  const optionCandidate = {
+    ...candidate,
+    candidate_id: "candidate-option-quality",
+    asset_class: "option" as const,
+    option_symbol: "SPY260821C00560000",
+    preferred_expression: "long_call",
+    market_price: "2",
+    signal_inputs: {
+      marketDecisionInputs: {
+        option: {
+          selectionScore: 0.6,
+          liquidityScore: 0.8,
+          impliedVolatility: 0.3,
+          delta: 0.48,
+          gamma: 0.03,
+          theta: -0.06,
+          vega: 0.15,
+          rho: 0.04,
+          spreadPct: 0.02,
+          volume: 5_000,
+          openInterest: 8_000,
+          feed: "opra"
+        }
+      }
+    },
+    market_evidence: {
+      bid: 1.98,
+      ask: 2.02,
+      midpoint: 2,
+      spreadPct: 0.02,
+      impliedVolatility: 0.3,
+      delta: 0.48,
+      gamma: 0.03,
+      theta: -0.06,
+      vega: 0.15,
+      rho: 0.04,
+      volume: 5_000,
+      openInterest: 8_000,
+      requestedFeed: "opra",
+      effectiveFeed: "opra"
+    }
+  };
+
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("FROM candidates candidate")) {
+          return { rows: [optionCandidate], rowCount: 1 };
+        }
+        if (statement.includes("INSERT INTO execution_reviews")) {
+          persistedMarketEvidence = JSON.parse(String(values?.[10]));
+        }
+        if (statement.includes("INSERT INTO order_intents")) {
+          intentValues = values ?? [];
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    explorationThresholds: PAPER_EXPLORATION_V2_THRESHOLDS,
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.status, "completed");
+  assert.equal(intentValues[12], 3);
+  assert.equal(intentValues[15], 600);
+  assert.equal(persistedMarketEvidence[0]?.effectiveFeed, "opra");
+  assert.equal(persistedMarketEvidence[0]?.selectionScore, 0.6);
+  assert.equal(persistedMarketEvidence[0]?.delta, 0.48);
+  assert.equal(persistedMarketEvidence[0]?.openInterest, 8_000);
+});
+
 test("entry review skips an existing candidate and account-snapshot review identity", async () => {
   let reviewCreated = false;
   let sourceReads = 0;
@@ -367,6 +478,86 @@ test("exit review evaluates existing thresholds against PostgreSQL position and 
   assert.equal(result.reviewsCreated, 1);
   assert.equal(sql.some((statement) => statement.includes("'exit'")), true);
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO order_intents")), true);
+});
+
+test("exit review maps a short equity exit to buy-to-cover", async () => {
+  let reviewOrderIntent: Record<string, unknown> | undefined;
+  let intentValues: readonly unknown[] = [];
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:exit:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("FROM positions position")) {
+          return {
+            rows: [{
+              position_id: "position-short", candidate_id: "candidate-short",
+              symbol: "AAPL", order_symbol: "AAPL", asset_class: "equity",
+              side: "short", available_quantity: "1", average_entry_price: "200",
+              strategy_key: "baseline", account_id: "account-1",
+              account_snapshot_id: "snapshot-1", snapshot_fingerprint: "portfolio-fingerprint",
+              structural_fingerprint: "structural-fingerprint", market_price: "180",
+              market_timestamp: "2026-07-20T21:59:30.000Z", market_request_id: "sip-request"
+            }],
+            rowCount: 1
+          };
+        }
+        if (statement.includes("INSERT INTO execution_reviews")) {
+          reviewOrderIntent = JSON.parse(String(values?.[9])) as Record<string, unknown>;
+          return { rows: [{ fence_held: true, inserted_count: 1 }], rowCount: 1 };
+        }
+        if (statement.includes("INSERT INTO order_intents")) intentValues = values ?? [];
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.status, "completed");
+  assert.equal(reviewOrderIntent?.side, "buy");
+  assert.equal(intentValues[10], "buy");
+});
+
+test("PostgreSQL exit review forces a genuine 0DTE long option exit in the final 30 minutes", async () => {
+  let reviewOrderIntent: Record<string, unknown> | undefined;
+  let trigger: Record<string, unknown> | undefined;
+  const result = await runPostgresReviewWorkflow({
+    command: "zero-dte:exit:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("FROM positions position")) {
+          return {
+            rows: [{
+              position_id: "position-0dte", candidate_id: "candidate-0dte",
+              symbol: "SPY", order_symbol: "SPY260720C00555000", asset_class: "option",
+              side: "long", available_quantity: "1", average_entry_price: "1.00",
+              strategy_key: "zero_dte_spy", account_id: "account-1",
+              account_snapshot_id: "snapshot-1", snapshot_fingerprint: "portfolio-fingerprint",
+              structural_fingerprint: "structural-fingerprint", market_price: "1.00",
+              market_timestamp: "2026-07-20T19:44:30.000Z", market_request_id: "opra-request"
+            }],
+            rowCount: 1
+          };
+        }
+        if (statement.includes("INSERT INTO execution_reviews")) {
+          reviewOrderIntent = JSON.parse(String(values?.[9])) as Record<string, unknown>;
+          const portfolioPayload = JSON.parse(String(values?.[11])) as Record<string, unknown>;
+          trigger = portfolioPayload.trigger as Record<string, unknown> | undefined;
+          return { rows: [{ fence_held: true, inserted_count: 1 }], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    now: new Date("2026-07-20T19:45:00.000Z")
+  });
+
+  assert.equal(result.status, "completed");
+  assert.equal(reviewOrderIntent?.side, "sell_to_close");
+  assert.equal(reviewOrderIntent?.reason, "ODTE_FORCE_EXIT_BEFORE_CLOSE");
+  assert.equal(trigger?.reason, "ODTE_FORCE_EXIT_BEFORE_CLOSE");
 });
 
 const repeatedExitSource = (marketPrice: string, marketTimestamp: string) => ({

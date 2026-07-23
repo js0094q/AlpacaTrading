@@ -70,6 +70,10 @@ test("0DTE lifecycle commands and reconciliation resolve to stable jobs", () => 
     resolve("paper:reconcile:external-order"),
     POSTGRES_SCHEDULER_JOBS.reconciliation
   );
+  assert.strictEqual(
+    resolve("paper:order:cancel"),
+    POSTGRES_SCHEDULER_JOBS.reconciliation
+  );
 });
 
 test("paper exit-review aliases converge on the exit-review job", () => {

@@ -34,6 +34,7 @@ const WORKSTREAMS = [
   ["paper:portfolio:review", ["--format=json"]],
   ["paper:options:discover", ["--underlying=SPY", "--dte=0", "--format=json"]],
   ["paper:ops:review", ["--format=json"]],
+  ["zero-dte:exit:review", ["--format=json"]],
   ["paper:exit:review", ["--format=json"]],
   ["paper:exit:execute", ["--confirmPaper", "--format=json"]],
   ["paper:execute:reviewed", ["--confirmPaper", "--sections=equityBuys,equityAdds,optionBuys", "--format=json"]],
@@ -41,7 +42,6 @@ const WORKSTREAMS = [
   ["hedge:exit:review", ["--format=json"]],
   ["hedge:exit:execute", ["--confirmPaper", "--format=json"]],
   ["zero-dte:engine", ["--confirmPaper", "--format=json"]],
-  ["zero-dte:exit:review", ["--format=json"]],
   ["zero-dte:reconcile", ["--format=json"]],
   ["paper:learn", ["--format=json"]],
   ["system:recover", ["--format=json"]]

@@ -132,11 +132,11 @@ const OPTION_FIELD_CLASSIFICATIONS = {
   dailyVolume: "execution_gate",
   openInterest: "execution_gate",
   impliedVolatility: "decision_input",
-  delta: "audit_only",
-  gamma: "audit_only",
-  theta: "audit_only",
-  vega: "audit_only",
-  rho: "audit_only",
+  delta: "decision_input",
+  gamma: "decision_input",
+  theta: "decision_input",
+  vega: "decision_input",
+  rho: "decision_input",
   greekCoverage: "derived_feature_input",
   quoteAgeSeconds: "derived_feature_input",
   quoteFreshnessStatus: "execution_gate",
@@ -152,6 +152,7 @@ const OPTION_FIELD_CLASSIFICATIONS = {
   retrievedAt: "audit_only",
   liquidityResult: "execution_gate",
   liquidityScore: "decision_input",
+  selectionScore: "decision_input",
   suitability: "derived_feature_input",
   eligibility: "execution_gate",
   rejectionReasons: "derived_feature_input"
@@ -255,8 +256,8 @@ const deriveOptionContractFeature = (input: {
     (Date.parse(`${contract.expirationDate}T20:00:00.000Z`) - Date.parse(input.asOf)) / 3_600_000
   );
   const greekCoverage = snapshot
-    ? [snapshot.delta, snapshot.gamma, snapshot.theta, snapshot.vega]
-      .filter((value) => value !== null && value !== undefined).length / 4
+    ? [snapshot.delta, snapshot.gamma, snapshot.theta, snapshot.vega, snapshot.rho]
+      .filter((value) => value !== null && value !== undefined).length / 5
     : 0;
   const spreadSignal = spreadPct === null ? 0 : 1 - Math.min(1, Math.abs(spreadPct));
   const liquidityScore =
@@ -264,6 +265,28 @@ const deriveOptionContractFeature = (input: {
     Math.min(1, (liquidity ?? 0) / 10_000) * 0.4 +
     spreadSignal * 0.2;
   const decisionLiquidityScore = liquidityScore + greekCoverage * 0.1;
+  const delta = snapshot?.delta ?? null;
+  const deltaQuality = delta === null
+    ? 0
+    : 1 - Math.min(1, Math.abs(Math.abs(delta) - 0.5) / 0.5);
+  const impliedVolatility = snapshot?.impliedVolatility ?? null;
+  const impliedVolatilityQuality = impliedVolatility === null
+    ? 0
+    : 1 - Math.min(1, Math.abs(impliedVolatility - 0.35) / 0.65);
+  const moneynessQuality = moneyness === null
+    ? 0
+    : 1 - Math.min(1, Math.abs(moneyness) / 0.15);
+  const volumeQuality = Math.min(1, (volume ?? 0) / 5_000);
+  const openInterestQuality = Math.min(1, (openInterest ?? 0) / 10_000);
+  const selectionScore =
+    Math.min(1, decisionLiquidityScore) * 0.25 +
+    Math.max(0, spreadSignal) * 0.2 +
+    volumeQuality * 0.15 +
+    openInterestQuality * 0.15 +
+    deltaQuality * 0.12 +
+    greekCoverage * 0.05 +
+    impliedVolatilityQuality * 0.04 +
+    moneynessQuality * 0.04;
   const activeStatus = contract.status === "active";
   const rejectionReasons: string[] = [];
   if (!activeStatus) rejectionReasons.push("not_active");
@@ -320,8 +343,8 @@ const deriveOptionContractFeature = (input: {
     extrinsicValue,
     dailyVolume: volume,
     openInterest,
-    impliedVolatility: snapshot?.impliedVolatility ?? null,
-    delta: snapshot?.delta ?? null,
+    impliedVolatility,
+    delta,
     gamma: snapshot?.gamma ?? null,
     theta: snapshot?.theta ?? null,
     vega: snapshot?.vega ?? null,
@@ -339,6 +362,7 @@ const deriveOptionContractFeature = (input: {
     retrievedAt: snapshot?.retrievedAt ?? null,
     liquidityResult: hasLiquidity ? "passed" : "failed",
     liquidityScore: decisionLiquidityScore,
+    selectionScore,
     suitability: hasLiquidity && liquidityScore > 0.7
       ? "suitable"
       : hasLiquidity && liquidityScore > 0.35
@@ -428,18 +452,25 @@ const buildOptionFeatures = (input: {
         marketEvidenceTimestamp: input.asOf
       } satisfies FeatureValues,
       candidate: null,
+      candidates: { call: null, put: null },
       materialEvidence: { contracts: contractFeatures, selectedOptionSymbol: null }
     };
   }
 
-  const nearestExpiration = rows.map((row) => row.contract.expirationDate).sort()[0]!;
-  const nearestRows = rows.filter((row) => row.contract.expirationDate === nearestExpiration);
-  const selected = [...nearestRows].sort((a, b) =>
-    Math.abs(a.contract.strike - input.close) - Math.abs(b.contract.strike - input.close)
-  )[0]!;
-  const selectedFeature = contractFeatures.find((row) =>
-    row.optionSymbol === selected.contract.optionSymbol
+  const rankedFeatures = [...contractFeatures].sort((left, right) =>
+    Number(right.eligibility) - Number(left.eligibility) ||
+    right.selectionScore - left.selectionScore ||
+    Math.abs(Number(left.moneyness ?? Number.POSITIVE_INFINITY)) -
+      Math.abs(Number(right.moneyness ?? Number.POSITIVE_INFINITY)) ||
+    left.expirationDate.localeCompare(right.expirationDate) ||
+    left.optionSymbol.localeCompare(right.optionSymbol)
+  );
+  const selectedFeature = rankedFeatures[0]!;
+  const selected = rows.find((row) =>
+    row.contract.optionSymbol === selectedFeature.optionSymbol
   )!;
+  const nearestExpiration = selected.contract.expirationDate;
+  const nearestRows = rows.filter((row) => row.contract.expirationDate === nearestExpiration);
   const calls = nearestRows.filter((row) => row.contract.type === "call");
   const puts = nearestRows.filter((row) => row.contract.type === "put");
   const ivSamples = rows
@@ -450,8 +481,50 @@ const buildOptionFeatures = (input: {
     ? null
     : ivSamples.filter((value) => value <= impliedVolatility).length / ivSamples.length;
   const evidenceTimestamp = selectedFeature.sourceObservationTimestamp ?? input.asOf;
-  const entryPrice = selected.snapshot.midpoint ?? selected.snapshot.ask ?? selected.snapshot.last ?? null;
   const contractEligible = selectedFeature.eligibility;
+  const candidateFor = (type: "call" | "put") => {
+    const feature = rankedFeatures.find((row) =>
+      row.optionType === type && row.eligibility
+    );
+    if (!feature) return null;
+    const row = rows.find((entry) =>
+      entry.contract.optionSymbol === feature.optionSymbol
+    );
+    if (!row) return null;
+    const candidateEntryPrice =
+      row.snapshot.midpoint ?? row.snapshot.ask ?? row.snapshot.last ?? null;
+    return {
+      optionSymbol: row.contract.optionSymbol,
+      expirationDate: row.contract.expirationDate,
+      strike: row.contract.strike,
+      type: row.contract.type,
+      estimatedEntryPrice: candidateEntryPrice,
+      maxLoss: null,
+      maxProfit: null,
+      breakeven: null,
+      liquidityScore: feature.liquidityScore,
+      evidenceTimestamp: feature.sourceObservationTimestamp ?? input.asOf,
+      decisionInputs: {
+        delta: row.snapshot.delta,
+        gamma: row.snapshot.gamma ?? null,
+        theta: row.snapshot.theta ?? null,
+        vega: row.snapshot.vega ?? null,
+        rho: row.snapshot.rho ?? null,
+        impliedVolatility: row.snapshot.impliedVolatility,
+        volume: feature.dailyVolume,
+        openInterest: feature.openInterest,
+        spreadPct: feature.spreadPct,
+        moneyness: feature.moneyness,
+        quoteFreshnessStatus: feature.quoteFreshnessStatus,
+        feed: feature.feedValidated ? "opra" : null,
+        selectionScore: feature.selectionScore
+      }
+    } as const;
+  };
+  const candidates = {
+    call: candidateFor("call"),
+    put: candidateFor("put")
+  };
 
   return {
     values: {
@@ -504,27 +577,8 @@ const buildOptionFeatures = (input: {
       optionSuitability: selectedFeature.suitability,
       marketEvidenceTimestamp: evidenceTimestamp
     } satisfies FeatureValues,
-    candidate: contractEligible ? {
-      optionSymbol: selected.contract.optionSymbol,
-      expirationDate: selected.contract.expirationDate,
-      strike: selected.contract.strike,
-      type: selected.contract.type,
-      estimatedEntryPrice: entryPrice,
-      maxLoss: null,
-      maxProfit: null,
-      breakeven: null,
-      liquidityScore: selectedFeature.liquidityScore,
-      evidenceTimestamp
-      ,decisionInputs: {
-        delta: selected.snapshot.delta, gamma: selected.snapshot.gamma ?? null,
-        theta: selected.snapshot.theta ?? null, vega: selected.snapshot.vega ?? null,
-        rho: selected.snapshot.rho ?? null, impliedVolatility,
-        volume: selectedFeature.dailyVolume, openInterest: selectedFeature.openInterest,
-        spreadPct: selectedFeature.spreadPct, moneyness: selectedFeature.moneyness,
-        quoteFreshnessStatus: selectedFeature.quoteFreshnessStatus,
-        feed: selectedFeature.feedValidated ? "opra" : null
-      }
-    } : null,
+    candidate: contractEligible ? candidates[selected.contract.type] : null,
+    candidates,
     materialEvidence: {
       contracts: contractFeatures,
       selectedOptionSymbol: selected.contract.optionSymbol
@@ -639,7 +693,8 @@ const calculateFeatures = (input: {
       observedAt: decisionAsOf,
       features: values,
       sourceFingerprint: fingerprint({ bar, stockSnapshot, option: option.materialEvidence }),
-      optionCandidate: option.candidate
+      optionCandidate: option.candidate,
+      optionCandidates: option.candidates
     };
   });
 };
@@ -664,9 +719,22 @@ const targetFromFeature = (input: {
       : typeof values.relativeVolume === "number" ? 0.2 * (values.relativeVolume - 1) : 0) +
     (typeof values.intradayReturn === "number" ? Math.max(-0.25, Math.min(0.25, values.intradayReturn * 5)) : 0) +
     (typeof values.distanceFromVwap === "number" ? Math.max(-0.15, Math.min(0.15, values.distanceFromVwap * 3)) : 0);
-  const marketImpliedVolatility = typeof values.atmImpliedVol === "number"
-    ? values.atmImpliedVol
+  const direction = classifyDirectionalScore(
+    directionScore,
+    input.decisionThresholds?.directionScore
+  );
+  const optionCandidate = direction === "long"
+    ? input.feature.optionCandidates.call
+    : direction === "short"
+      ? input.feature.optionCandidates.put
+      : null;
+  const optionDecisionInputs = optionCandidate?.decisionInputs;
+  const candidateImpliedVolatility = optionDecisionInputs &&
+    typeof optionDecisionInputs.impliedVolatility === "number"
+    ? optionDecisionInputs.impliedVolatility
     : null;
+  const marketImpliedVolatility = candidateImpliedVolatility ??
+    (typeof values.atmImpliedVol === "number" ? values.atmImpliedVol : null);
   const volatilityAdjusted = marketImpliedVolatility === null
     ? EXISTING_NO_IV_VOLATILITY_MULTIPLIER
     : Math.max(0, Math.min(2, 1 + marketImpliedVolatility));
@@ -676,10 +744,6 @@ const targetFromFeature = (input: {
   const expectedReturn = directionScore * volatilityAdjusted;
   const learningBoost = Math.max(0, Math.min(1, (input.learningAccuracy ?? 0.5) - 0.5));
   const confidence = Math.max(0, Math.min(1, Math.abs(directionScore) / 2 + learningBoost * 0.2));
-  const direction = classifyDirectionalScore(
-    directionScore,
-    input.decisionThresholds?.directionScore
-  );
   const atr14 = typeof values.atr14 === "number" ? values.atr14 : null;
   const close = typeof values.currentTradablePrice === "number"
     ? values.currentTradablePrice
@@ -694,10 +758,15 @@ const targetFromFeature = (input: {
     expectedReturn,
     atr: atr14,
     trend: String(values.trend ?? "neutral"),
-    iv: typeof values.atmImpliedVol === "number" ? values.atmImpliedVol : null,
-    liquidityScore: typeof values.preferredContractLiquidityScore === "number" ? values.preferredContractLiquidityScore : 0,
-    spreadPct: typeof values.estimatedBidAskSpreadPct === "number" ? values.estimatedBidAskSpreadPct : null,
-    hasOptionsData: Number(values.callLiquidityAvailable ?? 0) > 0 || Number(values.putLiquidityAvailable ?? 0) > 0
+    iv: marketImpliedVolatility,
+    liquidityScore: typeof optionCandidate?.liquidityScore === "number"
+      ? optionCandidate.liquidityScore
+      : 0,
+    spreadPct: optionDecisionInputs &&
+      typeof optionDecisionInputs.spreadPct === "number"
+      ? optionDecisionInputs.spreadPct
+      : null,
+    hasOptionsData: optionCandidate !== null
   }, input.riskProfile === "aggressive", input.decisionThresholds);
   const rationale = [
     ...selector.rationale,
@@ -725,7 +794,7 @@ const targetFromFeature = (input: {
     optionsStrategy: {
       alternatives: selector.alternatives,
       rationale: selector.rationale,
-      optionsCandidate: input.feature.optionCandidate,
+      optionsCandidate: optionCandidate,
       decisionInputs: {
         currentTradablePrice: values.currentTradablePrice,
         intradayReturn: values.intradayReturn,
@@ -788,7 +857,11 @@ export const buildPostgresFeaturesAndTargets = async (input: {
     }));
     await yieldToEventLoop();
   }
-  const features: PostgresFeatureSnapshot[] = calculated.map(({ optionCandidate: _candidate, ...feature }) => feature);
+  const features: PostgresFeatureSnapshot[] = calculated.map(({
+    optionCandidate: _candidate,
+    optionCandidates: _candidates,
+    ...feature
+  }) => feature);
   const targets = Array.from(bySymbol.keys()).map((symbol) => {
     const latest = calculated.filter((row) => row.symbol === symbol).at(-1)!;
     return targetFromFeature({

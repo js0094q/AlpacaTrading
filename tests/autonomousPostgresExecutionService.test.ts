@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  promoteNextConfirmedPostgresIntent,
   runAutonomousPostgresExecutionCommand,
   validateAutonomousExecutionEvidence,
   type AutonomousExecutionIntentRow
@@ -16,6 +17,7 @@ const intent = (overrides: Partial<AutonomousExecutionIntentRow> = {}): Autonomo
   review_account_fingerprint: "structural-fingerprint",
   reservation_id: "reservation-1",
   execution_review_id: "review-1",
+  review_type: "entry",
   confirmation_evidence_id: "confirmation-1",
   client_order_id: "worker-order-1",
   strategy_key: "baseline",
@@ -91,6 +93,211 @@ test("the execution gate compares the persisted broker identity hash without has
     60
   );
   assert.equal(payload.symbol, "AAPL");
+});
+
+test("the execution gate emits supported option sell-to-close semantics", () => {
+  const payload = validateAutonomousExecutionEvidence(
+    intent({
+      asset_class: "option",
+      side: "sell_to_close",
+      symbol: "SPY260720P00555000",
+      notional: null,
+      quantity: "1",
+      limit_price: "1.05",
+      market_evidence: [{
+        symbol: "SPY260720P00555000",
+        referencePrice: 1.05,
+        timestamp: "2026-07-20T21:59:30.000Z"
+      }]
+    }),
+    broker,
+    new Date("2026-07-20T22:00:00.000Z"),
+    60
+  );
+  assert.equal(payload.side, "sell");
+  assert.equal(payload.position_intent, "sell_to_close");
+});
+
+test("confirmation promotion atomically readies an entry intent with a buying-power reservation", async () => {
+  const statements: string[] = [];
+  const values: Array<readonly unknown[]> = [];
+  const result = await promoteNextConfirmedPostgresIntent({
+    command: "paper:execute:reviewed",
+    query: {
+      query: async (sql: string, parameters?: readonly unknown[]) => {
+        statements.push(sql);
+        values.push(parameters ?? []);
+        if (sql.includes("intent.status = 'created'")) {
+          return {
+            rows: [{
+              order_intent_id: "intent-created",
+              candidate_id: "candidate-1",
+              account_id: "account-1",
+              account_snapshot_id: "snapshot-1",
+              strategy_key: "baseline",
+              symbol: "AAPL",
+              asset_class: "equity",
+              side: "buy",
+              max_risk: "100",
+              execution_review_id: "review-1",
+              review_type: "entry",
+              review_payload_fingerprint: "review-payload",
+              review_signature: "review-signature",
+              review_expires_at: "2026-07-20T22:15:00.000Z"
+            }],
+            rowCount: 1
+          };
+        }
+        if (sql.includes("AS buying_power_allowed")) {
+          return {
+            rows: [{
+              buying_power_allowed: true,
+              deployment_allowed: true,
+              strategy_allowed: true,
+              symbol_allowed: true,
+              position_count_allowed: true,
+              order_count_allowed: true
+            }],
+            rowCount: 1
+          };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence: {
+      jobName: "paper-execution",
+      workstream: "paper_execution",
+      ownerId: "owner",
+      runId: "run",
+      fencingToken: "10"
+    },
+    signingKey: "test-signing-key-with-sufficient-length",
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.status, "promoted");
+  assert.equal(result.orderIntentId, "intent-created");
+  assert.equal(statements.some((sql) => sql.includes("INSERT INTO confirmation_evidence")), true);
+  assert.equal(statements.some((sql) => sql.includes("INSERT INTO buying_power_reservations")), true);
+  assert.equal(statements.some((sql) => sql.includes("UPDATE strategy_allocations")), true);
+  assert.equal(
+    statements.some((sql) =>
+      sql.includes("SET confirmation_evidence_id") &&
+      sql.includes("status = 'ready_for_submission'")
+    ),
+    true
+  );
+  const confirmationInsert = statements.findIndex((sql) => sql.includes("INSERT INTO confirmation_evidence"));
+  assert.equal(values[confirmationInsert]?.[5], "autonomous_worker_confirm_paper");
+});
+
+test("paper execution promotes a confirmed created intent before broker submission", async () => {
+  let countReads = 0;
+  const transactionStatements: string[] = [];
+  const result = await runAutonomousPostgresExecutionCommand({
+    command: "paper:execute:reviewed",
+    query: {
+      query: async () => {
+        countReads += 1;
+        return {
+          rows: [{
+            ready_count: countReads === 1 ? "0" : "1",
+            confirmable_count: countReads === 1 ? "1" : "0"
+          }],
+          rowCount: 1
+        };
+      }
+    },
+    transaction: async (operation) => operation({
+      query: async (sql: string) => {
+        transactionStatements.push(sql);
+        if (sql.includes("intent.status = 'created'")) {
+          return {
+            rows: [{
+              order_intent_id: "intent-created",
+              candidate_id: "candidate-1",
+              account_id: "account-1",
+              account_snapshot_id: "snapshot-1",
+              strategy_key: "baseline",
+              symbol: "AAPL",
+              asset_class: "equity",
+              side: "buy",
+              max_risk: "100",
+              execution_review_id: "review-1",
+              review_type: "entry",
+              review_payload_fingerprint: "review-payload",
+              review_signature: "review-signature",
+              review_expires_at: "2026-07-20T22:15:00.000Z"
+            }],
+            rowCount: 1
+          };
+        }
+        if (sql.includes("AS buying_power_allowed")) {
+          return {
+            rows: [{
+              buying_power_allowed: true,
+              deployment_allowed: true,
+              strategy_allowed: true,
+              symbol_allowed: true,
+              position_count_allowed: true,
+              order_count_allowed: true
+            }],
+            rowCount: 1
+          };
+        }
+        if (sql.includes("FROM order_intents intent")) {
+          return {
+            rows: [intent({
+              order_intent_id: "intent-created",
+              confirmation_evidence_id: "confirmation-ready",
+              reservation_id: "reservation-ready"
+            }) as unknown as Record<string, unknown>],
+            rowCount: 1
+          };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    }),
+    marketOpen: async () => true,
+    captureBrokerSnapshot: async () => broker,
+    submitOrder: async (payload) => ({
+      data: {
+        id: "broker-order-1",
+        client_order_id: payload.client_order_id,
+        status: "accepted",
+        symbol: payload.symbol,
+        side: payload.side,
+        type: payload.type,
+        time_in_force: payload.time_in_force,
+        qty: payload.qty,
+        submitted_at: "2026-07-20T22:00:00.000Z"
+      },
+      status: 200,
+      url: "paper"
+    }),
+    safety: {
+      environment: "paper",
+      tradingMode: "paper",
+      liveTradingEnabled: false,
+      paperOrderExecutionEnabled: true,
+      paperOptionsExecutionEnabled: true,
+      quoteMaxAgeSeconds: 60
+    },
+    confirmPaper: true,
+    confirmationSigningKey: "test-signing-key-with-sufficient-length",
+    fence: {
+      jobName: "paper-execution",
+      workstream: "paper_execution",
+      ownerId: "owner",
+      runId: "run",
+      fencingToken: "10"
+    },
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.status, "completed");
+  assert.equal(result.submittedOrderCount, 1);
+  assert.equal(transactionStatements.some((sql) => sql.includes("INSERT INTO confirmation_evidence")), true);
 });
 
 test("an execution command with no ready PostgreSQL intent makes no broker call", async () => {
@@ -383,4 +590,78 @@ test("a deterministic pre-submit rejection releases the claimed intent without b
   assert.notEqual(candidateUpdate, -1);
   assert.equal(statementValues[candidateUpdate]?.[1], "execution_deferred");
   assert.equal(statementValues[candidateUpdate]?.[2], "PAPER_OPTIONS_EXECUTION_DISABLED");
+});
+
+test("equity short submission fails closed unless Alpaca reports shortable and easy to borrow", async () => {
+  const statements: string[] = [];
+  let submitCalls = 0;
+  await assert.rejects(
+    runAutonomousPostgresExecutionCommand({
+      command: "paper:execute:reviewed",
+      query: {
+        query: async () => ({
+          rows: [{ ready_count: "1", confirmable_count: "0" }],
+          rowCount: 1
+        })
+      },
+      transaction: async (operation) => operation({
+        query: async (sql: string) => {
+          statements.push(sql);
+          if (sql.includes("FROM order_intents intent")) {
+            return {
+              rows: [intent({
+                side: "sell",
+                order_type: "market",
+                quantity: "1",
+                notional: null,
+                limit_price: null
+              }) as unknown as Record<string, unknown>],
+              rowCount: 1
+            };
+          }
+          return { rows: [], rowCount: 1 };
+        }
+      }),
+      marketOpen: async () => true,
+      captureBrokerSnapshot: async () => broker,
+      checkAsset: async () => ({
+        symbol: "AAPL",
+        tradable: true,
+        asset: {
+          symbol: "AAPL",
+          status: "active",
+          tradable: true,
+          shortable: true,
+          easyToBorrow: false
+        }
+      }),
+      submitOrder: async () => {
+        submitCalls += 1;
+        throw new Error("must not submit");
+      },
+      safety: {
+        environment: "paper",
+        tradingMode: "paper",
+        liveTradingEnabled: false,
+        paperOrderExecutionEnabled: true,
+        paperOptionsExecutionEnabled: true,
+        quoteMaxAgeSeconds: 60
+      },
+      confirmPaper: true,
+      fence: {
+        jobName: "execution",
+        workstream: "execution",
+        ownerId: "owner",
+        runId: "run",
+        fencingToken: "15"
+      },
+      now: new Date("2026-07-20T22:00:00.000Z")
+    }),
+    /POSTGRES_SHORT_ASSET_INELIGIBLE/
+  );
+  assert.equal(submitCalls, 0);
+  assert.equal(
+    statements.some((sql) => /SET status = 'ready_for_submission'/.test(sql)),
+    true
+  );
 });

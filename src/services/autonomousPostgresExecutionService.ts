@@ -1,3 +1,4 @@
+import { createHmac } from "node:crypto";
 import type { QueryResult } from "pg";
 
 import { canonicalJsonHash } from "../lib/canonicalJson.js";
@@ -8,6 +9,10 @@ import type {
   AlpacaPaperOrderRequest,
   AlpacaSubmittedOrder
 } from "./alpacaClient.js";
+import {
+  checkAlpacaSymbolTradability,
+  type AlpacaAssetTradabilityResult
+} from "./alpacaAssetService.js";
 import type { PostgresAuthorityBrokerSnapshot } from "./postgresAuthorityBrokerSnapshot.js";
 
 export type AutonomousExecutionIntentRow = {
@@ -19,6 +24,7 @@ export type AutonomousExecutionIntentRow = {
   review_account_fingerprint: string;
   reservation_id: string | null;
   execution_review_id: string;
+  review_type: "entry" | "exit";
   confirmation_evidence_id: string;
   review_signature?: string | null;
   payload_fingerprint?: string | null;
@@ -157,16 +163,16 @@ export const validateAutonomousExecutionEvidence = (
 
 const commandFilter = (command: string) => {
   if (command === "paper:execute:reviewed") {
-    return "intent.side IN ('buy', 'buy_to_open')";
+    return "review.review_type = 'entry' AND intent.side IN ('buy', 'sell', 'buy_to_open')";
   }
   if (command === "paper:exit:execute") {
-    return "intent.side IN ('sell', 'sell_to_close')";
+    return "review.review_type = 'exit' AND intent.side IN ('buy', 'sell', 'sell_to_close')";
   }
   if (command === "hedge:exit:execute") {
-    return "intent.side IN ('sell', 'sell_to_close') AND intent.strategy_key ILIKE '%hedge%'";
+    return "review.review_type = 'exit' AND intent.side IN ('sell', 'sell_to_close') AND intent.strategy_key ILIKE '%hedge%'";
   }
   if (command === "zero-dte:engine") {
-    return "intent.side IN ('buy', 'buy_to_open') AND (intent.strategy_key ILIKE '%zero%dte%' OR intent.strategy_key ILIKE '%0dte%')";
+    return "review.review_type = 'entry' AND intent.side IN ('buy', 'buy_to_open') AND (intent.strategy_key ILIKE '%zero%dte%' OR intent.strategy_key ILIKE '%0dte%')";
   }
   throw new Error(`POSTGRES_EXECUTION_COMMAND_UNSUPPORTED: ${command}`);
 };
@@ -186,6 +192,366 @@ const fenceValues = (fence: SchedulerFence) => [
   fence.runId,
   fence.fencingToken
 ];
+
+type ConfirmableIntentRow = {
+  order_intent_id: string;
+  candidate_id: string | null;
+  account_id: string;
+  account_snapshot_id: string;
+  strategy_key: string;
+  symbol: string;
+  asset_class: "equity" | "option";
+  side: "buy" | "sell" | "buy_to_open" | "sell_to_close";
+  max_risk: string | number | null;
+  execution_review_id: string;
+  review_type: "entry" | "exit";
+  review_payload_fingerprint: string;
+  review_signature: string;
+  review_expires_at: string | Date;
+};
+
+const capacityAllowed = (row: Record<string, unknown> | undefined) =>
+  Boolean(row) && [
+    "buying_power_allowed",
+    "deployment_allowed",
+    "strategy_allowed",
+    "symbol_allowed",
+    "position_count_allowed",
+    "order_count_allowed"
+  ].every((field) => row?.[field] === true);
+
+export const promoteNextConfirmedPostgresIntent = async (input: {
+  readonly command: string;
+  readonly query: AutonomousExecutionQuery;
+  readonly fence: SchedulerFence;
+  readonly signingKey: string;
+  readonly now: Date;
+}) => {
+  if (input.signingKey.trim().length < 16) {
+    throw new Error("PAPER_REVIEW_SIGNING_KEY_REQUIRED");
+  }
+  const nowIso = input.now.toISOString();
+  const selected = await input.query.query(
+    `SELECT intent.id AS order_intent_id, intent.candidate_id, intent.account_id,
+            snapshot.id AS account_snapshot_id, intent.strategy_key, intent.symbol,
+            intent.asset_class, intent.side, intent.max_risk::text AS max_risk,
+            intent.execution_review_id, review.review_type,
+            review.payload_fingerprint AS review_payload_fingerprint,
+            review.signature AS review_signature, review.expires_at AS review_expires_at
+     FROM order_intents intent
+     JOIN execution_reviews review ON review.id = intent.execution_review_id
+     JOIN LATERAL (
+       SELECT current_snapshot.id, current_snapshot.snapshot_fingerprint,
+              current_snapshot.evidence
+       FROM account_snapshots current_snapshot
+       WHERE current_snapshot.account_id = intent.account_id
+       ORDER BY current_snapshot.observed_at DESC, current_snapshot.id DESC
+       LIMIT 1
+     ) snapshot ON true
+     JOIN strategy_allocations allocation
+       ON allocation.account_id = intent.account_id
+      AND allocation.strategy_key = intent.strategy_key
+      AND allocation.status = 'active' AND allocation.effective_to IS NULL
+     WHERE intent.status = 'created' AND intent.environment = 'paper'
+       AND ${commandFilter(input.command)}
+       AND review.status = 'valid' AND review.environment = 'paper'
+       AND review.paper_only AND NOT review.live_trading_enabled
+       AND review.expires_at > $1
+       AND snapshot.evidence->>'structuralPortfolioFingerprint' = review.account_fingerprint
+       AND ${fenceSql(2)}
+     ORDER BY intent.created_at, intent.id
+     LIMIT 1
+     FOR UPDATE OF intent, review, allocation SKIP LOCKED`,
+    [nowIso, ...fenceValues(input.fence)]
+  );
+  const intent = selected.rows[0] as ConfirmableIntentRow | undefined;
+  if (!intent) return { status: "none" as const };
+
+  const reservationRequired = intent.review_type === "entry";
+  const amount = positive(intent.max_risk);
+  if (reservationRequired && amount === null) {
+    throw new Error("POSTGRES_CONFIRMATION_RISK_AMOUNT_MISSING");
+  }
+  if (reservationRequired) {
+    const capacity = await input.query.query(
+      `WITH snapshot AS (
+         SELECT buying_power, equity
+         FROM account_snapshots
+         WHERE id = $2 AND account_id = $1
+       ), reservations AS (
+         SELECT COALESCE(SUM(amount), 0) AS total,
+                COALESCE(SUM(amount) FILTER (WHERE symbol = $4), 0) AS symbol_total
+         FROM buying_power_reservations
+         WHERE account_id = $1 AND status = 'active' AND expires_at > $5
+       ), open_orders AS (
+         SELECT COALESCE(SUM(COALESCE(
+                  notional,
+                  quantity * limit_price * CASE WHEN asset_class = 'option' THEN 100 ELSE 1 END
+                )), 0) AS total,
+                COALESCE(SUM(COALESCE(
+                  notional,
+                  quantity * limit_price * CASE WHEN asset_class = 'option' THEN 100 ELSE 1 END
+                )) FILTER (WHERE symbol = $4), 0) AS symbol_total,
+                COUNT(*) AS count
+         FROM orders
+         WHERE account_id = $1
+           AND status IN ('new', 'accepted', 'pending_new', 'partially_filled', 'held', 'replaced')
+       ), position_state AS (
+         SELECT COALESCE(SUM(ABS(COALESCE(market_value, cost_basis, 0))), 0) AS total,
+                COALESCE(SUM(ABS(COALESCE(market_value, cost_basis, 0)))
+                  FILTER (WHERE symbol = $4), 0) AS symbol_total,
+                COUNT(*) AS count
+         FROM positions
+         WHERE account_id = $1 AND status IN ('open', 'closing')
+       ), limits AS (
+         SELECT *
+         FROM risk_limits
+         WHERE account_id = $1 AND status = 'active' AND effective_to IS NULL
+         ORDER BY CASE WHEN scope_type = 'portfolio' THEN 0 ELSE 1 END, updated_at DESC
+         LIMIT 1
+       ), allocation AS (
+         SELECT *
+         FROM strategy_allocations
+         WHERE account_id = $1 AND strategy_key = $3
+           AND status = 'active' AND effective_to IS NULL
+       )
+       SELECT
+         COALESCE(snapshot.buying_power, 0) - reservations.total - open_orders.total
+           - GREATEST(
+               COALESCE(limits.cash_reserve_amount, 0),
+               COALESCE(snapshot.equity, 0) * COALESCE(limits.cash_reserve_ratio, 0)
+             ) >= $6::numeric AS buying_power_allowed,
+         (limits.max_deployment_amount IS NULL OR
+            position_state.total + open_orders.total + reservations.total + $6::numeric
+              <= limits.max_deployment_amount)
+           AND (limits.max_deployment_ratio IS NULL OR
+            position_state.total + open_orders.total + reservations.total + $6::numeric
+              <= COALESCE(snapshot.equity, 0) * limits.max_deployment_ratio)
+           AS deployment_allowed,
+         (allocation.allocation_amount IS NULL OR
+            allocation.deployed_amount + allocation.reserved_amount + $6::numeric
+              <= allocation.allocation_amount)
+           AND (allocation.allocation_ratio IS NULL OR
+            allocation.deployed_amount + allocation.reserved_amount + $6::numeric
+              <= COALESCE(snapshot.equity, 0) * allocation.allocation_ratio)
+           AS strategy_allowed,
+         limits.max_symbol_notional IS NULL OR
+           position_state.symbol_total + open_orders.symbol_total +
+             reservations.symbol_total + $6::numeric <= limits.max_symbol_notional
+           AS symbol_allowed,
+         limits.max_position_count IS NULL OR position_state.count < limits.max_position_count
+           AS position_count_allowed,
+         limits.max_order_count IS NULL OR open_orders.count < limits.max_order_count
+           AS order_count_allowed
+       FROM snapshot, reservations, open_orders, position_state, limits, allocation`,
+      [
+        intent.account_id,
+        intent.account_snapshot_id,
+        intent.strategy_key,
+        intent.symbol,
+        nowIso,
+        amount
+      ]
+    );
+    if (!capacityAllowed(capacity.rows[0])) {
+      return {
+        status: "blocked" as const,
+        code: "POSTGRES_CONFIRMATION_CAPACITY_BLOCKED",
+        orderIntentId: intent.order_intent_id
+      };
+    }
+  }
+
+  const reviewExpiryMs = Date.parse(String(intent.review_expires_at));
+  const expiresAt = new Date(Math.min(reviewExpiryMs, input.now.getTime() + 15 * 60_000)).toISOString();
+  if (!Number.isFinite(reviewExpiryMs) || Date.parse(expiresAt) <= input.now.getTime()) {
+    throw new Error("POSTGRES_CONFIRMATION_EXPIRATION_INVALID");
+  }
+  const confirmationEvidence = {
+    command: input.command,
+    confirmPaper: true,
+    scheduler: {
+      jobName: input.fence.jobName,
+      workstream: input.fence.workstream,
+      ownerId: input.fence.ownerId,
+      runId: input.fence.runId,
+      fencingToken: input.fence.fencingToken
+    }
+  };
+  const confirmationFingerprint = canonicalJsonHash({
+    executionReviewId: intent.execution_review_id,
+    reviewPayloadFingerprint: intent.review_payload_fingerprint,
+    evidence: confirmationEvidence
+  });
+  const confirmationId = `confirmation_${confirmationFingerprint}`;
+  const confirmationSignature = createHmac("sha256", input.signingKey)
+    .update(confirmationFingerprint)
+    .digest("hex");
+  const confirmationWrite = await input.query.query(
+    `INSERT INTO confirmation_evidence(
+       id, execution_review_id, account_id, candidate_id, evidence_type,
+       confirmation_method, status, paper_only, payload_fingerprint,
+       signature_algorithm, signature, evidence, confirmed_at, expires_at,
+       created_at, updated_at
+     ) SELECT $1, $2, $3, $4, $5, $6, 'valid', true, $7,
+              'hmac-sha256', $8, $9::jsonb, $10, $11, $10, $10
+       WHERE ${fenceSql(12)}
+     ON CONFLICT (execution_review_id, payload_fingerprint) DO NOTHING`,
+    [
+      confirmationId,
+      intent.execution_review_id,
+      intent.account_id,
+      intent.candidate_id,
+      "paper_execution_confirmation",
+      "autonomous_worker_confirm_paper",
+      confirmationFingerprint,
+      confirmationSignature,
+      JSON.stringify(confirmationEvidence),
+      nowIso,
+      expiresAt,
+      ...fenceValues(input.fence)
+    ]
+  );
+  if (confirmationWrite.rowCount !== 1) {
+    throw new Error("POSTGRES_CONFIRMATION_EVIDENCE_PERSISTENCE_FAILED");
+  }
+
+  const reservationId = reservationRequired
+    ? `reservation_${canonicalJsonHash({
+        accountId: intent.account_id,
+        orderIntentId: intent.order_intent_id,
+        confirmationId
+      })}`
+    : null;
+  if (reservationRequired) {
+    const reservationFingerprint = canonicalJsonHash({
+      accountId: intent.account_id,
+      accountSnapshotId: intent.account_snapshot_id,
+      strategyKey: intent.strategy_key,
+      symbol: intent.symbol,
+      amount
+    });
+    const reservationWrite = await input.query.query(
+      `INSERT INTO buying_power_reservations(
+         id, account_id, candidate_id, strategy_key, symbol, asset_class,
+         amount, status, idempotency_key, reservation_fingerprint,
+         account_snapshot_id, scheduler_job_name, scheduler_fencing_token,
+         expires_at, created_at, updated_at
+       ) SELECT $1, $2, $3, $4, $5, $6, $7, 'active', $8, $9, $10, $11, $12,
+                $13, $14, $14
+         WHERE ${fenceSql(15)}`,
+      [
+        reservationId,
+        intent.account_id,
+        intent.candidate_id,
+        intent.strategy_key,
+        intent.symbol,
+        intent.asset_class,
+        amount,
+        `confirmation:${confirmationFingerprint}`,
+        reservationFingerprint,
+        intent.account_snapshot_id,
+        input.fence.jobName,
+        input.fence.fencingToken,
+        expiresAt,
+        nowIso,
+        ...fenceValues(input.fence)
+      ]
+    );
+    if (reservationWrite.rowCount !== 1) {
+      throw new Error("POSTGRES_CONFIRMATION_RESERVATION_PERSISTENCE_FAILED");
+    }
+    const allocationWrite = await input.query.query(
+      `UPDATE strategy_allocations
+       SET reserved_amount = reserved_amount + $3::numeric,
+           updated_at = $4, version = version + 1
+       WHERE account_id = $1 AND strategy_key = $2
+         AND status = 'active' AND effective_to IS NULL
+         AND ${fenceSql(5)}`,
+      [
+        intent.account_id,
+        intent.strategy_key,
+        amount,
+        nowIso,
+        ...fenceValues(input.fence)
+      ]
+    );
+    if (allocationWrite.rowCount !== 1) {
+      throw new Error("POSTGRES_CONFIRMATION_ALLOCATION_PERSISTENCE_FAILED");
+    }
+  }
+
+  const lifecycleFingerprint = canonicalJsonHash({
+    orderIntentId: intent.order_intent_id,
+    confirmationId,
+    reservationId,
+    status: "ready_for_submission",
+    at: nowIso
+  });
+  const intentWrite = await input.query.query(
+    `UPDATE order_intents
+     SET confirmation_evidence_id = $2, reservation_id = $3,
+         status = 'ready_for_submission', ready_at = $4, updated_at = $4,
+         lifecycle_fingerprint = $5, version = version + 1
+     WHERE id = $1 AND status = 'created' AND ${fenceSql(6)}`,
+    [
+      intent.order_intent_id,
+      confirmationId,
+      reservationId,
+      nowIso,
+      lifecycleFingerprint,
+      ...fenceValues(input.fence)
+    ]
+  );
+  if (intentWrite.rowCount !== 1) {
+    throw new Error("POSTGRES_CONFIRMATION_PROMOTION_FAILED");
+  }
+  const lifecycleWrite = await input.query.query(
+    `INSERT INTO lifecycle_fingerprints(
+       id, account_id, candidate_id, order_intent_id, entity_type, entity_id,
+       lifecycle_stage, fingerprint, payload_version, evidence, captured_at, created_at
+     ) SELECT $1, $2, $3, $4, 'order_intent', $4, 'ready_for_submission',
+              $5, 1, $6::jsonb, $7, $7
+       WHERE ${fenceSql(8)}
+     ON CONFLICT (entity_type, entity_id, lifecycle_stage, fingerprint) DO NOTHING`,
+    [
+      `${intent.order_intent_id}:ready:${confirmationFingerprint}`,
+      intent.account_id,
+      intent.candidate_id,
+      intent.order_intent_id,
+      lifecycleFingerprint,
+      JSON.stringify({ confirmationId, reservationId, command: input.command }),
+      nowIso,
+      ...fenceValues(input.fence)
+    ]
+  );
+  if (lifecycleWrite.rowCount !== 1) {
+    throw new Error("POSTGRES_CONFIRMATION_LIFECYCLE_PERSISTENCE_FAILED");
+  }
+  if (intent.candidate_id) {
+    const candidateWrite = await input.query.query(
+      `UPDATE candidates
+       SET lifecycle_status = 'confirmed',
+           decision_reason = 'PAPER_ORDER_INTENT_CONFIRMED',
+           updated_at = $2, version = version + 1
+       WHERE id = $1 AND decision = 'selected' AND ${fenceSql(3)}`,
+      [
+        intent.candidate_id,
+        nowIso,
+        ...fenceValues(input.fence)
+      ]
+    );
+    if (candidateWrite.rowCount !== 1) {
+      throw new Error("POSTGRES_CONFIRMATION_CANDIDATE_PERSISTENCE_FAILED");
+    }
+  }
+  return {
+    status: "promoted" as const,
+    orderIntentId: intent.order_intent_id,
+    confirmationEvidenceId: confirmationId,
+    reservationId
+  };
+};
 
 const persistCandidateExecutionStage = async (
   query: AutonomousExecutionQuery,
@@ -224,7 +590,7 @@ const claimIntent = async (
             account.broker_account_id,
             snapshot.snapshot_fingerprint AS account_snapshot_fingerprint,
             review.account_fingerprint AS review_account_fingerprint,
-            intent.reservation_id, intent.execution_review_id,
+            intent.reservation_id, intent.execution_review_id, review.review_type,
             intent.confirmation_evidence_id, review.signature AS review_signature,
             review.payload_fingerprint, intent.client_order_id,
             intent.strategy_key, intent.symbol, intent.asset_class,
@@ -492,29 +858,44 @@ export const runAutonomousPostgresExecutionCommand = async (input: {
   readonly submitOrder: (
     payload: AlpacaPaperOrderRequest
   ) => Promise<AlpacaApiResponse<AlpacaSubmittedOrder>>;
+  readonly checkAsset?: (
+    symbol: string
+  ) => Promise<AlpacaAssetTradabilityResult>;
   readonly fence: SchedulerFence;
   readonly safety: AutonomousExecutionSafety;
   readonly confirmPaper: boolean;
+  readonly confirmationSigningKey?: string;
   readonly expectedPayloadSignature?: string;
   readonly now?: Date;
 }) => {
   assertSafety(input.safety, input.confirmPaper);
   const filter = commandFilter(input.command);
   const countResult = await input.query.query(
-    `SELECT COUNT(*) AS ready_count FROM order_intents intent
-     WHERE intent.status = 'ready_for_submission' AND intent.environment = 'paper'
-       AND ${filter}`
+    `SELECT
+       COUNT(*) FILTER (WHERE intent.status = 'ready_for_submission') AS ready_count,
+       COUNT(*) FILTER (
+         WHERE intent.status = 'created'
+           AND review.status = 'valid' AND review.expires_at > now()
+       ) AS confirmable_count
+     FROM order_intents intent
+     JOIN execution_reviews review ON review.id = intent.execution_review_id
+     WHERE intent.status IN ('created', 'ready_for_submission')
+       AND intent.environment = 'paper' AND ${filter}`
   );
-  const readyCount = Number(countResult.rows[0]?.ready_count ?? 0);
-  if (!Number.isSafeInteger(readyCount) || readyCount < 0) {
+  let readyCount = Number(countResult.rows[0]?.ready_count ?? 0);
+  const confirmableCount = Number(countResult.rows[0]?.confirmable_count ?? 0);
+  if (
+    !Number.isSafeInteger(readyCount) || readyCount < 0 ||
+    !Number.isSafeInteger(confirmableCount) || confirmableCount < 0
+  ) {
     throw new Error("POSTGRES_READY_INTENT_COUNT_INVALID");
   }
-  if (readyCount === 0) {
+  if (readyCount === 0 && confirmableCount === 0) {
     return {
       status: "no_op" as const,
       code: "NO_READY_POSTGRES_ORDER_INTENTS",
       submittedOrderCount: 0,
-      evidence: { readyIntentCount: 0 }
+      evidence: { readyIntentCount: 0, confirmableIntentCount: 0 }
     };
   }
 
@@ -523,11 +904,45 @@ export const runAutonomousPostgresExecutionCommand = async (input: {
       status: "no_op" as const,
       code: "PAPER_MARKET_CLOSED",
       submittedOrderCount: 0,
-      evidence: { readyIntentCount: readyCount, marketOpen: false }
+      evidence: {
+        readyIntentCount: readyCount,
+        confirmableIntentCount: confirmableCount,
+        marketOpen: false
+      }
     };
   }
 
   const now = input.now ?? new Date();
+  let promotion: Awaited<ReturnType<typeof promoteNextConfirmedPostgresIntent>> | undefined;
+  if (readyCount === 0 && confirmableCount > 0) {
+    const signingKey = input.confirmationSigningKey ??
+      process.env.PAPER_REVIEW_SIGNING_KEY?.trim() ??
+      "";
+    promotion = await input.transaction((query) =>
+      promoteNextConfirmedPostgresIntent({
+        command: input.command,
+        query,
+        fence: input.fence,
+        signingKey,
+        now
+      })
+    );
+    if (promotion.status !== "promoted") {
+      return {
+        status: "no_op" as const,
+        code: promotion.status === "blocked"
+          ? promotion.code
+          : "NO_READY_POSTGRES_ORDER_INTENTS",
+        submittedOrderCount: 0,
+        evidence: {
+          readyIntentCount: 0,
+          confirmableIntentCount: confirmableCount,
+          confirmationPromotion: promotion.status
+        }
+      };
+    }
+    readyCount = 1;
+  }
   const broker = await input.captureBrokerSnapshot();
   const intent = await input.transaction((query) =>
     claimIntent(query, input.command, input.fence, now, input.expectedPayloadSignature)
@@ -536,6 +951,22 @@ export const runAutonomousPostgresExecutionCommand = async (input: {
   try {
     if (intent.asset_class === "option" && !input.safety.paperOptionsExecutionEnabled) {
       throw new Error("PAPER_OPTIONS_EXECUTION_DISABLED");
+    }
+    if (
+      intent.review_type === "entry" &&
+      intent.asset_class === "equity" &&
+      intent.side === "sell"
+    ) {
+      const asset = await (
+        input.checkAsset ?? checkAlpacaSymbolTradability
+      )(intent.symbol);
+      if (
+        !asset.tradable ||
+        asset.asset?.shortable !== true ||
+        asset.asset.easyToBorrow !== true
+      ) {
+        throw new Error("POSTGRES_SHORT_ASSET_INELIGIBLE");
+      }
     }
     payload = validateAutonomousExecutionEvidence(
       intent,
@@ -569,6 +1000,8 @@ export const runAutonomousPostgresExecutionCommand = async (input: {
     submittedOrderCount: 1,
     evidence: {
       readyIntentCount: readyCount,
+      confirmableIntentCount: confirmableCount,
+      confirmationPromoted: promotion?.status === "promoted",
       orderIntentId: intent.order_intent_id,
       orderId: recorded.orderId,
       brokerOrderId: recorded.brokerOrderId,

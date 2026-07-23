@@ -30,6 +30,7 @@
     "paper:review": "tsx src/postgresOnlyCli.ts paper:review",
     "paper:portfolio:review": "tsx src/postgresOnlyCli.ts paper:portfolio:review",
     "paper:options:discover": "tsx src/postgresOnlyCli.ts paper:options:discover",
+    "paper:order:cancel": "tsx src/postgresOnlyCli.ts paper:order:cancel",
     "paper:reconcile:external-order": "tsx src/postgresOnlyCli.ts paper:reconcile:external-order",
     "paper:ops:review": "tsx src/postgresOnlyCli.ts paper:ops:review",
     "paper:exit:review": "tsx src/postgresOnlyCli.ts paper:exit:review",

@@ -104,6 +104,12 @@ test("research persists current PostgreSQL evidence and selected candidates befo
       stockEvidenceFreshnessStatus: "FRESH", marketSessionEligible: true,
       option: null
     },
+    strategyClassification: {
+      family: "equity",
+      daysToExpiration: null,
+      leapsMinDte: 180,
+      leapsMaxDte: 730
+    },
     learningAdjustmentStatus: "not_applicable_no_postgres_learning_model",
     learningModelCapability: {
       authority: "postgres",
@@ -596,4 +602,63 @@ test("research assigns zero_dte_spy only to a matching SPY same-day option expre
   assert.equal(candidateValues[4], "SPY260720C00555000");
   assert.equal(candidateValues[5], "option");
   assert.equal(candidateValues[12], "zero_dte_spy");
+});
+
+test("research classifies a production long-dated option with repository LEAPS policy", async () => {
+  let candidateValues: readonly unknown[] = [];
+  const leapsTarget = {
+    ...target,
+    preferredExpression: "long_put" as const,
+    direction: "short" as const,
+    optionsStrategy: {
+      alternatives: ["shares"],
+      rationale: [],
+      optionsCandidate: {
+        optionSymbol: "SPY270416P00500000",
+        type: "put",
+        expirationDate: "2027-04-16",
+        strike: 500,
+        estimatedEntryPrice: 20,
+        liquidityScore: 0.9
+      }
+    }
+  };
+  await runPostgresResearchWorkflow({
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("INSERT INTO candidates")) candidateValues = values ?? [];
+        if (statement.includes("to_regclass('public.learning_runs')")) {
+          return { rows: [{ learning_model_relation: null }], rowCount: 1 };
+        }
+        return {
+          rows: statement.includes("INSERT INTO research_runs")
+            ? [{ version: "1" }]
+            : [],
+          rowCount: 1
+        };
+      }
+    },
+    fence,
+    riskProfile: "aggressive",
+    optionsEnabled: true,
+    maxCandidates: 10,
+    now: new Date("2026-07-20T18:00:00.000Z"),
+    dependencies: {
+      refreshMarketData: async () => ({
+        bars: [bar],
+        stockSnapshots: [],
+        optionContracts: [],
+        optionSnapshots: [],
+        summary: {}
+      }) as never,
+      buildFeaturesAndTargets: async () => ({
+        features: [],
+        targets: [leapsTarget]
+      }),
+      symbols: ["SPY"]
+    }
+  });
+
+  assert.equal(candidateValues[4], "SPY270416P00500000");
+  assert.equal(candidateValues[12], "leaps");
 });

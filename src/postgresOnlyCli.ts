@@ -53,6 +53,7 @@ import { runAutonomousPostgresCommand } from "./services/autonomousPostgresComma
 import { runAutonomousPostgresExecutionCommand } from "./services/autonomousPostgresExecutionService.js";
 import { capturePostgresAuthorityBrokerSnapshot } from "./services/postgresAuthorityBrokerSnapshot.js";
 import { reconcilePostgresPaperOrders } from "./services/postgresReconciliationService.js";
+import { runPostgresPaperOrderCancellation } from "./services/postgresOrderCancellationService.js";
 import { runPostgresResearchWorkflow } from "./services/postgresResearchWorkflowService.js";
 import { runPostgresReviewWorkflow } from "./services/postgresReviewWorkflowService.js";
 import { paperSubmitConfiguration } from "./services/paperSubmitSafetyConfig.js";
@@ -405,6 +406,19 @@ const run = async (scheduledContext?: PostgresScheduledCommandOperationContext) 
     });
     print({ ...paperEnvelope(), command, ...result });
     if (result.errors.length > 0) process.exitCode = 1;
+    return;
+  }
+
+  if (command === "paper:order:cancel") {
+    const context = requireScheduledContext(scheduledContext);
+    const result = await runPostgresPaperOrderCancellation({
+      query: queryAdapter(context.pool),
+      fence: context.fence,
+      brokerOrderId: String(args.brokerOrderId || ""),
+      clientOrderId: String(args.clientOrderId || ""),
+      confirmPaper: Object.prototype.hasOwnProperty.call(args, "confirmPaper")
+    });
+    print({ ...paperEnvelope(), command, ...result });
     return;
   }
 

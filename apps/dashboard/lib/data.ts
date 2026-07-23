@@ -43,6 +43,8 @@ export interface PaperActionInput {
   asOf?: string;
   staleThesis?: boolean;
   riskNormalizationObservations?: number;
+  brokerOrderId?: string;
+  clientOrderId?: string;
 }
 
 const numberOrNull = (value: unknown): number | null => {
@@ -371,7 +373,15 @@ export const parsePaperActionInput = (value: unknown): PaperActionInput => {
     entryAt: typeof record.entryAt === "string" ? record.entryAt : undefined,
     asOf: typeof record.asOf === "string" ? record.asOf : undefined,
     staleThesis: record.staleThesis === true,
-    riskNormalizationObservations: numberOrNull(record.riskNormalizationObservations) ?? undefined
+    riskNormalizationObservations: numberOrNull(record.riskNormalizationObservations) ?? undefined,
+    brokerOrderId:
+      typeof record.brokerOrderId === "string" && record.brokerOrderId.trim()
+        ? record.brokerOrderId.trim()
+        : undefined,
+    clientOrderId:
+      typeof record.clientOrderId === "string" && record.clientOrderId.trim()
+        ? record.clientOrderId.trim()
+        : undefined
   };
 };
 
@@ -937,6 +947,11 @@ export const runPaperDryRun = async (input: PaperActionInput) => {
 };
 
 export const runPaperConfirm = async (input: PaperActionInput) => {
+  void input;
+  throw new Error("POSTGRES_ONLY_RUNTIME_PATH_DISABLED");
+};
+
+export const runPaperOrderCancellation = async (input: PaperActionInput) => {
   void input;
   throw new Error("POSTGRES_ONLY_RUNTIME_PATH_DISABLED");
 };

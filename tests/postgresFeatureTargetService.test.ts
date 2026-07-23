@@ -375,11 +375,28 @@ test("Alpaca option quote, liquidity, IV, and all five Greeks propagate into cla
   assert.equal(feature.optionQuoteFreshnessStatus, "fresh");
   assert.equal(feature.optionContractEligible, true);
   const candidate = result.targets[0]!.optionsStrategy?.optionsCandidate as Record<string, unknown>;
-  assert.deepEqual(candidate.decisionInputs, { delta: 0.5, gamma: 0.02, theta: -0.08, vega: 0.12, rho: 0.03, impliedVolatility: 0.25, volume: 500, openInterest: 1_000, spreadPct: 0.04, moneyness: 0, quoteFreshnessStatus: "fresh", feed: "opra" });
+  assert.deepEqual(candidate.decisionInputs, {
+    delta: 0.5,
+    gamma: 0.02,
+    theta: -0.08,
+    vega: 0.12,
+    rho: 0.03,
+    impliedVolatility: 0.25,
+    volume: 500,
+    openInterest: 1_000,
+    spreadPct: 0.04,
+    moneyness: 0,
+    quoteFreshnessStatus: "fresh",
+    feed: "opra",
+    selectionScore: 0.5688461538461539
+  });
   const classifications = feature.optionFieldClassifications as Record<string, string>;
   assert.equal(classifications.impliedVolatility, "decision_input");
-  assert.equal(classifications.delta, "audit_only");
-  assert.equal(classifications.rho, "audit_only");
+  assert.equal(classifications.delta, "decision_input");
+  assert.equal(classifications.gamma, "decision_input");
+  assert.equal(classifications.theta, "decision_input");
+  assert.equal(classifications.vega, "decision_input");
+  assert.equal(classifications.rho, "decision_input");
   assert.equal(classifications.dailyVolume, "execution_gate");
   assert.equal(classifications.openInterest, "execution_gate");
   assert.equal(classifications.eligibility, "execution_gate");
@@ -388,6 +405,80 @@ test("Alpaca option quote, liquidity, IV, and all five Greeks propagate into cla
   assert.equal(contractFeatures.length, 1);
   assert.equal("fieldClassifications" in contractFeatures[0]!, false);
   assert.deepEqual(result.features[0]!.features.optionContractFeatures, []);
+});
+
+test("bullish historical and SIP signals select a real call even when a put is closer to ATM", async () => {
+  const putSymbol = "SPY260829P00560000";
+  const callSymbol = "SPY260829C00565000";
+  const result = await buildOptionFeaturesFixture({
+    contracts: [
+      optionContractFixture(putSymbol, 560, { type: "put" }),
+      optionContractFixture(callSymbol, 565, { type: "call" })
+    ],
+    snapshots: [
+      optionSnapshotFixture(putSymbol, { delta: -0.5 }),
+      optionSnapshotFixture(callSymbol, { delta: 0.45 })
+    ]
+  });
+
+  const target = result.targets[0]!;
+  assert.equal(target.direction, "long");
+  const candidate = target.optionsStrategy?.optionsCandidate as Record<string, unknown>;
+  assert.equal(candidate.optionSymbol, callSymbol);
+  assert.equal(candidate.type, "call");
+});
+
+test("contract selection ranks OPRA Greeks, IV, spread, volume, and open interest", async () => {
+  const closestButWeak = "SPY260829C00560000";
+  const liquidWithGreeks = "SPY260829C00565000";
+  const result = await buildOptionFeaturesFixture({
+    contracts: [
+      optionContractFixture(closestButWeak, 560, { openInterest: 1 }),
+      optionContractFixture(liquidWithGreeks, 565, { openInterest: 8_000 })
+    ],
+    snapshots: [
+      optionSnapshotFixture(closestButWeak, {
+        bid: 4.8,
+        ask: 5.2,
+        midpoint: 5,
+        spread: 0.4,
+        spreadPct: 0.08,
+        volume: 1,
+        openInterest: 1,
+        impliedVolatility: 1.5,
+        delta: null,
+        gamma: null,
+        theta: null,
+        vega: null,
+        rho: null
+      }),
+      optionSnapshotFixture(liquidWithGreeks, {
+        bid: 4.95,
+        ask: 5.05,
+        midpoint: 5,
+        spread: 0.1,
+        spreadPct: 0.02,
+        volume: 5_000,
+        openInterest: 8_000,
+        impliedVolatility: 0.3,
+        delta: 0.48,
+        gamma: 0.03,
+        theta: -0.06,
+        vega: 0.15,
+        rho: 0.04
+      })
+    ]
+  });
+
+  const candidate = result.targets[0]!.optionsStrategy
+    ?.optionsCandidate as Record<string, unknown>;
+  assert.equal(candidate.optionSymbol, liquidWithGreeks);
+  const inputs = candidate.decisionInputs as Record<string, unknown>;
+  assert.equal(inputs.volume, 5_000);
+  assert.equal(inputs.openInterest, 8_000);
+  assert.equal(inputs.impliedVolatility, 0.3);
+  assert.equal(inputs.delta, 0.48);
+  assert.equal(typeof inputs.selectionScore, "number");
 });
 
 test("historical option evidence remains available only at matching historical as-of rows", async () => {
@@ -569,9 +660,15 @@ test("an unselected contract material change invalidates the feature fingerprint
   });
   const baseline = await build(0.2);
   const changed = await build(0.35);
+  const baselineContracts = baseline.features.at(-1)!.features
+    .optionContractFeatures as Array<Record<string, unknown>>;
+  const changedContracts = changed.features.at(-1)!.features
+    .optionContractFeatures as Array<Record<string, unknown>>;
   assert.notEqual(
-    baseline.features.at(-1)!.features.ivPercentile,
-    changed.features.at(-1)!.features.ivPercentile
+    baselineContracts.find((row) => row.optionSymbol === unselectedSymbol)
+      ?.selectionScore,
+    changedContracts.find((row) => row.optionSymbol === unselectedSymbol)
+      ?.selectionScore
   );
   assert.notEqual(
     baseline.features.at(-1)!.sourceFingerprint,
