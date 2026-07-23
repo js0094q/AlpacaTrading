@@ -41,9 +41,66 @@ const loadLatestOptionContracts = async (limit: number) => {
   const dashboard = await import(
     pathToFileURL(`${process.cwd()}/apps/dashboard/lib/data.ts`).href
   ) as unknown as {
-    latestOptionContracts: (limit: number) => Promise<DashboardOptionRow[]>;
+    normalizeDashboardBridgeSummary: (summary: {
+      optionContracts: Array<Record<string, unknown>>;
+    }) => {
+      optionContracts?: unknown;
+    };
   };
-  return dashboard.latestOptionContracts(limit);
+  const rows = getDb().prepare(
+    `
+    SELECT
+      c.underlying_symbol,
+      c.option_symbol,
+      c.type,
+      c.expiration_date,
+      c.strike,
+      c.multiplier,
+      c.tradable,
+      s.bid,
+      s.ask,
+      s.midpoint,
+      s.last,
+      s.quote_status,
+      s.executable,
+      s.executable_price,
+      s.executable_price_source,
+      s.rejection_reason,
+      s.quote_timestamp,
+      s.quote_age_ms,
+      s.snapshot_timestamp,
+      s.source,
+      s.source_feed,
+      s.normalization_path,
+      s.days_to_expiration,
+      s.volume,
+      s.open_interest,
+      s.implied_volatility,
+      s.delta,
+      s.gamma,
+      s.theta,
+      s.vega,
+      s.rho,
+      s.spread_percentage,
+      s.timestamp
+    FROM option_contracts c
+    LEFT JOIN option_snapshots s
+      ON s.option_symbol = c.option_symbol
+      AND s.timestamp = (
+        SELECT MAX(timestamp)
+        FROM option_snapshots
+        WHERE option_symbol = c.option_symbol
+      )
+    ORDER BY COALESCE(s.timestamp, c.expiration_date) DESC
+    LIMIT ?
+    `
+  ).all(limit) as Array<Record<string, unknown>>;
+  const normalized = dashboard.normalizeDashboardBridgeSummary({
+    optionContracts: rows
+  });
+  return Array.isArray(normalized.optionContracts)
+    ? normalized.optionContracts as DashboardOptionRow[]
+    : [];
 };
 
 describe("option decision evidence", () => {

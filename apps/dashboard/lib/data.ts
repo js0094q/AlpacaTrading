@@ -586,6 +586,7 @@ const normalizeBridgeOptionContractRow = (value: unknown): OptionContractDashboa
     type: textOrNull(row.type ?? row.optionType) ?? "-",
     expiration_date: textOrNull(row.expiration_date ?? row.expirationDate) ?? "-",
     strike: numberOrNull(row.strike),
+    multiplier: numberOrNull(row.multiplier),
     tradable: booleanFlag(row.tradable) ? 1 : 0,
     bid: numberOrNull(row.bid),
     ask: numberOrNull(row.ask),
@@ -597,106 +598,31 @@ const normalizeBridgeOptionContractRow = (value: unknown): OptionContractDashboa
     executable_price_source: textOrNull(row.executable_price_source ?? row.executablePriceSource),
     rejection_reason: textOrNull(row.rejection_reason ?? row.rejectionReason),
     quote_timestamp: textOrNull(row.quote_timestamp ?? row.quoteTimestamp),
+    quote_age_ms: numberOrNull(row.quote_age_ms ?? row.quoteAgeMs),
+    snapshot_timestamp: textOrNull(row.snapshot_timestamp ?? row.snapshotTimestamp),
+    source: textOrNull(row.source),
+    source_feed: textOrNull(row.source_feed ?? row.sourceFeed),
+    normalization_path: textOrNull(row.normalization_path ?? row.normalizationPath),
+    days_to_expiration: numberOrNull(row.days_to_expiration ?? row.daysToExpiration),
+    volume: numberOrNull(row.volume),
+    open_interest: numberOrNull(row.open_interest ?? row.openInterest),
+    implied_volatility: numberOrNull(row.implied_volatility ?? row.impliedVolatility),
+    delta: numberOrNull(row.delta),
+    gamma: numberOrNull(row.gamma),
+    theta: numberOrNull(row.theta),
+    vega: numberOrNull(row.vega),
+    rho: numberOrNull(row.rho),
+    spread_percentage: numberOrNull(row.spread_percentage ?? row.spreadPercentage),
     timestamp: textOrNull(row.timestamp ?? row.observed_at ?? row.observedAt)
   });
 };
 
 export const latestOptionContracts = async (limit = 10) =>
-  shouldUseVercelReadOnlyFallback()
-    ? []
-    : isPaperDashboardBridgeEnabled()
-      ? getPaperBridgeSummary().then((summary) => clampRows(summary.optionContracts, limit))
-    : queryAllRows<{
-        underlying_symbol: string;
-        option_symbol: string;
-        type: string;
-        expiration_date: string;
-        strike: number | null;
-        multiplier: number | null;
-        tradable: number;
-        bid: number | null;
-        ask: number | null;
-        midpoint: number | null;
-        last: number | null;
-        quote_status: string | null;
-        executable: number | null;
-        executable_price: number | null;
-        executable_price_source: string | null;
-        rejection_reason: string | null;
-        quote_timestamp: string | null;
-        quote_age_ms: number | null;
-        snapshot_timestamp: string | null;
-        source: string | null;
-        source_feed: string | null;
-        normalization_path: string | null;
-        days_to_expiration: number | null;
-        volume: number | null;
-        open_interest: number | null;
-        implied_volatility: number | null;
-        delta: number | null;
-        gamma: number | null;
-        theta: number | null;
-        vega: number | null;
-        rho: number | null;
-        spread_percentage: number | null;
-        timestamp: string | null;
-      }>(
-        `
-        SELECT
-          c.underlying_symbol,
-          c.option_symbol,
-          c.type,
-          c.expiration_date,
-          c.strike,
-          c.multiplier,
-          c.tradable,
-          s.bid,
-          s.ask,
-          s.midpoint,
-          s.last,
-          s.quote_status,
-          s.executable,
-          s.executable_price,
-          s.executable_price_source,
-          s.rejection_reason,
-          s.quote_timestamp,
-          s.quote_age_ms,
-          s.snapshot_timestamp,
-          s.source,
-          s.source_feed,
-          s.normalization_path,
-          s.days_to_expiration,
-          s.volume,
-          s.open_interest,
-          s.implied_volatility,
-          s.delta,
-          s.gamma,
-          s.theta,
-          s.vega,
-          s.rho,
-          s.spread_percentage,
-          s.timestamp
-        FROM option_contracts c
-        LEFT JOIN option_snapshots s
-          ON s.option_symbol = c.option_symbol
-          AND s.timestamp = (
-            SELECT MAX(timestamp)
-            FROM option_snapshots
-            WHERE option_symbol = c.option_symbol
-          )
-        ORDER BY COALESCE(s.timestamp, c.expiration_date) DESC
-        LIMIT ?
-        `,
-        [safeLimit(limit, 10, 50)]
-      ).then((rows) => rows.map(normalizeOptionContractDashboardRow));
-
   isPaperDashboardBridgeEnabled()
     ? getPaperBridgeSummary().then((summary) =>
         clampRows(summary.optionContracts, limit).map(normalizeBridgeOptionContractRow)
       )
     : [];
-
-main
 
 export const latestOpenOrders = async (limit = 12) =>
   isPaperDashboardBridgeEnabled()
@@ -970,86 +896,6 @@ export const latestHedgeLearningStatus = async () => {
 };
 
 export const buildCachedDashboardSnapshot = async (): Promise<DashboardSnapshot> => {
-  const state = assertPaperDashboardAccess();
-
-  const [account, positions, openOrders, latestResearch, latestPlans, executions, snapshots, requestIds, optionContracts] =
-    await Promise.all([
-      captureWithTimeout("account", () => getAlpacaAccountSnapshot()),
-      captureWithTimeout("positions", () => listAlpacaPositions()),
-      captureWithTimeout("openOrders", () => listAlpacaOpenOrders()),
-      rowsOrEmpty(() => latestResearchRuns(5)),
-      rowsOrEmpty(() => latestPaperPlans(10)),
-      captureWithTimeout("executions", () => latestPaperExecutions(25)),
-      rowsOrEmpty(() => latestPaperRecommendationSnapshots(10)),
-      rowsOrEmpty(() => latestApiRequestIds(12)),
-      rowsOrEmpty(() => latestOptionContracts(10))
-    ]);
-
-  const [reviewDryRun, learningSummary, promotionReadiness, hedge] = await Promise.all([
-    captureWithTimeout("review", () => cachedReviewAndDryRun(), 3_000),
-    captureWithTimeout("learningSummary", async () => {
-      const { paperLearningSummary } = await import(
-        "../../../src/services/paperLearningLedgerService"
-      );
-      return paperLearningSummary();
-    }, 3_000),
-    Promise.resolve()
-      .then(async () => {
-        const service = await import("../../../src/services/paperLearningLedgerService");
-        return service.buildPromotionReadinessAnalytics();
-      })
-      .catch(() => []),
-    captureWithTimeout(
-      "hedge",
-      () => latestHedgeDashboardRecommendation(),
-      3_000
-    )
-  ]);
-
-  const review =
-    reviewDryRun.ok
-      ? reviewDryRun.data.review
-      : {
-          ok: false as const,
-          label: "review",
-          error: reviewDryRun.error
-        };
-  const dryRun =
-    reviewDryRun.ok
-      ? reviewDryRun.data.dryRun
-      : {
-          ok: false as const,
-          label: "dryRun",
-          error: reviewDryRun.error
-        };
-
-  return {
-    paperOnly: true,
-    environment: state.alpacaEnv,
-    liveTradingEnabled: state.liveTradingEnabled,
-    generatedAt: new Date().toISOString(),
-    mode: "vps-cached-summary",
-    historicalDataAvailable: true,
-    durableStorageConfigured: false,
-    historicalWarning: null,
-    durableStorageWarning: null,
-    account,
-    positions,
-    runtime: cachedSummaryUnavailable("runtime"),
-    plan: cachedPlanResult(latestPlans),
-    review,
-    dryRun,
-    openOrders,
-    latestResearch,
-    latestPaperPlans: latestPlans,
-    snapshots,
-    executions,
-    learningSummary,
-    promotionReadiness: Array.isArray(promotionReadiness) ? promotionReadiness : [],
-    optionContracts,
-    requestIds,
-    hedge
-  } as DashboardSnapshot;
   throw new Error("DASHBOARD_POSTGRES_BRIDGE_REQUIRED");
 };
 
