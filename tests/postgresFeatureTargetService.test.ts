@@ -276,6 +276,24 @@ test("option feature evidence uses persisted quote timestamps and liquidity with
   assert.equal(latest.marketEvidenceTimestamp, "2026-06-29T19:59:59.000Z");
 });
 
+test("missing option evidence and underlying price fail closed without nested access errors", async () => {
+  const result = await buildOptionFeaturesFixture({
+    contracts: [optionContractFixture("SPY260829C00560000", 560)],
+    snapshots: [optionSnapshotFixture("SPY260829C00560000", {
+      underlyingPrice: undefined,
+      evidence: undefined as never
+    })]
+  });
+
+  const feature = result.features.at(-1)!.features;
+  assert.equal(feature.optionUnderlyingPrice, null);
+  assert.equal(feature.optionContractEligible, false);
+  assert.match(
+    JSON.stringify(feature.optionContractRejectionReasons),
+    /underlying_price_missing/
+  );
+});
+
 test("feature source fingerprints bind the underlying market values", async () => {
   const build = (sourceBars: PostgresMarketBar[]) => buildPostgresFeaturesAndTargets({
     bars: sourceBars,

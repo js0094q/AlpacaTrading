@@ -215,9 +215,9 @@ const deriveOptionContractFeature = (input: {
   const quoteFreshnessStatus = snapshot?.freshnessStatus === "stale"
     ? "stale"
     : calculatedFreshness;
-  const requestedFeed = snapshot?.requestedFeed ?? snapshot?.evidence.requestedFeed ?? null;
-  const effectiveFeed = snapshot?.effectiveFeed ?? snapshot?.evidence.effectiveFeed ?? null;
-  const validationBasis = snapshot?.evidence.validationBasis;
+  const requestedFeed = snapshot?.requestedFeed ?? snapshot?.evidence?.requestedFeed ?? null;
+  const effectiveFeed = snapshot?.effectiveFeed ?? snapshot?.evidence?.effectiveFeed ?? null;
+  const validationBasis = snapshot?.evidence?.validationBasis;
   const feedValidationBasis = validationBasis === "request_feed_opra"
     ? validationBasis
     : effectiveFeed === "opra"
@@ -225,7 +225,10 @@ const deriveOptionContractFeature = (input: {
       : null;
   const feedValidated = requestedFeed === "opra" &&
     feedValidationBasis !== null;
-  const underlyingPrice = snapshot?.underlyingPrice ?? null;
+  const underlyingPrice =
+    typeof snapshot?.underlyingPrice === "number" && Number.isFinite(snapshot.underlyingPrice)
+      ? snapshot.underlyingPrice
+      : null;
   const entryPrice = snapshot?.midpoint ?? snapshot?.ask ?? snapshot?.last ?? null;
   const moneyness = underlyingPrice !== null && underlyingPrice > 0
     ? contract.type === "call"

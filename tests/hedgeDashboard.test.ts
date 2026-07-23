@@ -252,6 +252,18 @@ test("dashboard labels expired hedge recommendations as not current", () => {
   assert.doesNotMatch(html, /Current recommendation/);
 });
 
+test("dashboard does not crash when a bridge recommendation omits effective status", () => {
+  const recommendation = {
+    ...dashboardRecommendation("blocked"),
+    effectiveStatus: undefined
+  } as unknown as HedgeDashboardRecommendation;
+
+  const html = renderToStaticMarkup(createElement(HedgePanel, { recommendation }));
+
+  assert.match(html, /UNKNOWN/);
+  assert.match(html, /This recommendation is not current/);
+});
+
 test("dashboard renders current risk, regime, LEAPS, sizing, and blocker details", () => {
   const html = renderToStaticMarkup(
     createElement(HedgePanel, { recommendation: dashboardRecommendation("current") })
