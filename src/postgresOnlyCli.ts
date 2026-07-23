@@ -341,10 +341,15 @@ const run = async (scheduledContext?: PostgresScheduledCommandOperationContext) 
 
   if (command && AUTONOMOUS_REVIEW_COMMANDS.has(command)) {
     const context = requireScheduledContext(scheduledContext);
+    const maxCandidates = Math.max(
+      1,
+      Math.min(25, Number.parseInt(String(args.maxCandidates || "25"), 10) || 25)
+    );
     const result = await runPostgresReviewWorkflow({
       command,
       query: queryAdapter(context.pool),
       fence: context.fence,
+      maxCandidates,
       ...(command === "paper:options:discover"
         ? {
             underlying: String(args.underlying || ""),

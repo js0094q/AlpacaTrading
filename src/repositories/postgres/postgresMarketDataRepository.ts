@@ -101,6 +101,30 @@ export type PostgresOptionSnapshot = {
   evidence: Readonly<Record<string, unknown>>;
 };
 
+export type PostgresMarketDataIngestionRun = {
+  cycleId: string | null;
+  workstream: string;
+  symbol: string;
+  provider: string;
+  endpoint: string | null;
+  requestedFeed: string | null;
+  effectiveFeed: string | null;
+  requestStartedAt: string;
+  requestCompletedAt: string;
+  pagesRetrieved: number;
+  rowsReceived: number;
+  newestProviderTimestamp: string | null;
+  oldestProviderTimestamp: string | null;
+  newestProviderAgeSeconds: number | null;
+  acceptedRows: number;
+  staleRows: number;
+  rejectedRows: number;
+  freshnessThresholdSeconds: number;
+  rejectionReason: string | null;
+  persistenceResult: string;
+  requestIds: readonly string[];
+};
+
 export type PostgresFeatureSnapshot = {
   symbol: string;
   observedAt: string;
@@ -263,6 +287,86 @@ const dedupeStable = <T>(rows: readonly T[], keyOf: (row: T) => string) => {
 };
 
 export class PostgresMarketDataRepository {
+  async recordMarketDataIngestionRun(
+    run: PostgresMarketDataIngestionRun,
+    context: FencedPostgresRepositoryContext
+  ) {
+    await requireFence(context);
+    const id = `ingestion_${stableRecordId(
+      "market_data_ingestion",
+      `${run.cycleId ?? context.schedulerFence.runId}:${run.workstream}:${run.symbol}:${run.requestStartedAt}`
+    )}`;
+    const completed = run.persistenceResult === "persisted";
+    const result = await context.transaction.query(
+      `INSERT INTO market_data_ingestion_runs(
+         id, ingestion_type, status, source, requested_feed, effective_feed,
+         requested_symbols, request_ids, records_received, records_persisted,
+         error_code, error_message, scheduler_job_name, scheduler_fencing_token,
+         started_at, completed_at, cycle_id, workstream, symbol,
+         provider_endpoint, pages_retrieved, newest_provider_timestamp,
+         oldest_provider_timestamp, newest_provider_age_seconds,
+         records_accepted, records_stale, records_rejected,
+         freshness_threshold_seconds, rejection_reason, persistence_result,
+         created_at, updated_at
+       ) SELECT $1, 'option_snapshots', $2, $3, $4, $5, $6::jsonb, $7::jsonb,
+                $8, $9, $10, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+                $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $14, $14
+         WHERE ${fencePredicate(29)}
+       ON CONFLICT (id) DO UPDATE SET
+         status = EXCLUDED.status,
+         effective_feed = EXCLUDED.effective_feed,
+         request_ids = EXCLUDED.request_ids,
+         records_received = EXCLUDED.records_received,
+         records_persisted = EXCLUDED.records_persisted,
+         error_code = EXCLUDED.error_code,
+         error_message = EXCLUDED.error_message,
+         completed_at = EXCLUDED.completed_at,
+         pages_retrieved = EXCLUDED.pages_retrieved,
+         newest_provider_timestamp = EXCLUDED.newest_provider_timestamp,
+         oldest_provider_timestamp = EXCLUDED.oldest_provider_timestamp,
+         newest_provider_age_seconds = EXCLUDED.newest_provider_age_seconds,
+         records_accepted = EXCLUDED.records_accepted,
+         records_stale = EXCLUDED.records_stale,
+         records_rejected = EXCLUDED.records_rejected,
+         rejection_reason = EXCLUDED.rejection_reason,
+         persistence_result = EXCLUDED.persistence_result,
+         updated_at = EXCLUDED.updated_at`,
+      [
+        id,
+        completed ? "completed" : "failed",
+        run.provider,
+        run.requestedFeed,
+        run.effectiveFeed,
+        JSON.stringify([run.symbol]),
+        JSON.stringify(run.requestIds),
+        run.rowsReceived,
+        completed ? run.acceptedRows : 0,
+        run.rejectionReason?.split(":", 1)[0] ?? null,
+        context.schedulerFence.jobName,
+        context.schedulerFence.fencingToken,
+        run.requestStartedAt,
+        run.requestCompletedAt,
+        run.cycleId,
+        run.workstream,
+        run.symbol,
+        run.endpoint,
+        run.pagesRetrieved,
+        run.newestProviderTimestamp,
+        run.oldestProviderTimestamp,
+        run.newestProviderAgeSeconds,
+        run.acceptedRows,
+        run.staleRows,
+        run.rejectedRows,
+        run.freshnessThresholdSeconds,
+        run.rejectionReason,
+        run.persistenceResult,
+        ...fenceValues(context.schedulerFence)
+      ]
+    );
+    assertWritten(result.rowCount);
+    return { stored: 1 };
+  }
+
   async upsertUniverseSymbols(
     rows: readonly PostgresUniverseSymbol[],
     context: FencedPostgresRepositoryContext

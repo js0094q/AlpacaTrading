@@ -6,6 +6,11 @@ import type { SchedulerFence } from "../repositories/contracts/common.js";
 import { PostgresMarketDataRepository } from "../repositories/postgres/postgresMarketDataRepository.js";
 import type { FencedPostgresRepositoryContext } from "../repositories/postgres/postgresRepositorySupport.js";
 import type { RiskProfile } from "../types.js";
+import {
+  paperExplorationProfile,
+  paperExplorationThresholds,
+  type PaperExplorationThresholds
+} from "./paperExplorationConfig.js";
 import { buildPostgresFeaturesAndTargets } from "./postgresFeatureTargetService.js";
 import { refreshPostgresMarketData } from "./postgresMarketDataService.js";
 
@@ -274,12 +279,17 @@ const persistCandidates = async (input: {
   targets: FeatureTargetResult["targets"];
   maxCandidates: number;
   now: Date;
+  explorationThresholds: PaperExplorationThresholds;
 }) => {
-  const selected = input.targets
-    .filter((target) => target.direction !== "neutral" && target.preferredExpression !== "none")
-    .flatMap((target) => {
+  const evaluated = input.targets
+    .map((target) => {
       const option = executableOption(target);
-      if (target.preferredExpression !== "shares" && !option) return [];
+      const reasons: string[] = [];
+      if (target.direction === "neutral") reasons.push("DIRECTION_THRESHOLD_NOT_MET");
+      if (target.preferredExpression === "none") reasons.push("STRATEGY_ELIGIBILITY_NOT_MET");
+      if (target.preferredExpression !== "shares" && !option) {
+        reasons.push("CURRENT_OPTION_EVIDENCE_REQUIRED");
+      }
       const optionSymbol = typeof option?.optionSymbol === "string" ? option.optionSymbol : null;
       const expirationDate = typeof option?.expirationDate === "string" ? option.expirationDate : null;
       const strategyFamily = optionSymbol
@@ -287,15 +297,35 @@ const persistCandidates = async (input: {
           ? "zero_dte_spy"
           : "standard_option"
         : "equity";
-      return [{ target, option, optionSymbol, strategyFamily, score: scoreTarget(target, input.now) }];
+      return {
+        target,
+        option,
+        optionSymbol,
+        strategyFamily,
+        score: scoreTarget(target, input.now),
+        reasons
+      };
     })
-    .sort((left, right) => right.score - left.score)
-    .slice(0, input.maxCandidates);
-  const learningModelCapability = selected.length > 0
+    .sort((left, right) => right.score - left.score);
+  const eligible = evaluated.filter((row) => row.reasons.length === 0);
+  const selectedKeys = new Set(
+    eligible.slice(0, input.maxCandidates).map((row) => row.target.sourceFingerprint)
+  );
+  const decisions = evaluated.map((row) => ({
+    ...row,
+    selected: selectedKeys.has(row.target.sourceFingerprint),
+    reasons: row.reasons.length > 0
+      ? row.reasons
+      : selectedKeys.has(row.target.sourceFingerprint)
+        ? ["RANKED_SELECTED"]
+        : ["CANDIDATE_LIMIT_EXCEEDED"]
+  }));
+  const selectedCount = decisions.filter((row) => row.selected).length;
+  const learningModelCapability = selectedCount > 0
     ? await resolvePostgresLearningModelCapability(input.query, input.now.toISOString())
     : null;
-  for (let index = 0; index < selected.length; index += 1) {
-    const { target, option, optionSymbol, strategyFamily, score } = selected[index]!;
+  for (let index = 0; index < decisions.length; index += 1) {
+    const { target, option, optionSymbol, strategyFamily, score, selected, reasons } = decisions[index]!;
     const id = `candidate_${canonicalJsonHash({ run: input.researchRunId, source: target.sourceFingerprint })}`;
     const signalInputs = {
       targetSourceFingerprint: target.sourceFingerprint,
@@ -306,6 +336,11 @@ const persistCandidates = async (input: {
       marketDecisionInputs: {
         ...(target.optionsStrategy?.decisionInputs as Record<string, unknown> | undefined),
         option: option?.decisionInputs ?? null
+      },
+      decisionGates: {
+        profile: paperExplorationProfile(input.explorationThresholds),
+        outcome: selected ? "passed" : "failed",
+        reasons
       },
       learningAdjustmentStatus: "not_applicable_no_postgres_learning_model",
       learningModelCapability
@@ -321,9 +356,9 @@ const persistCandidates = async (input: {
          data_quality_status, created_at, updated_at
        ) SELECT $1, $1, $2, $1, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
                 $13, $14, $15, $16, $17, $18, $19, $20, $21,
-                'selected', 'selected', 'RANKED_SELECTED', $22::jsonb,
-                $23::jsonb, 'CURRENT_POSTGRES_MARKET_EVIDENCE', $24, $24
-         WHERE ${fenceSql(25)}
+                $22, $23, $24, $25::jsonb,
+                $26::jsonb, 'CURRENT_POSTGRES_MARKET_EVIDENCE', $27, $27
+         WHERE ${fenceSql(28)}
        ON CONFLICT (id) DO NOTHING`,
       [
         id, input.researchRunId, target.symbol, optionSymbol ? target.symbol : null,
@@ -334,13 +369,19 @@ const persistCandidates = async (input: {
         target.takeProfit === null ? null : Math.abs(target.takeProfit - target.entryReference),
         Number(option?.liquidityScore ?? 0), target.volatilityAdjustedScore,
         typeof option?.strike === "number" ? option.strike : null,
+        selected ? "selected" : "rejected",
+        selected ? "selected" : "rejected",
+        reasons[0],
         JSON.stringify(target.rationale), JSON.stringify(signalInputs),
         input.now.toISOString(), ...fenceValues(input.fence)
       ]
     );
     if (result.rowCount !== 1 && result.rowCount !== 0) throw new Error("POSTGRES_CANDIDATE_PERSISTENCE_FAILED");
   }
-  return selected.length;
+  return {
+    selected: selectedCount,
+    rejected: decisions.length - selectedCount
+  };
 };
 
 export const runPostgresResearchWorkflow = async (input: {
@@ -351,11 +392,17 @@ export const runPostgresResearchWorkflow = async (input: {
   maxCandidates: number;
   now?: Date;
   dependencies?: Partial<ResearchDependencies>;
+  explorationThresholds?: PaperExplorationThresholds;
 }) => {
   const deps = { ...dependencies, ...input.dependencies };
   const now = input.now ?? new Date();
   const nowIso = now.toISOString();
   const runId = `research_${randomUUID()}`;
+  const explorationThresholds = input.explorationThresholds ?? paperExplorationThresholds();
+  const explorationProfile = paperExplorationProfile({
+    ...explorationThresholds,
+    maxCandidates: input.maxCandidates
+  });
   const config = {
     riskProfile: input.riskProfile,
     optionsEnabled: input.optionsEnabled,
@@ -363,7 +410,8 @@ export const runPostgresResearchWorkflow = async (input: {
     barLookbackDays: 365,
     marketDataAuthority: "postgres",
     stockFeed: "sip",
-    optionFeed: "opra"
+    optionFeed: "opra",
+    explorationProfile
   };
   await input.query.query(
     `UPDATE research_runs
@@ -420,6 +468,7 @@ export const runPostgresResearchWorkflow = async (input: {
       optionSnapshots: market.optionSnapshots,
       riskProfile: input.riskProfile,
       optionsEnabled: input.optionsEnabled,
+      decisionThresholds: explorationThresholds,
       repository,
       context
     });
@@ -427,9 +476,13 @@ export const runPostgresResearchWorkflow = async (input: {
       query: input.query, fence: input.fence, researchRunId: runId,
       market, features: generated.features, targets: generated.targets, now: nowIso
     });
-    const candidatesSelected = await persistCandidates({
+    const candidateDecisions = await persistCandidates({
       query: input.query, fence: input.fence, researchRunId: runId,
-      targets: generated.targets, maxCandidates: input.maxCandidates, now
+      targets: generated.targets, maxCandidates: input.maxCandidates, now,
+      explorationThresholds: {
+        ...explorationThresholds,
+        maxCandidates: input.maxCandidates
+      }
     });
     const completed = await input.query.query(
       `UPDATE research_runs
@@ -437,8 +490,13 @@ export const runPostgresResearchWorkflow = async (input: {
            candidates_selected = $4, summary = $5::jsonb, completed_at = $6,
            heartbeat_at = $6, updated_at = $6, version = version + 1
        WHERE id = $1 AND status = 'running' AND ${fenceSql(7)}`,
-      [runId, deps.symbols.length, generated.targets.length, candidatesSelected,
-        JSON.stringify({ ...market.summary, evidenceStored }), nowIso,
+      [runId, deps.symbols.length, generated.targets.length, candidateDecisions.selected,
+        JSON.stringify({
+          ...market.summary,
+          evidenceStored,
+          candidateDecisionCounts: candidateDecisions,
+          explorationProfile
+        }), nowIso,
         ...fenceValues(input.fence)]
     );
     if (completed.rowCount !== 1) throw new Error("POSTGRES_RESEARCH_COMPLETION_FAILED");
@@ -447,7 +505,8 @@ export const runPostgresResearchWorkflow = async (input: {
       runId,
       universeSize: deps.symbols.length,
       targetsGenerated: generated.targets.length,
-      candidatesSelected,
+      candidatesSelected: candidateDecisions.selected,
+      candidatesRejected: candidateDecisions.rejected,
       evidenceStored,
       market: market.summary
     };

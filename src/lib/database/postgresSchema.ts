@@ -41,6 +41,7 @@ export const POSTGRES_OPERATIONAL_INDEXES = [
   "account_snapshots_account_observed_idx",
   "account_snapshots_request_idx",
   "market_data_ingestion_runs_status_started_idx",
+  "market_data_ingestion_runs_cycle_symbol_idx",
   "universe_symbols_enabled_idx",
   "market_bars_symbol_time_idx",
   "stock_snapshots_symbol_observed_idx",
@@ -121,7 +122,21 @@ export const POSTGRES_RELEASE_3_COLUMNS = [
   "option_contracts.open_interest_date",
   "option_contracts.close_price",
   "option_contracts.close_price_date",
-  "option_contracts.evidence"
+  "option_contracts.evidence",
+  "market_data_ingestion_runs.cycle_id",
+  "market_data_ingestion_runs.workstream",
+  "market_data_ingestion_runs.symbol",
+  "market_data_ingestion_runs.provider_endpoint",
+  "market_data_ingestion_runs.pages_retrieved",
+  "market_data_ingestion_runs.newest_provider_timestamp",
+  "market_data_ingestion_runs.oldest_provider_timestamp",
+  "market_data_ingestion_runs.newest_provider_age_seconds",
+  "market_data_ingestion_runs.records_accepted",
+  "market_data_ingestion_runs.records_stale",
+  "market_data_ingestion_runs.records_rejected",
+  "market_data_ingestion_runs.freshness_threshold_seconds",
+  "market_data_ingestion_runs.rejection_reason",
+  "market_data_ingestion_runs.persistence_result"
 ] as const;
 
 export const POSTGRES_RELEASE_3_CONSTRAINTS = [

@@ -24,6 +24,28 @@ Repeated entry-review workstreams skip a candidate and account-snapshot identity
 that already has a persisted entry review, preserving the database client-order
 uniqueness contract across continuously refreshed market evidence.
 
+## Paper exploration profile (2026-07-23)
+
+The autonomous PostgreSQL path uses a reversible paper-only exploration profile.
+Its explicit systemd environment values broaden genuine-data candidate
+admission and cap each new paper order at `$250`. Every research run persists
+the baseline and effective gate values in `research_runs.config`; every
+candidate persists its pass/fail reason and decision inputs; review, sizing,
+execution, and execution-defer reasons advance `candidates.lifecycle_status`
+and `candidates.decision_reason`.
+
+The profile does not change the 1,200-second OPRA freshness limit, the
+regular-session stock-evidence gate, the 50-bar indicator requirement, required
+option fields, paper/live enforcement, PostgreSQL authority, reconciliation,
+duplicate prevention, reservations, or aggregate exposure limits. If OPRA
+snapshots are stale or unavailable, they are not persisted as current evidence.
+The ingestion attempt is written to `market_data_ingestion_runs`, option data
+is marked degraded, and current SIP-backed equity research continues.
+
+Migration `005_market_data_ingestion_observability.sql` adds cycle, workstream,
+symbol, endpoint, pagination, provider-time range, freshness counts, rejection,
+and persistence-result fields for that audit trail.
+
 Execution-state projection refreshes `/v2/positions` directly at the PostgreSQL
 projection boundary. A successful empty array is authoritative; a failed or
 malformed position response fails closed, and no-intent state capture still
@@ -32,7 +54,9 @@ refreshes current account and position evidence.
 Migration `003_market_data_authority.sql` adds PostgreSQL authority for the
 worker's universe symbols, market bars, SIP stock snapshots, OPRA option
 contracts and snapshots, feature and target snapshots, strategy snapshots, and
-research evidence. Research rejects missing, future, or stale market evidence.
+research evidence. Research rejects missing, future, or stale decision evidence;
+stale option evidence is withheld from option paths while independently current
+equity evidence may proceed.
 Reviews create signed, unconfirmed PostgreSQL intents; they do not manufacture
 confirmation or bypass the existing paper execution gates. Reconciliation
 keeps unresolved ambiguous submissions available for a later broker lookup.

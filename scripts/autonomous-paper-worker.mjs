@@ -11,10 +11,17 @@ const MAX_WORKSTREAM_TIMEOUT_MS = 6 * 60 * 60 * 1000;
 const STATE_PERSIST_TIMEOUT_MS = 60_000;
 const FORCE_KILL_DELAY_MS = 5_000;
 const EXPECTED_DEFERRED_REASON_PATTERN = /\b(POSTGRES_OPTION_SNAPSHOTS_CURRENT_MISSING|POSTGRES_DECISION_MARKET_SESSION_INELIGIBLE|NO_ELIGIBLE_POSTGRES_CANDIDATES|NO_READY_POSTGRES_ORDER_INTENTS)\b/;
+const configuredMaxCandidates = Number(process.env.PAPER_EXPLORATION_MAX_CANDIDATES ?? 25);
+const PAPER_EXPLORATION_MAX_CANDIDATES =
+  Number.isSafeInteger(configuredMaxCandidates) &&
+  configuredMaxCandidates >= 1 &&
+  configuredMaxCandidates <= 25
+    ? configuredMaxCandidates
+    : 25;
 
 const WORKSTREAMS = [
-  ["research:daily", ["--riskProfile=aggressive", "--optionsEnabled=true", "--maxCandidates=10", "--assetClass=all", "--format=json"]],
-  ["paper:review", ["--riskProfile=aggressive", "--optionsEnabled=true", "--maxCandidates=10", "--format=json"]],
+  ["research:daily", ["--riskProfile=aggressive", "--optionsEnabled=true", `--maxCandidates=${PAPER_EXPLORATION_MAX_CANDIDATES}`, "--assetClass=all", "--format=json"]],
+  ["paper:review", ["--riskProfile=aggressive", "--optionsEnabled=true", `--maxCandidates=${PAPER_EXPLORATION_MAX_CANDIDATES}`, "--format=json"]],
   ["paper:portfolio:review", ["--format=json"]],
   ["paper:options:discover", ["--underlying=SPY", "--dte=0", "--format=json"]],
   ["paper:ops:review", ["--format=json"]],
@@ -182,7 +189,7 @@ for (const signal of ["SIGTERM", "SIGINT"]) {
   });
 }
 
-const runNpmCommand = (script, args, timeoutMs, purpose) =>
+const runNpmCommand = (script, args, timeoutMs, purpose, environment = {}) =>
   new Promise((resolve) => {
     const startedAt = Date.now();
     let stdout = "";
@@ -192,7 +199,7 @@ const runNpmCommand = (script, args, timeoutMs, purpose) =>
     let settled = false;
     let forceKillTimer = null;
     const child = spawn("npm", ["run", script, "--", ...args], {
-      env: process.env,
+      env: { ...process.env, ...environment },
       stdio: ["ignore", "pipe", "pipe"]
     });
     activeChild = child;
@@ -274,8 +281,11 @@ const classify = ({ exitCode, output, spawnError, timedOut }) => {
   return { classification: "failed", code: "WORKSTREAM_COMMAND_FAILED" };
 };
 
-const runWorkstream = async (script, args, timeoutMs) => {
-  const raw = await runNpmCommand(script, args, timeoutMs, "workstream");
+const runWorkstream = async (script, args, timeoutMs, cycleId) => {
+  const raw = await runNpmCommand(script, args, timeoutMs, "workstream", {
+    AUTONOMOUS_CYCLE_ID: cycleId,
+    AUTONOMOUS_WORKSTREAM: script
+  });
   const result = classify(raw);
   return {
     ...result,
@@ -371,7 +381,7 @@ const main = async () => {
         log({ event: "worker_stopped", cycle, cycleId, reason: "signal" });
         return;
       }
-      const result = await runWorkstream(script, args, workstreamTimeoutMs);
+      const result = await runWorkstream(script, args, workstreamTimeoutMs, cycleId);
 
       if (stopRequested) {
         await persistState(cycleId, "worker_stopped", statePayload(cycle, {

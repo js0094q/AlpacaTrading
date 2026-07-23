@@ -139,7 +139,9 @@ test("refresh persists genuine SIP and OPRA evidence in PostgreSQL", async () =>
     optionChainPageCount: 1,
     optionContractsByUnderlying: { SPY: 1 },
     optionSnapshotsByUnderlying: { SPY: 1 },
-    freshOptionSnapshotsByUnderlying: { SPY: 1 }
+    freshOptionSnapshotsByUnderlying: { SPY: 1 },
+    optionDataStatus: "current",
+    optionDataRejectionReasons: []
   });
   assert.equal(calls.upsertBars?.[0]?.[0] && (calls.upsertBars[0][0] as { requestId: string }).requestId, "request-bars");
   assert.equal((calls.upsertStockSnapshots?.[0]?.[0] as { effectiveFeed: string }).effectiveFeed, "sip");
@@ -303,8 +305,9 @@ test("stock freshness uses provider retrieval time instead of the cycle start ti
   assert.equal(stored.length, 1);
 });
 
-test("refresh persists stale option evidence as stale so downstream eligibility fails closed", async () => {
+test("refresh rejects stale option evidence, persists ingestion telemetry, and returns equity-only data", async () => {
   const calls: Record<string, unknown[][]> = {};
+  const ingestionRuns: Array<Record<string, unknown>> = [];
   const writer = Object.fromEntries([
     "upsertUniverseSymbols",
     "upsertBars",
@@ -317,6 +320,10 @@ test("refresh persists stale option evidence as stale so downstream eligibility 
   }]));
   const repository = {
     ...writer,
+    recordMarketDataIngestionRun: async (run: Record<string, unknown>) => {
+      ingestionRuns.push(run);
+      return { stored: 1 };
+    },
     listOptionContractsBySymbols: async () => calls.upsertOptionContracts?.[0] ?? [],
     listOptionSnapshotsByIdentity: async () => withEvidenceFingerprints(calls.upsertOptionSnapshots?.[0] ?? [])
   } as never;
@@ -327,7 +334,6 @@ test("refresh persists stale option evidence as stale so downstream eligibility 
       start: "2026-01-01T00:00:00.000Z",
       end: "2026-07-20T23:59:59.999Z",
       optionsEnabled: true,
-      requiredOptionUnderlyings: [],
       now: new Date("2026-07-20T20:05:00.000Z"),
       repository,
       context,
@@ -377,11 +383,132 @@ test("refresh persists stale option evidence as stale so downstream eligibility 
       }
     });
 
-  assert.equal(result.optionSnapshots[0]?.freshnessStatus, "stale");
-  assert.equal(
-    (result.optionSnapshots[0]?.evidence as Record<string, unknown>).freshnessStatus,
-    "stale"
-  );
+  assert.equal(result.bars.length, 1);
+  assert.equal(result.stockSnapshots.length, 1);
+  assert.equal(result.optionSnapshots.length, 0);
+  assert.equal(calls.upsertOptionSnapshots, undefined);
+  assert.equal(result.summary.optionDataStatus, "degraded");
+  assert.deepEqual(result.summary.optionDataRejectionReasons, [
+    "POSTGRES_OPTION_SNAPSHOTS_CURRENT_MISSING:SPY"
+  ]);
+  assert.equal(ingestionRuns.length, 1);
+  assert.deepEqual(ingestionRuns[0], {
+    cycleId: null,
+    workstream: "research",
+    symbol: "SPY",
+    provider: "alpaca",
+    endpoint: "/v1beta1/options/snapshots/SPY?feed=opra&limit=1000",
+    requestedFeed: "opra",
+    effectiveFeed: "opra",
+    requestStartedAt: "2026-07-20T20:05:00.000Z",
+    requestCompletedAt: "2026-07-20T20:05:00.000Z",
+    pagesRetrieved: 1,
+    rowsReceived: 1,
+    newestProviderTimestamp: "2026-07-10T20:00:02.000Z",
+    oldestProviderTimestamp: "2026-07-10T20:00:02.000Z",
+    newestProviderAgeSeconds: 864_298,
+    acceptedRows: 0,
+    staleRows: 1,
+    rejectedRows: 1,
+    freshnessThresholdSeconds: 1_200,
+    rejectionReason: "POSTGRES_OPTION_SNAPSHOTS_CURRENT_MISSING:SPY",
+    persistenceResult: "not_persisted_stale",
+    requestIds: ["request-options"]
+  });
+});
+
+test("an unavailable OPRA endpoint records the failure and does not block current equity research", async () => {
+  const ingestionRuns: Array<Record<string, unknown>> = [];
+  const result = await refreshPostgresMarketData({
+    symbols: ["SPY"],
+    timeframe: "1Day",
+    start: "2026-01-01T00:00:00.000Z",
+    end: "2026-07-20T23:59:59.999Z",
+    optionsEnabled: true,
+    now: new Date("2026-07-20T20:05:00.000Z"),
+    repository: {
+      upsertUniverseSymbols: async (rows: unknown[]) => ({ stored: rows.length }),
+      upsertBars: async (rows: unknown[]) => ({ stored: rows.length }),
+      upsertStockSnapshots: async (rows: unknown[]) => ({ stored: rows.length }),
+      upsertOptionContracts: async (rows: unknown[]) => ({ stored: rows.length }),
+      upsertOptionSnapshots: async (rows: unknown[]) => ({ stored: rows.length }),
+      listOptionContractsBySymbols: async () => [],
+      listOptionSnapshotsByIdentity: async () => [],
+      recordMarketDataIngestionRun: async (run: Record<string, unknown>) => {
+        ingestionRuns.push(run);
+        return { stored: 1 };
+      }
+    } as never,
+    context,
+    dependencies: {
+      fetchAllBars: async () => [{
+        symbol: "SPY",
+        bar: {
+          t: "2026-07-20T20:00:00.000Z",
+          o: 620,
+          h: 625,
+          l: 618,
+          c: 624,
+          v: 1_000_000
+        },
+        requestIds: ["request-bars"]
+      }],
+      fetchStockSnapshots: async () => [{
+        symbol: "SPY",
+        raw: stockRaw,
+        requestedFeed: "sip",
+        effectiveFeed: "sip",
+        currency: "USD",
+        requestId: "request-stocks"
+      }],
+      fetchOptionContracts: async () => [{
+        symbol: "SPY260720C00625000",
+        underlying_symbol: "SPY",
+        type: "call",
+        expiration_date: "2026-07-20",
+        strike_price: "625",
+        multiplier: "100",
+        status: "active",
+        tradable: true
+      }],
+      fetchOptionSnapshots: async () => [],
+      fetchOptionChainSnapshots: async () => {
+        throw new Error("ALPACA_API_UNAVAILABLE");
+      }
+    }
+  });
+
+  assert.equal(result.bars.length, 1);
+  assert.equal(result.stockSnapshots.length, 1);
+  assert.equal(result.optionSnapshots.length, 0);
+  assert.equal(result.summary.optionDataStatus, "degraded");
+  assert.deepEqual(result.summary.optionDataRejectionReasons, [
+    "POSTGRES_OPTION_PROVIDER_UNAVAILABLE:SPY:ALPACA_API_UNAVAILABLE"
+  ]);
+  assert.equal(ingestionRuns.length, 1);
+  assert.deepEqual(ingestionRuns[0], {
+    cycleId: null,
+    workstream: "research",
+    symbol: "SPY",
+    provider: "alpaca",
+    endpoint: "/v1beta1/options/snapshots/SPY",
+    requestedFeed: "opra",
+    effectiveFeed: null,
+    requestStartedAt: "2026-07-20T20:05:00.000Z",
+    requestCompletedAt: "2026-07-20T20:05:00.000Z",
+    pagesRetrieved: 0,
+    rowsReceived: 0,
+    newestProviderTimestamp: null,
+    oldestProviderTimestamp: null,
+    newestProviderAgeSeconds: null,
+    acceptedRows: 0,
+    staleRows: 0,
+    rejectedRows: 0,
+    freshnessThresholdSeconds: 1_200,
+    rejectionReason: "POSTGRES_OPTION_PROVIDER_UNAVAILABLE:SPY:ALPACA_API_UNAVAILABLE",
+    persistenceResult: "not_persisted_provider_unavailable",
+    requestIds: []
+  });
 });
 
 test("refresh ingests complete OPRA chains per underlying and persists documented fields without synthetic defaults", async () => {
@@ -723,8 +850,8 @@ test("refresh fails closed when a required underlying has no active contracts", 
   }), /POSTGRES_OPTION_CONTRACTS_MISSING:SPY/);
 });
 
-test("refresh fails closed when a required underlying has no fresh OPRA snapshot", async () => {
-  await assert.rejects(refreshPostgresMarketData({
+test("required underlying without fresh OPRA snapshots degrades only option-dependent paths", async () => {
+  const result = await refreshPostgresMarketData({
     symbols: ["SPY"],
     timeframe: "1Day",
     start: "2026-01-01T00:00:00.000Z",
@@ -775,5 +902,10 @@ test("refresh fails closed when a required underlying has no fresh OPRA snapshot
         }]
       })
     } as never
-  }), /POSTGRES_OPTION_SNAPSHOTS_CURRENT_MISSING:SPY/);
+  });
+  assert.equal(result.optionSnapshots.length, 0);
+  assert.equal(result.summary.optionDataStatus, "degraded");
+  assert.deepEqual(result.summary.optionDataRejectionReasons, [
+    "POSTGRES_OPTION_SNAPSHOTS_CURRENT_MISSING:SPY"
+  ]);
 });

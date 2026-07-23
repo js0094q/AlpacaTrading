@@ -9,6 +9,7 @@ import {
 
 const intent = (overrides: Partial<AutonomousExecutionIntentRow> = {}): AutonomousExecutionIntentRow => ({
   order_intent_id: "intent-1",
+  candidate_id: "candidate-1",
   account_id: "account-1",
   broker_account_id: "broker-account-1",
   account_snapshot_fingerprint: "portfolio-fingerprint",
@@ -250,11 +251,13 @@ test("a closed paper market blocks a ready intent without account sync or submis
 
 test("an uncertain broker submission is persisted as ambiguous before the command fails", async () => {
   const transactionSql: string[] = [];
+  const transactionValues: Array<readonly unknown[]> = [];
   const transaction = async <T>(
     operation: (query: { query: (sql: string, values?: readonly unknown[]) => Promise<{ rows: Record<string, unknown>[]; rowCount: number }> }) => Promise<T>
   ) => operation({
-    query: async (sql: string) => {
+    query: async (sql: string, values?: readonly unknown[]) => {
       transactionSql.push(sql);
+      transactionValues.push(values ?? []);
       if (sql.includes("FROM order_intents intent")) {
         return { rows: [intent() as unknown as Record<string, unknown>], rowCount: 1 };
       }
@@ -293,6 +296,10 @@ test("an uncertain broker submission is persisted as ambiguous before the comman
 
   assert.equal(transactionSql.some((sql) => /SET status = 'ambiguous'/.test(sql)), true);
   assert.equal(transactionSql.some((sql) => /INSERT INTO broker_events/.test(sql)), true);
+  const candidateUpdate = transactionSql.findIndex((sql) => sql.includes("UPDATE candidates"));
+  assert.notEqual(candidateUpdate, -1);
+  assert.equal(transactionValues[candidateUpdate]?.[1], "execution_ambiguous");
+  assert.equal(transactionValues[candidateUpdate]?.[2], "POSTGRES_BROKER_SUBMISSION_AMBIGUOUS");
 });
 
 test("claiming an unreserved intent does not lock the nullable reservation join", async () => {
@@ -333,12 +340,14 @@ test("claiming an unreserved intent does not lock the nullable reservation join"
 
 test("a deterministic pre-submit rejection releases the claimed intent without broker submission", async () => {
   const statements: string[] = [];
+  const statementValues: Array<readonly unknown[]> = [];
   let submitCalls = 0;
   const transaction = async <T>(operation: (query: {
     query: (sql: string) => Promise<{ rows: Record<string, unknown>[]; rowCount: number }>;
   }) => Promise<T>) => operation({
-    query: async (sql: string) => {
+    query: async (sql: string, values?: readonly unknown[]) => {
       statements.push(sql);
+      statementValues.push(values ?? []);
       if (sql.includes("FROM order_intents intent")) {
         return {
           rows: [intent({ asset_class: "option", side: "buy_to_open", symbol: "SPY260720C00625000" }) as unknown as Record<string, unknown>],
@@ -370,4 +379,8 @@ test("a deterministic pre-submit rejection releases the claimed intent without b
   assert.equal(submitCalls, 0);
   assert.equal(statements.some((sql) => /SET status = 'ready_for_submission'/.test(sql)), true);
   assert.equal(statements.some((sql) => /SET status = 'ambiguous'/.test(sql)), false);
+  const candidateUpdate = statements.findIndex((sql) => sql.includes("UPDATE candidates"));
+  assert.notEqual(candidateUpdate, -1);
+  assert.equal(statementValues[candidateUpdate]?.[1], "execution_deferred");
+  assert.equal(statementValues[candidateUpdate]?.[2], "PAPER_OPTIONS_EXECUTION_DISABLED");
 });

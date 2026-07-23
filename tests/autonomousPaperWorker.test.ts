@@ -57,6 +57,8 @@ const completePostgresOnlyEnvironment = {
 type FakeCall = {
   command: string;
   args: string[];
+  cycleId?: string;
+  workstream?: string;
   safety: {
     alpacaEnv?: string;
     tradingMode?: string;
@@ -100,6 +102,8 @@ const args = process.argv.slice(4);
 appendFileSync(process.env.WORKER_CALLS_PATH, JSON.stringify({
   command,
   args,
+  cycleId: process.env.AUTONOMOUS_CYCLE_ID,
+  workstream: process.env.AUTONOMOUS_WORKSTREAM,
   safety: {
     alpacaEnv: process.env.ALPACA_ENV,
     tradingMode: process.env.TRADING_MODE,
@@ -197,6 +201,9 @@ test("approved worker validates the production contract and persists a complete 
 
   const workstreamCalls = calls.filter((call) => call.command !== "worker:state");
   assert.deepEqual(workstreamCalls.map((call) => call.command), workstreams);
+  assert.ok(workstreamCalls.every((call) => call.cycleId === states[0]?.cycleId));
+  assert.ok(workstreamCalls.every((call) => call.workstream === call.command));
+  assert.equal(workstreamCalls[0]!.args.includes("--maxCandidates=25"), true);
   assert.ok(calls.every((call) => call.safety.alpacaEnv === "paper"));
   assert.ok(calls.every((call) => call.safety.tradingMode === "paper"));
   assert.ok(calls.every((call) => call.safety.alpacaLiveTrade === "false"));
@@ -418,6 +425,12 @@ test("autonomous service fixes paper-only authority and bounds failure restarts"
   assert.match(service, /^Environment=LIVE_TRADING_ENABLED=false$/m);
   assert.match(service, /^Environment=AUTONOMOUS_RUNTIME_AUDIT_APPROVED=true$/m);
   assert.match(service, /^Environment=DATABASE_BACKEND=postgres$/m);
+  assert.match(service, /^Environment=PAPER_EXPLORATION_DIRECTION_SCORE=0\.15$/m);
+  assert.match(service, /^Environment=PAPER_EXPLORATION_MIN_DIRECTIONAL_CONFIDENCE=0\.25$/m);
+  assert.match(service, /^Environment=PAPER_EXPLORATION_MIN_OPTION_LIQUIDITY_SCORE=0\.35$/m);
+  assert.match(service, /^Environment=PAPER_EXPLORATION_MAX_OPTION_SPREAD_PCT=0\.12$/m);
+  assert.match(service, /^Environment=PAPER_EXPLORATION_MAX_CANDIDATES=25$/m);
+  assert.match(service, /^Environment=PAPER_EXPLORATION_MAX_ORDER_NOTIONAL=250$/m);
   assert.match(service, /^Environment=POSTGRES_READS_ENABLED=true$/m);
   assert.match(service, /^Environment=POSTGRES_WRITES_ENABLED=true$/m);
   assert.match(service, /^Environment=POSTGRES_CONTROL_PLANE_AUTHORITY_ENABLED=true$/m);

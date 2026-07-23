@@ -12,6 +12,7 @@ import type { PostgresAuthorityBrokerSnapshot } from "./postgresAuthorityBrokerS
 
 export type AutonomousExecutionIntentRow = {
   order_intent_id: string;
+  candidate_id: string | null;
   account_id: string;
   broker_account_id: string;
   account_snapshot_fingerprint: string;
@@ -186,6 +187,31 @@ const fenceValues = (fence: SchedulerFence) => [
   fence.fencingToken
 ];
 
+const persistCandidateExecutionStage = async (
+  query: AutonomousExecutionQuery,
+  intent: AutonomousExecutionIntentRow,
+  fence: SchedulerFence,
+  now: Date,
+  status: "execution_deferred" | "execution_ambiguous" | "executed",
+  reason: string
+) => {
+  if (!intent.candidate_id) return;
+  const result = await query.query(
+    `UPDATE candidates
+     SET lifecycle_status = $2, decision_reason = $3, updated_at = $4,
+         version = version + 1
+     WHERE id = $1 AND decision = 'selected' AND ${fenceSql(5)}`,
+    [
+      intent.candidate_id,
+      status,
+      reason,
+      now.toISOString(),
+      ...fenceValues(fence)
+    ]
+  );
+  if (result.rowCount !== 1) throw new Error("POSTGRES_CANDIDATE_STAGE_PERSISTENCE_FAILED");
+};
+
 const claimIntent = async (
   query: AutonomousExecutionQuery,
   command: string,
@@ -194,7 +220,7 @@ const claimIntent = async (
   expectedPayloadSignature?: string
 ) => {
   const selected = await query.query(
-    `SELECT intent.id AS order_intent_id, intent.account_id,
+    `SELECT intent.id AS order_intent_id, intent.candidate_id, intent.account_id,
             account.broker_account_id,
             snapshot.snapshot_fingerprint AS account_snapshot_fingerprint,
             review.account_fingerprint AS review_account_fingerprint,
@@ -275,7 +301,8 @@ const releaseClaim = async (
   query: AutonomousExecutionQuery,
   intent: AutonomousExecutionIntentRow,
   fence: SchedulerFence,
-  now: Date
+  now: Date,
+  reason: string
 ) => {
   const released = await query.query(
     `UPDATE order_intents
@@ -286,6 +313,14 @@ const releaseClaim = async (
   if (released.rowCount !== 1) {
     throw new Error("POSTGRES_EXECUTION_INTENT_RELEASE_FAILED");
   }
+  await persistCandidateExecutionStage(
+    query,
+    intent,
+    fence,
+    now,
+    "execution_deferred",
+    reason
+  );
 };
 
 const recordSubmission = async (
@@ -370,6 +405,14 @@ const recordSubmission = async (
      WHERE id = $1 AND status = 'valid' AND ${fenceSql(3)}`,
     [intent.confirmation_evidence_id, now.toISOString(), ...values]
   );
+  await persistCandidateExecutionStage(
+    query,
+    intent,
+    fence,
+    now,
+    "executed",
+    "PAPER_ORDER_SUBMITTED"
+  );
   return { orderId, brokerOrderId, status };
 };
 
@@ -421,6 +464,14 @@ const recordAmbiguousSubmission = async (
   if (inserted.rowCount !== 1) {
     throw new Error("POSTGRES_BROKER_SUBMISSION_AMBIGUITY_PERSISTENCE_FAILED");
   }
+  await persistCandidateExecutionStage(
+    query,
+    intent,
+    fence,
+    now,
+    "execution_ambiguous",
+    "POSTGRES_BROKER_SUBMISSION_AMBIGUOUS"
+  );
 };
 
 const assertSafety = (safety: AutonomousExecutionSafety, confirmPaper: boolean) => {
@@ -493,7 +544,12 @@ export const runAutonomousPostgresExecutionCommand = async (input: {
       input.safety.quoteMaxAgeSeconds
     );
   } catch (error) {
-    await input.transaction((query) => releaseClaim(query, intent, input.fence, now));
+    const reason = error instanceof Error
+      ? error.message.slice(0, 240)
+      : "POSTGRES_EXECUTION_EVIDENCE_GATE_FAILED";
+    await input.transaction((query) =>
+      releaseClaim(query, intent, input.fence, now, reason)
+    );
     throw error;
   }
   let recorded: Awaited<ReturnType<typeof recordSubmission>>;

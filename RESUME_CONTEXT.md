@@ -83,8 +83,17 @@ checkpoints.
 - Production worker, research, review, reconciliation, execution, and market-data
   imports must remain isolated from SQLite.
 - Missing current option snapshots outside the option session and explicit
-  market-session ineligibility are deferred worker outcomes; they continue the
-  worker cycle without weakening any execution-readiness gate.
+  market-session ineligibility do not weaken any execution-readiness gate.
+  Stale OPRA rows are rejected before snapshot persistence, their provider
+  timestamps/counts/reason are written to `market_data_ingestion_runs`, and
+  current SIP-backed equity research continues with option data marked degraded.
+- The 2026-07-23 autonomous paper exploration profile is configured in
+  `alpaca-autonomous-paper.service`. Research persists every baseline/effective
+  gate pair and all selected/rejected candidate reasons. Entry review uses a
+  `$250` per-order exploration cap while retaining PostgreSQL risk limits,
+  aggregate exposure, cash reserve, reservation, reconciliation, and duplicate
+  gates. Candidate lifecycle reasons record review skips, capacity blocks,
+  sizing, execution deferral/ambiguity, and successful paper submission.
 - Repeated entry-review workstreams must skip an already persisted
   candidate/account-snapshot review identity rather than create a second review
   with the same client order ID.

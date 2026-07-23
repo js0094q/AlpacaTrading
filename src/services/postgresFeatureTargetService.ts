@@ -13,6 +13,11 @@ import { PostgresMarketDataRepository } from "../repositories/postgres/postgresM
 import type { RiskProfile } from "../types.js";
 import { normalizeSymbol } from "../lib/utils.js";
 import { atr, classifyTrend, distanceFrom, ema, macd, rollingStd, rsi, sma } from "./indicators.js";
+import {
+  BASELINE_DECISION_THRESHOLDS,
+  classifyDirectionalScore,
+  type PaperExplorationThresholds
+} from "./paperExplorationConfig.js";
 import { selectExpressionWithPolicy } from "./strategySelectionLogic.js";
 
 type FeatureTargetWriter = Pick<
@@ -181,6 +186,7 @@ const deriveOptionContractFeature = (input: {
   row: OptionEvidenceRow;
   asOf: string;
   activeRowsAtExpiration: number;
+  maximumOptionSpreadPct: number;
 }) => {
   const { contract, snapshot } = input.row;
   const bid = snapshot?.bid ?? null;
@@ -263,7 +269,7 @@ const deriveOptionContractFeature = (input: {
   if (openInterest === null) rejectionReasons.push("open_interest_missing");
   if (liquidity !== null && !hasLiquidity) rejectionReasons.push("liquidity_empty");
   if (spreadPct === null) rejectionReasons.push("spread_missing");
-  else if (spreadPct > 0.08) rejectionReasons.push("spread_too_wide");
+  else if (spreadPct > input.maximumOptionSpreadPct) rejectionReasons.push("spread_too_wide");
   if (entryPrice === null) rejectionReasons.push("entry_price_missing");
   const eligibility = rejectionReasons.length === 0;
   const evidenceTimestamp = quoteTimestamp ?? snapshot?.snapshotTimestamp ??
@@ -341,6 +347,7 @@ const buildOptionFeatures = (input: {
   close: number;
   contracts: readonly PostgresOptionContract[];
   snapshots: readonly PostgresOptionSnapshot[];
+  maximumOptionSpreadPct: number;
 }) => {
   const evidenceRows = optionEvidenceRowsAsOf(input);
   const rows = evidenceRows.filter((row): row is {
@@ -357,7 +364,8 @@ const buildOptionFeatures = (input: {
   const contractFeatures = evidenceRows.map((row) => deriveOptionContractFeature({
     row,
     asOf: input.asOf,
-    activeRowsAtExpiration: activeRowsByExpiration.get(row.contract.expirationDate) ?? 0
+    activeRowsAtExpiration: activeRowsByExpiration.get(row.contract.expirationDate) ?? 0,
+    maximumOptionSpreadPct: input.maximumOptionSpreadPct
   }));
   if (!rows.length) {
     return {
@@ -521,6 +529,7 @@ const calculateFeatures = (input: {
   stockSnapshots: readonly PostgresStockSnapshot[];
   contracts: readonly PostgresOptionContract[];
   snapshots: readonly PostgresOptionSnapshot[];
+  maximumOptionSpreadPct: number;
 }) => {
   const featureSymbol = normalizeSymbol(input.bars[0]?.symbol ?? "");
   const symbolContracts = input.contracts.filter((contract) =>
@@ -580,7 +589,8 @@ const calculateFeatures = (input: {
       // Current OPRA evidence cannot retroactively populate historical bars.
       // Preserve genuine historical option snapshots when callers supply them.
       contracts: includeOptionEvidence ? symbolContracts : [],
-      snapshots: includeOptionEvidence ? symbolSnapshots : []
+      snapshots: includeOptionEvidence ? symbolSnapshots : [],
+      maximumOptionSpreadPct: input.maximumOptionSpreadPct
     });
     const values: FeatureValues = {
       close: bar.close,
@@ -631,6 +641,7 @@ const targetFromFeature = (input: {
   riskProfile: RiskProfile;
   learningAccuracy?: number | null;
   learningModelName?: string | null;
+  decisionThresholds?: PaperExplorationThresholds;
 }): PostgresTargetSnapshot => {
   const values = input.feature.features;
   const directionScore =
@@ -657,7 +668,10 @@ const targetFromFeature = (input: {
   const expectedReturn = directionScore * volatilityAdjusted;
   const learningBoost = Math.max(0, Math.min(1, (input.learningAccuracy ?? 0.5) - 0.5));
   const confidence = Math.max(0, Math.min(1, Math.abs(directionScore) / 2 + learningBoost * 0.2));
-  const direction = directionScore > 0.25 ? "long" : directionScore < -0.25 ? "short" : "neutral";
+  const direction = classifyDirectionalScore(
+    directionScore,
+    input.decisionThresholds?.directionScore
+  );
   const atr14 = typeof values.atr14 === "number" ? values.atr14 : null;
   const close = typeof values.currentTradablePrice === "number"
     ? values.currentTradablePrice
@@ -676,7 +690,7 @@ const targetFromFeature = (input: {
     liquidityScore: typeof values.preferredContractLiquidityScore === "number" ? values.preferredContractLiquidityScore : 0,
     spreadPct: typeof values.estimatedBidAskSpreadPct === "number" ? values.estimatedBidAskSpreadPct : null,
     hasOptionsData: Number(values.callLiquidityAvailable ?? 0) > 0 || Number(values.putLiquidityAvailable ?? 0) > 0
-  }, input.riskProfile === "aggressive");
+  }, input.riskProfile === "aggressive", input.decisionThresholds);
   const rationale = [
     ...selector.rationale,
     `Risk profile set to ${input.riskProfile}`,
@@ -733,6 +747,7 @@ export const buildPostgresFeaturesAndTargets = async (input: {
   learningModelName?: string | null;
   repository?: FeatureTargetWriter;
   context: FencedPostgresRepositoryContext;
+  decisionThresholds?: PaperExplorationThresholds;
 }) => {
   const repository = input.repository ?? new PostgresMarketDataRepository();
   const bySymbol = new Map<string, PostgresMarketBar[]>();
@@ -758,7 +773,10 @@ export const buildPostgresFeaturesAndTargets = async (input: {
       bars: ordered,
       stockSnapshots: input.stockSnapshots,
       contracts: input.optionsEnabled ? input.optionContracts : [],
-      snapshots: input.optionsEnabled ? input.optionSnapshots : []
+      snapshots: input.optionsEnabled ? input.optionSnapshots : [],
+      maximumOptionSpreadPct:
+        input.decisionThresholds?.maximumOptionSpreadPct ??
+        BASELINE_DECISION_THRESHOLDS.maximumOptionSpreadPct
     }));
     await yieldToEventLoop();
   }
@@ -769,7 +787,8 @@ export const buildPostgresFeaturesAndTargets = async (input: {
       feature: latest,
       riskProfile: input.riskProfile,
       learningAccuracy: input.learningAccuracy,
-      learningModelName: input.learningModelName
+      learningModelName: input.learningModelName,
+      decisionThresholds: input.decisionThresholds
     });
   });
   await repository.upsertFeatureSnapshots(features, input.context);

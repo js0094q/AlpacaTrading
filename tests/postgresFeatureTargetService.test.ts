@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { buildPostgresFeaturesAndTargets } from "../src/services/postgresFeatureTargetService.js";
+import { paperExplorationThresholds } from "../src/services/paperExplorationConfig.js";
 import type {
   PostgresMarketBar,
   PostgresOptionContract,
@@ -124,6 +125,7 @@ const optionSnapshotFixture = (
 const buildOptionFeaturesFixture = (input: {
   contracts: PostgresOptionContract[];
   snapshots: PostgresOptionSnapshot[];
+  exploration?: boolean;
 }) => buildPostgresFeaturesAndTargets({
   bars: bars(60),
   stockSnapshots: [stockSnapshot()],
@@ -131,11 +133,31 @@ const buildOptionFeaturesFixture = (input: {
   optionSnapshots: input.snapshots,
   riskProfile: "aggressive",
   optionsEnabled: true,
+  ...(input.exploration ? { decisionThresholds: paperExplorationThresholds({}) } : {}),
   repository: {
     upsertFeatureSnapshots: async (rows: unknown[]) => ({ stored: rows.length }),
     upsertTargetSnapshots: async (rows: unknown[]) => ({ stored: rows.length })
   } as never,
   context
+});
+
+test("paper exploration admits a 10 percent option spread while the baseline remains at 8 percent", async () => {
+  const optionSymbol = "SPY260829C00560000";
+  const input = {
+    contracts: [optionContractFixture(optionSymbol, 560)],
+    snapshots: [optionSnapshotFixture(optionSymbol, {
+      bid: 4.75,
+      ask: 5.25,
+      midpoint: 5,
+      spread: 0.5,
+      spreadPct: 0.1
+    })]
+  };
+  const baseline = await buildOptionFeaturesFixture(input);
+  const exploration = await buildOptionFeaturesFixture({ ...input, exploration: true });
+
+  assert.equal(baseline.features.at(-1)!.features.optionContractEligible, false);
+  assert.equal(exploration.features.at(-1)!.features.optionContractEligible, true);
 });
 
 test("existing indicators and target thresholds persist genuine PostgreSQL features and targets", async () => {

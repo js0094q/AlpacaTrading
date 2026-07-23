@@ -50,3 +50,30 @@ test("migration 004 preserves option contract identity and provider fields as Po
   assert.match(sql, /conrelid = 'option_contracts'::regclass/);
   assert.doesNotMatch(sql, /sqlite/i);
 });
+
+test("migration 005 adds structured market-data ingestion observability", async () => {
+  const sql = await readFile(
+    "src/lib/database/migrations/005_market_data_ingestion_observability.sql",
+    "utf8"
+  );
+  for (const column of [
+    "cycle_id text",
+    "workstream text",
+    "symbol text",
+    "provider_endpoint text",
+    "pages_retrieved integer",
+    "newest_provider_timestamp timestamptz",
+    "oldest_provider_timestamp timestamptz",
+    "newest_provider_age_seconds numeric\\(20, 3\\)",
+    "records_accepted integer",
+    "records_stale integer",
+    "records_rejected integer",
+    "freshness_threshold_seconds integer",
+    "rejection_reason text",
+    "persistence_result text"
+  ]) {
+    assert.match(sql, new RegExp(`ADD COLUMN(?: IF NOT EXISTS)? ${column}`));
+  }
+  assert.match(sql, /market_data_ingestion_runs_counts_nonnegative/);
+  assert.doesNotMatch(sql, /sqlite/i);
+});

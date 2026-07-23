@@ -2,6 +2,11 @@ import { createHmac } from "node:crypto";
 
 import { canonicalJsonHash } from "../lib/canonicalJson.js";
 import type { SchedulerFence } from "../repositories/contracts/common.js";
+import {
+  paperExplorationProfile,
+  paperExplorationThresholds,
+  type PaperExplorationThresholds
+} from "./paperExplorationConfig.js";
 
 export type PostgresReviewQuery = {
   query: (sql: string, values?: readonly unknown[]) => Promise<{
@@ -78,7 +83,31 @@ const positiveOrInfinity = (value: unknown) => {
   return parsed !== null && parsed >= 0 ? parsed : Number.POSITIVE_INFINITY;
 };
 
-const entrySourceSql = (command: string) => `WITH latest_research AS (
+const persistCandidateStage = async (input: {
+  query: PostgresReviewQuery;
+  fence: SchedulerFence;
+  candidateId: string;
+  status: "skipped" | "blocked" | "sized";
+  reason: string;
+  now: string;
+}) => {
+  const result = await input.query.query(
+    `UPDATE candidates
+     SET lifecycle_status = $2, decision_reason = $3, updated_at = $4,
+         version = version + 1
+     WHERE id = $1 AND decision = 'selected' AND ${fenceSql(5)}`,
+    [
+      input.candidateId,
+      input.status,
+      input.reason,
+      input.now,
+      ...fenceValues(input.fence)
+    ]
+  );
+  if (result.rowCount !== 1) throw new Error("POSTGRES_CANDIDATE_STAGE_PERSISTENCE_FAILED");
+};
+
+const entrySourceSql = (command: string, maxCandidates: number) => `WITH latest_research AS (
   SELECT id FROM research_runs WHERE status = 'completed'
   ORDER BY completed_at DESC, id DESC LIMIT 1
 ), current_account AS (
@@ -178,7 +207,7 @@ WHERE candidate.decision = 'selected'
     AND contract.expiration_date = (($2::timestamptz AT TIME ZONE 'America/New_York')::date + $3::integer)` : ""}
   ${command === "hedge:review" ? "AND candidate.strategy_family ILIKE '%hedge%'" : ""}
 ORDER BY candidate.rank, candidate.id
-LIMIT 10`;
+LIMIT ${maxCandidates}`;
 
 const exitSourceSql = (command: string) => `WITH current_account AS (
   SELECT * FROM accounts WHERE environment = 'paper'
@@ -393,7 +422,10 @@ const runExitReview = async (input: {
   };
 };
 
-const sizing = (row: ReviewSourceRow): number | null => {
+const sizing = (
+  row: ReviewSourceRow,
+  maxOrderNotional: number
+): number | null => {
   const buyingPower = finite(row.buying_power);
   const cash = finite(row.cash);
   const equity = finite(row.equity);
@@ -410,7 +442,7 @@ const sizing = (row: ReviewSourceRow): number | null => {
     ? finite(row.cash_reserve_amount) ?? 0
     : equity * (finite(row.cash_reserve_ratio) ?? 0);
   const amount = Math.floor(Math.min(
-    1_000,
+    maxOrderNotional,
     buyingPower,
     Math.max(0, cash - cashReserve),
     allocationRemaining,
@@ -431,6 +463,8 @@ export const runPostgresReviewWorkflow = async (input: {
   maxMarketAgeHours?: number;
   underlying?: string;
   dte?: number;
+  maxCandidates?: number;
+  explorationThresholds?: PaperExplorationThresholds;
 }) => {
   if (!ENTRY_REVIEW_COMMANDS.has(input.command) && !EXIT_REVIEW_COMMANDS.has(input.command)) {
     return { status: "no_op" as const, code: "NO_POSTGRES_REVIEW_SCOPE", reviewsCreated: 0, pendingIntentsCreated: 0, capacityBlocked: 0 };
@@ -438,6 +472,15 @@ export const runPostgresReviewWorkflow = async (input: {
   const signingKey = input.signingKey ?? process.env.PAPER_REVIEW_SIGNING_KEY?.trim();
   if (!signingKey || signingKey.length < 16) throw new Error("PAPER_REVIEW_SIGNING_KEY_REQUIRED");
   const now = input.now ?? new Date();
+  const exploration = input.explorationThresholds ?? paperExplorationThresholds();
+  const explorationProfile = paperExplorationProfile(exploration);
+  const maxCandidates = Math.max(
+    1,
+    Math.min(
+      exploration.maxCandidates,
+      Number.isSafeInteger(input.maxCandidates) ? input.maxCandidates! : exploration.maxCandidates
+    )
+  );
   if (EXIT_REVIEW_COMMANDS.has(input.command)) {
     return runExitReview({
       command: input.command,
@@ -459,7 +502,10 @@ export const runPostgresReviewWorkflow = async (input: {
     }
     sourceValues = [underlying, now.toISOString(), input.dte!];
   }
-  const rows = (await input.query.query(entrySourceSql(input.command), sourceValues)).rows as ReviewSourceRow[];
+  const rows = (await input.query.query(
+    entrySourceSql(input.command, maxCandidates),
+    sourceValues
+  )).rows as ReviewSourceRow[];
   if (!rows.length) {
     return { status: "no_op" as const, code: "NO_ELIGIBLE_POSTGRES_CANDIDATES", reviewsCreated: 0, pendingIntentsCreated: 0, capacityBlocked: 0 };
   }
@@ -469,12 +515,15 @@ export const runPostgresReviewWorkflow = async (input: {
   let skipped = 0;
   let capacityBlocked = 0;
   const eligibleRows: ReviewSourceRow[] = [];
+  const skippedRows: ReviewSourceRow[] = [];
+  const capacityRows: ReviewSourceRow[] = [];
   for (const row of rows) {
     if (!row.structural_fingerprint || !row.snapshot_fingerprint) {
       throw new Error("POSTGRES_REVIEW_ACCOUNT_FINGERPRINT_MISSING");
     }
     if (Number(row.open_position_count) > 0 || Number(row.open_order_count) > 0) {
       skipped += 1;
+      skippedRows.push(row);
       continue;
     }
     const marketTimestamp = new Date(row.market_timestamp).toISOString();
@@ -485,15 +534,36 @@ export const runPostgresReviewWorkflow = async (input: {
     }
     const price = finite(row.market_price);
     if (price === null || price <= 0) throw new Error(`POSTGRES_REVIEW_MARKET_PRICE_MISSING:${row.symbol}`);
-    const amount = sizing(row);
+    const amount = sizing(row, exploration.maxOrderNotional);
     if (amount === null) {
       capacityBlocked += 1;
+      capacityRows.push(row);
       continue;
     }
     if (row.asset_class === "option" && !Math.floor(amount / (price * 100))) {
       throw new Error(`POSTGRES_REVIEW_OPTION_CAPACITY_INSUFFICIENT:${row.symbol}`);
     }
     eligibleRows.push(row);
+  }
+  for (const row of skippedRows) {
+    await persistCandidateStage({
+      query: input.query,
+      fence: input.fence,
+      candidateId: row.candidate_id,
+      status: "skipped",
+      reason: "POSTGRES_REVIEW_POSITION_OR_ORDER_EXISTS",
+      now: now.toISOString()
+    });
+  }
+  for (const row of capacityRows) {
+    await persistCandidateStage({
+      query: input.query,
+      fence: input.fence,
+      candidateId: row.candidate_id,
+      status: "blocked",
+      reason: "POSTGRES_REVIEW_CAPACITY_UNAVAILABLE",
+      now: now.toISOString()
+    });
   }
   if (!eligibleRows.length) {
     return {
@@ -513,7 +583,7 @@ export const runPostgresReviewWorkflow = async (input: {
     }
     const price = finite(row.market_price);
     if (price === null || price <= 0) throw new Error(`POSTGRES_REVIEW_MARKET_PRICE_MISSING:${row.symbol}`);
-    const amount = sizing(row);
+    const amount = sizing(row, exploration.maxOrderNotional);
     if (amount === null) continue;
     const option = row.asset_class === "option";
     const quantity = option ? Math.floor(amount / (price * 100)) : null;
@@ -543,6 +613,7 @@ export const runPostgresReviewWorkflow = async (input: {
     };
     const configuration = {
       environment: "paper", liveTradingEnabled: false,
+      explorationProfile,
       allocationAmount: row.allocation_amount, allocationRatio: row.allocation_ratio,
       maxPositionNotional: row.max_position_notional,
       maxSymbolNotional: row.max_symbol_notional,
@@ -606,6 +677,14 @@ export const runPostgresReviewWorkflow = async (input: {
         JSON.stringify(orderIntent), now.toISOString(), ...fenceValues(input.fence)]
     );
     if (intentResult.rowCount !== 1 && intentResult.rowCount !== 0) throw new Error("POSTGRES_ORDER_INTENT_PERSISTENCE_FAILED");
+    await persistCandidateStage({
+      query: input.query,
+      fence: input.fence,
+      candidateId: row.candidate_id,
+      status: "sized",
+      reason: "PAPER_ORDER_INTENT_CREATED",
+      now: now.toISOString()
+    });
     created += review.rowCount === 1 ? 1 : 0;
   }
   return {

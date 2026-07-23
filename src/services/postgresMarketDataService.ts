@@ -29,7 +29,7 @@ type MarketDataWriter = Pick<
   | "upsertOptionSnapshots"
   | "listOptionContractsBySymbols"
   | "listOptionSnapshotsByIdentity"
->;
+> & Partial<Pick<PostgresMarketDataRepository, "recordMarketDataIngestionRun">>;
 
 type MarketDataDependencies = {
   fetchAllBars: typeof fetchAllBars;
@@ -364,6 +364,10 @@ export const refreshPostgresMarketData = async (input: {
   const optionContractsByUnderlying: Record<string, number> = {};
   const optionSnapshotsByUnderlying: Record<string, number> = {};
   const freshOptionSnapshotsByUnderlying: Record<string, number> = {};
+  const optionDataRejectionReasons: string[] = [];
+  const ingestionRuns: Parameters<
+    NonNullable<MarketDataWriter["recordMarketDataIngestionRun"]>
+  >[0][] = [];
   if (input.optionsEnabled) {
     const optionFeed = process.env.ALPACA_OPTION_DATA_FEED?.trim().toLowerCase() || "opra";
     if (optionFeed !== "opra") throw new Error(`POSTGRES_OPTION_FEED_INVALID:${optionFeed}`);
@@ -415,18 +419,67 @@ export const refreshPostgresMarketData = async (input: {
         continue;
       }
       const contractBySymbol = new Map(currentContracts.map((row) => [row.optionSymbol, row]));
-      const chain = await dependencies.fetchOptionChainSnapshots(underlying, { feed: optionFeed });
+      const requestStartedAt = nowIso;
+      let chain: Awaited<ReturnType<typeof fetchOptionChainSnapshots>>;
+      try {
+        chain = await dependencies.fetchOptionChainSnapshots(underlying, { feed: optionFeed });
+      } catch (error) {
+        const providerCode = error instanceof Error
+          ? error.message.split(":", 1)[0]
+          : "OPTION_PROVIDER_REQUEST_FAILED";
+        const rejectionReason = `POSTGRES_OPTION_PROVIDER_UNAVAILABLE:${underlying}:${providerCode}`;
+        optionSnapshotsByUnderlying[underlying] = 0;
+        freshOptionSnapshotsByUnderlying[underlying] = 0;
+        optionDataRejectionReasons.push(rejectionReason);
+        ingestionRuns.push({
+          cycleId: process.env.AUTONOMOUS_CYCLE_ID?.trim() || null,
+          workstream: process.env.AUTONOMOUS_WORKSTREAM?.trim() || input.context.schedulerFence.workstream,
+          symbol: underlying,
+          provider: "alpaca",
+          endpoint: `/v1beta1/options/snapshots/${underlying}`,
+          requestedFeed: optionFeed,
+          effectiveFeed: null,
+          requestStartedAt,
+          requestCompletedAt: nowIso,
+          pagesRetrieved: 0,
+          rowsReceived: 0,
+          newestProviderTimestamp: null,
+          oldestProviderTimestamp: null,
+          newestProviderAgeSeconds: null,
+          acceptedRows: 0,
+          staleRows: 0,
+          rejectedRows: 0,
+          freshnessThresholdSeconds: maxOptionAgeMs / 1_000,
+          rejectionReason,
+          persistenceResult: "not_persisted_provider_unavailable",
+          requestIds: []
+        });
+        continue;
+      }
       optionChainPageCount += chain.pagesConsumed;
+      const providerTimestamps: string[] = [];
+      const requestIds = new Set<string>();
+      let acceptedRows = 0;
+      let staleRows = 0;
+      let rejectedRows = 0;
       for (const fetched of chain.snapshots) {
+        if (fetched.requestId) requestIds.add(fetched.requestId);
         const normalizedSymbol = fetched.symbol.trim().toUpperCase();
         const contract = contractBySymbol.get(normalizedSymbol);
-        if (!contract) continue;
         const normalized = normalizeOptionSnapshot(normalizedSymbol, fetched.raw);
+        if (normalized.snapshotTimestamp) providerTimestamps.push(normalized.snapshotTimestamp);
+        if (!contract) {
+          rejectedRows += 1;
+          continue;
+        }
         if (normalized.underlying !== underlying) {
           throw new Error(`POSTGRES_OPTION_SNAPSHOT_UNDERLYING_MISMATCH:${normalized.symbol}`);
         }
         const observedAt = normalized.snapshotTimestamp;
-        if (!observedAt) continue;
+        if (!observedAt) {
+          rejectedRows += 1;
+          continue;
+        }
         const retrievedAt = Date.parse(fetched.retrievedAt);
         if (!Number.isFinite(retrievedAt)) {
           throw new Error(`POSTGRES_OPTION_RETRIEVAL_TIMESTAMP_INVALID:${normalized.symbol}`);
@@ -436,6 +489,11 @@ export const refreshPostgresMarketData = async (input: {
           evidenceAge >= -60_000 && evidenceAge <= maxOptionAgeMs
           ? "fresh" as const
           : "stale" as const;
+        if (freshnessStatus === "stale") {
+          staleRows += 1;
+          rejectedRows += 1;
+          continue;
+        }
         const bid = normalized.latestQuote?.bidPrice ?? null;
         const ask = normalized.latestQuote?.askPrice ?? null;
         const validMarket = bid !== null && ask !== null && bid >= 0 && ask >= bid;
@@ -512,90 +570,131 @@ export const refreshPostgresMarketData = async (input: {
         )) {
           throw new Error(`POSTGRES_OPTION_SNAPSHOT_IDENTITY_CONFLICT:${identity}`);
         }
-        if (!existing) snapshotsByIdentity.set(identity, row);
+        if (!existing) {
+          snapshotsByIdentity.set(identity, row);
+          acceptedRows += 1;
+        }
       }
-      optionSnapshotsByUnderlying[underlying] = [...snapshotsByIdentity.values()]
-        .filter((row) => row.underlyingSymbol === underlying).length;
-      freshOptionSnapshotsByUnderlying[underlying] = [...snapshotsByIdentity.values()]
-        .filter((row) => row.underlyingSymbol === underlying && row.freshnessStatus === "fresh").length;
-      if (
-        requiredOptionUnderlyingSet.has(underlying) &&
-        freshOptionSnapshotsByUnderlying[underlying] === 0
-      ) {
-        throw new Error(`POSTGRES_OPTION_SNAPSHOTS_CURRENT_MISSING:${underlying}`);
-      }
+      optionSnapshotsByUnderlying[underlying] = acceptedRows;
+      freshOptionSnapshotsByUnderlying[underlying] = acceptedRows;
+      const rejectionReason = requiredOptionUnderlyingSet.has(underlying) && acceptedRows === 0
+        ? `POSTGRES_OPTION_SNAPSHOTS_CURRENT_MISSING:${underlying}`
+        : null;
+      if (rejectionReason) optionDataRejectionReasons.push(rejectionReason);
+      const orderedProviderTimestamps = providerTimestamps
+        .filter((timestamp) => Number.isFinite(Date.parse(timestamp)))
+        .sort((left, right) => Date.parse(left) - Date.parse(right));
+      const retrievalTimes = chain.snapshots
+        .map((row) => retrievalTimestamp(row.retrievedAt, nowIso))
+        .sort((left, right) => Date.parse(left) - Date.parse(right));
+      const requestCompletedAt = retrievalTimes.at(-1) ?? nowIso;
+      const newestProviderTimestamp = orderedProviderTimestamps.at(-1) ?? null;
+      ingestionRuns.push({
+        cycleId: process.env.AUTONOMOUS_CYCLE_ID?.trim() || null,
+        workstream: process.env.AUTONOMOUS_WORKSTREAM?.trim() || input.context.schedulerFence.workstream,
+        symbol: underlying,
+        provider: "alpaca",
+        endpoint: chain.snapshots[0]?.endpoint ?? `/v1beta1/options/snapshots/${underlying}`,
+        requestedFeed: optionFeed,
+        effectiveFeed: chain.snapshots.find((row) => row.effectiveFeed)?.effectiveFeed ?? null,
+        requestStartedAt,
+        requestCompletedAt,
+        pagesRetrieved: chain.pagesConsumed,
+        rowsReceived: chain.snapshots.length,
+        newestProviderTimestamp,
+        oldestProviderTimestamp: orderedProviderTimestamps[0] ?? null,
+        newestProviderAgeSeconds: newestProviderTimestamp
+          ? (Date.parse(requestCompletedAt) - Date.parse(newestProviderTimestamp)) / 1_000
+          : null,
+        acceptedRows,
+        staleRows,
+        rejectedRows,
+        freshnessThresholdSeconds: maxOptionAgeMs / 1_000,
+        rejectionReason,
+        persistenceResult: acceptedRows > 0 ? "pending_persistence" : "not_persisted_stale",
+        requestIds: [...requestIds]
+      });
     }
     optionSnapshots = [...snapshotsByIdentity.values()];
-    if (optionSnapshots.length === 0) {
-      throw new Error("POSTGRES_OPTION_SNAPSHOTS_MISSING");
-    }
-    await repository.upsertOptionSnapshots(optionSnapshots, input.context);
-    const persistedContracts = await repository.listOptionContractsBySymbols({
-      optionSymbols: optionContracts.map((row) => row.optionSymbol)
-    }, input.context);
-    const persistedSnapshots = await repository.listOptionSnapshotsByIdentity({
-      identities: optionSnapshots.map((row) => ({
-        optionSymbol: row.optionSymbol,
-        observedAt: row.observedAt
-      }))
-    }, input.context);
-    if (persistedContracts.length !== optionContracts.length) {
-      throw new Error("POSTGRES_OPTION_CONTRACT_READBACK_INCOMPLETE");
-    }
-    if (persistedSnapshots.length !== optionSnapshots.length) {
-      throw new Error("POSTGRES_OPTION_SNAPSHOT_READBACK_INCOMPLETE");
-    }
-    await yieldToEventLoop();
-    const persistedSnapshotEvidenceFingerprints = new Map(persistedSnapshots.map((row) => [
-      `${row.optionSymbol}:${row.observedAt}`,
-      row.evidenceFingerprint ?? null
-    ]));
-    for (let index = 0; index < optionSnapshots.length; index += 1) {
-      const row = optionSnapshots[index]!;
-      if (
-        persistedSnapshotEvidenceFingerprints.get(`${row.optionSymbol}:${row.observedAt}`) !==
-        optionSnapshotEvidenceFingerprint(row)
-      ) {
-        throw new Error("POSTGRES_OPTION_SNAPSHOT_EVIDENCE_FINGERPRINT_MISMATCH");
+    if (optionSnapshots.length > 0) {
+      await repository.upsertOptionSnapshots(optionSnapshots, input.context);
+      const persistedContracts = await repository.listOptionContractsBySymbols({
+        optionSymbols: optionContracts.map((row) => row.optionSymbol)
+      }, input.context);
+      const persistedSnapshots = await repository.listOptionSnapshotsByIdentity({
+        identities: optionSnapshots.map((row) => ({
+          optionSymbol: row.optionSymbol,
+          observedAt: row.observedAt
+        }))
+      }, input.context);
+      if (persistedContracts.length !== optionContracts.length) {
+        throw new Error("POSTGRES_OPTION_CONTRACT_READBACK_INCOMPLETE");
       }
-      if ((index + 1) % COOPERATIVE_YIELD_BATCH_SIZE === 0) await yieldToEventLoop();
+      if (persistedSnapshots.length !== optionSnapshots.length) {
+        throw new Error("POSTGRES_OPTION_SNAPSHOT_READBACK_INCOMPLETE");
+      }
+      await yieldToEventLoop();
+      const persistedSnapshotEvidenceFingerprints = new Map(persistedSnapshots.map((row) => [
+        `${row.optionSymbol}:${row.observedAt}`,
+        row.evidenceFingerprint ?? null
+      ]));
+      for (let index = 0; index < optionSnapshots.length; index += 1) {
+        const row = optionSnapshots[index]!;
+        if (
+          persistedSnapshotEvidenceFingerprints.get(`${row.optionSymbol}:${row.observedAt}`) !==
+          optionSnapshotEvidenceFingerprint(row)
+        ) {
+          throw new Error("POSTGRES_OPTION_SNAPSHOT_EVIDENCE_FINGERPRINT_MISMATCH");
+        }
+        if ((index + 1) % COOPERATIVE_YIELD_BATCH_SIZE === 0) await yieldToEventLoop();
+      }
+      const expectedContractsBySymbol = await fingerprintMap(
+        optionContracts,
+        (row) => row.optionSymbol,
+        optionContractPersistenceMaterial
+      );
+      const actualContractsBySymbol = await fingerprintMap(
+        persistedContracts,
+        (row) => row.optionSymbol,
+        optionContractPersistenceMaterial
+      );
+      if (
+        actualContractsBySymbol.size !== expectedContractsBySymbol.size ||
+        [...expectedContractsBySymbol].some(([key, fingerprint]) =>
+          actualContractsBySymbol.get(key) !== fingerprint)
+      ) {
+        throw new Error("POSTGRES_OPTION_CONTRACT_READBACK_MISMATCH");
+      }
+      const expectedSnapshotsByIdentity = await fingerprintMap(
+        optionSnapshots,
+        (row) => `${row.optionSymbol}:${row.observedAt}`,
+        optionSnapshotPersistenceMaterial
+      );
+      const actualSnapshotsByIdentity = await fingerprintMap(
+        persistedSnapshots,
+        (row) => `${row.optionSymbol}:${row.observedAt}`,
+        optionSnapshotPersistenceMaterial
+      );
+      if (
+        actualSnapshotsByIdentity.size !== expectedSnapshotsByIdentity.size ||
+        [...expectedSnapshotsByIdentity].some(([key, fingerprint]) =>
+          actualSnapshotsByIdentity.get(key) !== fingerprint)
+      ) {
+        throw new Error("POSTGRES_OPTION_SNAPSHOT_READBACK_MISMATCH");
+      }
+      optionContracts = persistedContracts;
+      optionSnapshots = persistedSnapshots;
     }
-    const expectedContractsBySymbol = await fingerprintMap(
-      optionContracts,
-      (row) => row.optionSymbol,
-      optionContractPersistenceMaterial
-    );
-    const actualContractsBySymbol = await fingerprintMap(
-      persistedContracts,
-      (row) => row.optionSymbol,
-      optionContractPersistenceMaterial
-    );
-    if (
-      actualContractsBySymbol.size !== expectedContractsBySymbol.size ||
-      [...expectedContractsBySymbol].some(([key, fingerprint]) =>
-        actualContractsBySymbol.get(key) !== fingerprint)
-    ) {
-      throw new Error("POSTGRES_OPTION_CONTRACT_READBACK_MISMATCH");
+    if (repository.recordMarketDataIngestionRun) {
+      for (const run of ingestionRuns) {
+        await repository.recordMarketDataIngestionRun({
+          ...run,
+          persistenceResult: run.persistenceResult === "pending_persistence"
+            ? "persisted"
+            : run.persistenceResult
+        }, input.context);
+      }
     }
-    const expectedSnapshotsByIdentity = await fingerprintMap(
-      optionSnapshots,
-      (row) => `${row.optionSymbol}:${row.observedAt}`,
-      optionSnapshotPersistenceMaterial
-    );
-    const actualSnapshotsByIdentity = await fingerprintMap(
-      persistedSnapshots,
-      (row) => `${row.optionSymbol}:${row.observedAt}`,
-      optionSnapshotPersistenceMaterial
-    );
-    if (
-      actualSnapshotsByIdentity.size !== expectedSnapshotsByIdentity.size ||
-      [...expectedSnapshotsByIdentity].some(([key, fingerprint]) =>
-        actualSnapshotsByIdentity.get(key) !== fingerprint)
-    ) {
-      throw new Error("POSTGRES_OPTION_SNAPSHOT_READBACK_MISMATCH");
-    }
-    optionContracts = persistedContracts;
-    optionSnapshots = persistedSnapshots;
   }
 
   return {
@@ -612,7 +711,13 @@ export const refreshPostgresMarketData = async (input: {
       optionChainPageCount,
       optionContractsByUnderlying,
       optionSnapshotsByUnderlying,
-      freshOptionSnapshotsByUnderlying
+      freshOptionSnapshotsByUnderlying,
+      optionDataStatus: !input.optionsEnabled
+        ? "disabled"
+        : optionDataRejectionReasons.length > 0
+          ? "degraded"
+          : "current",
+      optionDataRejectionReasons
     }
   };
 };

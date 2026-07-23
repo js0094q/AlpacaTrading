@@ -32,17 +32,28 @@ const candidate = {
 
 test("entry review persists signed PostgreSQL review and unconfirmed pending intent", async () => {
   const sql: string[] = [];
+  let sourceSql = "";
+  let intentValues: readonly unknown[] = [];
+  let candidateUpdateValues: readonly unknown[] = [];
   const result = await runPostgresReviewWorkflow({
     command: "paper:review",
     query: {
-      query: async (statement: string) => {
+      query: async (statement: string, values?: readonly unknown[]) => {
         sql.push(statement);
-        if (statement.includes("FROM candidates candidate")) return { rows: [candidate], rowCount: 1 };
+        if (statement.includes("FROM candidates candidate")) {
+          sourceSql = statement;
+          return { rows: [candidate], rowCount: 1 };
+        }
+        if (statement.includes("INSERT INTO order_intents")) {
+          intentValues = values ?? [];
+        }
+        if (statement.includes("UPDATE candidates")) candidateUpdateValues = values ?? [];
         return { rows: [], rowCount: 1 };
       }
     },
     fence,
     signingKey: "test-signing-key-with-sufficient-length",
+    maxCandidates: 25,
     now: new Date("2026-07-20T22:00:00.000Z")
   });
 
@@ -53,6 +64,10 @@ test("entry review persists signed PostgreSQL review and unconfirmed pending int
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO order_intents")), true);
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO confirmation_evidence")), false);
   assert.equal(sql.some((statement) => /'created'/.test(statement) && statement.includes("order_intents")), true);
+  assert.equal(intentValues[13], 250);
+  assert.equal(candidateUpdateValues[1], "sized");
+  assert.equal(candidateUpdateValues[2], "PAPER_ORDER_INTENT_CREATED");
+  assert.match(sourceSql, /LIMIT 25$/);
 });
 
 test("entry review skips an existing candidate and account-snapshot review identity", async () => {
@@ -132,6 +147,7 @@ test("review fails closed before persistence when market evidence is stale", asy
 
 test("entry review skips held/open-order candidates and reviews the remaining candidates", async () => {
   const sql: string[] = [];
+  const candidateUpdates: Array<readonly unknown[]> = [];
   const rows = [
     { ...candidate, candidate_id: "held-candidate", open_position_count: "1" },
     { ...candidate, candidate_id: "available-candidate", symbol: "QQQ" }
@@ -139,9 +155,10 @@ test("entry review skips held/open-order candidates and reviews the remaining ca
   const result = await runPostgresReviewWorkflow({
     command: "paper:review",
     query: {
-      query: async (statement: string) => {
+      query: async (statement: string, values?: readonly unknown[]) => {
         sql.push(statement);
         if (statement.includes("FROM candidates candidate")) return { rows, rowCount: rows.length };
+        if (statement.includes("UPDATE candidates")) candidateUpdates.push(values ?? []);
         return { rows: [], rowCount: 1 };
       }
     },
@@ -156,6 +173,11 @@ test("entry review skips held/open-order candidates and reviews the remaining ca
   assert.equal(result.skipped, 1);
   assert.equal(sql.filter((statement) => statement.includes("INSERT INTO execution_reviews")).length, 1);
   assert.equal(sql.filter((statement) => statement.includes("INSERT INTO order_intents")).length, 1);
+  assert.equal(candidateUpdates.some((values) =>
+    values[0] === "held-candidate" &&
+    values[1] === "skipped" &&
+    values[2] === "POSTGRES_REVIEW_POSITION_OR_ORDER_EXISTS"
+  ), true);
 });
 
 test("stale evidence fails closed before any candidate review is persisted", async () => {
@@ -218,14 +240,16 @@ test("option capacity failure is detected before a preceding valid candidate is 
 
 test("exhausted allocation capacity is a successful row-level no-op", async () => {
   const sql: string[] = [];
+  let candidateUpdateValues: readonly unknown[] = [];
   const result = await runPostgresReviewWorkflow({
     command: "paper:review",
     query: {
-      query: async (statement: string) => {
+      query: async (statement: string, values?: readonly unknown[]) => {
         sql.push(statement);
         if (statement.includes("FROM candidates candidate")) {
           return { rows: [{ ...candidate, reserved_amount: "5000" }], rowCount: 1 };
         }
+        if (statement.includes("UPDATE candidates")) candidateUpdateValues = values ?? [];
         return { rows: [], rowCount: 1 };
       }
     },
@@ -241,6 +265,8 @@ test("exhausted allocation capacity is a successful row-level no-op", async () =
   assert.equal(result.capacityBlocked, 1);
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO execution_reviews")), false);
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO order_intents")), false);
+  assert.equal(candidateUpdateValues[1], "blocked");
+  assert.equal(candidateUpdateValues[2], "POSTGRES_REVIEW_CAPACITY_UNAVAILABLE");
 });
 
 for (const field of ["buying_power", "cash", "equity"] as const) {

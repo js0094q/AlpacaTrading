@@ -77,7 +77,11 @@ test("research persists current PostgreSQL evidence and selected candidates befo
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO candidates")), true);
   assert.equal(sql.some((statement) => /id, decision_id, research_run_id/.test(statement)), true);
   assert.equal(sql.some((statement) => /SET status = 'completed'/.test(statement)), true);
-  assert.deepEqual(JSON.parse(String(candidateValues[22])), {
+  const signalInputs = JSON.parse(String(candidateValues[25]));
+  assert.deepEqual({
+    ...signalInputs,
+    decisionGates: undefined
+  }, {
     targetSourceFingerprint: "target-fingerprint", marketEvidenceTimestamp: bar.observedAt,
     entryReference: 555, stopLoss: 547.5, takeProfit: 570,
     marketDecisionInputs: {
@@ -91,6 +95,82 @@ test("research persists current PostgreSQL evidence and selected candidates befo
       relation: "public.learning_runs",
       status: "absent",
       verifiedAt: "2026-07-20T22:00:00.000Z"
+    },
+    decisionGates: undefined
+  });
+  assert.equal(signalInputs.decisionGates.outcome, "passed");
+  assert.deepEqual(signalInputs.decisionGates.reasons, ["RANKED_SELECTED"]);
+  assert.equal(signalInputs.decisionGates.profile.scope, "paper_only");
+});
+
+test("paper exploration persists selected and rejected candidate decisions with reversible gates", async () => {
+  const candidateRows: Array<readonly unknown[]> = [];
+  let researchConfig: Record<string, unknown> = {};
+  const result = await runPostgresResearchWorkflow({
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("INSERT INTO research_runs")) {
+          researchConfig = JSON.parse(String(values?.[3]));
+          return { rows: [{ version: "1" }], rowCount: 1 };
+        }
+        if (statement.includes("INSERT INTO candidates")) candidateRows.push(values ?? []);
+        if (statement.includes("to_regclass('public.learning_runs')")) {
+          return { rows: [{ learning_model_relation: null }], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    riskProfile: "aggressive",
+    optionsEnabled: false,
+    maxCandidates: 25,
+    now: new Date("2026-07-20T22:00:00.000Z"),
+    dependencies: {
+      refreshMarketData: async () => ({
+        bars: [bar], stockSnapshots: [], optionContracts: [], optionSnapshots: [],
+        summary: { optionDataStatus: "disabled", optionDataRejectionReasons: [] }
+      }) as never,
+      buildFeaturesAndTargets: async () => ({
+        features: [],
+        targets: [
+          target,
+          {
+            ...target,
+            symbol: "QQQ",
+            direction: "neutral",
+            confidence: 0.2,
+            expectedReturn: 0,
+            preferredExpression: "none",
+            sourceFingerprint: "rejected-target-fingerprint"
+          }
+        ]
+      }),
+      symbols: ["SPY", "QQQ"]
+    }
+  });
+
+  assert.equal(result.candidatesSelected, 1);
+  assert.equal(result.candidatesRejected, 1);
+  assert.equal(candidateRows.length, 2);
+  assert.equal(candidateRows[0]?.[21], "selected");
+  assert.equal(candidateRows[0]?.[23], "RANKED_SELECTED");
+  assert.equal(candidateRows[1]?.[21], "rejected");
+  assert.equal(candidateRows[1]?.[23], "DIRECTION_THRESHOLD_NOT_MET");
+  assert.deepEqual(researchConfig.explorationProfile, {
+    scope: "paper_only",
+    profile: "exploration_v1",
+    thresholds: {
+      directionScore: { previous: 0.25, current: 0.15 },
+      directionalConfidence: { previous: 0.35, current: 0.25 },
+      optionLiquidityScore: { previous: 0.5, current: 0.35 },
+      maxOptionSpreadPct: { previous: 0.08, current: 0.12 },
+      longOptionConfidence: { previous: 0.5, current: 0.4 },
+      aggressiveOptionConfidence: { previous: 0.7, current: 0.6 },
+      definedRiskConfidence: { previous: 0.8, current: 0.7 },
+      optionExpectedReturnPct: { previous: 1, current: 0.75 },
+      definedRiskExpectedReturnPct: { previous: 1.5, current: 1 },
+      maxCandidates: { previous: 10, current: 25 },
+      maxOrderNotional: { previous: 1_000, current: 250 }
     }
   });
 });
