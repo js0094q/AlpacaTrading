@@ -58,6 +58,31 @@ const emitEvent = (event) => {
   process.stdout.write(`${JSON.stringify(event)}\n`);
 };
 
+const forwardWorkstreamTelemetryLine = (line, context, childPid) => {
+  if (!context || !line.trim().startsWith("{")) return;
+  try {
+    const event = JSON.parse(line);
+    if (
+      !event ||
+      typeof event !== "object" ||
+      typeof event.event !== "string" ||
+      !event.event.startsWith("postgres_")
+    ) {
+      return;
+    }
+    emitEvent({
+      ...event,
+      cycle: context.cycle,
+      cycleId: context.cycleId,
+      position: context.position,
+      workstream: context.workstream,
+      childPid
+    });
+  } catch {
+    // Only complete one-line JSON telemetry events are forwarded.
+  }
+};
+
 const killProcessGroup = (child, signal = "SIGTERM") => {
   if (!child?.pid) return;
   try {
@@ -244,6 +269,7 @@ const runNpmCommand = (
   new Promise((resolve) => {
     const startedAt = Date.now();
     let stdout = "";
+    let stdoutLineBuffer = "";
     let stderr = "";
     let spawnError = false;
     let timedOut = false;
@@ -269,7 +295,17 @@ const runNpmCommand = (
       : null;
     heartbeat?.unref?.();
     child.stdout?.on("data", (chunk) => {
-      stdout = appendBounded(stdout, chunk);
+      const text = String(chunk);
+      stdout = appendBounded(stdout, text);
+      if (purpose !== "workstream" || !workstreamContext) return;
+      const lines = `${stdoutLineBuffer}${text}`.split(/\r?\n/);
+      stdoutLineBuffer = lines.pop() ?? "";
+      if (stdoutLineBuffer.length > MAX_CAPTURE_BYTES) {
+        stdoutLineBuffer = stdoutLineBuffer.slice(-MAX_CAPTURE_BYTES);
+      }
+      for (const line of lines) {
+        forwardWorkstreamTelemetryLine(line, workstreamContext, child.pid);
+      }
     });
     child.stderr?.on("data", (chunk) => {
       stderr = appendBounded(stderr, chunk);
@@ -304,6 +340,13 @@ const runNpmCommand = (
     child.once("close", (code) => {
       if (settled) return;
       settled = true;
+      if (purpose === "workstream" && workstreamContext && stdoutLineBuffer) {
+        forwardWorkstreamTelemetryLine(
+          stdoutLineBuffer,
+          workstreamContext,
+          child.pid
+        );
+      }
       if (heartbeat) clearInterval(heartbeat);
       clearTimeout(timeout);
       if (forceKillTimer) {
