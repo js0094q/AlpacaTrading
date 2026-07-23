@@ -30,7 +30,7 @@ type FeatureValues = Record<string, JsonValue | undefined>;
 const numberValue = (value: unknown) => typeof value === "number" && Number.isFinite(value) ? value : null;
 const stringValue = (value: unknown) => typeof value === "string" && value.length > 0 ? value : null;
 
-const isRegularMarketSession = (timestamp: string) => {
+const isExtendedMarketSession = (timestamp: string) => {
   const date = new Date(timestamp);
   if (!Number.isFinite(date.getTime())) return false;
   const parts = new Intl.DateTimeFormat("en-US", {
@@ -39,7 +39,12 @@ const isRegularMarketSession = (timestamp: string) => {
   const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
   if (values.weekday === "Sat" || values.weekday === "Sun") return false;
   const minutes = Number(values.hour) * 60 + Number(values.minute);
-  return minutes >= 570 && minutes <= 960;
+
+  // Alpaca extended equity session:
+  // premarket 04:00–09:30 ET
+  // regular   09:30–16:00 ET
+  // after-hours 16:00–20:00 ET
+  return minutes >= 240 && minutes <= 1200;
 };
 
 const stockEvidenceAsOf = (input: { symbol: string; asOf: string; snapshots: readonly PostgresStockSnapshot[] }) =>
@@ -79,7 +84,7 @@ const stockDecisionFeatures = (snapshot: PostgresStockSnapshot | null) => {
         ? (currentTradablePrice - low) / (high - low)
         : null;
     })(),
-    marketSessionEligible: freshnessStatus === "FRESH" && dataQualityStatus === "COMPLETE" && isRegularMarketSession(snapshot.sourceTimestamp ?? snapshot.observedAt),
+    marketSessionEligible: freshnessStatus === "FRESH" && dataQualityStatus === "COMPLETE" && isExtendedMarketSession(snapshot.sourceTimestamp ?? snapshot.observedAt),
     stockEvidenceFreshnessStatus: freshnessStatus,
     stockDataQualityStatus: dataQualityStatus,
     stockEvidenceTimestamp: snapshot.sourceTimestamp ?? snapshot.observedAt,
