@@ -6,8 +6,12 @@ import type { Pool } from "pg";
 import { loadDatabaseConfig } from "../src/lib/database/config.js";
 import { createPostgresPool } from "../src/lib/database/postgres.js";
 import { runPostgresMigrations } from "../src/lib/database/postgresMigrations.js";
-import { PAPER_EXPLORATION_V2_THRESHOLDS } from "../src/services/paperExplorationConfig.js";
+import {
+  PAPER_EXPLORATION_V2_THRESHOLDS,
+  paperExplorationThresholds
+} from "../src/services/paperExplorationConfig.js";
 import { runPostgresReviewWorkflow } from "../src/services/postgresReviewWorkflowService.js";
+import { selectExpressionWithPolicy } from "../src/services/strategySelectionLogic.js";
 
 const fence = {
   jobName: "allocation", workstream: "allocation", ownerId: "worker",
@@ -73,6 +77,76 @@ test("entry review persists signed PostgreSQL review and unconfirmed pending int
   assert.equal(candidateUpdateValues[1], "sized");
   assert.equal(candidateUpdateValues[2], "PAPER_ORDER_INTENT_CREATED");
   assert.match(sourceSql, /LIMIT 25$/);
+});
+
+test("a newly qualifying paper option candidate propagates into a PostgreSQL order intent", async () => {
+  const exploration = paperExplorationThresholds({
+    ALPACA_ENV: "paper",
+    TRADING_MODE: "paper",
+    ALPACA_LIVE_TRADE: "false",
+    LIVE_TRADING_ENABLED: "false"
+  });
+  const selection = selectExpressionWithPolicy({
+    symbol: "SPY",
+    asOf: "2026-07-20T21:59:30.000Z",
+    direction: "long",
+    confidence: 0.375,
+    expectedReturn: 0.002,
+    atr: 2,
+    trend: "bullish",
+    iv: 0.3,
+    liquidityScore: 0.1,
+    spreadPct: 0.15,
+    hasOptionsData: true
+  }, true, exploration);
+  assert.equal(selection.preferredExpression, "long_call");
+
+  let orderIntent: Record<string, unknown> | undefined;
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("FROM candidates candidate")) {
+          return {
+            rows: [{
+              ...candidate,
+              candidate_id: "candidate-new-threshold-option",
+              asset_class: "option",
+              option_symbol: "SPY260821C00560000",
+              preferred_expression: selection.preferredExpression,
+              confidence: "0.375",
+              market_price: "2",
+              signal_inputs: {
+                marketDecisionInputs: {
+                  option: {
+                    selectionScore: 0.5,
+                    liquidityScore: 0.1,
+                    spreadPct: 0.15,
+                    feed: "opra"
+                  }
+                }
+              }
+            }],
+            rowCount: 1
+          };
+        }
+        if (statement.includes("INSERT INTO execution_reviews")) {
+          orderIntent = JSON.parse(String(values?.[9])) as Record<string, unknown>;
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    explorationThresholds: exploration,
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.status, "completed");
+  assert.equal(result.pendingIntentsCreated, 1);
+  assert.equal(orderIntent?.symbol, "SPY260821C00560000");
+  assert.equal(orderIntent?.side, "buy_to_open");
+  assert.equal(orderIntent?.orderType, "limit");
 });
 
 test("entry review maps a selected equity short to a sell order intent", async () => {

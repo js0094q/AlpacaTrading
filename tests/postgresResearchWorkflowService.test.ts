@@ -180,17 +180,17 @@ test("paper exploration persists selected and rejected candidate decisions with 
   assert.equal(candidateRows[1]?.[23], "DIRECTION_THRESHOLD_NOT_MET");
   assert.deepEqual(researchConfig.explorationProfile, {
     scope: "paper_only",
-    profile: "exploration_v2",
+    profile: "exploration_v3",
     thresholds: {
-      directionScore: { previous: 0.15, current: 0.05 },
-      directionalConfidence: { previous: 0.25, current: 0.1 },
-      optionLiquidityScore: { previous: 0.35, current: 0.1 },
-      maxOptionSpreadPct: { previous: 0.12, current: 0.15 },
-      longOptionConfidence: { previous: 0.4, current: 0.25 },
-      aggressiveOptionConfidence: { previous: 0.6, current: 0.4 },
-      definedRiskConfidence: { previous: 0.7, current: 0.5 },
-      optionExpectedReturnPct: { previous: 0.75, current: 0.25 },
-      definedRiskExpectedReturnPct: { previous: 1, current: 0.5 },
+      directionScore: { previous: 0.05, current: 0.04 },
+      directionalConfidence: { previous: 0.1, current: 0.05 },
+      optionLiquidityScore: { previous: 0.1, current: 0.1 },
+      maxOptionSpreadPct: { previous: 0.15, current: 0.15 },
+      longOptionConfidence: { previous: 0.25, current: 0.2 },
+      aggressiveOptionConfidence: { previous: 0.4, current: 0.35 },
+      definedRiskConfidence: { previous: 0.5, current: 0.45 },
+      optionExpectedReturnPct: { previous: 0.25, current: 0.2 },
+      definedRiskExpectedReturnPct: { previous: 0.5, current: 0.4 },
       maxCandidates: { previous: 25, current: 25 },
       maxOrderNotional: { previous: 1_000, current: 1_000 }
     }

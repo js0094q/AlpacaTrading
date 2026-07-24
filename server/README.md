@@ -1,6 +1,6 @@
 # Alpaca Investing VPS Bootstrap
 
-## Current PostgreSQL-only runtime boundary (2026-07-20)
+## Current PostgreSQL-only runtime boundary (2026-07-24)
 
 PostgreSQL is the sole production runtime authority. Do not run historical
 SQLite migration, backfill, reconciliation, shadow, dual-write, or fallback
@@ -20,6 +20,15 @@ PostgreSQL candidates, option evidence, positions, and lifecycle events. The
 health route reports autonomous-worker state from persisted PostgreSQL lifecycle
 events; blocked strategy decisions remain blocked domain results. No dashboard
 route restores SQLite or a legacy runtime fallback.
+
+The autonomous unit fixes paper exploration V3 strategy gates at
+`0.04` directional score, `0.05` directional confidence,
+`0.20/0.35/0.45` option confidence, and `0.20%/0.40%` option expected return.
+Liquidity remains `0.10`, spread remains capped at `15%`, and new-order
+notional remains capped at `$1,000`. The worker records the three legitimate
+PostgreSQL empty-work results listed in
+`docs/paper-candidate-qualification-inventory.md` as successful `no_action`
+events; actual operational blocks remain blocked.
 
 Before enabling the worker, run current SIP/OPRA market-data ingestion, verify
 the PostgreSQL market/feature/target/research rows, and reconcile against the

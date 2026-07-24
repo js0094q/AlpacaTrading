@@ -1,5 +1,21 @@
 # Resume Context: Alpaca Trading Research Infra
 
+## Paper qualification V3 and successful no-action outcomes (2026-07-24)
+
+- The paper-only exploration profile lowers strategy qualification gates from
+  V2 to V3: direction score `0.05` → `0.04`; directional confidence `0.10` →
+  `0.05`; long/aggressive/defined-risk option confidence `0.25/0.40/0.50` →
+  `0.20/0.35/0.45`; and option/defined-risk expected return `0.25%/0.50%` →
+  `0.20%/0.40%`.
+- Option liquidity remains `0.10`, maximum spread remains `15%`, candidate
+  count remains `25`, and maximum order notional remains `$1,000`.
+- `NO_ELIGIBLE_POSTGRES_CANDIDATES`, `NO_POSTGRES_EXIT_TRIGGER`, and
+  `NO_READY_POSTGRES_ORDER_INTENTS` now complete with
+  `classification=no_action`, `code=WORKSTREAM_NO_ACTION`, exit 0, and their
+  exact domain `reasonCode`. Genuine blocked/failure outcomes remain blocked.
+- The full runtime threshold inventory and unchanged safety boundary are in
+  `docs/paper-candidate-qualification-inventory.md`.
+
 ## Autonomous PostgreSQL lifecycle shutdown repair (2026-07-23)
 
 - The autonomous worker now waits for the complete detached workstream process
@@ -13,9 +29,10 @@
 - The worker gives cooperative domain and lease cleanup a bounded 20-second
   default grace period before process-group `SIGKILL`, below systemd's
   30-second `TimeoutStopSec`.
-- Successful `blocked` and `no_op` command results keep their exact domain
-  `reasonCode` under `WORKSTREAM_BLOCKED`; cycle continuation no longer hides
-  the underlying PostgreSQL no-op reason.
+- Other successful `blocked` and `no_op` command results keep their exact
+  domain `reasonCode` under `WORKSTREAM_BLOCKED`; the three legitimate
+  empty-work codes listed above are the narrow `WORKSTREAM_NO_ACTION`
+  exceptions.
 - The repair preserves lifecycle rows, fencing, and
   `research_runs_one_active_workstream_idx`. It does not delete active history,
   disable the uniqueness constraint, or weaken paper/account safety gates.

@@ -89,6 +89,7 @@ const runWorker = (options: {
   failStateEvent?: string;
   successCommand?: string;
   successOutput?: string;
+  successOutputs?: Record<string, string>;
   environment?: Record<string, string>;
 } = {}) => {
   const directory = mkdtempSync(join(tmpdir(), "autonomous-paper-worker-"));
@@ -146,6 +147,11 @@ if (command === process.env.WORKER_SUCCESS_COMMAND) {
   process.stdout.write(process.env.WORKER_SUCCESS_OUTPUT || JSON.stringify({ status: "success" }));
   process.exit(0);
 }
+const successOutputs = JSON.parse(process.env.WORKER_SUCCESS_OUTPUTS || "{}");
+if (Object.prototype.hasOwnProperty.call(successOutputs, command)) {
+  process.stdout.write(successOutputs[command]);
+  process.exit(0);
+}
 process.stdout.write(JSON.stringify({ status: "success" }));
 `,
     { mode: 0o700 }
@@ -170,7 +176,8 @@ process.stdout.write(JSON.stringify({ status: "success" }));
           WORKER_FAIL_OUTPUT: options.failOutput ?? "",
           WORKER_FAIL_STATE_EVENT: options.failStateEvent ?? "",
           WORKER_SUCCESS_COMMAND: options.successCommand ?? "",
-          WORKER_SUCCESS_OUTPUT: options.successOutput ?? ""
+          WORKER_SUCCESS_OUTPUT: options.successOutput ?? "",
+          WORKER_SUCCESS_OUTPUTS: JSON.stringify(options.successOutputs ?? {})
         },
         encoding: "utf8",
         timeout: 15_000
@@ -517,22 +524,38 @@ test("expected closed-market readiness conditions defer without stopping the wor
   }
 });
 
-test("successful PostgreSQL no-op output preserves its exact blocked reason", () => {
-  const { result, states } = runWorker({
-    successCommand: "paper:portfolio:review",
-    successOutput: JSON.stringify({
-      status: "no_op",
-      code: "NO_OPEN_POSTGRES_POSITIONS"
-    })
+test("legitimate PostgreSQL empty-work outcomes are no-action completions across all 16 workstreams", () => {
+  const expected = {
+    "paper:review": "NO_ELIGIBLE_POSTGRES_CANDIDATES",
+    "paper:exit:review": "NO_POSTGRES_EXIT_TRIGGER",
+    "paper:execute:reviewed": "NO_READY_POSTGRES_ORDER_INTENTS"
+  } as const;
+  const { result, calls, states } = runWorker({
+    successOutputs: Object.fromEntries(
+      Object.entries(expected).map(([command, code]) => [
+        command,
+        JSON.stringify({ status: "no_op", code })
+      ])
+    )
   });
   assert.equal(result.status, 0, result.stderr || result.stdout);
-  const completion = states.find((state) =>
-    state.eventType === "workstream_completed" &&
-    state.payload.workstream === "paper:portfolio:review"
+  assert.deepEqual(
+    calls.filter((call) => call.command !== "worker:state").map((call) => call.command),
+    workstreams
   );
-  assert.equal(completion?.payload.classification, "blocked");
-  assert.equal(completion?.payload.code, "WORKSTREAM_BLOCKED");
-  assert.equal(completion?.payload.reasonCode, "NO_OPEN_POSTGRES_POSITIONS");
+  const completions = states.filter((state) => state.eventType === "workstream_completed");
+  assert.equal(completions.length, 16);
+  for (const [workstream, reasonCode] of Object.entries(expected)) {
+    const completion = completions.find((state) => state.payload.workstream === workstream);
+    assert.equal(completion?.payload.classification, "no_action");
+    assert.equal(completion?.payload.code, "WORKSTREAM_NO_ACTION");
+    assert.equal(completion?.payload.reasonCode, reasonCode);
+  }
+  assert.equal(
+    completions.some((state) => state.payload.code === "WORKSTREAM_BLOCKED"),
+    false
+  );
+  assert.equal(states.some((state) => state.eventType === "cycle_completed"), true);
 });
 
 test("a worker-state persistence failure is fatal before the workstream starts", () => {
@@ -761,15 +784,15 @@ test("autonomous service fixes paper-only authority and bounds failure restarts"
   assert.match(service, /^Environment=LIVE_TRADING_ENABLED=false$/m);
   assert.match(service, /^Environment=AUTONOMOUS_RUNTIME_AUDIT_APPROVED=true$/m);
   assert.match(service, /^Environment=DATABASE_BACKEND=postgres$/m);
-  assert.match(service, /^Environment=PAPER_EXPLORATION_DIRECTION_SCORE=0\.05$/m);
-  assert.match(service, /^Environment=PAPER_EXPLORATION_MIN_DIRECTIONAL_CONFIDENCE=0\.10$/m);
+  assert.match(service, /^Environment=PAPER_EXPLORATION_DIRECTION_SCORE=0\.04$/m);
+  assert.match(service, /^Environment=PAPER_EXPLORATION_MIN_DIRECTIONAL_CONFIDENCE=0\.05$/m);
   assert.match(service, /^Environment=PAPER_EXPLORATION_MIN_OPTION_LIQUIDITY_SCORE=0\.10$/m);
   assert.match(service, /^Environment=PAPER_EXPLORATION_MAX_OPTION_SPREAD_PCT=0\.15$/m);
-  assert.match(service, /^Environment=PAPER_EXPLORATION_MIN_LONG_OPTION_CONFIDENCE=0\.25$/m);
-  assert.match(service, /^Environment=PAPER_EXPLORATION_MIN_AGGRESSIVE_OPTION_CONFIDENCE=0\.40$/m);
-  assert.match(service, /^Environment=PAPER_EXPLORATION_MIN_DEFINED_RISK_CONFIDENCE=0\.50$/m);
-  assert.match(service, /^Environment=PAPER_EXPLORATION_MIN_OPTION_EXPECTED_RETURN_PCT=0\.25$/m);
-  assert.match(service, /^Environment=PAPER_EXPLORATION_MIN_DEFINED_RISK_EXPECTED_RETURN_PCT=0\.50$/m);
+  assert.match(service, /^Environment=PAPER_EXPLORATION_MIN_LONG_OPTION_CONFIDENCE=0\.20$/m);
+  assert.match(service, /^Environment=PAPER_EXPLORATION_MIN_AGGRESSIVE_OPTION_CONFIDENCE=0\.35$/m);
+  assert.match(service, /^Environment=PAPER_EXPLORATION_MIN_DEFINED_RISK_CONFIDENCE=0\.45$/m);
+  assert.match(service, /^Environment=PAPER_EXPLORATION_MIN_OPTION_EXPECTED_RETURN_PCT=0\.20$/m);
+  assert.match(service, /^Environment=PAPER_EXPLORATION_MIN_DEFINED_RISK_EXPECTED_RETURN_PCT=0\.40$/m);
   assert.match(service, /^Environment=PAPER_EXPLORATION_MAX_CANDIDATES=25$/m);
   assert.match(service, /^Environment=PAPER_EXPLORATION_MAX_ORDER_NOTIONAL=1000$/m);
   assert.match(service, /^Environment=POSTGRES_READS_ENABLED=true$/m);

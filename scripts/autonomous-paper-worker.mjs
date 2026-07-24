@@ -20,6 +20,11 @@ const FORCE_KILL_DELAY_MS =
     : 20_000;
 const WORKSTREAM_HEARTBEAT_MS = 30_000;
 const EXPECTED_DEFERRED_REASON_PATTERN = /\b(POSTGRES_OPTION_SNAPSHOTS_CURRENT_MISSING|POSTGRES_DECISION_MARKET_SESSION_INELIGIBLE|NO_ELIGIBLE_POSTGRES_CANDIDATES|NO_READY_POSTGRES_ORDER_INTENTS)\b/;
+const SUCCESSFUL_NO_ACTION_REASON_CODES = new Set([
+  "NO_ELIGIBLE_POSTGRES_CANDIDATES",
+  "NO_POSTGRES_EXIT_TRIGGER",
+  "NO_READY_POSTGRES_ORDER_INTENTS"
+]);
 const configuredMaxCandidates = Number(process.env.PAPER_EXPLORATION_MAX_CANDIDATES ?? 25);
 const PAPER_EXPLORATION_MAX_CANDIDATES =
   Number.isSafeInteger(configuredMaxCandidates) &&
@@ -428,11 +433,23 @@ const classify = ({ exitCode, output, spawnError, timedOut }) => {
     if (/"status"\s*:\s*"(failed|rejected)"/i.test(output)) {
       return { classification: "failed", code: "WORKSTREAM_COMMAND_FAILED" };
     }
+    const reasonCode = structuredReasonCode(output);
+    if (
+      /"status"\s*:\s*"no_op"/i.test(output) &&
+      reasonCode &&
+      SUCCESSFUL_NO_ACTION_REASON_CODES.has(reasonCode)
+    ) {
+      return {
+        classification: "no_action",
+        code: "WORKSTREAM_NO_ACTION",
+        reasonCode
+      };
+    }
     if (/"status"\s*:\s*"(blocked|no_op)"|NO_CANDIDATE|NO_RUNTIME_CANDIDATES/i.test(output)) {
       return {
         classification: "blocked",
         code: "WORKSTREAM_BLOCKED",
-        reasonCode: structuredReasonCode(output)
+        reasonCode
       };
     }
     if (/"status"\s*:\s*"skipped"/i.test(output)) {
@@ -594,7 +611,12 @@ const main = async () => {
 
       if (
         result.code &&
-        !["WORKSTREAM_BLOCKED", "WORKSTREAM_SKIPPED", "WORKSTREAM_DEFERRED"].includes(result.code)
+        ![
+          "WORKSTREAM_BLOCKED",
+          "WORKSTREAM_SKIPPED",
+          "WORKSTREAM_DEFERRED",
+          "WORKSTREAM_NO_ACTION"
+        ].includes(result.code)
       ) {
         const failurePayload = {
           ...basePayload,

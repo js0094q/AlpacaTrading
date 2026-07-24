@@ -40,11 +40,12 @@ requests; a cancelled request is rethrown and is never downgraded to optional
 provider unavailability. The domain workflow terminalizes its current lifecycle
 row, and the scheduler releases its lease as failed before the command exits.
 The parent worker does not persist `worker_stopped` until the detached
-workstream process group is gone. Successful
-PostgreSQL `blocked` and `no_op` results retain their exact domain `reasonCode`
-beneath the stable `WORKSTREAM_BLOCKED` classification, so a completed cycle
-does not erase why a workstream performed no mutation. Lifecycle audit rows and
-the active-workstream uniqueness index remain intact.
+workstream process group is gone. Successful PostgreSQL empty-work results
+`NO_ELIGIBLE_POSTGRES_CANDIDATES`, `NO_POSTGRES_EXIT_TRIGGER`, and
+`NO_READY_POSTGRES_ORDER_INTENTS` retain their exact domain `reasonCode` under
+`classification=no_action` and `code=WORKSTREAM_NO_ACTION`. Genuine
+operational inability to continue remains blocked. Lifecycle audit rows and the
+active-workstream uniqueness index remain intact.
 
 OPRA snapshot persistence commits symbol-scoped batches of at most 250 rows and
 immediately reads each exact identity back before the next batch begins. Each
@@ -57,7 +58,7 @@ row: inline payloads are bounded to 250 rows and 4 MB, while large feature
 payloads are copied from `feature_snapshots` inside PostgreSQL one row at a
 time instead of being retransmitted in a multi-row client parameter.
 
-## Paper exploration profile (2026-07-23)
+## Paper exploration profile (2026-07-24)
 
 The autonomous PostgreSQL path uses a reversible paper-only exploration profile.
 Its explicit systemd environment values broaden genuine-data candidate
@@ -67,14 +68,13 @@ candidate persists its pass/fail reason and decision inputs; review, sizing,
 execution, and execution-defer reasons advance `candidates.lifecycle_status`
 and `candidates.decision_reason`.
 
-Exploration v2 lowers only paper candidate-selection gates from the deployed v1
-profile: direction score `0.15` to `0.05`, directional confidence `0.25` to
-`0.10`, option liquidity `0.35` to `0.10`, long-option confidence `0.40` to
-`0.25`, aggressive-option confidence `0.60` to `0.40`, defined-risk confidence
-`0.70` to `0.50`, option expected return `0.75%` to `0.25%`, and defined-risk
-expected return `1.00%` to `0.50%`. Maximum option spread increases from `12%`
-to `15%`. Candidate count remains `25` and maximum order notional remains
-`$1,000`.
+Exploration v3 lowers only strategy qualification gates from deployed v2:
+direction score `0.05` to `0.04`, directional confidence `0.10` to `0.05`,
+long-option confidence `0.25` to `0.20`, aggressive-option confidence `0.40`
+to `0.35`, defined-risk confidence `0.50` to `0.45`, option expected return
+`0.25%` to `0.20%`, and defined-risk expected return `0.50%` to `0.40%`.
+Option liquidity remains `0.10`, maximum option spread remains `15%`, candidate
+count remains `25`, and maximum order notional remains `$1,000`.
 
 The profile does not change the 1,200-second OPRA freshness limit, the
 regular-session stock-evidence gate, the 50-bar indicator requirement, required
@@ -83,6 +83,10 @@ duplicate prevention, reservations, or aggregate exposure limits. If OPRA
 snapshots are stale or unavailable, they are not persisted as current evidence.
 The ingestion attempt is written to `market_data_ingestion_runs`, option data
 is marked degraded, and current SIP-backed equity research continues.
+
+The complete qualification inventory, outcome source trace, and unchanged
+safety boundary are documented in
+`docs/paper-candidate-qualification-inventory.md`.
 
 Migration `005_market_data_ingestion_observability.sql` adds cycle, workstream,
 symbol, endpoint, pagination, provider-time range, freshness counts, rejection,
