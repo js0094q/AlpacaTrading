@@ -294,22 +294,18 @@ export const runPostgresPaperOrderCancellation = async (input: {
 
     }
 
-    if (lifecycleState !== "cancel_ambiguous") {
-      let mutationError: unknown = null;
+    let mutationClaimed = lifecycleState === "cancel_ambiguous";
+    if (!mutationClaimed) {
+      // Claim the one broker mutation durably before touching Alpaca. A
+      // concurrent/restarted runner that observes an existing claim must stay
+      // lookup-only; it must never issue a second DELETE.
       await assertFence();
-      try {
-        await (input.cancelOrder ?? cancelPaperOrder)(expectedBrokerId);
-      } catch (error) {
-        mutationError = error;
-      }
       const ambiguousEvidence = {
         brokerOrderId: expectedBrokerId,
         clientOrderId: expectedClientId,
         brokerStatus: beforeStatus,
-        mutationOutcome: mutationError ? "unknown" : "accepted_no_terminal_state",
-        errorCode: mutationError instanceof Error
-          ? mutationError.message.split(":", 1)[0]
-          : null
+        mutationAttempt: "pending",
+        mutationOutcome: "not_started"
       };
       const ambiguousEventId = `broker_event_${stableRecordId(
         "alpaca_order_cancellation_ambiguous",
@@ -382,13 +378,33 @@ export const runPostgresPaperOrderCancellation = async (input: {
           ...fenceValues(input.fence)
         ]
       );
-      const ambiguousResult = ambiguous.rows[0] ?? {};
-      if (
-        Number(ambiguousResult.transition_count ?? 0) !== 1 ||
-        Number(ambiguousResult.updated_intent_count ?? 0) !== 1 ||
-        Number(ambiguousResult.event_count ?? 0) !== 1
-      ) {
+      const ambiguousResult = ambiguous.rows[0];
+      if (!ambiguousResult) {
         throw new Error("POSTGRES_CANCEL_AMBIGUITY_PERSISTENCE_FAILED");
+      }
+      const transitionCount = Number(ambiguousResult.transition_count ?? 0);
+      const updatedIntentCount = Number(ambiguousResult.updated_intent_count ?? 0);
+      const eventCount = Number(ambiguousResult.event_count ?? 0);
+      if (![transitionCount, updatedIntentCount, eventCount].every(Number.isFinite)) {
+        throw new Error("POSTGRES_CANCEL_AMBIGUITY_PERSISTENCE_FAILED");
+      }
+      // Only the transaction that inserted the transition/event owns the
+      // mutation opportunity. A zero count is an already-claimed restart or
+      // concurrent runner and therefore remains lookup-only.
+      mutationClaimed = transitionCount === 1 && updatedIntentCount === 1 && eventCount === 1;
+      if ((transitionCount > 0 || updatedIntentCount > 0 || eventCount > 0) && !mutationClaimed) {
+        throw new Error("POSTGRES_CANCEL_AMBIGUITY_PERSISTENCE_FAILED");
+      }
+    }
+
+    if (mutationClaimed && lifecycleState !== "cancel_ambiguous") {
+      await assertFence();
+      try {
+        await (input.cancelOrder ?? cancelPaperOrder)(expectedBrokerId);
+      } catch {
+        // The durable cancel_ambiguous marker is authoritative. Recovery below
+        // remains lookup-only regardless of the broker response or process
+        // interruption after DELETE.
       }
     }
 
