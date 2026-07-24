@@ -918,13 +918,14 @@ export const recoverAmbiguousPostgresSubmission = async (input: {
   captureBrokerSnapshot?: (
     capturedAt?: string
   ) => Promise<PostgresAuthorityBrokerSnapshot>;
+  assertFence?: () => Promise<void> | void;
 }) => {
   const clientOrderId = required(
     input.clientOrderId,
     "POSTGRES_BROKER_SUBMISSION_RECOVERY_CLIENT_ID_REQUIRED"
   );
-  const maxAttempts = input.maxAttempts ?? 4;
-  const retryDelayMs = input.retryDelayMs ?? 750;
+  const maxAttempts = input.maxAttempts ?? 8;
+  const retryDelayMs = input.retryDelayMs ?? 500;
   if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 10) {
     throw new Error("POSTGRES_BROKER_SUBMISSION_RECOVERY_POLICY_INVALID");
   }
@@ -938,11 +939,14 @@ export const recoverAmbiguousPostgresSubmission = async (input: {
   const lookup = input.getOrderByClientOrderId ?? getPaperOrderByClientOrderId;
   const sleep = input.sleep ?? boundedSleep;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    await input.assertFence?.();
     let response: AlpacaApiResponse<AlpacaSubmittedOrder>;
     try {
       response = await lookup(clientOrderId);
     } catch {
-      if (attempt < maxAttempts) await sleep(retryDelayMs);
+      if (attempt < maxAttempts) {
+        await sleep(Math.min(retryDelayMs * (2 ** (attempt - 1)), 5_000));
+      }
       continue;
     }
     const brokerOrderId = required(
@@ -961,6 +965,7 @@ export const recoverAmbiguousPostgresSubmission = async (input: {
     ) {
       throw new Error("POSTGRES_RECONCILIATION_BROKER_IDENTITY_MISMATCH");
     }
+    await input.assertFence?.();
     const reconciliation = await reconcilePostgresPaperOrders({
       query: input.query,
       fence: input.fence,

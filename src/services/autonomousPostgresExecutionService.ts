@@ -932,7 +932,8 @@ const recordSubmissionAttempt = async (
   intent: AutonomousExecutionIntentRow,
   payload: AlpacaPaperOrderRequest,
   fence: SchedulerFence,
-  now: Date
+  now: Date,
+  lifecycleContext?: { cycleId: string; workstreamExecutionId: string }
 ) => {
   const evidence = {
     command: "submit_order",
@@ -966,6 +967,19 @@ const recordSubmissionAttempt = async (
   if (inserted.rowCount !== 0 && inserted.rowCount !== 1) {
     throw new Error("POSTGRES_BROKER_SUBMISSION_ATTEMPT_PERSISTENCE_FAILED");
   }
+  const lifecycleState = intent.review_type === "exit"
+    ? "exit_submission_attempt_persisted"
+    : "submission_attempt_persisted";
+  await query.query(
+    `UPDATE order_intents
+     SET lifecycle_state = $2,
+         autonomous_cycle_id = COALESCE($4, autonomous_cycle_id),
+         workstream_execution_id = COALESCE($5, workstream_execution_id),
+         updated_at = $3, version = version + 1
+     WHERE id = $1 AND status = 'submission_pending' AND ${fenceSql(6)}`,
+    [intent.order_intent_id, lifecycleState, now.toISOString(), lifecycleContext?.cycleId ?? null,
+      lifecycleContext?.workstreamExecutionId ?? null, ...fenceValues(fence)]
+  );
 };
 
 const recordAmbiguousSubmission = async (
@@ -986,9 +1000,10 @@ const recordAmbiguousSubmission = async (
   const values = fenceValues(fence);
   const updated = await query.query(
     `UPDATE order_intents
-     SET status = 'ambiguous', updated_at = $2, version = version + 1
-     WHERE id = $1 AND status = 'submission_pending' AND ${fenceSql(3)}`,
-    [intent.order_intent_id, now.toISOString(), ...values]
+     SET status = 'ambiguous', lifecycle_state = CASE WHEN $3 = 'exit' THEN 'exit_submission_ambiguous' ELSE 'submission_ambiguous' END,
+         updated_at = $2, version = version + 1
+     WHERE id = $1 AND status = 'submission_pending' AND ${fenceSql(4)}`,
+    [intent.order_intent_id, now.toISOString(), intent.review_type, ...values]
   );
   if (updated.rowCount !== 1) {
     throw new Error("POSTGRES_BROKER_SUBMISSION_AMBIGUITY_PERSISTENCE_FAILED");
@@ -1026,6 +1041,50 @@ const recordAmbiguousSubmission = async (
   );
 };
 
+const isAmbiguousSubmissionError = (error: unknown) => {
+  const status = Number((error as { status?: unknown } | null)?.status);
+  if (Number.isFinite(status) && status >= 400 && status < 500 && status !== 408 && status !== 409 && status !== 429) {
+    return false;
+  }
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return !/invalid|rejected|not tradable|insufficient|forbidden|unauthorized|bad request/i.test(message);
+};
+
+const recordDeterministicSubmissionFailure = async (
+  query: AutonomousExecutionQuery,
+  intent: AutonomousExecutionIntentRow,
+  error: unknown,
+  fence: SchedulerFence,
+  now: Date
+) => {
+  const message = error instanceof Error ? error.message.slice(0, 500) : "Broker rejected the order.";
+  const payload = { code: "POSTGRES_BROKER_SUBMISSION_REJECTED", message };
+  const values = fenceValues(fence);
+  const updated = await query.query(
+    `UPDATE order_intents
+     SET status = 'failed', lifecycle_state = 'failed_terminal', terminal_at = $2,
+         updated_at = $2, version = version + 1
+     WHERE id = $1 AND status = 'submission_pending' AND ${fenceSql(3)}`,
+    [intent.order_intent_id, now.toISOString(), ...values]
+  );
+  if (updated.rowCount !== 1) throw new Error("POSTGRES_BROKER_SUBMISSION_REJECTION_PERSISTENCE_FAILED");
+  await query.query(
+    `INSERT INTO broker_events(
+       event_id, account_id, order_intent_id, client_order_id,
+       event_type, event_status, error_classification, retryable,
+       response_payload, response_fingerprint, occurred_at, received_at
+     ) SELECT $1, $2, $3, $4, 'order_submission', 'rejected',
+              'deterministic_broker_rejection', false, $5::jsonb, $6, $7, $7
+       WHERE ${fenceSql(8)}
+     ON CONFLICT (event_id) DO NOTHING`,
+    [
+      `broker_event_${stableRecordId("alpaca_broker_submission_rejected", `${intent.account_id}:${intent.client_order_id}:${now.toISOString()}`)}`,
+      intent.account_id, intent.order_intent_id, intent.client_order_id,
+      JSON.stringify(payload), canonicalJsonHash(payload), now.toISOString(), ...values
+    ]
+  );
+};
+
 const assertSafety = (safety: AutonomousExecutionSafety, confirmPaper: boolean) => {
   if (safety.environment !== "paper" || safety.tradingMode !== "paper") {
     throw new Error("PAPER_RUNTIME_REQUIRED");
@@ -1060,6 +1119,10 @@ export const runAutonomousPostgresExecutionCommand = async <
   readonly confirmPaper: boolean;
   readonly confirmationSigningKey?: string;
   readonly expectedPayloadSignature?: string;
+  readonly lifecycleContext?: {
+    readonly cycleId: string;
+    readonly workstreamExecutionId: string;
+  };
   readonly now?: Date;
 }) => {
   assertSafety(input.safety, input.confirmPaper);
@@ -1191,7 +1254,7 @@ export const runAutonomousPostgresExecutionCommand = async <
   }
   try {
     await input.transaction((query) =>
-      recordSubmissionAttempt(query, intent, payload, input.fence, now)
+      recordSubmissionAttempt(query, intent, payload, input.fence, now, input.lifecycleContext)
     );
   } catch (error) {
     const reason = error instanceof Error
@@ -1209,6 +1272,12 @@ export const runAutonomousPostgresExecutionCommand = async <
       recordSubmission(query, intent, response, input.fence, now)
     );
   } catch (error) {
+    if (!isAmbiguousSubmissionError(error)) {
+      await input.transaction((query) =>
+        recordDeterministicSubmissionFailure(query, intent, error, input.fence, now)
+      );
+      throw error;
+    }
     await input.transaction((query) =>
       recordAmbiguousSubmission(query, intent, error, input.fence, now)
     );

@@ -223,6 +223,29 @@ test("ambiguous submission recovery remains pending after the bounded absence po
   });
 });
 
+test("default ambiguous recovery uses eight exponential lookups capped at five seconds", async () => {
+  const waits: number[] = [];
+  let lookups = 0;
+  const result = await recoverAmbiguousPostgresSubmission({
+    query: { query: async () => ({ rows: [], rowCount: 0 }) },
+    fence,
+    clientOrderId: "client-default-policy",
+    sleep: async (delayMs) => { waits.push(delayMs); },
+    syncBrokerState: false,
+    getOrderByClientOrderId: async () => {
+      lookups += 1;
+      throw new Error("not visible yet");
+    }
+  });
+  assert.equal(lookups, 8);
+  assert.deepEqual(waits, [500, 1000, 2000, 4000, 5000, 5000, 5000]);
+  assert.deepEqual(result, {
+    status: "pending",
+    attempts: 8,
+    code: "POSTGRES_BROKER_SUBMISSION_RECOVERY_PENDING"
+  });
+});
+
 test("resolved broker submissions are recorded exclusively in PostgreSQL", async () => {
   const sql: string[] = [];
   const result = await reconcilePostgresPaperOrders({

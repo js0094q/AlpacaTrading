@@ -521,8 +521,23 @@ const run = async (scheduledContext?: PostgresScheduledCommandOperationContext) 
         recoverAmbiguousPostgresSubmission({
           query: queryAdapter(context.pool),
           fence: context.fence,
-          clientOrderId
+          clientOrderId,
+          assertFence: async () => {
+            const lease = await context.pool.query(
+              `SELECT 1 FROM scheduler_leases
+               WHERE job_name = $1 AND workstream = $2 AND owner_id = $3
+                 AND run_id = $4 AND fencing_token = $5
+                 AND status = 'held' AND expires_at > now() LIMIT 1`,
+              [context.fence.jobName, context.fence.workstream, context.fence.ownerId,
+                context.fence.runId, context.fence.fencingToken]
+            );
+            if (lease.rowCount !== 1) throw new Error("SCHEDULER_FENCE_LOST");
+          }
         }),
+      lifecycleContext: {
+        cycleId: context.fence.runId,
+        workstreamExecutionId: context.fence.workstream
+      },
       fence: context.fence,
       safety: {
         environment: safety.environment,
