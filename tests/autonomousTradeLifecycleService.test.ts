@@ -98,10 +98,20 @@ test("migration 006 contains durable lifecycle lineage and terminal transition t
   );
   assert.match(sql, /FROM\s+option_contracts/i);
   assert.match(sql, /expiration_date/i);
-  assert.match(sql, /review_id\s*=\s*execution_review_id/i);
-  assert.match(sql, /confirmation_id\s*=\s*confirmation_evidence_id/i);
+  assert.match(
+    sql,
+    /review_id\s*=\s*COALESCE\(review_id,\s*execution_review_id\)/i
+  );
+  assert.match(
+    sql,
+    /confirmation_id\s*=\s*COALESCE\(confirmation_id,\s*confirmation_evidence_id\)/i
+  );
   assert.match(sql, /authorization_snapshot_id\s*=\s*review\.source_snapshot_id/i);
   assert.match(sql, /COUNT\(\*\)\s+FROM\s+orders[\s\S]*=\s*1/i);
+  assert.match(
+    sql,
+    /COUNT\(\*\)\s+FROM\s+orders[\s\S]*broker_order_id\s+IS\s+NOT\s+NULL[\s\S]*=\s*1/i
+  );
   assert.match(sql, /CREATE TABLE(?: IF NOT EXISTS)? autonomous_trade_lifecycle_transitions/i);
   assert.match(sql, /append-only|ON CONFLICT/i);
   assert.match(sql, /CREATE TABLE(?: IF NOT EXISTS)? reservation_terminal_transitions/i);

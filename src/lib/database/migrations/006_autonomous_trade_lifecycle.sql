@@ -32,18 +32,22 @@ UPDATE order_intents AS intent SET lifecycle_state = CASE
   WHEN intent.status = 'submitted' THEN 'submission_ambiguous'
   WHEN intent.status = 'reconciled'
     AND (SELECT COUNT(*) FROM orders AS broker_order
-         WHERE broker_order.order_intent_id = intent.id) = 1
+         WHERE broker_order.order_intent_id = intent.id
+           AND broker_order.broker_order_id IS NOT NULL) = 1
     AND EXISTS (
     SELECT 1 FROM orders AS broker_order
     WHERE broker_order.order_intent_id = intent.id
+      AND broker_order.broker_order_id IS NOT NULL
       AND broker_order.status = 'filled'
   ) THEN 'filled'
   WHEN intent.status = 'reconciled'
     AND (SELECT COUNT(*) FROM orders AS broker_order
-         WHERE broker_order.order_intent_id = intent.id) = 1
+         WHERE broker_order.order_intent_id = intent.id
+           AND broker_order.broker_order_id IS NOT NULL) = 1
     AND EXISTS (
     SELECT 1 FROM orders AS broker_order
     WHERE broker_order.order_intent_id = intent.id
+      AND broker_order.broker_order_id IS NOT NULL
       AND broker_order.status IN ('canceled', 'cancelled')
   ) THEN 'cancelled'
   WHEN intent.status = 'cancelled' THEN 'cancelled'
@@ -52,8 +56,8 @@ UPDATE order_intents AS intent SET lifecycle_state = CASE
 WHERE intent.lifecycle_state IS NULL;
 
 UPDATE order_intents
-SET review_id = execution_review_id,
-    confirmation_id = confirmation_evidence_id
+SET review_id = COALESCE(review_id, execution_review_id),
+    confirmation_id = COALESCE(confirmation_id, confirmation_evidence_id)
 WHERE review_id IS NULL OR confirmation_id IS NULL;
 
 UPDATE order_intents AS intent
