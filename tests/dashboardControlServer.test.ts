@@ -26,11 +26,27 @@ const passedAuthority = {
 };
 
 const dashboardData = {
-  latestResearch: [{ id: "research-1", status: "completed" }],
-  latestPaperPlans: [{ id: "candidate-1", decision: "blocked" }],
+  latestResearch: [{
+    id: "research-1",
+    status: "completed",
+    started_at: new Date("2026-07-22T14:55:00.000Z")
+  }],
+  latestPaperPlans: [{
+    id: "candidate-1",
+    decision: "blocked",
+    as_of: new Date("2026-07-22T14:59:00.000Z")
+  }],
   reviews: [{ id: "review-1", status: "blocked" }],
+  orderIntents: [{
+    intent_id: "intent-1",
+    terminal_at: new Date("2026-07-22T15:00:00.000Z")
+  }],
   executions: [],
   optionContracts: [],
+  autonomousLifecycle: [{
+    cycle_id: "cycle-1",
+    occurred_at: new Date("2026-07-22T15:00:00.000Z")
+  }],
   readyIntentCount: 0,
   requestIds: ["request-1"]
 };
@@ -167,6 +183,23 @@ describe("PostgreSQL-only dashboard control", () => {
     assert.equal(JSON.stringify(data).includes("POSTGRES_ONLY_RUNTIME_PATH_DISABLED"), false);
     assert.equal((data.plan as Record<string, unknown>).ok, true);
     assert.equal(((data.plan as Record<string, unknown>).data as Record<string, unknown>).plan instanceof Array, true);
+    assert.equal(
+      ((data.latestResearch as Array<Record<string, unknown>>)[0]?.started_at),
+      "2026-07-22T14:55:00.000Z"
+    );
+    assert.equal(
+      ((data.latestPaperPlans as Array<Record<string, unknown>>)[0]?.as_of),
+      "2026-07-22T14:59:00.000Z"
+    );
+    assert.equal(
+      ((data.orderIntents as Array<Record<string, unknown>>)[0]?.terminal_at),
+      "2026-07-22T15:00:00.000Z"
+    );
+    assert.equal(
+      ((data.autonomousLifecycle as Array<Record<string, unknown>>)[0]?.occurred_at),
+      "2026-07-22T15:00:00.000Z"
+    );
+    assert.equal(JSON.stringify(data).includes('"started_at":{}'), false);
   });
 
   test("0DTE summary is a PostgreSQL read and returns blocked state as data", async () => {

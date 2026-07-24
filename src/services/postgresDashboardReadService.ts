@@ -322,51 +322,384 @@ export const readPostgresDashboardData = async (
   limit = 25
 ) => {
   const boundedLimit = Math.max(1, Math.min(100, Math.floor(limit)));
-  const [research, plans, reviews, orders, options, readyIntents] = await Promise.all([
+  const [
+    research,
+    plans,
+    reviews,
+    intents,
+    orders,
+    options,
+    lifecycle,
+    readyIntents
+  ] = await Promise.all([
     query.query(
-      `SELECT id, workstream, status, risk_profile, options_enabled,
-              request_id,
-              candidates_selected, started_at, completed_at, error_code, error_message
-       FROM research_runs
-       ORDER BY created_at DESC, id DESC
+      `SELECT research.id, research.workstream, research.status,
+              research.risk_profile, research.options_enabled,
+              research.request_id, research.candidates_selected,
+              research.started_at, research.completed_at, research.created_at,
+              research.updated_at, research.error_code, research.error_message
+       FROM research_runs research
+       ORDER BY research.created_at DESC, research.id DESC
        LIMIT $1`,
       [boundedLimit]
     ),
     query.query(
-      `SELECT id, symbol, option_symbol, asset_class, direction,
-              preferred_expression, strategy_family, score, confidence,
-              decision, lifecycle_status, decision_reason, as_of, updated_at
-       FROM candidates
-       ORDER BY updated_at DESC, rank, id
+      `SELECT candidate.id, candidate.id AS candidate_id, candidate.symbol,
+              candidate.option_symbol, candidate.asset_class, candidate.direction,
+              candidate.preferred_expression, candidate.strategy_family,
+              candidate.score, candidate.confidence, candidate.expected_return,
+              candidate.option_liquidity_score, candidate.volatility_score,
+              candidate.decision, candidate.lifecycle_status,
+              candidate.decision_reason, candidate.as_of,
+              candidate.created_at AS candidate_created_at,
+              candidate.updated_at AS candidate_updated_at,
+              review.id AS review_id, review.status AS review_status,
+              review.created_at AS review_created_at,
+              review.updated_at AS review_updated_at,
+              review.expires_at AS review_expires_at,
+              confirmation.id AS confirmation_id,
+              confirmation.status AS confirmation_status,
+              confirmation.confirmed_at, confirmation.expires_at AS confirmation_expires_at,
+              confirmation.created_at AS confirmation_created_at,
+              intent.id AS intent_id, intent.client_order_id,
+              intent.status AS intent_status,
+              COALESCE(
+                intent.request_payload->>'terminalReasonCode',
+                intent.request_payload->>'recoveryReason',
+                intent.request_payload #>> '{staleReadyRecovery,reason}'
+              ) AS intent_terminal_reason,
+              intent.ready_at, intent.submitted_at AS intent_submitted_at,
+              intent.terminal_at, intent.created_at AS intent_created_at,
+              intent.updated_at AS intent_updated_at,
+              reservation.id AS reservation_id,
+              reservation.status AS reservation_status,
+              reservation.release_reason, reservation.amount AS reservation_amount,
+              reservation.expires_at AS reservation_expires_at,
+              reservation.released_at AS reservation_released_at,
+              reservation.created_at AS reservation_created_at,
+              order_row.broker_order_id, order_row.status AS broker_order_status,
+              order_row.filled_quantity, order_row.filled_average_price,
+              order_row.submitted_at, order_row.accepted_at, order_row.filled_at,
+              order_row.cancelled_at, order_row.expired_at,
+              order_row.last_broker_update_at,
+              broker_event.event_type AS latest_broker_event_type,
+              broker_event.event_status AS latest_broker_event_status,
+              broker_event.occurred_at AS latest_broker_event_at,
+              position.id AS position_id, position.status AS position_status,
+              position.side AS position_side, position.opened_at,
+              position.closed_at, position.last_reconciled_at,
+              jsonb_build_object(
+                'sipPrice', candidate.signal_inputs #> '{marketDecisionInputs,currentTradablePrice}',
+                'sipFreshnessStatus', candidate.signal_inputs #> '{marketDecisionInputs,stockEvidenceFreshnessStatus}',
+                'opraFeed', to_jsonb(COALESCE(
+                  review.market_evidence->0->>'effectiveFeed',
+                  candidate.signal_inputs #>> '{marketDecisionInputs,option,feed}'
+                )),
+                'bid', review.market_evidence->0->'bid',
+                'ask', review.market_evidence->0->'ask',
+                'spread', COALESCE(
+                  review.market_evidence->0->'spread',
+                  review.market_evidence->0->'spreadPct'
+                ),
+                'spreadPct', COALESCE(
+                  review.market_evidence->0->'spreadPct',
+                  candidate.signal_inputs #> '{marketDecisionInputs,option,spreadPct}'
+                ),
+                'volume', COALESCE(
+                  review.market_evidence->0->'volume',
+                  candidate.signal_inputs #> '{marketDecisionInputs,option,volume}'
+                ),
+                'openInterest', COALESCE(
+                  review.market_evidence->0->'openInterest',
+                  candidate.signal_inputs #> '{marketDecisionInputs,option,openInterest}'
+                ),
+                'impliedVolatility', COALESCE(
+                  review.market_evidence->0->'impliedVolatility',
+                  candidate.signal_inputs #> '{marketDecisionInputs,option,impliedVolatility}',
+                  candidate.signal_inputs #> '{marketDecisionInputs,impliedVolatility}'
+                ),
+                'delta', COALESCE(
+                  review.market_evidence->0->'delta',
+                  candidate.signal_inputs #> '{marketDecisionInputs,option,delta}'
+                ),
+                'gamma', COALESCE(
+                  review.market_evidence->0->'gamma',
+                  candidate.signal_inputs #> '{marketDecisionInputs,option,gamma}'
+                ),
+                'theta', COALESCE(
+                  review.market_evidence->0->'theta',
+                  candidate.signal_inputs #> '{marketDecisionInputs,option,theta}'
+                ),
+                'vega', COALESCE(
+                  review.market_evidence->0->'vega',
+                  candidate.signal_inputs #> '{marketDecisionInputs,option,vega}'
+                ),
+                'rho', COALESCE(
+                  review.market_evidence->0->'rho',
+                  candidate.signal_inputs #> '{marketDecisionInputs,option,rho}'
+                ),
+                'historicalBarCount', to_jsonb(history.historical_bar_count),
+                'historicalBarStart', to_jsonb(history.first_observed_at),
+                'historicalBarEnd', to_jsonb(history.last_observed_at),
+                'realizedVolatility', COALESCE(
+                  candidate.signal_inputs #> '{marketDecisionInputs,realizedVolatility20}',
+                  feature.features->'realizedVolatility20'
+                ),
+                'liquidityScore', to_jsonb(candidate.option_liquidity_score),
+                'finalConfidence', to_jsonb(candidate.confidence),
+                'expectedReturn', to_jsonb(candidate.expected_return),
+                'scoreComponents', candidate.signal_inputs #> '{candidateScore,components}',
+                'scoreInputs', candidate.signal_inputs #> '{candidateScore,inputs}',
+                'strategyClassification', candidate.signal_inputs->'strategyClassification',
+                'positionSizingInput', jsonb_build_object(
+                  'quantity', review.order_intent->'quantity',
+                  'notional', review.order_intent->'notional',
+                  'referencePrice', review.market_evidence->0->'referencePrice',
+                  'allocationAmount', to_jsonb(reservation.amount)
+                ),
+                'limitPriceConstruction', jsonb_build_object(
+                  'limitPrice', review.order_intent->'limitPrice',
+                  'bid', review.market_evidence->0->'bid',
+                  'ask', review.market_evidence->0->'ask',
+                  'midpoint', review.market_evidence->0->'midpoint',
+                  'referencePrice', review.market_evidence->0->'referencePrice'
+                )
+              ) AS premium_decision_evidence
+       FROM candidates candidate
+       LEFT JOIN LATERAL (
+         SELECT review.* FROM execution_reviews review
+         WHERE review.candidate_id = candidate.id
+         ORDER BY review.created_at DESC, review.id DESC LIMIT 1
+       ) review ON true
+       LEFT JOIN LATERAL (
+         SELECT confirmation.* FROM confirmation_evidence confirmation
+         WHERE confirmation.execution_review_id = review.id
+         ORDER BY confirmation.created_at DESC, confirmation.id DESC LIMIT 1
+       ) confirmation ON true
+       LEFT JOIN LATERAL (
+         SELECT intent.* FROM order_intents intent
+         WHERE intent.candidate_id = candidate.id
+         ORDER BY intent.created_at DESC, intent.id DESC LIMIT 1
+       ) intent ON true
+       LEFT JOIN buying_power_reservations reservation ON reservation.id = intent.reservation_id
+       LEFT JOIN LATERAL (
+         SELECT order_row.* FROM orders order_row
+         WHERE order_row.order_intent_id = intent.id
+         ORDER BY order_row.updated_at DESC, order_row.id DESC LIMIT 1
+       ) order_row ON true
+       LEFT JOIN LATERAL (
+         SELECT broker_event.* FROM broker_events broker_event
+         WHERE broker_event.order_intent_id = intent.id
+         ORDER BY broker_event.occurred_at DESC, broker_event.event_id DESC LIMIT 1
+       ) broker_event ON true
+       LEFT JOIN LATERAL (
+         SELECT position.* FROM positions position
+         WHERE position.candidate_id = candidate.id
+         ORDER BY position.updated_at DESC, position.id DESC LIMIT 1
+       ) position ON true
+       LEFT JOIN LATERAL (
+         SELECT COUNT(*)::integer AS historical_bar_count,
+                MIN(bar.observed_at) AS first_observed_at,
+                MAX(bar.observed_at) AS last_observed_at
+         FROM market_bars bar
+         WHERE bar.symbol = candidate.symbol
+           AND bar.timeframe = '1Day'
+           AND bar.observed_at <= candidate.as_of
+           AND bar.observed_at >= candidate.as_of - interval '365 days'
+       ) history ON true
+       LEFT JOIN LATERAL (
+         SELECT feature_snapshot.features
+         FROM feature_snapshots feature_snapshot
+         WHERE feature_snapshot.symbol = candidate.symbol
+           AND feature_snapshot.observed_at <= candidate.as_of
+         ORDER BY feature_snapshot.observed_at DESC LIMIT 1
+       ) feature ON true
+       ORDER BY candidate.updated_at DESC, candidate.rank, candidate.id
        LIMIT $1`,
       [boundedLimit]
     ),
     query.query(
-      `SELECT id, review_type, status, environment, paper_only,
-              live_trading_enabled, client_order_id, expires_at, created_at,
-              blockers, warnings
-       FROM execution_reviews
-       ORDER BY created_at DESC, id DESC
+      `SELECT review.id, review.id AS review_id, review.candidate_id,
+              review.review_type, review.status, review.environment,
+              review.paper_only, review.live_trading_enabled,
+              review.client_order_id, review.expires_at, review.created_at,
+              review.updated_at, review.consumed_at, review.blockers, review.warnings,
+              confirmation.id AS confirmation_id,
+              confirmation.status AS confirmation_status,
+              confirmation.confirmed_at,
+              confirmation.expires_at AS confirmation_expires_at,
+              confirmation.consumed_at AS confirmation_consumed_at,
+              intent.id AS intent_id, intent.status AS intent_status,
+              intent.client_order_id AS intent_client_order_id,
+              intent.reservation_id, intent.ready_at, intent.submitted_at,
+              intent.terminal_at, intent.created_at AS intent_created_at,
+              intent.updated_at AS intent_updated_at,
+              COALESCE(
+                intent.request_payload->>'terminalReasonCode',
+                intent.request_payload->>'recoveryReason',
+                intent.request_payload #>> '{staleReadyRecovery,reason}'
+              ) AS intent_terminal_reason,
+              reservation.status AS reservation_status,
+              reservation.release_reason, reservation.expires_at AS reservation_expires_at,
+              reservation.released_at AS reservation_released_at,
+              order_row.broker_order_id, order_row.status AS broker_order_status,
+              order_row.filled_quantity, order_row.filled_average_price,
+              order_row.submitted_at AS broker_submitted_at,
+              order_row.filled_at AS broker_filled_at,
+              broker_event.event_type AS latest_broker_event_type,
+              broker_event.event_status AS latest_broker_event_status,
+              broker_event.occurred_at AS latest_broker_event_at,
+              position.id AS position_id, position.status AS position_status,
+              position.last_reconciled_at
+       FROM execution_reviews review
+       LEFT JOIN LATERAL (
+         SELECT confirmation.* FROM confirmation_evidence confirmation
+         WHERE confirmation.execution_review_id = review.id
+         ORDER BY confirmation.created_at DESC, confirmation.id DESC LIMIT 1
+       ) confirmation ON true
+       LEFT JOIN LATERAL (
+         SELECT intent.* FROM order_intents intent
+         WHERE intent.execution_review_id = review.id
+         ORDER BY intent.created_at DESC, intent.id DESC LIMIT 1
+       ) intent ON true
+       LEFT JOIN buying_power_reservations reservation ON reservation.id = intent.reservation_id
+       LEFT JOIN LATERAL (
+         SELECT order_row.* FROM orders order_row
+         WHERE order_row.order_intent_id = intent.id
+         ORDER BY order_row.updated_at DESC, order_row.id DESC LIMIT 1
+       ) order_row ON true
+       LEFT JOIN LATERAL (
+         SELECT broker_event.* FROM broker_events broker_event
+         WHERE broker_event.order_intent_id = intent.id
+         ORDER BY broker_event.occurred_at DESC, broker_event.event_id DESC LIMIT 1
+       ) broker_event ON true
+       LEFT JOIN LATERAL (
+         SELECT position.* FROM positions position
+         WHERE position.opening_order_id = order_row.id
+            OR position.closing_order_id = order_row.id
+         ORDER BY position.updated_at DESC, position.id DESC LIMIT 1
+       ) position ON true
+       ORDER BY review.created_at DESC, review.id DESC
        LIMIT $1`,
       [boundedLimit]
     ),
     query.query(
-      `SELECT id, broker_order_id, client_order_id, symbol, asset_class,
-              side, order_type, time_in_force, status, quantity, notional,
-              filled_quantity, filled_average_price, submitted_at, updated_at
-       FROM orders
-       ORDER BY updated_at DESC, id DESC
+      `SELECT intent.id AS intent_id, intent.candidate_id,
+              intent.execution_review_id AS review_id,
+              intent.confirmation_evidence_id AS confirmation_id,
+              confirmation.status AS confirmation_status,
+              intent.reservation_id, reservation.status AS reservation_status,
+              reservation.release_reason, reservation.expires_at AS reservation_expires_at,
+              reservation.released_at AS reservation_released_at,
+              intent.symbol, intent.asset_class, intent.side,
+              intent.status AS intent_status, intent.client_order_id,
+              COALESCE(
+                intent.request_payload->>'terminalReasonCode',
+                intent.request_payload->>'recoveryReason',
+                intent.request_payload #>> '{staleReadyRecovery,reason}'
+              ) AS intent_terminal_reason,
+              intent.ready_at, intent.submitted_at AS intent_submitted_at,
+              intent.terminal_at, intent.created_at AS intent_created_at,
+              intent.updated_at AS intent_updated_at,
+              COALESCE(
+                order_row.broker_order_id,
+                intent.request_payload #>> '{staleReadyRecovery,brokerOrderId}'
+              ) AS broker_order_id,
+              COALESCE(
+                order_row.status,
+                intent.request_payload #>> '{staleReadyRecovery,brokerStatus}'
+              ) AS broker_order_status,
+              order_row.filled_quantity, order_row.filled_average_price,
+              order_row.submitted_at AS broker_submitted_at,
+              order_row.filled_at AS broker_filled_at,
+              broker_event.event_type AS latest_broker_event_type,
+              broker_event.event_status AS latest_broker_event_status,
+              broker_event.occurred_at AS latest_broker_event_at,
+              position.id AS position_id, position.status AS position_status,
+              candidate.strategy_family,
+              position.opened_at, position.closed_at, position.last_reconciled_at
+       FROM order_intents intent
+       LEFT JOIN candidates candidate ON candidate.id = intent.candidate_id
+       LEFT JOIN execution_reviews review ON review.id = intent.execution_review_id
+       LEFT JOIN confirmation_evidence confirmation
+         ON confirmation.id = intent.confirmation_evidence_id
+       LEFT JOIN buying_power_reservations reservation
+         ON reservation.id = intent.reservation_id
+       LEFT JOIN LATERAL (
+         SELECT order_row.* FROM orders order_row
+         WHERE order_row.order_intent_id = intent.id
+         ORDER BY order_row.updated_at DESC, order_row.id DESC LIMIT 1
+       ) order_row ON true
+       LEFT JOIN LATERAL (
+         SELECT broker_event.* FROM broker_events broker_event
+         WHERE broker_event.order_intent_id = intent.id
+         ORDER BY broker_event.occurred_at DESC, broker_event.event_id DESC LIMIT 1
+       ) broker_event ON true
+       LEFT JOIN LATERAL (
+         SELECT position.* FROM positions position
+         WHERE position.opening_order_id = order_row.id
+            OR position.closing_order_id = order_row.id
+         ORDER BY position.updated_at DESC, position.id DESC LIMIT 1
+       ) position ON true
+       WHERE intent.environment = 'paper'
+       ORDER BY intent.updated_at DESC, intent.id DESC
+       LIMIT $1`,
+      [boundedLimit]
+    ),
+    query.query(
+      `SELECT order_row.id, order_row.id AS broker_execution_id,
+              order_row.order_intent_id, intent.execution_review_id,
+              intent.candidate_id, intent.reservation_id,
+              order_row.broker_order_id, order_row.client_order_id,
+              order_row.symbol, order_row.asset_class, order_row.side,
+              order_row.order_type, order_row.time_in_force, order_row.status,
+              order_row.quantity, order_row.notional,
+              order_row.filled_quantity, order_row.filled_average_price,
+              order_row.submitted_at, order_row.accepted_at, order_row.filled_at,
+              order_row.cancelled_at, order_row.expired_at,
+              order_row.last_broker_update_at, order_row.updated_at,
+              broker_event.event_type AS latest_broker_event_type,
+              broker_event.event_status AS latest_broker_event_status,
+              broker_event.occurred_at AS latest_broker_event_at,
+              position.id AS position_id, position.status AS position_status,
+              position.last_reconciled_at
+       FROM orders order_row
+       LEFT JOIN order_intents intent ON intent.id = order_row.order_intent_id
+       LEFT JOIN LATERAL (
+         SELECT broker_event.* FROM broker_events broker_event
+         WHERE broker_event.order_id = order_row.id
+         ORDER BY broker_event.occurred_at DESC, broker_event.event_id DESC LIMIT 1
+       ) broker_event ON true
+       LEFT JOIN LATERAL (
+         SELECT position.* FROM positions position
+         WHERE position.opening_order_id = order_row.id
+            OR position.closing_order_id = order_row.id
+         ORDER BY position.updated_at DESC, position.id DESC LIMIT 1
+       ) position ON true
+       ORDER BY order_row.updated_at DESC, order_row.id DESC
        LIMIT $1`,
       [boundedLimit]
     ),
     query.query(
       `SELECT contract.option_symbol, contract.underlying_symbol,
               contract.type, contract.expiration_date, contract.strike,
+              contract.multiplier,
               contract.tradable, quote.bid, quote.ask, quote.midpoint,
-              quote.last, quote.quote_timestamp, quote.observed_at
+              quote.last, quote.volume, quote.open_interest,
+              quote.implied_volatility, quote.delta, quote.gamma,
+              quote.theta, quote.vega, quote.rho,
+              quote.quote_timestamp, quote.snapshot_timestamp,
+              quote.observed_at, quote.source,
+              quote.evidence->>'requestedFeed' AS requested_feed,
+              quote.evidence->>'effectiveFeed' AS effective_feed,
+              quote.evidence->'underlyingPrice' AS underlying_price,
+              quote.evidence->'spreadPct' AS spread_percentage
        FROM option_contracts contract
        LEFT JOIN LATERAL (
-         SELECT bid, ask, midpoint, last, quote_timestamp, observed_at
+         SELECT bid, ask, midpoint, last, volume, open_interest,
+                implied_volatility, delta, gamma, theta, vega, rho,
+                quote_timestamp, snapshot_timestamp, observed_at,
+                source, evidence
          FROM option_snapshots snapshot
          WHERE snapshot.option_symbol = contract.option_symbol
          ORDER BY snapshot.observed_at DESC
@@ -375,6 +708,42 @@ export const readPostgresDashboardData = async (
        ORDER BY contract.updated_at DESC, contract.option_symbol
        LIMIT $1`,
       [boundedLimit]
+    ),
+    query.query(
+      `WITH latest_terminal AS (
+         SELECT event_id, entity_id, event_type, occurred_at, payload
+         FROM workstream_events
+         WHERE workstream = 'autonomous_worker'
+           AND event_type IN ('cycle_completed', 'cycle_failed')
+         ORDER BY occurred_at DESC, event_id DESC
+         LIMIT 1
+       )
+       SELECT event.entity_id AS cycle_id, event.event_type,
+              event.payload->>'workstream' AS workstream,
+              CASE WHEN event.payload->>'position' ~ '^[0-9]+$'
+                THEN (event.payload->>'position')::integer ELSE NULL END AS position,
+              CASE
+                WHEN event.event_type = 'cycle_completed' THEN 'success'
+                WHEN event.event_type = 'cycle_failed'
+                  THEN COALESCE(event.payload->>'classification', 'blocked')
+                ELSE event.payload->>'classification'
+              END AS classification,
+              COALESCE(event.payload->>'reasonCode', event.payload->>'code')
+                AS reason_code,
+              CASE WHEN event.payload->>'durationMs' ~ '^[0-9]+(\\.[0-9]+)?$'
+                THEN (event.payload->>'durationMs')::numeric ELSE NULL END
+                AS duration_ms,
+              event.occurred_at
+       FROM workstream_events event
+       JOIN latest_terminal terminal ON terminal.entity_id = event.entity_id
+       WHERE event.workstream = 'autonomous_worker'
+         AND event.event_type IN (
+           'workstream_completed', 'workstream_failed',
+           'cycle_completed', 'cycle_failed'
+         )
+       ORDER BY position NULLS LAST, event.occurred_at, event.event_id
+       LIMIT $1`,
+      [Math.max(21, boundedLimit)]
     ),
     query.query(
       `SELECT COUNT(*) AS ready_count
@@ -387,8 +756,10 @@ export const readPostgresDashboardData = async (
     latestResearch: research.rows,
     latestPaperPlans: plans.rows,
     reviews: reviews.rows,
+    orderIntents: intents.rows,
     executions: orders.rows,
     optionContracts: options.rows,
+    autonomousLifecycle: lifecycle.rows,
     readyIntentCount: integerValue(readyIntents.rows[0]?.ready_count),
     requestIds: research.rows
       .map((row) => textValue(row.request_id))

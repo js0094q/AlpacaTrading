@@ -304,6 +304,8 @@ const readCurrentSummary = async () => {
     },
     latestResearch: dashboard.latestResearch,
     latestPaperPlans: dashboard.latestPaperPlans,
+    orderIntents: dashboard.orderIntents,
+    autonomousLifecycle: dashboard.autonomousLifecycle,
     snapshots: dashboard.optionContracts,
     executions: { ok: true, label: "executions", data: dashboard.executions },
     learningSummary: {
@@ -691,6 +693,21 @@ const authorize = (request: IncomingMessage) => {
   return Boolean(configured && supplied && safeTokenEquals(configured, supplied));
 };
 
+export const normalizeControlPayload = (value: unknown): unknown => {
+  if (value === null || value === undefined) return value;
+  if (value instanceof Date) return value.toISOString();
+  if (Array.isArray(value)) return value.map(normalizeControlPayload);
+  if (typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, entry]) => [
+        key,
+        normalizeControlPayload(entry)
+      ])
+    );
+  }
+  return value;
+};
+
 const correlationId = (request: IncomingMessage) =>
   String(request.headers["x-correlation-id"] || "").trim().slice(0, 128) || randomUUID();
 
@@ -698,7 +715,7 @@ const respond = (response: ServerResponse, status: number, payload: unknown) => 
   response.statusCode = status;
   response.setHeader("content-type", "application/json");
   response.setHeader("cache-control", "no-store");
-  response.end(JSON.stringify(redactSensitiveData(payload)));
+  response.end(JSON.stringify(redactSensitiveData(normalizeControlPayload(payload))));
 };
 
 const requestListener = async (request: IncomingMessage, response: ServerResponse) => {

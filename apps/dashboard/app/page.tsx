@@ -4,6 +4,7 @@ import {
   type HedgeDashboardRecommendation
 } from "./components/HedgePanel";
 import ZeroDtePanel from "./components/ZeroDtePanel";
+import { PostgresEvidencePanel } from "./components/PostgresEvidencePanel";
 import {
   buildDashboardSnapshot,
   dashboardMoney,
@@ -81,10 +82,19 @@ type PaperDryRunSnapshot = {
 type PaperExecutionSnapshot = {
   symbol?: string;
   id?: string;
+  order_intent_id?: string | null;
+  execution_review_id?: string | null;
+  candidate_id?: string | null;
+  reservation_id?: string | null;
+  position_id?: string | null;
   status?: string;
   strategy?: string;
   requestId?: string;
   clientOrderId?: string;
+  broker_order_id?: string | null;
+  filled_quantity?: string | number | null;
+  filled_average_price?: string | number | null;
+  last_reconciled_at?: string | null;
 };
 
 type PaperOpenOrder = {
@@ -302,6 +312,12 @@ export default async function DashboardPage() {
           )}
         </div>
 
+        <PostgresEvidencePanel
+          plans={snapshot?.latestPaperPlans || []}
+          intents={snapshot?.orderIntents || []}
+          lifecycle={snapshot?.autonomousLifecycle || []}
+        />
+
         <div className="panel wide">
           <h2>Learning Ledger</h2>
           {learningSummary?.ok ? (
@@ -384,13 +400,15 @@ export default async function DashboardPage() {
         <div className="panel">
           <h2>Latest Research</h2>
           <div className="list">
-            {(snapshot?.latestResearch || []).map((row: any) => (
-              <div className="row" key={row.id}>
-                <strong>{row.risk_profile}</strong>
-                <span>{row.status}</span>
-                <span className="mono">{row.candidates_selected}</span>
+            {(snapshot?.latestResearch || []).map((row) => {
+              const researchRow = row as Record<string, unknown>;
+              return <div className="row" key={String(researchRow.id || "research")}>
+                <strong>{String(researchRow.risk_profile || "-")}</strong>
+                <span>{String(researchRow.status || "-")}</span>
+                <span className="mono">{String(researchRow.candidates_selected ?? "-")}</span>
               </div>
-            ))}
+            })}
+            {!snapshot?.latestResearch?.length ? <p className="subtle">Successful-empty: no research runs are available.</p> : null}
           </div>
         </div>
 
@@ -399,10 +417,14 @@ export default async function DashboardPage() {
           {executions?.ok ? (
             <div className="list">
               {executions.data.slice(0, 12).map((entry) => (
-                <div className="row" key={entry.id}>
-                  <strong>{entry.symbol}</strong>
-                  <span>{entry.status} {entry.strategy ? `- ${entry.strategy}` : ""}</span>
-                  <span className="mono">{entry.requestId || entry.clientOrderId}</span>
+                <div className="row" key={entry.id || entry.broker_order_id || entry.clientOrderId}>
+                  <strong>{entry.symbol || "-"}</strong>
+                  <span>{entry.status || "-"} {entry.strategy ? `- ${entry.strategy}` : ""}</span>
+                  <span className="mono">{entry.broker_order_id || entry.clientOrderId || "-"}</span>
+                  <span>intent {entry.order_intent_id || "-"}</span>
+                  <span>position {entry.position_id || "-"}</span>
+                  <span>fill {entry.filled_quantity ?? "-"} @ {entry.filled_average_price ?? "-"}</span>
+                  <span>reconciled {entry.last_reconciled_at || "-"}</span>
                 </div>
               ))}
               {!executions.data.length ? <p className="subtle">No ledger rows yet.</p> : null}

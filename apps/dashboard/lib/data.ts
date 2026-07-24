@@ -80,6 +80,8 @@ type PaperBridgeSummary = {
   dryRun?: unknown;
   latestResearch?: unknown;
   latestPaperPlans?: unknown;
+  orderIntents?: unknown;
+  autonomousLifecycle?: unknown;
   openOrders?: unknown;
   snapshots?: unknown;
   executions?: unknown;
@@ -140,6 +142,8 @@ export interface DashboardSnapshot {
   dryRun: DashboardResult<{ summary: { wouldSubmitCount: number; payloadsBlocked: number }; assetClass: string }>;
   latestResearch: unknown[];
   latestPaperPlans: unknown[];
+  orderIntents: unknown[];
+  autonomousLifecycle: unknown[];
   openOrders: DashboardResult<unknown>;
   snapshots: unknown[];
   executions: DashboardResult<unknown> | unknown[];
@@ -789,6 +793,8 @@ export const normalizeDashboardBridgeSummary = (summary: PaperBridgeSummary): Pa
   return {
     ...summary,
     latestPaperPlans: latestPlans,
+    orderIntents: clampRows(summary.orderIntents, 100),
+    autonomousLifecycle: clampRows(summary.autonomousLifecycle, 100),
     plan: cachedPlanResult(planRowsFromBridgeValue(summary.plan, latestPlans)),
     optionContracts: clampRows(summary.optionContracts, 100).map(normalizeBridgeOptionContractRow),
     hedge: normalizeBridgeHedgeResult(summary.hedge)

@@ -1,12 +1,23 @@
 import type { QueryResult } from "pg";
 
 import type { SchedulerFence } from "../repositories/contracts/common.js";
+import { AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS } from "./autonomousFreshnessPolicy.js";
+
+type StaleReadyOrderLookup = (
+  clientOrderId: string
+) => Promise<{ data: { id?: string; client_order_id?: string; status?: string }; status?: number }>;
 
 export type AutonomousPostgresQueryExecutor = {
   query: (
     sql: string,
     values?: readonly unknown[]
   ) => Promise<Pick<QueryResult<Record<string, unknown>>, "rows" | "rowCount">>;
+};
+
+const brokerOrderAbsent = (error: unknown) => {
+  const status = Number((error as { status?: unknown } | null)?.status);
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return status === 404 || /\b404\b|order not found/i.test(message);
 };
 
 type EvidenceRow = {
@@ -119,7 +130,8 @@ const requireAuthorityEvidence = (row: EvidenceRow | undefined) => {
 export const runAutonomousPostgresRecovery = async (
   query: AutonomousPostgresQueryExecutor,
   fence: SchedulerFence,
-  now: Date
+  now: Date,
+  options: { getOrderByClientOrderId?: StaleReadyOrderLookup } = {}
 ) => {
   const values = [
     now.toISOString(),
@@ -136,6 +148,155 @@ export const runAutonomousPostgresRecovery = async (
       AND lease.fencing_token = $6 AND lease.status = 'held'
       AND lease.expires_at > now()
   )`;
+  const fenceSqlAt = (start: number) => `EXISTS (
+    SELECT 1 FROM scheduler_leases lease
+    WHERE lease.job_name = $${start} AND lease.workstream = $${start + 1}
+      AND lease.owner_id = $${start + 2} AND lease.run_id = $${start + 3}
+      AND lease.fencing_token = $${start + 4} AND lease.status = 'held'
+      AND lease.expires_at > now()
+  )`;
+  let staleReadyIntents = 0;
+  let staleReadyCancelled = 0;
+  let staleReadyPreserved = 0;
+  let staleReadyReservationsReleased = 0;
+  let staleReadyAllocationsAdjusted = 0;
+  if (options.getOrderByClientOrderId) {
+    const staleReady = await query.query(
+      `SELECT intent.id, intent.client_order_id
+       FROM order_intents intent
+       JOIN execution_reviews review ON review.id = intent.execution_review_id
+       JOIN candidates candidate ON candidate.id = intent.candidate_id
+       LEFT JOIN confirmation_evidence confirmation
+         ON confirmation.id = intent.confirmation_evidence_id
+       LEFT JOIN buying_power_reservations reservation
+         ON reservation.id = intent.reservation_id
+       WHERE intent.status = 'ready_for_submission'
+         AND intent.environment = 'paper'
+         AND NOT EXISTS (
+           SELECT 1 FROM orders existing_order
+           WHERE existing_order.order_intent_id = intent.id
+         )
+         AND (
+           candidate.decision <> 'selected'
+           OR candidate.lifecycle_status IN ('expired', 'rejected', 'blocked', 'skipped')
+           OR candidate.as_of <= $7::timestamptz - ($8::integer * interval '1 second')
+           OR
+           review.status IN ('expired', 'revoked', 'blocked') OR review.expires_at <= $1
+           OR confirmation.status IS NULL OR confirmation.status <> 'valid'
+           OR confirmation.expires_at IS NULL OR confirmation.expires_at <= $1
+           OR reservation.status IS NULL OR reservation.status NOT IN ('active', 'committed')
+           OR reservation.expires_at IS NULL OR reservation.expires_at <= $1
+         )
+         AND ${fenceSql}`,
+      [now.toISOString(), ...values.slice(1), now.toISOString(), AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS]
+    );
+    staleReadyIntents = staleReady.rowCount ?? staleReady.rows.length;
+    for (const row of staleReady.rows) {
+      const clientOrderId = String(row.client_order_id ?? "").trim();
+      if (!clientOrderId) continue;
+      try {
+        const broker = await options.getOrderByClientOrderId(clientOrderId);
+        if (!broker.data?.id || broker.data.client_order_id !== clientOrderId) {
+          throw new Error("POSTGRES_STALE_READY_BROKER_IDENTITY_MISMATCH");
+        }
+        const preserved = await query.query(
+          `UPDATE order_intents
+           SET status = 'ambiguous', updated_at = $2, version = version + 1,
+               request_payload = request_payload || jsonb_build_object(
+                 'staleReadyRecovery', jsonb_build_object(
+                   'brokerOrderId', $3, 'brokerStatus', $4,
+                   'reason', 'BROKER_ORDER_FOUND_DURING_STALE_READY_RECOVERY'
+                 )
+               )
+           WHERE id = $1 AND status = 'ready_for_submission' AND ${fenceSqlAt(5)}`,
+          [row.id, now.toISOString(), broker.data.id, broker.data.status ?? "unknown", ...values.slice(1)]
+        );
+        if (preserved.rowCount === 1) staleReadyPreserved += 1;
+      } catch (error) {
+        if (!brokerOrderAbsent(error)) throw error;
+        const cancelled = await query.query(
+          `WITH locked_reservation AS MATERIALIZED (
+             SELECT reservation.id, reservation.account_id, reservation.strategy_key,
+                    reservation.amount
+             FROM buying_power_reservations reservation
+             WHERE reservation.id = (
+               SELECT intent.reservation_id FROM order_intents intent WHERE intent.id = $1
+             ) AND reservation.status IN ('active', 'committed')
+             FOR UPDATE
+           ), locked_allocation AS MATERIALIZED (
+             SELECT allocation.id, allocation.account_id, allocation.strategy_key,
+                    allocation.reserved_amount
+             FROM strategy_allocations allocation
+             JOIN locked_reservation reservation
+               ON reservation.account_id = allocation.account_id
+              AND reservation.strategy_key = allocation.strategy_key
+             WHERE allocation.status = 'active' AND allocation.effective_to IS NULL
+             FOR UPDATE
+           ), validation AS (
+             SELECT CASE WHEN (SELECT COUNT(*) FROM locked_reservation) = 0 OR
+                              ((SELECT COUNT(*) FROM locked_allocation) = 1 AND
+                               (SELECT MIN(reserved_amount) FROM locked_allocation) >=
+                               (SELECT MIN(amount) FROM locked_reservation))
+                         THEN 'ok' ELSE 'mismatch' END AS outcome
+           ), cancelled AS (
+             UPDATE order_intents intent
+             SET status = 'cancelled', terminal_at = $2, updated_at = $2,
+                 version = intent.version + 1,
+                 request_payload = request_payload || jsonb_build_object(
+                   'recoveryReason', 'STALE_READY_INTENT_RECOVERY'
+                 ),
+                 lifecycle_fingerprint = encode(sha256(convert_to(
+                   concat_ws('|', intent.id, intent.lifecycle_fingerprint, 'cancelled',
+                     'STALE_READY_INTENT_RECOVERY'), 'UTF8')), 'hex')
+             WHERE intent.id = $1 AND intent.status = 'ready_for_submission'
+               AND NOT EXISTS (SELECT 1 FROM orders existing_order WHERE existing_order.order_intent_id = intent.id)
+               AND (SELECT outcome = 'ok' FROM validation)
+               AND ${fenceSqlAt(3)}
+             RETURNING intent.id, intent.account_id, intent.reservation_id
+           ), released AS (
+             UPDATE buying_power_reservations reservation
+             SET status = 'released', released_at = $2,
+                 release_reason = 'STALE_READY_INTENT_RECOVERY',
+                 updated_at = $2, version = reservation.version + 1
+             FROM cancelled
+             WHERE reservation.id = cancelled.reservation_id
+               AND reservation.status IN ('active', 'committed')
+               AND (SELECT outcome = 'ok' FROM validation)
+               AND ${fenceSqlAt(3)}
+             RETURNING reservation.account_id, reservation.strategy_key, reservation.amount
+           ), adjusted AS (
+             UPDATE strategy_allocations allocation
+             SET reserved_amount = allocation.reserved_amount - released.amount,
+                 updated_at = $2, version = allocation.version + 1
+             FROM released
+             WHERE allocation.account_id = released.account_id
+               AND allocation.strategy_key = released.strategy_key
+               AND allocation.status = 'active' AND allocation.effective_to IS NULL
+               AND (SELECT outcome = 'ok' FROM validation)
+               AND ${fenceSqlAt(3)}
+             RETURNING allocation.id
+           )
+           SELECT (SELECT outcome FROM validation) AS outcome,
+                  (SELECT COUNT(*) FROM cancelled)::text AS cancelled_count,
+                  (SELECT COUNT(*) FROM released)::text AS released_count,
+                  (SELECT COUNT(*) FROM adjusted)::text AS adjusted_count`,
+          [row.id, now.toISOString(), ...values.slice(1)]
+        );
+        if (String(cancelled.rows[0]?.outcome ?? "mismatch") !== "ok") {
+          throw new Error("POSTGRES_STALE_READY_RESERVATION_ALLOCATION_MISMATCH");
+        }
+        if (Number(cancelled.rows[0]?.cancelled_count ?? 0) !== 1) continue;
+        const releasedCount = Number(cancelled.rows[0]?.released_count ?? 0);
+        const adjustedCount = Number(cancelled.rows[0]?.adjusted_count ?? 0);
+        if (releasedCount > 0 && adjustedCount !== releasedCount) {
+          throw new Error("POSTGRES_STALE_READY_RESERVATION_RELEASE_FAILED");
+        }
+        staleReadyCancelled += 1;
+        staleReadyReservationsReleased += releasedCount;
+        staleReadyAllocationsAdjusted += adjustedCount;
+      }
+    }
+  }
   const researchRuns = await query.query(
     `UPDATE research_runs
      SET status = 'recovered', completed_at = $1, recovered_at = $1,
@@ -291,7 +452,12 @@ export const runAutonomousPostgresRecovery = async (
     reservations: expiredReservationCount,
     reviews: reviews.rowCount ?? 0,
     confirmations: confirmations.rowCount ?? 0,
-    intents: intents.rowCount ?? 0
+    intents: intents.rowCount ?? 0,
+    staleReadyIntents,
+    staleReadyCancelled,
+    staleReadyPreserved,
+    staleReadyReservationsReleased,
+    staleReadyAllocationsAdjusted
   };
 };
 
@@ -300,13 +466,16 @@ export const runAutonomousPostgresCommand = async (input: {
   readonly query: AutonomousPostgresQueryExecutor;
   readonly fence: SchedulerFence;
   readonly now?: Date;
+  readonly getOrderByClientOrderId?: StaleReadyOrderLookup;
 }) => {
   if (!INSPECTION_COMMANDS.has(input.command)) {
     throw new Error(`POSTGRES_AUTONOMOUS_COMMAND_UNSUPPORTED: ${input.command}`);
   }
   const now = input.now ?? new Date();
   const recovery = input.command === "system:recover"
-    ? await runAutonomousPostgresRecovery(input.query, input.fence, now)
+    ? await runAutonomousPostgresRecovery(input.query, input.fence, now, {
+        getOrderByClientOrderId: input.getOrderByClientOrderId
+      })
     : undefined;
   const evidenceResult = await input.query.query(inspectionSql);
   const row = evidenceResult.rows[0] as EvidenceRow | undefined;

@@ -25,7 +25,7 @@ import { redactSensitiveData } from "./lib/securityRedaction.js";
 import { normalizeSymbol } from "./lib/utils.js";
 import { getAlpacaAccountSnapshot } from "./services/alpacaAccountService.js";
 import { checkAlpacaSymbolTradability } from "./services/alpacaAssetService.js";
-import { AlpacaApiError } from "./services/alpacaClient.js";
+import { AlpacaApiError, getPaperOrderByClientOrderId } from "./services/alpacaClient.js";
 import { buildAlpacaConfigDiagnostic } from "./services/alpacaConfigDiagnosticService.js";
 import { getAlpacaMarketClock } from "./services/alpacaMarketClockService.js";
 import { listAlpacaOpenOrders } from "./services/alpacaOrderReadService.js";
@@ -485,7 +485,8 @@ const run = async (scheduledContext?: PostgresScheduledCommandOperationContext) 
     const result = await runAutonomousPostgresCommand({
       command,
       query: queryAdapter(context.pool),
-      fence: context.fence
+      fence: context.fence,
+      getOrderByClientOrderId: getPaperOrderByClientOrderId
     });
     print({ ...paperEnvelope(), ...result });
     return;

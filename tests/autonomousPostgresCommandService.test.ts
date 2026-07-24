@@ -107,7 +107,12 @@ test("system recovery performs bounded fenced PostgreSQL recovery before evaluat
     reservations: 2,
     reviews: 3,
     confirmations: 4,
-    intents: 5
+    intents: 5,
+    staleReadyIntents: 0,
+    staleReadyCancelled: 0,
+    staleReadyPreserved: 0,
+    staleReadyReservationsReleased: 0,
+    staleReadyAllocationsAdjusted: 0
   });
   assert.equal(calls.length, 6);
   for (const sql of calls.slice(0, 5)) assert.match(sql, /scheduler_leases/);
@@ -198,6 +203,207 @@ test("reservation recovery fails closed on a PostgreSQL allocation mismatch sent
     }, new Date("2026-07-20T22:00:00.000Z")),
     /POSTGRES_RECOVERY_RESERVATION_ALLOCATION_MISMATCH/
   );
+});
+
+test("recovery terminalizes the observed SMCI-style orphan without a broker mutation and is restart-idempotent", async () => {
+  const calls: Array<{ sql: string; values: readonly unknown[] }> = [];
+  let staleSelections = 0;
+  const brokerLookups: string[] = [];
+  const query: AutonomousPostgresQueryExecutor = {
+    query: async (sql: string, values: readonly unknown[] = []) => {
+      calls.push({ sql, values });
+      if (sql.includes("JOIN candidates candidate") && sql.includes("ready_for_submission")) {
+        staleSelections += 1;
+        return staleSelections === 1
+          ? {
+              rows: [{
+                id: "intent_0b84078e45627788d01518116b420f114638a05a6a1e9989013ec748b0339450",
+                client_order_id: "pg-7d879a1ad4e10e4641e1684d4be81d1e"
+              }],
+              rowCount: 1
+            }
+          : { rows: [], rowCount: 0 };
+      }
+      if (sql.includes("STALE_READY_INTENT_RECOVERY")) {
+        return {
+          rows: [{
+            outcome: "ok",
+            cancelled_count: "1",
+            released_count: "0",
+            adjusted_count: "0"
+          }],
+          rowCount: 1
+        };
+      }
+      if (sql.includes("UPDATE buying_power_reservations")) return { rows: [{ outcome: "ok", expired_reservation_count: "0" }], rowCount: 1 };
+      if (sql.includes("UPDATE order_intents")) return { rows: [], rowCount: 1 };
+      return { rows: [], rowCount: 1 };
+    }
+  };
+  const fence = {
+    jobName: "autonomous-recovery", workstream: "autonomous_recovery", ownerId: "owner", runId: "run", fencingToken: "12"
+  };
+  const getOrderByClientOrderId = async (clientOrderId: string) => {
+      brokerLookups.push(clientOrderId);
+      const error = new Error("order not found") as Error & { status?: number };
+      error.status = 404;
+      throw error;
+  };
+  const first = await runAutonomousPostgresRecovery(
+    query,
+    fence,
+    new Date("2026-07-24T16:00:00.000Z"),
+    { getOrderByClientOrderId }
+  );
+  const restarted = await runAutonomousPostgresRecovery(
+    query,
+    fence,
+    new Date("2026-07-24T16:01:00.000Z"),
+    { getOrderByClientOrderId }
+  );
+
+  assert.equal(first.staleReadyIntents, 1);
+  assert.equal(first.staleReadyCancelled, 1);
+  assert.equal(first.staleReadyReservationsReleased, 0);
+  assert.equal(first.staleReadyAllocationsAdjusted, 0);
+  assert.equal(restarted.staleReadyIntents, 0);
+  assert.equal(restarted.staleReadyCancelled, 0);
+  assert.deepEqual(brokerLookups, ["pg-7d879a1ad4e10e4641e1684d4be81d1e"]);
+
+  const selectionSql = calls.find((entry) =>
+    entry.sql.includes("FROM order_intents intent") &&
+    entry.sql.includes("ready_for_submission")
+  );
+  assert.match(selectionSql?.sql ?? "", /candidate\.decision <> 'selected'/);
+  assert.match(selectionSql?.sql ?? "", /candidate\.lifecycle_status IN/);
+  assert.match(selectionSql?.sql ?? "", /candidate\.as_of <=/);
+  assert.match(selectionSql?.sql ?? "", /review\.expires_at <=/);
+  assert.match(selectionSql?.sql ?? "", /confirmation\.expires_at/);
+  assert.match(selectionSql?.sql ?? "", /reservation\.status/);
+  assert.equal(selectionSql?.values.at(-1), 1_800);
+
+  const recoverySql = calls.find((entry) => entry.sql.includes("STALE_READY_INTENT_RECOVERY"));
+  assert.match(recoverySql?.sql ?? "", /status = 'cancelled'/);
+  assert.match(recoverySql?.sql ?? "", /request_payload = request_payload \|\| jsonb_build_object/);
+  assert.match(recoverySql?.sql ?? "", /'recoveryReason', 'STALE_READY_INTENT_RECOVERY'/);
+  assert.match(recoverySql?.sql ?? "", /UPDATE buying_power_reservations/);
+  assert.match(recoverySql?.sql ?? "", /locked_allocation AS MATERIALIZED/);
+  assert.match(recoverySql?.sql ?? "", /reserved_amount/);
+  assert.match(recoverySql?.sql ?? "", /outcome = 'ok'/);
+  assert.match(recoverySql?.sql ?? "", /NOT EXISTS \(\s*SELECT 1 FROM orders/);
+});
+
+test("stale-ready recovery releases a surviving reservation only with one sufficient allocation", async () => {
+  const query: AutonomousPostgresQueryExecutor = {
+    query: async (sql: string) => {
+      if (sql.includes("JOIN candidates candidate") && sql.includes("ready_for_submission")) {
+        return {
+          rows: [{ id: "intent-active-reservation", client_order_id: "pg-active-reservation" }],
+          rowCount: 1
+        };
+      }
+      if (sql.includes("STALE_READY_INTENT_RECOVERY")) {
+        return {
+          rows: [{
+            outcome: "ok",
+            cancelled_count: "1",
+            released_count: "1",
+            adjusted_count: "1"
+          }],
+          rowCount: 1
+        };
+      }
+      if (sql.includes("UPDATE buying_power_reservations")) {
+        return { rows: [{ outcome: "ok", expired_reservation_count: "0" }], rowCount: 1 };
+      }
+      return { rows: [], rowCount: 0 };
+    }
+  };
+  const notFound = async () => {
+    const error = new Error("order not found") as Error & { status?: number };
+    error.status = 404;
+    throw error;
+  };
+  const result = await runAutonomousPostgresRecovery(query, {
+    jobName: "autonomous-recovery",
+    workstream: "autonomous_recovery",
+    ownerId: "owner",
+    runId: "run",
+    fencingToken: "14"
+  }, new Date("2026-07-24T16:00:00.000Z"), {
+    getOrderByClientOrderId: notFound
+  });
+
+  assert.equal(result.staleReadyCancelled, 1);
+  assert.equal(result.staleReadyReservationsReleased, 1);
+  assert.equal(result.staleReadyAllocationsAdjusted, 1);
+});
+
+test("stale-ready recovery leaves state unchanged when reservation allocation validation fails", async () => {
+  const query: AutonomousPostgresQueryExecutor = {
+    query: async (sql: string) => {
+      if (sql.includes("JOIN candidates candidate") && sql.includes("ready_for_submission")) {
+        return {
+          rows: [{ id: "intent-mismatch", client_order_id: "pg-mismatch" }],
+          rowCount: 1
+        };
+      }
+      if (sql.includes("STALE_READY_INTENT_RECOVERY")) {
+        return {
+          rows: [{
+            outcome: "mismatch",
+            cancelled_count: "0",
+            released_count: "0",
+            adjusted_count: "0"
+          }],
+          rowCount: 1
+        };
+      }
+      return { rows: [], rowCount: 0 };
+    }
+  };
+  const notFound = async () => {
+    const error = new Error("order not found") as Error & { status?: number };
+    error.status = 404;
+    throw error;
+  };
+
+  await assert.rejects(
+    runAutonomousPostgresRecovery(query, {
+      jobName: "autonomous-recovery",
+      workstream: "autonomous_recovery",
+      ownerId: "owner",
+      runId: "run",
+      fencingToken: "15"
+    }, new Date("2026-07-24T16:00:00.000Z"), {
+      getOrderByClientOrderId: notFound
+    }),
+    /POSTGRES_STALE_READY_RESERVATION_ALLOCATION_MISMATCH/
+  );
+});
+
+test("recovery preserves a broker order found for a stale ready intent", async () => {
+  const calls: string[] = [];
+  const query: AutonomousPostgresQueryExecutor = {
+    query: async (sql: string) => {
+      calls.push(sql);
+      if (sql.includes("FROM order_intents intent") && sql.includes("ready_for_submission")) {
+        return { rows: [{ id: "intent-stale-ready", client_order_id: "E2E-stale-ready", reservation_id: "reservation-stale" }], rowCount: 1 };
+      }
+      if (sql.includes("UPDATE buying_power_reservations")) return { rows: [{ outcome: "ok", expired_reservation_count: "0" }], rowCount: 1 };
+      return { rows: [], rowCount: 1 };
+    }
+  };
+  const result = await runAutonomousPostgresRecovery(query, {
+    jobName: "autonomous-recovery", workstream: "autonomous_recovery", ownerId: "owner", runId: "run", fencingToken: "13"
+  }, new Date("2026-07-20T22:00:00.000Z"), {
+    getOrderByClientOrderId: async () => ({ status: 200, requestId: "request-1", data: {
+      id: "broker-1", client_order_id: "E2E-stale-ready", status: "accepted"
+    } } as never)
+  });
+  assert.equal(result.staleReadyIntents, 1);
+  assert.equal(result.staleReadyPreserved, 1);
+  assert.equal(calls.some((sql) => sql.includes("STALE_READY_INTENT_RECOVERY")), false);
 });
 
 test("PostgreSQL recovery persists SHA-256 cancellation audit rows in an isolated schema", {
