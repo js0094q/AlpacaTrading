@@ -29,6 +29,7 @@ type Target = Record<string, unknown> & {
   broker_order_id: string | null;
   reservation_id: string | null;
   strategy_key: string;
+  review_type: "entry" | "exit";
   symbol: string;
   asset_class: "equity" | "option";
   side: "buy" | "sell" | "buy_to_open" | "sell_to_close";
@@ -63,12 +64,13 @@ const optional = (value: unknown) => value === null || value === undefined || va
 const targetsSql = `SELECT intent.id AS order_intent_id, intent.candidate_id,
        intent.account_id,
        intent.client_order_id, broker_order.broker_order_id,
-       intent.reservation_id, intent.strategy_key,
+       intent.reservation_id, intent.strategy_key, review.review_type,
        intent.symbol, intent.asset_class, intent.side, intent.order_type,
        intent.time_in_force, intent.quantity::text, intent.notional::text,
        intent.limit_price::text, intent.status AS intent_status,
        intent.updated_at::text AS intent_updated_at
 FROM order_intents intent
+JOIN execution_reviews review ON review.id = intent.execution_review_id
 LEFT JOIN LATERAL (
   SELECT * FROM orders WHERE order_intent_id = intent.id
   ORDER BY created_at DESC, id DESC LIMIT 1
@@ -85,7 +87,7 @@ const BROKER_ABSENCE_TERMINAL_AGE_MS = 120_000;
 const brokerOrderAbsent = (error: unknown) => {
   const status = Number((error as { status?: unknown } | null)?.status);
   const message = error instanceof Error ? error.message : String(error ?? "");
-  return status === 404 || /\b404\b|order not found/i.test(message);
+  return status === 404 || /\b404\b|order not found|not visible/i.test(message);
 };
 
 type ExternalOrderObservation = {
@@ -781,15 +783,19 @@ export const reconcilePostgresPaperOrders = async (input: {
           now.toISOString(), ...fenceValues(input.fence)]
       );
       const intentStatus = terminalStatuses.has(status) ? "reconciled" : "submitted";
+      const lifecycleState = target.review_type === "exit"
+        ? (status === "partially_filled" ? "exit_partially_filled" : "exit_broker_order_discovered")
+        : (status === "partially_filled" ? "partially_filled" : status === "filled" ? "filled" : "broker_order_accepted");
       const updated = await input.query.query(
         `UPDATE order_intents SET status = $2,
+           lifecycle_state = $5,
            submitted_at = COALESCE(submitted_at, $3),
            terminal_at = CASE WHEN $2 = 'reconciled' THEN $4 ELSE terminal_at END,
            updated_at = $4, version = version + 1
          WHERE id = $1 AND status IN ('submission_pending','submitted','ambiguous')
-           AND ${fenceSql(5)}`,
+           AND ${fenceSql(6)}`,
         [target.order_intent_id, intentStatus, optional(response.data.submitted_at) ?? now.toISOString(),
-          now.toISOString(), ...fenceValues(input.fence)]
+          now.toISOString(), lifecycleState, ...fenceValues(input.fence)]
       );
       if (updated.rowCount !== 1) throw new Error("POSTGRES_RECONCILIATION_INTENT_PERSISTENCE_FAILED");
       if (terminalStatuses.has(status) && target.reservation_id) {
@@ -938,12 +944,23 @@ export const recoverAmbiguousPostgresSubmission = async (input: {
   }
   const lookup = input.getOrderByClientOrderId ?? getPaperOrderByClientOrderId;
   const sleep = input.sleep ?? boundedSleep;
+  let absenceOnly = true;
+  let sawAbsence = false;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     await input.assertFence?.();
     let response: AlpacaApiResponse<AlpacaSubmittedOrder>;
     try {
       response = await lookup(clientOrderId);
-    } catch {
+    } catch (error) {
+      if (brokerOrderAbsent(error)) {
+        sawAbsence = true;
+      } else {
+        absenceOnly = false;
+        const status = Number((error as { status?: unknown } | null)?.status);
+        if (Number.isFinite(status) && status >= 400 && status < 500 && status !== 408 && status !== 429) {
+          throw new Error("POSTGRES_BROKER_SUBMISSION_RECOVERY_DETERMINISTIC_LOOKUP_FAILED");
+        }
+      }
       if (attempt < maxAttempts) {
         await sleep(Math.min(retryDelayMs * (2 ** (attempt - 1)), 5_000));
       }
@@ -990,6 +1007,9 @@ export const recoverAmbiguousPostgresSubmission = async (input: {
       brokerOrderId,
       brokerStatus
     };
+  }
+  if (!sawAbsence || !absenceOnly) {
+    throw new Error("POSTGRES_BROKER_SUBMISSION_RECOVERY_INFRASTRUCTURE_UNRESOLVED");
   }
   return {
     status: "pending" as const,

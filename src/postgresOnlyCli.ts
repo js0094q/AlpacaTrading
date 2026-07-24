@@ -535,8 +535,8 @@ const run = async (scheduledContext?: PostgresScheduledCommandOperationContext) 
           }
         }),
       lifecycleContext: {
-        cycleId: context.fence.runId,
-        workstreamExecutionId: context.fence.workstream
+        cycleId: process.env.AUTONOMOUS_CYCLE_ID?.trim() || context.fence.runId,
+        workstreamExecutionId: context.fence.runId
       },
       fence: context.fence,
       safety: {

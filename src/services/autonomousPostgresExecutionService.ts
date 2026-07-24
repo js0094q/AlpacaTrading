@@ -889,11 +889,15 @@ const recordSubmission = async (
       JSON.stringify(payload), canonicalJsonHash(payload), occurredAt, now.toISOString()
     ]
   );
+  const lifecycleState = intent.review_type === "exit"
+    ? (status === "partially_filled" ? "exit_partially_filled" : "exit_broker_order_discovered")
+    : (status === "partially_filled" ? "partially_filled" : status === "filled" ? "filled" : "broker_order_accepted");
   const updated = await query.query(
     `UPDATE order_intents
-     SET status = 'submitted', submitted_at = $2, updated_at = $2, version = version + 1
-     WHERE id = $1 AND status = 'submission_pending' AND ${fenceSql(3)}`,
-    [intent.order_intent_id, now.toISOString(), ...values]
+     SET status = 'submitted', lifecycle_state = $3,
+         submitted_at = $2, updated_at = $2, version = version + 1
+     WHERE id = $1 AND status = 'submission_pending' AND ${fenceSql(4)}`,
+    [intent.order_intent_id, now.toISOString(), lifecycleState, ...values]
   );
   if (updated.rowCount !== 1) throw new Error("POSTGRES_EXECUTION_RESULT_PERSISTENCE_FAILED");
   if (intent.reservation_id) {
@@ -970,7 +974,7 @@ const recordSubmissionAttempt = async (
   const lifecycleState = intent.review_type === "exit"
     ? "exit_submission_attempt_persisted"
     : "submission_attempt_persisted";
-  await query.query(
+  const lifecycleUpdated = await query.query(
     `UPDATE order_intents
      SET lifecycle_state = $2,
          autonomous_cycle_id = COALESCE($4, autonomous_cycle_id),
@@ -980,6 +984,9 @@ const recordSubmissionAttempt = async (
     [intent.order_intent_id, lifecycleState, now.toISOString(), lifecycleContext?.cycleId ?? null,
       lifecycleContext?.workstreamExecutionId ?? null, ...fenceValues(fence)]
   );
+  if (lifecycleUpdated.rowCount !== 1) {
+    throw new Error("POSTGRES_BROKER_SUBMISSION_ATTEMPT_LIFECYCLE_PERSISTENCE_FAILED");
+  }
 };
 
 const recordAmbiguousSubmission = async (
