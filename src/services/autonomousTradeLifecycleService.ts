@@ -130,12 +130,27 @@ const transitions: Readonly<Record<AutonomousTradeLifecycleState, readonly Auton
   submission_ambiguous: ["broker_order_discovered", "failed_terminal"],
   broker_order_discovered: [
     "broker_order_accepted",
+    "cancelled",
     "rejected",
     "expired",
     "cancel_requested"
   ],
-  broker_order_accepted: ["partially_filled", "filled", "cancel_requested"],
-  partially_filled: ["filled", "position_reconciled", "cancel_requested"],
+  broker_order_accepted: [
+    "partially_filled",
+    "filled",
+    "cancelled",
+    "rejected",
+    "expired",
+    "cancel_requested"
+  ],
+  partially_filled: [
+    "filled",
+    "position_reconciled",
+    "cancelled",
+    "rejected",
+    "expired",
+    "cancel_requested"
+  ],
   filled: ["position_reconciled", "exit_evaluated"],
   position_reconciled: ["exit_evaluated"],
   exit_evaluated: ["exit_review_created", "closed"],
@@ -156,15 +171,23 @@ const transitions: Readonly<Record<AutonomousTradeLifecycleState, readonly Auton
   exit_broker_order_discovered: [
     "exit_partially_filled",
     "closed",
+    "cancelled",
     "rejected",
     "expired",
     "cancel_requested"
   ],
-  exit_partially_filled: ["closed", "cancel_requested"],
+  exit_partially_filled: [
+    "closed",
+    "cancelled",
+    "rejected",
+    "expired",
+    "cancel_requested"
+  ],
   closed: [],
   cancel_requested: [
     "cancel_ambiguous",
     "filled",
+    "exit_broker_order_discovered",
     "rejected",
     "expired",
     "cancelled",
@@ -172,6 +195,7 @@ const transitions: Readonly<Record<AutonomousTradeLifecycleState, readonly Auton
   ],
   cancel_ambiguous: [
     "filled",
+    "exit_broker_order_discovered",
     "rejected",
     "expired",
     "cancelled",
@@ -184,6 +208,28 @@ const transitions: Readonly<Record<AutonomousTradeLifecycleState, readonly Auton
 };
 export const validateLifecycleTransition = (from: AutonomousTradeLifecycleState | string, to: AutonomousTradeLifecycleState | string): void => { if (!(transitions[from as AutonomousTradeLifecycleState]?.includes(to as AutonomousTradeLifecycleState))) throw new Error(`INVALID_LIFECYCLE_TRANSITION:${from}->${to}`); };
 export const isTerminalLifecycleState = (state: AutonomousTradeLifecycleState) => ["closed", "cancelled", "rejected", "expired", "failed_terminal"].includes(state);
+
+export const resolveLifecycleTransitionPath = (
+  fromState: AutonomousTradeLifecycleState,
+  toState: AutonomousTradeLifecycleState
+): readonly AutonomousTradeLifecycleState[] => {
+  if (fromState === toState) return [fromState];
+  const queue: AutonomousTradeLifecycleState[][] = [[fromState]];
+  const visited = new Set<AutonomousTradeLifecycleState>([fromState]);
+  while (queue.length > 0) {
+    const path = queue.shift();
+    if (!path) break;
+    const current = path[path.length - 1]!;
+    for (const next of transitions[current]) {
+      if (visited.has(next)) continue;
+      const candidate = [...path, next];
+      if (next === toState) return candidate;
+      visited.add(next);
+      queue.push(candidate);
+    }
+  }
+  throw new Error(`NO_VALID_LIFECYCLE_PATH:${fromState}->${toState}`);
+};
 
 export const lifecycleStateForBrokerStatus = (
   reviewType: "entry" | "exit",
@@ -203,6 +249,37 @@ export const lifecycleStateForBrokerStatus = (
   return ["accepted", "new", "pending_new", "held"].includes(status)
     ? "broker_order_accepted"
     : "broker_order_discovered";
+};
+
+export const resolveBrokerReconciliationLifecyclePath = (input: {
+  fromState: AutonomousTradeLifecycleState | string;
+  reviewType: "entry" | "exit";
+  brokerStatus: string;
+}): readonly AutonomousTradeLifecycleState[] => {
+  if (
+    !AUTONOMOUS_TRADE_LIFECYCLE_STATES.includes(
+      input.fromState as AutonomousTradeLifecycleState
+    )
+  ) {
+    throw new Error(`UNKNOWN_LIFECYCLE_STATE:${input.fromState}`);
+  }
+  const fromState = input.fromState as AutonomousTradeLifecycleState;
+  const status = input.brokerStatus.trim().toLowerCase();
+  if (
+    input.reviewType === "exit" &&
+    status === "filled" &&
+    fromState === "exit_partially_filled"
+  ) {
+    return [fromState];
+  }
+  if (
+    ["cancel_requested", "cancel_ambiguous"].includes(fromState) &&
+    !["filled", "canceled", "cancelled", "rejected", "expired"].includes(status)
+  ) {
+    return [fromState];
+  }
+  const target = lifecycleStateForBrokerStatus(input.reviewType, status);
+  return resolveLifecycleTransitionPath(fromState, target);
 };
 
 export const autonomousLifecycleContextFromRuntime = (

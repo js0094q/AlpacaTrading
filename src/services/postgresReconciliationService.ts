@@ -9,7 +9,9 @@ import {
   type AlpacaSubmittedOrder
 } from "./alpacaClient.js";
 import { paperSubmitConfiguration } from "./paperSubmitSafetyConfig.js";
-import { lifecycleStateForBrokerStatus } from "./autonomousTradeLifecycleService.js";
+import {
+  resolveBrokerReconciliationLifecyclePath
+} from "./autonomousTradeLifecycleService.js";
 import {
   capturePostgresAuthorityBrokerSnapshot,
   type PostgresAuthorityBrokerSnapshot
@@ -806,14 +808,17 @@ export const reconcilePostgresPaperOrders = async (input: {
       const orderId = `order_${stableRecordId("alpaca_order", `${target.account_id}:${brokerId}`)}`;
       const eventId = `broker_event_${stableRecordId("reconciliation", `${brokerId}:${status}:${occurredAt}`)}`;
       const intentStatus = terminalStatuses.has(status) ? "reconciled" : "submitted";
-      const lifecycleState = (
-        !terminalStatuses.has(status) &&
-        ["cancel_requested", "cancel_ambiguous"].includes(
-          String(target.lifecycle_state ?? "")
-        )
-      )
-        ? target.lifecycle_state
-        : lifecycleStateForBrokerStatus(target.review_type, status);
+      const lifecyclePath = resolveBrokerReconciliationLifecyclePath({
+        fromState: required(
+          target.lifecycle_state,
+          "POSTGRES_RECONCILIATION_LIFECYCLE_STATE_MISSING"
+        ),
+        reviewType: target.review_type,
+        brokerStatus: status
+      });
+      const lifecycleState = lifecyclePath[lifecyclePath.length - 1]!;
+      const lifecycleFromStates = lifecyclePath.slice(0, -1);
+      const lifecycleToStates = lifecyclePath.slice(1);
       const symbol = required(
         response.data.symbol ?? target.symbol,
         "POSTGRES_RECONCILIATION_SYMBOL_MISSING"
@@ -862,8 +867,24 @@ export const reconcilePostgresPaperOrders = async (input: {
                AND current_order_intent.status IN (
                  'submission_pending','submitted','ambiguous','reconciled'
                )
-               AND ${fenceSql(32)}
+               AND ${fenceSql(34)}
              FOR UPDATE
+           ), transition_path AS MATERIALIZED (
+             SELECT transition_path.from_state, transition_path.to_state,
+                    transition_path.ordinal
+             FROM unnest($29::text[], $30::text[]) WITH ORDINALITY
+               AS transition_path(from_state, to_state, ordinal)
+           ), lifecycle_path_guard AS (
+             SELECT 1 AS allowed
+             FROM current_order_intent
+             WHERE (
+               cardinality($29::text[]) = 0
+               AND current_order_intent.lifecycle_state = $28
+             ) OR (
+               cardinality($29::text[]) > 0
+               AND current_order_intent.lifecycle_state = ($29::text[])[1]
+               AND ($30::text[])[cardinality($30::text[])] = $28
+             )
            ), locked_reservation AS MATERIALIZED (
              SELECT reservation.id, reservation.account_id,
                     reservation.strategy_key, reservation.amount
@@ -907,7 +928,7 @@ export const reconcilePostgresPaperOrders = async (input: {
                     NULLIF($5::numeric - $6::numeric, 0)))
            ), persistence_guard AS (
              SELECT 1 AS allowed
-             FROM current_order_intent
+             FROM lifecycle_path_guard
              WHERE $4::numeric = $6::numeric
                 OR EXISTS (
                   SELECT 1 FROM resized WHERE resized.settled_amount > 0
@@ -967,16 +988,19 @@ export const reconcilePostgresPaperOrders = async (input: {
                workstream_execution_id, authorization_snapshot_id,
                evidence, occurred_at
              )
-             SELECT $29, current_order_intent.id,
-                    current_order_intent.lifecycle_state, $28,
-                    current_order_intent.operation, $31,
+             SELECT $31 || ':' || transition_path.ordinal::text,
+                    current_order_intent.id,
+                    transition_path.from_state, transition_path.to_state,
+                    current_order_intent.operation,
+                    $33 || ':' || transition_path.ordinal::text,
                     current_order_intent.autonomous_cycle_id,
                     current_order_intent.workstream_execution_id,
                     current_order_intent.authorization_snapshot_id,
-                    $30::jsonb, $3
+                    $32::jsonb, $3
              FROM current_order_intent
-             WHERE current_order_intent.lifecycle_state <> $28
-               AND EXISTS (SELECT 1 FROM stored_order)
+             CROSS JOIN transition_path
+             WHERE EXISTS (SELECT 1 FROM stored_order)
+             ORDER BY transition_path.ordinal
              ON CONFLICT (order_intent_id, idempotency_key) DO NOTHING
              RETURNING order_intent_id
            ), updated_intent AS (
@@ -991,8 +1015,9 @@ export const reconcilePostgresPaperOrders = async (input: {
              WHERE intent.id = current_order_intent.id
                AND EXISTS (SELECT 1 FROM stored_order)
                AND (
-                 current_order_intent.lifecycle_state = $28
-                 OR EXISTS (SELECT 1 FROM lifecycle_transition)
+                 cardinality($29::text[]) = 0
+                 OR (SELECT COUNT(*) FROM lifecycle_transition) =
+                    cardinality($29::text[])
                )
              RETURNING intent.id
            ), reconciliation_event AS (
@@ -1017,6 +1042,8 @@ export const reconcilePostgresPaperOrders = async (input: {
                AS event_count,
              (SELECT COUNT(*) FROM updated_intent)::text
                AS updated_intent_count,
+             (SELECT COUNT(*) FROM lifecycle_transition)::text
+               AS lifecycle_transition_count,
              (SELECT COUNT(*) FROM partial_reservation)::text
                AS partial_reservation_count,
              (SELECT COUNT(*) FROM adjusted)::text
@@ -1050,6 +1077,8 @@ export const reconcilePostgresPaperOrders = async (input: {
             canonicalJsonHash(raw),
             intentStatus,
             lifecycleState,
+            lifecycleFromStates,
+            lifecycleToStates,
             lifecycleTransitionId,
             JSON.stringify(lifecycleEvidence),
             `broker-reconciliation:${brokerId}:${lifecycleState}`,
@@ -1062,6 +1091,10 @@ export const reconcilePostgresPaperOrders = async (input: {
         const updatedIntentCount = Number(
           partialObservation.rows[0]?.updated_intent_count ?? 0
         );
+        const lifecycleTransitionCount = Number(
+          partialObservation.rows[0]?.lifecycle_transition_count ??
+            lifecycleFromStates.length
+        );
         const partialReservationCount = Number(
           partialObservation.rows[0]?.partial_reservation_count ?? 0
         );
@@ -1073,66 +1106,14 @@ export const reconcilePostgresPaperOrders = async (input: {
         if (
           storedOrderCount !== 1 ||
           updatedIntentCount !== 1 ||
+          lifecycleTransitionCount !== lifecycleFromStates.length ||
           partialReservationCount !== adjustedAllocationCount ||
           partialReservationCount !== (isReplay ? 0 : 1)
         ) {
           throw new Error("POSTGRES_RECONCILIATION_PARTIAL_RESERVATION_FAILED");
         }
       } else {
-        const stored = await input.query.query(
-          `INSERT INTO orders(
-             id, account_id, order_intent_id, broker_order_id, client_order_id,
-             environment, symbol, asset_class, side, order_type, time_in_force,
-             status, quantity, notional, limit_price, filled_quantity,
-             filled_average_price, broker_request_id, submitted_at,
-             last_broker_update_at, raw_status, created_at, updated_at
-           ) SELECT $1, $2, $3, $4, $5, 'paper', $6, $7, $8, $9, $10, $11,
-                    $12, $13, $14, $15, $16, $17, $18, $19, $20::jsonb, $19, $19
-             WHERE ${fenceSql(21)}
-           ON CONFLICT (account_id, client_order_id) DO UPDATE SET
-             broker_order_id = EXCLUDED.broker_order_id,
-             status = EXCLUDED.status, quantity = EXCLUDED.quantity,
-             notional = EXCLUDED.notional, limit_price = EXCLUDED.limit_price,
-             filled_quantity = EXCLUDED.filled_quantity,
-             filled_average_price = EXCLUDED.filled_average_price,
-             broker_request_id = EXCLUDED.broker_request_id,
-             last_broker_update_at = EXCLUDED.last_broker_update_at,
-             raw_status = EXCLUDED.raw_status, version = orders.version + 1,
-             updated_at = EXCLUDED.updated_at`,
-          [
-            orderId, target.account_id, target.order_intent_id, brokerId,
-            clientId, symbol, target.asset_class, target.side,
-            target.order_type, target.time_in_force, status, orderedQuantity,
-            optional(response.data.notional ?? target.notional),
-            optional(response.data.limit_price ?? target.limit_price),
-            filledQuantity, optional(response.data.filled_avg_price),
-            response.requestId ?? null, optional(response.data.submitted_at),
-            new Date(occurredAt).toISOString(), JSON.stringify(raw),
-            ...fenceValues(input.fence)
-          ]
-        );
-        if (stored.rowCount !== 1) {
-          throw new Error("POSTGRES_RECONCILIATION_ORDER_PERSISTENCE_FAILED");
-        }
-        const event = await input.query.query(
-          `INSERT INTO broker_events(
-             event_id, account_id, order_id, order_intent_id, broker_order_id,
-             client_order_id, event_type, event_status, request_id, http_status,
-             response_payload, response_fingerprint, occurred_at, received_at
-           ) SELECT $1, $2, $3, $4, $5, $6, 'reconciliation', $7, $8, $9,
-                    $10::jsonb, $11, $12, $13
-             WHERE ${fenceSql(14)}
-           ON CONFLICT (event_id) DO NOTHING`,
-          [
-            eventId, target.account_id, orderId, target.order_intent_id,
-            brokerId, clientId, status, response.requestId ?? null,
-            response.status, JSON.stringify(raw), canonicalJsonHash(raw),
-            new Date(occurredAt).toISOString(), now.toISOString(),
-            ...fenceValues(input.fence)
-          ]
-        );
-        eventRowCount = event.rowCount ?? 0;
-        const updated = await input.query.query(
+        const observation = await input.query.query(
           `WITH current_order_intent AS MATERIALIZED (
              SELECT current_order_intent.id,
                     current_order_intent.lifecycle_state,
@@ -1141,12 +1122,55 @@ export const reconcilePostgresPaperOrders = async (input: {
                     current_order_intent.workstream_execution_id,
                     current_order_intent.authorization_snapshot_id
              FROM order_intents current_order_intent
-             WHERE current_order_intent.id = $1
+             WHERE current_order_intent.id = $3
                AND current_order_intent.status IN (
                  'submission_pending','submitted','ambiguous','reconciled'
                )
-               AND ${fenceSql(9)}
+               AND ${fenceSql(32)}
              FOR UPDATE
+           ), transition_path AS MATERIALIZED (
+             SELECT transition_path.from_state, transition_path.to_state,
+                    transition_path.ordinal
+             FROM unnest($27::text[], $28::text[]) WITH ORDINALITY
+               AS transition_path(from_state, to_state, ordinal)
+           ), lifecycle_path_guard AS (
+             SELECT 1 AS allowed
+             FROM current_order_intent
+             WHERE (
+               cardinality($27::text[]) = 0
+               AND current_order_intent.lifecycle_state = $26
+             ) OR (
+               cardinality($27::text[]) > 0
+               AND current_order_intent.lifecycle_state = ($27::text[])[1]
+               AND ($28::text[])[cardinality($28::text[])] = $26
+             )
+           ), stored_order AS (
+             INSERT INTO orders(
+               id, account_id, order_intent_id, broker_order_id,
+               client_order_id, environment, symbol, asset_class, side,
+               order_type, time_in_force, status, quantity, notional,
+               limit_price, filled_quantity, filled_average_price,
+               broker_request_id, submitted_at, last_broker_update_at,
+               raw_status, created_at, updated_at
+             )
+             SELECT $1, $2, $3, $4, $5, 'paper', $6, $7, $8, $9,
+                    $10, $11, $12, $13, $14, $15, $16, $17, $18,
+                    $19, $20::jsonb, $19, $19
+             FROM lifecycle_path_guard
+             ON CONFLICT (account_id, client_order_id) DO UPDATE SET
+               broker_order_id = EXCLUDED.broker_order_id,
+               status = EXCLUDED.status,
+               quantity = EXCLUDED.quantity,
+               notional = EXCLUDED.notional,
+               limit_price = EXCLUDED.limit_price,
+               filled_quantity = EXCLUDED.filled_quantity,
+               filled_average_price = EXCLUDED.filled_average_price,
+               broker_request_id = EXCLUDED.broker_request_id,
+               last_broker_update_at = EXCLUDED.last_broker_update_at,
+               raw_status = EXCLUDED.raw_status,
+               version = orders.version + 1,
+               updated_at = EXCLUDED.updated_at
+             RETURNING id
            ), lifecycle_transition AS (
              INSERT INTO autonomous_trade_lifecycle_transitions(
                id, order_intent_id, from_state, to_state, operation,
@@ -1154,51 +1178,115 @@ export const reconcilePostgresPaperOrders = async (input: {
                workstream_execution_id, authorization_snapshot_id,
                evidence, occurred_at
              )
-             SELECT $6, current_order_intent.id,
-                    current_order_intent.lifecycle_state, $5,
-                    current_order_intent.operation, $7,
+             SELECT $29 || ':' || transition_path.ordinal::text,
+                    current_order_intent.id,
+                    transition_path.from_state, transition_path.to_state,
+                    current_order_intent.operation,
+                    $30 || ':' || transition_path.ordinal::text,
                     current_order_intent.autonomous_cycle_id,
                     current_order_intent.workstream_execution_id,
                     current_order_intent.authorization_snapshot_id,
-                    $8::jsonb, $4
+                    $31::jsonb, $24
              FROM current_order_intent
-             WHERE current_order_intent.lifecycle_state <> $5
+             CROSS JOIN transition_path
+             WHERE EXISTS (SELECT 1 FROM stored_order)
+             ORDER BY transition_path.ordinal
              ON CONFLICT (order_intent_id, idempotency_key) DO NOTHING
              RETURNING order_intent_id
            ), updated_intent AS (
              UPDATE order_intents intent
-             SET status = $2, lifecycle_state = $5,
-                 submitted_at = COALESCE(intent.submitted_at, $3),
+             SET status = $25, lifecycle_state = $26,
+                 submitted_at = COALESCE(intent.submitted_at, $18),
                  terminal_at = CASE
-                   WHEN $2 = 'reconciled' THEN $4 ELSE intent.terminal_at
+                   WHEN $25 = 'reconciled' THEN $24 ELSE intent.terminal_at
                  END,
-                 updated_at = $4, version = intent.version + 1
+                 updated_at = $24, version = intent.version + 1
              FROM current_order_intent
              WHERE intent.id = current_order_intent.id
+               AND EXISTS (SELECT 1 FROM stored_order)
                AND (
-                 current_order_intent.lifecycle_state = $5
-                 OR EXISTS (SELECT 1 FROM lifecycle_transition)
+                 cardinality($27::text[]) = 0
+                 OR (SELECT COUNT(*) FROM lifecycle_transition) =
+                    cardinality($27::text[])
                )
              RETURNING intent.id
+           ), reconciliation_event AS (
+             INSERT INTO broker_events(
+               event_id, account_id, order_id, order_intent_id,
+               broker_order_id, client_order_id, event_type, event_status,
+               request_id, http_status, response_payload,
+               response_fingerprint, occurred_at, received_at
+             )
+             SELECT $21, $2, stored_order.id, $3, $4, $5,
+                    'reconciliation', $11, $17, $22, $20::jsonb, $23,
+                    $19, $24
+             FROM stored_order
+             JOIN updated_intent ON updated_intent.id = $3
+             ON CONFLICT (event_id) DO NOTHING
+             RETURNING event_id
            )
-           SELECT (SELECT COUNT(*) FROM updated_intent)::text
-             AS updated_intent_count`,
+           SELECT
+             (SELECT COUNT(*) FROM stored_order)::text
+               AS stored_order_count,
+             (SELECT COUNT(*) FROM reconciliation_event)::text
+               AS event_count,
+             (SELECT COUNT(*) FROM lifecycle_transition)::text
+               AS lifecycle_transition_count,
+             (SELECT COUNT(*) FROM updated_intent)::text
+               AS updated_intent_count`,
           [
+            orderId,
+            target.account_id,
             target.order_intent_id,
-            intentStatus,
-            optional(response.data.submitted_at) ?? now.toISOString(),
+            brokerId,
+            clientId,
+            symbol,
+            target.asset_class,
+            target.side,
+            target.order_type,
+            target.time_in_force,
+            status,
+            orderedQuantity,
+            optional(response.data.notional ?? target.notional),
+            optional(response.data.limit_price ?? target.limit_price),
+            filledQuantity,
+            optional(response.data.filled_avg_price),
+            response.requestId ?? null,
+            optional(response.data.submitted_at),
+            new Date(occurredAt).toISOString(),
+            JSON.stringify(raw),
+            eventId,
+            response.status,
+            canonicalJsonHash(raw),
             now.toISOString(),
+            intentStatus,
             lifecycleState,
+            lifecycleFromStates,
+            lifecycleToStates,
             lifecycleTransitionId,
             `broker-reconciliation:${brokerId}:${lifecycleState}`,
             JSON.stringify(lifecycleEvidence),
             ...fenceValues(input.fence)
           ]
         );
-        const updatedIntentCount = Number(
-          updated.rows[0]?.updated_intent_count ?? updated.rowCount ?? 0
+        const storedOrderCount = Number(
+          observation.rows[0]?.stored_order_count ?? observation.rowCount ?? 0
         );
-        if (updatedIntentCount !== 1) {
+        const updatedIntentCount = Number(
+          observation.rows[0]?.updated_intent_count ?? observation.rowCount ?? 0
+        );
+        const lifecycleTransitionCount = Number(
+          observation.rows[0]?.lifecycle_transition_count ??
+            lifecycleFromStates.length
+        );
+        eventRowCount = Number(
+          observation.rows[0]?.event_count ?? observation.rowCount ?? 0
+        );
+        if (
+          storedOrderCount !== 1 ||
+          updatedIntentCount !== 1 ||
+          lifecycleTransitionCount !== lifecycleFromStates.length
+        ) {
           throw new Error("POSTGRES_RECONCILIATION_INTENT_PERSISTENCE_FAILED");
         }
       }

@@ -146,7 +146,9 @@ test("a worker restart resumes persisted ambiguous submission by exact client id
               quantity: "1",
               notional: null,
               limit_price: null,
-              intent_status: "ambiguous"
+              intent_status: "ambiguous",
+              review_type: "entry",
+              lifecycle_state: "submission_ambiguous"
             }],
             rowCount: 1
           };
@@ -269,9 +271,10 @@ test("HTTP 500 lookup errors mentioning visibility remain infrastructure failure
 
 test("resolved broker submissions are recorded exclusively in PostgreSQL", async () => {
   const sql: string[] = [];
+  let atomicValues: readonly unknown[] = [];
   const result = await reconcilePostgresPaperOrders({
     query: {
-      query: async (statement: string) => {
+      query: async (statement: string, values?: readonly unknown[]) => {
         sql.push(statement);
         if (statement.includes("FROM order_intents intent")) {
           return { rows: [{
@@ -279,8 +282,12 @@ test("resolved broker submissions are recorded exclusively in PostgreSQL", async
             client_order_id: "client-1", broker_order_id: null,
             symbol: "SPY", asset_class: "equity", side: "buy",
             order_type: "market", time_in_force: "day", quantity: null,
-            notional: "1000", limit_price: null, intent_status: "ambiguous"
+            notional: "1000", limit_price: null, intent_status: "ambiguous",
+            review_type: "entry", lifecycle_state: "submission_ambiguous"
           }], rowCount: 1 };
+        }
+        if (statement.includes("INSERT INTO orders")) {
+          atomicValues = values ?? [];
         }
         return { rows: [], rowCount: 1 };
       }
@@ -300,9 +307,26 @@ test("resolved broker submissions are recorded exclusively in PostgreSQL", async
   });
 
   assert.equal(result.recorded, 1);
-  assert.equal(sql.some((statement) => statement.includes("INSERT INTO orders")), true);
-  assert.equal(sql.some((statement) => statement.includes("INSERT INTO broker_events")), true);
-  assert.equal(sql.some((statement) => statement.includes("UPDATE order_intents")), true);
+  const atomicObservation = sql.find((statement) =>
+    statement.includes("INSERT INTO orders") &&
+    statement.includes("INSERT INTO broker_events") &&
+    statement.includes("INSERT INTO autonomous_trade_lifecycle_transitions") &&
+    statement.includes("UPDATE order_intents")
+  );
+  assert.ok(
+    atomicObservation,
+    "order, event, ordered lifecycle audit, and intent must share one statement"
+  );
+  assert.match(atomicObservation, /unnest\([\s\S]*WITH ORDINALITY/);
+  assert.match(atomicObservation, /ORDER BY transition_path\.ordinal/);
+  assert.deepEqual(atomicValues[26], [
+    "submission_ambiguous",
+    "broker_order_discovered"
+  ]);
+  assert.deepEqual(atomicValues[27], [
+    "broker_order_discovered",
+    "broker_order_accepted"
+  ]);
 });
 
 test("terminal cancellation releases the committed reservation without deployed allocation", async () => {
@@ -382,6 +406,8 @@ test("terminal cancellation releases the committed reservation without deployed 
     lifecycle,
     "lifecycle audit append and lifecycle update must share one atomic statement"
   );
+  assert.deepEqual(lifecycle.values[26], ["cancel_ambiguous"]);
+  assert.deepEqual(lifecycle.values[27], ["cancelled"]);
 });
 
 test("terminal fill transfers the reservation into deployed allocation exactly once", async () => {
@@ -398,7 +424,9 @@ test("terminal fill transfers the reservation into deployed allocation exactly o
               reservation_id: "reservation-fill", strategy_key: "baseline",
               symbol: "AAPL", asset_class: "equity", side: "buy",
               order_type: "market", time_in_force: "day", quantity: "1",
-              notional: null, limit_price: null, intent_status: "submitted"
+              notional: null, limit_price: null, intent_status: "submitted",
+              review_type: "entry", lifecycle_state: "broker_order_accepted",
+              prior_filled_quantity: "0"
             }],
             rowCount: 1
           };
@@ -517,11 +545,15 @@ test("partial fill resizes only the remaining reservation and allocation atomica
   assert.match(partial.sql, /INSERT INTO orders/);
   assert.match(partial.sql, /INSERT INTO broker_events/);
   assert.match(partial.sql, /UPDATE order_intents/);
+  assert.match(partial.sql, /unnest\([\s\S]*WITH ORDINALITY/);
+  assert.match(partial.sql, /ORDER BY transition_path\.ordinal/);
   assert.match(partial.sql, /amount = resized\.remaining_amount/);
   assert.match(partial.sql, /reserved_amount = allocation\.reserved_amount - resized\.settled_amount/);
   assert.match(partial.sql, /deployed_amount = allocation\.deployed_amount \+ resized\.settled_amount/);
   assert.doesNotMatch(partial.sql, /reservation_terminal_transitions/);
   assert.deepEqual(partial.values.slice(3, 6), ["4", "10", "0"]);
+  assert.deepEqual(partial.values[28], ["broker_order_accepted"]);
+  assert.deepEqual(partial.values[29], ["partially_filled"]);
 });
 
 test("partial reconciliation rolls back as one statement and replays the same fill exactly once", async () => {

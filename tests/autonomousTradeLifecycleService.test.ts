@@ -8,6 +8,7 @@ import {
   STRATEGY_CLASSIFICATIONS,
   TRADE_OPERATIONS,
   classifyOptionStrategy,
+  resolveBrokerReconciliationLifecyclePath,
   validateCloseOperation,
   validateLifecycleTransition,
   type AutonomousTradeLifecycleService,
@@ -134,6 +135,210 @@ test("permits either cancellation phase to reconcile every actual terminal broke
   }
 });
 
+test("resolves every entry broker observation through maintained ordered lifecycle hops", () => {
+  for (
+    const source of [
+      "submission_attempt_persisted",
+      "submission_ambiguous"
+    ] as const
+  ) {
+    assert.deepEqual(
+      resolveBrokerReconciliationLifecyclePath({
+        fromState: source,
+        reviewType: "entry",
+        brokerStatus: "accepted"
+      }),
+      [source, "broker_order_discovered", "broker_order_accepted"]
+    );
+    assert.deepEqual(
+      resolveBrokerReconciliationLifecyclePath({
+        fromState: source,
+        reviewType: "entry",
+        brokerStatus: "partially_filled"
+      }),
+      [
+        source,
+        "broker_order_discovered",
+        "broker_order_accepted",
+        "partially_filled"
+      ]
+    );
+    assert.deepEqual(
+      resolveBrokerReconciliationLifecyclePath({
+        fromState: source,
+        reviewType: "entry",
+        brokerStatus: "filled"
+      }),
+      [
+        source,
+        "broker_order_discovered",
+        "broker_order_accepted",
+        "filled"
+      ]
+    );
+  }
+  assert.deepEqual(
+    resolveBrokerReconciliationLifecyclePath({
+      fromState: "broker_order_discovered",
+      reviewType: "entry",
+      brokerStatus: "filled"
+    }),
+    ["broker_order_discovered", "broker_order_accepted", "filled"]
+  );
+  assert.deepEqual(
+    resolveBrokerReconciliationLifecyclePath({
+      fromState: "broker_order_accepted",
+      reviewType: "entry",
+      brokerStatus: "partially_filled"
+    }),
+    ["broker_order_accepted", "partially_filled"]
+  );
+  assert.deepEqual(
+    resolveBrokerReconciliationLifecyclePath({
+      fromState: "partially_filled",
+      reviewType: "entry",
+      brokerStatus: "filled"
+    }),
+    ["partially_filled", "filled"]
+  );
+});
+
+test("resolves every exit broker observation without prematurely closing the position", () => {
+  for (
+    const source of [
+      "exit_submission_attempt_persisted",
+      "exit_submission_ambiguous"
+    ] as const
+  ) {
+    assert.deepEqual(
+      resolveBrokerReconciliationLifecyclePath({
+        fromState: source,
+        reviewType: "exit",
+        brokerStatus: "accepted"
+      }),
+      [source, "exit_broker_order_discovered"]
+    );
+    assert.deepEqual(
+      resolveBrokerReconciliationLifecyclePath({
+        fromState: source,
+        reviewType: "exit",
+        brokerStatus: "partially_filled"
+      }),
+      [
+        source,
+        "exit_broker_order_discovered",
+        "exit_partially_filled"
+      ]
+    );
+    assert.deepEqual(
+      resolveBrokerReconciliationLifecyclePath({
+        fromState: source,
+        reviewType: "exit",
+        brokerStatus: "filled"
+      }),
+      [source, "exit_broker_order_discovered"]
+    );
+  }
+  assert.deepEqual(
+    resolveBrokerReconciliationLifecyclePath({
+      fromState: "exit_partially_filled",
+      reviewType: "exit",
+      brokerStatus: "filled"
+    }),
+    ["exit_partially_filled"],
+    "position reconciliation, not order reconciliation, closes the exit"
+  );
+});
+
+test("resolves canceled, rejected, and expired observations from every persisted broker phase", () => {
+  const entrySources = [
+    "submission_attempt_persisted",
+    "submission_ambiguous",
+    "broker_order_discovered",
+    "broker_order_accepted",
+    "partially_filled"
+  ] as const;
+  const exitSources = [
+    "exit_submission_attempt_persisted",
+    "exit_submission_ambiguous",
+    "exit_broker_order_discovered",
+    "exit_partially_filled"
+  ] as const;
+  for (
+    const [brokerStatus, terminalState] of [
+      ["canceled", "cancelled"],
+      ["rejected", "rejected"],
+      ["expired", "expired"]
+    ] as const
+  ) {
+    for (const fromState of entrySources) {
+      const path = resolveBrokerReconciliationLifecyclePath({
+        fromState,
+        reviewType: "entry",
+        brokerStatus
+      });
+      assert.equal(path[0], fromState);
+      assert.equal(path[path.length - 1], terminalState);
+      for (let index = 1; index < path.length; index += 1) {
+        assert.doesNotThrow(() =>
+          validateLifecycleTransition(path[index - 1]!, path[index]!)
+        );
+      }
+    }
+    for (const fromState of exitSources) {
+      const path = resolveBrokerReconciliationLifecyclePath({
+        fromState,
+        reviewType: "exit",
+        brokerStatus
+      });
+      assert.equal(path[0], fromState);
+      assert.equal(path[path.length - 1], terminalState);
+      for (let index = 1; index < path.length; index += 1) {
+        assert.doesNotThrow(() =>
+          validateLifecycleTransition(path[index - 1]!, path[index]!)
+        );
+      }
+    }
+  }
+});
+
+test("resolves cancellation fills by review semantics and terminal broker outcomes by audit edge", () => {
+  for (const source of ["cancel_requested", "cancel_ambiguous"] as const) {
+    assert.deepEqual(
+      resolveBrokerReconciliationLifecyclePath({
+        fromState: source,
+        reviewType: "entry",
+        brokerStatus: "filled"
+      }),
+      [source, "filled"]
+    );
+    assert.deepEqual(
+      resolveBrokerReconciliationLifecyclePath({
+        fromState: source,
+        reviewType: "exit",
+        brokerStatus: "filled"
+      }),
+      [source, "exit_broker_order_discovered"]
+    );
+    for (
+      const [brokerStatus, lifecycleState] of [
+        ["canceled", "cancelled"],
+        ["rejected", "rejected"],
+        ["expired", "expired"]
+      ] as const
+    ) {
+      assert.deepEqual(
+        resolveBrokerReconciliationLifecyclePath({
+          fromState: source,
+          reviewType: "exit",
+          brokerStatus
+        }),
+        [source, lifecycleState]
+      );
+    }
+  }
+});
+
 test("migration 006 contains durable lifecycle lineage and terminal transition tables", async () => {
   const sql = await readFile(new URL("../src/lib/database/migrations/006_autonomous_trade_lifecycle.sql", import.meta.url), "utf8");
   assert.match(sql, /ALTER TABLE order_intents/i);
@@ -218,6 +423,75 @@ test("migration 006 contains durable lifecycle lineage and terminal transition t
       assert.match(
         sql,
         new RegExp(`\\('${source}','${outcome}'\\)`)
+      );
+    }
+  }
+  const brokerPaths = [
+    ["submission_ambiguous", "broker_order_discovered"],
+    ["exit_submission_ambiguous", "exit_broker_order_discovered"],
+    ["cancel_requested", "exit_broker_order_discovered"],
+    ["cancel_ambiguous", "exit_broker_order_discovered"]
+  ] as const;
+  for (const [fromState, toState] of brokerPaths) {
+    assert.match(
+      sql,
+      new RegExp(`\\('${fromState}','${toState}'\\)`)
+    );
+  }
+  const parityScenarios = [
+    ...[
+      "submission_attempt_persisted",
+      "submission_ambiguous",
+      "broker_order_discovered"
+    ].flatMap((fromState) =>
+      ["accepted", "partially_filled", "filled"].map((brokerStatus) => ({
+        fromState,
+        reviewType: "entry" as const,
+        brokerStatus
+      }))
+    ),
+    ...[
+      "exit_submission_attempt_persisted",
+      "exit_submission_ambiguous"
+    ].flatMap((fromState) =>
+      ["accepted", "partially_filled", "filled"].map((brokerStatus) => ({
+        fromState,
+        reviewType: "exit" as const,
+        brokerStatus
+      }))
+    ),
+    ...[
+      "submission_attempt_persisted",
+      "submission_ambiguous",
+      "broker_order_discovered",
+      "broker_order_accepted",
+      "partially_filled"
+    ].flatMap((fromState) =>
+      ["canceled", "rejected", "expired"].map((brokerStatus) => ({
+        fromState,
+        reviewType: "entry" as const,
+        brokerStatus
+      }))
+    ),
+    ...[
+      "exit_submission_attempt_persisted",
+      "exit_submission_ambiguous",
+      "exit_broker_order_discovered",
+      "exit_partially_filled"
+    ].flatMap((fromState) =>
+      ["canceled", "rejected", "expired"].map((brokerStatus) => ({
+        fromState,
+        reviewType: "exit" as const,
+        brokerStatus
+      }))
+    )
+  ];
+  for (const scenario of parityScenarios) {
+    const path = resolveBrokerReconciliationLifecyclePath(scenario);
+    for (let index = 1; index < path.length; index += 1) {
+      assert.match(
+        sql,
+        new RegExp(`\\('${path[index - 1]}','${path[index]}'\\)`)
       );
     }
   }

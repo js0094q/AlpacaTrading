@@ -139,6 +139,30 @@ CREATE TABLE IF NOT EXISTS autonomous_trade_lifecycle_transitions (
 );
 CREATE OR REPLACE FUNCTION enforce_autonomous_lifecycle_transition() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
+  IF NEW.from_state IS NOT NULL AND EXISTS (
+    SELECT 1
+    FROM (VALUES
+      ('submission_ambiguous','broker_order_discovered'),
+      ('broker_order_discovered','cancelled'),
+      ('broker_order_accepted','cancelled'),
+      ('broker_order_accepted','rejected'),
+      ('broker_order_accepted','expired'),
+      ('partially_filled','cancelled'),
+      ('partially_filled','rejected'),
+      ('partially_filled','expired'),
+      ('exit_submission_ambiguous','exit_broker_order_discovered'),
+      ('exit_broker_order_discovered','cancelled'),
+      ('exit_partially_filled','cancelled'),
+      ('exit_partially_filled','rejected'),
+      ('exit_partially_filled','expired'),
+      ('cancel_requested','exit_broker_order_discovered'),
+      ('cancel_ambiguous','exit_broker_order_discovered')
+    ) AS additional_edges(from_state,to_state)
+    WHERE additional_edges.from_state = NEW.from_state
+      AND additional_edges.to_state = NEW.to_state
+  ) THEN
+    RETURN NEW;
+  END IF;
   IF NEW.from_state IS NOT NULL AND NOT EXISTS (SELECT 1 FROM (VALUES
     ('candidate_created','review_created'),('review_created','confirmed'),('confirmed','ready_for_submission'),('ready_for_submission','submission_attempt_persisted'),('submission_attempt_persisted','submission_ambiguous'),('submission_attempt_persisted','broker_order_discovered'),('submission_attempt_persisted','cancelled'),('submission_attempt_persisted','rejected'),('submission_attempt_persisted','expired'),('broker_order_discovered','broker_order_accepted'),('broker_order_discovered','rejected'),('broker_order_discovered','expired'),('broker_order_accepted','partially_filled'),('broker_order_accepted','filled'),('partially_filled','filled'),('partially_filled','position_reconciled'),('filled','position_reconciled'),('position_reconciled','exit_evaluated'),('exit_evaluated','exit_review_created'),('exit_review_created','exit_confirmed'),('exit_confirmed','exit_ready_for_submission'),('exit_ready_for_submission','exit_submission_attempt_persisted'),('exit_submission_attempt_persisted','exit_submission_ambiguous'),('exit_submission_attempt_persisted','exit_broker_order_discovered'),('exit_submission_attempt_persisted','cancelled'),('exit_submission_attempt_persisted','rejected'),('exit_submission_attempt_persisted','expired'),('exit_broker_order_discovered','exit_partially_filled'),('exit_broker_order_discovered','closed'),('exit_broker_order_discovered','rejected'),('exit_broker_order_discovered','expired'),('exit_partially_filled','closed'),('ready_for_submission','cancel_requested'),('broker_order_discovered','cancel_requested'),('broker_order_accepted','cancel_requested'),('partially_filled','cancel_requested'),('exit_ready_for_submission','cancel_requested'),('exit_broker_order_discovered','cancel_requested'),('exit_partially_filled','cancel_requested'),('cancel_requested','cancel_ambiguous'),('cancel_requested','filled'),('cancel_requested','rejected'),('cancel_requested','expired'),('cancel_requested','cancelled'),('cancel_requested','failed_terminal'),('cancel_ambiguous','filled'),('cancel_ambiguous','rejected'),('cancel_ambiguous','expired'),('cancel_ambiguous','cancelled'),('cancel_ambiguous','failed_terminal')) AS edges(from_state,to_state) WHERE edges.from_state=NEW.from_state AND edges.to_state=NEW.to_state) THEN
     RAISE EXCEPTION 'INVALID_LIFECYCLE_TRANSITION:%->%', NEW.from_state, NEW.to_state USING ERRCODE='23514';
