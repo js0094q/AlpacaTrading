@@ -245,7 +245,7 @@ const autonomousConstraintDefinitions: Readonly<Record<string, { readonly table:
   lifecycle_transition_from_state_contract: { table: "autonomous_trade_lifecycle_transitions", fragments: ["from_state", "candidate_created"] },
   lifecycle_transition_to_state_contract: { table: "autonomous_trade_lifecycle_transitions", fragments: ["to_state", "candidate_created"] },
   lifecycle_transition_operation_contract: { table: "autonomous_trade_lifecycle_transitions", fragments: ["operation", "buy_to_open"] },
-  reservation_terminal_state_contract: { table: "reservation_terminal_transitions", fragments: ["terminal_state", "cancelled"] },
+  reservation_terminal_state_contract: { table: "reservation_terminal_transitions", fragments: ["terminal_state", "filled", "cancelled"] },
   reservation_release_reason_nonempty: { table: "reservation_terminal_transitions", fragments: ["release_reason", "btrim"] },
   reservation_release_reason_contract: {
     table: "reservation_terminal_transitions",

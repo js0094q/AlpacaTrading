@@ -799,36 +799,63 @@ export const reconcilePostgresPaperOrders = async (input: {
       );
       if (updated.rowCount !== 1) throw new Error("POSTGRES_RECONCILIATION_INTENT_PERSISTENCE_FAILED");
       if (terminalStatuses.has(status) && target.reservation_id) {
+        const reservationTerminalState = status === "canceled"
+          ? "cancelled"
+          : status;
+        const reservationReleaseReason = status === "filled"
+          ? "broker_terminal_filled"
+          : status === "canceled" || status === "cancelled"
+            ? "broker_terminal_cancelled"
+            : status === "rejected"
+              ? "broker_terminal_rejected"
+              : "broker_terminal_expired";
+        const terminalTransitionId = `reservation_transition_${stableRecordId(
+          "reservation_terminal",
+          `${target.reservation_id}:${reservationTerminalState}`
+        )}`;
         const reservation = await input.query.query(
           `WITH released AS (
              UPDATE buying_power_reservations reservation
              SET status = 'released', released_at = $3,
-                 release_reason = 'broker_terminal:' || $2,
+                 release_reason = $5,
                  updated_at = $3, version = reservation.version + 1
              WHERE reservation.id = $1
                AND reservation.status IN ('active', 'committed')
-               AND ${fenceSql(4)}
+               AND ${fenceSql(8)}
              RETURNING reservation.account_id, reservation.strategy_key,
                        reservation.amount
            ), adjusted AS (
              UPDATE strategy_allocations allocation
              SET reserved_amount = GREATEST(0, allocation.reserved_amount - released.amount),
                  deployed_amount = allocation.deployed_amount +
-                   CASE WHEN $2 = 'filled' THEN released.amount ELSE 0 END,
+                   CASE WHEN $4 = 'filled' THEN released.amount ELSE 0 END,
                  updated_at = $3, version = allocation.version + 1
              FROM released
              WHERE allocation.account_id = released.account_id
                AND allocation.strategy_key = released.strategy_key
                AND allocation.status = 'active' AND allocation.effective_to IS NULL
              RETURNING allocation.id
+           ), terminal_transition AS (
+             INSERT INTO reservation_terminal_transitions(
+               id, reservation_id, order_intent_id, terminal_state,
+               release_reason, idempotency_key, occurred_at
+             )
+             SELECT $6, $1, $2, $4, $5, $7, $3 FROM released
+             ON CONFLICT (reservation_id) DO NOTHING
+             RETURNING id
            )
            SELECT
              (SELECT COUNT(*) FROM released)::text AS released_reservation_count,
-             (SELECT COUNT(*) FROM adjusted)::text AS adjusted_allocation_count`,
+             (SELECT COUNT(*) FROM adjusted)::text AS adjusted_allocation_count,
+             (SELECT COUNT(*) FROM terminal_transition)::text AS terminal_transition_count`,
           [
             target.reservation_id,
-            status,
+            target.order_intent_id,
             now.toISOString(),
+            reservationTerminalState,
+            reservationReleaseReason,
+            terminalTransitionId,
+            `${target.order_intent_id}:${reservationTerminalState}`,
             ...fenceValues(input.fence)
           ]
         );
@@ -838,7 +865,14 @@ export const reconcilePostgresPaperOrders = async (input: {
         const adjustedCount = Number(
           reservation.rows[0]?.adjusted_allocation_count ?? 0
         );
-        if (releasedCount !== 1 || adjustedCount !== 1) {
+        const terminalTransitionCount = Number(
+          reservation.rows[0]?.terminal_transition_count ?? 0
+        );
+        if (
+          releasedCount !== 1 ||
+          adjustedCount !== 1 ||
+          terminalTransitionCount !== 1
+        ) {
           throw new Error("POSTGRES_RECONCILIATION_RESERVATION_RELEASE_FAILED");
         }
       }

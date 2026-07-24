@@ -100,6 +100,7 @@ test("migration 006 contains durable lifecycle lineage and terminal transition t
   assert.match(sql, /INVALID_LIFECYCLE_TRANSITION/i);
   assert.match(sql, /reservation_release_reason_contract/i);
   assert.match(sql, /reservation_terminal_transitions_append_only/i);
+  assert.match(sql, /terminal_state IN \('filled','cancelled','rejected','expired','closed','failed_terminal'\)/i);
   assert.doesNotMatch(
     sql,
     /WHEN\s+status\s*=\s*'submitted'\s+THEN\s+'broker_order_accepted'/i

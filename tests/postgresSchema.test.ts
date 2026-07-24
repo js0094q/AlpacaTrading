@@ -149,7 +149,7 @@ const poolWith = (options: {
                   : conname === "lifecycle_transition_operation_contract"
                     ? "CHECK ((operation IS NULL) OR (operation = ANY (ARRAY['buy_to_open'::text])))"
                   : conname === "reservation_terminal_state_contract"
-                    ? "CHECK (terminal_state = ANY (ARRAY['cancelled'::text]))"
+                    ? "CHECK (terminal_state = ANY (ARRAY['filled'::text, 'cancelled'::text]))"
                   : conname === "reservation_release_reason_nonempty"
                     ? "CHECK (btrim(release_reason) <> ''::text)"
                   : conname === "reservation_release_reason_contract"

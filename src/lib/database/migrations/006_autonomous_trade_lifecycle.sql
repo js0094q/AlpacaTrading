@@ -156,7 +156,7 @@ CREATE INDEX IF NOT EXISTS autonomous_trade_lifecycle_transitions_intent_idx ON 
 CREATE TABLE IF NOT EXISTS reservation_terminal_transitions (
   id text PRIMARY KEY, reservation_id text NOT NULL REFERENCES buying_power_reservations(id), order_intent_id text REFERENCES order_intents(id),
   terminal_state text NOT NULL, release_reason text NOT NULL, idempotency_key text NOT NULL, occurred_at timestamptz NOT NULL DEFAULT now(),
-  CONSTRAINT reservation_terminal_state_contract CHECK (terminal_state IN ('cancelled','rejected','expired','closed','failed_terminal')),
+  CONSTRAINT reservation_terminal_state_contract CHECK (terminal_state IN ('filled','cancelled','rejected','expired','closed','failed_terminal')),
   CONSTRAINT reservation_release_reason_nonempty CHECK (btrim(release_reason) <> ''),
   CONSTRAINT reservation_release_reason_contract CHECK (release_reason IN (
     'broker_terminal_filled','broker_terminal_cancelled','broker_terminal_rejected',

@@ -326,7 +326,11 @@ test("terminal cancellation releases the committed reservation without deployed 
         }
         if (sql.includes("released_reservation_count")) {
           return {
-            rows: [{ released_reservation_count: "1", adjusted_allocation_count: "1" }],
+            rows: [{
+              released_reservation_count: "1",
+              adjusted_allocation_count: "1",
+              terminal_transition_count: "1"
+            }],
             rowCount: 1
           };
         }
@@ -365,7 +369,9 @@ test("terminal cancellation releases the committed reservation without deployed 
   assert.ok(release);
   assert.match(release.sql, /status = 'released'/);
   assert.match(release.sql, /deployed_amount = allocation\.deployed_amount/);
-  assert.equal(release.values[1], "canceled");
+  assert.match(release.sql, /INSERT INTO reservation_terminal_transitions/);
+  assert.equal(release.values[3], "cancelled");
+  assert.equal(release.values[4], "broker_terminal_cancelled");
 });
 
 test("terminal fill transfers the reservation into deployed allocation exactly once", async () => {
@@ -389,7 +395,11 @@ test("terminal fill transfers the reservation into deployed allocation exactly o
         }
         if (sql.includes("released_reservation_count")) {
           return {
-            rows: [{ released_reservation_count: "1", adjusted_allocation_count: "1" }],
+            rows: [{
+              released_reservation_count: "1",
+              adjusted_allocation_count: "1",
+              terminal_transition_count: "1"
+            }],
             rowCount: 1
           };
         }
@@ -413,8 +423,9 @@ test("terminal fill transfers the reservation into deployed allocation exactly o
 
   const release = statements.find((sql) => sql.includes("released_reservation_count"));
   assert.ok(release);
-  assert.match(release, /CASE WHEN \$2 = 'filled' THEN released\.amount/);
+  assert.match(release, /CASE WHEN \$4 = 'filled' THEN released\.amount/);
   assert.match(release, /reservation\.status IN \('active', 'committed'\)/);
+  assert.match(release, /INSERT INTO reservation_terminal_transitions/);
 });
 
 test("an externally originated broker order is observed without fabricating an intent", async () => {
