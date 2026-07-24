@@ -168,6 +168,16 @@ export const POSTGRES_RELEASE_3_CONSTRAINTS = [
   "option_contracts_evidence_object"
 ] as const;
 
+/** Migration-006 constraints are registered separately from the release-3 verifier. */
+export const POSTGRES_AUTONOMOUS_LIFECYCLE_CONSTRAINTS = [
+  "order_intents_operation_contract",
+  "order_intents_strategy_classification_contract",
+  "order_intents_lifecycle_state_contract",
+  "lifecycle_transition_to_state_contract",
+  "lifecycle_transition_operation_contract",
+  "reservation_terminal_state_contract"
+] as const;
+
 export const POSTGRES_RELEASE_3_NOT_NULL_COLUMNS = [
   "candidates.decision_id",
   "option_contracts.evidence"
