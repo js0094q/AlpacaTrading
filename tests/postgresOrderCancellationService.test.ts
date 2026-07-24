@@ -579,6 +579,56 @@ test("failure to persist the pre-mutation attempt marker performs zero DELETEs",
   assert.equal(cancelCalls, 0);
 });
 
+test("malformed or mixed pre-mutation marker counts fail closed before DELETE", async () => {
+  const malformedCounts = [
+    {},
+    { transition_count: null, updated_intent_count: "1", event_count: "1" },
+    { transition_count: "2", updated_intent_count: "1", event_count: "1" },
+    { transition_count: "-1", updated_intent_count: "0", event_count: "0" },
+    { transition_count: "1.0", updated_intent_count: "1", event_count: "1" },
+    { transition_count: "1", updated_intent_count: "0", event_count: "1" }
+  ];
+  for (const counts of malformedCounts) {
+    let cancelCalls = 0;
+    await assert.rejects(
+      runPostgresPaperOrderCancellation({
+        query: {
+          query: async (sql: string) => {
+            if (sql.includes("FROM orders broker_order")) {
+              return {
+                rows: [{
+                  order_id: "order-1",
+                  order_intent_id: "intent-1",
+                  account_id: "account-1",
+                  broker_order_id: "broker-order-1",
+                  client_order_id: "E2E-CANCEL-20260723",
+                  status: "accepted",
+                  lifecycle_state: "cancel_requested"
+                }],
+                rowCount: 1
+              };
+            }
+            if (sql.includes("AS transition_count")) return { rows: [counts], rowCount: 1 };
+            return { rows: [], rowCount: 1 };
+          }
+        },
+        fence,
+        brokerOrderId: "broker-order-1",
+        confirmPaper: true,
+        safety: paperSafety,
+        assertFence: async () => undefined,
+        getOrderById: async () => brokerOrder("accepted") as never,
+        cancelOrder: async () => {
+          cancelCalls += 1;
+          return { data: null, status: 204, url: "paper" };
+        }
+      }),
+      /POSTGRES_CANCEL_AMBIGUITY_PERSISTENCE_FAILED/
+    );
+    assert.equal(cancelCalls, 0);
+  }
+});
+
 test("fence loss after the durable attempt marker leaves lookup-only behavior", async () => {
   let cancelCalls = 0;
   let fenceChecks = 0;

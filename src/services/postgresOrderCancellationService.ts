@@ -382,10 +382,20 @@ export const runPostgresPaperOrderCancellation = async (input: {
       if (!ambiguousResult) {
         throw new Error("POSTGRES_CANCEL_AMBIGUITY_PERSISTENCE_FAILED");
       }
-      const transitionCount = Number(ambiguousResult.transition_count ?? 0);
-      const updatedIntentCount = Number(ambiguousResult.updated_intent_count ?? 0);
-      const eventCount = Number(ambiguousResult.event_count ?? 0);
-      if (![transitionCount, updatedIntentCount, eventCount].every(Number.isFinite)) {
+      const parseCount = (value: unknown) => {
+        if (typeof value === "number" && Number.isInteger(value) && (value === 0 || value === 1)) {
+          return value;
+        }
+        if (typeof value === "string" && /^[01]$/.test(value)) return Number(value);
+        throw new Error("POSTGRES_CANCEL_AMBIGUITY_PERSISTENCE_FAILED");
+      };
+      const transitionCount = parseCount(ambiguousResult.transition_count);
+      const updatedIntentCount = parseCount(ambiguousResult.updated_intent_count);
+      const eventCount = parseCount(ambiguousResult.event_count);
+      if (!(
+        (transitionCount === 0 && updatedIntentCount === 0 && eventCount === 0) ||
+        (transitionCount === 1 && updatedIntentCount === 1 && eventCount === 1)
+      )) {
         throw new Error("POSTGRES_CANCEL_AMBIGUITY_PERSISTENCE_FAILED");
       }
       // Only the transaction that inserted the transition/event owns the
