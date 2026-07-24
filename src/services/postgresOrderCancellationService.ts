@@ -75,6 +75,17 @@ const defaultSleep = async (delayMs: number) => {
   await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
 };
 
+const assertCurrentFence = async (
+  query: CancellationQuery,
+  fence: SchedulerFence
+) => {
+  const result = await query.query(
+    `SELECT 1 AS current_fence WHERE ${fenceSql(1)}`,
+    fenceValues(fence)
+  );
+  if (result.rowCount !== 1) throw new Error("SCHEDULER_FENCE_LOST");
+};
+
 const assertSafety = (safety: CancellationSafety, confirmPaper: boolean) => {
   if (safety.environment !== "paper" || safety.tradingMode !== "paper") {
     throw new Error("PAPER_RUNTIME_REQUIRED");
@@ -102,6 +113,7 @@ export const runPostgresPaperOrderCancellation = async (input: {
   maxRecoveryAttempts?: number;
   recoveryDelayMs?: number;
   sleep?: (delayMs: number) => Promise<void>;
+  assertFence?: () => Promise<void>;
 }) => {
   const safety = input.safety ?? paperSubmitConfiguration();
   assertSafety(safety, input.confirmPaper);
@@ -167,6 +179,8 @@ export const runPostgresPaperOrderCancellation = async (input: {
     DEFAULT_CANCEL_RECOVERY_ATTEMPTS;
   const recoveryDelayMs = input.recoveryDelayMs ??
     DEFAULT_CANCEL_RECOVERY_DELAY_MS;
+  const assertFence = input.assertFence ??
+    (() => assertCurrentFence(input.query, input.fence));
   if (
     !Number.isSafeInteger(maxRecoveryAttempts) ||
     maxRecoveryAttempts < 1 ||
@@ -278,7 +292,11 @@ export const runPostgresPaperOrderCancellation = async (input: {
         throw new Error("POSTGRES_CANCEL_REQUEST_PERSISTENCE_FAILED");
       }
 
+    }
+
+    if (lifecycleState !== "cancel_ambiguous") {
       let mutationError: unknown = null;
+      await assertFence();
       try {
         await (input.cancelOrder ?? cancelPaperOrder)(expectedBrokerId);
       } catch (error) {
@@ -374,9 +392,9 @@ export const runPostgresPaperOrderCancellation = async (input: {
       }
     }
 
-    let recoveredObservation = false;
     let lastLookupError: unknown = null;
     for (let attempt = 1; attempt <= maxRecoveryAttempts; attempt += 1) {
+      await assertFence();
       try {
         const observed = await getByClient(expectedClientId);
         if (
@@ -390,7 +408,7 @@ export const runPostgresPaperOrderCancellation = async (input: {
           throw new Error("POSTGRES_CANCEL_RECOVERY_IDENTITY_MISMATCH");
         }
         after = observed;
-        recoveredObservation = true;
+        lastLookupError = null;
         const observedStatus = required(
           observed.data.status,
           "POSTGRES_CANCEL_BROKER_STATUS_MISSING"
@@ -415,7 +433,7 @@ export const runPostgresPaperOrderCancellation = async (input: {
         await (input.sleep ?? defaultSleep)(delay);
       }
     }
-    if (!recoveredObservation && lastLookupError) {
+    if (lastLookupError) {
       throw new Error(
         "POSTGRES_CANCEL_RECOVERY_INFRASTRUCTURE_UNRESOLVED",
         { cause: lastLookupError }
@@ -497,7 +515,10 @@ export const runAutonomousPostgresPaperOrderCancellation = async (input: {
            'new', 'accepted', 'pending_new', 'partially_filled', 'held',
            'pending_replace', 'pending_cancel'
          )
-         AND COALESCE(broker_order.filled_quantity, 0) = 0
+         AND (
+           broker_order.quantity IS NULL
+           OR COALESCE(broker_order.filled_quantity, 0) < broker_order.quantity
+         )
          AND (
            broker_order.submitted_at <=
              $1::timestamptz - ($2::integer * interval '1 minute')

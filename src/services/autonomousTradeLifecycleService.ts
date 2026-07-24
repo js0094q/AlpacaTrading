@@ -162,8 +162,21 @@ const transitions: Readonly<Record<AutonomousTradeLifecycleState, readonly Auton
   ],
   exit_partially_filled: ["closed", "cancel_requested"],
   closed: [],
-  cancel_requested: ["cancel_ambiguous", "cancelled", "expired"],
-  cancel_ambiguous: ["cancelled", "expired", "failed_terminal"],
+  cancel_requested: [
+    "cancel_ambiguous",
+    "filled",
+    "rejected",
+    "expired",
+    "cancelled",
+    "failed_terminal"
+  ],
+  cancel_ambiguous: [
+    "filled",
+    "rejected",
+    "expired",
+    "cancelled",
+    "failed_terminal"
+  ],
   cancelled: [],
   rejected: [],
   expired: [],

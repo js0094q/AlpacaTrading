@@ -86,6 +86,12 @@ WHERE intent.environment = 'paper'
     OR (
       intent.status = 'reconciled'
       AND intent.reservation_id IS NOT NULL
+      AND EXISTS (
+        SELECT 1
+        FROM buying_power_reservations reservation
+        WHERE reservation.id = intent.reservation_id
+          AND reservation.status IN ('active', 'committed')
+      )
       AND NOT EXISTS (
         SELECT 1
         FROM reservation_terminal_transitions transition
@@ -798,52 +804,7 @@ export const reconcilePostgresPaperOrders = async (input: {
         "POSTGRES_RECONCILIATION_TIMESTAMP_MISSING"
       );
       const orderId = `order_${stableRecordId("alpaca_order", `${target.account_id}:${brokerId}`)}`;
-      const stored = await input.query.query(
-        `INSERT INTO orders(
-           id, account_id, order_intent_id, broker_order_id, client_order_id,
-           environment, symbol, asset_class, side, order_type, time_in_force,
-           status, quantity, notional, limit_price, filled_quantity,
-           filled_average_price, broker_request_id, submitted_at,
-           last_broker_update_at, raw_status, created_at, updated_at
-         ) SELECT $1, $2, $3, $4, $5, 'paper', $6, $7, $8, $9, $10, $11,
-                  $12, $13, $14, $15, $16, $17, $18, $19, $20::jsonb, $19, $19
-           WHERE ${fenceSql(21)}
-         ON CONFLICT (account_id, client_order_id) DO UPDATE SET
-           broker_order_id = EXCLUDED.broker_order_id,
-           status = EXCLUDED.status, quantity = EXCLUDED.quantity,
-           notional = EXCLUDED.notional, limit_price = EXCLUDED.limit_price,
-           filled_quantity = EXCLUDED.filled_quantity,
-           filled_average_price = EXCLUDED.filled_average_price,
-           broker_request_id = EXCLUDED.broker_request_id,
-           last_broker_update_at = EXCLUDED.last_broker_update_at,
-           raw_status = EXCLUDED.raw_status, version = orders.version + 1,
-           updated_at = EXCLUDED.updated_at`,
-        [orderId, target.account_id, target.order_intent_id, brokerId, clientId,
-          required(response.data.symbol ?? target.symbol, "POSTGRES_RECONCILIATION_SYMBOL_MISSING"),
-          target.asset_class, target.side, target.order_type, target.time_in_force,
-          status, optional(response.data.qty ?? target.quantity),
-          optional(response.data.notional ?? target.notional),
-          optional(response.data.limit_price ?? target.limit_price),
-          optional(response.data.filled_qty) ?? "0", optional(response.data.filled_avg_price),
-          response.requestId ?? null, optional(response.data.submitted_at),
-          new Date(occurredAt).toISOString(), JSON.stringify(raw), ...fenceValues(input.fence)]
-      );
-      if (stored.rowCount !== 1) throw new Error("POSTGRES_RECONCILIATION_ORDER_PERSISTENCE_FAILED");
       const eventId = `broker_event_${stableRecordId("reconciliation", `${brokerId}:${status}:${occurredAt}`)}`;
-      const event = await input.query.query(
-        `INSERT INTO broker_events(
-           event_id, account_id, order_id, order_intent_id, broker_order_id,
-           client_order_id, event_type, event_status, request_id, http_status,
-           response_payload, response_fingerprint, occurred_at, received_at
-         ) SELECT $1, $2, $3, $4, $5, $6, 'reconciliation', $7, $8, $9,
-                  $10::jsonb, $11, $12, $13
-           WHERE ${fenceSql(14)}
-         ON CONFLICT (event_id) DO NOTHING`,
-        [eventId, target.account_id, orderId, target.order_intent_id, brokerId,
-          clientId, status, response.requestId ?? null, response.status,
-          JSON.stringify(raw), canonicalJsonHash(raw), new Date(occurredAt).toISOString(),
-          now.toISOString(), ...fenceValues(input.fence)]
-      );
       const intentStatus = terminalStatuses.has(status) ? "reconciled" : "submitted";
       const lifecycleState = (
         !terminalStatuses.has(status) &&
@@ -853,23 +814,27 @@ export const reconcilePostgresPaperOrders = async (input: {
       )
         ? target.lifecycle_state
         : lifecycleStateForBrokerStatus(target.review_type, status);
-      const updated = await input.query.query(
-        `UPDATE order_intents SET status = $2,
-           lifecycle_state = $5,
-           submitted_at = COALESCE(submitted_at, $3),
-           terminal_at = CASE WHEN $2 = 'reconciled' THEN $4 ELSE terminal_at END,
-           updated_at = $4, version = version + 1
-         WHERE id = $1
-           AND status IN ('submission_pending','submitted','ambiguous','reconciled')
-           AND ${fenceSql(6)}`,
-        [target.order_intent_id, intentStatus, optional(response.data.submitted_at) ?? now.toISOString(),
-          now.toISOString(), lifecycleState, ...fenceValues(input.fence)]
+      const symbol = required(
+        response.data.symbol ?? target.symbol,
+        "POSTGRES_RECONCILIATION_SYMBOL_MISSING"
       );
-      if (updated.rowCount !== 1) throw new Error("POSTGRES_RECONCILIATION_INTENT_PERSISTENCE_FAILED");
+      const filledQuantity = optional(response.data.filled_qty) ?? "0";
+      const orderedQuantity = optional(response.data.qty ?? target.quantity);
+      const priorFilledQuantity = optional(target.prior_filled_quantity) ?? "0";
+      const lifecycleEvidence = {
+        source: "broker_reconciliation",
+        brokerOrderId: brokerId,
+        clientOrderId: clientId,
+        brokerStatus: status,
+        occurredAt: new Date(occurredAt).toISOString()
+      };
+      const lifecycleTransitionId = `lifecycle_transition_${stableRecordId(
+        "broker_reconciliation",
+        `${target.order_intent_id}:${lifecycleState}:${brokerId}`
+      )}`;
+      let eventRowCount = 0;
+
       if (status === "partially_filled" && target.reservation_id) {
-        const filledQuantity = optional(response.data.filled_qty) ?? "0";
-        const orderedQuantity = optional(response.data.qty ?? target.quantity);
-        const priorFilledQuantity = optional(target.prior_filled_quantity) ?? "0";
         const filled = Number(filledQuantity);
         const ordered = Number(orderedQuantity);
         const priorFilled = Number(priorFilledQuantity);
@@ -879,19 +844,33 @@ export const reconcilePostgresPaperOrders = async (input: {
           !Number.isFinite(priorFilled) ||
           ordered <= 0 ||
           priorFilled < 0 ||
-          filled <= priorFilled ||
+          filled < priorFilled ||
           filled >= ordered
         ) {
           throw new Error("POSTGRES_RECONCILIATION_PARTIAL_QUANTITY_INVALID");
         }
-        const partialReservation = await input.query.query(
-          `WITH locked_reservation AS MATERIALIZED (
+        const partialObservation = await input.query.query(
+          `WITH current_order_intent AS MATERIALIZED (
+             SELECT current_order_intent.id,
+                    current_order_intent.lifecycle_state,
+                    current_order_intent.operation,
+                    current_order_intent.autonomous_cycle_id,
+                    current_order_intent.workstream_execution_id,
+                    current_order_intent.authorization_snapshot_id
+             FROM order_intents current_order_intent
+             WHERE current_order_intent.id = $2
+               AND current_order_intent.status IN (
+                 'submission_pending','submitted','ambiguous','reconciled'
+               )
+               AND ${fenceSql(32)}
+             FOR UPDATE
+           ), locked_reservation AS MATERIALIZED (
              SELECT reservation.id, reservation.account_id,
                     reservation.strategy_key, reservation.amount
              FROM buying_power_reservations reservation
              WHERE reservation.id = $1
                AND reservation.status IN ('active', 'committed')
-               AND ${fenceSql(7)}
+               AND EXISTS (SELECT 1 FROM current_order_intent)
              FOR UPDATE
            ), locked_allocation AS MATERIALIZED (
              SELECT allocation.id, allocation.account_id,
@@ -926,6 +905,40 @@ export const reconcilePostgresPaperOrders = async (input: {
                  (reservation.amount *
                    (($5::numeric - $4::numeric) /
                     NULLIF($5::numeric - $6::numeric, 0)))
+           ), persistence_guard AS (
+             SELECT 1 AS allowed
+             FROM current_order_intent
+             WHERE $4::numeric = $6::numeric
+                OR EXISTS (
+                  SELECT 1 FROM resized WHERE resized.settled_amount > 0
+                )
+           ), stored_order AS (
+             INSERT INTO orders(
+               id, account_id, order_intent_id, broker_order_id,
+               client_order_id, environment, symbol, asset_class, side,
+               order_type, time_in_force, status, quantity, notional,
+               limit_price, filled_quantity, filled_average_price,
+               broker_request_id, submitted_at, last_broker_update_at,
+               raw_status, created_at, updated_at
+             )
+             SELECT $7, $8, $2, $9, $10, 'paper', $11, $12, $13,
+                    $14, $15, $16, $5, $17, $18, $4, $19, $20,
+                    $21, $22, $23::jsonb, $22, $22
+             FROM persistence_guard
+             ON CONFLICT (account_id, client_order_id) DO UPDATE SET
+               broker_order_id = EXCLUDED.broker_order_id,
+               status = EXCLUDED.status,
+               quantity = EXCLUDED.quantity,
+               notional = EXCLUDED.notional,
+               limit_price = EXCLUDED.limit_price,
+               filled_quantity = EXCLUDED.filled_quantity,
+               filled_average_price = EXCLUDED.filled_average_price,
+               broker_request_id = EXCLUDED.broker_request_id,
+               last_broker_update_at = EXCLUDED.last_broker_update_at,
+               raw_status = EXCLUDED.raw_status,
+               version = orders.version + 1,
+               updated_at = EXCLUDED.updated_at
+             RETURNING id
            ), partial_reservation AS (
              UPDATE buying_power_reservations reservation
              SET amount = resized.remaining_amount,
@@ -933,6 +946,7 @@ export const reconcilePostgresPaperOrders = async (input: {
              FROM resized
              WHERE reservation.id = resized.id
                AND resized.settled_amount > 0
+               AND EXISTS (SELECT 1 FROM stored_order)
              RETURNING resized.account_id, resized.strategy_key,
                        resized.settled_amount
            ), adjusted AS (
@@ -946,8 +960,63 @@ export const reconcilePostgresPaperOrders = async (input: {
                AND allocation.status = 'active'
                AND allocation.effective_to IS NULL
              RETURNING allocation.id
+           ), lifecycle_transition AS (
+             INSERT INTO autonomous_trade_lifecycle_transitions(
+               id, order_intent_id, from_state, to_state, operation,
+               idempotency_key, autonomous_cycle_id,
+               workstream_execution_id, authorization_snapshot_id,
+               evidence, occurred_at
+             )
+             SELECT $29, current_order_intent.id,
+                    current_order_intent.lifecycle_state, $28,
+                    current_order_intent.operation, $31,
+                    current_order_intent.autonomous_cycle_id,
+                    current_order_intent.workstream_execution_id,
+                    current_order_intent.authorization_snapshot_id,
+                    $30::jsonb, $3
+             FROM current_order_intent
+             WHERE current_order_intent.lifecycle_state <> $28
+               AND EXISTS (SELECT 1 FROM stored_order)
+             ON CONFLICT (order_intent_id, idempotency_key) DO NOTHING
+             RETURNING order_intent_id
+           ), updated_intent AS (
+             UPDATE order_intents intent
+             SET status = $27, lifecycle_state = $28,
+                 submitted_at = COALESCE(intent.submitted_at, $21),
+                 terminal_at = CASE
+                   WHEN $27 = 'reconciled' THEN $3 ELSE intent.terminal_at
+                 END,
+                 updated_at = $3, version = intent.version + 1
+             FROM current_order_intent
+             WHERE intent.id = current_order_intent.id
+               AND EXISTS (SELECT 1 FROM stored_order)
+               AND (
+                 current_order_intent.lifecycle_state = $28
+                 OR EXISTS (SELECT 1 FROM lifecycle_transition)
+               )
+             RETURNING intent.id
+           ), reconciliation_event AS (
+             INSERT INTO broker_events(
+               event_id, account_id, order_id, order_intent_id,
+               broker_order_id, client_order_id, event_type, event_status,
+               request_id, http_status, response_payload,
+               response_fingerprint, occurred_at, received_at
+             )
+             SELECT $24, $8, stored_order.id, $2, $9, $10,
+                    'reconciliation', $16, $20, $25, $23::jsonb, $26,
+                    $22, $3
+             FROM stored_order
+             JOIN updated_intent ON updated_intent.id = $2
+             ON CONFLICT (event_id) DO NOTHING
+             RETURNING event_id
            )
            SELECT
+             (SELECT COUNT(*) FROM stored_order)::text
+               AS stored_order_count,
+             (SELECT COUNT(*) FROM reconciliation_event)::text
+               AS event_count,
+             (SELECT COUNT(*) FROM updated_intent)::text
+               AS updated_intent_count,
              (SELECT COUNT(*) FROM partial_reservation)::text
                AS partial_reservation_count,
              (SELECT COUNT(*) FROM adjusted)::text
@@ -959,20 +1028,178 @@ export const reconcilePostgresPaperOrders = async (input: {
             filledQuantity,
             orderedQuantity,
             priorFilledQuantity,
+            orderId,
+            target.account_id,
+            brokerId,
+            clientId,
+            symbol,
+            target.asset_class,
+            target.side,
+            target.order_type,
+            target.time_in_force,
+            status,
+            optional(response.data.notional ?? target.notional),
+            optional(response.data.limit_price ?? target.limit_price),
+            optional(response.data.filled_avg_price),
+            response.requestId ?? null,
+            optional(response.data.submitted_at),
+            new Date(occurredAt).toISOString(),
+            JSON.stringify(raw),
+            eventId,
+            response.status,
+            canonicalJsonHash(raw),
+            intentStatus,
+            lifecycleState,
+            lifecycleTransitionId,
+            JSON.stringify(lifecycleEvidence),
+            `broker-reconciliation:${brokerId}:${lifecycleState}`,
             ...fenceValues(input.fence)
           ]
         );
+        const storedOrderCount = Number(
+          partialObservation.rows[0]?.stored_order_count ?? 0
+        );
+        const updatedIntentCount = Number(
+          partialObservation.rows[0]?.updated_intent_count ?? 0
+        );
         const partialReservationCount = Number(
-          partialReservation.rows[0]?.partial_reservation_count ?? 0
+          partialObservation.rows[0]?.partial_reservation_count ?? 0
         );
         const adjustedAllocationCount = Number(
-          partialReservation.rows[0]?.adjusted_allocation_count ?? 0
+          partialObservation.rows[0]?.adjusted_allocation_count ?? 0
         );
+        eventRowCount = Number(partialObservation.rows[0]?.event_count ?? 0);
+        const isReplay = filled === priorFilled;
         if (
+          storedOrderCount !== 1 ||
+          updatedIntentCount !== 1 ||
           partialReservationCount !== adjustedAllocationCount ||
-          partialReservationCount > 1
+          partialReservationCount !== (isReplay ? 0 : 1)
         ) {
           throw new Error("POSTGRES_RECONCILIATION_PARTIAL_RESERVATION_FAILED");
+        }
+      } else {
+        const stored = await input.query.query(
+          `INSERT INTO orders(
+             id, account_id, order_intent_id, broker_order_id, client_order_id,
+             environment, symbol, asset_class, side, order_type, time_in_force,
+             status, quantity, notional, limit_price, filled_quantity,
+             filled_average_price, broker_request_id, submitted_at,
+             last_broker_update_at, raw_status, created_at, updated_at
+           ) SELECT $1, $2, $3, $4, $5, 'paper', $6, $7, $8, $9, $10, $11,
+                    $12, $13, $14, $15, $16, $17, $18, $19, $20::jsonb, $19, $19
+             WHERE ${fenceSql(21)}
+           ON CONFLICT (account_id, client_order_id) DO UPDATE SET
+             broker_order_id = EXCLUDED.broker_order_id,
+             status = EXCLUDED.status, quantity = EXCLUDED.quantity,
+             notional = EXCLUDED.notional, limit_price = EXCLUDED.limit_price,
+             filled_quantity = EXCLUDED.filled_quantity,
+             filled_average_price = EXCLUDED.filled_average_price,
+             broker_request_id = EXCLUDED.broker_request_id,
+             last_broker_update_at = EXCLUDED.last_broker_update_at,
+             raw_status = EXCLUDED.raw_status, version = orders.version + 1,
+             updated_at = EXCLUDED.updated_at`,
+          [
+            orderId, target.account_id, target.order_intent_id, brokerId,
+            clientId, symbol, target.asset_class, target.side,
+            target.order_type, target.time_in_force, status, orderedQuantity,
+            optional(response.data.notional ?? target.notional),
+            optional(response.data.limit_price ?? target.limit_price),
+            filledQuantity, optional(response.data.filled_avg_price),
+            response.requestId ?? null, optional(response.data.submitted_at),
+            new Date(occurredAt).toISOString(), JSON.stringify(raw),
+            ...fenceValues(input.fence)
+          ]
+        );
+        if (stored.rowCount !== 1) {
+          throw new Error("POSTGRES_RECONCILIATION_ORDER_PERSISTENCE_FAILED");
+        }
+        const event = await input.query.query(
+          `INSERT INTO broker_events(
+             event_id, account_id, order_id, order_intent_id, broker_order_id,
+             client_order_id, event_type, event_status, request_id, http_status,
+             response_payload, response_fingerprint, occurred_at, received_at
+           ) SELECT $1, $2, $3, $4, $5, $6, 'reconciliation', $7, $8, $9,
+                    $10::jsonb, $11, $12, $13
+             WHERE ${fenceSql(14)}
+           ON CONFLICT (event_id) DO NOTHING`,
+          [
+            eventId, target.account_id, orderId, target.order_intent_id,
+            brokerId, clientId, status, response.requestId ?? null,
+            response.status, JSON.stringify(raw), canonicalJsonHash(raw),
+            new Date(occurredAt).toISOString(), now.toISOString(),
+            ...fenceValues(input.fence)
+          ]
+        );
+        eventRowCount = event.rowCount ?? 0;
+        const updated = await input.query.query(
+          `WITH current_order_intent AS MATERIALIZED (
+             SELECT current_order_intent.id,
+                    current_order_intent.lifecycle_state,
+                    current_order_intent.operation,
+                    current_order_intent.autonomous_cycle_id,
+                    current_order_intent.workstream_execution_id,
+                    current_order_intent.authorization_snapshot_id
+             FROM order_intents current_order_intent
+             WHERE current_order_intent.id = $1
+               AND current_order_intent.status IN (
+                 'submission_pending','submitted','ambiguous','reconciled'
+               )
+               AND ${fenceSql(9)}
+             FOR UPDATE
+           ), lifecycle_transition AS (
+             INSERT INTO autonomous_trade_lifecycle_transitions(
+               id, order_intent_id, from_state, to_state, operation,
+               idempotency_key, autonomous_cycle_id,
+               workstream_execution_id, authorization_snapshot_id,
+               evidence, occurred_at
+             )
+             SELECT $6, current_order_intent.id,
+                    current_order_intent.lifecycle_state, $5,
+                    current_order_intent.operation, $7,
+                    current_order_intent.autonomous_cycle_id,
+                    current_order_intent.workstream_execution_id,
+                    current_order_intent.authorization_snapshot_id,
+                    $8::jsonb, $4
+             FROM current_order_intent
+             WHERE current_order_intent.lifecycle_state <> $5
+             ON CONFLICT (order_intent_id, idempotency_key) DO NOTHING
+             RETURNING order_intent_id
+           ), updated_intent AS (
+             UPDATE order_intents intent
+             SET status = $2, lifecycle_state = $5,
+                 submitted_at = COALESCE(intent.submitted_at, $3),
+                 terminal_at = CASE
+                   WHEN $2 = 'reconciled' THEN $4 ELSE intent.terminal_at
+                 END,
+                 updated_at = $4, version = intent.version + 1
+             FROM current_order_intent
+             WHERE intent.id = current_order_intent.id
+               AND (
+                 current_order_intent.lifecycle_state = $5
+                 OR EXISTS (SELECT 1 FROM lifecycle_transition)
+               )
+             RETURNING intent.id
+           )
+           SELECT (SELECT COUNT(*) FROM updated_intent)::text
+             AS updated_intent_count`,
+          [
+            target.order_intent_id,
+            intentStatus,
+            optional(response.data.submitted_at) ?? now.toISOString(),
+            now.toISOString(),
+            lifecycleState,
+            lifecycleTransitionId,
+            `broker-reconciliation:${brokerId}:${lifecycleState}`,
+            JSON.stringify(lifecycleEvidence),
+            ...fenceValues(input.fence)
+          ]
+        );
+        const updatedIntentCount = Number(
+          updated.rows[0]?.updated_intent_count ?? updated.rowCount ?? 0
+        );
+        if (updatedIntentCount !== 1) {
+          throw new Error("POSTGRES_RECONCILIATION_INTENT_PERSISTENCE_FAILED");
         }
       }
       if (terminalStatuses.has(status) && target.reservation_id) {
@@ -1099,7 +1326,7 @@ export const reconcilePostgresPaperOrders = async (input: {
           throw new Error("POSTGRES_RECONCILIATION_RESERVATION_RELEASE_FAILED");
         }
       }
-      if (event.rowCount === 0) result.replayed += 1;
+      if (eventRowCount === 0) result.replayed += 1;
       else result.recorded += 1;
       result.orders.push({
         orderId,

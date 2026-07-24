@@ -319,7 +319,9 @@ test("terminal cancellation releases the committed reservation without deployed 
               reservation_id: "reservation-cancel", strategy_key: "baseline",
               symbol: "AAPL", asset_class: "equity", side: "buy",
               order_type: "limit", time_in_force: "day", quantity: "1",
-              notional: null, limit_price: "1", intent_status: "submitted"
+              notional: null, limit_price: "1", intent_status: "submitted",
+              lifecycle_state: "cancel_ambiguous",
+              prior_filled_quantity: "0"
             }],
             rowCount: 1
           };
@@ -372,6 +374,14 @@ test("terminal cancellation releases the committed reservation without deployed 
   assert.match(release.sql, /INSERT INTO reservation_terminal_transitions/);
   assert.equal(release.values[3], "cancelled");
   assert.equal(release.values[4], "broker_terminal_cancelled");
+  const lifecycle = statements.find(({ sql }) =>
+    sql.includes("UPDATE order_intents") &&
+    sql.includes("INSERT INTO autonomous_trade_lifecycle_transitions")
+  );
+  assert.ok(
+    lifecycle,
+    "lifecycle audit append and lifecycle update must share one atomic statement"
+  );
 });
 
 test("terminal fill transfers the reservation into deployed allocation exactly once", async () => {
@@ -462,6 +472,9 @@ test("partial fill resizes only the remaining reservation and allocation atomica
         if (sql.includes("partial_reservation_count")) {
           return {
             rows: [{
+              stored_order_count: "1",
+              event_count: "1",
+              updated_intent_count: "1",
               partial_reservation_count: "1",
               adjusted_allocation_count: "1"
             }],
@@ -501,11 +514,125 @@ test("partial fill resizes only the remaining reservation and allocation atomica
   );
   assert.ok(partial);
   assert.match(partial.sql, /UPDATE buying_power_reservations/);
+  assert.match(partial.sql, /INSERT INTO orders/);
+  assert.match(partial.sql, /INSERT INTO broker_events/);
+  assert.match(partial.sql, /UPDATE order_intents/);
   assert.match(partial.sql, /amount = resized\.remaining_amount/);
   assert.match(partial.sql, /reserved_amount = allocation\.reserved_amount - resized\.settled_amount/);
   assert.match(partial.sql, /deployed_amount = allocation\.deployed_amount \+ resized\.settled_amount/);
   assert.doesNotMatch(partial.sql, /reservation_terminal_transitions/);
   assert.deepEqual(partial.values.slice(3, 6), ["4", "10", "0"]);
+});
+
+test("partial reconciliation rolls back as one statement and replays the same fill exactly once", async () => {
+  let committedFilledQuantity = "0";
+  let settlementCount = 0;
+  let failAtomicWrite = true;
+  const query = {
+    query: async (sql: string) => {
+      if (sql.includes("FROM order_intents intent")) {
+        return {
+          rows: [{
+            order_intent_id: "intent-partial-restart",
+            account_id: "account-1",
+            client_order_id: "client-partial-restart",
+            broker_order_id: "broker-partial-restart",
+            reservation_id: "reservation-partial-restart",
+            strategy_key: "baseline",
+            review_type: "entry",
+            symbol: "AAPL",
+            asset_class: "equity",
+            side: "buy",
+            order_type: "limit",
+            time_in_force: "day",
+            quantity: "10",
+            notional: null,
+            limit_price: "100",
+            intent_status: "submitted",
+            lifecycle_state: committedFilledQuantity === "0"
+              ? "broker_order_accepted"
+              : "partially_filled",
+            prior_filled_quantity: committedFilledQuantity
+          }],
+          rowCount: 1
+        };
+      }
+      if (sql.includes("partial_reservation_count")) {
+        assert.match(sql, /INSERT INTO orders/);
+        assert.match(sql, /INSERT INTO broker_events/);
+        assert.match(sql, /UPDATE order_intents/);
+        if (failAtomicWrite) {
+          failAtomicWrite = false;
+          throw new Error("injected atomic persistence failure");
+        }
+        if (committedFilledQuantity === "0") {
+          committedFilledQuantity = "4";
+          settlementCount += 1;
+          return {
+            rows: [{
+              stored_order_count: "1",
+              event_count: "1",
+              updated_intent_count: "1",
+              partial_reservation_count: "1",
+              adjusted_allocation_count: "1"
+            }],
+            rowCount: 1
+          };
+        }
+        return {
+          rows: [{
+            stored_order_count: "1",
+            event_count: "0",
+            updated_intent_count: "1",
+            partial_reservation_count: "0",
+            adjusted_allocation_count: "0"
+          }],
+          rowCount: 1
+        };
+      }
+      return { rows: [], rowCount: 1 };
+    }
+  };
+  const run = () => reconcilePostgresPaperOrders({
+    query,
+    fence,
+    syncBrokerState: false,
+    now: new Date("2026-07-20T22:00:00.000Z"),
+    getOrderByClientOrderId: async () => ({
+      status: 200,
+      data: {
+        id: "broker-partial-restart",
+        client_order_id: "client-partial-restart",
+        symbol: "AAPL",
+        asset_class: "us_equity",
+        side: "buy",
+        type: "limit",
+        time_in_force: "day",
+        status: "partially_filled",
+        qty: "10",
+        limit_price: "100",
+        filled_qty: "4",
+        filled_avg_price: "99",
+        submitted_at: "2026-07-20T21:59:00.000Z",
+        updated_at: "2026-07-20T21:59:30.000Z"
+      }
+    }) as never
+  });
+
+  const failed = await run();
+  assert.equal(failed.partial, 0);
+  assert.match(failed.errors[0]?.code ?? "", /injected atomic persistence failure/);
+  assert.equal(committedFilledQuantity, "0");
+
+  const resumed = await run();
+  assert.equal(resumed.partial, 1);
+  assert.equal(resumed.errors.length, 0);
+  assert.equal(settlementCount, 1);
+
+  const replayed = await run();
+  assert.equal(replayed.partial, 1);
+  assert.equal(replayed.errors.length, 0);
+  assert.equal(settlementCount, 1);
 });
 
 test("terminal reservation settlement is a successful replay after its unique transition exists", async () => {
@@ -657,8 +784,12 @@ test("restart can reselect a reconciled intent whose terminal reservation settle
   );
   assert.match(selection ?? "", /intent\.status = 'reconciled'/);
   assert.match(selection ?? "", /reservation_terminal_transitions/);
+  assert.match(
+    selection ?? "",
+    /buying_power_reservations[\s\S]*status IN \('active', 'committed'\)/
+  );
   const intentUpdate = statements.find((sql) =>
-    sql.includes("UPDATE order_intents SET status")
+    sql.includes("UPDATE order_intents")
   );
   assert.match(intentUpdate ?? "", /'reconciled'/);
 });

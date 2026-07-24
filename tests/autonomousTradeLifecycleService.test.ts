@@ -117,6 +117,23 @@ test("permits cancellation only from maintained nonterminal entry and exit state
   }
 });
 
+test("permits either cancellation phase to reconcile every actual terminal broker outcome", () => {
+  const terminalOutcomes = [
+    "filled",
+    "rejected",
+    "expired",
+    "cancelled",
+    "failed_terminal"
+  ] as const;
+  for (const source of ["cancel_requested", "cancel_ambiguous"] as const) {
+    for (const outcome of terminalOutcomes) {
+      assert.doesNotThrow(() =>
+        validateLifecycleTransition(source, outcome)
+      );
+    }
+  }
+});
+
 test("migration 006 contains durable lifecycle lineage and terminal transition tables", async () => {
   const sql = await readFile(new URL("../src/lib/database/migrations/006_autonomous_trade_lifecycle.sql", import.meta.url), "utf8");
   assert.match(sql, /ALTER TABLE order_intents/i);
@@ -187,5 +204,21 @@ test("migration 006 contains durable lifecycle lineage and terminal transition t
       sql,
       new RegExp(`\\('${source}','cancel_requested'\\)`)
     );
+  }
+  for (const source of ["cancel_requested", "cancel_ambiguous"]) {
+    for (
+      const outcome of [
+        "filled",
+        "rejected",
+        "expired",
+        "cancelled",
+        "failed_terminal"
+      ]
+    ) {
+      assert.match(
+        sql,
+        new RegExp(`\\('${source}','${outcome}'\\)`)
+      );
+    }
   }
 });
