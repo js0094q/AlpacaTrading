@@ -73,7 +73,10 @@ const observedExitOptionContract = (optionSymbol: string) => {
       ? "standard_long_put"
       : "standard_long_call",
     opening_contract_id: `contract-${optionSymbol}`,
-    opening_authorization_snapshot_id: `opening-snapshot-${optionSymbol}`
+    opening_authorization_snapshot_id: `opening-snapshot-${optionSymbol}`,
+    allocation_id: "allocation-baseline",
+    allocation_status: "active",
+    allocation_effective_to: null
   };
 };
 
@@ -962,6 +965,8 @@ test("exit review evaluates existing thresholds against PostgreSQL position and 
             symbol: "SPY", order_symbol: "SPY", asset_class: "equity",
             side: "long", available_quantity: "2", average_entry_price: "500",
             strategy_key: "baseline", account_id: "account-1",
+            allocation_id: "allocation-baseline",
+            allocation_status: "active", allocation_effective_to: null,
             account_snapshot_id: "snapshot-1", snapshot_fingerprint: "portfolio-fingerprint",
             structural_fingerprint: "structural-fingerprint", market_price: "550",
             market_timestamp: "2026-07-20T21:59:30.000Z", market_request_id: "sip-request"
@@ -1005,6 +1010,8 @@ test("exit review maps a short equity exit to buy-to-cover", async () => {
               symbol: "AAPL", order_symbol: "AAPL", asset_class: "equity",
               side: "short", available_quantity: "1", average_entry_price: "200",
               strategy_key: "baseline", account_id: "account-1",
+              allocation_id: "allocation-baseline",
+              allocation_status: "active", allocation_effective_to: null,
               account_snapshot_id: "snapshot-1", snapshot_fingerprint: "portfolio-fingerprint",
               structural_fingerprint: "structural-fingerprint", market_price: "180",
               market_timestamp: "2026-07-20T21:59:30.000Z", market_request_id: "sip-request"
@@ -1075,6 +1082,9 @@ test("exit review uses the opening allocation key when candidate family differs 
               available_quantity: "2",
               average_entry_price: "500",
               strategy_key: "baseline-v1",
+              allocation_id: "allocation-baseline-v1",
+              allocation_status: "active",
+              allocation_effective_to: null,
               account_id: "account-1",
               account_snapshot_id: "snapshot-1",
               snapshot_fingerprint: "portfolio-fingerprint",
@@ -1118,10 +1128,11 @@ test("exit review uses the opening allocation key when candidate family differs 
   assert.match(sourceSql, /opening_intent\.strategy_key AS strategy_key/);
   assert.match(
     sourceSql,
-    /allocation\.strategy_key = opening_intent\.strategy_key/
+    /strategy_allocation\.strategy_key = opening_intent\.strategy_key/
   );
-  assert.match(sourceSql, /allocation\.status = 'active'/);
-  assert.match(sourceSql, /allocation\.effective_to IS NULL/);
+  assert.match(sourceSql, /strategy_allocation\.status = 'active'/);
+  assert.match(sourceSql, /strategy_allocation\.effective_to IS NULL/);
+  assert.match(sourceSql, /allocation\.id AS allocation_id/);
   assert.doesNotMatch(
     sourceSql,
     /COALESCE\(candidate\.strategy_family, allocation\.strategy_key\)/
@@ -1154,6 +1165,76 @@ test("exit source excludes closing positions and positions with an active close 
     /close_intent\.lifecycle_state NOT IN \(\s*'closed','cancelled','rejected','expired','failed_terminal'\s*\)/
   );
 });
+
+for (const [label, allocationEvidence] of [
+  [
+    "missing",
+    {
+      allocation_id: null,
+      allocation_status: null,
+      allocation_effective_to: null
+    }
+  ],
+  [
+    "inactive",
+    {
+      allocation_id: "allocation-old",
+      allocation_status: "superseded",
+      allocation_effective_to: "2026-07-19T22:00:00.000Z"
+    }
+  ]
+] as const) {
+  test(`exit review fails closed when the opening strategy allocation is ${label}`, async () => {
+    let sourceSql = "";
+    await assert.rejects(
+      runPostgresReviewWorkflow({
+        command: "paper:exit:review",
+        query: {
+          query: async (statement: string) => {
+            if (statement.includes("FROM positions position")) {
+              sourceSql = statement;
+              return {
+                rows: [{
+                  position_id: `position-allocation-${label}`,
+                  candidate_id: `candidate-allocation-${label}`,
+                  opening_intent_id: `intent-allocation-${label}`,
+                  opening_review_id: `review-allocation-${label}`,
+                  opening_order_id: `order-allocation-${label}`,
+                  opening_strategy_classification: "equity_long",
+                  opening_authorization_snapshot_id: "snapshot-open",
+                  symbol: "SPY",
+                  order_symbol: "SPY",
+                  asset_class: "equity",
+                  side: "long",
+                  available_quantity: "1",
+                  average_entry_price: "500",
+                  strategy_key: "baseline-v1",
+                  ...allocationEvidence,
+                  account_id: "account-1",
+                  account_snapshot_id: "snapshot-1",
+                  snapshot_fingerprint: "portfolio-fingerprint",
+                  structural_fingerprint: "structural-fingerprint",
+                  market_price: "550",
+                  market_timestamp: "2026-07-20T21:59:30.000Z",
+                  market_request_id: "sip-request"
+                }],
+                rowCount: 1
+              };
+            }
+            return { rows: [], rowCount: 1 };
+          }
+        },
+        fence,
+        signingKey: "test-signing-key-with-sufficient-length",
+        now: new Date("2026-07-20T22:00:00.000Z")
+      }),
+      new RegExp(
+        `POSTGRES_EXIT_ALLOCATION_AUTHORITY_MISSING:position-allocation-${label}:baseline-v1`
+      )
+    );
+    assert.match(sourceSql, /LEFT JOIN LATERAL/);
+  });
+}
 
 test("option exit retains the observed contract, open quantity cap, and immutable opening classification", async () => {
   let reviewOrderIntent: Record<string, unknown> | undefined;

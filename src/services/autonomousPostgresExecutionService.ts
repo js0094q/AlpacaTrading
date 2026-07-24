@@ -13,6 +13,7 @@ import {
   checkAlpacaSymbolTradability,
   type AlpacaAssetTradabilityResult
 } from "./alpacaAssetService.js";
+import { AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS } from "./autonomousFreshnessPolicy.js";
 import { optionsQuoteConfig } from "./optionQuoteNormalizer.js";
 import {
   autonomousLifecycleContextFromRuntime,
@@ -44,6 +45,7 @@ export type AutonomousExecutionIntentRow = {
   client_order_id: string;
   strategy_key: string;
   symbol: string;
+  underlying_symbol?: string | null;
   asset_class: "equity" | "option";
   side: "buy" | "sell" | "buy_to_open" | "sell_to_close";
   order_type: "market" | "limit";
@@ -149,6 +151,49 @@ const marketEvidence = (
   return visit(value);
 };
 
+const validateOptionUnderlyingSipEvidence = (
+  intent: AutonomousExecutionIntentRow,
+  record: Record<string, unknown>,
+  now: Date
+) => {
+  const sip = record.underlyingSip;
+  if (!sip || typeof sip !== "object" || Array.isArray(sip)) {
+    throw new Error("POSTGRES_OPTION_UNDERLYING_SIP_EVIDENCE_UNUSABLE");
+  }
+  const evidence = sip as Record<string, unknown>;
+  const expectedUnderlying = text(intent.underlying_symbol).toUpperCase();
+  const observedUnderlying = text(evidence.symbol).toUpperCase();
+  const referencePrice = positive(evidence.referencePrice);
+  const persistedUnderlyingPrice = positive(record.underlyingPrice);
+  const timestamp = text(evidence.timestamp);
+  const observedAt = Date.parse(timestamp);
+  const requestedFeed = text(evidence.requestedFeed).toLowerCase();
+  const effectiveFeed = text(evidence.effectiveFeed).toLowerCase();
+  const provider = text(evidence.provider).toLowerCase();
+  const source = text(evidence.source);
+  if (
+    !expectedUnderlying ||
+    observedUnderlying !== expectedUnderlying ||
+    !referencePrice ||
+    persistedUnderlyingPrice !== referencePrice ||
+    requestedFeed !== "sip" ||
+    effectiveFeed !== "sip" ||
+    provider !== "alpaca" ||
+    source !== "postgres.stock_snapshots" ||
+    !Number.isFinite(observedAt)
+  ) {
+    throw new Error("POSTGRES_OPTION_UNDERLYING_SIP_EVIDENCE_UNUSABLE");
+  }
+  const ageSeconds = (now.getTime() - observedAt) / 1_000;
+  if (
+    ageSeconds < 0 ||
+    ageSeconds > AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS
+  ) {
+    throw new Error("POSTGRES_OPTION_UNDERLYING_SIP_EVIDENCE_STALE");
+  }
+  return referencePrice;
+};
+
 export const validateAutonomousExecutionEvidence = (
   intent: AutonomousExecutionIntentRow,
   broker: AutonomousExecutionBrokerSnapshot,
@@ -183,11 +228,15 @@ export const validateAutonomousExecutionEvidence = (
   }
   if (intent.asset_class === "option") {
     const record = evidence.record;
+    const underlyingPrice = validateOptionUnderlyingSipEvidence(
+      intent,
+      record,
+      now
+    );
     const bid = positive(record.bid);
     const ask = positive(record.ask);
     const spreadPct = Number(record.spreadPct);
     const maximumSpreadPct = Number(record.maximumSpreadPct);
-    const underlyingPrice = positive(record.underlyingPrice);
     const volume = Number(record.volume);
     const openInterest = Number(record.openInterest);
     const requestedFeed = text(record.requestedFeed).toLowerCase();
@@ -719,6 +768,7 @@ const claimIntent = async (
             intent.confirmation_evidence_id, review.signature AS review_signature,
             review.payload_fingerprint, intent.client_order_id,
             intent.strategy_key, intent.symbol, intent.asset_class,
+            intent.underlying_symbol,
             intent.side, intent.order_type, intent.time_in_force,
             intent.quantity::text AS quantity, intent.notional::text AS notional,
             intent.limit_price::text AS limit_price,

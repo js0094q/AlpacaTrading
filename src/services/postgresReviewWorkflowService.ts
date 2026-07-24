@@ -522,6 +522,9 @@ SELECT position.id AS position_id,
        position.asset_class, position.side, position.available_quantity::text,
        position.average_entry_price::text,
        opening_intent.strategy_key AS strategy_key,
+       allocation.id AS allocation_id,
+       allocation.status AS allocation_status,
+       allocation.effective_to AS allocation_effective_to,
        account.id AS account_id, snapshot.id AS account_snapshot_id,
        snapshot.snapshot_fingerprint,
        snapshot.evidence->>'structuralPortfolioFingerprint' AS structural_fingerprint,
@@ -576,11 +579,18 @@ JOIN LATERAL (
   SELECT * FROM account_snapshots WHERE account_id = account.id
   ORDER BY observed_at DESC, id DESC LIMIT 1
 ) snapshot ON true
-JOIN strategy_allocations allocation
-  ON allocation.account_id = account.id
- AND allocation.strategy_key = opening_intent.strategy_key
- AND allocation.status = 'active'
- AND allocation.effective_to IS NULL
+LEFT JOIN LATERAL (
+  SELECT strategy_allocation.id, strategy_allocation.status,
+         strategy_allocation.effective_to
+  FROM strategy_allocations strategy_allocation
+  WHERE strategy_allocation.account_id = account.id
+    AND strategy_allocation.strategy_key = opening_intent.strategy_key
+  ORDER BY (
+    strategy_allocation.status = 'active' AND
+    strategy_allocation.effective_to IS NULL
+  ) DESC, strategy_allocation.updated_at DESC, strategy_allocation.id
+  LIMIT 1
+) allocation ON true
 JOIN LATERAL (
   SELECT option_market.market_price, option_market.market_timestamp,
          option_market.market_request_id, option_market.market_evidence
@@ -657,7 +667,7 @@ WHERE position.account_id = account.id AND position.status = 'open'
         'closed','cancelled','rejected','expired','failed_terminal'
       )
   )
-  ${command === "hedge:exit:review" ? "AND opening_intent.strategy_key ILIKE '%hedge%'" : ""}
+  ${command === "hedge:exit:review" ? "AND (opening_intent.strategy_key ILIKE '%hedge%' OR opening_intent.strategy_key IS NULL)" : ""}
   ${command === "zero-dte:exit:review" ? "AND position.asset_class = 'option' AND substring(position.option_symbol from '[0-9]{6}') = to_char(now() AT TIME ZONE 'America/New_York', 'YYMMDD')" : ""}
 ORDER BY position.opened_at, position.id`;
 };
@@ -672,6 +682,18 @@ const runExitReview = async (input: {
 }) => {
   const rows = (await input.query.query(exitSourceSql(input.command))).rows as Array<Record<string, unknown>>;
   const eligible = rows.flatMap((row) => {
+    const positionId = String(row.position_id ?? "").trim();
+    const strategyKey = String(row.strategy_key ?? "").trim();
+    if (
+      !strategyKey ||
+      !String(row.allocation_id ?? "").trim() ||
+      String(row.allocation_status ?? "").trim().toLowerCase() !== "active" ||
+      row.allocation_effective_to !== null
+    ) {
+      throw new Error(
+        `POSTGRES_EXIT_ALLOCATION_AUTHORITY_MISSING:${positionId || "unknown"}:${strategyKey || "unknown"}`
+      );
+    }
     const price = finite(row.market_price);
     const entry = finite(row.average_entry_price);
     const quantity = finite(row.available_quantity);

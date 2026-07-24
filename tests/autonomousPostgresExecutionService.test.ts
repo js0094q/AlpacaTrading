@@ -54,6 +54,22 @@ const broker = {
   structuralPortfolioFingerprint: "structural-fingerprint"
 };
 
+const optionUnderlyingSip = (
+  overrides: Record<string, unknown> = {}
+) => ({
+  symbol: "SPY",
+  referencePrice: 555,
+  timestamp: "2026-07-20T21:59:00.000Z",
+  requestId: "sip-underlying-request",
+  bid: 554.9,
+  ask: 555.1,
+  requestedFeed: "sip",
+  effectiveFeed: "sip",
+  provider: "alpaca",
+  source: "postgres.stock_snapshots",
+  ...overrides
+});
+
 test("broker statuses map to exact entry and exit lifecycle states", () => {
   assert.equal(lifecycleStateForBrokerStatus("entry", "accepted"), "broker_order_accepted");
   assert.equal(lifecycleStateForBrokerStatus("entry", "partially_filled"), "partially_filled");
@@ -235,6 +251,7 @@ test("the execution gate rejects a fresh option intent with an unusable quote", 
     () => validateAutonomousExecutionEvidence(
       intent({
         asset_class: "option",
+        underlying_symbol: "SPY",
         side: "buy_to_open",
         symbol: "SPY260821C00560000",
         market_evidence: [{
@@ -250,7 +267,8 @@ test("the execution gate rejects a fresh option intent with an unusable quote", 
           openInterest: 8_000,
           requestedFeed: "opra",
           effectiveFeed: "opra",
-          source: "postgres.option_snapshots"
+          source: "postgres.option_snapshots",
+          underlyingSip: optionUnderlyingSip()
         }]
       }),
       broker,
@@ -266,6 +284,7 @@ test("the execution gate preserves the stricter 15-minute option quote age", () 
     () => validateAutonomousExecutionEvidence(
       intent({
         asset_class: "option",
+        underlying_symbol: "SPY",
         side: "buy_to_open",
         symbol: "SPY260821C00560000",
         market_evidence: [{
@@ -281,7 +300,8 @@ test("the execution gate preserves the stricter 15-minute option quote age", () 
           openInterest: 8_000,
           requestedFeed: "opra",
           effectiveFeed: "opra",
-          source: "postgres.option_snapshots"
+          source: "postgres.option_snapshots",
+          underlyingSip: optionUnderlyingSip()
         }]
       }),
       broker,
@@ -291,6 +311,91 @@ test("the execution gate preserves the stricter 15-minute option quote age", () 
     /POSTGRES_MARKET_EVIDENCE_STALE/
   );
 });
+
+for (const reviewType of ["entry", "exit"] as const) {
+  for (const [label, sipEvidence, expected] of [
+    [
+      "missing nested SIP evidence",
+      undefined,
+      /POSTGRES_OPTION_UNDERLYING_SIP_EVIDENCE_UNUSABLE/
+    ],
+    [
+      "31:01 stale nested SIP evidence",
+      optionUnderlyingSip({ timestamp: "2026-07-20T21:28:59.000Z" }),
+      /POSTGRES_OPTION_UNDERLYING_SIP_EVIDENCE_STALE/
+    ],
+    [
+      "wrong SIP provider and feed",
+      optionUnderlyingSip({
+        requestedFeed: "iex",
+        effectiveFeed: "iex",
+        provider: "synthetic"
+      }),
+      /POSTGRES_OPTION_UNDERLYING_SIP_EVIDENCE_UNUSABLE/
+    ],
+    [
+      "unlinked SIP underlying",
+      optionUnderlyingSip({ symbol: "QQQ" }),
+      /POSTGRES_OPTION_UNDERLYING_SIP_EVIDENCE_UNUSABLE/
+    ],
+    [
+      "nonpositive SIP underlying price",
+      optionUnderlyingSip({ referencePrice: 0 }),
+      /POSTGRES_OPTION_UNDERLYING_SIP_EVIDENCE_UNUSABLE/
+    ]
+  ] as const) {
+    test(`the ${reviewType} broker gate rejects ${label} with fresh OPRA`, () => {
+      const optionSymbol = "SPY260821C00560000";
+      assert.throws(
+        () => validateAutonomousExecutionEvidence(
+          intent({
+            asset_class: "option",
+            underlying_symbol: "SPY",
+            review_type: reviewType,
+            side: reviewType === "entry" ? "buy_to_open" : "sell_to_close",
+            symbol: optionSymbol,
+            operation: reviewType === "entry" ? "buy_to_open" : "sell_to_close",
+            strategy_classification: "standard_long_call",
+            contract_id: `contract-${optionSymbol}`,
+            parent_position_id: reviewType === "exit" ? "position-call" : null,
+            opening_intent_id:
+              reviewType === "exit" ? "opening-intent-call" : null,
+            position_side: reviewType === "exit" ? "long" : null,
+            position_available_quantity: reviewType === "exit" ? "1" : null,
+            position_option_symbol: reviewType === "exit" ? optionSymbol : null,
+            position_contract_id:
+              reviewType === "exit" ? `contract-${optionSymbol}` : null,
+            quantity: "1",
+            notional: null,
+            limit_price: "2",
+            market_evidence: [{
+              symbol: optionSymbol,
+              referencePrice: 2,
+              timestamp: "2026-07-20T21:59:30.000Z",
+              bid: 1.98,
+              ask: 2.02,
+              spreadPct: 0.02,
+              maximumSpreadPct: 0.15,
+              underlyingPrice: 555,
+              volume: 5_000,
+              openInterest: 8_000,
+              requestedFeed: "opra",
+              effectiveFeed: "opra",
+              source: "postgres.option_snapshots",
+              ...(sipEvidence === undefined
+                ? {}
+                : { underlyingSip: sipEvidence })
+            }]
+          }),
+          broker,
+          new Date("2026-07-20T22:00:00.000Z"),
+          1_800
+        ),
+        expected
+      );
+    });
+  }
+}
 
 test("the execution gate compares the persisted broker identity hash without hashing it twice", () => {
   const payload = validateAutonomousExecutionEvidence(
@@ -306,6 +411,7 @@ test("the execution gate emits supported option sell-to-close semantics", () => 
   const payload = validateAutonomousExecutionEvidence(
     intent({
       asset_class: "option",
+      underlying_symbol: "SPY",
       review_type: "exit",
       side: "sell_to_close",
       symbol: "SPY260720P00555000",
@@ -334,7 +440,8 @@ test("the execution gate emits supported option sell-to-close semantics", () => 
         openInterest: 8_000,
         requestedFeed: "opra",
         effectiveFeed: "opra",
-        source: "postgres.option_snapshots"
+        source: "postgres.option_snapshots",
+        underlyingSip: optionUnderlyingSip()
       }]
     }),
     broker,
@@ -391,6 +498,7 @@ test("an option close retains its observed contract and cannot exceed reconciled
   const optionIntent = intent({
     review_type: "exit",
     asset_class: "option",
+    underlying_symbol: "SPY",
     symbol: "SPY260821P00500000",
     side: "sell_to_close",
     operation: "sell_to_close",
@@ -416,7 +524,8 @@ test("an option close retains its observed contract and cannot exceed reconciled
       openInterest: 800,
       requestedFeed: "opra",
       effectiveFeed: "opra",
-      source: "postgres.option_snapshots"
+      source: "postgres.option_snapshots",
+      underlyingSip: optionUnderlyingSip()
     }]
   });
 
