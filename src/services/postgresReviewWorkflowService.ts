@@ -605,9 +605,15 @@ export const runPostgresReviewWorkflow = async (input: {
   // still fails closed for the entire review batch.
   let skipped = 0;
   let capacityBlocked = 0;
-  const eligibleRows: ReviewSourceRow[] = [];
+  const eligibleRows: Array<{ row: ReviewSourceRow; amount: number }> = [];
   const skippedRows: ReviewSourceRow[] = [];
-  const capacityRows: ReviewSourceRow[] = [];
+  const capacityRows: Array<{
+    row: ReviewSourceRow;
+    reason:
+      | "POSTGRES_REVIEW_CAPACITY_UNAVAILABLE"
+      | "POSTGRES_REVIEW_OPTION_CAPACITY_INSUFFICIENT"
+      | "POSTGRES_REVIEW_SHORT_CAPACITY_INSUFFICIENT";
+  }> = [];
   for (const row of rows) {
     if (!row.structural_fingerprint || !row.snapshot_fingerprint) {
       throw new Error("POSTGRES_REVIEW_ACCOUNT_FINGERPRINT_MISSING");
@@ -628,20 +634,24 @@ export const runPostgresReviewWorkflow = async (input: {
     const amount = sizing(row, exploration.maxOrderNotional);
     if (amount === null) {
       capacityBlocked += 1;
-      capacityRows.push(row);
+      capacityRows.push({ row, reason: "POSTGRES_REVIEW_CAPACITY_UNAVAILABLE" });
       continue;
     }
     if (row.asset_class === "option" && !Math.floor(amount / (price * 100))) {
-      throw new Error(`POSTGRES_REVIEW_OPTION_CAPACITY_INSUFFICIENT:${row.symbol}`);
+      capacityBlocked += 1;
+      capacityRows.push({ row, reason: "POSTGRES_REVIEW_OPTION_CAPACITY_INSUFFICIENT" });
+      continue;
     }
     if (
       row.asset_class === "equity" &&
       row.direction === "short" &&
       !Math.floor(amount / price)
     ) {
-      throw new Error(`POSTGRES_REVIEW_SHORT_CAPACITY_INSUFFICIENT:${row.symbol}`);
+      capacityBlocked += 1;
+      capacityRows.push({ row, reason: "POSTGRES_REVIEW_SHORT_CAPACITY_INSUFFICIENT" });
+      continue;
     }
-    eligibleRows.push(row);
+    eligibleRows.push({ row, amount });
   }
   for (const row of skippedRows) {
     await persistCandidateStage({
@@ -653,13 +663,13 @@ export const runPostgresReviewWorkflow = async (input: {
       now: now.toISOString()
     });
   }
-  for (const row of capacityRows) {
+  for (const { row, reason } of capacityRows) {
     await persistCandidateStage({
       query: input.query,
       fence: input.fence,
       candidateId: row.candidate_id,
       status: "blocked",
-      reason: "POSTGRES_REVIEW_CAPACITY_UNAVAILABLE",
+      reason,
       now: now.toISOString()
     });
   }
@@ -672,7 +682,7 @@ export const runPostgresReviewWorkflow = async (input: {
     };
   }
   let created = 0;
-  for (const row of eligibleRows) {
+  for (const { row, amount } of eligibleRows) {
     const marketTimestamp = new Date(row.market_timestamp).toISOString();
     const age = now.getTime() - Date.parse(marketTimestamp);
     const maxAge = (input.maxMarketAgeHours ?? 96) * 3_600_000;
@@ -681,8 +691,6 @@ export const runPostgresReviewWorkflow = async (input: {
     }
     const price = finite(row.market_price);
     if (price === null || price <= 0) throw new Error(`POSTGRES_REVIEW_MARKET_PRICE_MISSING:${row.symbol}`);
-    const amount = sizing(row, exploration.maxOrderNotional);
-    if (amount === null) continue;
     const option = row.asset_class === "option";
     const shortEquity = !option && row.direction === "short";
     const quantity = option
@@ -690,10 +698,6 @@ export const runPostgresReviewWorkflow = async (input: {
       : shortEquity
         ? Math.floor(amount / price)
         : null;
-    if (option && (!quantity || quantity <= 0)) throw new Error(`POSTGRES_REVIEW_OPTION_CAPACITY_INSUFFICIENT:${row.symbol}`);
-    if (shortEquity && (!quantity || quantity <= 0)) {
-      throw new Error(`POSTGRES_REVIEW_SHORT_CAPACITY_INSUFFICIENT:${row.symbol}`);
-    }
     const effectiveRisk = shortEquity ? price * (quantity ?? 0) : amount;
     const orderSymbol = row.option_symbol ?? row.symbol;
     const clientOrderId = `pg-${canonicalJsonHash({ account: row.account_id, candidate: row.candidate_id, snapshot: row.account_snapshot_id }).slice(0, 32)}`;

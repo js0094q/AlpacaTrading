@@ -394,8 +394,9 @@ test("stale evidence fails closed before any candidate review is persisted", asy
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO order_intents")), false);
 });
 
-test("option capacity failure is detected before a preceding valid candidate is persisted", async () => {
+test("option capacity insufficiency blocks only that candidate and preserves preceding eligible work", async () => {
   const sql: string[] = [];
+  const candidateUpdates: Array<readonly unknown[]> = [];
   const rows = [
     { ...candidate, candidate_id: "available-candidate" },
     {
@@ -408,24 +409,72 @@ test("option capacity failure is detected before a preceding valid candidate is 
       market_price: "20"
     }
   ];
-  await assert.rejects(
-    runPostgresReviewWorkflow({
-      command: "paper:review",
-      query: {
-        query: async (statement: string) => {
-          sql.push(statement);
-          if (statement.includes("FROM candidates candidate")) return { rows, rowCount: rows.length };
-          return { rows: [], rowCount: 1 };
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        sql.push(statement);
+        if (statement.includes("FROM candidates candidate")) return { rows, rowCount: rows.length };
+        if (statement.includes("UPDATE candidates")) candidateUpdates.push(values ?? []);
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.status, "completed");
+  assert.equal(result.reviewsCreated, 1);
+  assert.equal(result.pendingIntentsCreated, 1);
+  assert.equal(result.capacityBlocked, 1);
+  assert.equal(sql.filter((statement) => statement.includes("INSERT INTO execution_reviews")).length, 1);
+  assert.equal(sql.filter((statement) => statement.includes("INSERT INTO order_intents")).length, 1);
+  assert.equal(candidateUpdates.some((values) =>
+    values[0] === "option-candidate" &&
+    values[1] === "blocked" &&
+    values[2] === "POSTGRES_REVIEW_OPTION_CAPACITY_INSUFFICIENT"
+  ), true);
+});
+
+test("short capacity insufficiency is a successful candidate-level block", async () => {
+  const sql: string[] = [];
+  let candidateUpdateValues: readonly unknown[] = [];
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        sql.push(statement);
+        if (statement.includes("FROM candidates candidate")) {
+          return {
+            rows: [{
+              ...candidate,
+              candidate_id: "short-capacity-candidate",
+              direction: "short",
+              market_price: "2000"
+            }],
+            rowCount: 1
+          };
         }
-      },
-      fence,
-      signingKey: "test-signing-key-with-sufficient-length",
-      now: new Date("2026-07-20T22:00:00.000Z")
-    }),
-    /POSTGRES_REVIEW_OPTION_CAPACITY_INSUFFICIENT:SPY/
-  );
+        if (statement.includes("UPDATE candidates")) candidateUpdateValues = values ?? [];
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.status, "completed");
+  assert.equal(result.code, "POSTGRES_REVIEW_CAPACITY_UNAVAILABLE");
+  assert.equal(result.reviewsCreated, 0);
+  assert.equal(result.pendingIntentsCreated, 0);
+  assert.equal(result.capacityBlocked, 1);
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO execution_reviews")), false);
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO order_intents")), false);
+  assert.equal(candidateUpdateValues[0], "short-capacity-candidate");
+  assert.equal(candidateUpdateValues[1], "blocked");
+  assert.equal(candidateUpdateValues[2], "POSTGRES_REVIEW_SHORT_CAPACITY_INSUFFICIENT");
 });
 
 test("exhausted allocation capacity is a successful row-level no-op", async () => {
