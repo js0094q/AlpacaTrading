@@ -46,7 +46,7 @@ The following gates are deliberately unchanged:
 | Maximum option spread | 15% |
 | Maximum candidates per research run | 25 |
 | Maximum new-order notional | $1,000 |
-| Current OPRA quote age | at most 1,200 seconds |
+| Current OPRA quote age | at most 1,800 seconds (30 minutes) |
 | LEAPS range | 180–730 DTE |
 
 The computed candidate score in `postgresResearchWorkflowService.ts` is a
@@ -72,7 +72,7 @@ ranked and the first 25 are selected.
 - Every option candidate first passes the equity directional and confidence
   gates above.
 - Contract evidence must be active and tradable, have a current snapshot and
-  underlying price, be OPRA-validated, have a quote no older than 1,200
+  underlying price, be OPRA-validated, have a quote no older than 1,800
   seconds, contain volume and open interest with positive combined liquidity,
   contain a spread no wider than 15%, and contain an entry price.
 - The derived option liquidity score must remain at least `0.10`.

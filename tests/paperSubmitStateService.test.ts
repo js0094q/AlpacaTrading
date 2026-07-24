@@ -465,7 +465,7 @@ describe("paper submit state validation", () => {
     assert.equal(config.equityMaxPortfolioDeployPct, 50);
     assert.equal(config.equityMaxPositionPct, 10);
     assert.equal(config.equityMinCashReservePct, 20);
-    assert.equal(config.quoteMaxAgeSeconds, 1_200);
+    assert.equal(config.quoteMaxAgeSeconds, 1_800);
     assert.equal(config.maxPriceDriftPct, 10);
     assert.equal(config.allocationIdentity, "baseline-v1");
   });

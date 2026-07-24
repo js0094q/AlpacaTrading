@@ -518,8 +518,110 @@ test("reconciliation synchronizes broker account and positions into PostgreSQL a
   );
   const positionInsert = statements.find(({ sql }) => sql.includes("INSERT INTO positions"));
   assert.ok(positionInsert);
-  assert.equal(positionInsert.values[3], "AAPL");
-  assert.equal(positionInsert.values[7], "short");
+  assert.equal(positionInsert.values[5], "AAPL");
+  assert.equal(positionInsert.values[9], "short");
+});
+
+test("position reconciliation carries matching filled entry lineage through a safe upsert", async () => {
+  const statements: Array<{ sql: string; values: readonly unknown[] }> = [];
+  const result = await reconcilePostgresPaperOrders({
+    query: {
+      query: async (sql: string, values?: readonly unknown[]) => {
+        statements.push({ sql, values: values ?? [] });
+        if (sql.includes("FROM order_intents intent")) {
+          return { rows: [], rowCount: 0 };
+        }
+        if (sql.includes("FROM orders") && sql.includes("filled")) {
+          return {
+            rows: [{
+              candidate_id: "candidate-autonomous-1",
+              opening_order_id: "order-entry-1"
+            }],
+            rowCount: 1
+          };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    now: new Date("2026-07-20T22:00:00.000Z"),
+    captureBrokerSnapshot: async () => ({
+      capturedAt: "2026-07-20T22:00:00.000Z",
+      accountIdentityHash: "paper-account-lineage-hash",
+      account: {
+        status: "ACTIVE",
+        currency: "USD",
+        cash: 10_000,
+        equity: 20_000,
+        buyingPower: 30_000,
+        optionsBuyingPower: 15_000,
+        optionsApprovalLevel: 3,
+        tradingBlocked: false,
+        accountBlocked: false
+      },
+      configuration: {
+        environment: "paper",
+        tradingMode: "paper",
+        liveTradingEnabled: false
+      },
+      configurationFingerprint: "configuration-fingerprint",
+      positions: [{
+        brokerPositionKey: "equity:SPY",
+        symbol: "SPY",
+        underlyingSymbol: null,
+        optionSymbol: null,
+        assetClass: "equity",
+        side: "long",
+        quantity: 1,
+        availableQuantity: 1,
+        averageEntryPrice: 500,
+        currentPrice: 501,
+        marketValue: 501,
+        costBasis: 500,
+        unrealizedPnl: 1
+      }],
+      orders: [],
+      structuralPortfolioFingerprint: "structural-fingerprint",
+      portfolioFingerprint: "portfolio-fingerprint"
+    }) as never
+  });
+
+  assert.equal(result.brokerState?.positionsUpserted, 1);
+  const lineageLookup = statements.find(({ sql }) =>
+    sql.includes("FROM orders") && sql.includes("filled")
+  );
+  assert.ok(lineageLookup, "reconciliation must derive lineage from matching filled entry");
+  assert.match(
+    lineageLookup.sql,
+    /broker_order\.status IN \('filled', 'partially_filled'\)/
+  );
+  assert.match(
+    lineageLookup.sql,
+    /ABS\(\s*broker_order\.filled_quantity - \$6::numeric\s*\) <= 0\.000000000001/
+  );
+  assert.match(
+    lineageLookup.sql,
+    /ABS\(\s*broker_order\.filled_average_price - \$7::numeric\s*\) <= 0\.00000001/
+  );
+  assert.equal(lineageLookup.values[5], 1);
+  assert.equal(lineageLookup.values[6], 500);
+  const positionInsert = statements.find(({ sql }) => sql.includes("INSERT INTO positions"));
+  assert.ok(positionInsert);
+  assert.equal(positionInsert.values[3], "candidate-autonomous-1");
+  assert.equal(positionInsert.values[4], "order-entry-1");
+  assert.match(positionInsert.sql, /ON CONFLICT \(account_id, broker_position_key\)/);
+  assert.match(
+    positionInsert.sql,
+    /candidate_id = CASE[\s\S]*positions\.status = 'closed'[\s\S]*EXCLUDED\.candidate_id[\s\S]*COALESCE\(positions\.candidate_id, EXCLUDED\.candidate_id\)/
+  );
+  assert.match(
+    positionInsert.sql,
+    /opening_order_id = CASE[\s\S]*positions\.status = 'closed'[\s\S]*EXCLUDED\.opening_order_id[\s\S]*COALESCE\(positions\.opening_order_id, EXCLUDED\.opening_order_id\)/
+  );
+  assert.match(
+    positionInsert.sql,
+    /opened_at = CASE[\s\S]*positions\.status = 'closed'[\s\S]*EXCLUDED\.opened_at[\s\S]*positions\.opened_at/
+  );
 });
 
 test("the execution transaction can persist its exact captured broker snapshot", async () => {

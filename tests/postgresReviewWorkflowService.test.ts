@@ -34,6 +34,17 @@ const candidate = {
   market_request_id: "sip-request", open_position_count: "0",
   open_order_count: "0"
 };
+const observedOptionContract = {
+  contract_option_symbol: "SPY260821C00560000",
+  contract_tradable: true,
+  contract_status: "active",
+  contract_source: "alpaca",
+  contract_observed_at: "2026-07-20T21:59:00.000Z"
+};
+const observedExitOptionContract = (optionSymbol: string) => ({
+  ...observedOptionContract,
+  contract_option_symbol: optionSymbol
+});
 
 test("entry review persists signed PostgreSQL review and unconfirmed pending intent", async () => {
   const sql: string[] = [];
@@ -110,6 +121,7 @@ test("a newly qualifying paper option candidate propagates into a PostgreSQL ord
           return {
             rows: [{
               ...candidate,
+              ...observedOptionContract,
               candidate_id: "candidate-new-threshold-option",
               asset_class: "option",
               option_symbol: "SPY260821C00560000",
@@ -118,13 +130,28 @@ test("a newly qualifying paper option candidate propagates into a PostgreSQL ord
               market_price: "2",
               signal_inputs: {
                 marketDecisionInputs: {
+                  currentTradablePrice: 555,
                   option: {
                     selectionScore: 0.5,
                     liquidityScore: 0.1,
-                    spreadPct: 0.15,
+                    spreadPct: 0.02,
+                    volume: 5_000,
+                    openInterest: 8_000,
                     feed: "opra"
                   }
                 }
+              },
+              market_evidence: {
+                bid: 1.98,
+                ask: 2.02,
+                midpoint: 2,
+                spreadPct: 0.02,
+                volume: 5_000,
+                openInterest: 8_000,
+                underlyingPrice: 555,
+                requestedFeed: "opra",
+                effectiveFeed: "opra",
+                provider: "alpaca"
               }
             }],
             rowCount: 1
@@ -188,6 +215,7 @@ test("option review sizing is conservatively scaled by premium Alpaca decision e
   let persistedMarketEvidence: Array<Record<string, unknown>> = [];
   const optionCandidate = {
     ...candidate,
+    ...observedOptionContract,
     candidate_id: "candidate-option-quality",
     asset_class: "option" as const,
     option_symbol: "SPY260821C00560000",
@@ -224,8 +252,10 @@ test("option review sizing is conservatively scaled by premium Alpaca decision e
       rho: 0.04,
       volume: 5_000,
       openInterest: 8_000,
+      underlyingPrice: 555,
       requestedFeed: "opra",
-      effectiveFeed: "opra"
+      effectiveFeed: "opra",
+      provider: "alpaca"
     }
   };
 
@@ -335,6 +365,192 @@ test("review fails closed before persistence when market evidence is stale", asy
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO order_intents")), false);
 });
 
+test("entry review accepts market evidence that is fresh through the 30-minute boundary", async () => {
+  const sql: string[] = [];
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string) => {
+        sql.push(statement);
+        if (statement.includes("FROM candidates candidate")) {
+          return {
+            rows: [{
+              ...candidate,
+              market_timestamp: "2026-07-20T21:30:01.000Z"
+            }],
+            rowCount: 1
+          };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.status, "completed");
+  assert.equal(result.reviewsCreated, 1);
+  assert.equal(result.pendingIntentsCreated, 1);
+  assert.equal(sql.some((statement) => statement.includes("INSERT INTO execution_reviews")), true);
+});
+
+test("entry review rejects market evidence older than 30 minutes before persistence", async () => {
+  const sql: string[] = [];
+  await assert.rejects(
+    runPostgresReviewWorkflow({
+      command: "paper:review",
+      query: {
+        query: async (statement: string) => {
+          sql.push(statement);
+          if (statement.includes("FROM candidates candidate")) {
+            return {
+              rows: [{
+                ...candidate,
+                market_timestamp: "2026-07-20T21:29:59.000Z"
+              }],
+              rowCount: 1
+            };
+          }
+          return { rows: [], rowCount: 1 };
+        }
+      },
+      fence,
+      signingKey: "test-signing-key-with-sufficient-length",
+      now: new Date("2026-07-20T22:00:00.000Z")
+    }),
+    /POSTGRES_REVIEW_MARKET_EVIDENCE_STALE:SPY/
+  );
+  assert.equal(sql.some((statement) => statement.includes("INSERT INTO execution_reviews")), false);
+  assert.equal(sql.some((statement) => statement.includes("INSERT INTO order_intents")), false);
+});
+
+for (const [label, marketEvidence] of [
+  ["missing bid", { ask: 2.02, midpoint: 2 }],
+  ["missing ask", { bid: 1.98, midpoint: 2 }],
+  ["crossed quote", { bid: 2.02, ask: 1.98, midpoint: 2 }],
+  ["non-executable quote", { bid: 0, ask: 0, midpoint: 0 }]
+] as const) {
+  test(`option review rejects fresh option evidence with ${label} before persistence`, async () => {
+    const sql: string[] = [];
+    const optionCandidate = {
+      ...candidate,
+      ...observedOptionContract,
+      candidate_id: `candidate-option-invalid-${label.replaceAll(" ", "-")}`,
+      asset_class: "option" as const,
+      option_symbol: "SPY260821C00560000",
+      preferred_expression: "long_call",
+      market_price: "2",
+      market_evidence: {
+        ...marketEvidence,
+        volume: 5_000,
+        openInterest: 8_000,
+        impliedVolatility: 0.3,
+        requestedFeed: "opra",
+        effectiveFeed: "opra",
+        provider: "alpaca",
+        underlyingPrice: 555
+      },
+      signal_inputs: {
+        marketDecisionInputs: {
+          currentTradablePrice: 555,
+          option: {
+            selectionScore: 0.6,
+            liquidityScore: 0.8,
+            spreadPct: 0.02,
+            feed: "opra"
+          }
+        }
+      }
+    };
+
+    await assert.rejects(
+      runPostgresReviewWorkflow({
+        command: "paper:review",
+        query: {
+          query: async (statement: string) => {
+            sql.push(statement);
+            if (statement.includes("FROM candidates candidate")) {
+              return { rows: [optionCandidate], rowCount: 1 };
+            }
+            return { rows: [], rowCount: 1 };
+          }
+        },
+        fence,
+        signingKey: "test-signing-key-with-sufficient-length",
+        now: new Date("2026-07-20T22:00:00.000Z")
+      }),
+      /POSTGRES_REVIEW_OPTION_QUOTE_INVALID:SPY260821C00560000/
+    );
+    assert.equal(sql.some((statement) => statement.includes("INSERT INTO execution_reviews")), false);
+    assert.equal(sql.some((statement) => statement.includes("INSERT INTO order_intents")), false);
+  });
+}
+
+test("option review rejects an untradable or unobserved contract before persistence", async () => {
+  const sql: string[] = [];
+  await assert.rejects(
+    runPostgresReviewWorkflow({
+      command: "paper:review",
+      query: {
+        query: async (statement: string) => {
+          sql.push(statement);
+          if (statement.includes("FROM candidates candidate")) {
+            return {
+              rows: [{
+                ...candidate,
+                candidate_id: "candidate-option-untradable",
+                asset_class: "option",
+                option_symbol: "SPY260821C00560000",
+                preferred_expression: "long_call",
+                market_price: "2",
+                contract_option_symbol: "SPY260821C00560000",
+                contract_tradable: false,
+                contract_status: "inactive",
+                contract_source: "alpaca",
+                contract_observed_at: "2026-07-20T21:59:00.000Z",
+                market_evidence: {
+                  bid: 1.98,
+                  ask: 2.02,
+                  midpoint: 2,
+                  spreadPct: 0.02,
+                  volume: 5_000,
+                  openInterest: 8_000,
+                  underlyingPrice: 555,
+                  requestedFeed: "opra",
+                  effectiveFeed: "opra",
+                  provider: "alpaca"
+                },
+                signal_inputs: {
+                  marketDecisionInputs: {
+                    currentTradablePrice: 555,
+                    option: {
+                      selectionScore: 0.6,
+                      liquidityScore: 0.8,
+                      spreadPct: 0.02,
+                      volume: 5_000,
+                      openInterest: 8_000,
+                      feed: "opra"
+                    }
+                  }
+                }
+              }],
+              rowCount: 1
+            };
+          }
+          return { rows: [], rowCount: 1 };
+        }
+      },
+      fence,
+      signingKey: "test-signing-key-with-sufficient-length",
+      now: new Date("2026-07-20T22:00:00.000Z")
+    }),
+    /POSTGRES_REVIEW_OPTION_CONTRACT_INVALID:SPY260821C00560000/
+  );
+  assert.equal(sql.some((statement) => statement.includes("INSERT INTO execution_reviews")), false);
+  assert.equal(sql.some((statement) => statement.includes("INSERT INTO order_intents")), false);
+});
+
 test("entry review skips held/open-order candidates and reviews the remaining candidates", async () => {
   const sql: string[] = [];
   const candidateUpdates: Array<readonly unknown[]> = [];
@@ -401,12 +617,39 @@ test("option capacity insufficiency blocks only that candidate and preserves pre
     { ...candidate, candidate_id: "available-candidate" },
     {
       ...candidate,
+      ...observedOptionContract,
       candidate_id: "option-candidate",
       symbol: "SPY",
       asset_class: "option" as const,
       option_symbol: "SPY260821C00600000",
+      contract_option_symbol: "SPY260821C00600000",
       preferred_expression: "option",
-      market_price: "20"
+      market_price: "20",
+      market_evidence: {
+        bid: 19.8,
+        ask: 20.2,
+        midpoint: 20,
+        spreadPct: 0.02,
+        volume: 5_000,
+        openInterest: 8_000,
+        underlyingPrice: 555,
+        requestedFeed: "opra",
+        effectiveFeed: "opra",
+        provider: "alpaca"
+      },
+      signal_inputs: {
+        marketDecisionInputs: {
+          currentTradablePrice: 555,
+          option: {
+            selectionScore: 0.6,
+            liquidityScore: 0.8,
+            spreadPct: 0.02,
+            volume: 5_000,
+            openInterest: 8_000,
+            feed: "opra"
+          }
+        }
+      }
     }
   ];
   const result = await runPostgresReviewWorkflow({
@@ -652,13 +895,25 @@ test("PostgreSQL exit review forces a genuine 0DTE long option exit in the final
         if (statement.includes("FROM positions position")) {
           return {
             rows: [{
+              ...observedExitOptionContract("SPY260720C00555000"),
               position_id: "position-0dte", candidate_id: "candidate-0dte",
               symbol: "SPY", order_symbol: "SPY260720C00555000", asset_class: "option",
               side: "long", available_quantity: "1", average_entry_price: "1.00",
               strategy_key: "zero_dte_spy", account_id: "account-1",
               account_snapshot_id: "snapshot-1", snapshot_fingerprint: "portfolio-fingerprint",
               structural_fingerprint: "structural-fingerprint", market_price: "1.00",
-              market_timestamp: "2026-07-20T19:44:30.000Z", market_request_id: "opra-request"
+              market_timestamp: "2026-07-20T19:44:30.000Z", market_request_id: "opra-request",
+              market_evidence: {
+                bid: 1,
+                ask: 1.02,
+                spreadPct: 0.0198,
+                underlyingPrice: 555,
+                volume: 5_000,
+                openInterest: 8_000,
+                requestedFeed: "opra",
+                effectiveFeed: "opra",
+                provider: "alpaca"
+              }
             }],
             rowCount: 1
           };
@@ -683,6 +938,179 @@ test("PostgreSQL exit review forces a genuine 0DTE long option exit in the final
   assert.equal(trigger?.reason, "ODTE_FORCE_EXIT_BEFORE_CLOSE");
 });
 
+test("PostgreSQL exit review applies the LEAPS full-profit trigger to a long-dated option", async () => {
+  let reviewOrderIntent: Record<string, unknown> | undefined;
+  let trigger: Record<string, unknown> | undefined;
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:exit:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("FROM positions position")) {
+          return {
+            rows: [{
+              ...observedExitOptionContract("SPY280121C00550000"),
+              position_id: "position-leaps", candidate_id: "candidate-leaps",
+              symbol: "SPY", order_symbol: "SPY280121C00550000", asset_class: "option",
+              side: "long", available_quantity: "1", average_entry_price: "1.00",
+              strategy_key: "leaps", account_id: "account-1",
+              account_snapshot_id: "snapshot-1", snapshot_fingerprint: "portfolio-fingerprint",
+              structural_fingerprint: "structural-fingerprint", market_price: "2.25",
+              market_timestamp: "2026-07-20T21:59:30.000Z", market_request_id: "opra-request",
+              market_evidence: {
+                bid: 2.25,
+                ask: 2.30,
+                spreadPct: 0.021978,
+                underlyingPrice: 555,
+                volume: 5_000,
+                openInterest: 8_000,
+                requestedFeed: "opra",
+                effectiveFeed: "opra",
+                provider: "alpaca"
+              }
+            }],
+            rowCount: 1
+          };
+        }
+        if (statement.includes("INSERT INTO execution_reviews")) {
+          reviewOrderIntent = JSON.parse(String(values?.[9])) as Record<string, unknown>;
+          const portfolioPayload = JSON.parse(String(values?.[11])) as Record<string, unknown>;
+          trigger = portfolioPayload.trigger as Record<string, unknown> | undefined;
+          return { rows: [{ fence_held: true, inserted_count: 1 }], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.status, "completed");
+  assert.equal(reviewOrderIntent?.side, "sell_to_close");
+  assert.equal(reviewOrderIntent?.reason, "LEAPS_FULL_PROFIT_TAKE");
+  assert.equal(trigger?.reason, "LEAPS_FULL_PROFIT_TAKE");
+});
+
+test("PostgreSQL exit review applies the maintained LEAPS severe-trend trigger", async () => {
+  let reviewOrderIntent: Record<string, unknown> | undefined;
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:exit:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("FROM positions position")) {
+          return {
+            rows: [{
+              ...observedExitOptionContract("SPY280121C00550000"),
+              position_id: "position-leaps-trend",
+              candidate_id: "candidate-leaps-trend",
+              symbol: "SPY",
+              order_symbol: "SPY280121C00550000",
+              asset_class: "option",
+              side: "long",
+              available_quantity: "1",
+              average_entry_price: "2.00",
+              strategy_key: "leaps",
+              account_id: "account-1",
+              account_snapshot_id: "snapshot-1",
+              snapshot_fingerprint: "portfolio-fingerprint",
+              structural_fingerprint: "structural-fingerprint",
+              market_price: "2.10",
+              market_timestamp: "2026-07-20T21:59:30.000Z",
+              market_request_id: "opra-request",
+              underlying_close: "500",
+              severe_trend_sma: "510",
+              severe_trend_bar_count: "200",
+              market_evidence: {
+                bid: 2.10,
+                ask: 2.14,
+                spreadPct: 0.018868,
+                underlyingPrice: 500,
+                volume: 5_000,
+                openInterest: 8_000,
+                requestedFeed: "opra",
+                effectiveFeed: "opra",
+                provider: "alpaca"
+              }
+            }],
+            rowCount: 1
+          };
+        }
+        if (statement.includes("INSERT INTO execution_reviews")) {
+          reviewOrderIntent = JSON.parse(String(values?.[9])) as Record<string, unknown>;
+          return {
+            rows: [{ fence_held: true, inserted_count: 1 }],
+            rowCount: 1
+          };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.status, "completed");
+  assert.equal(reviewOrderIntent?.reason, "LEAPS_SEVERE_TREND_BREAK");
+  assert.equal(reviewOrderIntent?.side, "sell_to_close");
+});
+
+test("option exit review rejects an unusable quote before persisting a close intent", async () => {
+  const sql: string[] = [];
+  await assert.rejects(
+    runPostgresReviewWorkflow({
+      command: "paper:exit:review",
+      query: {
+        query: async (statement: string) => {
+          sql.push(statement);
+          if (statement.includes("FROM positions position")) {
+            return {
+              rows: [{
+                ...observedExitOptionContract("SPY260821P00550000"),
+                position_id: "position-option-invalid-exit",
+                candidate_id: "candidate-option-invalid-exit",
+                symbol: "SPY",
+                order_symbol: "SPY260821P00550000",
+                asset_class: "option",
+                side: "long",
+                available_quantity: "1",
+                average_entry_price: "2.00",
+                strategy_key: "standard_option",
+                account_id: "account-1",
+                account_snapshot_id: "snapshot-1",
+                snapshot_fingerprint: "portfolio-fingerprint",
+                structural_fingerprint: "structural-fingerprint",
+                market_price: "0.90",
+                market_timestamp: "2026-07-20T21:59:30.000Z",
+                market_request_id: "opra-request",
+                market_evidence: {
+                  bid: 1.00,
+                  ask: 0.90,
+                  spreadPct: 0.05,
+                  underlyingPrice: 555,
+                  volume: 5_000,
+                  openInterest: 8_000,
+                  requestedFeed: "opra",
+                  effectiveFeed: "opra",
+                  provider: "alpaca"
+                }
+              }],
+              rowCount: 1
+            };
+          }
+          return { rows: [], rowCount: 1 };
+        }
+      },
+      fence,
+      signingKey: "test-signing-key-with-sufficient-length",
+      now: new Date("2026-07-20T22:00:00.000Z")
+    }),
+    /POSTGRES_EXIT_REVIEW_OPTION_QUOTE_INVALID:SPY260821P00550000/
+  );
+  assert.equal(sql.some((statement) => statement.includes("INSERT INTO execution_reviews")), false);
+  assert.equal(sql.some((statement) => statement.includes("INSERT INTO order_intents")), false);
+});
+
 const repeatedExitSource = (marketPrice: string, marketTimestamp: string) => ({
   position_id: "position-repeated-exit", candidate_id: null,
   symbol: "SPY", order_symbol: "SPY260722P00748000", asset_class: "option",
@@ -690,7 +1118,65 @@ const repeatedExitSource = (marketPrice: string, marketTimestamp: string) => ({
   strategy_key: "baseline", account_id: "account-repeated-exit",
   account_snapshot_id: "snapshot-repeated-exit", snapshot_fingerprint: "portfolio-fingerprint",
   structural_fingerprint: "structural-fingerprint", market_price: marketPrice,
-  market_timestamp: marketTimestamp, market_request_id: "opra-request"
+  market_timestamp: marketTimestamp, market_request_id: "opra-request",
+  ...observedExitOptionContract("SPY260722P00748000"),
+  market_evidence: {
+    bid: Number(marketPrice),
+    ask: Number(marketPrice) + 0.02,
+    spreadPct: 0.04,
+    underlyingPrice: 555,
+    volume: 5_000,
+    openInterest: 8_000,
+    requestedFeed: "opra",
+    effectiveFeed: "opra",
+    provider: "alpaca"
+  }
+});
+
+test("option exit review rejects non-Alpaca or unobserved contract evidence before persistence", async () => {
+  const sql: string[] = [];
+  await assert.rejects(
+    runPostgresReviewWorkflow({
+      command: "paper:exit:review",
+      query: {
+        query: async (statement: string) => {
+          sql.push(statement);
+          if (statement.includes("FROM positions position")) {
+            return {
+              rows: [{
+                ...repeatedExitSource(
+                  "0.50",
+                  "2026-07-22T16:50:00.000Z"
+                ),
+                contract_source: "synthetic",
+                market_evidence: {
+                  ...repeatedExitSource(
+                    "0.50",
+                    "2026-07-22T16:50:00.000Z"
+                  ).market_evidence,
+                  provider: "synthetic"
+                }
+              }],
+              rowCount: 1
+            };
+          }
+          return { rows: [], rowCount: 1 };
+        }
+      },
+      fence,
+      signingKey: "test-signing-key-with-sufficient-length",
+      now: new Date("2026-07-22T16:51:00.000Z")
+    }),
+    /POSTGRES_EXIT_REVIEW_OPTION_(QUOTE|CONTRACT)_INVALID/
+  );
+  assert.equal(
+    sql.some((statement) => statement.includes("INSERT INTO execution_reviews")),
+    false
+  );
+  assert.equal(
+    sql.some((statement) => statement.includes("INSERT INTO order_intents")),
+    false
+  );
 });
 
 test("repeated exit evidence for one position and account snapshot is an idempotent row-level skip", async () => {

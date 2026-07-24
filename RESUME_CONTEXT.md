@@ -1,5 +1,22 @@
 # Resume Context: Alpaca Trading Research Infra
 
+## Autonomous 30-minute evidence and position lifecycle (2026-07-24)
+
+- The applicable autonomous SIP/OPRA evidence window is exactly 1,800 seconds
+  across snapshot normalization, PostgreSQL option ingestion, option-feature
+  eligibility, candidate/review evidence, and pre-submit evidence.
+- Executable option paths remain stricter than age alone: positive bid and ask,
+  non-crossed quotes, configured spread cap, positive underlying price,
+  observed OPRA provenance, and non-empty volume/open-interest liquidity are
+  required before review and submission.
+- Broker position reconciliation now derives and preserves the originating
+  candidate and filled opening-order IDs. That lineage lets each cycle apply
+  the correct equity, short-cover, standard-option, 0DTE, or LEAPS exit policy.
+- PostgreSQL LEAPS positions use the maintained hard stop, full-profit, and
+  DTE-decay rules; option closes remain `sell_to_close`, short-equity closes
+  remain buy-to-cover, and normal mark drift does not invalidate structural
+  authorization.
+
 ## Paper qualification V3 and successful no-action outcomes (2026-07-24)
 
 - The paper-only exploration profile lowers strategy qualification gates from

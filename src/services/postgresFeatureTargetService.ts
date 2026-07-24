@@ -18,6 +18,7 @@ import {
   classifyDirectionalScore,
   type PaperExplorationThresholds
 } from "./paperExplorationConfig.js";
+import { AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS } from "./autonomousFreshnessPolicy.js";
 import { selectExpressionWithPolicy } from "./strategySelectionLogic.js";
 
 type FeatureTargetWriter = Pick<
@@ -215,7 +216,8 @@ const deriveOptionContractFeature = (input: {
   const calculatedFreshness = quoteTimestamp === null
     ? "missing"
     : quoteAgeSeconds !== null && Number.isFinite(quoteAgeSeconds) &&
-        quoteAgeSeconds >= 0 && quoteAgeSeconds <= 1_200
+        quoteAgeSeconds >= 0 &&
+        quoteAgeSeconds <= AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS
       ? "fresh"
       : "stale";
   const quoteFreshnessStatus = snapshot?.freshnessStatus === "stale"
@@ -293,6 +295,9 @@ const deriveOptionContractFeature = (input: {
   if (!contract.tradable) rejectionReasons.push("not_tradable");
   if (!snapshot) rejectionReasons.push("snapshot_missing");
   if (underlyingPrice === null) rejectionReasons.push("underlying_price_missing");
+  if (bid === null || bid <= 0) rejectionReasons.push("bid_missing_or_non_executable");
+  if (ask === null || ask <= 0) rejectionReasons.push("ask_missing_or_non_executable");
+  if (bid !== null && ask !== null && ask < bid) rejectionReasons.push("quote_crossed");
   if (quoteFreshnessStatus === "missing") rejectionReasons.push("quote_timestamp_missing");
   if (quoteFreshnessStatus === "stale") rejectionReasons.push("quote_stale");
   if (!feedValidated) rejectionReasons.push("feed_invalid");

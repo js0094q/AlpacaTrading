@@ -19,6 +19,7 @@ import {
   refreshUniverseAssetMetadata,
   seedInitialUniverse
 } from "./universeService.js";
+import { AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS } from "./autonomousFreshnessPolicy.js";
 import { normalizeStockSnapshot } from "./stockSnapshotNormalizer.js";
 
 const snapshotColumns = [
@@ -357,7 +358,7 @@ export const runStockObservation = async (input: {
         now: now(),
         maxAgeSeconds: positiveInteger(
           process.env.MARKET_OBSERVATORY_MAX_AGE_SECONDS,
-          1200
+          AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS
         )
       });
       try {

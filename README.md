@@ -105,11 +105,19 @@ to `0.35`, defined-risk confidence `0.50` to `0.45`, option expected return
 Option liquidity remains `0.10`, maximum option spread remains `15%`, candidate
 count remains `25`, and maximum order notional remains `$1,000`.
 
-The profile does not change the 1,200-second OPRA freshness limit, the
-regular-session stock-evidence gate, the 50-bar indicator requirement, required
-option fields, paper/live enforcement, PostgreSQL authority, reconciliation,
-duplicate prevention, reservations, or aggregate exposure limits. If OPRA
-snapshots are stale or unavailable, they are not persisted as current evidence.
+The autonomous evidence window is 1,800 seconds (30 minutes) for SIP/OPRA
+snapshot normalization, PostgreSQL option ingestion, feature eligibility,
+candidate/review evidence, and submission evidence. Executable option orders
+remain subject to the stricter quote contract: positive bid and ask, non-crossed
+market, configured spread cap, observed OPRA contract, current underlying,
+liquidity, and eligible market session. The profile does not change the 50-bar
+indicator requirement, paper/live enforcement, PostgreSQL authority,
+reconciliation, duplicate prevention, reservations, or aggregate exposure
+limits. If OPRA snapshots are stale or unavailable, they are not persisted as
+current evidence.
+Daily historical bars retain their session-aware lookback tolerance; they are
+not executable quotes and therefore do not substitute for a current SIP or
+OPRA snapshot.
 The ingestion attempt is written to `market_data_ingestion_runs`, option data
 is marked degraded, and current SIP-backed equity research continues.
 
@@ -336,7 +344,8 @@ VPS_CONTROL_TOKEN=
 DASHBOARD_ADMIN_TOKEN=
 AUTOMATED_PAPER_EXECUTION_ENABLED=true
 PAPER_REVIEW_SIGNING_KEY=replace_me
-PAPER_SUBMIT_QUOTE_MAX_AGE_SECONDS=1200
+MARKET_OBSERVATORY_MAX_AGE_SECONDS=1800
+PAPER_SUBMIT_QUOTE_MAX_AGE_SECONDS=1800
 PAPER_SUBMIT_MAX_PRICE_DRIFT_PCT=10
 PAPER_0DTE_DISCOVERY_ENABLED=true
 PAPER_OPTION_EXIT_REVIEW_ENABLED=true

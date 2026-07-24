@@ -6,6 +6,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync
 } from "node:fs";
@@ -856,6 +857,8 @@ test("autonomous service fixes paper-only authority and bounds failure restarts"
   assert.match(service, /^Environment=POSTGRES_SHADOW_COMPARE_ENABLED=false$/m);
   assert.match(service, /^Environment=POSTGRES_EXECUTION_STATE_SHADOW_ENABLED=false$/m);
   assert.match(service, /^Environment=SQLITE_AUDIT_MIRROR_ENABLED=false$/m);
+  assert.match(service, /^Environment=MARKET_OBSERVATORY_MAX_AGE_SECONDS=1800$/m);
+  assert.match(service, /^Environment=PAPER_SUBMIT_QUOTE_MAX_AGE_SECONDS=1800$/m);
   assert.match(service, /^ExecStart=\/usr\/bin\/node scripts\/autonomous-paper-worker\.mjs --workstream-timeout-ms=3600000$/m);
   assert.doesNotMatch(service, /^ExecStart=.*npm run paper:autonomous/m);
   assert.match(service, /^StartLimitIntervalSec=300$/m);
@@ -863,4 +866,30 @@ test("autonomous service fixes paper-only authority and bounds failure restarts"
   assert.match(service, /^Restart=on-failure$/m);
   assert.match(service, /^RestartSec=30$/m);
   assert.match(service, /^KillMode=mixed$/m);
+});
+
+test("every protected production unit fixes the autonomous evidence window at 30 minutes", () => {
+  const systemdRoot = join(repoRoot, "server/systemd");
+  const protectedUnits = readdirSync(systemdRoot)
+    .filter((name) => name.endsWith(".service"))
+    .map((name) => ({
+      name,
+      source: readFileSync(join(systemdRoot, name), "utf8")
+    }))
+    .filter(({ source }) =>
+      source.includes("EnvironmentFile=/opt/alpaca-investing/secrets/alpaca.env")
+    );
+  assert.ok(protectedUnits.length > 0);
+  for (const { name, source } of protectedUnits) {
+    assert.match(
+      source,
+      /^Environment=MARKET_OBSERVATORY_MAX_AGE_SECONDS=1800$/m,
+      name
+    );
+    assert.match(
+      source,
+      /^Environment=PAPER_SUBMIT_QUOTE_MAX_AGE_SECONDS=1800$/m,
+      name
+    );
+  }
 });

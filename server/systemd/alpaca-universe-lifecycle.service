@@ -10,6 +10,8 @@ User=alpaca
 Group=alpaca
 WorkingDirectory=/home/alpaca/Alpaca-Trading
 EnvironmentFile=/opt/alpaca-investing/secrets/alpaca.env
+Environment=MARKET_OBSERVATORY_MAX_AGE_SECONDS=1800
+Environment=PAPER_SUBMIT_QUOTE_MAX_AGE_SECONDS=1800
 Environment=PATH=/usr/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=NODE_ENV=production
 Environment=AUTOMATED_PAPER_EXECUTION_ENABLED=false

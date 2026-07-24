@@ -30,6 +30,14 @@ PostgreSQL empty-work results, including `NO_CANCELLABLE_POSTGRES_ORDERS`, in
 `docs/paper-candidate-qualification-inventory.md` as successful `no_action`
 events; actual operational blocks remain blocked.
 
+The applicable autonomous SIP/OPRA evidence window is 1,800 seconds. The
+checked-in worker and dashboard-control units set both
+`MARKET_OBSERVATORY_MAX_AGE_SECONDS=1800` and
+`PAPER_SUBMIT_QUOTE_MAX_AGE_SECONDS=1800`; the protected runtime environment
+must match. Option executability still requires positive, non-crossed bid/ask,
+the configured spread cap, observed OPRA provenance, a current underlying, and
+non-empty liquidity evidence.
+
 Before enabling the worker, run current SIP/OPRA market-data ingestion, verify
 the PostgreSQL market/feature/target/research rows, and reconcile against the
 Alpaca paper account. Missing or stale evidence is terminal for the workstream.

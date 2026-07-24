@@ -124,7 +124,7 @@ preserved. Trade, quote, minute, daily, and previous-daily timestamps remain
 separate. `observed_at` is ingestion time and never substitutes for source time.
 
 Freshness uses quote time, then trade time, then minute-bar time. The default
-freshness limit is 20 minutes and can be configured with
+freshness limit is 30 minutes and can be configured with
 `MARKET_OBSERVATORY_MAX_AGE_SECONDS`. Freshness is `FRESH`, `STALE`, or `UNKNOWN`.
 Data quality is `COMPLETE`, `PARTIAL`, `MISSING_QUOTE`, `MISSING_TRADE`,
 `MISSING_MINUTE_BAR`, or `SOURCE_ERROR`.

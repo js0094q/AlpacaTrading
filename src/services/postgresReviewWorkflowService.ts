@@ -2,7 +2,12 @@ import { createHmac } from "node:crypto";
 
 import { canonicalJsonHash } from "../lib/canonicalJson.js";
 import type { SchedulerFence } from "../repositories/contracts/common.js";
-import { parseOptionSymbol } from "./optionSymbolService.js";
+import { AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS } from "./autonomousFreshnessPolicy.js";
+import { paperLeapsExitConfig } from "./leapsExitPolicy.js";
+import {
+  optionDaysToExpiration,
+  parseOptionSymbol
+} from "./optionSymbolService.js";
 import {
   paperExplorationProfile,
   paperExplorationThresholds,
@@ -47,6 +52,11 @@ type ReviewSourceRow = Record<string, unknown> & {
   market_request_id: string | null;
   signal_inputs?: unknown;
   market_evidence?: unknown;
+  contract_option_symbol?: string | null;
+  contract_tradable?: boolean | null;
+  contract_status?: string | null;
+  contract_source?: string | null;
+  contract_observed_at?: Date | string | null;
   open_position_count: string | number;
   open_order_count: string | number;
 };
@@ -105,6 +115,84 @@ const optionDecisionInputs = (row: ReviewSourceRow) => {
   const signalInputs = jsonRecord(row.signal_inputs);
   const marketDecisionInputs = jsonRecord(signalInputs.marketDecisionInputs);
   return jsonRecord(marketDecisionInputs.option);
+};
+const decisionInputs = (row: ReviewSourceRow) => {
+  const signalInputs = jsonRecord(row.signal_inputs);
+  return jsonRecord(signalInputs.marketDecisionInputs);
+};
+const executableOptionEvidence = (input: {
+  evidence: Record<string, unknown>;
+  maximumSpreadPct: number;
+  underlyingFallback?: unknown;
+}) => {
+  const evidence = input.evidence;
+  const bid = finite(evidence.bid);
+  const ask = finite(evidence.ask);
+  const spreadPct = finite(evidence.spreadPct);
+  const volume = finite(evidence.volume);
+  const openInterest = finite(evidence.openInterest);
+  const underlyingPrice =
+    finite(evidence.underlyingPrice) ??
+    finite(input.underlyingFallback);
+  const requestedFeed = String(evidence.requestedFeed ?? "").trim().toLowerCase();
+  const effectiveFeed = String(evidence.effectiveFeed ?? evidence.feed ?? "")
+    .trim()
+    .toLowerCase();
+  const provider = String(evidence.provider ?? "").trim().toLowerCase();
+  return !(
+    bid === null || bid <= 0 ||
+    ask === null || ask <= 0 ||
+    ask < bid ||
+    spreadPct === null ||
+    spreadPct < 0 ||
+    spreadPct > input.maximumSpreadPct ||
+    underlyingPrice === null || underlyingPrice <= 0 ||
+    volume === null || volume < 0 ||
+    openInterest === null || openInterest < 0 ||
+    volume + openInterest <= 0 ||
+    requestedFeed !== "opra" ||
+    effectiveFeed !== "opra" ||
+    provider !== "alpaca"
+  );
+};
+const assertExecutableOptionReviewEvidence = (
+  row: ReviewSourceRow,
+  maximumSpreadPct: number
+) => {
+  if (row.asset_class !== "option") return;
+  if (!executableOptionEvidence({
+    evidence: {
+      ...jsonRecord(row.market_evidence),
+      ...optionDecisionInputs(row)
+    },
+    maximumSpreadPct,
+    underlyingFallback: decisionInputs(row).currentTradablePrice
+  })) {
+    throw new Error(
+      `POSTGRES_REVIEW_OPTION_QUOTE_INVALID:${row.option_symbol ?? row.symbol}`
+    );
+  }
+};
+const assertObservedOptionContract = (row: ReviewSourceRow) => {
+  if (row.asset_class !== "option") return;
+  const optionSymbol = String(row.option_symbol ?? row.order_symbol ?? "")
+    .trim()
+    .toUpperCase();
+  const parsed = parseOptionSymbol(optionSymbol);
+  const observedAt = Date.parse(String(row.contract_observed_at ?? ""));
+  if (
+    !parsed.ok ||
+    String(row.contract_option_symbol ?? "").trim().toUpperCase() !==
+      optionSymbol ||
+    row.contract_tradable !== true ||
+    String(row.contract_status ?? "").trim().toLowerCase() !== "active" ||
+    String(row.contract_source ?? "").trim().toLowerCase() !== "alpaca" ||
+    !Number.isFinite(observedAt)
+  ) {
+    throw new Error(
+      `POSTGRES_REVIEW_OPTION_CONTRACT_INVALID:${optionSymbol || row.symbol}`
+    );
+  }
 };
 const optionSizingScale = (row: ReviewSourceRow) => {
   if (row.asset_class !== "option") return 1;
@@ -183,6 +271,11 @@ SELECT candidate.id AS candidate_id, candidate.symbol, candidate.asset_class,
        limits.cash_reserve_amount::text, limits.cash_reserve_ratio::text,
        market.market_price::text, market.market_timestamp,
        market.market_request_id, market.market_evidence,
+       contract.option_symbol AS contract_option_symbol,
+       contract.tradable AS contract_tradable,
+       contract.status AS contract_status,
+       contract.source AS contract_source,
+       contract.observed_at AS contract_observed_at,
        (SELECT COUNT(*) FROM positions position
          WHERE position.account_id = account.id AND position.status IN ('open', 'closing')
            AND (position.symbol = candidate.symbol OR position.option_symbol = candidate.option_symbol)
@@ -194,7 +287,8 @@ SELECT candidate.id AS candidate_id, candidate.symbol, candidate.asset_class,
        ) AS open_order_count
 FROM candidates candidate
 JOIN latest_research research ON research.id = candidate.research_run_id
-${command === "paper:options:discover" ? "JOIN option_contracts contract ON contract.option_symbol = candidate.option_symbol" : ""}
+LEFT JOIN option_contracts contract
+  ON contract.option_symbol = candidate.option_symbol
 CROSS JOIN current_account account
 JOIN LATERAL (
   SELECT * FROM account_snapshots WHERE account_id = account.id
@@ -218,7 +312,7 @@ JOIN LATERAL (
            COALESCE(option_snapshot.quote_timestamp, option_snapshot.snapshot_timestamp,
                     option_snapshot.trade_timestamp, option_snapshot.observed_at) AS market_timestamp,
            option_snapshot.request_id AS market_request_id,
-           jsonb_build_object(
+	           jsonb_build_object(
              'bid', option_snapshot.bid,
              'ask', option_snapshot.ask,
              'midpoint', option_snapshot.midpoint,
@@ -230,11 +324,13 @@ JOIN LATERAL (
              'gamma', option_snapshot.gamma,
              'theta', option_snapshot.theta,
              'vega', option_snapshot.vega,
-             'rho', option_snapshot.rho,
-             'requestedFeed', option_snapshot.evidence->>'requestedFeed',
-             'effectiveFeed', option_snapshot.evidence->>'effectiveFeed',
-             'spread', option_snapshot.evidence->'spread',
-             'spreadPct', option_snapshot.evidence->'spreadPct'
+	             'rho', option_snapshot.rho,
+	             'underlyingPrice', option_snapshot.evidence->'underlyingPrice',
+	             'requestedFeed', option_snapshot.evidence->>'requestedFeed',
+	             'effectiveFeed', option_snapshot.evidence->>'effectiveFeed',
+	             'provider', option_snapshot.source,
+	             'spread', option_snapshot.evidence->'spread',
+	             'spreadPct', option_snapshot.evidence->'spreadPct'
            ) AS market_evidence
     FROM option_snapshots option_snapshot
     WHERE candidate.option_symbol IS NOT NULL
@@ -283,7 +379,12 @@ WHERE candidate.decision = 'selected'
 ORDER BY candidate.rank, candidate.id
 LIMIT ${maxCandidates}`;
 
-const exitSourceSql = (command: string) => `WITH current_account AS (
+const exitSourceSql = (command: string) => {
+  const severeTrendBars = Math.min(
+    1_000,
+    paperLeapsExitConfig().severeTrendExitSma
+  );
+  return `WITH current_account AS (
   SELECT * FROM accounts WHERE environment = 'paper'
   ORDER BY updated_at DESC, id LIMIT 1
 )
@@ -295,10 +396,20 @@ SELECT position.id AS position_id, position.candidate_id, position.symbol,
        account.id AS account_id, snapshot.id AS account_snapshot_id,
        snapshot.snapshot_fingerprint,
        snapshot.evidence->>'structuralPortfolioFingerprint' AS structural_fingerprint,
-       market.market_price::text, market.market_timestamp, market.market_request_id
+       market.market_price::text, market.market_timestamp, market.market_request_id,
+       market.market_evidence, leaps_trend.underlying_close::text,
+       leaps_trend.severe_trend_sma::text,
+       leaps_trend.severe_trend_bar_count::text,
+       contract.option_symbol AS contract_option_symbol,
+       contract.tradable AS contract_tradable,
+       contract.status AS contract_status,
+       contract.source AS contract_source,
+       contract.observed_at AS contract_observed_at
 FROM positions position
 CROSS JOIN current_account account
 LEFT JOIN candidates candidate ON candidate.id = position.candidate_id
+LEFT JOIN option_contracts contract
+  ON contract.option_symbol = position.option_symbol
 JOIN LATERAL (
   SELECT * FROM account_snapshots WHERE account_id = account.id
   ORDER BY observed_at DESC, id DESC LIMIT 1
@@ -310,12 +421,26 @@ JOIN LATERAL (
 ) allocation ON true
 JOIN LATERAL (
   SELECT option_market.market_price, option_market.market_timestamp,
-         option_market.market_request_id
+         option_market.market_request_id, option_market.market_evidence
   FROM (
     SELECT COALESCE(option_snapshot.bid, option_snapshot.midpoint, option_snapshot.last) AS market_price,
            COALESCE(option_snapshot.quote_timestamp, option_snapshot.snapshot_timestamp,
                     option_snapshot.trade_timestamp, option_snapshot.observed_at) AS market_timestamp,
-           option_snapshot.request_id AS market_request_id
+           option_snapshot.request_id AS market_request_id,
+           jsonb_build_object(
+             'bid', option_snapshot.bid,
+             'ask', option_snapshot.ask,
+             'midpoint', option_snapshot.midpoint,
+             'last', option_snapshot.last,
+             'volume', option_snapshot.volume,
+             'openInterest', option_snapshot.open_interest,
+             'underlyingPrice', option_snapshot.evidence->'underlyingPrice',
+             'requestedFeed', option_snapshot.evidence->>'requestedFeed',
+             'effectiveFeed', option_snapshot.evidence->>'effectiveFeed',
+             'provider', option_snapshot.source,
+             'spread', option_snapshot.evidence->'spread',
+             'spreadPct', option_snapshot.evidence->'spreadPct'
+           ) AS market_evidence
     FROM option_snapshots option_snapshot
     WHERE position.option_symbol IS NOT NULL
       AND option_snapshot.option_symbol = position.option_symbol
@@ -323,7 +448,7 @@ JOIN LATERAL (
   ) option_market
   UNION ALL
   SELECT stock_market.market_price, stock_market.market_timestamp,
-         stock_market.market_request_id
+         stock_market.market_request_id, stock_market.market_evidence
   FROM (
     SELECT COALESCE(
              (stock.evidence->>'midpoint')::numeric,
@@ -333,7 +458,8 @@ JOIN LATERAL (
              bar.close
            ) AS market_price,
            COALESCE(stock.source_timestamp, bar.observed_at) AS market_timestamp,
-           COALESCE(stock.request_id, bar.request_id) AS market_request_id
+           COALESCE(stock.request_id, bar.request_id) AS market_request_id,
+           COALESCE(stock.evidence, '{}'::jsonb) AS market_evidence
     FROM market_bars bar
     LEFT JOIN LATERAL (
       SELECT * FROM stock_snapshots WHERE symbol = position.symbol
@@ -345,11 +471,26 @@ JOIN LATERAL (
   ) stock_market
   LIMIT 1
 ) market ON market.market_price > 0 AND market.market_timestamp IS NOT NULL
+LEFT JOIN LATERAL (
+  SELECT
+    (array_agg(trend.close ORDER BY trend.observed_at DESC))[1]
+      AS underlying_close,
+    AVG(trend.close) AS severe_trend_sma,
+    COUNT(*) AS severe_trend_bar_count
+  FROM (
+    SELECT bar.close, bar.observed_at
+    FROM market_bars bar
+    WHERE bar.symbol = position.symbol AND bar.timeframe = '1Day'
+    ORDER BY bar.observed_at DESC
+    LIMIT ${severeTrendBars}
+  ) trend
+) leaps_trend ON position.asset_class = 'option'
 WHERE position.account_id = account.id AND position.status IN ('open','closing')
   AND position.available_quantity > 0
   ${command === "hedge:exit:review" ? "AND COALESCE(candidate.strategy_family, allocation.strategy_key) ILIKE '%hedge%'" : ""}
   ${command === "zero-dte:exit:review" ? "AND position.asset_class = 'option' AND substring(position.option_symbol from '[0-9]{6}') = to_char(now() AT TIME ZONE 'America/New_York', 'YYMMDD')" : ""}
 ORDER BY position.opened_at, position.id`;
+};
 
 const runExitReview = async (input: {
   command: string;
@@ -357,7 +498,7 @@ const runExitReview = async (input: {
   fence: SchedulerFence;
   signingKey: string;
   now: Date;
-  maxMarketAgeHours: number;
+  maxMarketAgeSeconds: number;
 }) => {
   const rows = (await input.query.query(exitSourceSql(input.command))).rows as Array<Record<string, unknown>>;
   const eligible = rows.flatMap((row) => {
@@ -369,17 +510,76 @@ const runExitReview = async (input: {
     }
     const timestamp = new Date(String(row.market_timestamp)).toISOString();
     const age = input.now.getTime() - Date.parse(timestamp);
-    if (!Number.isFinite(age) || age < -60_000 || age > input.maxMarketAgeHours * 3_600_000) {
+    if (
+      !Number.isFinite(age) ||
+      age < -60_000 ||
+      age > input.maxMarketAgeSeconds * 1_000
+    ) {
       throw new Error(`POSTGRES_REVIEW_MARKET_EVIDENCE_STALE:${String(row.symbol)}`);
     }
     const directionalReturn = (price / entry - 1) * (row.side === "short" ? -1 : 1);
     const option = row.asset_class === "option";
+    if (
+      option &&
+      !executableOptionEvidence({
+        evidence: jsonRecord(row.market_evidence),
+        maximumSpreadPct:
+          paperExplorationThresholds().maximumOptionSpreadPct
+      })
+    ) {
+      throw new Error(
+        `POSTGRES_EXIT_REVIEW_OPTION_QUOTE_INVALID:${String(row.order_symbol)}`
+      );
+    }
+    if (option) assertObservedOptionContract(row as ReviewSourceRow);
     const forceZeroDteExit = option &&
       isFinalThirtyMinutesForZeroDte(String(row.order_symbol), input.now);
+    const parsedOption = option
+      ? parseOptionSymbol(String(row.order_symbol))
+      : null;
+    const currentDte = parsedOption?.ok
+      ? optionDaysToExpiration(parsedOption.expirationDate, input.now.toISOString())
+      : null;
+    const leapsConfig = paperLeapsExitConfig();
+    const strategyKey = String(row.strategy_key ?? "").toLowerCase();
+    const leaps = option && (
+      strategyKey.includes("leaps") ||
+      (currentDte !== null && currentDte >= leapsConfig.minDteAtEntry)
+    );
+    const directionalReturnPct = directionalReturn * 100;
+    const severeTrendBarCount = finite(row.severe_trend_bar_count);
+    const underlyingClose = finite(row.underlying_close);
+    const severeTrendSma = finite(row.severe_trend_sma);
+    const severeTrendBreak = leaps &&
+      parsedOption?.ok === true &&
+      severeTrendBarCount !== null &&
+      severeTrendBarCount >= leapsConfig.severeTrendExitSma &&
+      underlyingClose !== null &&
+      severeTrendSma !== null &&
+      (
+        (parsedOption.optionType === "call" &&
+          underlyingClose < severeTrendSma) ||
+        (parsedOption.optionType === "put" &&
+          underlyingClose > severeTrendSma)
+      );
     const reason = option
-      ? forceZeroDteExit
-        ? "ODTE_FORCE_EXIT_BEFORE_CLOSE"
-        : directionalReturn <= -0.5 ? "ODTE_STOP_LOSS_50" : directionalReturn >= 0.5 ? "ODTE_TAKE_PROFIT_50" : null
+      ? leaps
+        ? directionalReturnPct <= leapsConfig.hardStopLossPct
+          ? "LEAPS_HARD_STOP_LOSS"
+          : directionalReturnPct >= leapsConfig.fullProfitTakePct
+            ? "LEAPS_FULL_PROFIT_TAKE"
+            : currentDte !== null && currentDte <= leapsConfig.dteExitThreshold
+              ? "LEAPS_DTE_EXIT_WINDOW"
+              : severeTrendBreak
+                ? "LEAPS_SEVERE_TREND_BREAK"
+                : null
+        : forceZeroDteExit
+          ? "ODTE_FORCE_EXIT_BEFORE_CLOSE"
+          : directionalReturn <= -0.5
+            ? "ODTE_STOP_LOSS_50"
+            : directionalReturn >= 0.5
+              ? "ODTE_TAKE_PROFIT_50"
+              : null
       : directionalReturn <= -0.05 ? "EQUITY_STOP_LOSS_5" : directionalReturn >= 0.08 ? "EQUITY_TAKE_PROFIT_8" : null;
     return reason ? [{ row, price, quantity, timestamp, option, reason, directionalReturn }] : [];
   });
@@ -400,10 +600,18 @@ const runExitReview = async (input: {
     if (!structural || !portfolio || !snapshotId) throw new Error("POSTGRES_REVIEW_ACCOUNT_FINGERPRINT_MISSING");
     const clientOrderId = `pg-exit-${canonicalJsonHash({ accountId, positionId, snapshotId }).slice(0, 28)}`;
     const marketEvidence = [{
-      symbol: orderSymbol, underlyingSymbol: String(row.symbol),
-      referencePrice: item.price, timestamp: item.timestamp,
+      symbol: orderSymbol,
+      underlyingSymbol: String(row.symbol),
+      referencePrice: item.price,
+      timestamp: item.timestamp,
       requestId: row.market_request_id ?? null,
-      source: item.option ? "postgres.option_snapshots" : "postgres.stock_snapshots"
+      ...(item.option ? {
+        ...jsonRecord(row.market_evidence),
+        maximumSpreadPct: paperExplorationThresholds().maximumOptionSpreadPct
+      } : {}),
+      source: item.option
+        ? "postgres.option_snapshots"
+        : "postgres.stock_snapshots"
     }];
     if (item.option && row.side !== "long") {
       throw new Error(`POSTGRES_OPTION_CLOSE_SIDE_UNSUPPORTED:${orderSymbol}`);
@@ -551,7 +759,7 @@ export const runPostgresReviewWorkflow = async (input: {
   fence: SchedulerFence;
   signingKey?: string;
   now?: Date;
-  maxMarketAgeHours?: number;
+  maxMarketAgeSeconds?: number;
   underlying?: string;
   dte?: number;
   maxCandidates?: number;
@@ -579,7 +787,9 @@ export const runPostgresReviewWorkflow = async (input: {
       fence: input.fence,
       signingKey,
       now,
-      maxMarketAgeHours: input.maxMarketAgeHours ?? 96
+      maxMarketAgeSeconds:
+        input.maxMarketAgeSeconds ??
+        AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS
     });
   }
   let sourceValues: readonly unknown[] = [];
@@ -625,12 +835,20 @@ export const runPostgresReviewWorkflow = async (input: {
     }
     const marketTimestamp = new Date(row.market_timestamp).toISOString();
     const age = now.getTime() - Date.parse(marketTimestamp);
-    const maxAge = (input.maxMarketAgeHours ?? 96) * 3_600_000;
+    const maxAge = (
+      input.maxMarketAgeSeconds ??
+      AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS
+    ) * 1_000;
     if (!Number.isFinite(age) || age < -60_000 || age > maxAge) {
       throw new Error(`POSTGRES_REVIEW_MARKET_EVIDENCE_STALE:${row.symbol}`);
     }
     const price = finite(row.market_price);
     if (price === null || price <= 0) throw new Error(`POSTGRES_REVIEW_MARKET_PRICE_MISSING:${row.symbol}`);
+    assertObservedOptionContract(row);
+    assertExecutableOptionReviewEvidence(
+      row,
+      exploration.maximumOptionSpreadPct
+    );
     const amount = sizing(row, exploration.maxOrderNotional);
     if (amount === null) {
       capacityBlocked += 1;
@@ -685,12 +903,19 @@ export const runPostgresReviewWorkflow = async (input: {
   for (const { row, amount } of eligibleRows) {
     const marketTimestamp = new Date(row.market_timestamp).toISOString();
     const age = now.getTime() - Date.parse(marketTimestamp);
-    const maxAge = (input.maxMarketAgeHours ?? 96) * 3_600_000;
+    const maxAge = (
+      input.maxMarketAgeSeconds ??
+      AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS
+    ) * 1_000;
     if (!Number.isFinite(age) || age < -60_000 || age > maxAge) {
       throw new Error(`POSTGRES_REVIEW_MARKET_EVIDENCE_STALE:${row.symbol}`);
     }
     const price = finite(row.market_price);
     if (price === null || price <= 0) throw new Error(`POSTGRES_REVIEW_MARKET_PRICE_MISSING:${row.symbol}`);
+    assertExecutableOptionReviewEvidence(
+      row,
+      exploration.maximumOptionSpreadPct
+    );
     const option = row.asset_class === "option";
     const shortEquity = !option && row.direction === "short";
     const quantity = option
@@ -709,7 +934,13 @@ export const runPostgresReviewWorkflow = async (input: {
       requestId: row.market_request_id,
       source: option ? "postgres.option_snapshots" : "postgres.stock_snapshots",
       ...jsonRecord(row.market_evidence),
-      ...(option ? optionDecisionInputs(row) : {})
+      ...(option ? optionDecisionInputs(row) : {}),
+      ...(option ? {
+        underlyingPrice:
+          finite(jsonRecord(row.market_evidence).underlyingPrice) ??
+          finite(decisionInputs(row).currentTradablePrice),
+        maximumSpreadPct: exploration.maximumOptionSpreadPct
+      } : {})
     }];
     const entrySide = option ? "buy_to_open" : row.direction === "short" ? "sell" : "buy";
     const orderIntent = {

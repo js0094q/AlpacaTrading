@@ -9,6 +9,7 @@ import {
   type PostgresStockSnapshot,
   type PostgresUniverseSymbol
 } from "../repositories/postgres/postgresMarketDataRepository.js";
+import { AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS } from "./autonomousFreshnessPolicy.js";
 import { normalizeOptionSnapshot } from "./optionSnapshotNormalizer.js";
 import {
   fetchAllBars,
@@ -356,7 +357,7 @@ export const refreshPostgresMarketData = async (input: {
       currency: fetched.currency,
       requestId: fetched.requestId,
       now: stockObservationTime,
-      maxAgeSeconds: maxBarAgeMs / 1_000
+      maxAgeSeconds: AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS
     });
     if (!normalized.sourceTimestamp || normalized.dataQualityStatus === "SOURCE_ERROR") {
       throw new Error(`POSTGRES_STOCK_SNAPSHOT_INCOMPLETE:${symbol}`);
@@ -438,7 +439,8 @@ export const refreshPostgresMarketData = async (input: {
           staleRows: 0,
           rejectedRows: 0,
           freshnessThresholdSeconds:
-            (input.maxOptionSnapshotAgeSeconds ?? 1_200),
+            (input.maxOptionSnapshotAgeSeconds ??
+              AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS),
           rejectionReason,
           persistenceResult: "not_persisted_provider_unavailable",
           requestIds: []
@@ -482,7 +484,10 @@ export const refreshPostgresMarketData = async (input: {
       await repository.upsertOptionContracts(optionContracts, input.context);
     }
     const snapshotsByIdentity = new Map<string, PostgresOptionSnapshot>();
-    const maxOptionAgeMs = (input.maxOptionSnapshotAgeSeconds ?? 1_200) * 1_000;
+    const maxOptionAgeMs = (
+      input.maxOptionSnapshotAgeSeconds ??
+      AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS
+    ) * 1_000;
     for (const underlying of requestedSymbols) {
       const currentContracts = optionContracts.filter((row) => row.underlyingSymbol === underlying);
       if (!currentContracts.length) {

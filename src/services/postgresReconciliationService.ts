@@ -195,6 +195,70 @@ const syncBrokerAccountAndPositions = async (input: {
       accountId,
       brokerPositionKey: position.brokerPositionKey
     })}`;
+    const lineageResult = await input.query.query(
+      `SELECT intent.candidate_id, broker_order.id AS opening_order_id,
+              COALESCE(
+                broker_order.filled_at,
+                broker_order.updated_at,
+                broker_order.created_at
+              )::text AS opening_filled_at
+       FROM orders broker_order
+       JOIN order_intents intent ON intent.id = broker_order.order_intent_id
+       WHERE broker_order.account_id = $1
+         AND broker_order.symbol = $2
+         AND broker_order.asset_class = $3
+         AND broker_order.status IN ('filled', 'partially_filled')
+         AND COALESCE(
+           broker_order.filled_at,
+           broker_order.updated_at,
+           broker_order.created_at
+         ) <= $5::timestamptz
+         AND ABS(
+           broker_order.filled_quantity - $6::numeric
+         ) <= 0.000000000001
+         AND ABS(
+           broker_order.filled_average_price - $7::numeric
+         ) <= 0.00000001
+         AND COALESCE(
+           broker_order.filled_at,
+           broker_order.updated_at,
+           broker_order.created_at
+         ) > COALESCE(
+           (
+             SELECT existing_position.closed_at
+             FROM positions existing_position
+             WHERE existing_position.account_id = $1
+               AND existing_position.broker_position_key = $8
+           ),
+           '-infinity'::timestamptz
+         )
+         AND (
+           ($4 = 'long' AND intent.side IN ('buy', 'buy_to_open'))
+           OR ($4 = 'short' AND intent.side = 'sell'
+               AND intent.asset_class = 'equity')
+         )
+       ORDER BY COALESCE(
+         broker_order.filled_at,
+         broker_order.updated_at,
+         broker_order.created_at
+       ) DESC, broker_order.id DESC
+       LIMIT 1`,
+      [
+        accountId,
+        position.optionSymbol ?? position.symbol,
+        position.assetClass,
+        position.side,
+        snapshot.capturedAt,
+        position.quantity,
+        position.averageEntryPrice,
+        position.brokerPositionKey
+      ]
+    );
+    const lineage = lineageResult.rows[0];
+    const candidateId = optional(lineage?.candidate_id);
+    const openingOrderId = optional(lineage?.opening_order_id);
+    const openingFilledAt =
+      optional(lineage?.opening_filled_at) ?? snapshot.capturedAt;
     const stored = await input.query.query(
       `INSERT INTO positions(
          id, account_id, broker_position_key, candidate_id, opening_order_id,
@@ -203,10 +267,18 @@ const syncBrokerAccountAndPositions = async (input: {
          average_entry_price, current_price, market_value, cost_basis,
          unrealized_pnl, source_account_snapshot_id, opened_at,
          last_reconciled_at, created_at, updated_at
-       ) SELECT $1, $2, $3, NULL, NULL, NULL, $4, $5, $6, $7, $8, 'open',
-                $9, $10, $11, $12, $13, $14, $15, $16, $17, $17, $17, $17
-         WHERE ${fenceSql(18)}
+       ) SELECT $1, $2, $3, $4, $5, NULL, $6, $7, $8, $9, $10, 'open',
+                $11, $12, $13, $14, $15, $16, $17, $18, $19, $19, $19, $19
+         WHERE ${fenceSql(20)}
        ON CONFLICT (account_id, broker_position_key) DO UPDATE SET
+         candidate_id = CASE
+           WHEN positions.status = 'closed' THEN EXCLUDED.candidate_id
+           ELSE COALESCE(positions.candidate_id, EXCLUDED.candidate_id)
+         END,
+         opening_order_id = CASE
+           WHEN positions.status = 'closed' THEN EXCLUDED.opening_order_id
+           ELSE COALESCE(positions.opening_order_id, EXCLUDED.opening_order_id)
+         END,
          symbol = EXCLUDED.symbol,
          underlying_symbol = EXCLUDED.underlying_symbol,
          option_symbol = EXCLUDED.option_symbol,
@@ -221,6 +293,10 @@ const syncBrokerAccountAndPositions = async (input: {
          cost_basis = EXCLUDED.cost_basis,
          unrealized_pnl = EXCLUDED.unrealized_pnl,
          source_account_snapshot_id = EXCLUDED.source_account_snapshot_id,
+         opened_at = CASE
+           WHEN positions.status = 'closed' THEN EXCLUDED.opened_at
+           ELSE positions.opened_at
+         END,
          closed_at = NULL,
          last_reconciled_at = EXCLUDED.last_reconciled_at,
          version = positions.version + 1,
@@ -229,6 +305,8 @@ const syncBrokerAccountAndPositions = async (input: {
         positionId,
         accountId,
         position.brokerPositionKey,
+        candidateId,
+        openingOrderId,
         position.symbol,
         position.underlyingSymbol,
         position.optionSymbol,
@@ -242,7 +320,7 @@ const syncBrokerAccountAndPositions = async (input: {
         position.costBasis,
         position.unrealizedPnl,
         accountSnapshotId,
-        snapshot.capturedAt,
+        openingFilledAt,
         ...fenceValues(input.fence)
       ]
     );

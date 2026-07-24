@@ -284,9 +284,9 @@ test("stock freshness uses provider retrieval time instead of the cycle start ti
         symbol: "SPY",
         raw: {
           ...stockRaw,
-          latestTrade: { ...stockRaw.latestTrade, t: "2026-07-20T20:24:59.000Z" },
-          latestQuote: { ...stockRaw.latestQuote, t: "2026-07-20T20:24:59.000Z" },
-          minuteBar: { ...stockRaw.minuteBar, t: "2026-07-20T20:24:00.000Z" }
+          latestTrade: { ...stockRaw.latestTrade, t: "2026-07-20T19:55:01.000Z" },
+          latestQuote: { ...stockRaw.latestQuote, t: "2026-07-20T19:55:01.000Z" },
+          minuteBar: { ...stockRaw.minuteBar, t: "2026-07-20T19:55:00.000Z" }
         },
         requestedFeed: "sip",
         effectiveFeed: "sip",
@@ -303,6 +303,72 @@ test("stock freshness uses provider retrieval time instead of the cycle start ti
   assert.equal(result.stockSnapshots[0]?.observedAt, "2026-07-20T20:25:00.000Z");
   assert.equal(result.stockSnapshots[0]?.evidence.freshnessStatus, "FRESH");
   assert.equal(stored.length, 1);
+});
+
+test("PostgreSQL stock ingestion rejects evidence older than the 30-minute autonomous window", async () => {
+  const repository = {
+    upsertUniverseSymbols: async () => ({ stored: 1 }),
+    upsertBars: async () => ({ stored: 1 }),
+    upsertStockSnapshots: async () => ({ stored: 1 })
+  } as never;
+
+  await assert.rejects(
+    refreshPostgresMarketData({
+      symbols: ["SPY"],
+      timeframe: "1Day",
+      start: "2026-01-01T00:00:00.000Z",
+      end: "2026-07-20T23:59:59.999Z",
+      optionsEnabled: false,
+      now: new Date("2026-07-20T20:25:00.000Z"),
+      repository,
+      context,
+      dependencies: {
+        fetchAllBars: async () => [{
+          symbol: "SPY",
+          bar: {
+            t: "2026-07-20T20:00:00.000Z",
+            o: 620,
+            h: 625,
+            l: 618,
+            c: 624,
+            v: 1_000_000
+          },
+          requestIds: ["request-bars"]
+        }],
+        fetchStockSnapshots: async () => [{
+          symbol: "SPY",
+          raw: {
+            ...stockRaw,
+            latestTrade: {
+              ...stockRaw.latestTrade,
+              t: "2026-07-20T19:54:59.000Z"
+            },
+            latestQuote: {
+              ...stockRaw.latestQuote,
+              t: "2026-07-20T19:54:59.000Z"
+            },
+            minuteBar: {
+              ...stockRaw.minuteBar,
+              t: "2026-07-20T19:54:00.000Z"
+            }
+          },
+          requestedFeed: "sip",
+          effectiveFeed: "sip",
+          currency: "USD",
+          requestId: "request-stocks",
+          retrievedAt: "2026-07-20T20:25:00.000Z"
+        }],
+        fetchOptionContracts: async () => [],
+        fetchOptionSnapshots: async () => [],
+        fetchOptionChainSnapshots: async () => ({
+          underlyingSymbol: "SPY",
+          pagesConsumed: 0,
+          snapshots: []
+        })
+      }
+    }),
+    /POSTGRES_STOCK_SNAPSHOT_STALE:SPY/
+  );
 });
 
 test("refresh rejects stale option evidence, persists ingestion telemetry, and returns equity-only data", async () => {
@@ -410,7 +476,7 @@ test("refresh rejects stale option evidence, persists ingestion telemetry, and r
     acceptedRows: 0,
     staleRows: 1,
     rejectedRows: 1,
-    freshnessThresholdSeconds: 1_200,
+    freshnessThresholdSeconds: 1_800,
     rejectionReason: "POSTGRES_OPTION_SNAPSHOTS_CURRENT_MISSING:SPY",
     persistenceResult: "not_persisted_stale",
     requestIds: ["request-options"]
@@ -584,7 +650,7 @@ test("an unavailable OPRA endpoint records the failure and does not block curren
     acceptedRows: 0,
     staleRows: 0,
     rejectedRows: 0,
-    freshnessThresholdSeconds: 1_200,
+    freshnessThresholdSeconds: 1_800,
     rejectionReason: "POSTGRES_OPTION_PROVIDER_UNAVAILABLE:SPY:ALPACA_API_UNAVAILABLE",
     persistenceResult: "not_persisted_provider_unavailable",
     requestIds: []

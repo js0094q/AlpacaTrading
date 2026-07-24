@@ -13,6 +13,7 @@ import {
   checkAlpacaSymbolTradability,
   type AlpacaAssetTradabilityResult
 } from "./alpacaAssetService.js";
+import { optionsQuoteConfig } from "./optionQuoteNormalizer.js";
 import type { PostgresAuthorityBrokerSnapshot } from "./postgresAuthorityBrokerSnapshot.js";
 
 export type AutonomousExecutionIntentRow = {
@@ -90,8 +91,16 @@ const positive = (value: unknown) => {
 const marketEvidence = (
   value: unknown,
   symbol: string
-): { referencePrice: number; timestamp: string } | null => {
-  const visit = (entry: unknown): { referencePrice: number; timestamp: string } | null => {
+): {
+  referencePrice: number;
+  timestamp: string;
+  record: Record<string, unknown>;
+} | null => {
+  const visit = (entry: unknown): {
+    referencePrice: number;
+    timestamp: string;
+    record: Record<string, unknown>;
+  } | null => {
     if (Array.isArray(entry)) {
       for (const item of entry) {
         const found = visit(item);
@@ -108,7 +117,7 @@ const marketEvidence = (
       record.observedAt ?? record.capturedAt
     );
     if ((!entrySymbol || entrySymbol === symbol.toUpperCase()) && price && timestamp) {
-      return { referencePrice: price, timestamp };
+      return { referencePrice: price, timestamp, record };
     }
     for (const nested of Object.values(record)) {
       const found = visit(nested);
@@ -142,11 +151,50 @@ export const validateAutonomousExecutionEvidence = (
   }
   const observedAt = Date.parse(evidence.timestamp);
   const ageSeconds = (now.getTime() - observedAt) / 1_000;
+  const effectiveMaxAgeSeconds = intent.asset_class === "option"
+    ? Math.min(quoteMaxAgeSeconds, optionsQuoteConfig().maxAgeMs / 1_000)
+    : quoteMaxAgeSeconds;
   if (
     !Number.isFinite(observedAt) || ageSeconds < 0 ||
-    ageSeconds > quoteMaxAgeSeconds
+    ageSeconds > effectiveMaxAgeSeconds
   ) {
     throw new Error("POSTGRES_MARKET_EVIDENCE_STALE");
+  }
+  if (intent.asset_class === "option") {
+    const record = evidence.record;
+    const bid = positive(record.bid);
+    const ask = positive(record.ask);
+    const spreadPct = Number(record.spreadPct);
+    const maximumSpreadPct = Number(record.maximumSpreadPct);
+    const underlyingPrice = positive(record.underlyingPrice);
+    const volume = Number(record.volume);
+    const openInterest = Number(record.openInterest);
+    const requestedFeed = text(record.requestedFeed).toLowerCase();
+    const effectiveFeed = text(record.effectiveFeed).toLowerCase();
+    const source = text(record.source);
+    const liquidityValid =
+      Number.isFinite(volume) &&
+      volume >= 0 &&
+      Number.isFinite(openInterest) &&
+      openInterest >= 0 &&
+      volume + openInterest > 0;
+    if (
+      !bid ||
+      !ask ||
+      ask < bid ||
+      !Number.isFinite(spreadPct) ||
+      spreadPct < 0 ||
+      !Number.isFinite(maximumSpreadPct) ||
+      maximumSpreadPct < 0 ||
+      spreadPct > maximumSpreadPct ||
+      !underlyingPrice ||
+      !liquidityValid ||
+      requestedFeed !== "opra" ||
+      effectiveFeed !== "opra" ||
+      source !== "postgres.option_snapshots"
+    ) {
+      throw new Error("POSTGRES_OPTION_MARKET_EVIDENCE_UNUSABLE");
+    }
   }
   if (!intent.quantity && !intent.notional) {
     throw new Error("POSTGRES_ORDER_INTENT_SIZE_MISSING");

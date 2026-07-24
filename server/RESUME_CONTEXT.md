@@ -13,6 +13,11 @@ The repository worker uses paper exploration V3 and narrowly classifies
 `NO_RECONCILIABLE_POSTGRES_ORDERS`, as successful `WORKSTREAM_NO_ACTION`
 outcomes. Require the checked-in unit's paper/live-off assertions, unchanged
 liquidity/spread/notional gates, and all PostgreSQL/reconciliation controls.
+The unit and protected environment must both set
+`MARKET_OBSERVATORY_MAX_AGE_SECONDS=1800` and
+`PAPER_SUBMIT_QUOTE_MAX_AGE_SECONDS=1800`. This 30-minute evidence window does
+not replace the positive/non-crossed bid/ask, OPRA provenance, spread,
+underlying, liquidity, market-session, or risk gates.
 
 ## Deployment sequence
 

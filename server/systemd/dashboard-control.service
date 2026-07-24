@@ -18,6 +18,8 @@ Environment=DATABASE_BACKEND=postgres
 Environment=POSTGRES_SHADOW_COMPARE_ENABLED=false
 Environment=POSTGRES_EXECUTION_STATE_SHADOW_ENABLED=false
 Environment=SQLITE_AUDIT_MIRROR_ENABLED=false
+Environment=MARKET_OBSERVATORY_MAX_AGE_SECONDS=1800
+Environment=PAPER_SUBMIT_QUOTE_MAX_AGE_SECONDS=1800
 ExecStart=/usr/bin/node /home/alpaca/Alpaca-Trading/node_modules/tsx/dist/cli.mjs server/dashboard-control/server.ts
 Restart=on-failure
 RestartSec=5s

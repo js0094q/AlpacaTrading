@@ -345,6 +345,39 @@ describe("market observatory stock snapshots", () => {
     assert.equal(stale.freshnessStatus, "STALE");
   });
 
+  test("uses the autonomous 30-minute default freshness boundary", () => {
+    const sourceTimestamp = "2026-07-13T16:45:00.000Z";
+    const freshAtBoundary = normalizeStockSnapshot({
+      symbol: "AAPL",
+      raw: {
+        ...completeSnapshot,
+        latestTrade: { ...completeSnapshot.latestTrade, t: sourceTimestamp },
+        latestQuote: { ...completeSnapshot.latestQuote, t: sourceTimestamp },
+        minuteBar: { ...completeSnapshot.minuteBar, t: sourceTimestamp }
+      },
+      observedAt: "2026-07-13T17:14:59.000Z",
+      requestedFeed: "sip",
+      effectiveFeed: "sip",
+      now: new Date("2026-07-13T17:14:59.000Z")
+    });
+    const staleAfterBoundary = normalizeStockSnapshot({
+      symbol: "AAPL",
+      raw: {
+        ...completeSnapshot,
+        latestTrade: { ...completeSnapshot.latestTrade, t: sourceTimestamp },
+        latestQuote: { ...completeSnapshot.latestQuote, t: sourceTimestamp },
+        minuteBar: { ...completeSnapshot.minuteBar, t: sourceTimestamp }
+      },
+      observedAt: "2026-07-13T17:15:01.000Z",
+      requestedFeed: "sip",
+      effectiveFeed: "sip",
+      now: new Date("2026-07-13T17:15:01.000Z")
+    });
+
+    assert.equal(freshAtBoundary.freshnessStatus, "FRESH");
+    assert.equal(staleAfterBoundary.freshnessStatus, "STALE");
+  });
+
   test("marks incomplete daily context partial and preserves observed zeroes", () => {
     const row = normalizeStockSnapshot({
       symbol: "AAPL",

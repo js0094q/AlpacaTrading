@@ -4,6 +4,7 @@ import type {
   StockSnapshotFreshnessStatus,
   StockSnapshotRow
 } from "../types.js";
+import { AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS } from "./autonomousFreshnessPolicy.js";
 
 export interface StockSnapshotRaw {
   [key: string]: unknown;
@@ -210,7 +211,8 @@ export const normalizeStockSnapshot = (input: {
     freshnessStatus: sourceFreshness({
       sourceTimestamp,
       now: input.now ?? new Date(input.observedAt),
-      maxAgeSeconds: input.maxAgeSeconds ?? 1200
+      maxAgeSeconds:
+        input.maxAgeSeconds ?? AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS
     }),
     dataQualityStatus: dataQuality({
       error: errorSummary,

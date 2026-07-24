@@ -95,6 +95,99 @@ test("the execution gate accepts complete fresh paper evidence without synthesiz
   });
 });
 
+test("the execution gate accepts evidence at 29:59 and rejects evidence older than 30 minutes", () => {
+  const accepted = validateAutonomousExecutionEvidence(
+    intent({
+      market_evidence: [{
+        symbol: "AAPL",
+        referencePrice: 200,
+        timestamp: "2026-07-20T21:30:01.000Z"
+      }]
+    }),
+    broker,
+    new Date("2026-07-20T22:00:00.000Z"),
+    1_800
+  );
+  assert.equal(accepted.client_order_id, "worker-order-1");
+  assert.throws(
+    () => validateAutonomousExecutionEvidence(
+      intent({
+        market_evidence: [{
+          symbol: "AAPL",
+          referencePrice: 200,
+          timestamp: "2026-07-20T21:29:59.000Z"
+        }]
+      }),
+      broker,
+      new Date("2026-07-20T22:00:00.000Z"),
+      1_800
+    ),
+    /POSTGRES_MARKET_EVIDENCE_STALE/
+  );
+});
+
+test("the execution gate rejects a fresh option intent with an unusable quote", () => {
+  assert.throws(
+    () => validateAutonomousExecutionEvidence(
+      intent({
+        asset_class: "option",
+        side: "buy_to_open",
+        symbol: "SPY260821C00560000",
+        market_evidence: [{
+          symbol: "SPY260821C00560000",
+          referencePrice: 2,
+          timestamp: "2026-07-20T21:59:30.000Z",
+          bid: 2.02,
+          ask: 1.98,
+          spreadPct: 0.02,
+          maximumSpreadPct: 0.15,
+          underlyingPrice: 555,
+          volume: 5_000,
+          openInterest: 8_000,
+          requestedFeed: "opra",
+          effectiveFeed: "opra",
+          source: "postgres.option_snapshots"
+        }]
+      }),
+      broker,
+      new Date("2026-07-20T22:00:00.000Z"),
+      1_800
+    ),
+    /POSTGRES_OPTION_MARKET_EVIDENCE_UNUSABLE/
+  );
+});
+
+test("the execution gate preserves the stricter 15-minute option quote age", () => {
+  assert.throws(
+    () => validateAutonomousExecutionEvidence(
+      intent({
+        asset_class: "option",
+        side: "buy_to_open",
+        symbol: "SPY260821C00560000",
+        market_evidence: [{
+          symbol: "SPY260821C00560000",
+          referencePrice: 2,
+          timestamp: "2026-07-20T21:40:00.000Z",
+          bid: 1.98,
+          ask: 2.02,
+          spreadPct: 0.02,
+          maximumSpreadPct: 0.15,
+          underlyingPrice: 555,
+          volume: 5_000,
+          openInterest: 8_000,
+          requestedFeed: "opra",
+          effectiveFeed: "opra",
+          source: "postgres.option_snapshots"
+        }]
+      }),
+      broker,
+      new Date("2026-07-20T22:00:00.000Z"),
+      1_800
+    ),
+    /POSTGRES_MARKET_EVIDENCE_STALE/
+  );
+});
+
 test("the execution gate compares the persisted broker identity hash without hashing it twice", () => {
   const payload = validateAutonomousExecutionEvidence(
     intent({ broker_account_id: "account-identity" }),
@@ -117,7 +210,17 @@ test("the execution gate emits supported option sell-to-close semantics", () => 
       market_evidence: [{
         symbol: "SPY260720P00555000",
         referencePrice: 1.05,
-        timestamp: "2026-07-20T21:59:30.000Z"
+        timestamp: "2026-07-20T21:59:30.000Z",
+        bid: 1.05,
+        ask: 1.08,
+        spreadPct: 0.028169,
+        maximumSpreadPct: 0.15,
+        underlyingPrice: 555,
+        volume: 5_000,
+        openInterest: 8_000,
+        requestedFeed: "opra",
+        effectiveFeed: "opra",
+        source: "postgres.option_snapshots"
       }]
     }),
     broker,
