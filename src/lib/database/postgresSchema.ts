@@ -110,6 +110,7 @@ export const POSTGRES_OPERATIONAL_INDEXES = [
   "lifecycle_fingerprints_candidate_idx",
   "lifecycle_fingerprints_intent_idx",
   "order_intents_lifecycle_state_idx",
+  "order_intents_autonomous_cycle_idx",
   "order_intents_cycle_workstream_idx",
   "autonomous_trade_lifecycle_transitions_intent_idx"
 ] as const;
@@ -145,11 +146,15 @@ export const POSTGRES_RELEASE_3_COLUMNS = [
   ,"order_intents.operation",
   "order_intents.strategy_classification",
   "order_intents.lifecycle_state",
-  "order_intents.cycle_id",
-  "order_intents.workstream",
-  "order_intents.snapshot_id",
-  "order_intents.parent_intent_id",
+  "order_intents.review_id",
+  "order_intents.confirmation_id",
+  "order_intents.parent_position_id",
   "order_intents.opening_intent_id",
+  "order_intents.contract_id",
+  "order_intents.authorization_snapshot_id",
+  "order_intents.autonomous_cycle_id",
+  "order_intents.workstream_execution_id",
+  "order_intents.scheduler_fence_token",
   "order_intents.broker_order_id",
   "order_intents.reservation_release_reason"
 ] as const;
