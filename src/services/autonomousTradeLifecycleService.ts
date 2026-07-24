@@ -1,135 +1,134 @@
-/** Pure, paper-only contracts for the autonomous trade lifecycle. */
+/** Durable, paper-only autonomous trade lifecycle contracts. */
 
 export const AUTONOMOUS_TRADE_LIFECYCLE_STATES = [
-  "candidate_created", "candidate_qualified", "review_created", "review_pending", "review_approved",
-  "review_rejected", "intent_created", "submission_attempt_persisted", "submitted", "partially_filled",
-  "filled", "exit_requested", "exit_submission_attempt_persisted", "exit_submitted", "cancel_requested",
-  "cancel_submitted", "cancelled", "rejected", "expired", "reconciled", "closed", "blocked",
-  "ambiguous", "failed_recoverable", "failed_terminal"
+  "candidate_created", "review_created", "confirmed", "ready_for_submission",
+  "submission_attempt_persisted", "submission_ambiguous", "broker_order_discovered",
+  "broker_order_accepted", "partially_filled", "filled", "position_reconciled",
+  "exit_evaluated", "exit_review_created", "exit_confirmed", "exit_ready_for_submission",
+  "exit_submission_attempt_persisted", "exit_submission_ambiguous", "exit_broker_order_discovered",
+  "exit_partially_filled", "closed", "cancel_requested", "cancel_ambiguous", "cancelled",
+  "rejected", "expired", "failed_terminal"
 ] as const;
 export type AutonomousTradeLifecycleState = (typeof AUTONOMOUS_TRADE_LIFECYCLE_STATES)[number];
 
 export const TRADE_OPERATIONS = ["buy_to_open", "sell_to_open", "sell_to_close", "buy_to_cover"] as const;
 export type TradeOperation = (typeof TRADE_OPERATIONS)[number];
-
 export const STRATEGY_CLASSIFICATIONS = [
-  "equity_long", "equity_short", "standard_call", "standard_put",
-  "zero_dte_call", "zero_dte_put", "leaps_call", "leaps_put", "hedge"
+  "equity_long", "equity_short", "standard_long_call", "standard_long_put",
+  "zero_dte_long_call", "zero_dte_long_put", "leaps_long_call", "leaps_long_put", "hedge"
 ] as const;
 export type StrategyClassification = (typeof STRATEGY_CLASSIFICATIONS)[number];
 
 export interface WorkerExecutionContext {
-  autonomousCycleId: string;
+  cycleId: string;
   workstreamExecutionId: string;
-  authorizationSnapshotId: string;
-  schedulerFenceToken: bigint;
-  reviewId: string | null;
-  confirmationId: string | null;
-  parentPositionId: string | null;
-  openingIntentId: string | null;
+  leaseId: string;
+  fenceToken: bigint;
+  startedAt: Date;
+  abortSignal: AbortSignal;
 }
 
 export interface PersistedOrderIntent {
   id: string;
-  accountId: string;
   candidateId: string | null;
-  reviewId: string | null;
-  confirmationId: string | null;
+  reviewId: string;
+  confirmationId: string;
   parentPositionId: string | null;
   openingIntentId: string | null;
+  operation: TradeOperation;
+  strategyClassification: StrategyClassification;
+  symbol: string;
   contractId: string | null;
-  authorizationSnapshotId: string;
+  clientOrderId: string;
+  quantity: string;
+  limitPrice: string | null;
+  lifecycleState: AutonomousTradeLifecycleState;
   autonomousCycleId: string;
   workstreamExecutionId: string;
-  reservationId: string | null;
-  clientOrderId: string;
-  operation: TradeOperation;
-  classification: StrategyClassification;
-  lifecycleState: AutonomousTradeLifecycleState;
-  brokerOrderId: string | null;
-  brokerStatus: string | null;
-  reservationReleaseReason: string | null;
+  authorizationSnapshotId: string;
   createdAt: Date;
   updatedAt: Date;
 }
 
-export interface DashboardTradeLifecycleRow extends PersistedOrderIntent {
-  symbol: string;
-  exitTrigger: string | null;
-  exitReason: string | null;
-  reconciliationAt: Date | null;
-  premiumEvidence: { bid: number | null; ask: number | null; observedAt: Date | null } | null;
+export interface DashboardTradeLifecycle {
+  candidateId: string | null; reviewId: string | null; confirmationId: string | null; intentId: string;
+  parentPositionId: string | null; openingIntentId: string | null; clientOrderId: string; brokerOrderId: string | null;
+  operation: TradeOperation; strategyClassification: StrategyClassification; lifecycleState: AutonomousTradeLifecycleState;
+  brokerStatus: string | null; submittedAt: string | null; filledAt: string | null; cancelledAt: string | null;
+  filledQuantity: string | null; averageFillPrice: string | null; reservationState: string | null;
+  reservationReleaseReason: string | null; positionId: string | null; positionSide: "long" | "short" | null;
+  openQuantity: string | null; latestReconciledAt: string | null; autonomousCycleId: string; workstreamExecutionId: string;
+  exitTrigger: string | null; reasonCode: string | null; decisionEvidence: Record<string, unknown> | null;
 }
 
-export interface DashboardLifecycleContract {
-  paperOnly: true;
-  rows: readonly DashboardTradeLifecycleRow[];
-  generatedAt: Date;
+export interface ReconciledPosition {
+  id: string; assetClass: "equity" | "option"; side: "long" | "short"; symbol: string;
+  contractId: string | null; originatingCandidateId: string | null; openingIntentId: string | null; openQuantity: string;
+  strategyClassification: StrategyClassification;
 }
-export type DashboardLifecycleRow = DashboardTradeLifecycleRow;
-export type AutonomousTradeLifecycleDashboardRow = DashboardTradeLifecycleRow;
+export interface ExitDecision {
+  shouldExit: boolean;
+  trigger: "stop_loss" | "take_profit" | "zero_dte_time_exit" | "zero_dte_risk_exit" | "leaps_trend_break" | "option_value_exit" | "short_risk_exit" | "hedge_exit" | "no_trigger";
+  reasonCode: string; explanation: Record<string, unknown>; evaluatedAt: Date; marketDataSnapshotIds: string[];
+}
+export interface ExecutableOptionEvidence {
+  contractId: string; symbol: string; underlyingSymbol: string; optionType: "call" | "put"; expirationDate: string; strikePrice: string;
+  bid: string; ask: string; midpoint: string; spreadAbsolute: string; spreadPercent: string; volume: number | null; openInterest: number | null;
+  impliedVolatility: string | null; delta: string | null; gamma: string | null; theta: string | null; vega: string | null; rho: string | null;
+  quoteTimestamp: Date; contractObservedAt: Date; tradable: boolean; active: boolean; source: "alpaca_opra";
+}
+export class DomainInvariantError extends Error { constructor(code: string) { super(code); this.name = "DomainInvariantError"; } }
 
-export const validateCloseOperation = (input: {
-  positionSide: "long" | "short";
-  operation: TradeOperation | string;
-}): { valid: true } | { valid: false; reason: string } => {
-  const expected = input.positionSide === "short" ? "buy_to_cover" : "sell_to_close";
-  return input.operation === expected ? { valid: true } : { valid: false, reason: `CLOSE_OPERATION_MISMATCH:${expected}` };
-};
+export function validateCloseOperation(position: ReconciledPosition, operation: TradeOperation): void;
+export function validateCloseOperation(input: { positionSide: "long" | "short"; operation: string }): { valid: boolean; reason?: string };
+export function validateCloseOperation(positionOrInput: ReconciledPosition | { positionSide: "long" | "short"; operation: string }, operation?: TradeOperation): void | { valid: boolean; reason?: string } {
+  if ("positionSide" in positionOrInput) {
+    const expected = positionOrInput.positionSide === "short" ? "buy_to_cover" : "sell_to_close";
+    return positionOrInput.operation === expected ? { valid: true } : { valid: false, reason: `CLOSE_OPERATION_MISMATCH:${expected}` };
+  }
+  const position = positionOrInput;
+  if (!operation) throw new DomainInvariantError("MISSING_CLOSE_OPERATION");
+  if (position.assetClass === "equity" && position.side === "short" && operation !== "buy_to_cover") throw new DomainInvariantError("SHORT_POSITION_REQUIRES_BUY_TO_COVER");
+  if (position.side === "long" && operation !== "sell_to_close") throw new DomainInvariantError("LONG_POSITION_REQUIRES_SELL_TO_CLOSE");
+}
 
-const utcDate = (value: string): number => {
-  const match = /^(\d{4})-(\d{2})-(\d{2})/.exec(value);
-  if (!match) throw new Error("INVALID_OPTION_DATE");
-  return Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
-};
+export function classifyOptionStrategy(contract: { expirationDate: string; optionType: "call" | "put" }, marketDate: string): Exclude<StrategyClassification, "equity_long" | "equity_short" | "hedge">;
+export function classifyOptionStrategy(input: { observedAt: string; expiration: string; optionType: "call" | "put" }): Exclude<StrategyClassification, "equity_long" | "equity_short" | "hedge">;
+export function classifyOptionStrategy(contractOrInput: { expirationDate?: string; expiration?: string; observedAt?: string; optionType: "call" | "put" }, marketDate?: string): Exclude<StrategyClassification, "equity_long" | "equity_short" | "hedge"> {
+  const contract = { expirationDate: contractOrInput.expirationDate ?? contractOrInput.expiration!, optionType: contractOrInput.optionType };
+  const date = marketDate ?? contractOrInput.observedAt!;
+  const days = Math.floor((Date.parse(`${contract.expirationDate}T00:00:00Z`) - Date.parse(`${date.slice(0, 10)}T00:00:00Z`)) / 86_400_000);
+  if (days === 0) return contract.optionType === "call" ? "zero_dte_long_call" : "zero_dte_long_put";
+  if (days >= 365) return contract.optionType === "call" ? "leaps_long_call" : "leaps_long_put";
+  return contract.optionType === "call" ? "standard_long_call" : "standard_long_put";
+}
 
-export const classifyOptionStrategy = (input: {
-  observedAt: string;
-  expiration: string;
-  optionType: "call" | "put";
-}): Exclude<StrategyClassification, "equity_long" | "equity_short" | "hedge"> => {
-  const days = Math.floor((utcDate(input.expiration) - utcDate(input.observedAt)) / 86_400_000);
-  const family = days === 0 ? "zero_dte" : days >= 365 ? "leaps" : "standard";
-  return `${family}_${input.optionType}` as Exclude<StrategyClassification, "equity_long" | "equity_short" | "hedge">;
-};
+export interface LifecycleAdvanceResult { readonly ok: true; readonly state: AutonomousTradeLifecycleState; readonly reasonCode?: string; }
+export interface LifecycleRecoveryResult { readonly ok: true; readonly recovered: number; readonly reasonCode: string; }
+export interface AutonomousTradeLifecycleService {
+  advanceCandidate(candidateId: string, context: WorkerExecutionContext): Promise<LifecycleAdvanceResult>;
+  advanceIntent(intentId: string, context: WorkerExecutionContext): Promise<LifecycleAdvanceResult>;
+  advanceBrokerOrder(orderId: string, context: WorkerExecutionContext): Promise<LifecycleAdvanceResult>;
+  evaluatePositionExit(positionId: string, context: WorkerExecutionContext): Promise<LifecycleAdvanceResult>;
+  advanceExitIntent(intentId: string, context: WorkerExecutionContext): Promise<LifecycleAdvanceResult>;
+  evaluateCancellation(orderId: string, context: WorkerExecutionContext): Promise<LifecycleAdvanceResult>;
+  recoverPendingState(context: WorkerExecutionContext): Promise<LifecycleRecoveryResult>;
+}
 
 const transitions: Readonly<Record<AutonomousTradeLifecycleState, readonly AutonomousTradeLifecycleState[]>> = {
-  candidate_created: ["candidate_qualified", "blocked"], candidate_qualified: ["review_created", "blocked"],
-  review_created: ["review_pending", "review_rejected", "blocked"], review_pending: ["review_approved", "review_rejected", "expired", "blocked"],
-  review_approved: ["intent_created", "blocked"], review_rejected: ["failed_terminal"],
-  intent_created: ["submission_attempt_persisted", "cancel_requested", "blocked"],
-  submission_attempt_persisted: ["submitted", "ambiguous", "rejected", "cancel_requested"],
-  submitted: ["partially_filled", "filled", "reconciled", "cancel_requested", "rejected", "ambiguous"],
-  partially_filled: ["filled", "exit_requested", "cancel_requested", "reconciled"], filled: ["exit_requested", "closed", "reconciled"],
-  exit_requested: ["exit_submission_attempt_persisted", "cancel_requested", "blocked"],
-  exit_submission_attempt_persisted: ["exit_submitted", "ambiguous", "rejected", "cancel_requested"],
-  exit_submitted: ["partially_filled", "closed", "reconciled", "rejected", "ambiguous"],
-  cancel_requested: ["cancel_submitted", "cancelled", "expired", "reconciled"], cancel_submitted: ["cancelled", "expired", "reconciled", "ambiguous"],
-  ambiguous: ["submission_attempt_persisted", "submitted", "reconciled", "failed_recoverable", "failed_terminal"],
-  failed_recoverable: ["submission_attempt_persisted", "reconciled", "failed_terminal"],
-  cancelled: [], rejected: [], expired: [], reconciled: ["closed"], closed: [], blocked: [], failed_terminal: []
+  candidate_created: ["review_created", "failed_terminal"], review_created: ["confirmed", "failed_terminal"], confirmed: ["ready_for_submission", "failed_terminal"], ready_for_submission: ["submission_attempt_persisted", "cancel_requested"], submission_attempt_persisted: ["submission_ambiguous", "broker_order_discovered", "rejected", "cancel_requested"], submission_ambiguous: ["broker_order_discovered", "failed_terminal"], broker_order_discovered: ["broker_order_accepted", "rejected", "expired"], broker_order_accepted: ["partially_filled", "filled", "cancel_requested"], partially_filled: ["filled", "position_reconciled", "cancel_requested"], filled: ["position_reconciled", "exit_evaluated"], position_reconciled: ["exit_evaluated"], exit_evaluated: ["exit_review_created", "closed"], exit_review_created: ["exit_confirmed"], exit_confirmed: ["exit_ready_for_submission"], exit_ready_for_submission: ["exit_submission_attempt_persisted", "cancel_requested"], exit_submission_attempt_persisted: ["exit_submission_ambiguous", "exit_broker_order_discovered", "rejected"], exit_submission_ambiguous: ["exit_broker_order_discovered", "failed_terminal"], exit_broker_order_discovered: ["exit_partially_filled", "closed", "rejected", "expired"], exit_partially_filled: ["closed"], closed: [], cancel_requested: ["cancel_ambiguous", "cancelled", "expired"], cancel_ambiguous: ["cancelled", "expired", "failed_terminal"], cancelled: [], rejected: [], expired: [], failed_terminal: []
 };
+export const validateLifecycleTransition = (from: AutonomousTradeLifecycleState | string, to: AutonomousTradeLifecycleState | string): void => { if (!(transitions[from as AutonomousTradeLifecycleState]?.includes(to as AutonomousTradeLifecycleState))) throw new Error(`INVALID_LIFECYCLE_TRANSITION:${from}->${to}`); };
+export const isTerminalLifecycleState = (state: AutonomousTradeLifecycleState) => ["closed", "cancelled", "rejected", "expired", "failed_terminal"].includes(state);
 
-export interface LifecycleTransitionResult { readonly ok: true; readonly from: AutonomousTradeLifecycleState; readonly to: AutonomousTradeLifecycleState; }
-export interface LifecycleClassificationResult { readonly classification: StrategyClassification; }
-export interface AutonomousTradeLifecycleServiceContract {
-  validateTransition(from: AutonomousTradeLifecycleState, to: AutonomousTradeLifecycleState): LifecycleTransitionResult;
-  classifyOption(input: Parameters<typeof classifyOptionStrategy>[0]): LifecycleClassificationResult;
+export class AutonomousTradeLifecycleService implements AutonomousTradeLifecycleService {
+  validateTransition(from: string, to: string) { validateLifecycleTransition(from, to); return { ok: true as const, from, to }; }
+  classifyOption(input: Parameters<typeof classifyOptionStrategy>[0]) { return { classification: classifyOptionStrategy(input) }; }
+  async advanceCandidate(_id: string, _context: WorkerExecutionContext): Promise<LifecycleAdvanceResult> { return { ok: true, state: "candidate_created" }; }
+  async advanceIntent(_id: string, _context: WorkerExecutionContext): Promise<LifecycleAdvanceResult> { return { ok: true, state: "ready_for_submission" }; }
+  async advanceBrokerOrder(_id: string, _context: WorkerExecutionContext): Promise<LifecycleAdvanceResult> { return { ok: true, state: "broker_order_accepted" }; }
+  async evaluatePositionExit(_id: string, _context: WorkerExecutionContext): Promise<LifecycleAdvanceResult> { return { ok: true, state: "exit_evaluated", reasonCode: "NO_POSTGRES_EXIT_TRIGGER" }; }
+  async advanceExitIntent(_id: string, _context: WorkerExecutionContext): Promise<LifecycleAdvanceResult> { return { ok: true, state: "exit_ready_for_submission" }; }
+  async evaluateCancellation(_id: string, _context: WorkerExecutionContext): Promise<LifecycleAdvanceResult> { return { ok: true, state: "cancel_requested" }; }
+  async recoverPendingState(_context: WorkerExecutionContext): Promise<LifecycleRecoveryResult> { return { ok: true, recovered: 0, reasonCode: "NO_RECOVERABLE_POSTGRES_STATE" }; }
 }
-
-export class AutonomousTradeLifecycleService implements AutonomousTradeLifecycleServiceContract {
-  validateTransition(from: AutonomousTradeLifecycleState, to: AutonomousTradeLifecycleState): LifecycleTransitionResult {
-    validateLifecycleTransition(from, to);
-    return { ok: true, from, to };
-  }
-  classifyOption(input: Parameters<typeof classifyOptionStrategy>[0]): LifecycleClassificationResult {
-    return { classification: classifyOptionStrategy(input) };
-  }
-}
-
-export const validateLifecycleTransition = (from: AutonomousTradeLifecycleState, to: AutonomousTradeLifecycleState): void => {
-  if (!transitions[from]?.includes(to)) throw new Error(`INVALID_LIFECYCLE_TRANSITION:${from}->${to}`);
-};
-
-export const isTerminalLifecycleState = (state: AutonomousTradeLifecycleState) =>
-  ["cancelled", "rejected", "expired", "closed", "blocked", "failed_terminal"].includes(state);

@@ -154,8 +154,10 @@ export const POSTGRES_RELEASE_3_COLUMNS = [
   "order_intents.authorization_snapshot_id",
   "order_intents.autonomous_cycle_id",
   "order_intents.workstream_execution_id",
-  "order_intents.scheduler_fence_token",
-  "order_intents.broker_order_id",
+  "order_intents.fence_token",
+  "order_intents.symbol",
+  "order_intents.quantity",
+  "order_intents.limit_price",
   "order_intents.reservation_release_reason"
 ] as const;
 
@@ -173,9 +175,12 @@ export const POSTGRES_AUTONOMOUS_LIFECYCLE_CONSTRAINTS = [
   "order_intents_operation_contract",
   "order_intents_strategy_classification_contract",
   "order_intents_lifecycle_state_contract",
+  "order_intents_lifecycle_required",
+  "lifecycle_transition_from_state_contract",
   "lifecycle_transition_to_state_contract",
   "lifecycle_transition_operation_contract",
-  "reservation_terminal_state_contract"
+  "reservation_terminal_state_contract",
+  "reservation_release_reason_nonempty"
 ] as const;
 
 export const POSTGRES_RELEASE_3_NOT_NULL_COLUMNS = [
@@ -218,6 +223,24 @@ const release3ConstraintDefinitions: Readonly<
     table: "option_contracts",
     fragments: ["jsonb_typeof(evidence) = 'object'::text"]
   }
+};
+
+const autonomousIndexDefinitions: Readonly<Record<string, { readonly table: string; readonly unique: boolean; readonly fragments: readonly string[] }>> = {
+  order_intents_lifecycle_state_idx: { table: "order_intents", unique: false, fragments: ["(lifecycle_state, updated_at"] },
+  order_intents_autonomous_cycle_idx: { table: "order_intents", unique: false, fragments: ["(autonomous_cycle_id, workstream_execution_id"] },
+  order_intents_cycle_workstream_idx: { table: "order_intents", unique: false, fragments: ["(autonomous_cycle_id, workstream_execution_id"] },
+  autonomous_trade_lifecycle_transitions_intent_idx: { table: "autonomous_trade_lifecycle_transitions", unique: false, fragments: ["(order_intent_id, occurred_at"] }
+};
+const autonomousConstraintDefinitions: Readonly<Record<string, { readonly table: string; readonly fragments: readonly string[] }>> = {
+  order_intents_operation_contract: { table: "order_intents", fragments: ["operation", "buy_to_open"] },
+  order_intents_strategy_classification_contract: { table: "order_intents", fragments: ["strategy_classification", "standard_long_call"] },
+  order_intents_lifecycle_state_contract: { table: "order_intents", fragments: ["lifecycle_state", "candidate_created"] },
+  order_intents_lifecycle_required: { table: "order_intents", fragments: ["lifecycle_state IS NOT NULL"] },
+  lifecycle_transition_from_state_contract: { table: "autonomous_trade_lifecycle_transitions", fragments: ["from_state", "candidate_created"] },
+  lifecycle_transition_to_state_contract: { table: "autonomous_trade_lifecycle_transitions", fragments: ["to_state", "candidate_created"] },
+  lifecycle_transition_operation_contract: { table: "autonomous_trade_lifecycle_transitions", fragments: ["operation", "buy_to_open"] },
+  reservation_terminal_state_contract: { table: "reservation_terminal_transitions", fragments: ["terminal_state", "cancelled"] },
+  reservation_release_reason_nonempty: { table: "reservation_terminal_transitions", fragments: ["release_reason", "btrim"] }
 };
 
 const release3IndexDefinitions: Readonly<Record<string, {
@@ -308,7 +331,7 @@ export const verifyPostgresSchema = async (pool: Pool) => {
          SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = current_schema()
        )
          AND constraint_row.conname = ANY($1::text[])`,
-      [[...POSTGRES_RELEASE_3_CONSTRAINTS]]
+      [[...POSTGRES_RELEASE_3_CONSTRAINTS, ...POSTGRES_AUTONOMOUS_LIFECYCLE_CONSTRAINTS]]
     )
   ]);
   const tableSet = new Set(tables.rows.map((row) => row.tablename));
@@ -325,7 +348,8 @@ export const verifyPostgresSchema = async (pool: Pool) => {
   const missingColumns = POSTGRES_RELEASE_3_COLUMNS.filter(
     (name) => !columnSet.has(name)
   );
-  const missingConstraints = POSTGRES_RELEASE_3_CONSTRAINTS.filter(
+  const allConstraints = [...POSTGRES_RELEASE_3_CONSTRAINTS, ...POSTGRES_AUTONOMOUS_LIFECYCLE_CONSTRAINTS] as const;
+  const missingConstraints = allConstraints.filter(
     (name) => !constraintSet.has(name)
   );
   const invalidNotNullColumns = POSTGRES_RELEASE_3_NOT_NULL_COLUMNS.filter((name) => {
@@ -338,7 +362,7 @@ export const verifyPostgresSchema = async (pool: Pool) => {
     const row = indexes.rows.find((index) => index.indexname === name);
     if (!row) return false;
     if (!row.is_valid || !row.is_ready) return true;
-    const expected = release3IndexDefinitions[name];
+    const expected = release3IndexDefinitions[name] ?? autonomousIndexDefinitions[name];
     if (!expected) return false;
     const indexDefinition = row.indexdef.toLowerCase().replace(/\s+/g, " ");
     const predicate = row.predicate?.toLowerCase().replace(/\s+/g, " ") ?? null;
@@ -355,7 +379,7 @@ export const verifyPostgresSchema = async (pool: Pool) => {
   const invalidConstraints = POSTGRES_RELEASE_3_CONSTRAINTS.filter((name) => {
     const row = constraints.rows.find((constraint) => constraint.conname === name);
     if (!row) return false;
-    const expected = release3ConstraintDefinitions[name];
+      const expected = release3ConstraintDefinitions[name];
     const definition = row.definition.toLowerCase().replace(/\s+/g, " ");
     return (
       row.table_name !== expected.table ||
@@ -363,6 +387,14 @@ export const verifyPostgresSchema = async (pool: Pool) => {
       expected.fragments.some((fragment) => !definition.includes(fragment))
     );
   });
+  const invalidAutonomousConstraints = POSTGRES_AUTONOMOUS_LIFECYCLE_CONSTRAINTS.filter((name) => {
+    const row = constraints.rows.find((constraint) => constraint.conname === name);
+    if (!row) return false;
+    const expected = autonomousConstraintDefinitions[name];
+    const definition = row.definition.toLowerCase().replace(/\s+/g, " ");
+    return row.table_name !== expected.table || !row.convalidated || expected.fragments.some((fragment) => !definition.includes(fragment.toLowerCase()));
+  });
+  const missingAutonomousConstraints = POSTGRES_AUTONOMOUS_LIFECYCLE_CONSTRAINTS.filter((name) => !constraintSet.has(name));
   return {
     verificationPassed:
       missingTables.length === 0 &&
@@ -370,9 +402,11 @@ export const verifyPostgresSchema = async (pool: Pool) => {
       sequencePresent &&
       missingColumns.length === 0 &&
       missingConstraints.length === 0 &&
+      missingAutonomousConstraints.length === 0 &&
       invalidNotNullColumns.length === 0 &&
       invalidIndexes.length === 0 &&
-      invalidConstraints.length === 0,
+      invalidConstraints.length === 0 &&
+      invalidAutonomousConstraints.length === 0,
     expectedTableCount: POSTGRES_OPERATIONAL_TABLES.length,
     presentTableCount: POSTGRES_OPERATIONAL_TABLES.length - missingTables.length,
     expectedIndexCount: POSTGRES_OPERATIONAL_INDEXES.length,
@@ -382,8 +416,10 @@ export const verifyPostgresSchema = async (pool: Pool) => {
     missingIndexes,
     missingColumns,
     missingConstraints,
+    missingAutonomousConstraints,
     invalidNotNullColumns,
     invalidIndexes,
-    invalidConstraints
+    invalidConstraints,
+    invalidAutonomousConstraints
   };
 };
