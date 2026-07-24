@@ -37,12 +37,22 @@ const candidate = {
 const observedOptionContract = {
   contract_option_symbol: "SPY260821C00560000",
   contract_id: "option-contract-SPY260821C00560000",
+  contract_underlying_symbol: "SPY",
   contract_type: "call",
   contract_expiration_date: "2026-08-21",
   contract_tradable: true,
   contract_status: "active",
   contract_source: "alpaca",
-  contract_observed_at: "2026-07-20T21:59:00.000Z"
+  contract_observed_at: "2026-07-20T21:59:00.000Z",
+  sip_underlying_symbol: "SPY",
+  sip_market_price: "555",
+  sip_market_timestamp: "2026-07-20T21:59:30.000Z",
+  sip_bid_price: "554.90",
+  sip_ask_price: "555.10",
+  sip_requested_feed: "sip",
+  sip_effective_feed: "sip",
+  sip_provider: "alpaca",
+  sip_request_id: "sip-underlying-request"
 };
 const observedExitOptionContract = (optionSymbol: string) => {
   const parsed = optionSymbol.match(/^([A-Z]{1,6})(\d{6})([CP])\d{8}$/);
@@ -134,11 +144,14 @@ test("a newly qualifying paper option candidate propagates into a PostgreSQL ord
   assert.equal(selection.preferredExpression, "long_call");
 
   let orderIntent: Record<string, unknown> | undefined;
+  let reviewMarketEvidence: Array<Record<string, unknown>> = [];
+  let sourceSql = "";
   const result = await runPostgresReviewWorkflow({
     command: "paper:review",
     query: {
       query: async (statement: string, values?: readonly unknown[]) => {
         if (statement.includes("FROM candidates candidate")) {
+          sourceSql = statement;
           return {
             rows: [{
               ...candidate,
@@ -180,6 +193,9 @@ test("a newly qualifying paper option candidate propagates into a PostgreSQL ord
         }
         if (statement.includes("INSERT INTO execution_reviews")) {
           orderIntent = JSON.parse(String(values?.[9])) as Record<string, unknown>;
+          reviewMarketEvidence = JSON.parse(
+            String(values?.[10])
+          ) as Array<Record<string, unknown>>;
         }
         return { rows: [], rowCount: 1 };
       }
@@ -195,6 +211,21 @@ test("a newly qualifying paper option candidate propagates into a PostgreSQL ord
   assert.equal(orderIntent?.symbol, "SPY260821C00560000");
   assert.equal(orderIntent?.side, "buy_to_open");
   assert.equal(orderIntent?.orderType, "limit");
+  assert.equal(reviewMarketEvidence[0]?.underlyingPrice, 555);
+  assert.deepEqual(reviewMarketEvidence[0]?.underlyingSip, {
+    symbol: "SPY",
+    referencePrice: 555,
+    timestamp: "2026-07-20T21:59:30.000Z",
+    requestId: "sip-underlying-request",
+    bid: 554.9,
+    ask: 555.1,
+    requestedFeed: "sip",
+    effectiveFeed: "sip",
+    provider: "alpaca",
+    source: "postgres.stock_snapshots"
+  });
+  assert.match(sourceSql, /FROM stock_snapshots stock/);
+  assert.match(sourceSql, /contract\.underlying_symbol AS contract_underlying_symbol/);
 });
 
 test("entry review maps a selected equity short to a sell order intent", async () => {
@@ -445,6 +476,88 @@ test("entry review rejects market evidence older than 30 minutes before persiste
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO execution_reviews")), false);
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO order_intents")), false);
 });
+
+for (const [label, sipOverride, expected] of [
+  [
+    "missing SIP underlying evidence",
+    {
+      sip_market_price: null,
+      sip_market_timestamp: null,
+      sip_requested_feed: null,
+      sip_effective_feed: null,
+      sip_provider: null
+    },
+    /POSTGRES_REVIEW_OPTION_UNDERLYING_SIP_INVALID:SPY260821C00560000/
+  ],
+  [
+    "stale SIP underlying evidence",
+    { sip_market_timestamp: "2026-07-20T21:29:59.000Z" },
+    /POSTGRES_REVIEW_OPTION_UNDERLYING_SIP_STALE:SPY260821C00560000/
+  ]
+] as const) {
+  test(`option entry rejects ${label} even when OPRA is fresh`, async () => {
+    const sql: string[] = [];
+    const optionCandidate = {
+      ...candidate,
+      ...observedOptionContract,
+      ...sipOverride,
+      candidate_id: `candidate-${label.replaceAll(" ", "-")}`,
+      asset_class: "option" as const,
+      option_symbol: "SPY260821C00560000",
+      preferred_expression: "long_call",
+      market_price: "2",
+      market_timestamp: "2026-07-20T21:59:30.000Z",
+      market_evidence: {
+        bid: 1.98,
+        ask: 2.02,
+        midpoint: 2,
+        spreadPct: 0.02,
+        volume: 5_000,
+        openInterest: 8_000,
+        underlyingPrice: 555,
+        requestedFeed: "opra",
+        effectiveFeed: "opra",
+        provider: "alpaca"
+      },
+      signal_inputs: {
+        marketDecisionInputs: {
+          currentTradablePrice: 555,
+          option: {
+            selectionScore: 0.6,
+            liquidityScore: 0.8,
+            spreadPct: 0.02,
+            volume: 5_000,
+            openInterest: 8_000,
+            feed: "opra"
+          }
+        }
+      }
+    };
+
+    await assert.rejects(
+      runPostgresReviewWorkflow({
+        command: "paper:review",
+        query: {
+          query: async (statement: string) => {
+            sql.push(statement);
+            if (statement.includes("FROM candidates candidate")) {
+              return { rows: [optionCandidate], rowCount: 1 };
+            }
+            return { rows: [], rowCount: 1 };
+          }
+        },
+        fence,
+        signingKey: "test-signing-key-with-sufficient-length",
+        now: new Date("2026-07-20T22:00:00.000Z")
+      }),
+      expected
+    );
+    assert.equal(
+      sql.some((statement) => statement.includes("INSERT INTO execution_reviews")),
+      false
+    );
+  });
+}
 
 for (const [label, marketEvidence] of [
   ["missing bid", { ask: 2.02, midpoint: 2 }],
@@ -935,14 +1048,16 @@ test("exit review maps a short equity exit to buy-to-cover", async () => {
   assert.equal(result.confirmationCreated, true);
 });
 
-test("exit review persists a long equity sell-to-close operation and opening lineage", async () => {
+test("exit review uses the opening allocation key when candidate family differs so the close remains claimable", async () => {
   let reviewOrderIntent: Record<string, unknown> | undefined;
   let persistenceValues: readonly unknown[] = [];
+  let sourceSql = "";
   const result = await runPostgresReviewWorkflow({
     command: "paper:exit:review",
     query: {
       query: async (statement: string, values?: readonly unknown[]) => {
         if (statement.includes("FROM positions position")) {
+          sourceSql = statement;
           return {
             rows: [{
               position_id: "position-long",
@@ -952,13 +1067,14 @@ test("exit review persists a long equity sell-to-close operation and opening lin
               opening_order_id: "order-long-open",
               opening_strategy_classification: "equity_long",
               opening_authorization_snapshot_id: "snapshot-long-open",
+              candidate_strategy_family: "momentum-breakout",
               symbol: "SPY",
               order_symbol: "SPY",
               asset_class: "equity",
               side: "long",
               available_quantity: "2",
               average_entry_price: "500",
-              strategy_key: "baseline",
+              strategy_key: "baseline-v1",
               account_id: "account-1",
               account_snapshot_id: "snapshot-1",
               snapshot_fingerprint: "portfolio-fingerprint",
@@ -998,6 +1114,18 @@ test("exit review persists a long equity sell-to-close operation and opening lin
   assert.equal(persistenceValues.includes("equity_long"), true);
   assert.equal(persistenceValues.includes("position-long"), true);
   assert.equal(persistenceValues.includes("intent-long-open"), true);
+  assert.equal(persistenceValues.includes("baseline-v1"), true);
+  assert.match(sourceSql, /opening_intent\.strategy_key AS strategy_key/);
+  assert.match(
+    sourceSql,
+    /allocation\.strategy_key = opening_intent\.strategy_key/
+  );
+  assert.match(sourceSql, /allocation\.status = 'active'/);
+  assert.match(sourceSql, /allocation\.effective_to IS NULL/);
+  assert.doesNotMatch(
+    sourceSql,
+    /COALESCE\(candidate\.strategy_family, allocation\.strategy_key\)/
+  );
   assert.equal(result.confirmationCreated, true);
 });
 
@@ -1029,6 +1157,7 @@ test("exit source excludes closing positions and positions with an active close 
 
 test("option exit retains the observed contract, open quantity cap, and immutable opening classification", async () => {
   let reviewOrderIntent: Record<string, unknown> | undefined;
+  let reviewMarketEvidence: Array<Record<string, unknown>> = [];
   let persistenceValues: readonly unknown[] = [];
   const symbol = "SPY270720P00500000";
   const result = await runPostgresReviewWorkflow({
@@ -1081,6 +1210,9 @@ test("option exit retains the observed contract, open quantity cap, and immutabl
         }
         if (statement.includes("INSERT INTO execution_reviews")) {
           reviewOrderIntent = JSON.parse(String(values?.[9])) as Record<string, unknown>;
+          reviewMarketEvidence = JSON.parse(
+            String(values?.[10])
+          ) as Array<Record<string, unknown>>;
           persistenceValues = values ?? [];
           return {
             rows: [{
@@ -1107,6 +1239,12 @@ test("option exit retains the observed contract, open quantity cap, and immutabl
   assert.equal(persistenceValues.includes(`contract-${symbol}`), true);
   assert.equal(persistenceValues.includes("leaps_long_put"), true);
   assert.equal(persistenceValues.includes("intent-option-open"), true);
+  assert.equal(reviewMarketEvidence[0]?.underlyingPrice, 555);
+  assert.equal(
+    (reviewMarketEvidence[0]?.underlyingSip as Record<string, unknown>)
+      .source,
+    "postgres.stock_snapshots"
+  );
 });
 
 test("PostgreSQL exit review forces a genuine 0DTE long option exit in the final 30 minutes", async () => {
@@ -1128,6 +1266,7 @@ test("PostgreSQL exit review forces a genuine 0DTE long option exit in the final
               account_snapshot_id: "snapshot-1", snapshot_fingerprint: "portfolio-fingerprint",
               structural_fingerprint: "structural-fingerprint", market_price: "1.00",
               market_timestamp: "2026-07-20T19:44:30.000Z", market_request_id: "opra-request",
+              sip_market_timestamp: "2026-07-20T19:44:30.000Z",
               market_evidence: {
                 bid: 1,
                 ask: 1.02,
@@ -1371,6 +1510,61 @@ test("option exit review preserves the stricter 15-minute executable quote gate"
   );
 });
 
+for (const [label, sipOverride, expected] of [
+  [
+    "missing SIP underlying evidence",
+    {
+      sip_market_price: null,
+      sip_market_timestamp: null,
+      sip_requested_feed: null,
+      sip_effective_feed: null,
+      sip_provider: null
+    },
+    /POSTGRES_EXIT_REVIEW_OPTION_UNDERLYING_SIP_INVALID:SPY260722P00748000/
+  ],
+  [
+    "stale SIP underlying evidence",
+    { sip_market_timestamp: "2026-07-22T16:29:59.000Z" },
+    /POSTGRES_EXIT_REVIEW_OPTION_UNDERLYING_SIP_STALE:SPY260722P00748000/
+  ]
+] as const) {
+  test(`option exit rejects ${label} even when OPRA is fresh`, async () => {
+    const sql: string[] = [];
+    await assert.rejects(
+      runPostgresReviewWorkflow({
+        command: "paper:exit:review",
+        query: {
+          query: async (statement: string) => {
+            sql.push(statement);
+            if (statement.includes("FROM positions position")) {
+              return {
+                rows: [{
+                  ...repeatedExitSource(
+                    "0.50",
+                    "2026-07-22T16:59:30.000Z"
+                  ),
+                  ...sipOverride
+                }],
+                rowCount: 1
+              };
+            }
+            return { rows: [], rowCount: 1 };
+          }
+        },
+        fence,
+        signingKey: "test-signing-key-with-sufficient-length",
+        maxMarketAgeSeconds: 1_800,
+        now: new Date("2026-07-22T17:00:00.000Z")
+      }),
+      expected
+    );
+    assert.equal(
+      sql.some((statement) => statement.includes("INSERT INTO execution_reviews")),
+      false
+    );
+  });
+}
+
 const repeatedExitSource = (marketPrice: string, marketTimestamp: string) => ({
   position_id: "position-repeated-exit", candidate_id: null,
   symbol: "SPY", order_symbol: "SPY260722P00748000", asset_class: "option",
@@ -1380,6 +1574,7 @@ const repeatedExitSource = (marketPrice: string, marketTimestamp: string) => ({
   structural_fingerprint: "structural-fingerprint", market_price: marketPrice,
   market_timestamp: marketTimestamp, market_request_id: "opra-request",
   ...observedExitOptionContract("SPY260722P00748000"),
+  sip_market_timestamp: marketTimestamp,
   market_evidence: {
     bid: Number(marketPrice),
     ask: Number(marketPrice) + 0.02,

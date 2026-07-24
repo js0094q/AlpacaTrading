@@ -60,12 +60,22 @@ type ReviewSourceRow = Record<string, unknown> & {
   market_evidence?: unknown;
   contract_option_symbol?: string | null;
   contract_id?: string | null;
+  contract_underlying_symbol?: string | null;
   contract_type?: "call" | "put" | null;
   contract_expiration_date?: Date | string | null;
   contract_tradable?: boolean | null;
   contract_status?: string | null;
   contract_source?: string | null;
   contract_observed_at?: Date | string | null;
+  sip_underlying_symbol?: string | null;
+  sip_market_price?: string | number | null;
+  sip_market_timestamp?: Date | string | null;
+  sip_bid_price?: string | number | null;
+  sip_ask_price?: string | number | null;
+  sip_requested_feed?: string | null;
+  sip_effective_feed?: string | null;
+  sip_provider?: string | null;
+  sip_request_id?: string | null;
   open_position_count: string | number;
   open_order_count: string | number;
 };
@@ -125,14 +135,10 @@ const optionDecisionInputs = (row: ReviewSourceRow) => {
   const marketDecisionInputs = jsonRecord(signalInputs.marketDecisionInputs);
   return jsonRecord(marketDecisionInputs.option);
 };
-const decisionInputs = (row: ReviewSourceRow) => {
-  const signalInputs = jsonRecord(row.signal_inputs);
-  return jsonRecord(signalInputs.marketDecisionInputs);
-};
 const executableOptionEvidence = (input: {
   evidence: Record<string, unknown>;
   maximumSpreadPct: number;
-  underlyingFallback?: unknown;
+  underlyingPrice: unknown;
 }) => {
   const evidence = input.evidence;
   const bid = finite(evidence.bid);
@@ -140,9 +146,7 @@ const executableOptionEvidence = (input: {
   const spreadPct = finite(evidence.spreadPct);
   const volume = finite(evidence.volume);
   const openInterest = finite(evidence.openInterest);
-  const underlyingPrice =
-    finite(evidence.underlyingPrice) ??
-    finite(input.underlyingFallback);
+  const underlyingPrice = finite(input.underlyingPrice);
   const requestedFeed = String(evidence.requestedFeed ?? "").trim().toLowerCase();
   const effectiveFeed = String(evidence.effectiveFeed ?? evidence.feed ?? "")
     .trim()
@@ -175,12 +179,81 @@ const assertExecutableOptionReviewEvidence = (
       ...optionDecisionInputs(row)
     },
     maximumSpreadPct,
-    underlyingFallback: decisionInputs(row).currentTradablePrice
+    underlyingPrice: row.sip_market_price
   })) {
     throw new Error(
       `POSTGRES_REVIEW_OPTION_QUOTE_INVALID:${row.option_symbol ?? row.symbol}`
     );
   }
+};
+const assertFreshAlpacaSipUnderlying = (input: {
+  row: ReviewSourceRow;
+  now: Date;
+  maxAgeSeconds: number;
+  errorScope: "REVIEW" | "EXIT_REVIEW";
+}) => {
+  const row = input.row;
+  if (row.asset_class !== "option") return null;
+  const optionSymbol = String(row.option_symbol ?? row.order_symbol ?? "")
+    .trim()
+    .toUpperCase();
+  const underlying = String(row.symbol ?? "").trim().toUpperCase();
+  const contractUnderlying = String(row.contract_underlying_symbol ?? "")
+    .trim()
+    .toUpperCase();
+  const sipUnderlying = String(row.sip_underlying_symbol ?? "")
+    .trim()
+    .toUpperCase();
+  const price = finite(row.sip_market_price);
+  const bid = finite(row.sip_bid_price);
+  const ask = finite(row.sip_ask_price);
+  const timestampText = String(row.sip_market_timestamp ?? "").trim();
+  const timestampMs = Date.parse(timestampText);
+  const requestedFeed = String(row.sip_requested_feed ?? "")
+    .trim()
+    .toLowerCase();
+  const effectiveFeed = String(row.sip_effective_feed ?? "")
+    .trim()
+    .toLowerCase();
+  const provider = String(row.sip_provider ?? "").trim().toLowerCase();
+  if (
+    !underlying ||
+    !optionSymbol ||
+    contractUnderlying !== underlying ||
+    sipUnderlying !== underlying ||
+    price === null ||
+    price <= 0 ||
+    requestedFeed !== "sip" ||
+    effectiveFeed !== "sip" ||
+    provider !== "alpaca" ||
+    !Number.isFinite(timestampMs)
+  ) {
+    throw new Error(
+      `POSTGRES_${input.errorScope}_OPTION_UNDERLYING_SIP_INVALID:${optionSymbol || underlying}`
+    );
+  }
+  const maxAgeSeconds = Math.min(
+    input.maxAgeSeconds,
+    AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS
+  );
+  const age = input.now.getTime() - timestampMs;
+  if (age < -60_000 || age > maxAgeSeconds * 1_000) {
+    throw new Error(
+      `POSTGRES_${input.errorScope}_OPTION_UNDERLYING_SIP_STALE:${optionSymbol}`
+    );
+  }
+  return {
+    symbol: sipUnderlying,
+    referencePrice: price,
+    timestamp: new Date(timestampMs).toISOString(),
+    requestId: row.sip_request_id ?? null,
+    bid,
+    ask,
+    requestedFeed,
+    effectiveFeed,
+    provider,
+    source: "postgres.stock_snapshots"
+  };
 };
 const assertObservedOptionContract = (row: ReviewSourceRow) => {
   if (row.asset_class !== "option") return;
@@ -196,6 +269,8 @@ const assertObservedOptionContract = (row: ReviewSourceRow) => {
     !String(row.contract_id ?? "").trim() ||
     String(row.contract_option_symbol ?? "").trim().toUpperCase() !==
       optionSymbol ||
+    String(row.contract_underlying_symbol ?? "").trim().toUpperCase() !==
+      String(row.symbol ?? "").trim().toUpperCase() ||
     expirationDate !== parsed.expirationDate ||
     contractType !== parsed.optionType ||
     row.contract_tradable !== true ||
@@ -287,12 +362,17 @@ SELECT candidate.id AS candidate_id, candidate.symbol, candidate.asset_class,
        market.market_request_id, market.market_evidence,
        contract.option_symbol AS contract_option_symbol,
        contract.contract_id AS contract_id,
+       contract.underlying_symbol AS contract_underlying_symbol,
        contract.type AS contract_type,
        contract.expiration_date AS contract_expiration_date,
        contract.tradable AS contract_tradable,
        contract.status AS contract_status,
        contract.source AS contract_source,
        contract.observed_at AS contract_observed_at,
+       sip.sip_underlying_symbol, sip.sip_market_price,
+       sip.sip_market_timestamp, sip.sip_bid_price, sip.sip_ask_price,
+       sip.sip_requested_feed, sip.sip_effective_feed, sip.sip_provider,
+       sip.sip_request_id,
        (SELECT COUNT(*) FROM positions position
          WHERE position.account_id = account.id AND position.status IN ('open', 'closing')
            AND (position.symbol = candidate.symbol OR position.option_symbol = candidate.option_symbol)
@@ -306,6 +386,28 @@ FROM candidates candidate
 JOIN latest_research research ON research.id = candidate.research_run_id
 LEFT JOIN option_contracts contract
   ON contract.option_symbol = candidate.option_symbol
+LEFT JOIN LATERAL (
+  SELECT stock.symbol AS sip_underlying_symbol,
+         COALESCE(
+           (stock.evidence->>'midpoint')::numeric,
+           (stock.evidence->>'latestTradePrice')::numeric,
+           (stock.evidence->>'currentTradablePrice')::numeric,
+           (stock.evidence->>'marketReferencePrice')::numeric,
+           (stock.evidence->>'minuteClose')::numeric,
+           (stock.evidence->>'dailyClose')::numeric
+         ) AS sip_market_price,
+         stock.source_timestamp AS sip_market_timestamp,
+         (stock.evidence->>'bidPrice')::numeric AS sip_bid_price,
+         (stock.evidence->>'askPrice')::numeric AS sip_ask_price,
+         stock.requested_feed AS sip_requested_feed,
+         stock.effective_feed AS sip_effective_feed,
+         stock.source AS sip_provider,
+         stock.request_id AS sip_request_id
+  FROM stock_snapshots stock
+  WHERE stock.symbol = candidate.symbol
+  ORDER BY stock.observed_at DESC, stock.id DESC
+  LIMIT 1
+) sip ON candidate.option_symbol IS NOT NULL
 CROSS JOIN current_account account
 JOIN LATERAL (
   SELECT * FROM account_snapshots WHERE account_id = account.id
@@ -419,7 +521,7 @@ SELECT position.id AS position_id,
        COALESCE(position.option_symbol, position.symbol) AS order_symbol,
        position.asset_class, position.side, position.available_quantity::text,
        position.average_entry_price::text,
-       COALESCE(candidate.strategy_family, allocation.strategy_key) AS strategy_key,
+       opening_intent.strategy_key AS strategy_key,
        account.id AS account_id, snapshot.id AS account_snapshot_id,
        snapshot.snapshot_fingerprint,
        snapshot.evidence->>'structuralPortfolioFingerprint' AS structural_fingerprint,
@@ -429,12 +531,17 @@ SELECT position.id AS position_id,
        leaps_trend.severe_trend_bar_count::text,
        contract.option_symbol AS contract_option_symbol,
        contract.contract_id AS contract_id,
+       contract.underlying_symbol AS contract_underlying_symbol,
        contract.type AS contract_type,
        contract.expiration_date AS contract_expiration_date,
        contract.tradable AS contract_tradable,
        contract.status AS contract_status,
        contract.source AS contract_source,
-       contract.observed_at AS contract_observed_at
+       contract.observed_at AS contract_observed_at,
+       sip.sip_underlying_symbol, sip.sip_market_price,
+       sip.sip_market_timestamp, sip.sip_bid_price, sip.sip_ask_price,
+       sip.sip_requested_feed, sip.sip_effective_feed, sip.sip_provider,
+       sip.sip_request_id
 FROM positions position
 CROSS JOIN current_account account
 LEFT JOIN candidates candidate ON candidate.id = position.candidate_id
@@ -443,15 +550,37 @@ LEFT JOIN order_intents opening_intent
   ON opening_intent.id = opening_order.order_intent_id
 LEFT JOIN option_contracts contract
   ON contract.option_symbol = position.option_symbol
+LEFT JOIN LATERAL (
+  SELECT stock.symbol AS sip_underlying_symbol,
+         COALESCE(
+           (stock.evidence->>'midpoint')::numeric,
+           (stock.evidence->>'latestTradePrice')::numeric,
+           (stock.evidence->>'currentTradablePrice')::numeric,
+           (stock.evidence->>'marketReferencePrice')::numeric,
+           (stock.evidence->>'minuteClose')::numeric,
+           (stock.evidence->>'dailyClose')::numeric
+         ) AS sip_market_price,
+         stock.source_timestamp AS sip_market_timestamp,
+         (stock.evidence->>'bidPrice')::numeric AS sip_bid_price,
+         (stock.evidence->>'askPrice')::numeric AS sip_ask_price,
+         stock.requested_feed AS sip_requested_feed,
+         stock.effective_feed AS sip_effective_feed,
+         stock.source AS sip_provider,
+         stock.request_id AS sip_request_id
+  FROM stock_snapshots stock
+  WHERE stock.symbol = position.symbol
+  ORDER BY stock.observed_at DESC, stock.id DESC
+  LIMIT 1
+) sip ON position.option_symbol IS NOT NULL
 JOIN LATERAL (
   SELECT * FROM account_snapshots WHERE account_id = account.id
   ORDER BY observed_at DESC, id DESC LIMIT 1
 ) snapshot ON true
-JOIN LATERAL (
-  SELECT * FROM strategy_allocations WHERE account_id = account.id
-    AND status = 'active' AND effective_to IS NULL
-  ORDER BY updated_at DESC, id LIMIT 1
-) allocation ON true
+JOIN strategy_allocations allocation
+  ON allocation.account_id = account.id
+ AND allocation.strategy_key = opening_intent.strategy_key
+ AND allocation.status = 'active'
+ AND allocation.effective_to IS NULL
 JOIN LATERAL (
   SELECT option_market.market_price, option_market.market_timestamp,
          option_market.market_request_id, option_market.market_evidence
@@ -528,7 +657,7 @@ WHERE position.account_id = account.id AND position.status = 'open'
         'closed','cancelled','rejected','expired','failed_terminal'
       )
   )
-  ${command === "hedge:exit:review" ? "AND COALESCE(candidate.strategy_family, allocation.strategy_key) ILIKE '%hedge%'" : ""}
+  ${command === "hedge:exit:review" ? "AND opening_intent.strategy_key ILIKE '%hedge%'" : ""}
   ${command === "zero-dte:exit:review" ? "AND position.asset_class = 'option' AND substring(position.option_symbol from '[0-9]{6}') = to_char(now() AT TIME ZONE 'America/New_York', 'YYMMDD')" : ""}
 ORDER BY position.opened_at, position.id`;
 };
@@ -566,12 +695,21 @@ const runExitReview = async (input: {
     }
     const directionalReturn = (price / entry - 1) * (row.side === "short" ? -1 : 1);
     const option = row.asset_class === "option";
+    const underlyingSip = option
+      ? assertFreshAlpacaSipUnderlying({
+          row: row as ReviewSourceRow,
+          now: input.now,
+          maxAgeSeconds: input.maxMarketAgeSeconds,
+          errorScope: "EXIT_REVIEW"
+        })
+      : null;
     if (
       option &&
       !executableOptionEvidence({
         evidence: jsonRecord(row.market_evidence),
         maximumSpreadPct:
-          paperExplorationThresholds().maximumOptionSpreadPct
+          paperExplorationThresholds().maximumOptionSpreadPct,
+        underlyingPrice: underlyingSip?.referencePrice
       })
     ) {
       throw new Error(
@@ -659,7 +797,8 @@ const runExitReview = async (input: {
       option,
       reason,
       directionalReturn,
-      strategyClassification
+      strategyClassification,
+      underlyingSip
     }] : [];
   });
   if (!eligible.length) {
@@ -686,6 +825,8 @@ const runExitReview = async (input: {
       requestId: row.market_request_id ?? null,
       ...(item.option ? {
         ...jsonRecord(row.market_evidence),
+        underlyingPrice: item.underlyingSip?.referencePrice,
+        underlyingSip: item.underlyingSip,
         maximumSpreadPct: paperExplorationThresholds().maximumOptionSpreadPct
       } : {}),
       source: item.option
@@ -1037,6 +1178,14 @@ export const runPostgresReviewWorkflow = async (input: {
     const price = finite(row.market_price);
     if (price === null || price <= 0) throw new Error(`POSTGRES_REVIEW_MARKET_PRICE_MISSING:${row.symbol}`);
     assertObservedOptionContract(row);
+    assertFreshAlpacaSipUnderlying({
+      row,
+      now,
+      maxAgeSeconds:
+        input.maxMarketAgeSeconds ??
+        AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS,
+      errorScope: "REVIEW"
+    });
     assertExecutableOptionReviewEvidence(
       row,
       exploration.maximumOptionSpreadPct
@@ -1107,6 +1256,14 @@ export const runPostgresReviewWorkflow = async (input: {
     }
     const price = finite(row.market_price);
     if (price === null || price <= 0) throw new Error(`POSTGRES_REVIEW_MARKET_PRICE_MISSING:${row.symbol}`);
+    const underlyingSip = assertFreshAlpacaSipUnderlying({
+      row,
+      now,
+      maxAgeSeconds:
+        input.maxMarketAgeSeconds ??
+        AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS,
+      errorScope: "REVIEW"
+    });
     assertExecutableOptionReviewEvidence(
       row,
       exploration.maximumOptionSpreadPct
@@ -1147,9 +1304,8 @@ export const runPostgresReviewWorkflow = async (input: {
       ...jsonRecord(row.market_evidence),
       ...(option ? optionDecisionInputs(row) : {}),
       ...(option ? {
-        underlyingPrice:
-          finite(jsonRecord(row.market_evidence).underlyingPrice) ??
-          finite(decisionInputs(row).currentTradablePrice),
+        underlyingPrice: underlyingSip?.referencePrice,
+        underlyingSip,
         maximumSpreadPct: exploration.maximumOptionSpreadPct
       } : {})
     }];
