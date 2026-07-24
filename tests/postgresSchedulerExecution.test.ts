@@ -233,6 +233,187 @@ test("uses separate checked-out transactions for acquire, heartbeat, and release
   assert.equal(fake.active.size, 0);
 });
 
+test("retries a transient heartbeat transaction while the current lease still has safe time", async () => {
+  const fake = createTransactionPool();
+  const startedAt = Date.parse("2026-07-15T20:00:00.000Z");
+  let currentTimeMs = startedAt;
+  let heartbeatCalls = 0;
+  let successfulHeartbeat!: () => void;
+  const heartbeatObserved = new Promise<void>((resolve) => {
+    successfulHeartbeat = resolve;
+  });
+  const schedulerTelemetry: Array<Record<string, unknown>> = [];
+  const currentLease = lease();
+  const repository: PostgresSchedulerLeaseStore = {
+    async acquire() {
+      return { status: "acquired", lease: currentLease };
+    },
+    async heartbeat() {
+      heartbeatCalls += 1;
+      if (heartbeatCalls === 1) {
+        throw Object.assign(
+          new Error("temporary heartbeat connection reset"),
+          { code: "ECONNRESET" }
+        );
+      }
+      const heartbeatAt = new Date(currentTimeMs).toISOString();
+      successfulHeartbeat();
+      return {
+        status: "updated",
+        lease: {
+          ...currentLease,
+          heartbeatAt,
+          expiresAt: new Date(currentTimeMs + 60_000).toISOString(),
+          version: currentLease.version + heartbeatCalls
+        }
+      };
+    },
+    async release(input) {
+      return {
+        status: "updated",
+        lease: {
+          ...currentLease,
+          status: "released",
+          releasedAt: new Date(currentTimeMs).toISOString(),
+          releaseReason: input.releaseReason ?? "completed",
+          version: currentLease.version + heartbeatCalls + 1
+        }
+      };
+    }
+  };
+  let waits = 0;
+  const wait = async (milliseconds: number, signal: AbortSignal) => {
+    waits += 1;
+    if (waits <= 2) {
+      currentTimeMs += milliseconds;
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      if (signal.aborted) return resolve();
+      signal.addEventListener("abort", () => resolve(), { once: true });
+    });
+  };
+
+  const value = await runWithPostgresSchedulerLease(
+    {
+      pool: fake.pool,
+      config: config(),
+      job: POSTGRES_SCHEDULER_JOBS.research,
+      ownerId: "worker-a",
+      runId: "run-a",
+      operationId: "research-run-a",
+      leaseDurationMs: 60_000,
+      heartbeatIntervalMs: 15_000,
+      operation: async ({ signal }) => {
+        await Promise.race([
+          heartbeatObserved,
+          new Promise<never>((_resolve, reject) => {
+            signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+          })
+        ]);
+        return "complete";
+      }
+    },
+    {
+      repository,
+      now: () => new Date(currentTimeMs),
+      wait,
+      emit: (event) => schedulerTelemetry.push(event)
+    }
+  );
+
+  assert.equal(value, "complete");
+  assert.equal(heartbeatCalls, 2);
+  assert.deepEqual(
+    schedulerTelemetry.map((event) => event.event),
+    [
+      "postgres_scheduler_lease_acquired",
+      "postgres_scheduler_fence_renewal_retry",
+      "postgres_scheduler_fence_renewed",
+      "postgres_scheduler_lease_released"
+    ]
+  );
+});
+
+test("does not retry a permanent PostgreSQL heartbeat error", async () => {
+  const fake = createTransactionPool();
+  const startedAt = Date.parse("2026-07-15T20:00:00.000Z");
+  let currentTimeMs = startedAt;
+  let heartbeatCalls = 0;
+  const currentLease = lease();
+  const permanentError = Object.assign(
+    new Error("password authentication failed"),
+    { code: "28P01" }
+  );
+  const repository: PostgresSchedulerLeaseStore = {
+    async acquire() {
+      return { status: "acquired", lease: currentLease };
+    },
+    async heartbeat() {
+      heartbeatCalls += 1;
+      throw permanentError;
+    },
+    async release(input) {
+      return {
+        status: "updated",
+        lease: {
+          ...currentLease,
+          status: "released",
+          releasedAt: new Date(currentTimeMs).toISOString(),
+          releaseReason: input.releaseReason ?? "completed",
+          version: 2
+        }
+      };
+    }
+  };
+  const schedulerTelemetry: Array<Record<string, unknown>> = [];
+
+  await assert.rejects(
+    runWithPostgresSchedulerLease(
+      {
+        pool: fake.pool,
+        config: config(),
+        job: POSTGRES_SCHEDULER_JOBS.research,
+        ownerId: "worker-a",
+        runId: "run-a",
+        operationId: "research-run-a",
+        leaseDurationMs: 60_000,
+        heartbeatIntervalMs: 15_000,
+        operation: ({ signal }) =>
+          new Promise((_resolve, reject) => {
+            signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+          })
+      },
+      {
+        repository,
+        now: () => new Date(currentTimeMs),
+        wait: async (milliseconds) => {
+          currentTimeMs += milliseconds;
+        },
+        emit: (event) => schedulerTelemetry.push(event)
+      }
+    ),
+    (error) =>
+      error instanceof PostgresSchedulerExecutionError &&
+      error.code === "SCHEDULER_HEARTBEAT_FAILED" &&
+      error.cause === permanentError
+  );
+
+  assert.equal(heartbeatCalls, 1);
+  assert.equal(
+    schedulerTelemetry.filter(
+      (event) => event.event === "postgres_scheduler_fence_renewal_retry"
+    ).length,
+    0
+  );
+  assert.equal(
+    schedulerTelemetry.filter(
+      (event) => event.event === "postgres_scheduler_fence_renewal_failed"
+    ).length,
+    1
+  );
+});
+
 test("aborts the operation and fails closed when a heartbeat loses the fence", async () => {
   const fake = createTransactionPool();
   const currentLease = lease();

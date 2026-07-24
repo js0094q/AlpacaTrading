@@ -721,7 +721,8 @@ export class PostgresMarketDataRepository {
 
   async persistOptionSnapshotsWithReadback(
     rows: readonly PostgresOptionSnapshot[],
-    context: FencedPostgresRepositoryContext
+    context: FencedPostgresRepositoryContext,
+    signal?: AbortSignal
   ) {
     await requireFence(context);
     if (!rows.length) return { stored: 0, persistedRows: [] as PostgresOptionSnapshot[] };
@@ -746,6 +747,11 @@ export class PostgresMarketDataRepository {
     let profiledReadback = false;
 
     for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
+      if (signal?.aborted) {
+        throw signal.reason instanceof Error
+          ? signal.reason
+          : new Error("SCHEDULER_COMMAND_TERMINATED: option persistence cancelled.");
+      }
       const { symbol, batch } = batches[batchIndex]!;
       const batchNumber = batchIndex + 1;
       const fence = await requireFence(context);

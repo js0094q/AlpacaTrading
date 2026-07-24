@@ -87,6 +87,15 @@ row: inline payloads are bounded to 250 rows and 4 MB, while large feature
 payloads are copied from `feature_snapshots` inside PostgreSQL one row at a
 time instead of being retransmitted in a multi-row client parameter.
 
+Large option-contract and OPRA normalization loops yield every 250 inputs so
+the scheduler heartbeat can run in the same process. A transient connection,
+deadlock, serialization, capacity, or lock heartbeat error retries at one-second
+intervals only while the current lease retains a five-second safety margin;
+permanent authentication, schema, configuration, or fence errors abort
+immediately. Cancellation is rechecked before every snapshot batch, after the
+final batch, before readback, and before ingestion telemetry so an aborted
+operation cannot continue PostgreSQL writes.
+
 ## Paper exploration profile (2026-07-24)
 
 The autonomous PostgreSQL path uses a reversible paper-only exploration profile.

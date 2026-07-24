@@ -723,6 +723,230 @@ test("scheduler cancellation is rethrown instead of being degraded to unavailabl
   );
 });
 
+test("large OPRA normalization yields and stops before persistence after scheduler cancellation", async () => {
+  const cancellation = new AbortController();
+  const cancellationError = new Error("SCHEDULER_HEARTBEAT_FAILED:test cancellation");
+  const optionSymbols = Array.from(
+    { length: 251 },
+    (_value, index) =>
+      `SPY260724C${String(500_000 + index).padStart(8, "0")}`
+  );
+  let storedContracts: Array<Record<string, unknown>> = [];
+  let snapshotPersistenceCalls = 0;
+
+  await assert.rejects(
+    refreshPostgresMarketData({
+      symbols: ["SPY"],
+      timeframe: "1Day",
+      start: "2026-01-01T00:00:00.000Z",
+      end: "2026-07-20T23:59:59.999Z",
+      optionsEnabled: true,
+      now: new Date("2026-07-20T20:05:00.000Z"),
+      signal: cancellation.signal,
+      repository: {
+        upsertUniverseSymbols: async (rows: unknown[]) => ({ stored: rows.length }),
+        upsertBars: async (rows: unknown[]) => ({ stored: rows.length }),
+        upsertStockSnapshots: async (rows: unknown[]) => ({ stored: rows.length }),
+        upsertOptionContracts: async (rows: Array<Record<string, unknown>>) => {
+          storedContracts = rows;
+          return { stored: rows.length };
+        },
+        upsertOptionSnapshots: async (rows: unknown[]) => {
+          snapshotPersistenceCalls += 1;
+          return { stored: rows.length };
+        },
+        listOptionContractsBySymbols: async () => storedContracts,
+        listOptionSnapshotsByIdentity: async () => []
+      } as never,
+      context,
+      dependencies: {
+        fetchAllBars: async () => [{
+          symbol: "SPY",
+          bar: {
+            t: "2026-07-20T20:00:00.000Z",
+            o: 620,
+            h: 625,
+            l: 618,
+            c: 624,
+            v: 1_000_000
+          },
+          requestIds: ["request-bars"]
+        }],
+        fetchStockSnapshots: async () => [{
+          symbol: "SPY",
+          raw: stockRaw,
+          retrievedAt: "2026-07-20T20:05:00.000Z",
+          requestedFeed: "sip",
+          effectiveFeed: "sip",
+          currency: "USD",
+          requestId: "request-stocks"
+        }],
+        fetchOptionContracts: async () => optionSymbols.map((symbol, index) => ({
+          symbol,
+          underlying_symbol: "SPY",
+          type: "call",
+          expiration_date: "2026-07-24",
+          strike_price: String(500 + index / 1_000),
+          multiplier: "100",
+          status: "active",
+          tradable: true
+        })),
+        fetchOptionSnapshots: async () => [],
+        fetchOptionChainSnapshots: async () => {
+          setImmediate(() => cancellation.abort(cancellationError));
+          return {
+            underlyingSymbol: "SPY",
+            pagesConsumed: 1,
+            snapshots: optionSymbols.map((symbol) => ({
+              symbol,
+              raw: {
+                snapshotTimestamp: "2026-07-20T20:05:00.000Z",
+                latestQuote: {
+                  bp: 1.2,
+                  ap: 1.3,
+                  t: "2026-07-20T20:05:00.000Z"
+                },
+                latestTrade: {
+                  p: 1.25,
+                  t: "2026-07-20T20:04:59.000Z"
+                },
+                dailyBar: { v: 500 },
+                impliedVolatility: 0.2,
+                greeks: { delta: 0.5 }
+              },
+              requestId: `request-${symbol}`,
+              endpoint: "/v1beta1/options/snapshots/SPY?feed=opra",
+              underlyingSymbol: "SPY",
+              requestedFeed: "opra",
+              effectiveFeed: "opra",
+              pageToken: null,
+              retrievedAt: "2026-07-20T20:05:00.000Z"
+            }))
+          };
+        }
+      }
+    }),
+    (error: unknown) => error === cancellationError
+  );
+
+  assert.equal(snapshotPersistenceCalls, 0);
+});
+
+test("scheduler cancellation after the final option batch stops readback and ingestion telemetry", async () => {
+  const cancellation = new AbortController();
+  const cancellationError = new Error("SCHEDULER_HEARTBEAT_FAILED:post-batch cancellation");
+  const optionSymbol = "SPY260724C00500000";
+  let storedContracts: Array<Record<string, unknown>> = [];
+  let contractReadbackCalls = 0;
+  let ingestionTelemetryWrites = 0;
+
+  await assert.rejects(
+    refreshPostgresMarketData({
+      symbols: ["SPY"],
+      timeframe: "1Day",
+      start: "2026-01-01T00:00:00.000Z",
+      end: "2026-07-20T23:59:59.999Z",
+      optionsEnabled: true,
+      now: new Date("2026-07-20T20:05:00.000Z"),
+      signal: cancellation.signal,
+      repository: {
+        upsertUniverseSymbols: async (rows: unknown[]) => ({ stored: rows.length }),
+        upsertBars: async (rows: unknown[]) => ({ stored: rows.length }),
+        upsertStockSnapshots: async (rows: unknown[]) => ({ stored: rows.length }),
+        upsertOptionContracts: async (rows: Array<Record<string, unknown>>) => {
+          storedContracts = rows;
+          return { stored: rows.length };
+        },
+        upsertOptionSnapshots: async (rows: unknown[]) => ({ stored: rows.length }),
+        persistOptionSnapshotsWithReadback: async (rows: PostgresOptionSnapshot[]) => {
+          cancellation.abort(cancellationError);
+          return {
+            stored: rows.length,
+            persistedRows: withEvidenceFingerprints(rows) as never
+          };
+        },
+        listOptionContractsBySymbols: async () => {
+          contractReadbackCalls += 1;
+          return storedContracts;
+        },
+        listOptionSnapshotsByIdentity: async () => [],
+        recordMarketDataIngestionRun: async () => {
+          ingestionTelemetryWrites += 1;
+          return { stored: 1 };
+        }
+      } as never,
+      context,
+      dependencies: {
+        fetchAllBars: async () => [{
+          symbol: "SPY",
+          bar: {
+            t: "2026-07-20T20:00:00.000Z",
+            o: 620,
+            h: 625,
+            l: 618,
+            c: 624,
+            v: 1_000_000
+          },
+          requestIds: ["request-bars"]
+        }],
+        fetchStockSnapshots: async () => [{
+          symbol: "SPY",
+          raw: stockRaw,
+          retrievedAt: "2026-07-20T20:05:00.000Z",
+          requestedFeed: "sip",
+          effectiveFeed: "sip",
+          currency: "USD",
+          requestId: "request-stocks"
+        }],
+        fetchOptionContracts: async () => [{
+          symbol: optionSymbol,
+          underlying_symbol: "SPY",
+          type: "call",
+          expiration_date: "2026-07-24",
+          strike_price: "500",
+          multiplier: "100",
+          status: "active",
+          tradable: true
+        }],
+        fetchOptionSnapshots: async () => [],
+        fetchOptionChainSnapshots: async () => ({
+          underlyingSymbol: "SPY",
+          pagesConsumed: 1,
+          snapshots: [{
+            symbol: optionSymbol,
+            raw: {
+              snapshotTimestamp: "2026-07-20T20:05:00.000Z",
+              latestQuote: {
+                bp: 1.2,
+                ap: 1.3,
+                t: "2026-07-20T20:05:00.000Z"
+              },
+              latestTrade: {
+                p: 1.25,
+                t: "2026-07-20T20:04:59.000Z"
+              },
+              dailyBar: { v: 500 },
+              impliedVolatility: 0.2,
+              greeks: { delta: 0.5 }
+            },
+            requestId: "request-options",
+            endpoint: "/v1beta1/options/snapshots/SPY?feed=opra",
+            underlyingSymbol: "SPY",
+            requestedFeed: "opra",
+            effectiveFeed: "opra",
+            pageToken: null,
+            retrievedAt: "2026-07-20T20:05:00.000Z"
+          }]
+        })
+      }
+    }),
+    (error: unknown) => error === cancellationError
+  );
+
+  assert.equal(contractReadbackCalls, 0);
+  assert.equal(ingestionTelemetryWrites, 0);
+});
+
 test("refresh ingests complete OPRA chains per underlying and persists documented fields without synthetic defaults", async () => {
   const contractCalls: string[][] = [];
   const chainCalls: string[] = [];

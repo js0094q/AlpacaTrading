@@ -34,7 +34,8 @@ type MarketDataWriter = Pick<
   recordMarketDataIngestionRun?: PostgresMarketDataRepository["recordMarketDataIngestionRun"];
   persistOptionSnapshotsWithReadback?: (
     rows: readonly PostgresOptionSnapshot[],
-    context: FencedPostgresRepositoryContext
+    context: FencedPostgresRepositoryContext,
+    signal?: AbortSignal
   ) => Promise<{
     stored: number;
     persistedRows: PostgresOptionSnapshot[];
@@ -58,18 +59,30 @@ const defaults: MarketDataDependencies = {
 };
 
 const COOPERATIVE_YIELD_BATCH_SIZE = 250;
-const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
+const throwIfAborted = (signal?: AbortSignal) => {
+  if (!signal?.aborted) return;
+  throw signal.reason instanceof Error
+    ? signal.reason
+    : new Error("SCHEDULER_COMMAND_TERMINATED: market-data refresh cancelled.");
+};
+const yieldToEventLoop = async (signal?: AbortSignal) => {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  throwIfAborted(signal);
+};
 
 const fingerprintMap = async <T>(
   rows: readonly T[],
   keyFor: (row: T) => string,
-  materialFor: (row: T) => unknown
+  materialFor: (row: T) => unknown,
+  signal?: AbortSignal
 ) => {
   const result = new Map<string, string>();
   for (let index = 0; index < rows.length; index += 1) {
     const row = rows[index]!;
     result.set(keyFor(row), canonicalJsonHash(materialFor(row)));
-    if ((index + 1) % COOPERATIVE_YIELD_BATCH_SIZE === 0) await yieldToEventLoop();
+    if ((index + 1) % COOPERATIVE_YIELD_BATCH_SIZE === 0) {
+      await yieldToEventLoop(signal);
+    }
   }
   return result;
 };
@@ -264,6 +277,7 @@ export const refreshPostgresMarketData = async (input: {
   readonly context: FencedPostgresRepositoryContext;
   readonly dependencies?: Partial<MarketDataDependencies>;
 }) => {
+  throwIfAborted(input.signal);
   const now = input.now ?? new Date();
   const nowIso = now.toISOString();
   const requestedSymbols = symbols(input.symbols);
@@ -297,6 +311,7 @@ export const refreshPostgresMarketData = async (input: {
     feed: "sip",
     signal: input.signal
   });
+  throwIfAborted(input.signal);
   const barRows: PostgresMarketBar[] = fetchedBars.flatMap((entry) => {
     const open = number(entry.bar.o);
     const high = number(entry.bar.h);
@@ -340,6 +355,7 @@ export const refreshPostgresMarketData = async (input: {
     currency: "USD",
     signal: input.signal
   });
+  throwIfAborted(input.signal);
   const stockRows: PostgresStockSnapshot[] = [];
   for (const symbol of requestedSymbols) {
     const fetched = fetchedStocks.find((row) => row.symbol.toUpperCase() === symbol);
@@ -406,6 +422,7 @@ export const refreshPostgresMarketData = async (input: {
           limit: null,
           signal: input.signal
         });
+        throwIfAborted(input.signal);
       } catch (error) {
         if (input.signal?.aborted) {
           throw input.signal.reason instanceof Error
@@ -447,7 +464,14 @@ export const refreshPostgresMarketData = async (input: {
         });
         continue;
       }
-      for (const raw of rawContracts) {
+      for (let contractIndex = 0; contractIndex < rawContracts.length; contractIndex += 1) {
+        if (
+          contractIndex > 0 &&
+          contractIndex % COOPERATIVE_YIELD_BATCH_SIZE === 0
+        ) {
+          await yieldToEventLoop(input.signal);
+        }
+        const raw = rawContracts[contractIndex]!;
         const row = contractRow(raw, nowIso);
         if (!row) continue;
         if (row.underlyingSymbol !== underlying) {
@@ -481,6 +505,7 @@ export const refreshPostgresMarketData = async (input: {
       throw new Error("POSTGRES_OPTION_CONTRACTS_MISSING");
     }
     if (optionContracts.length > 0) {
+      throwIfAborted(input.signal);
       await repository.upsertOptionContracts(optionContracts, input.context);
     }
     const snapshotsByIdentity = new Map<string, PostgresOptionSnapshot>();
@@ -503,6 +528,7 @@ export const refreshPostgresMarketData = async (input: {
           feed: optionFeed,
           signal: input.signal
         });
+        throwIfAborted(input.signal);
       } catch (error) {
         if (input.signal?.aborted) {
           throw input.signal.reason instanceof Error
@@ -547,7 +573,18 @@ export const refreshPostgresMarketData = async (input: {
       let acceptedRows = 0;
       let staleRows = 0;
       let rejectedRows = 0;
-      for (const fetched of chain.snapshots) {
+      for (
+        let snapshotIndex = 0;
+        snapshotIndex < chain.snapshots.length;
+        snapshotIndex += 1
+      ) {
+        if (
+          snapshotIndex > 0 &&
+          snapshotIndex % COOPERATIVE_YIELD_BATCH_SIZE === 0
+        ) {
+          await yieldToEventLoop(input.signal);
+        }
+        const fetched = chain.snapshots[snapshotIndex]!;
         if (fetched.requestId) requestIds.add(fetched.requestId);
         const normalizedSymbol = fetched.symbol.trim().toUpperCase();
         const contract = contractBySymbol.get(normalizedSymbol);
@@ -704,11 +741,13 @@ export const refreshPostgresMarketData = async (input: {
     }
     optionSnapshots = [...snapshotsByIdentity.values()];
     if (optionSnapshots.length > 0) {
+      throwIfAborted(input.signal);
       let persistedSnapshots: PostgresOptionSnapshot[];
       if (repository.persistOptionSnapshotsWithReadback) {
         const snapshotPersistence = await repository.persistOptionSnapshotsWithReadback(
           optionSnapshots,
-          input.context
+          input.context,
+          input.signal
         );
         persistedSnapshots = snapshotPersistence.persistedRows;
       } else {
@@ -720,16 +759,18 @@ export const refreshPostgresMarketData = async (input: {
           }))
         }, input.context);
       }
+      throwIfAborted(input.signal);
       const persistedContracts = await repository.listOptionContractsBySymbols({
         optionSymbols: optionContracts.map((row) => row.optionSymbol)
       }, input.context);
+      throwIfAborted(input.signal);
       if (persistedContracts.length !== optionContracts.length) {
         throw new Error("POSTGRES_OPTION_CONTRACT_READBACK_INCOMPLETE");
       }
       if (persistedSnapshots.length !== optionSnapshots.length) {
         throw new Error("POSTGRES_OPTION_SNAPSHOT_READBACK_INCOMPLETE");
       }
-      await yieldToEventLoop();
+      await yieldToEventLoop(input.signal);
       const persistedSnapshotEvidenceFingerprints = new Map(persistedSnapshots.map((row) => [
         `${row.optionSymbol}:${row.observedAt}`,
         row.evidenceFingerprint ?? null
@@ -742,17 +783,21 @@ export const refreshPostgresMarketData = async (input: {
         ) {
           throw new Error("POSTGRES_OPTION_SNAPSHOT_EVIDENCE_FINGERPRINT_MISMATCH");
         }
-        if ((index + 1) % COOPERATIVE_YIELD_BATCH_SIZE === 0) await yieldToEventLoop();
+        if ((index + 1) % COOPERATIVE_YIELD_BATCH_SIZE === 0) {
+          await yieldToEventLoop(input.signal);
+        }
       }
       const expectedContractsBySymbol = await fingerprintMap(
         optionContracts,
         (row) => row.optionSymbol,
-        optionContractPersistenceMaterial
+        optionContractPersistenceMaterial,
+        input.signal
       );
       const actualContractsBySymbol = await fingerprintMap(
         persistedContracts,
         (row) => row.optionSymbol,
-        optionContractPersistenceMaterial
+        optionContractPersistenceMaterial,
+        input.signal
       );
       if (
         actualContractsBySymbol.size !== expectedContractsBySymbol.size ||
@@ -764,12 +809,14 @@ export const refreshPostgresMarketData = async (input: {
       const expectedSnapshotsByIdentity = await fingerprintMap(
         optionSnapshots,
         (row) => `${row.optionSymbol}:${row.observedAt}`,
-        optionSnapshotPersistenceMaterial
+        optionSnapshotPersistenceMaterial,
+        input.signal
       );
       const actualSnapshotsByIdentity = await fingerprintMap(
         persistedSnapshots,
         (row) => `${row.optionSymbol}:${row.observedAt}`,
-        optionSnapshotPersistenceMaterial
+        optionSnapshotPersistenceMaterial,
+        input.signal
       );
       if (
         actualSnapshotsByIdentity.size !== expectedSnapshotsByIdentity.size ||
@@ -783,6 +830,7 @@ export const refreshPostgresMarketData = async (input: {
     }
     if (repository.recordMarketDataIngestionRun) {
       for (const run of ingestionRuns) {
+        throwIfAborted(input.signal);
         await repository.recordMarketDataIngestionRun({
           ...run,
           persistenceResult: run.persistenceResult === "pending_persistence"
@@ -793,6 +841,7 @@ export const refreshPostgresMarketData = async (input: {
     }
   }
 
+  throwIfAborted(input.signal);
   return {
     bars: barRows,
     stockSnapshots: stockRows,

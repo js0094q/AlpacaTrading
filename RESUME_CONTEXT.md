@@ -16,6 +16,12 @@
   DTE-decay rules; option closes remain `sell_to_close`, short-equity closes
   remain buy-to-cover, and normal mark drift does not invalidate structural
   authorization.
+- OPRA normalization yields every 250 inputs so scheduler renewal is not
+  starved. Only classified transient PostgreSQL/network heartbeat failures
+  retry, at one-second intervals inside the existing lease minus a five-second
+  safety margin; permanent errors and fence loss abort immediately. Market-data
+  persistence rechecks cancellation before each batch and after the final batch
+  before readback or ingestion telemetry.
 
 ## Paper qualification V3 and successful no-action outcomes (2026-07-24)
 

@@ -122,6 +122,84 @@ const waitFor = (milliseconds: number, signal: AbortSignal) =>
 const isoAt = (date: Date, millisecondsAfter = 0) =>
   new Date(date.getTime() + millisecondsAfter).toISOString();
 
+const HEARTBEAT_RETRY_INTERVAL_MS = 1_000;
+const HEARTBEAT_EXPIRY_SAFETY_MS = 5_000;
+const TRANSIENT_HEARTBEAT_ERROR_CODES = new Set([
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EHOSTUNREACH",
+  "ENETDOWN",
+  "ENETUNREACH",
+  "EPIPE",
+  "ETIMEDOUT",
+  "40001",
+  "40P01",
+  "53300",
+  "55P03",
+  "57P01",
+  "57P02",
+  "57P03"
+]);
+
+const safeErrorIdentity = (error: unknown) => {
+  const candidate =
+    error !== null && typeof error === "object"
+      ? error as { name?: unknown; code?: unknown }
+      : {};
+  return {
+    errorName:
+      typeof candidate.name === "string" && candidate.name.trim()
+        ? candidate.name
+        : "Error",
+    errorCode:
+      typeof candidate.code === "string" && candidate.code.trim()
+        ? candidate.code
+        : null
+  };
+};
+
+const isTransientHeartbeatError = (error: unknown) => {
+  const pending: unknown[] = [error];
+  const seen = new Set<unknown>();
+  while (pending.length > 0 && seen.size < 12) {
+    const candidate = pending.shift();
+    if (
+      candidate === null ||
+      typeof candidate !== "object" ||
+      seen.has(candidate)
+    ) {
+      continue;
+    }
+    seen.add(candidate);
+    const record = candidate as {
+      code?: unknown;
+      message?: unknown;
+      cause?: unknown;
+      errors?: unknown;
+    };
+    const code = typeof record.code === "string"
+      ? record.code.trim().toUpperCase()
+      : "";
+    if (
+      code.startsWith("08") ||
+      TRANSIENT_HEARTBEAT_ERROR_CODES.has(code)
+    ) {
+      return true;
+    }
+    if (
+      typeof record.message === "string" &&
+      /\b(connection|socket)\b.*\b(closed|reset|terminated|timeout|timed out)\b|\bsocket hang up\b/i.test(
+        record.message
+      )
+    ) {
+      return true;
+    }
+    if (record.cause !== undefined) pending.push(record.cause);
+    if (Array.isArray(record.errors)) pending.push(...record.errors);
+  }
+  return false;
+};
+
 const requireNonempty = (value: string, code: string) => {
   if (!value.trim()) {
     throw new PostgresSchedulerExecutionError(code, "Scheduler identity is required.");
@@ -245,6 +323,13 @@ export const runWithPostgresSchedulerLease = async <T>(
       "The acquired scheduler lease does not match the requested identity."
     );
   }
+  const acquiredLeaseExpiresAtMs = Date.parse(acquisition.lease.expiresAt);
+  if (!Number.isFinite(acquiredLeaseExpiresAtMs)) {
+    throw new PostgresSchedulerExecutionError(
+      "SCHEDULER_ACQUISITION_LEASE_INVALID",
+      "The acquired scheduler lease has no valid expiry timestamp."
+    );
+  }
   emit({
     event: "postgres_scheduler_lease_acquired",
     jobName: fence.jobName,
@@ -263,6 +348,7 @@ export const runWithPostgresSchedulerLease = async <T>(
 
   const heartbeatStop = new AbortController();
   const operationAbort = new AbortController();
+  let leaseExpiresAtMs = acquiredLeaseExpiresAtMs;
   let heartbeatFailure: PostgresSchedulerExecutionError | undefined;
   let terminationFailure: PostgresSchedulerExecutionError | undefined;
   const abortForExternalTermination = () => {
@@ -299,61 +385,123 @@ export const runWithPostgresSchedulerLease = async <T>(
       }
       if (heartbeatStop.signal.aborted) return;
 
-      const heartbeatAt = now();
-      const renewalStartedAt = performance.now();
-      try {
-        const heartbeat = await withPostgresTransaction(
-          input.pool,
-          input.config,
-          (client) =>
-            repository.heartbeat(
-              {
-                jobName: fence.jobName,
-                ownerId: fence.ownerId,
-                runId: fence.runId,
-                fencingToken: fence.fencingToken,
-                heartbeatAt: isoAt(heartbeatAt),
-                expiresAt: isoAt(heartbeatAt, input.leaseDurationMs)
-              },
-              operationContext(input, client)
-            )
-        );
-        if (heartbeat.status !== "updated") {
-          heartbeatFailure = fencedMutationError(
-            "SCHEDULER_FENCE_LOST",
-            "heartbeat",
-            heartbeat
+      let retryAttempt = 0;
+      while (!heartbeatStop.signal.aborted) {
+        const heartbeatAt = now();
+        const renewalStartedAt = performance.now();
+        try {
+          const heartbeat = await withPostgresTransaction(
+            input.pool,
+            input.config,
+            (client) =>
+              repository.heartbeat(
+                {
+                  jobName: fence.jobName,
+                  ownerId: fence.ownerId,
+                  runId: fence.runId,
+                  fencingToken: fence.fencingToken,
+                  heartbeatAt: isoAt(heartbeatAt),
+                  expiresAt: isoAt(heartbeatAt, input.leaseDurationMs)
+                },
+                operationContext(input, client)
+              )
           );
-          operationAbort.abort(heartbeatFailure);
-          return;
-        }
-        emit({
-          event: "postgres_scheduler_fence_renewed",
-          jobName: fence.jobName,
-          workstream: fence.workstream,
-          leaseOwner: fence.ownerId,
-          runId: fence.runId,
-          fencingToken: fence.fencingToken,
-          heartbeatAt: heartbeat.lease.heartbeatAt,
-          expiresAt: heartbeat.lease.expiresAt,
-          renewalTimingMs: input.heartbeatIntervalMs,
-          renewalLatencyMs: performance.now() - renewalStartedAt,
-          remainingLeaseMs: Math.max(
+          if (heartbeat.status !== "updated") {
+            heartbeatFailure = fencedMutationError(
+              "SCHEDULER_FENCE_LOST",
+              "heartbeat",
+              heartbeat
+            );
+            operationAbort.abort(heartbeatFailure);
+            return;
+          }
+          const renewedLeaseExpiresAtMs = Date.parse(heartbeat.lease.expiresAt);
+          if (!Number.isFinite(renewedLeaseExpiresAtMs)) {
+            throw new PostgresSchedulerExecutionError(
+              "SCHEDULER_HEARTBEAT_LEASE_INVALID",
+              "The renewed scheduler lease has no valid expiry timestamp."
+            );
+          }
+          leaseExpiresAtMs = renewedLeaseExpiresAtMs;
+          emit({
+            event: "postgres_scheduler_fence_renewed",
+            jobName: fence.jobName,
+            workstream: fence.workstream,
+            leaseOwner: fence.ownerId,
+            runId: fence.runId,
+            fencingToken: fence.fencingToken,
+            heartbeatAt: heartbeat.lease.heartbeatAt,
+            expiresAt: heartbeat.lease.expiresAt,
+            renewalTimingMs: input.heartbeatIntervalMs,
+            renewalLatencyMs: performance.now() - renewalStartedAt,
+            remainingLeaseMs: Math.max(
+              0,
+              leaseExpiresAtMs - now().getTime()
+            )
+          });
+          break;
+        } catch (error) {
+          const remainingLeaseMs = Math.max(
             0,
-            Date.parse(heartbeat.lease.expiresAt) - now().getTime()
-          )
-        });
-      } catch (error) {
-        heartbeatFailure =
-          error instanceof PostgresSchedulerExecutionError
-            ? error
-            : new PostgresSchedulerExecutionError(
-                "SCHEDULER_HEARTBEAT_FAILED",
-                "Scheduler heartbeat failed.",
-                error
-              );
-        operationAbort.abort(heartbeatFailure);
-        return;
+            leaseExpiresAtMs - now().getTime()
+          );
+          const retryDelayMs = Math.min(
+            HEARTBEAT_RETRY_INTERVAL_MS,
+            Math.max(0, remainingLeaseMs - HEARTBEAT_EXPIRY_SAFETY_MS)
+          );
+          if (
+            error instanceof PostgresSchedulerExecutionError ||
+            !isTransientHeartbeatError(error) ||
+            retryDelayMs <= 0
+          ) {
+            heartbeatFailure =
+              error instanceof PostgresSchedulerExecutionError
+                ? error
+                : new PostgresSchedulerExecutionError(
+                    "SCHEDULER_HEARTBEAT_FAILED",
+                    "Scheduler heartbeat failed before the safe renewal deadline.",
+                    error
+                  );
+            emit({
+              event: "postgres_scheduler_fence_renewal_failed",
+              jobName: fence.jobName,
+              workstream: fence.workstream,
+              leaseOwner: fence.ownerId,
+              runId: fence.runId,
+              fencingToken: fence.fencingToken,
+              retryAttempt,
+              remainingLeaseMs,
+              ...safeErrorIdentity(error)
+            });
+            operationAbort.abort(heartbeatFailure);
+            return;
+          }
+          retryAttempt += 1;
+          emit({
+            event: "postgres_scheduler_fence_renewal_retry",
+            jobName: fence.jobName,
+            workstream: fence.workstream,
+            leaseOwner: fence.ownerId,
+            runId: fence.runId,
+            fencingToken: fence.fencingToken,
+            retryAttempt,
+            retryDelayMs,
+            remainingLeaseMs,
+            ...safeErrorIdentity(error)
+          });
+          try {
+            await wait(retryDelayMs, heartbeatStop.signal);
+          } catch (waitError) {
+            heartbeatFailure = new PostgresSchedulerExecutionError(
+              "SCHEDULER_HEARTBEAT_FAILED",
+              "Scheduler heartbeat retry wait failed.",
+              waitError
+            );
+            operationAbort.abort(heartbeatFailure);
+            return;
+          }
+          if (heartbeatStop.signal.aborted) return;
+        }
       }
     }
   };
