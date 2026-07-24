@@ -5,6 +5,8 @@ import type { Pool, QueryResult } from "pg";
 import {
   POSTGRES_OPERATIONAL_INDEXES,
   POSTGRES_OPERATIONAL_TABLES,
+  POSTGRES_AUTONOMOUS_LIFECYCLE_CONSTRAINTS,
+  POSTGRES_AUTONOMOUS_LIFECYCLE_TRIGGERS,
   POSTGRES_RELEASE_3_COLUMNS,
   POSTGRES_RELEASE_3_CONSTRAINTS,
   POSTGRES_RELEASE_3_NOT_NULL_COLUMNS,
@@ -16,6 +18,7 @@ const poolWith = (options: {
   missingIndex?: string;
   missingColumn?: string;
   missingConstraint?: string;
+  missingTrigger?: string;
   invalidConstraint?: string;
   invalidIndex?: string;
   nullableColumn?: string;
@@ -53,6 +56,22 @@ const poolWith = (options: {
         reconciliation_discrepancies_domain_idx: {
           tableName: "reconciliation_discrepancies",
           indexdef: "CREATE INDEX reconciliation_discrepancies_domain_idx ON reconciliation_discrepancies (domain, discrepancy_type, observed_at DESC)"
+        },
+        order_intents_lifecycle_state_idx: {
+          tableName: "order_intents",
+          indexdef: "CREATE INDEX order_intents_lifecycle_state_idx ON order_intents (lifecycle_state, updated_at DESC)"
+        },
+        order_intents_autonomous_cycle_idx: {
+          tableName: "order_intents",
+          indexdef: "CREATE INDEX order_intents_autonomous_cycle_idx ON order_intents (autonomous_cycle_id, workstream_execution_id, created_at DESC)"
+        },
+        order_intents_cycle_workstream_idx: {
+          tableName: "order_intents",
+          indexdef: "CREATE INDEX order_intents_cycle_workstream_idx ON order_intents (autonomous_cycle_id, workstream_execution_id, created_at DESC)"
+        },
+        autonomous_trade_lifecycle_transitions_intent_idx: {
+          tableName: "autonomous_trade_lifecycle_transitions",
+          indexdef: "CREATE INDEX autonomous_trade_lifecycle_transitions_intent_idx ON autonomous_trade_lifecycle_transitions (order_intent_id, occurred_at DESC)"
         }
       };
       return {
@@ -93,7 +112,7 @@ const poolWith = (options: {
     }
     if (text.includes("pg_catalog.pg_constraint")) {
       return {
-        rows: POSTGRES_RELEASE_3_CONSTRAINTS
+        rows: [...POSTGRES_RELEASE_3_CONSTRAINTS, ...POSTGRES_AUTONOMOUS_LIFECYCLE_CONSTRAINTS]
           .filter((conname) => conname !== options.missingConstraint)
           .map((conname) => ({
             conname,
@@ -101,7 +120,13 @@ const poolWith = (options: {
               ? "scheduler_leases"
               : conname === "option_contracts_evidence_object"
                 ? "option_contracts"
-              : "workstream_events",
+                : conname.startsWith("order_intents_")
+                  ? "order_intents"
+                  : conname.startsWith("lifecycle_transition_")
+                    ? "autonomous_trade_lifecycle_transitions"
+                    : conname.startsWith("reservation_")
+                      ? "reservation_terminal_transitions"
+                      : "workstream_events",
             convalidated: options.invalidConstraint === conname ? false : true,
             definition: conname === "scheduler_leases_timestamp_order"
               ? "CHECK ((heartbeat_at >= acquired_at) AND (expires_at > heartbeat_at) AND ((released_at IS NULL) OR (released_at >= acquired_at)))"
@@ -113,7 +138,40 @@ const poolWith = (options: {
                   ? "CHECK ((processing_status <> 'processing'::text) OR (processing_started_at IS NOT NULL))"
                 : conname === "option_contracts_evidence_object"
                   ? "CHECK (jsonb_typeof(evidence) = 'object'::text)"
+                  : conname === "order_intents_operation_contract"
+                    ? "CHECK ((operation IS NULL) OR (operation = ANY (ARRAY['buy_to_open'::text])))"
+                  : conname === "order_intents_strategy_classification_contract"
+                    ? "CHECK ((strategy_classification IS NULL) OR (strategy_classification = ANY (ARRAY['standard_long_call'::text])))"
+                  : conname === "order_intents_lifecycle_state_contract"
+                    ? "CHECK (lifecycle_state = ANY (ARRAY['candidate_created'::text]))"
+                  : conname === "order_intents_lifecycle_required"
+                    ? "CHECK (lifecycle_state IS NOT NULL)"
+                  : conname === "lifecycle_transition_from_state_contract"
+                    ? "CHECK ((from_state IS NULL) OR (from_state = ANY (ARRAY['candidate_created'::text])))"
+                  : conname === "lifecycle_transition_to_state_contract"
+                    ? "CHECK (to_state = ANY (ARRAY['candidate_created'::text]))"
+                  : conname === "lifecycle_transition_operation_contract"
+                    ? "CHECK ((operation IS NULL) OR (operation = ANY (ARRAY['buy_to_open'::text])))"
+                  : conname === "reservation_terminal_state_contract"
+                    ? "CHECK (terminal_state = ANY (ARRAY['cancelled'::text]))"
+                  : conname === "reservation_release_reason_nonempty"
+                    ? "CHECK (btrim(release_reason) <> ''::text)"
+                  : conname === "reservation_release_reason_contract"
+                    ? "CHECK (release_reason = ANY (ARRAY['broker_terminal_filled'::text, 'broker_absence_established'::text]))"
                 : "CHECK ((processed_at IS NULL) OR (processing_started_at IS NULL) OR (processed_at >= processing_started_at))"
+          }))
+      } as unknown as QueryResult;
+    }
+    if (text.includes("pg_catalog.pg_trigger")) {
+      return {
+        rows: POSTGRES_AUTONOMOUS_LIFECYCLE_TRIGGERS
+          .filter((trigger_name) => trigger_name !== options.missingTrigger)
+          .map((trigger_name) => ({
+            trigger_name,
+            table_name: trigger_name === "reservation_terminal_transitions_append_only"
+              ? "reservation_terminal_transitions"
+              : "autonomous_trade_lifecycle_transitions",
+            enabled: "O"
           }))
       } as unknown as QueryResult;
     }
@@ -151,6 +209,7 @@ test("schema verification requires every operational table, index, and fencing s
   assert.deepEqual(result.missingIndexes, []);
   assert.deepEqual(result.missingColumns, []);
   assert.deepEqual(result.missingConstraints, []);
+  assert.deepEqual(result.missingTriggers, []);
   assert.deepEqual(result.invalidNotNullColumns, []);
   assert.deepEqual(result.invalidIndexes, []);
   assert.deepEqual(result.invalidConstraints, []);
@@ -162,6 +221,7 @@ test("schema verification reports exact missing objects without connection detai
     missingIndex: "scheduler_leases_fencing_token_idx",
     missingColumn: "candidates.decision_id",
     missingConstraint: "workstream_events_attempts_nonnegative",
+    missingTrigger: "autonomous_lifecycle_transition_edge",
     invalidConstraint: "scheduler_leases_timestamp_order",
     invalidIndex: "candidates_decision_id_idx",
     nullableColumn: POSTGRES_RELEASE_3_NOT_NULL_COLUMNS[0],
@@ -172,6 +232,7 @@ test("schema verification reports exact missing objects without connection detai
   assert.deepEqual(result.missingIndexes, ["scheduler_leases_fencing_token_idx"]);
   assert.deepEqual(result.missingColumns, ["candidates.decision_id"]);
   assert.deepEqual(result.missingConstraints, ["workstream_events_attempts_nonnegative"]);
+  assert.deepEqual(result.missingTriggers, ["autonomous_lifecycle_transition_edge"]);
   assert.deepEqual(result.invalidNotNullColumns, ["candidates.decision_id"]);
   assert.deepEqual(result.invalidIndexes, ["candidates_decision_id_idx"]);
   assert.deepEqual(result.invalidConstraints, ["scheduler_leases_timestamp_order"]);

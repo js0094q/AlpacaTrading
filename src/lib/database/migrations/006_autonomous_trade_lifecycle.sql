@@ -54,6 +54,9 @@ DO $$ BEGIN
   END IF;
 END $$;
 
+ALTER TABLE order_intents
+  ALTER COLUMN lifecycle_state SET NOT NULL;
+
 CREATE INDEX IF NOT EXISTS order_intents_lifecycle_state_idx ON order_intents (lifecycle_state, updated_at DESC);
 CREATE INDEX IF NOT EXISTS order_intents_autonomous_cycle_idx ON order_intents (autonomous_cycle_id, workstream_execution_id, created_at DESC);
 CREATE TABLE IF NOT EXISTS autonomous_trade_lifecycle_transitions (
@@ -85,5 +88,15 @@ CREATE TABLE IF NOT EXISTS reservation_terminal_transitions (
   id text PRIMARY KEY, reservation_id text NOT NULL REFERENCES buying_power_reservations(id), order_intent_id text REFERENCES order_intents(id),
   terminal_state text NOT NULL, release_reason text NOT NULL, idempotency_key text NOT NULL, occurred_at timestamptz NOT NULL DEFAULT now(),
   CONSTRAINT reservation_terminal_state_contract CHECK (terminal_state IN ('cancelled','rejected','expired','closed','failed_terminal')),
-  CONSTRAINT reservation_release_reason_nonempty CHECK (btrim(release_reason) <> ''), UNIQUE (reservation_id), UNIQUE (reservation_id,idempotency_key)
+  CONSTRAINT reservation_release_reason_nonempty CHECK (btrim(release_reason) <> ''),
+  CONSTRAINT reservation_release_reason_contract CHECK (release_reason IN (
+    'broker_terminal_filled','broker_terminal_cancelled','broker_terminal_rejected',
+    'broker_terminal_expired','position_closed','stale_intent_recovery',
+    'broker_absence_established'
+  )),
+  UNIQUE (reservation_id), UNIQUE (reservation_id,idempotency_key)
 );
+DROP TRIGGER IF EXISTS reservation_terminal_transitions_append_only ON reservation_terminal_transitions;
+CREATE TRIGGER reservation_terminal_transitions_append_only
+  BEFORE UPDATE OR DELETE ON reservation_terminal_transitions
+  FOR EACH ROW EXECUTE FUNCTION reject_autonomous_lifecycle_mutation();

@@ -180,12 +180,20 @@ export const POSTGRES_AUTONOMOUS_LIFECYCLE_CONSTRAINTS = [
   "lifecycle_transition_to_state_contract",
   "lifecycle_transition_operation_contract",
   "reservation_terminal_state_contract",
-  "reservation_release_reason_nonempty"
+  "reservation_release_reason_nonempty",
+  "reservation_release_reason_contract"
+] as const;
+
+export const POSTGRES_AUTONOMOUS_LIFECYCLE_TRIGGERS = [
+  "autonomous_lifecycle_transition_edge",
+  "autonomous_lifecycle_transitions_append_only",
+  "reservation_terminal_transitions_append_only"
 ] as const;
 
 export const POSTGRES_RELEASE_3_NOT_NULL_COLUMNS = [
   "candidates.decision_id",
-  "option_contracts.evidence"
+  "option_contracts.evidence",
+  "order_intents.lifecycle_state"
 ] as const;
 
 const release3ConstraintDefinitions: Readonly<
@@ -240,7 +248,11 @@ const autonomousConstraintDefinitions: Readonly<Record<string, { readonly table:
   lifecycle_transition_to_state_contract: { table: "autonomous_trade_lifecycle_transitions", fragments: ["to_state", "candidate_created"] },
   lifecycle_transition_operation_contract: { table: "autonomous_trade_lifecycle_transitions", fragments: ["operation", "buy_to_open"] },
   reservation_terminal_state_contract: { table: "reservation_terminal_transitions", fragments: ["terminal_state", "cancelled"] },
-  reservation_release_reason_nonempty: { table: "reservation_terminal_transitions", fragments: ["release_reason", "btrim"] }
+  reservation_release_reason_nonempty: { table: "reservation_terminal_transitions", fragments: ["release_reason", "btrim"] },
+  reservation_release_reason_contract: {
+    table: "reservation_terminal_transitions",
+    fragments: ["release_reason", "broker_terminal_filled", "broker_absence_established"]
+  }
 };
 
 const release3IndexDefinitions: Readonly<Record<string, {
@@ -273,7 +285,7 @@ const release3IndexDefinitions: Readonly<Record<string, {
 };
 
 export const verifyPostgresSchema = async (pool: Pool) => {
-  const [tables, indexes, sequences, columns, constraints] = await Promise.all([
+  const [tables, indexes, sequences, columns, constraints, triggers] = await Promise.all([
     pool.query<{ tablename: string }>(
       `SELECT tablename
        FROM pg_catalog.pg_tables
@@ -332,6 +344,24 @@ export const verifyPostgresSchema = async (pool: Pool) => {
        )
          AND constraint_row.conname = ANY($1::text[])`,
       [[...POSTGRES_RELEASE_3_CONSTRAINTS, ...POSTGRES_AUTONOMOUS_LIFECYCLE_CONSTRAINTS]]
+    ),
+    pool.query<{
+      trigger_name: string;
+      table_name: string;
+      enabled: string;
+    }>(
+      `SELECT trigger_row.tgname AS trigger_name,
+              table_row.relname AS table_name,
+              trigger_row.tgenabled AS enabled
+       FROM pg_catalog.pg_trigger AS trigger_row
+       JOIN pg_catalog.pg_class AS table_row
+         ON table_row.oid = trigger_row.tgrelid
+       JOIN pg_catalog.pg_namespace AS namespace_row
+         ON namespace_row.oid = table_row.relnamespace
+       WHERE namespace_row.nspname = current_schema()
+         AND NOT trigger_row.tgisinternal
+         AND trigger_row.tgname = ANY($1::text[])`,
+      [[...POSTGRES_AUTONOMOUS_LIFECYCLE_TRIGGERS]]
     )
   ]);
   const tableSet = new Set(tables.rows.map((row) => row.tablename));
@@ -352,6 +382,18 @@ export const verifyPostgresSchema = async (pool: Pool) => {
   const missingConstraints = allConstraints.filter(
     (name) => !constraintSet.has(name)
   );
+  const triggerSet = new Set(triggers.rows.map((row) => row.trigger_name));
+  const missingTriggers = POSTGRES_AUTONOMOUS_LIFECYCLE_TRIGGERS.filter(
+    (name) => !triggerSet.has(name)
+  );
+  const invalidTriggers = POSTGRES_AUTONOMOUS_LIFECYCLE_TRIGGERS.filter((name) => {
+    const row = triggers.rows.find((trigger) => trigger.trigger_name === name);
+    if (!row) return false;
+    const expectedTable = name === "reservation_terminal_transitions_append_only"
+      ? "reservation_terminal_transitions"
+      : "autonomous_trade_lifecycle_transitions";
+    return row.table_name !== expectedTable || !["O", "A"].includes(row.enabled);
+  });
   const invalidNotNullColumns = POSTGRES_RELEASE_3_NOT_NULL_COLUMNS.filter((name) => {
     const row = columns.rows.find(
       (column) => `${column.table_name}.${column.column_name}` === name
@@ -403,10 +445,12 @@ export const verifyPostgresSchema = async (pool: Pool) => {
       missingColumns.length === 0 &&
       missingConstraints.length === 0 &&
       missingAutonomousConstraints.length === 0 &&
+      missingTriggers.length === 0 &&
       invalidNotNullColumns.length === 0 &&
       invalidIndexes.length === 0 &&
       invalidConstraints.length === 0 &&
-      invalidAutonomousConstraints.length === 0,
+      invalidAutonomousConstraints.length === 0 &&
+      invalidTriggers.length === 0,
     expectedTableCount: POSTGRES_OPERATIONAL_TABLES.length,
     presentTableCount: POSTGRES_OPERATIONAL_TABLES.length - missingTables.length,
     expectedIndexCount: POSTGRES_OPERATIONAL_INDEXES.length,
@@ -417,9 +461,11 @@ export const verifyPostgresSchema = async (pool: Pool) => {
     missingColumns,
     missingConstraints,
     missingAutonomousConstraints,
+    missingTriggers,
     invalidNotNullColumns,
     invalidIndexes,
     invalidConstraints,
-    invalidAutonomousConstraints
+    invalidAutonomousConstraints,
+    invalidTriggers
   };
 };

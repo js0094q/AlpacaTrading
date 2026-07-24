@@ -120,15 +120,3 @@ const transitions: Readonly<Record<AutonomousTradeLifecycleState, readonly Auton
 };
 export const validateLifecycleTransition = (from: AutonomousTradeLifecycleState | string, to: AutonomousTradeLifecycleState | string): void => { if (!(transitions[from as AutonomousTradeLifecycleState]?.includes(to as AutonomousTradeLifecycleState))) throw new Error(`INVALID_LIFECYCLE_TRANSITION:${from}->${to}`); };
 export const isTerminalLifecycleState = (state: AutonomousTradeLifecycleState) => ["closed", "cancelled", "rejected", "expired", "failed_terminal"].includes(state);
-
-export class AutonomousTradeLifecycleService implements AutonomousTradeLifecycleService {
-  validateTransition(from: string, to: string) { validateLifecycleTransition(from, to); return { ok: true as const, from, to }; }
-  classifyOption(input: Parameters<typeof classifyOptionStrategy>[0]) { return { classification: classifyOptionStrategy(input) }; }
-  async advanceCandidate(_id: string, _context: WorkerExecutionContext): Promise<LifecycleAdvanceResult> { return { ok: true, state: "candidate_created" }; }
-  async advanceIntent(_id: string, _context: WorkerExecutionContext): Promise<LifecycleAdvanceResult> { return { ok: true, state: "ready_for_submission" }; }
-  async advanceBrokerOrder(_id: string, _context: WorkerExecutionContext): Promise<LifecycleAdvanceResult> { return { ok: true, state: "broker_order_accepted" }; }
-  async evaluatePositionExit(_id: string, _context: WorkerExecutionContext): Promise<LifecycleAdvanceResult> { return { ok: true, state: "exit_evaluated", reasonCode: "NO_POSTGRES_EXIT_TRIGGER" }; }
-  async advanceExitIntent(_id: string, _context: WorkerExecutionContext): Promise<LifecycleAdvanceResult> { return { ok: true, state: "exit_ready_for_submission" }; }
-  async evaluateCancellation(_id: string, _context: WorkerExecutionContext): Promise<LifecycleAdvanceResult> { return { ok: true, state: "cancel_requested" }; }
-  async recoverPendingState(_context: WorkerExecutionContext): Promise<LifecycleRecoveryResult> { return { ok: true, recovered: 0, reasonCode: "NO_RECOVERABLE_POSTGRES_STATE" }; }
-}

@@ -4,43 +4,77 @@ import test from "node:test";
 
 import {
   AUTONOMOUS_TRADE_LIFECYCLE_STATES,
+  DomainInvariantError,
   STRATEGY_CLASSIFICATIONS,
   TRADE_OPERATIONS,
-  AutonomousTradeLifecycleService,
   classifyOptionStrategy,
   validateCloseOperation,
-  validateLifecycleTransition
+  validateLifecycleTransition,
+  type AutonomousTradeLifecycleService,
+  type PersistedOrderIntent,
+  type WorkerExecutionContext
 } from "../src/services/autonomousTradeLifecycleService.js";
 
-test("exposes the complete lifecycle domain contracts", async () => {
-  assert.equal(AUTONOMOUS_TRADE_LIFECYCLE_STATES.length, 25);
-  assert.equal(AUTONOMOUS_TRADE_LIFECYCLE_STATES[0], "candidate_created");
-  assert.equal(AUTONOMOUS_TRADE_LIFECYCLE_STATES.at(-1), "failed_terminal");
+test("exposes the exact lifecycle domain contracts", () => {
+  assert.deepEqual(AUTONOMOUS_TRADE_LIFECYCLE_STATES, [
+    "candidate_created", "review_created", "confirmed", "ready_for_submission",
+    "submission_attempt_persisted", "submission_ambiguous", "broker_order_discovered",
+    "broker_order_accepted", "partially_filled", "filled", "position_reconciled",
+    "exit_evaluated", "exit_review_created", "exit_confirmed", "exit_ready_for_submission",
+    "exit_submission_attempt_persisted", "exit_submission_ambiguous",
+    "exit_broker_order_discovered", "exit_partially_filled", "closed", "cancel_requested",
+    "cancel_ambiguous", "cancelled", "rejected", "expired", "failed_terminal"
+  ]);
   assert.deepEqual(TRADE_OPERATIONS, ["buy_to_open", "sell_to_open", "sell_to_close", "buy_to_cover"]);
   assert.deepEqual(STRATEGY_CLASSIFICATIONS, [
-    "equity_long", "equity_short", "standard_call", "standard_put",
-    "zero_dte_call", "zero_dte_put", "leaps_call", "leaps_put", "hedge"
+    "equity_long", "equity_short", "standard_long_call", "standard_long_put",
+    "zero_dte_long_call", "zero_dte_long_put", "leaps_long_call", "leaps_long_put", "hedge"
   ]);
-  assert.equal(validateCloseOperation({ positionSide: "short", operation: "buy" }).valid, false);
-  assert.equal(validateCloseOperation({ positionSide: "short", operation: "buy_to_cover" }).valid, true);
 });
 
 test("classifies options from observed UTC date-only expiration", () => {
-  assert.equal(classifyOptionStrategy({ observedAt: "2026-07-24T14:00:00.000Z", expiration: "2026-07-24", optionType: "call" }), "zero_dte_call");
-  assert.equal(classifyOptionStrategy({ observedAt: "2026-07-24T14:00:00.000Z", expiration: "2027-07-24", optionType: "put" }), "leaps_put");
-  assert.equal(classifyOptionStrategy({ observedAt: "2026-07-24T14:00:00.000Z", expiration: "2026-08-21", optionType: "call" }), "standard_call");
+  assert.equal(classifyOptionStrategy({ observedAt: "2026-07-24T14:00:00.000Z", expiration: "2026-07-24", optionType: "call" }), "zero_dte_long_call");
+  assert.equal(classifyOptionStrategy({ observedAt: "2026-07-24T14:00:00.000Z", expiration: "2027-07-24", optionType: "put" }), "leaps_long_put");
+  assert.equal(classifyOptionStrategy({ observedAt: "2026-07-24T14:00:00.000Z", expiration: "2026-08-21", optionType: "call" }), "standard_long_call");
 });
 
-test("exports the lifecycle service interface and typed result", () => {
-  const service = new AutonomousTradeLifecycleService();
-  assert.equal(typeof service.validateTransition, "function");
-  assert.equal(typeof service.classifyOption, "function");
-  assert.equal(service.validateTransition("intent_created", "submission_attempt_persisted").ok, true);
+test("requires domain close operations before broker-side mapping", () => {
+  const shortPosition = {
+    id: "position-short",
+    assetClass: "equity" as const,
+    side: "short" as const,
+    symbol: "POOL",
+    contractId: null,
+    originatingCandidateId: "candidate-short",
+    openingIntentId: "intent-open",
+    openQuantity: "1",
+    strategyClassification: "equity_short" as const
+  };
+  assert.throws(
+    () => validateCloseOperation(shortPosition, "buy_to_open"),
+    (error) => error instanceof DomainInvariantError &&
+      error.message === "SHORT_POSITION_REQUIRES_BUY_TO_COVER"
+  );
+  assert.doesNotThrow(() => validateCloseOperation(shortPosition, "buy_to_cover"));
+});
+
+test("exports compile-time lifecycle service and persisted intent contracts", () => {
+  const acceptsService = (_service: AutonomousTradeLifecycleService) => true;
+  const acceptsContext = (_context: WorkerExecutionContext) => true;
+  const acceptsIntent = (_intent: PersistedOrderIntent) => true;
+  assert.equal(typeof acceptsService, "function");
+  assert.equal(typeof acceptsContext, "function");
+  assert.equal(typeof acceptsIntent, "function");
 });
 
 test("rejects invalid lifecycle transitions", () => {
-  assert.throws(() => validateLifecycleTransition("closed", "submitted"), /INVALID_LIFECYCLE_TRANSITION/);
-  assert.doesNotThrow(() => validateLifecycleTransition("intent_created", "submission_attempt_persisted"));
+  assert.throws(
+    () => validateLifecycleTransition("closed", "submission_attempt_persisted"),
+    /INVALID_LIFECYCLE_TRANSITION/
+  );
+  assert.doesNotThrow(() =>
+    validateLifecycleTransition("ready_for_submission", "submission_attempt_persisted")
+  );
 });
 
 test("migration 006 contains durable lifecycle lineage and terminal transition tables", async () => {
@@ -54,6 +88,10 @@ test("migration 006 contains durable lifecycle lineage and terminal transition t
   assert.match(sql, /contract_id/i);
   assert.match(sql, /CHECK[\s\S]*lifecycle_state/i);
   assert.match(sql, /BEFORE\s+(UPDATE|DELETE)/i);
+  assert.match(sql, /enforce_autonomous_lifecycle_transition/i);
+  assert.match(sql, /INVALID_LIFECYCLE_TRANSITION/i);
+  assert.match(sql, /reservation_release_reason_contract/i);
+  assert.match(sql, /reservation_terminal_transitions_append_only/i);
   assert.match(sql, /CREATE TABLE(?: IF NOT EXISTS)? autonomous_trade_lifecycle_transitions/i);
   assert.match(sql, /append-only|ON CONFLICT/i);
   assert.match(sql, /CREATE TABLE(?: IF NOT EXISTS)? reservation_terminal_transitions/i);
