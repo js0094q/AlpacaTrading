@@ -129,17 +129,316 @@ const premiumDecisionEvidence = (value: unknown): Record<string, unknown> => {
   };
 };
 
+const RESEARCH_DASHBOARD_FIELDS = [
+  "id",
+  "workstream",
+  "status",
+  "risk_profile",
+  "options_enabled",
+  "request_id",
+  "candidates_selected",
+  "started_at",
+  "completed_at",
+  "created_at",
+  "updated_at",
+  "error_code",
+  "error_message"
+] as const;
+
+const PLAN_DASHBOARD_FIELDS = [
+  "id",
+  "candidate_id",
+  "symbol",
+  "option_symbol",
+  "asset_class",
+  "direction",
+  "preferred_expression",
+  "strategy_family",
+  "score",
+  "confidence",
+  "expected_return",
+  "option_liquidity_score",
+  "volatility_score",
+  "decision",
+  "lifecycle_status",
+  "decision_reason",
+  "as_of",
+  "candidate_created_at",
+  "candidate_updated_at",
+  "review_id",
+  "review_status",
+  "review_created_at",
+  "review_updated_at",
+  "review_expires_at",
+  "confirmation_id",
+  "confirmation_status",
+  "confirmed_at",
+  "confirmation_expires_at",
+  "confirmation_created_at",
+  "intent_id",
+  "client_order_id",
+  "intent_status",
+  "operation",
+  "strategy_classification",
+  "lifecycle_state",
+  "autonomous_cycle_id",
+  "workstream_execution_id",
+  "parent_position_id",
+  "opening_intent_id",
+  "intent_terminal_reason",
+  "exit_trigger",
+  "lifecycle_reason_code",
+  "ready_at",
+  "intent_submitted_at",
+  "terminal_at",
+  "intent_created_at",
+  "intent_updated_at",
+  "reservation_id",
+  "reservation_status",
+  "release_reason",
+  "reservation_amount",
+  "reservation_expires_at",
+  "reservation_released_at",
+  "reservation_created_at",
+  "broker_order_id",
+  "broker_order_status",
+  "filled_quantity",
+  "filled_average_price",
+  "submitted_at",
+  "accepted_at",
+  "filled_at",
+  "cancelled_at",
+  "expired_at",
+  "last_broker_update_at",
+  "latest_broker_event_type",
+  "latest_broker_event_status",
+  "latest_broker_event_at",
+  "position_id",
+  "position_status",
+  "position_side",
+  "opened_at",
+  "closed_at",
+  "last_reconciled_at",
+  "premium_decision_evidence"
+] as const;
+
+const REVIEW_DASHBOARD_FIELDS = [
+  "id",
+  "review_id",
+  "candidate_id",
+  "review_type",
+  "status",
+  "environment",
+  "paper_only",
+  "live_trading_enabled",
+  "client_order_id",
+  "expires_at",
+  "created_at",
+  "updated_at",
+  "consumed_at",
+  "blockers",
+  "warnings",
+  "confirmation_id",
+  "confirmation_status",
+  "confirmed_at",
+  "confirmation_expires_at",
+  "confirmation_consumed_at",
+  "intent_id",
+  "intent_status",
+  "intent_client_order_id",
+  "reservation_id",
+  "ready_at",
+  "submitted_at",
+  "terminal_at",
+  "intent_created_at",
+  "intent_updated_at",
+  "intent_terminal_reason",
+  "reservation_status",
+  "release_reason",
+  "reservation_expires_at",
+  "reservation_released_at",
+  "broker_order_id",
+  "broker_order_status",
+  "filled_quantity",
+  "filled_average_price",
+  "broker_submitted_at",
+  "broker_filled_at",
+  "latest_broker_event_type",
+  "latest_broker_event_status",
+  "latest_broker_event_at",
+  "position_id",
+  "position_status",
+  "last_reconciled_at"
+] as const;
+
+const INTENT_DASHBOARD_FIELDS = [
+  "intent_id",
+  "candidate_id",
+  "review_id",
+  "confirmation_id",
+  "confirmation_status",
+  "reservation_id",
+  "reservation_status",
+  "release_reason",
+  "reservation_expires_at",
+  "reservation_released_at",
+  "symbol",
+  "asset_class",
+  "side",
+  "intent_status",
+  "client_order_id",
+  "operation",
+  "strategy_classification",
+  "lifecycle_state",
+  "autonomous_cycle_id",
+  "workstream_execution_id",
+  "parent_position_id",
+  "opening_intent_id",
+  "intent_terminal_reason",
+  "exit_trigger",
+  "lifecycle_reason_code",
+  "ready_at",
+  "intent_submitted_at",
+  "terminal_at",
+  "intent_created_at",
+  "intent_updated_at",
+  "broker_order_id",
+  "broker_order_status",
+  "filled_quantity",
+  "filled_average_price",
+  "broker_submitted_at",
+  "broker_filled_at",
+  "latest_broker_event_type",
+  "latest_broker_event_status",
+  "latest_broker_event_at",
+  "position_id",
+  "position_status",
+  "strategy_family",
+  "opened_at",
+  "closed_at",
+  "last_reconciled_at"
+] as const;
+
+const EXECUTION_DASHBOARD_FIELDS = [
+  "id",
+  "broker_execution_id",
+  "order_intent_id",
+  "execution_review_id",
+  "candidate_id",
+  "reservation_id",
+  "operation",
+  "strategy_classification",
+  "lifecycle_state",
+  "autonomous_cycle_id",
+  "workstream_execution_id",
+  "parent_position_id",
+  "opening_intent_id",
+  "broker_order_id",
+  "client_order_id",
+  "symbol",
+  "asset_class",
+  "side",
+  "order_type",
+  "time_in_force",
+  "status",
+  "quantity",
+  "notional",
+  "filled_quantity",
+  "filled_average_price",
+  "submitted_at",
+  "accepted_at",
+  "filled_at",
+  "cancelled_at",
+  "expired_at",
+  "last_broker_update_at",
+  "updated_at",
+  "latest_broker_event_type",
+  "latest_broker_event_status",
+  "latest_broker_event_at",
+  "position_id",
+  "position_status",
+  "last_reconciled_at"
+] as const;
+
+const OPTION_DASHBOARD_FIELDS = [
+  "option_symbol",
+  "underlying_symbol",
+  "type",
+  "expiration_date",
+  "strike",
+  "multiplier",
+  "tradable",
+  "bid",
+  "ask",
+  "midpoint",
+  "last",
+  "volume",
+  "open_interest",
+  "implied_volatility",
+  "delta",
+  "gamma",
+  "theta",
+  "vega",
+  "rho",
+  "quote_timestamp",
+  "snapshot_timestamp",
+  "observed_at",
+  "source",
+  "requested_feed",
+  "effective_feed",
+  "underlying_price",
+  "spread_percentage"
+] as const;
+
+const LIFECYCLE_DASHBOARD_FIELDS = [
+  "row_kind",
+  "cycle_scope",
+  "cycle_id",
+  "event_type",
+  "workstream",
+  "position",
+  "classification",
+  "reason_code",
+  "duration_ms",
+  "occurred_at",
+  "candidate_id",
+  "review_id",
+  "confirmation_id",
+  "intent_id",
+  "parent_position_id",
+  "opening_intent_id",
+  "client_order_id",
+  "broker_order_id",
+  "broker_status",
+  "operation",
+  "strategy_classification",
+  "lifecycle_state",
+  "reservation_state",
+  "reservation_release_reason",
+  "position_id",
+  "position_side",
+  "open_quantity",
+  "latest_reconciled_at",
+  "autonomous_cycle_id",
+  "workstream_execution_id",
+  "exit_trigger",
+  "lifecycle_reason_code",
+  "decision_evidence"
+] as const;
+
 const normalizeDashboardRow = (
-  row: Record<string, unknown>
+  row: Record<string, unknown>,
+  allowedFields: readonly string[]
 ): Record<string, unknown> => {
   const normalized: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(row)) {
-    if (sensitiveDashboardKey(key)) continue;
+  for (const key of allowedFields) {
+    if (!Object.prototype.hasOwnProperty.call(row, key)) continue;
+    const value = row[key];
     if (key === "premium_decision_evidence" || key === "decision_evidence") {
       normalized[key] = premiumDecisionEvidence(value);
       continue;
     }
-    if (/(?:_at|_timestamp)$/.test(key)) {
+    if (key === "as_of" || /(?:_at|_timestamp)$/.test(key)) {
       normalized[key] = timestampValue(value);
       continue;
     }
@@ -148,8 +447,10 @@ const normalizeDashboardRow = (
   return normalized;
 };
 
-const normalizeDashboardRows = (rows: Array<Record<string, unknown>>) =>
-  rows.map(normalizeDashboardRow);
+const normalizeDashboardRows = (
+  rows: Array<Record<string, unknown>>,
+  allowedFields: readonly string[]
+) => rows.map((row) => normalizeDashboardRow(row, allowedFields));
 
 const newYorkDate = (now: Date) => {
   const parts = new Intl.DateTimeFormat("en-US", {
@@ -883,16 +1184,55 @@ export const readPostgresDashboardData = async (
            )
          ORDER BY started.occurred_at DESC, started.event_id DESC
          LIMIT 1
+       ), interrupted_cycle AS (
+         SELECT started.entity_id, stopped.occurred_at AS stopped_at
+         FROM workstream_events started
+         JOIN LATERAL (
+           SELECT interrupted.occurred_at
+           FROM workstream_events interrupted
+           WHERE interrupted.workstream = 'autonomous_worker'
+             AND interrupted.entity_id = started.entity_id
+             AND interrupted.event_type = 'worker_stopped'
+           ORDER BY interrupted.occurred_at DESC, interrupted.event_id DESC
+           LIMIT 1
+         ) stopped ON true
+         WHERE started.workstream = 'autonomous_worker'
+           AND started.event_type = 'cycle_started'
+           AND NOT EXISTS (
+             SELECT 1
+             FROM workstream_events terminal
+             WHERE terminal.workstream = 'autonomous_worker'
+               AND terminal.entity_id = started.entity_id
+               AND terminal.event_type IN ('cycle_completed', 'cycle_failed')
+           )
+         ORDER BY stopped.occurred_at DESC, started.event_id DESC
+         LIMIT 1
        ), cycle_scope AS (
          SELECT current_cycle.entity_id AS cycle_id, 'current'::text AS cycle_scope
          FROM current_cycle
          UNION ALL
-         SELECT latest_terminal.entity_id, 'last_completed'::text
+         SELECT interrupted_cycle.entity_id, 'interrupted'::text
+         FROM interrupted_cycle
+         WHERE NOT EXISTS (
+           SELECT 1 FROM current_cycle
+           WHERE current_cycle.entity_id = interrupted_cycle.entity_id
+         )
+         UNION ALL
+         SELECT latest_terminal.entity_id,
+                CASE
+                  WHEN latest_terminal.event_type = 'cycle_completed'
+                    THEN 'last_completed'::text
+                  ELSE 'last_failed'::text
+                END
          FROM latest_terminal
          WHERE NOT EXISTS (
            SELECT 1 FROM current_cycle
            WHERE current_cycle.entity_id = latest_terminal.entity_id
          )
+           AND NOT EXISTS (
+             SELECT 1 FROM interrupted_cycle
+             WHERE interrupted_cycle.entity_id = latest_terminal.entity_id
+           )
        ), worker_projection AS (
          SELECT 'workstream'::text AS row_kind, scope.cycle_scope,
                 event.entity_id AS cycle_id, event.event_type,
@@ -903,6 +1243,9 @@ export const readPostgresDashboardData = async (
                   WHEN event.event_type = 'cycle_completed' THEN 'success'
                   WHEN event.event_type = 'cycle_failed'
                     THEN COALESCE(event.payload->>'classification', 'blocked')
+                  WHEN event.event_type = 'worker_stopped'
+                    AND scope.cycle_scope = 'interrupted' THEN 'interrupted'
+                  WHEN event.event_type = 'worker_stopped' THEN 'stopped'
                   WHEN event.event_type IN ('cycle_started', 'workstream_started')
                     THEN 'running'
                   ELSE event.payload->>'classification'
@@ -935,7 +1278,8 @@ export const readPostgresDashboardData = async (
          WHERE event.workstream = 'autonomous_worker'
            AND event.event_type IN (
              'cycle_started', 'workstream_started', 'workstream_completed',
-             'workstream_failed', 'cycle_completed', 'cycle_failed'
+             'workstream_failed', 'cycle_completed', 'cycle_failed',
+             'worker_stopped'
            )
        ), trade_projection AS (
          SELECT 'trade_lifecycle'::text AS row_kind, scope.cycle_scope,
@@ -1049,13 +1393,34 @@ export const readPostgresDashboardData = async (
       []
     )
   ]);
-  const latestResearch = normalizeDashboardRows(research.rows);
-  const latestPaperPlans = normalizeDashboardRows(plans.rows);
-  const normalizedReviews = normalizeDashboardRows(reviews.rows);
-  const orderIntents = normalizeDashboardRows(intents.rows);
-  const executions = normalizeDashboardRows(orders.rows);
-  const optionContracts = normalizeDashboardRows(options.rows);
-  const autonomousLifecycle = normalizeDashboardRows(lifecycle.rows);
+  const latestResearch = normalizeDashboardRows(
+    research.rows,
+    RESEARCH_DASHBOARD_FIELDS
+  );
+  const latestPaperPlans = normalizeDashboardRows(
+    plans.rows,
+    PLAN_DASHBOARD_FIELDS
+  );
+  const normalizedReviews = normalizeDashboardRows(
+    reviews.rows,
+    REVIEW_DASHBOARD_FIELDS
+  );
+  const orderIntents = normalizeDashboardRows(
+    intents.rows,
+    INTENT_DASHBOARD_FIELDS
+  );
+  const executions = normalizeDashboardRows(
+    orders.rows,
+    EXECUTION_DASHBOARD_FIELDS
+  );
+  const optionContracts = normalizeDashboardRows(
+    options.rows,
+    OPTION_DASHBOARD_FIELDS
+  );
+  const autonomousLifecycle = normalizeDashboardRows(
+    lifecycle.rows,
+    LIFECYCLE_DASHBOARD_FIELDS
+  );
   return {
     latestResearch,
     latestPaperPlans,

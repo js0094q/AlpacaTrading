@@ -23,6 +23,31 @@ const workstreams = [
   "research:daily",
   "paper:options:discover",
   "paper:review",
+  "paper:portfolio:review",
+  "paper:ops:review",
+  "hedge:review",
+  "paper:execute:reviewed",
+  "zero-dte:engine",
+  "zero-dte:reconcile",
+  "paper:exit:review",
+  "zero-dte:exit:review",
+  "hedge:exit:review",
+  "paper:exit:execute",
+  "hedge:exit:execute",
+  "zero-dte:reconcile",
+  "paper:order:cancel",
+  "zero-dte:reconcile",
+  "paper:learn",
+  "system:recover"
+] as const;
+
+const executedCommands = [
+  "zero-dte:reconcile",
+  "research:daily",
+  "paper:options:discover",
+  "paper:review",
+  "paper:portfolio:review",
+  "paper:ops:review",
   "hedge:review",
   "paper:execute:reviewed",
   "zero-dte:reconcile",
@@ -40,6 +65,19 @@ const workstreams = [
   "paper:learn",
   "system:recover"
 ] as const;
+
+const emptyRecoveryCounters = {
+  researchRuns: 0,
+  reservations: 0,
+  reviews: 0,
+  confirmations: 0,
+  intents: 0,
+  staleReadyIntents: 0,
+  staleReadyCancelled: 0,
+  staleReadyPreserved: 0,
+  staleReadyReservationsReleased: 0,
+  staleReadyAllocationsAdjusted: 0
+} as const;
 
 const completePostgresOnlyEnvironment = {
   ...process.env,
@@ -163,6 +201,24 @@ if (command === process.env.WORKER_SUCCESS_COMMAND) {
 const successOutputs = JSON.parse(process.env.WORKER_SUCCESS_OUTPUTS || "{}");
 if (Object.prototype.hasOwnProperty.call(successOutputs, command)) {
   process.stdout.write(successOutputs[command]);
+  process.exit(0);
+}
+if (command === "system:recover") {
+  process.stdout.write(JSON.stringify({
+    status: "completed",
+    recovery: {
+      researchRuns: 0,
+      reservations: 0,
+      reviews: 0,
+      confirmations: 0,
+      intents: 0,
+      staleReadyIntents: 0,
+      staleReadyCancelled: 0,
+      staleReadyPreserved: 0,
+      staleReadyReservationsReleased: 0,
+      staleReadyAllocationsAdjusted: 0
+    }
+  }));
   process.exit(0);
 }
 process.stdout.write(JSON.stringify({ status: "success" }));
@@ -372,7 +428,7 @@ test("approved worker validates the production contract and persists a complete 
   assert.equal(overlapped, false, "workstreams and state writes must not overlap");
 
   const workstreamCalls = calls.filter((call) => call.command !== "worker:state");
-  assert.deepEqual(workstreamCalls.map((call) => call.command), workstreams);
+  assert.deepEqual(workstreamCalls.map((call) => call.command), executedCommands);
   assert.ok(workstreamCalls.every((call) => call.cycleId === states[0]?.cycleId));
   assert.ok(workstreamCalls.every((call) => call.workstream === call.command));
   assert.equal(
@@ -401,6 +457,15 @@ test("approved worker validates the production contract and persists a complete 
     entryExecution?.args.includes("--sections=equityBuys,equityAdds,optionBuys"),
     true
   );
+  assert.ok(
+    workstreamCalls.findIndex((call) => call.command === "paper:portfolio:review") <
+      workstreamCalls.findIndex((call) => call.command === "paper:ops:review")
+  );
+  assert.ok(
+    workstreamCalls.findIndex((call) => call.command === "paper:ops:review") <
+      workstreamCalls.findIndex((call) => call.command === "paper:execute:reviewed"),
+    "the signed reviewed artifact must be refreshed before entry execution"
+  );
 
   const expectedEvents = ["cycle_started"];
   for (const workstream of workstreams) {
@@ -413,6 +478,13 @@ test("approved worker validates the production contract and persists a complete 
   expectedEvents.push("cycle_completed", "worker_stopped");
   assert.deepEqual(states.map((state) => state.eventType), expectedEvents);
   assert.equal(new Set(states.map((state) => state.cycleId)).size, 1);
+  assert.deepEqual(
+    states
+      .filter((state) => state.eventType === "workstream_started")
+      .map((state) => state.payload.workstream),
+    workstreams,
+    "internal reconciliation must not increase the 20 public workstream states"
+  );
   assert.match(states[0]!.cycleId, /^[0-9a-f-]{36}$/i);
   assert.ok(states.every((state) => Number.isFinite(Date.parse(state.occurredAt))));
   assert.match(result.stdout, /"event":"cycle_completed"/);
@@ -428,16 +500,11 @@ test("the 20 public workstreams enforce lifecycle phase order and publish dashbo
     calls
       .filter((call) => call.command !== "worker:state")
       .map((call) => call.command),
-    workstreams
+    executedCommands
   );
   assert.equal(workstreams[0], "zero-dte:reconcile");
   assert.equal(workstreams.at(-1), "system:recover");
 
-  const reconciliations = workstreams
-    .map((workstream, index) => ({ workstream, index }))
-    .filter(({ workstream }) => workstream === "zero-dte:reconcile")
-    .map(({ index }) => index);
-  assert.deepEqual(reconciliations, [0, 6, 8, 13, 15, 17]);
   for (const mutation of [
     "paper:execute:reviewed",
     "zero-dte:engine",
@@ -446,13 +513,19 @@ test("the 20 public workstreams enforce lifecycle phase order and publish dashbo
     "paper:order:cancel"
   ] as const) {
     assert.equal(
-      workstreams[workstreams.indexOf(mutation) + 1],
+      executedCommands[executedCommands.indexOf(mutation) + 1],
       "zero-dte:reconcile",
       `${mutation} must be immediately followed by reconciliation`
     );
   }
-  assert.ok(reconciliations[2]! < workstreams.indexOf("paper:exit:review"));
-  assert.ok(reconciliations[4]! < workstreams.indexOf("paper:order:cancel"));
+  assert.ok(
+    executedCommands.indexOf("paper:portfolio:review") <
+      executedCommands.indexOf("paper:ops:review")
+  );
+  assert.ok(
+    executedCommands.indexOf("paper:ops:review") <
+      executedCommands.indexOf("paper:execute:reviewed")
+  );
 
   const dashboardRefresh = states.find(
     (state) =>
@@ -461,6 +534,47 @@ test("the 20 public workstreams enforce lifecycle phase order and publish dashbo
   );
   assert.equal(dashboardRefresh?.payload.dashboardProjectionReady, true);
   assert.equal(dashboardRefresh?.payload.dashboardProjectionAuthority, "postgres");
+});
+
+test("every failing broker mutation reconciles before the cycle fails or considers later mutations", () => {
+  const brokerMutations = [
+    "paper:execute:reviewed",
+    "zero-dte:engine",
+    "paper:exit:execute",
+    "hedge:exit:execute",
+    "paper:order:cancel"
+  ] as const;
+
+  for (const [mutationPosition, mutation] of brokerMutations.entries()) {
+    const { result, calls, states } = runWorker({
+      failCommand: mutation,
+      failOutput: JSON.stringify({
+        status: "failed",
+        code: "BROKER_SUBMISSION_AMBIGUOUS"
+      })
+    });
+    assert.notEqual(
+      result.status,
+      0,
+      `${mutation}: ${result.stderr || result.stdout}`
+    );
+    const invoked = calls
+      .filter((call) => call.command !== "worker:state")
+      .map((call) => call.command);
+    const mutationIndex = invoked.indexOf(mutation);
+    assert.notEqual(mutationIndex, -1, mutation);
+    assert.equal(
+      invoked[mutationIndex + 1],
+      "zero-dte:reconcile",
+      mutation
+    );
+    for (const laterMutation of brokerMutations.slice(mutationPosition + 1)) {
+      assert.equal(invoked.includes(laterMutation), false, laterMutation);
+    }
+    assert.equal(states.at(-2)?.eventType, "workstream_failed", mutation);
+    assert.equal(states.at(-2)?.payload.workstream, mutation, mutation);
+    assert.equal(states.at(-1)?.eventType, "cycle_failed", mutation);
+  }
 });
 
 test("an unresolved reconciliation prevents later broker mutations but still reaches terminal recovery", () => {
@@ -501,6 +615,20 @@ test("an unresolved reconciliation prevents later broker mutations but still rea
       workstream
     );
   }
+  const skippedEntry = states.find(
+    (state) =>
+      state.eventType === "workstream_completed" &&
+      state.payload.workstream === "paper:execute:reviewed"
+  );
+  const retryReconciliation = skippedEntry?.payload
+    .postMutationReconciliation as Record<string, unknown> | undefined;
+  assert.equal(retryReconciliation?.classification, "blocked");
+  assert.equal(retryReconciliation?.code, "WORKSTREAM_BLOCKED");
+  assert.equal(
+    retryReconciliation?.reasonCode,
+    "POSTGRES_RECONCILIATION_UNRESOLVED"
+  );
+  assert.equal(typeof retryReconciliation?.durationMs, "number");
   assert.equal(
     states.some(
       (state) =>
@@ -649,7 +777,7 @@ test("expected closed-market readiness conditions defer without stopping the wor
     assert.equal(result.status, 0, result.stderr || result.stdout);
     assert.deepEqual(
       calls.filter((call) => call.command !== "worker:state").map((call) => call.command),
-      workstreams
+      executedCommands
     );
     const researchCompletion = states.find((state) =>
       state.eventType === "workstream_completed" && state.payload.workstream === "research:daily"
@@ -682,7 +810,7 @@ test("legitimate PostgreSQL empty-work outcomes are no-action completions across
   assert.equal(result.status, 0, result.stderr || result.stdout);
   assert.deepEqual(
     calls.filter((call) => call.command !== "worker:state").map((call) => call.command),
-    workstreams
+    executedCommands
   );
   const completions = states.filter((state) => state.eventType === "workstream_completed");
   assert.equal(completions.length, workstreams.length);
@@ -704,18 +832,7 @@ test("empty terminal recovery is a successful no-action outcome", () => {
     successOutputs: {
       "system:recover": JSON.stringify({
         status: "completed",
-        recovery: {
-          researchRuns: 0,
-          reservations: 0,
-          reviews: 0,
-          confirmations: 0,
-          intents: 0,
-          staleReadyIntents: 0,
-          staleReadyCancelled: 0,
-          staleReadyPreserved: 0,
-          staleReadyReservationsReleased: 0,
-          staleReadyAllocationsAdjusted: 0
-        }
+        recovery: emptyRecoveryCounters
       }, null, 2)
     }
   });
@@ -731,6 +848,80 @@ test("empty terminal recovery is a successful no-action outcome", () => {
     recovery?.payload.reasonCode,
     "NO_RECOVERABLE_POSTGRES_STATE"
   );
+});
+
+test("malformed empty recovery envelopes fail closed instead of becoming no-action", () => {
+  const malformed = [
+    {
+      name: "missing terminal status",
+      value: { recovery: emptyRecoveryCounters }
+    },
+    {
+      name: "unrecognized terminal status",
+      value: { status: "success", recovery: emptyRecoveryCounters }
+    },
+    {
+      name: "null counter",
+      value: {
+        status: "completed",
+        recovery: { ...emptyRecoveryCounters, intents: null }
+      }
+    },
+    {
+      name: "coerced string counter",
+      value: {
+        status: "completed",
+        recovery: { ...emptyRecoveryCounters, reviews: "0" }
+      }
+    },
+    {
+      name: "missing counter",
+      value: {
+        status: "completed",
+        recovery: Object.fromEntries(
+          Object.entries(emptyRecoveryCounters)
+            .filter(([field]) => field !== "confirmations")
+        )
+      }
+    },
+    {
+      name: "future extra counter",
+      value: {
+        status: "completed",
+        recovery: { ...emptyRecoveryCounters, futureRecoveryCount: 0 }
+      }
+    },
+    {
+      name: "negative counter",
+      value: {
+        status: "completed",
+        recovery: { ...emptyRecoveryCounters, reservations: -1 }
+      }
+    },
+    {
+      name: "fractional counter",
+      value: {
+        status: "completed",
+        recovery: { ...emptyRecoveryCounters, staleReadyIntents: 0.5 }
+      }
+    }
+  ] as const;
+
+  for (const testCase of malformed) {
+    const { result, states } = runWorker({
+      successOutputs: {
+        "system:recover": JSON.stringify(testCase.value)
+      }
+    });
+    assert.notEqual(result.status, 0, testCase.name);
+    assert.equal(states.at(-2)?.eventType, "workstream_failed", testCase.name);
+    assert.equal(
+      states.at(-2)?.payload.code,
+      "WORKSTREAM_COMMAND_FAILED",
+      testCase.name
+    );
+    assert.equal(states.at(-1)?.eventType, "cycle_failed", testCase.name);
+  }
 });
 
 test("learning authority, reconciliation, and database blockers remain blocked", () => {
@@ -750,7 +941,7 @@ test("learning authority, reconciliation, and database blockers remain blocked",
     assert.equal(result.status, 0, result.stderr || result.stdout);
     assert.deepEqual(
       calls.filter((call) => call.command !== "worker:state").map((call) => call.command),
-      workstreams
+      executedCommands
     );
     const learningCompletion = states.find((state) =>
       state.eventType === "workstream_completed" &&

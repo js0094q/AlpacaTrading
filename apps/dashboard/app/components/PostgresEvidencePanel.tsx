@@ -33,6 +33,13 @@ const lifecycleLabel = (classification: unknown) => {
   return value;
 };
 
+const lifecycleSections = [
+  ["current", "Current autonomous cycle"],
+  ["interrupted", "Interrupted autonomous cycle"],
+  ["last_completed", "Last completed autonomous cycle"],
+  ["last_failed", "Last failed autonomous cycle"]
+] as const;
+
 const PremiumEvidence = ({ value }: { value: unknown }) => {
   const evidence = recordValue(value);
   const fields = [
@@ -147,7 +154,15 @@ export const PostgresEvidencePanel = ({
               <span>
                 reservation {displayValue(row.reservation_id)} ({displayValue(row.reservation_status)})
               </span>
+              <span>release {displayValue(row.release_reason)}</span>
               <span>reconciled {displayValue(row.last_reconciled_at)}</span>
+              <span>operation {displayValue(row.operation)}</span>
+              <span>classification {displayValue(row.strategy_classification)}</span>
+              <span>lifecycle {displayValue(row.lifecycle_state)}</span>
+              <span>cycle {displayValue(row.autonomous_cycle_id)}</span>
+              <span>workstream {displayValue(row.workstream_execution_id)}</span>
+              <span>exit trigger {displayValue(row.exit_trigger)}</span>
+              <span>lifecycle reason {displayValue(row.lifecycle_reason_code)}</span>
             </div>
             <PremiumEvidence value={row.premium_decision_evidence} />
           </div>
@@ -182,9 +197,19 @@ export const PostgresEvidencePanel = ({
               reservation {displayValue(row.reservation_id)} ({displayValue(row.reservation_status)})
             </span>
             <span>
+              release {displayValue(row.reservation_release_reason ?? row.release_reason)}
+            </span>
+            <span>
               position {displayValue(row.position_id)} ({displayValue(row.position_status)})
             </span>
             <span>reconciled {displayValue(row.last_reconciled_at)}</span>
+            <span>operation {displayValue(row.operation)}</span>
+            <span>classification {displayValue(row.strategy_classification)}</span>
+            <span>lifecycle {displayValue(row.lifecycle_state)}</span>
+            <span>cycle {displayValue(row.autonomous_cycle_id)}</span>
+            <span>workstream {displayValue(row.workstream_execution_id)}</span>
+            <span>exit trigger {displayValue(row.exit_trigger)}</span>
+            <span>lifecycle reason {displayValue(row.lifecycle_reason_code)}</span>
           </div>
         );
       })}
@@ -193,29 +218,80 @@ export const PostgresEvidencePanel = ({
       ) : null}
     </div>
 
-    <h3>Latest completed autonomous cycle</h3>
-    <div className="list">
-      {lifecycle.map((value, index) => {
-        const row = recordValue(value);
-        return (
-          <div
-            className="row"
-            key={`${displayValue(row.cycle_id)}-${displayValue(row.position)}-${index}`}
-          >
-            <strong>
-              {lifecycleLabel(row.classification)} · {displayValue(row.workstream ?? row.event_type)}
-            </strong>
-            <span>cycle {displayValue(row.cycle_id)}</span>
-            <span>position {displayValue(row.position)}</span>
-            <span>reason {displayValue(row.reason_code)}</span>
-            <span>duration {displayValue(row.duration_ms)} ms</span>
-            <span>at {displayValue(row.occurred_at)}</span>
+    {lifecycleSections.map(([scope, heading]) => {
+      const rows = lifecycle.filter(
+        (value) => recordValue(value).cycle_scope === scope
+      );
+      if (!rows.length) return null;
+      return (
+        <React.Fragment key={scope}>
+          <h3>{heading}</h3>
+          <div className="list">
+            {rows.map((value, index) => {
+              const row = recordValue(value);
+              return (
+                <div
+                  className="row"
+                  key={`${displayValue(row.row_kind)}-${displayValue(row.cycle_id)}-${displayValue(row.intent_id)}-${displayValue(row.position)}-${index}`}
+                >
+                  <strong>
+                    {lifecycleLabel(row.classification)} ·{" "}
+                    {displayValue(row.workstream ?? row.event_type)}
+                  </strong>
+                  <span>cycle {displayValue(row.cycle_id)}</span>
+                  <span>position {displayValue(row.position)}</span>
+                  <span>reason {displayValue(row.reason_code)}</span>
+                  <span>duration {displayValue(row.duration_ms)} ms</span>
+                  <span>at {displayValue(row.occurred_at)}</span>
+                  <span>candidate {displayValue(row.candidate_id)}</span>
+                  <span>review {displayValue(row.review_id)}</span>
+                  <span>confirmation {displayValue(row.confirmation_id)}</span>
+                  <span>intent {displayValue(row.intent_id)}</span>
+                  <span>client {displayValue(row.client_order_id)}</span>
+                  <span>
+                    broker {displayValue(row.broker_order_id)} ({displayValue(row.broker_status)})
+                  </span>
+                  <span>operation {displayValue(row.operation)}</span>
+                  <span>classification {displayValue(row.strategy_classification)}</span>
+                  <span>lifecycle {displayValue(row.lifecycle_state)}</span>
+                  <span>
+                    reservation {displayValue(row.reservation_state)}
+                    {" "}({displayValue(row.reservation_release_reason)})
+                  </span>
+                  <span>
+                    position {displayValue(row.position_id)}
+                    {" "}({displayValue(row.position_side)}, open {displayValue(row.open_quantity)})
+                  </span>
+                  <span>reconciled {displayValue(row.latest_reconciled_at)}</span>
+                  <span>autonomous cycle {displayValue(row.autonomous_cycle_id)}</span>
+                  <span>workstream ID {displayValue(row.workstream_execution_id)}</span>
+                  <span>exit trigger {displayValue(row.exit_trigger)}</span>
+                  <span>lifecycle reason {displayValue(row.lifecycle_reason_code)}</span>
+                  {row.decision_evidence ? (
+                    <PremiumEvidence value={row.decision_evidence} />
+                  ) : null}
+                </div>
+              );
+            })}
           </div>
-        );
-      })}
-      {!lifecycle.length ? (
-        <p className="subtle">Unavailable: no completed autonomous cycle evidence is present.</p>
-      ) : null}
-    </div>
+        </React.Fragment>
+      );
+    })}
+    {lifecycle.some(
+      (value) =>
+        !lifecycleSections.some(
+          ([scope]) => recordValue(value).cycle_scope === scope
+        )
+    ) ? (
+      <>
+        <h3>Autonomous lifecycle evidence (scope unavailable)</h3>
+        <p className="subtle">
+          Lifecycle rows are present, but current/interrupted/terminal scope is unavailable.
+        </p>
+      </>
+    ) : null}
+    {!lifecycle.length ? (
+      <p className="subtle">Unavailable: no autonomous lifecycle evidence is present.</p>
+    ) : null}
   </div>
 );

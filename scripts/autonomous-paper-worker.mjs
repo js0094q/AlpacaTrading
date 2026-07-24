@@ -35,7 +35,18 @@ const BROKER_MUTATION_WORKSTREAMS = new Set([
   "hedge:exit:execute",
   "paper:order:cancel"
 ]);
+const INTERNAL_RECONCILIATION_AFTER = new Set([
+  "paper:execute:reviewed",
+  "paper:exit:execute"
+]);
 const RECONCILIATION_WORKSTREAM = "zero-dte:reconcile";
+const RECONCILIATION_ARGS = ["--format=json"];
+const NON_FATAL_WORKSTREAM_CODES = new Set([
+  "WORKSTREAM_BLOCKED",
+  "WORKSTREAM_SKIPPED",
+  "WORKSTREAM_DEFERRED",
+  "WORKSTREAM_NO_ACTION"
+]);
 const RECOVERY_COUNT_FIELDS = [
   "researchRuns",
   "reservations",
@@ -61,16 +72,16 @@ const WORKSTREAMS = [
   ["research:daily", ["--riskProfile=aggressive", "--optionsEnabled=true", `--maxCandidates=${PAPER_EXPLORATION_MAX_CANDIDATES}`, "--assetClass=all", "--format=json"]],
   ["paper:options:discover", ["--underlying=SPY", "--dte=0", "--format=json"]],
   ["paper:review", ["--riskProfile=aggressive", "--optionsEnabled=true", `--maxCandidates=${PAPER_EXPLORATION_MAX_CANDIDATES}`, "--format=json"]],
+  ["paper:portfolio:review", ["--format=json"]],
+  ["paper:ops:review", ["--format=json"]],
   ["hedge:review", ["--format=json"]],
   ["paper:execute:reviewed", ["--confirmPaper", "--sections=equityBuys,equityAdds,optionBuys", "--format=json"]],
-  ["zero-dte:reconcile", ["--format=json"]],
   ["zero-dte:engine", ["--confirmPaper", "--format=json"]],
   ["zero-dte:reconcile", ["--format=json"]],
   ["paper:exit:review", ["--format=json"]],
   ["zero-dte:exit:review", ["--format=json"]],
   ["hedge:exit:review", ["--format=json"]],
   ["paper:exit:execute", ["--confirmPaper", "--format=json"]],
-  ["zero-dte:reconcile", ["--format=json"]],
   ["hedge:exit:execute", ["--confirmPaper", "--format=json"]],
   ["zero-dte:reconcile", ["--format=json"]],
   ["paper:order:cancel", ["--autonomous", "--confirmPaper", "--format=json"]],
@@ -81,11 +92,7 @@ const WORKSTREAMS = [
 
 const STATE_COMMAND = "worker:state";
 const REQUIRED_COMMANDS = [
-  ...new Set([
-    ...WORKSTREAMS.map(([command]) => command),
-    "paper:portfolio:review",
-    "paper:ops:review"
-  ]),
+  ...new Set(WORKSTREAMS.map(([command]) => command)),
   STATE_COMMAND
 ];
 const EXPECTED_CONTRACT_ENTRY = {
@@ -513,16 +520,38 @@ const latestStructuredOutput = (output) => {
   return latest;
 };
 
-const emptyRecoveryResult = (output) => {
-  const recovery = latestStructuredOutput(output)?.recovery;
-  if (!recovery || typeof recovery !== "object" || Array.isArray(recovery)) return false;
-  if (!Object.keys(recovery).every((field) => RECOVERY_COUNT_FIELDS.includes(field))) {
-    return false;
+const recoveryEnvelope = (output) => {
+  const envelope = latestStructuredOutput(output);
+  if (
+    !envelope ||
+    !["completed", "no_op"].includes(envelope.status) ||
+    !envelope.recovery ||
+    typeof envelope.recovery !== "object" ||
+    Array.isArray(envelope.recovery)
+  ) {
+    return null;
   }
-  return RECOVERY_COUNT_FIELDS.every((field) => {
-    const value = Number(recovery[field]);
-    return Number.isFinite(value) && value === 0;
-  });
+  const recoveryFields = Object.keys(envelope.recovery);
+  if (
+    recoveryFields.length !== RECOVERY_COUNT_FIELDS.length ||
+    !recoveryFields.every((field) => RECOVERY_COUNT_FIELDS.includes(field))
+  ) {
+    return null;
+  }
+  const counters = RECOVERY_COUNT_FIELDS.map((field) => envelope.recovery[field]);
+  if (
+    !counters.every(
+      (value) =>
+        typeof value === "number" &&
+        Number.isSafeInteger(value) &&
+        value >= 0
+    )
+  ) {
+    return null;
+  }
+  const empty = counters.every((value) => value === 0);
+  if (envelope.status === "no_op" && !empty) return null;
+  return { empty };
 };
 
 const classify = ({ exitCode, output, spawnError, timedOut }, script) => {
@@ -533,12 +562,18 @@ const classify = ({ exitCode, output, spawnError, timedOut }, script) => {
       return { classification: "failed", code: "WORKSTREAM_COMMAND_FAILED" };
     }
     const reasonCode = structuredReasonCode(output);
-    if (script === "system:recover" && emptyRecoveryResult(output)) {
-      return {
-        classification: "no_action",
-        code: "WORKSTREAM_NO_ACTION",
-        reasonCode: "NO_RECOVERABLE_POSTGRES_STATE"
-      };
+    if (script === "system:recover") {
+      const recovery = recoveryEnvelope(output);
+      if (!recovery) {
+        return { classification: "failed", code: "WORKSTREAM_COMMAND_FAILED" };
+      }
+      if (recovery.empty) {
+        return {
+          classification: "no_action",
+          code: "WORKSTREAM_NO_ACTION",
+          reasonCode: "NO_RECOVERABLE_POSTGRES_STATE"
+        };
+      }
     }
     if (
       /"status"\s*:\s*"no_op"/i.test(output) &&
@@ -589,6 +624,12 @@ const classify = ({ exitCode, output, spawnError, timedOut }, script) => {
   }
   return { classification: "failed", code: "WORKSTREAM_COMMAND_FAILED" };
 };
+
+const workstreamResultIsFatal = (result) =>
+  Boolean(result.code) && !NON_FATAL_WORKSTREAM_CODES.has(result.code);
+
+const reconciliationResolved = (result) =>
+  ["success", "no_action"].includes(result.classification);
 
 const runWorkstream = async (
   script,
@@ -715,8 +756,10 @@ const main = async () => {
         emitEvent({ event: "worker_stopped", cycle, cycleId, reason: "signal" });
         return;
       }
-      const result =
-        unresolvedPriorMutation && BROKER_MUTATION_WORKSTREAMS.has(script)
+      const mutationSkippedForUnresolvedReconciliation =
+        unresolvedPriorMutation && BROKER_MUTATION_WORKSTREAMS.has(script);
+      let result =
+        mutationSkippedForUnresolvedReconciliation
           ? {
               classification: "blocked",
               code: "WORKSTREAM_BLOCKED",
@@ -734,10 +777,73 @@ const main = async () => {
               resumedCycleId
             );
 
-      if (script === RECONCILIATION_WORKSTREAM) {
-        unresolvedPriorMutation = !["success", "no_action"].includes(
-          result.classification
+      let internalReconciliationResult = null;
+      const nextPublicWorkstream = WORKSTREAMS[index + 1]?.[0] ?? null;
+      const reconcileBeforeLeavingMutation =
+        BROKER_MUTATION_WORKSTREAMS.has(script) &&
+        (
+          INTERNAL_RECONCILIATION_AFTER.has(script) ||
+          (
+            nextPublicWorkstream === RECONCILIATION_WORKSTREAM &&
+            workstreamResultIsFatal(result)
+          )
         );
+      if (reconcileBeforeLeavingMutation) {
+        const mutationResult = result;
+        internalReconciliationResult = await runWorkstream(
+          RECONCILIATION_WORKSTREAM,
+          RECONCILIATION_ARGS,
+          workstreamTimeoutMs,
+          cycle,
+          cycleId,
+          index + 1,
+          resumedCycleId
+        );
+        const reconciliationEvidence = {
+          classification: internalReconciliationResult.classification,
+          code: internalReconciliationResult.code,
+          reasonCode: internalReconciliationResult.reasonCode ?? null,
+          durationMs: internalReconciliationResult.durationMs
+        };
+        if (mutationSkippedForUnresolvedReconciliation) {
+          result = {
+            ...mutationResult,
+            postMutationReconciliation: reconciliationEvidence
+          };
+        } else if (workstreamResultIsFatal(internalReconciliationResult)) {
+          result = {
+            ...internalReconciliationResult,
+            mutationClassification: mutationResult.classification,
+            mutationCode: mutationResult.code,
+            postMutationReconciliation: reconciliationEvidence
+          };
+        } else if (
+          !reconciliationResolved(internalReconciliationResult) &&
+          !workstreamResultIsFatal(mutationResult)
+        ) {
+          result = {
+            ...mutationResult,
+            classification: "blocked",
+            code: "WORKSTREAM_BLOCKED",
+            reasonCode:
+              internalReconciliationResult.reasonCode ??
+              internalReconciliationResult.code,
+            postMutationReconciliation: reconciliationEvidence
+          };
+        } else {
+          result = {
+            ...mutationResult,
+            postMutationReconciliation: reconciliationEvidence
+          };
+        }
+      }
+
+      if (internalReconciliationResult) {
+        unresolvedPriorMutation = !reconciliationResolved(
+          internalReconciliationResult
+        );
+      } else if (script === RECONCILIATION_WORKSTREAM) {
+        unresolvedPriorMutation = !reconciliationResolved(result);
       } else if (
         BROKER_MUTATION_WORKSTREAMS.has(script) &&
         result.classification === "blocked" &&
@@ -758,13 +864,7 @@ const main = async () => {
       }
 
       if (
-        result.code &&
-        ![
-          "WORKSTREAM_BLOCKED",
-          "WORKSTREAM_SKIPPED",
-          "WORKSTREAM_DEFERRED",
-          "WORKSTREAM_NO_ACTION"
-        ].includes(result.code)
+        workstreamResultIsFatal(result)
       ) {
         const failurePayload = {
           ...basePayload,

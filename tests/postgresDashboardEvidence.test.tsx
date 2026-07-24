@@ -22,7 +22,9 @@ test("PostgreSQL dashboard projection returns bounded lineage, lifecycle, and pr
             completed_at: "not-a-timestamp",
             error_message:
               "Broker Authorization: Bearer dashboard-secret-token-value",
-            raw_headers: { authorization: "Bearer must-not-leak" }
+            raw_headers: { authorization: "Bearer must-not-leak" },
+            candidate_id: "cross-dataset-candidate-leak",
+            future_payload: { label: "future-unknown-visible" }
           }],
           rowCount: 1
         };
@@ -63,13 +65,22 @@ test("PostgreSQL dashboard projection returns bounded lineage, lifecycle, and pr
               password: "must-not-render",
               rawHeaders: { authorization: "Bearer must-not-render" }
             },
-            api_key: "must-not-render"
+            api_key: "must-not-render",
+            request_id: "cross-dataset-request-leak",
+            future_payload: { label: "future-unknown-visible" }
           }],
           rowCount: 1
         };
       }
       if (statement.includes("FROM execution_reviews review")) {
-        return { rows: [{ review_id: "review-1", intent_id: "intent-1" }], rowCount: 1 };
+        return {
+          rows: [{
+            review_id: "review-1",
+            intent_id: "intent-1",
+            future_payload: { label: "future-unknown-visible" }
+          }],
+          rowCount: 1
+        };
       }
       if (statement.trimStart().startsWith("SELECT intent.id AS intent_id")) {
         return {
@@ -84,16 +95,31 @@ test("PostgreSQL dashboard projection returns bounded lineage, lifecycle, and pr
             operation: "buy_to_open",
             autonomous_cycle_id: "cycle-1",
             workstream_execution_id: "workstream-cancel",
-            last_reconciled_at: "invalid"
+            last_reconciled_at: "invalid",
+            future_payload: { label: "future-unknown-visible" }
           }],
           rowCount: 1
         };
       }
       if (statement.includes("FROM orders order_row")) {
-        return { rows: [{ id: "order-1", broker_order_id: "broker-1" }], rowCount: 1 };
+        return {
+          rows: [{
+            id: "order-1",
+            broker_order_id: "broker-1",
+            future_payload: { label: "future-unknown-visible" }
+          }],
+          rowCount: 1
+        };
       }
       if (statement.includes("FROM option_contracts contract")) {
-        return { rows: [{ option_symbol: "SPY260724C00600000", implied_volatility: 0.2 }], rowCount: 1 };
+        return {
+          rows: [{
+            option_symbol: "SPY260724C00600000",
+            implied_volatility: 0.2,
+            future_payload: { label: "future-unknown-visible" }
+          }],
+          rowCount: 1
+        };
       }
       if (statement.includes("WITH latest_terminal")) {
         return {
@@ -127,7 +153,8 @@ test("PostgreSQL dashboard projection returns bounded lineage, lifecycle, and pr
               opraFeed: "opra",
               delta: 0.5,
               rawHeaders: { authorization: "Bearer must-not-render" }
-            }
+            },
+            future_payload: { label: "future-unknown-visible" }
           }],
           rowCount: 1
         };
@@ -176,6 +203,10 @@ test("PostgreSQL dashboard projection returns bounded lineage, lifecycle, and pr
     JSON.stringify(result),
     /"(?:rawHeaders|raw_headers|authorization|api_key|password)"\s*:/i
   );
+  assert.doesNotMatch(
+    JSON.stringify(result),
+    /future-unknown-visible|cross-dataset-candidate-leak|cross-dataset-request-leak/
+  );
 
   const candidateSql = sql.find((statement) => statement.includes("FROM candidates candidate")) ?? "";
   assert.match(candidateSql, /premium_decision_evidence/);
@@ -198,6 +229,14 @@ test("PostgreSQL dashboard projection returns bounded lineage, lifecycle, and pr
   assert.match(lifecycleSql, /workstream_completed/);
   assert.match(lifecycleSql, /reasonCode/);
   assert.match(lifecycleSql, /current_cycle/);
+  assert.match(lifecycleSql, /interrupted_cycle/);
+  assert.match(lifecycleSql, /worker_stopped/);
+  assert.match(
+    lifecycleSql,
+    /event\.event_type = 'worker_stopped'\s+AND scope\.cycle_scope = 'interrupted'/
+  );
+  assert.match(lifecycleSql, /last_completed/);
+  assert.match(lifecycleSql, /last_failed/);
   assert.match(lifecycleSql, /order_intents/);
   assert.match(lifecycleSql, /exitTrigger/);
 });
@@ -231,6 +270,13 @@ test("dashboard evidence component renders lineage, terminal intent, classificat
         position_status: "open",
         reservation_id: "reservation-1",
         reservation_status: "released",
+        release_reason: "filled",
+        operation: "buy_to_open",
+        strategy_classification: "standard_long_call",
+        lifecycle_state: "position_reconciled",
+        autonomous_cycle_id: "cycle-entry",
+        workstream_execution_id: "workstream-entry",
+        lifecycle_reason_code: "BROKER_FILL_RECONCILED",
         last_reconciled_at: "2026-07-24T15:10:00.000Z",
         premium_decision_evidence: {
           sipPrice: 600,
@@ -262,15 +308,58 @@ test("dashboard evidence component renders lineage, terminal intent, classificat
         intent_status: "cancelled",
         intent_terminal_reason: "STALE_READY_INTENT_RECOVERY",
         reservation_status: "expired",
-        broker_order_id: null
+        broker_order_id: "close-broker-1",
+        client_order_id: "close-client-1",
+        candidate_id: "candidate-exit",
+        review_id: "review-exit",
+        confirmation_id: "confirmation-exit",
+        confirmation_status: "consumed",
+        operation: "sell_to_close",
+        strategy_classification: "zero_dte_long_put",
+        lifecycle_state: "closed",
+        reservation_release_reason: "closed_fill",
+        position_id: "position-exit",
+        position_status: "closed",
+        last_reconciled_at: "2026-07-24T15:20:00.000Z",
+        autonomous_cycle_id: "cycle-close",
+        workstream_execution_id: "workstream-close",
+        exit_trigger: "ODTE_FORCE_EXIT_BEFORE_CLOSE",
+        lifecycle_reason_code: "EXIT_FILL_RECONCILED"
       }]}
       lifecycle={[{
+        row_kind: "trade_lifecycle",
+        cycle_scope: "current",
         cycle_id: "cycle-1",
         position: 11,
         workstream: "paper:exit:review",
         classification: "no_action",
         reason_code: "NO_POSTGRES_EXIT_TRIGGER",
-        duration_ms: 4264
+        duration_ms: 4264,
+        candidate_id: "candidate-lifecycle",
+        review_id: "review-lifecycle",
+        confirmation_id: "confirmation-lifecycle",
+        intent_id: "intent-lifecycle",
+        client_order_id: "client-lifecycle",
+        broker_order_id: "broker-lifecycle",
+        broker_status: "filled",
+        operation: "sell_to_close",
+        strategy_classification: "leaps_long_put",
+        lifecycle_state: "closed",
+        reservation_state: "released",
+        reservation_release_reason: "closed_fill",
+        position_id: "position-lifecycle",
+        latest_reconciled_at: "2026-07-24T15:25:00.000Z",
+        autonomous_cycle_id: "cycle-lifecycle",
+        workstream_execution_id: "workstream-lifecycle",
+        exit_trigger: "LEAPS_DTE_EXIT_WINDOW",
+        lifecycle_reason_code: "EXIT_FILL_RECONCILED",
+        decision_evidence: {
+          opraFeed: "opra",
+          delta: -0.4,
+          historicalBarCount: 252,
+          positionSizingInput: { quantity: 1 },
+          limitPriceConstruction: { limitPrice: 5 }
+        }
       }]}
     />
   );
@@ -292,9 +381,88 @@ test("dashboard evidence component renders lineage, terminal intent, classificat
     "Delta",
     "Historical bars",
     "Position sizing",
-    "Limit construction"
+    "Limit construction",
+    "buy_to_open",
+    "standard_long_call",
+    "position_reconciled",
+    "cycle-entry",
+    "workstream-entry",
+    "close-client-1",
+    "close-broker-1",
+    "sell_to_close",
+    "zero_dte_long_put",
+    "closed_fill",
+    "ODTE_FORCE_EXIT_BEFORE_CLOSE",
+    "Current autonomous cycle",
+    "candidate-lifecycle",
+    "review-lifecycle",
+    "confirmation-lifecycle",
+    "intent-lifecycle",
+    "client-lifecycle",
+    "broker-lifecycle",
+    "leaps_long_put",
+    "position-lifecycle",
+    "cycle-lifecycle",
+    "workstream-lifecycle",
+    "LEAPS_DTE_EXIT_WINDOW",
+    "EXIT_FILL_RECONCILED"
   ]) {
     assert.match(html, new RegExp(expected));
   }
   assert.doesNotMatch(html, /must-not-render/);
+});
+
+test("dashboard labels running, interrupted, and terminal cycle evidence without conflation", () => {
+  const html = renderToStaticMarkup(
+    <PostgresEvidencePanel
+      plans={[]}
+      intents={[]}
+      lifecycle={[
+        {
+          row_kind: "workstream",
+          cycle_scope: "current",
+          cycle_id: "cycle-current",
+          event_type: "workstream_started",
+          workstream: "paper:review",
+          classification: "running"
+        },
+        {
+          row_kind: "workstream",
+          cycle_scope: "interrupted",
+          cycle_id: "cycle-interrupted",
+          event_type: "worker_stopped",
+          workstream: "paper:execute:reviewed",
+          classification: "interrupted"
+        },
+        {
+          row_kind: "workstream",
+          cycle_scope: "last_completed",
+          cycle_id: "cycle-completed",
+          event_type: "cycle_completed",
+          classification: "success"
+        },
+        {
+          row_kind: "workstream",
+          cycle_scope: "last_failed",
+          cycle_id: "cycle-failed",
+          event_type: "cycle_failed",
+          classification: "blocked"
+        }
+      ]}
+    />
+  );
+
+  for (const expected of [
+    "Current autonomous cycle",
+    "Interrupted autonomous cycle",
+    "Last completed autonomous cycle",
+    "Last failed autonomous cycle",
+    "cycle-current",
+    "cycle-interrupted",
+    "cycle-completed",
+    "cycle-failed"
+  ]) {
+    assert.match(html, new RegExp(expected));
+  }
+  assert.doesNotMatch(html, /Latest completed autonomous cycle/);
 });
