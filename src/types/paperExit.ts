@@ -15,7 +15,8 @@ export type PaperExitAssetClass = "us_equity" | "us_option";
 export interface PaperExitOrderPayload {
   symbol: string;
   assetClass: PaperExitAssetClass;
-  side: "sell";
+  side: "buy" | "sell";
+  operation?: "sell_to_close" | "buy_to_cover";
   positionIntent?: "sell_to_close";
   qty: string;
   orderType: "limit" | "market";
@@ -79,7 +80,7 @@ export interface PaperExitReviewResult {
 
 export interface PaperExitSubmittedOrder {
   symbol: string;
-  side: "sell";
+  side: "buy" | "sell";
   qty: string;
   assetClass: PaperExitAssetClass;
   positionIntent?: "sell_to_close";

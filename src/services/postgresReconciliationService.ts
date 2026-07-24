@@ -183,6 +183,23 @@ const syncBrokerAccountAndPositions = async (input: {
   const closed = await input.query.query(
     `UPDATE positions
      SET status = 'closed', quantity = 0, available_quantity = 0,
+         closing_order_id = COALESCE(
+           positions.closing_order_id,
+           (
+             SELECT close_order.id
+             FROM orders close_order
+             JOIN order_intents close_intent
+               ON close_intent.id = close_order.order_intent_id
+             WHERE close_intent.parent_position_id = positions.id
+               AND close_order.status = 'filled'
+             ORDER BY COALESCE(
+               close_order.filled_at,
+               close_order.updated_at,
+               close_order.created_at
+             ) DESC, close_order.id DESC
+             LIMIT 1
+           )
+         ),
          closed_at = $2, last_reconciled_at = $2,
          version = version + 1, updated_at = $2
      WHERE account_id = $1 AND status IN ('open', 'closing')
@@ -193,6 +210,29 @@ const syncBrokerAccountAndPositions = async (input: {
   if (closed.rowCount === null) {
     throw new Error("POSTGRES_RECONCILIATION_POSITION_CLOSE_FAILED");
   }
+  const closedLifecycle = await input.query.query(
+    `UPDATE order_intents close_intent
+     SET lifecycle_state = 'closed', status = 'reconciled',
+         terminal_at = COALESCE(close_intent.terminal_at, $2),
+         updated_at = $2, version = close_intent.version + 1
+     FROM positions parent_position
+     WHERE close_intent.parent_position_id = parent_position.id
+       AND parent_position.account_id = $1
+       AND parent_position.status = 'closed'
+       AND close_intent.lifecycle_state IN (
+         'exit_broker_order_discovered','exit_partially_filled'
+       )
+       AND EXISTS (
+         SELECT 1 FROM orders close_order
+         WHERE close_order.order_intent_id = close_intent.id
+           AND close_order.status = 'filled'
+       )
+       AND ${fenceSql(3)}`,
+    [accountId, snapshot.capturedAt, ...fenceValues(input.fence)]
+  );
+  if (closedLifecycle.rowCount === null) {
+    throw new Error("POSTGRES_RECONCILIATION_EXIT_LIFECYCLE_CLOSE_FAILED");
+  }
   let positionsUpserted = 0;
   for (const position of snapshot.positions) {
     const positionId = `position_${canonicalJsonHash({
@@ -200,7 +240,9 @@ const syncBrokerAccountAndPositions = async (input: {
       brokerPositionKey: position.brokerPositionKey
     })}`;
     const lineageResult = await input.query.query(
-      `SELECT intent.candidate_id, broker_order.id AS opening_order_id,
+      `SELECT intent.candidate_id, intent.id AS opening_intent_id,
+              intent.strategy_classification, intent.contract_id,
+              broker_order.id AS opening_order_id,
               COALESCE(
                 broker_order.filled_at,
                 broker_order.updated_at,

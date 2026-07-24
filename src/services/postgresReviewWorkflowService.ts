@@ -9,10 +9,16 @@ import {
   parseOptionSymbol
 } from "./optionSymbolService.js";
 import {
+  classifyOptionStrategy,
+  type StrategyClassification,
+  type TradeOperation
+} from "./autonomousTradeLifecycleService.js";
+import {
   paperExplorationProfile,
   paperExplorationThresholds,
   type PaperExplorationThresholds
 } from "./paperExplorationConfig.js";
+import { optionsQuoteConfig } from "./optionQuoteNormalizer.js";
 
 export type PostgresReviewQuery = {
   query: (sql: string, values?: readonly unknown[]) => Promise<{
@@ -53,6 +59,9 @@ type ReviewSourceRow = Record<string, unknown> & {
   signal_inputs?: unknown;
   market_evidence?: unknown;
   contract_option_symbol?: string | null;
+  contract_id?: string | null;
+  contract_type?: "call" | "put" | null;
+  contract_expiration_date?: Date | string | null;
   contract_tradable?: boolean | null;
   contract_status?: string | null;
   contract_source?: string | null;
@@ -180,10 +189,15 @@ const assertObservedOptionContract = (row: ReviewSourceRow) => {
     .toUpperCase();
   const parsed = parseOptionSymbol(optionSymbol);
   const observedAt = Date.parse(String(row.contract_observed_at ?? ""));
+  const expirationDate = String(row.contract_expiration_date ?? "").slice(0, 10);
+  const contractType = String(row.contract_type ?? "").trim().toLowerCase();
   if (
     !parsed.ok ||
+    !String(row.contract_id ?? "").trim() ||
     String(row.contract_option_symbol ?? "").trim().toUpperCase() !==
       optionSymbol ||
+    expirationDate !== parsed.expirationDate ||
+    contractType !== parsed.optionType ||
     row.contract_tradable !== true ||
     String(row.contract_status ?? "").trim().toLowerCase() !== "active" ||
     String(row.contract_source ?? "").trim().toLowerCase() !== "alpaca" ||
@@ -272,6 +286,9 @@ SELECT candidate.id AS candidate_id, candidate.symbol, candidate.asset_class,
        market.market_price::text, market.market_timestamp,
        market.market_request_id, market.market_evidence,
        contract.option_symbol AS contract_option_symbol,
+       contract.contract_id AS contract_id,
+       contract.type AS contract_type,
+       contract.expiration_date AS contract_expiration_date,
        contract.tradable AS contract_tradable,
        contract.status AS contract_status,
        contract.source AS contract_source,
@@ -388,7 +405,17 @@ const exitSourceSql = (command: string) => {
   SELECT * FROM accounts WHERE environment = 'paper'
   ORDER BY updated_at DESC, id LIMIT 1
 )
-SELECT position.id AS position_id, position.candidate_id, position.symbol,
+SELECT position.id AS position_id,
+       COALESCE(position.candidate_id, opening_intent.candidate_id) AS candidate_id,
+       position.opening_order_id,
+       opening_intent.id AS opening_intent_id,
+       COALESCE(opening_intent.review_id, opening_intent.execution_review_id)
+         AS opening_review_id,
+       opening_intent.strategy_classification AS opening_strategy_classification,
+       opening_intent.contract_id AS opening_contract_id,
+       opening_intent.authorization_snapshot_id
+         AS opening_authorization_snapshot_id,
+       position.symbol,
        COALESCE(position.option_symbol, position.symbol) AS order_symbol,
        position.asset_class, position.side, position.available_quantity::text,
        position.average_entry_price::text,
@@ -401,6 +428,9 @@ SELECT position.id AS position_id, position.candidate_id, position.symbol,
        leaps_trend.severe_trend_sma::text,
        leaps_trend.severe_trend_bar_count::text,
        contract.option_symbol AS contract_option_symbol,
+       contract.contract_id AS contract_id,
+       contract.type AS contract_type,
+       contract.expiration_date AS contract_expiration_date,
        contract.tradable AS contract_tradable,
        contract.status AS contract_status,
        contract.source AS contract_source,
@@ -408,6 +438,9 @@ SELECT position.id AS position_id, position.candidate_id, position.symbol,
 FROM positions position
 CROSS JOIN current_account account
 LEFT JOIN candidates candidate ON candidate.id = position.candidate_id
+LEFT JOIN orders opening_order ON opening_order.id = position.opening_order_id
+LEFT JOIN order_intents opening_intent
+  ON opening_intent.id = opening_order.order_intent_id
 LEFT JOIN option_contracts contract
   ON contract.option_symbol = position.option_symbol
 JOIN LATERAL (
@@ -485,8 +518,16 @@ LEFT JOIN LATERAL (
     LIMIT ${severeTrendBars}
   ) trend
 ) leaps_trend ON position.asset_class = 'option'
-WHERE position.account_id = account.id AND position.status IN ('open','closing')
+WHERE position.account_id = account.id AND position.status = 'open'
   AND position.available_quantity > 0
+  AND NOT EXISTS (
+    SELECT 1
+    FROM order_intents close_intent
+    WHERE close_intent.parent_position_id = position.id
+      AND close_intent.lifecycle_state NOT IN (
+        'closed','cancelled','rejected','expired','failed_terminal'
+      )
+  )
   ${command === "hedge:exit:review" ? "AND COALESCE(candidate.strategy_family, allocation.strategy_key) ILIKE '%hedge%'" : ""}
   ${command === "zero-dte:exit:review" ? "AND position.asset_class = 'option' AND substring(position.option_symbol from '[0-9]{6}') = to_char(now() AT TIME ZONE 'America/New_York', 'YYMMDD')" : ""}
 ORDER BY position.opened_at, position.id`;
@@ -510,10 +551,16 @@ const runExitReview = async (input: {
     }
     const timestamp = new Date(String(row.market_timestamp)).toISOString();
     const age = input.now.getTime() - Date.parse(timestamp);
+    const effectiveMaxMarketAgeSeconds = row.asset_class === "option"
+      ? Math.min(
+          input.maxMarketAgeSeconds,
+          optionsQuoteConfig().maxAgeMs / 1_000
+        )
+      : input.maxMarketAgeSeconds;
     if (
       !Number.isFinite(age) ||
       age < -60_000 ||
-      age > input.maxMarketAgeSeconds * 1_000
+      age > effectiveMaxMarketAgeSeconds * 1_000
     ) {
       throw new Error(`POSTGRES_REVIEW_MARKET_EVIDENCE_STALE:${String(row.symbol)}`);
     }
@@ -532,7 +579,33 @@ const runExitReview = async (input: {
       );
     }
     if (option) assertObservedOptionContract(row as ReviewSourceRow);
-    const forceZeroDteExit = option &&
+    const openingStrategyClassification = String(
+      row.opening_strategy_classification ?? ""
+    ) as StrategyClassification;
+    const strategyClassification: StrategyClassification = option
+      ? openingStrategyClassification
+      : row.side === "short"
+        ? "equity_short"
+        : "equity_long";
+    if (
+      option &&
+      ![
+        "standard_long_call",
+        "standard_long_put",
+        "zero_dte_long_call",
+        "zero_dte_long_put",
+        "leaps_long_call",
+        "leaps_long_put",
+        "hedge"
+      ].includes(strategyClassification)
+    ) {
+      throw new Error(
+        `POSTGRES_EXIT_OPENING_CLASSIFICATION_MISSING:${String(row.order_symbol)}`
+      );
+    }
+    const zeroDte = strategyClassification === "zero_dte_long_call" ||
+      strategyClassification === "zero_dte_long_put";
+    const forceZeroDteExit = zeroDte &&
       isFinalThirtyMinutesForZeroDte(String(row.order_symbol), input.now);
     const parsedOption = option
       ? parseOptionSymbol(String(row.order_symbol))
@@ -541,11 +614,8 @@ const runExitReview = async (input: {
       ? optionDaysToExpiration(parsedOption.expirationDate, input.now.toISOString())
       : null;
     const leapsConfig = paperLeapsExitConfig();
-    const strategyKey = String(row.strategy_key ?? "").toLowerCase();
-    const leaps = option && (
-      strategyKey.includes("leaps") ||
-      (currentDte !== null && currentDte >= leapsConfig.minDteAtEntry)
-    );
+    const leaps = strategyClassification === "leaps_long_call" ||
+      strategyClassification === "leaps_long_put";
     const directionalReturnPct = directionalReturn * 100;
     const severeTrendBarCount = finite(row.severe_trend_bar_count);
     const underlyingClose = finite(row.underlying_close);
@@ -581,7 +651,16 @@ const runExitReview = async (input: {
               ? "ODTE_TAKE_PROFIT_50"
               : null
       : directionalReturn <= -0.05 ? "EQUITY_STOP_LOSS_5" : directionalReturn >= 0.08 ? "EQUITY_TAKE_PROFIT_8" : null;
-    return reason ? [{ row, price, quantity, timestamp, option, reason, directionalReturn }] : [];
+    return reason ? [{
+      row,
+      price,
+      quantity,
+      timestamp,
+      option,
+      reason,
+      directionalReturn,
+      strategyClassification
+    }] : [];
   });
   if (!eligible.length) {
     return { status: "no_op" as const, code: "NO_POSTGRES_EXIT_TRIGGER", reviewsCreated: 0, pendingIntentsCreated: 0, capacityBlocked: 0 };
@@ -616,17 +695,21 @@ const runExitReview = async (input: {
     if (item.option && row.side !== "long") {
       throw new Error(`POSTGRES_OPTION_CLOSE_SIDE_UNSUPPORTED:${orderSymbol}`);
     }
-    const exitSide = item.option
+    const operation: TradeOperation = item.option
       ? "sell_to_close"
       : row.side === "short"
-        ? "buy"
-        : "sell";
+        ? "buy_to_cover"
+        : "sell_to_close";
+    const exitSide = operation === "buy_to_cover" ? "buy" : item.option
+      ? "sell_to_close"
+      : "sell";
     const orderIntent = {
       symbol: orderSymbol, underlyingSymbol: item.option ? String(row.symbol) : null,
-      assetClass: String(row.asset_class), side: exitSide,
+      assetClass: String(row.asset_class), side: exitSide, operation,
       orderType: item.option ? "limit" : "market", timeInForce: "day",
       quantity: item.quantity, notional: null, limitPrice: item.option ? item.price : null,
-      clientOrderId, strategyKey: String(row.strategy_key), reason: item.reason
+      clientOrderId, strategyKey: String(row.strategy_key), reason: item.reason,
+      strategyClassification: item.strategyClassification
     };
     const payload = {
       positionId, candidateId, accountSnapshotId: snapshotId,
@@ -638,9 +721,64 @@ const runExitReview = async (input: {
     const signature = createHmac("sha256", input.signingKey).update(payloadFingerprint).digest("hex");
     const nowIso = input.now.toISOString();
     const expiresAt = new Date(input.now.getTime() + 15 * 60_000).toISOString();
-    const review = await input.query.query(
+    const openingIntentId = String(row.opening_intent_id ?? "").trim();
+    const openingOrderId = String(row.opening_order_id ?? "").trim();
+    const openingReviewId = String(row.opening_review_id ?? "").trim();
+    const openingAuthorizationSnapshotId = String(
+      row.opening_authorization_snapshot_id ?? ""
+    ).trim();
+    if (!openingIntentId || !openingOrderId || !openingReviewId) {
+      throw new Error(`POSTGRES_EXIT_OPENING_LINEAGE_MISSING:${orderSymbol}`);
+    }
+    const observedContractId = item.option
+      ? String(row.contract_id ?? "").trim()
+      : null;
+    const openingContractId = item.option
+      ? String(row.opening_contract_id ?? "").trim()
+      : null;
+    if (
+      item.option &&
+      (!observedContractId || !openingContractId ||
+        observedContractId !== openingContractId)
+    ) {
+      throw new Error(`POSTGRES_EXIT_OPTION_CONTRACT_LINEAGE_MISMATCH:${orderSymbol}`);
+    }
+    const confirmationEvidence = {
+      command: input.command,
+      confirmPaper: true,
+      autonomous: true,
+      parentPositionId: positionId,
+      openingIntentId,
+      scheduler: {
+        jobName: input.fence.jobName,
+        workstream: input.fence.workstream,
+        ownerId: input.fence.ownerId,
+        runId: input.fence.runId,
+        fencingToken: input.fence.fencingToken
+      }
+    };
+    const confirmationFingerprint = canonicalJsonHash({
+      executionReviewId: reviewId,
+      reviewPayloadFingerprint: payloadFingerprint,
+      evidence: confirmationEvidence
+    });
+    const confirmationId = `confirmation_${confirmationFingerprint}`;
+    const confirmationSignature = createHmac("sha256", input.signingKey)
+      .update(confirmationFingerprint)
+      .digest("hex");
+    const intentFingerprint = canonicalJsonHash({ reviewId, orderIntent });
+    const intentId = `intent_${intentFingerprint}`;
+    const lifecycleFingerprint = canonicalJsonHash({
+      orderIntentId: intentId,
+      confirmationId,
+      state: "exit_ready_for_submission",
+      at: nowIso
+    });
+    const cycleId = process.env.AUTONOMOUS_CYCLE_ID?.trim() ||
+      input.fence.runId;
+    const persistence = await input.query.query(
       `WITH fence_state AS (
-         SELECT ${fenceSql(15)} AS held
+         SELECT ${fenceSql(42)} AS held
        ), inserted_review AS (
          INSERT INTO execution_reviews(
            id, account_id, candidate_id, review_type, environment, paper_only,
@@ -656,9 +794,49 @@ const runExitReview = async (input: {
            WHERE client_order_id IS NOT NULL
          DO NOTHING
          RETURNING id
+       ), inserted_confirmation AS (
+         INSERT INTO confirmation_evidence(
+           id, execution_review_id, account_id, candidate_id, evidence_type,
+           confirmation_method, status, paper_only, payload_fingerprint,
+           signature_algorithm, signature, evidence, confirmed_at, expires_at,
+           created_at, updated_at
+         )
+         SELECT $15, inserted_review.id, $2, $3,
+                'paper_execution_confirmation',
+                'autonomous_worker_confirm_paper', 'valid', true, $16,
+                'hmac-sha256', $17, $18::jsonb, $14, $13, $14, $14
+         FROM inserted_review
+         RETURNING id
+       ), inserted_intent AS (
+         INSERT INTO order_intents(
+           id, account_id, candidate_id, execution_review_id,
+           confirmation_evidence_id, environment, client_order_id,
+           idempotency_key, strategy_key, symbol, underlying_symbol,
+           asset_class, side, order_type, time_in_force, quantity, limit_price,
+           estimated_premium, max_risk, status, intent_fingerprint,
+           lifecycle_fingerprint, request_payload, ready_at, created_at,
+           updated_at, operation, strategy_classification, lifecycle_state,
+           review_id, confirmation_id, parent_position_id, opening_intent_id,
+           contract_id, authorization_snapshot_id, autonomous_cycle_id,
+           workstream_execution_id, fence_token
+         )
+         SELECT $19, $2, $3, inserted_review.id, inserted_confirmation.id,
+                'paper', $4, $20, $21, $22, $23, $24, $25, $26, 'day',
+                $27, $28, $29, $30, 'ready_for_submission', $31, $32,
+                $10::jsonb, $14, $14, $14, $33, $34,
+                'exit_ready_for_submission', inserted_review.id,
+                inserted_confirmation.id, $35, $36, $37, $38, $39, $40,
+                $41
+         FROM inserted_review
+         JOIN inserted_confirmation ON true
+         ON CONFLICT (account_id, intent_fingerprint) DO NOTHING
+         RETURNING id
        )
        SELECT fence_state.held AS fence_held,
-              (SELECT COUNT(*)::integer FROM inserted_review) AS inserted_count
+              (SELECT COUNT(*)::integer FROM inserted_review) AS review_count,
+              (SELECT COUNT(*)::integer FROM inserted_confirmation)
+                AS confirmation_count,
+              (SELECT COUNT(*)::integer FROM inserted_intent) AS intent_count
        FROM fence_state`,
       [reviewId, accountId, candidateId, clientOrderId, structural, snapshotId,
         canonicalJsonHash({ reason: item.reason }), payloadFingerprint, signature,
@@ -667,57 +845,68 @@ const runExitReview = async (input: {
           snapshotId,
           portfolioFingerprint: portfolio,
           structuralPortfolioFingerprint: structural,
-          trigger: payload.trigger
+          trigger: payload.trigger,
+          openingLineage: {
+            candidateId,
+            openingReviewId,
+            openingIntentId,
+            openingOrderId,
+            openingAuthorizationSnapshotId: openingAuthorizationSnapshotId || null,
+            strategyClassification: item.strategyClassification,
+            contractId: observedContractId
+          }
         }),
-        expiresAt, nowIso, ...fenceValues(input.fence)]
-    );
-    const reviewOutcome = review.rowCount === 1 ? review.rows[0] : undefined;
-    if (!reviewOutcome) {
-      throw new Error("POSTGRES_EXIT_REVIEW_PERSISTENCE_FAILED");
-    }
-    if (reviewOutcome.fence_held !== true) {
-      throw new Error("SCHEDULER_FENCE_LOST");
-    }
-    const insertedCount = Number(reviewOutcome.inserted_count);
-    if (!Number.isInteger(insertedCount) || ![0, 1].includes(insertedCount)) {
-      throw new Error("POSTGRES_EXIT_REVIEW_PERSISTENCE_FAILED");
-    }
-    if (insertedCount === 0) {
-      skipped += 1;
-      continue;
-    }
-    const intentFingerprint = canonicalJsonHash({ reviewId, orderIntent });
-    const intent = await input.query.query(
-      `INSERT INTO order_intents(
-         id, account_id, candidate_id, execution_review_id, environment,
-         client_order_id, idempotency_key, strategy_key, symbol,
-         underlying_symbol, asset_class, side, order_type, time_in_force,
-         quantity, limit_price, estimated_premium, max_risk, status,
-         intent_fingerprint, lifecycle_fingerprint, request_payload,
-         created_at, updated_at
-       ) SELECT $1, $2, $3, $4, 'paper', $5, $6, $7, $8, $9, $10, $11,
-                $12, 'day', $13, $14, $15, $16, 'created', $17, $18,
-                $19::jsonb, $20, $20
-         WHERE ${fenceSql(21)}
-       ON CONFLICT (account_id, intent_fingerprint) DO NOTHING`,
-      [`intent_${intentFingerprint}`, accountId, candidateId, reviewId, clientOrderId,
-        `review:${payloadFingerprint}`, String(row.strategy_key), orderSymbol,
-        item.option ? String(row.symbol) : null, String(row.asset_class),
-        exitSide, item.option ? "limit" : "market",
-        item.quantity, item.option ? item.price : null,
+        expiresAt, nowIso, confirmationId, confirmationFingerprint,
+        confirmationSignature, JSON.stringify(confirmationEvidence),
+        intentId, `review:${payloadFingerprint}`, String(row.strategy_key),
+        orderSymbol, item.option ? String(row.symbol) : null,
+        String(row.asset_class), exitSide,
+        item.option ? "limit" : "market", item.quantity,
+        item.option ? item.price : null,
         item.option ? item.price * 100 * item.quantity : null,
         item.option ? item.price * 100 * item.quantity : item.price * item.quantity,
-        intentFingerprint, canonicalJsonHash({ status: "created", at: nowIso }),
-        JSON.stringify(orderIntent), nowIso, ...fenceValues(input.fence)]
+        intentFingerprint, lifecycleFingerprint, operation,
+        item.strategyClassification, positionId, openingIntentId,
+        observedContractId, snapshotId, cycleId, input.fence.runId,
+        input.fence.fencingToken, ...fenceValues(input.fence)]
     );
-    if (intent.rowCount !== 1) {
+    const persistenceOutcome = persistence.rowCount === 1
+      ? persistence.rows[0]
+      : undefined;
+    if (!persistenceOutcome) {
       throw new Error("POSTGRES_EXIT_REVIEW_PERSISTENCE_FAILED");
+    }
+    if (persistenceOutcome.fence_held !== true) {
+      throw new Error("SCHEDULER_FENCE_LOST");
+    }
+    const reviewCount = Number(
+      persistenceOutcome.review_count ?? persistenceOutcome.inserted_count
+    );
+    const confirmationCount = Number(
+      persistenceOutcome.confirmation_count ?? reviewCount
+    );
+    const intentCount = Number(
+      persistenceOutcome.intent_count ?? reviewCount
+    );
+    if (
+      ![reviewCount, confirmationCount, intentCount].every((count) =>
+        Number.isInteger(count) && [0, 1].includes(count)
+      ) ||
+      confirmationCount !== reviewCount ||
+      intentCount !== reviewCount
+    ) {
+      throw new Error("POSTGRES_EXIT_REVIEW_PERSISTENCE_FAILED");
+    }
+    if (reviewCount === 0) {
+      skipped += 1;
+      continue;
     }
     created += 1;
   }
   return {
     status: "completed" as const, command: input.command, reviewsCreated: created,
-    pendingIntentsCreated: created, skipped, capacityBlocked: 0, confirmationCreated: false, paperOnly: true
+    pendingIntentsCreated: created, skipped, capacityBlocked: 0,
+    confirmationCreated: created > 0, paperOnly: true
   };
 };
 
@@ -835,9 +1024,12 @@ export const runPostgresReviewWorkflow = async (input: {
     }
     const marketTimestamp = new Date(row.market_timestamp).toISOString();
     const age = now.getTime() - Date.parse(marketTimestamp);
-    const maxAge = (
+    const maxAge = Math.min(
       input.maxMarketAgeSeconds ??
-      AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS
+      AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS,
+      row.asset_class === "option"
+        ? optionsQuoteConfig().maxAgeMs / 1_000
+        : Number.POSITIVE_INFINITY
     ) * 1_000;
     if (!Number.isFinite(age) || age < -60_000 || age > maxAge) {
       throw new Error(`POSTGRES_REVIEW_MARKET_EVIDENCE_STALE:${row.symbol}`);
@@ -903,9 +1095,12 @@ export const runPostgresReviewWorkflow = async (input: {
   for (const { row, amount } of eligibleRows) {
     const marketTimestamp = new Date(row.market_timestamp).toISOString();
     const age = now.getTime() - Date.parse(marketTimestamp);
-    const maxAge = (
+    const maxAge = Math.min(
       input.maxMarketAgeSeconds ??
-      AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS
+      AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS,
+      row.asset_class === "option"
+        ? optionsQuoteConfig().maxAgeMs / 1_000
+        : Number.POSITIVE_INFINITY
     ) * 1_000;
     if (!Number.isFinite(age) || age < -60_000 || age > maxAge) {
       throw new Error(`POSTGRES_REVIEW_MARKET_EVIDENCE_STALE:${row.symbol}`);
@@ -918,6 +1113,22 @@ export const runPostgresReviewWorkflow = async (input: {
     );
     const option = row.asset_class === "option";
     const shortEquity = !option && row.direction === "short";
+    const operation: TradeOperation = option
+      ? "buy_to_open"
+      : shortEquity
+        ? "sell_to_open"
+        : "buy_to_open";
+    const strategyClassification: StrategyClassification = option
+      ? classifyOptionStrategy(
+          {
+            expirationDate: String(row.contract_expiration_date).slice(0, 10),
+            optionType: String(row.contract_type) as "call" | "put"
+          },
+          now.toISOString().slice(0, 10)
+        )
+      : shortEquity
+        ? "equity_short"
+        : "equity_long";
     const quantity = option
       ? Math.floor(amount / (price * 100))
       : shortEquity
@@ -950,6 +1161,8 @@ export const runPostgresReviewWorkflow = async (input: {
       side: entrySide,
       orderType: option ? "limit" : "market",
       timeInForce: "day",
+      operation,
+      strategyClassification,
       quantity,
       notional: option || shortEquity ? null : amount,
       limitPrice: option ? price : null,
@@ -1005,13 +1218,16 @@ export const runPostgresReviewWorkflow = async (input: {
          id, account_id, candidate_id, execution_review_id, environment,
          client_order_id, idempotency_key, strategy_key, symbol,
          underlying_symbol, asset_class, side, order_type, time_in_force,
-         quantity, notional, limit_price, estimated_premium, max_risk, status,
-         intent_fingerprint, lifecycle_fingerprint, request_payload,
-         created_at, updated_at
+       quantity, notional, limit_price, estimated_premium, max_risk, status,
+       intent_fingerprint, lifecycle_fingerprint, request_payload,
+         created_at, updated_at, operation, strategy_classification,
+         lifecycle_state, review_id, contract_id, authorization_snapshot_id,
+         autonomous_cycle_id, workstream_execution_id, fence_token
        ) SELECT $1, $2, $3, $4, 'paper', $5, $6, $7, $8, $9, $10, $11,
                 $12, 'day', $13, $14, $15, $16, $17, 'created', $18, $19,
-                $20::jsonb, $21, $21
-         WHERE ${fenceSql(22)}
+                $20::jsonb, $21, $21, $22, $23, 'review_created', $4, $24,
+                $25, $26, $27, $28
+         WHERE ${fenceSql(29)}
        ON CONFLICT (account_id, intent_fingerprint) DO NOTHING`,
       [intentId, row.account_id, row.candidate_id, reviewId, clientOrderId,
         `review:${payloadFingerprint}`, row.strategy_key, orderSymbol,
@@ -1020,7 +1236,12 @@ export const runPostgresReviewWorkflow = async (input: {
         option || shortEquity ? null : amount,
         option ? price : null, option ? price * 100 * (quantity ?? 0) : null,
         effectiveRisk, intentFingerprint, canonicalJsonHash({ status: "created", at: now.toISOString() }),
-        JSON.stringify(orderIntent), now.toISOString(), ...fenceValues(input.fence)]
+        JSON.stringify(orderIntent), now.toISOString(), operation,
+        strategyClassification, option ? String(row.contract_id) : null,
+        row.account_snapshot_id,
+        process.env.AUTONOMOUS_CYCLE_ID?.trim() || input.fence.runId,
+        input.fence.runId, input.fence.fencingToken,
+        ...fenceValues(input.fence)]
     );
     if (intentResult.rowCount !== 1 && intentResult.rowCount !== 0) throw new Error("POSTGRES_ORDER_INTENT_PERSISTENCE_FAILED");
     await persistCandidateStage({

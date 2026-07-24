@@ -48,16 +48,33 @@ const blockedExecution = (
   review
 });
 
-const toAlpacaPayload = (payload: PaperExitOrderPayload): AlpacaPaperOrderRequest => ({
-  symbol: payload.symbol,
-  qty: payload.qty,
-  side: "sell",
-  type: payload.orderType,
-  time_in_force: payload.timeInForce,
-  limit_price: payload.orderType === "limit" ? payload.limitPrice : undefined,
-  client_order_id: payload.clientOrderId,
-  position_intent: payload.assetClass === "us_option" ? "sell_to_close" : undefined
-});
+const toAlpacaPayload = (payload: PaperExitOrderPayload): AlpacaPaperOrderRequest => {
+  const operation = payload.operation ?? (
+    payload.assetClass === "us_option" && payload.side === "sell"
+      ? "sell_to_close"
+      : null
+  );
+  const validShortCover = operation === "buy_to_cover" &&
+    payload.assetClass === "us_equity" &&
+    payload.side === "buy";
+  const validLongClose = operation === "sell_to_close" &&
+    payload.side === "sell";
+  if (!validShortCover && !validLongClose) {
+    throw new Error("PAPER_EXIT_CLOSE_OPERATION_INVALID");
+  }
+  return {
+    symbol: payload.symbol,
+    qty: payload.qty,
+    side: payload.side,
+    type: payload.orderType,
+    time_in_force: payload.timeInForce,
+    limit_price: payload.orderType === "limit" ? payload.limitPrice : undefined,
+    client_order_id: payload.clientOrderId,
+    position_intent: payload.assetClass === "us_option"
+      ? "sell_to_close"
+      : undefined
+  };
+};
 
 const executionProjectionSource = (
   candidate: PaperExitReviewResult["exitCandidates"][number],
@@ -71,7 +88,7 @@ const executionProjectionSource = (
   symbol: candidate.symbol,
   underlyingSymbol: null,
   strategy: "paper-exit",
-  side: "sell",
+  side: candidate.orderPayload.side,
   orderType: candidate.orderPayload.orderType,
   timeInForce: candidate.orderPayload.timeInForce,
   qty: candidate.orderPayload.qty,
@@ -193,7 +210,7 @@ export const buildPaperExitExecutionResult = async (
     });
     submittedOrders.push({
       symbol: candidate.symbol,
-      side: "sell",
+      side: candidate.orderPayload.side,
       qty: candidate.orderPayload.qty,
       assetClass: candidate.assetClass,
       positionIntent: candidate.orderPayload.positionIntent,

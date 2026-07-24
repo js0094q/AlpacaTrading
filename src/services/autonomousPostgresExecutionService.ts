@@ -16,7 +16,10 @@ import {
 import { optionsQuoteConfig } from "./optionQuoteNormalizer.js";
 import {
   autonomousLifecycleContextFromRuntime,
-  lifecycleStateForBrokerStatus
+  lifecycleStateForBrokerStatus,
+  validateCloseOperation,
+  type StrategyClassification,
+  type TradeOperation
 } from "./autonomousTradeLifecycleService.js";
 import type { PostgresAuthorityBrokerSnapshot } from "./postgresAuthorityBrokerSnapshot.js";
 
@@ -51,6 +54,15 @@ export type AutonomousExecutionIntentRow = {
   stop_price: string | null;
   intent_version: string | number;
   market_evidence: unknown;
+  operation?: TradeOperation | null;
+  strategy_classification?: StrategyClassification | null;
+  parent_position_id?: string | null;
+  opening_intent_id?: string | null;
+  contract_id?: string | null;
+  position_side?: "long" | "short" | null;
+  position_available_quantity?: string | null;
+  position_option_symbol?: string | null;
+  position_contract_id?: string | null;
 };
 
 export type AutonomousExecutionBrokerSnapshot = Pick<
@@ -211,14 +223,60 @@ export const validateAutonomousExecutionEvidence = (
   if (intent.order_type === "limit" && !positive(intent.limit_price)) {
     throw new Error("POSTGRES_ORDER_INTENT_LIMIT_PRICE_MISSING");
   }
-  const positionIntent = intent.side === "buy_to_open" || intent.side === "sell_to_close"
-    ? intent.side
+  if (intent.review_type === "exit") {
+    if (
+      !intent.parent_position_id ||
+      !intent.position_side ||
+      !intent.operation
+    ) {
+      throw new Error("POSTGRES_CLOSE_POSITION_LINEAGE_MISSING");
+    }
+    const closeValidation = validateCloseOperation({
+      positionSide: intent.position_side,
+      operation: intent.operation
+    });
+    if (!closeValidation.valid) {
+      throw new Error(closeValidation.reason);
+    }
+    const closeQuantity = positive(intent.quantity);
+    const availableQuantity = positive(intent.position_available_quantity);
+    if (!closeQuantity || !availableQuantity) {
+      throw new Error("POSTGRES_CLOSE_QUANTITY_MISSING");
+    }
+    if (closeQuantity > availableQuantity + 1e-12) {
+      throw new Error("POSTGRES_CLOSE_QUANTITY_EXCEEDS_RECONCILED_POSITION");
+    }
+    if (
+      intent.asset_class === "option" &&
+      (
+        !intent.contract_id ||
+        intent.contract_id !== intent.position_contract_id ||
+        intent.symbol !== intent.position_option_symbol
+      )
+    ) {
+      throw new Error("POSTGRES_OPTION_CLOSE_CONTRACT_MISMATCH");
+    }
+  }
+  const operation = intent.operation ?? (
+    intent.side === "buy_to_open" || intent.side === "sell_to_close"
+      ? intent.side
+      : intent.review_type === "entry" && intent.side === "sell"
+        ? "sell_to_open"
+        : intent.review_type === "exit" && intent.side === "buy"
+          ? "buy_to_cover"
+          : "buy_to_open"
+  );
+  const positionIntent = intent.asset_class === "option" &&
+    (operation === "buy_to_open" || operation === "sell_to_close")
+    ? operation
     : undefined;
   const payload: AlpacaPaperOrderRequest = {
     symbol: intent.symbol,
     ...(intent.quantity ? { qty: intent.quantity } : {}),
     ...(intent.notional ? { notional: intent.notional } : {}),
-    side: intent.side.startsWith("buy") ? "buy" : "sell",
+    side: operation === "buy_to_open" || operation === "buy_to_cover"
+      ? "buy"
+      : "sell",
     type: intent.order_type,
     time_in_force: intent.time_in_force,
     ...(intent.limit_price ? { limit_price: intent.limit_price } : {}),
@@ -230,16 +288,16 @@ export const validateAutonomousExecutionEvidence = (
 
 const commandFilter = (command: string) => {
   if (command === "paper:execute:reviewed") {
-    return "review.review_type = 'entry' AND intent.side IN ('buy', 'sell', 'buy_to_open')";
+    return "review.review_type = 'entry' AND intent.operation IN ('buy_to_open', 'sell_to_open')";
   }
   if (command === "paper:exit:execute") {
-    return "review.review_type = 'exit' AND intent.side IN ('buy', 'sell', 'sell_to_close')";
+    return "review.review_type = 'exit' AND intent.operation IN ('sell_to_close', 'buy_to_cover')";
   }
   if (command === "hedge:exit:execute") {
-    return "review.review_type = 'exit' AND intent.side IN ('sell', 'sell_to_close') AND intent.strategy_key ILIKE '%hedge%'";
+    return "review.review_type = 'exit' AND intent.operation = 'sell_to_close' AND intent.strategy_key ILIKE '%hedge%'";
   }
   if (command === "zero-dte:engine") {
-    return "review.review_type = 'entry' AND intent.side IN ('buy', 'buy_to_open') AND (intent.strategy_key ILIKE '%zero%dte%' OR intent.strategy_key ILIKE '%0dte%')";
+    return "review.review_type = 'entry' AND intent.operation = 'buy_to_open' AND intent.strategy_classification IN ('zero_dte_long_call', 'zero_dte_long_put')";
   }
   throw new Error(`POSTGRES_EXECUTION_COMMAND_UNSUPPORTED: ${command}`);
 };
@@ -665,9 +723,22 @@ const claimIntent = async (
             intent.quantity::text AS quantity, intent.notional::text AS notional,
             intent.limit_price::text AS limit_price,
             intent.stop_price::text AS stop_price, intent.version AS intent_version,
-            review.market_evidence
+            review.market_evidence, intent.operation,
+            intent.strategy_classification, intent.parent_position_id,
+            intent.opening_intent_id, intent.contract_id,
+            parent_position.side AS position_side,
+            parent_position.available_quantity::text
+              AS position_available_quantity,
+            parent_position.option_symbol AS position_option_symbol,
+            opening_intent.contract_id AS position_contract_id
      FROM order_intents intent
      JOIN accounts account ON account.id = intent.account_id
+     LEFT JOIN positions parent_position
+       ON parent_position.id = intent.parent_position_id
+      AND parent_position.account_id = intent.account_id
+      AND parent_position.status = 'open'
+     LEFT JOIN order_intents opening_intent
+       ON opening_intent.id = intent.opening_intent_id
      JOIN LATERAL (
        SELECT * FROM account_snapshots current_snapshot
        WHERE current_snapshot.account_id = intent.account_id
@@ -1318,7 +1389,7 @@ export const runAutonomousPostgresExecutionCommand = async <
     if (
       intent.review_type === "entry" &&
       intent.asset_class === "equity" &&
-      intent.side === "sell"
+      intent.operation === "sell_to_open"
     ) {
       const asset = await (
         input.checkAsset ?? checkAlpacaSymbolTradability

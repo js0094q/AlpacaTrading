@@ -252,11 +252,15 @@ const avgEntryPrice = (position: AlpacaPositionRaw, qty: number): number => {
 
 const marketValue = (position: AlpacaPositionRaw): number => numberField(position.market_value);
 
-const isActiveSellOrderFor = (orders: AlpacaSubmittedOrder[], symbol: string): boolean => {
+const isActiveExitOrderFor = (
+  orders: AlpacaSubmittedOrder[],
+  symbol: string,
+  side: "buy" | "sell"
+): boolean => {
   const normalized = normalizeSymbol(symbol);
   return orders.some((order) =>
     normalizeSymbol(order.symbol) === normalized &&
-    normalizeText(order.side) === "sell" &&
+    normalizeText(order.side) === side &&
     ACTIVE_EXIT_ORDER_STATUSES.has(normalizeText(order.status))
   );
 };
@@ -504,10 +508,14 @@ const buildOrderPayload = (input: {
   generatedAt: string;
   index: number;
   limitPrice?: string;
+  positionSide?: "long" | "short";
 }): PaperExitOrderPayload => ({
   symbol: input.symbol,
   assetClass: input.assetClass,
-  side: "sell",
+  side: input.positionSide === "short" ? "buy" : "sell",
+  operation: input.positionSide === "short"
+    ? "buy_to_cover"
+    : "sell_to_close",
   positionIntent: input.assetClass === "us_option" ? "sell_to_close" : undefined,
   qty: input.qty,
   orderType: input.orderType,
@@ -783,7 +791,16 @@ export const buildPaperExitReviewResult = async (
       continue;
     }
 
-    if (isActiveSellOrderFor(orders, symbol)) {
+    const positionSide = normalizeText(
+      position.side || (numberField(position.qty) < 0 ? "short" : "long")
+    ) === "short"
+      ? "short"
+      : "long";
+    if (isActiveExitOrderFor(
+      orders,
+      symbol,
+      positionSide === "short" ? "buy" : "sell"
+    )) {
       skipped.push({
         symbol,
         assetClass,
@@ -822,7 +839,8 @@ export const buildPaperExitReviewResult = async (
         orderType: "market",
         reason,
         generatedAt,
-        index: candidates.length
+        index: candidates.length,
+        positionSide
       });
       candidates.push(
         orderPayloadToCandidate({
@@ -898,7 +916,8 @@ export const buildPaperExitReviewResult = async (
         reason,
         generatedAt,
         index: candidates.length,
-        limitPrice
+        limitPrice,
+        positionSide
       });
       candidates.push(
         orderPayloadToCandidate({
@@ -982,7 +1001,8 @@ export const buildPaperExitReviewResult = async (
       reason,
       generatedAt,
       index: candidates.length,
-      limitPrice
+      limitPrice,
+      positionSide
     });
     candidates.push(
       orderPayloadToCandidate({

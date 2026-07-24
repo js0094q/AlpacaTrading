@@ -644,13 +644,17 @@ test("position reconciliation carries matching filled entry lineage through a sa
 
   assert.equal(result.brokerState?.positionsUpserted, 1);
   const lineageLookup = statements.find(({ sql }) =>
-    sql.includes("FROM orders") && sql.includes("filled")
+    sql.includes("FROM orders broker_order") &&
+    sql.includes("JOIN order_intents intent")
   );
   assert.ok(lineageLookup, "reconciliation must derive lineage from matching filled entry");
   assert.match(
     lineageLookup.sql,
     /broker_order\.status IN \('filled', 'partially_filled'\)/
   );
+  assert.match(lineageLookup.sql, /intent\.id AS opening_intent_id/);
+  assert.match(lineageLookup.sql, /intent\.strategy_classification/);
+  assert.match(lineageLookup.sql, /intent\.contract_id/);
   assert.match(
     lineageLookup.sql,
     /ABS\(\s*broker_order\.filled_quantity - \$6::numeric\s*\) <= 0\.000000000001/
@@ -684,6 +688,62 @@ test("position reconciliation carries matching filled entry lineage through a sa
     positionInsert.sql,
     /opened_at = CASE[\s\S]*positions\.status = 'closed'[\s\S]*EXCLUDED\.opened_at[\s\S]*positions\.opened_at/
   );
+});
+
+test("position reconciliation links a filled autonomous close and closes its lifecycle exactly once", async () => {
+  const statements: Array<{ sql: string; values: readonly unknown[] }> = [];
+  const result = await reconcilePostgresPaperOrders({
+    query: {
+      query: async (sql: string, values?: readonly unknown[]) => {
+        statements.push({ sql, values: values ?? [] });
+        if (sql.includes("FROM order_intents intent") && sql.includes("intent.status IN")) {
+          return { rows: [], rowCount: 0 };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    now: new Date("2026-07-20T22:00:00.000Z"),
+    captureBrokerSnapshot: async () => ({
+      capturedAt: "2026-07-20T22:00:00.000Z",
+      accountIdentityHash: "paper-account-close-hash",
+      account: {
+        status: "ACTIVE",
+        currency: "USD",
+        cash: 10_000,
+        equity: 20_000,
+        buyingPower: 30_000,
+        optionsBuyingPower: 15_000,
+        optionsApprovalLevel: 3,
+        tradingBlocked: false,
+        accountBlocked: false
+      },
+      configuration: {
+        environment: "paper",
+        tradingMode: "paper",
+        liveTradingEnabled: false
+      },
+      configurationFingerprint: "configuration-fingerprint",
+      positions: [],
+      orders: [],
+      structuralPortfolioFingerprint: "structural-fingerprint",
+      portfolioFingerprint: "portfolio-fingerprint"
+    }) as never
+  });
+
+  assert.equal(result.brokerState?.positionsObserved, 0);
+  const closeStatement = statements.find(({ sql }) =>
+    sql.includes("UPDATE positions") && sql.includes("status = 'closed'")
+  );
+  assert.ok(closeStatement);
+  assert.match(closeStatement.sql, /close_intent\.parent_position_id = positions\.id/);
+  assert.match(closeStatement.sql, /closing_order_id = COALESCE/);
+  const lifecycleClose = statements.find(({ sql }) =>
+    sql.includes("UPDATE order_intents") &&
+    sql.includes("lifecycle_state = 'closed'")
+  );
+  assert.ok(lifecycleClose);
+  assert.match(lifecycleClose.sql, /parent_position\.status = 'closed'/);
 });
 
 test("the execution transaction can persist its exact captured broker snapshot", async () => {

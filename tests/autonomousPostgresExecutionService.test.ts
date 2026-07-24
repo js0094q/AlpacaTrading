@@ -33,6 +33,15 @@ const intent = (overrides: Partial<AutonomousExecutionIntentRow> = {}): Autonomo
   limit_price: "200",
   stop_price: null,
   intent_version: "2",
+  operation: "buy_to_open",
+  strategy_classification: "equity_long",
+  parent_position_id: null,
+  opening_intent_id: null,
+  contract_id: null,
+  position_side: null,
+  position_available_quantity: null,
+  position_option_symbol: null,
+  position_contract_id: null,
   market_evidence: [{ symbol: "AAPL", referencePrice: 200, timestamp: "2026-07-20T21:59:30.000Z" }],
   ...overrides
 });
@@ -297,8 +306,18 @@ test("the execution gate emits supported option sell-to-close semantics", () => 
   const payload = validateAutonomousExecutionEvidence(
     intent({
       asset_class: "option",
+      review_type: "exit",
       side: "sell_to_close",
       symbol: "SPY260720P00555000",
+      operation: "sell_to_close",
+      strategy_classification: "zero_dte_long_put",
+      parent_position_id: "position-put",
+      opening_intent_id: "opening-intent-put",
+      contract_id: "contract-SPY260720P00555000",
+      position_side: "long",
+      position_available_quantity: "1",
+      position_option_symbol: "SPY260720P00555000",
+      position_contract_id: "contract-SPY260720P00555000",
       notional: null,
       quantity: "1",
       limit_price: "1.05",
@@ -324,6 +343,92 @@ test("the execution gate emits supported option sell-to-close semantics", () => 
   );
   assert.equal(payload.side, "sell");
   assert.equal(payload.position_intent, "sell_to_close");
+});
+
+test("a short cover is validated as buy-to-cover before mapping to Alpaca buy", () => {
+  const payload = validateAutonomousExecutionEvidence(
+    intent({
+      review_type: "exit",
+      side: "buy",
+      operation: "buy_to_cover",
+      strategy_classification: "equity_short",
+      parent_position_id: "position-short",
+      position_side: "short",
+      position_available_quantity: "2",
+      quantity: "2"
+    }),
+    broker,
+    new Date("2026-07-20T22:00:00.000Z"),
+    60
+  );
+
+  assert.equal(payload.side, "buy");
+  assert.equal(payload.position_intent, undefined);
+});
+
+test("a generic or mismatched short close is rejected before Alpaca payload mapping", () => {
+  assert.throws(
+    () => validateAutonomousExecutionEvidence(
+      intent({
+        review_type: "exit",
+        side: "buy",
+        operation: "sell_to_close",
+        strategy_classification: "equity_short",
+        parent_position_id: "position-short",
+        position_side: "short",
+        position_available_quantity: "2",
+        quantity: "2"
+      }),
+      broker,
+      new Date("2026-07-20T22:00:00.000Z"),
+      60
+    ),
+    /CLOSE_OPERATION_MISMATCH:buy_to_cover/
+  );
+});
+
+test("an option close retains its observed contract and cannot exceed reconciled available quantity", () => {
+  const optionIntent = intent({
+    review_type: "exit",
+    asset_class: "option",
+    symbol: "SPY260821P00500000",
+    side: "sell_to_close",
+    operation: "sell_to_close",
+    strategy_classification: "standard_long_put",
+    contract_id: "contract-SPY260821P00500000",
+    parent_position_id: "position-put",
+    position_side: "long",
+    position_option_symbol: "SPY260821P00500000",
+    position_contract_id: "contract-SPY260821P00500000",
+    position_available_quantity: "1",
+    quantity: "2",
+    limit_price: "1.00",
+    market_evidence: [{
+      symbol: "SPY260821P00500000",
+      referencePrice: 1,
+      timestamp: "2026-07-20T21:59:30.000Z",
+      bid: 1,
+      ask: 1.02,
+      spreadPct: 0.0198,
+      maximumSpreadPct: 0.15,
+      underlyingPrice: 555,
+      volume: 500,
+      openInterest: 800,
+      requestedFeed: "opra",
+      effectiveFeed: "opra",
+      source: "postgres.option_snapshots"
+    }]
+  });
+
+  assert.throws(
+    () => validateAutonomousExecutionEvidence(
+      optionIntent,
+      broker,
+      new Date("2026-07-20T22:00:00.000Z"),
+      60
+    ),
+    /POSTGRES_CLOSE_QUANTITY_EXCEEDS_RECONCILED_POSITION/
+  );
 });
 
 test("confirmation promotion atomically readies an entry intent with a buying-power reservation", async () => {
@@ -1190,6 +1295,8 @@ test("equity short submission fails closed unless Alpaca reports shortable and e
             return {
               rows: [intent({
                 side: "sell",
+                operation: "sell_to_open",
+                strategy_classification: "equity_short",
                 order_type: "market",
                 quantity: "1",
                 notional: null,

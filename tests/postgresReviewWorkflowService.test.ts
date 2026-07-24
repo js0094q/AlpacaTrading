@@ -36,15 +36,36 @@ const candidate = {
 };
 const observedOptionContract = {
   contract_option_symbol: "SPY260821C00560000",
+  contract_id: "option-contract-SPY260821C00560000",
+  contract_type: "call",
+  contract_expiration_date: "2026-08-21",
   contract_tradable: true,
   contract_status: "active",
   contract_source: "alpaca",
   contract_observed_at: "2026-07-20T21:59:00.000Z"
 };
-const observedExitOptionContract = (optionSymbol: string) => ({
-  ...observedOptionContract,
-  contract_option_symbol: optionSymbol
-});
+const observedExitOptionContract = (optionSymbol: string) => {
+  const parsed = optionSymbol.match(/^([A-Z]{1,6})(\d{6})([CP])\d{8}$/);
+  if (!parsed) throw new Error(`invalid test option symbol: ${optionSymbol}`);
+  const expiration = parsed[2]!;
+  const put = parsed[3] === "P";
+  return {
+    ...observedOptionContract,
+    contract_option_symbol: optionSymbol,
+    contract_id: `contract-${optionSymbol}`,
+    contract_type: put ? "put" : "call",
+    contract_expiration_date:
+      `20${expiration.slice(0, 2)}-${expiration.slice(2, 4)}-${expiration.slice(4, 6)}`,
+    opening_intent_id: `opening-intent-${optionSymbol}`,
+    opening_review_id: `opening-review-${optionSymbol}`,
+    opening_order_id: `opening-order-${optionSymbol}`,
+    opening_strategy_classification: put
+      ? "standard_long_put"
+      : "standard_long_call",
+    opening_contract_id: `contract-${optionSymbol}`,
+    opening_authorization_snapshot_id: `opening-snapshot-${optionSymbol}`
+  };
+};
 
 test("entry review persists signed PostgreSQL review and unconfirmed pending intent", async () => {
   const sql: string[] = [];
@@ -820,6 +841,11 @@ test("exit review evaluates existing thresholds against PostgreSQL position and 
         if (statement.includes("FROM positions position")) return {
           rows: [{
             position_id: "position-1", candidate_id: "candidate-1",
+            opening_intent_id: "intent-long-open",
+            opening_review_id: "review-long-open",
+            opening_order_id: "order-long-open",
+            opening_strategy_classification: "equity_long",
+            opening_authorization_snapshot_id: "snapshot-long-open",
             symbol: "SPY", order_symbol: "SPY", asset_class: "equity",
             side: "long", available_quantity: "2", average_entry_price: "500",
             strategy_key: "baseline", account_id: "account-1",
@@ -848,7 +874,8 @@ test("exit review evaluates existing thresholds against PostgreSQL position and 
 
 test("exit review maps a short equity exit to buy-to-cover", async () => {
   let reviewOrderIntent: Record<string, unknown> | undefined;
-  let intentValues: readonly unknown[] = [];
+  let persistenceSql = "";
+  let persistenceValues: readonly unknown[] = [];
   const result = await runPostgresReviewWorkflow({
     command: "paper:exit:review",
     query: {
@@ -857,6 +884,11 @@ test("exit review maps a short equity exit to buy-to-cover", async () => {
           return {
             rows: [{
               position_id: "position-short", candidate_id: "candidate-short",
+              opening_intent_id: "intent-short-open",
+              opening_review_id: "review-short-open",
+              opening_order_id: "order-short-open",
+              opening_strategy_classification: "equity_short",
+              opening_authorization_snapshot_id: "snapshot-short-open",
               symbol: "AAPL", order_symbol: "AAPL", asset_class: "equity",
               side: "short", available_quantity: "1", average_entry_price: "200",
               strategy_key: "baseline", account_id: "account-1",
@@ -868,10 +900,20 @@ test("exit review maps a short equity exit to buy-to-cover", async () => {
           };
         }
         if (statement.includes("INSERT INTO execution_reviews")) {
+          persistenceSql = statement;
+          persistenceValues = values ?? [];
           reviewOrderIntent = JSON.parse(String(values?.[9])) as Record<string, unknown>;
-          return { rows: [{ fence_held: true, inserted_count: 1 }], rowCount: 1 };
+          return {
+            rows: [{
+              fence_held: true,
+              inserted_count: 1,
+              review_count: 1,
+              confirmation_count: 1,
+              intent_count: 1
+            }],
+            rowCount: 1
+          };
         }
-        if (statement.includes("INSERT INTO order_intents")) intentValues = values ?? [];
         return { rows: [], rowCount: 1 };
       }
     },
@@ -882,7 +924,189 @@ test("exit review maps a short equity exit to buy-to-cover", async () => {
 
   assert.equal(result.status, "completed");
   assert.equal(reviewOrderIntent?.side, "buy");
-  assert.equal(intentValues[10], "buy");
+  assert.equal(reviewOrderIntent?.operation, "buy_to_cover");
+  assert.match(persistenceSql, /INSERT INTO confirmation_evidence/);
+  assert.match(persistenceSql, /INSERT INTO order_intents/);
+  assert.match(persistenceSql, /'ready_for_submission'/);
+  assert.equal(persistenceValues.includes("buy_to_cover"), true);
+  assert.equal(persistenceValues.includes("equity_short"), true);
+  assert.equal(persistenceValues.includes("position-short"), true);
+  assert.equal(persistenceValues.includes("intent-short-open"), true);
+  assert.equal(result.confirmationCreated, true);
+});
+
+test("exit review persists a long equity sell-to-close operation and opening lineage", async () => {
+  let reviewOrderIntent: Record<string, unknown> | undefined;
+  let persistenceValues: readonly unknown[] = [];
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:exit:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("FROM positions position")) {
+          return {
+            rows: [{
+              position_id: "position-long",
+              candidate_id: "candidate-long",
+              opening_intent_id: "intent-long-open",
+              opening_review_id: "review-long-open",
+              opening_order_id: "order-long-open",
+              opening_strategy_classification: "equity_long",
+              opening_authorization_snapshot_id: "snapshot-long-open",
+              symbol: "SPY",
+              order_symbol: "SPY",
+              asset_class: "equity",
+              side: "long",
+              available_quantity: "2",
+              average_entry_price: "500",
+              strategy_key: "baseline",
+              account_id: "account-1",
+              account_snapshot_id: "snapshot-1",
+              snapshot_fingerprint: "portfolio-fingerprint",
+              structural_fingerprint: "structural-fingerprint",
+              market_price: "550",
+              market_timestamp: "2026-07-20T21:59:30.000Z",
+              market_request_id: "sip-request"
+            }],
+            rowCount: 1
+          };
+        }
+        if (statement.includes("INSERT INTO execution_reviews")) {
+          reviewOrderIntent = JSON.parse(String(values?.[9])) as Record<string, unknown>;
+          persistenceValues = values ?? [];
+          return {
+            rows: [{
+              fence_held: true,
+              review_count: 1,
+              confirmation_count: 1,
+              intent_count: 1
+            }],
+            rowCount: 1
+          };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.status, "completed");
+  assert.equal(reviewOrderIntent?.side, "sell");
+  assert.equal(reviewOrderIntent?.operation, "sell_to_close");
+  assert.equal(persistenceValues.includes("sell_to_close"), true);
+  assert.equal(persistenceValues.includes("equity_long"), true);
+  assert.equal(persistenceValues.includes("position-long"), true);
+  assert.equal(persistenceValues.includes("intent-long-open"), true);
+  assert.equal(result.confirmationCreated, true);
+});
+
+test("exit source excludes closing positions and positions with an active close intent", async () => {
+  let sourceSql = "";
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:exit:review",
+    query: {
+      query: async (statement: string) => {
+        if (statement.includes("FROM positions position")) sourceSql = statement;
+        return { rows: [], rowCount: 0 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.status, "no_op");
+  assert.equal(result.code, "NO_POSTGRES_EXIT_TRIGGER");
+  assert.match(sourceSql, /position\.status = 'open'/);
+  assert.doesNotMatch(sourceSql, /position\.status IN \('open','closing'\)/);
+  assert.match(sourceSql, /close_intent\.parent_position_id = position\.id/);
+  assert.match(
+    sourceSql,
+    /close_intent\.lifecycle_state NOT IN \(\s*'closed','cancelled','rejected','expired','failed_terminal'\s*\)/
+  );
+});
+
+test("option exit retains the observed contract, open quantity cap, and immutable opening classification", async () => {
+  let reviewOrderIntent: Record<string, unknown> | undefined;
+  let persistenceValues: readonly unknown[] = [];
+  const symbol = "SPY270720P00500000";
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:exit:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("FROM positions position")) {
+          return {
+            rows: [{
+              ...observedExitOptionContract(symbol),
+              contract_id: `contract-${symbol}`,
+              contract_type: "put",
+              contract_expiration_date: "2027-07-20",
+              position_id: "position-option",
+              candidate_id: "candidate-option",
+              opening_intent_id: "intent-option-open",
+              opening_review_id: "review-option-open",
+              opening_order_id: "order-option-open",
+              opening_strategy_classification: "leaps_long_put",
+              opening_contract_id: `contract-${symbol}`,
+              opening_authorization_snapshot_id: "snapshot-option-open",
+              symbol: "SPY",
+              order_symbol: symbol,
+              asset_class: "option",
+              side: "long",
+              available_quantity: "2",
+              average_entry_price: "2.00",
+              strategy_key: "standard_option",
+              account_id: "account-1",
+              account_snapshot_id: "snapshot-1",
+              snapshot_fingerprint: "portfolio-fingerprint",
+              structural_fingerprint: "structural-fingerprint",
+              market_price: "0.90",
+              market_timestamp: "2026-07-20T21:59:30.000Z",
+              market_request_id: "opra-request",
+              market_evidence: {
+                bid: 0.90,
+                ask: 0.95,
+                spreadPct: 0.054,
+                underlyingPrice: 555,
+                volume: 500,
+                openInterest: 800,
+                requestedFeed: "opra",
+                effectiveFeed: "opra",
+                provider: "alpaca"
+              }
+            }],
+            rowCount: 1
+          };
+        }
+        if (statement.includes("INSERT INTO execution_reviews")) {
+          reviewOrderIntent = JSON.parse(String(values?.[9])) as Record<string, unknown>;
+          persistenceValues = values ?? [];
+          return {
+            rows: [{
+              fence_held: true,
+              review_count: 1,
+              confirmation_count: 1,
+              intent_count: 1
+            }],
+            rowCount: 1
+          };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.status, "completed");
+  assert.equal(reviewOrderIntent?.symbol, symbol);
+  assert.equal(reviewOrderIntent?.quantity, 2);
+  assert.equal(reviewOrderIntent?.operation, "sell_to_close");
+  assert.equal(persistenceValues.includes(`contract-${symbol}`), true);
+  assert.equal(persistenceValues.includes("leaps_long_put"), true);
+  assert.equal(persistenceValues.includes("intent-option-open"), true);
 });
 
 test("PostgreSQL exit review forces a genuine 0DTE long option exit in the final 30 minutes", async () => {
@@ -896,6 +1120,7 @@ test("PostgreSQL exit review forces a genuine 0DTE long option exit in the final
           return {
             rows: [{
               ...observedExitOptionContract("SPY260720C00555000"),
+              opening_strategy_classification: "zero_dte_long_call",
               position_id: "position-0dte", candidate_id: "candidate-0dte",
               symbol: "SPY", order_symbol: "SPY260720C00555000", asset_class: "option",
               side: "long", available_quantity: "1", average_entry_price: "1.00",
@@ -949,6 +1174,7 @@ test("PostgreSQL exit review applies the LEAPS full-profit trigger to a long-dat
           return {
             rows: [{
               ...observedExitOptionContract("SPY280121C00550000"),
+              opening_strategy_classification: "leaps_long_call",
               position_id: "position-leaps", candidate_id: "candidate-leaps",
               symbol: "SPY", order_symbol: "SPY280121C00550000", asset_class: "option",
               side: "long", available_quantity: "1", average_entry_price: "1.00",
@@ -1001,6 +1227,7 @@ test("PostgreSQL exit review applies the maintained LEAPS severe-trend trigger",
           return {
             rows: [{
               ...observedExitOptionContract("SPY280121C00550000"),
+              opening_strategy_classification: "leaps_long_call",
               position_id: "position-leaps-trend",
               candidate_id: "candidate-leaps-trend",
               symbol: "SPY",
@@ -1111,6 +1338,39 @@ test("option exit review rejects an unusable quote before persisting a close int
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO order_intents")), false);
 });
 
+test("option exit review preserves the stricter 15-minute executable quote gate", async () => {
+  const sql: string[] = [];
+  await assert.rejects(
+    runPostgresReviewWorkflow({
+      command: "paper:exit:review",
+      query: {
+        query: async (statement: string) => {
+          sql.push(statement);
+          if (statement.includes("FROM positions position")) {
+            return {
+              rows: [repeatedExitSource(
+                "0.50",
+                "2026-07-22T16:44:59.000Z"
+              )],
+              rowCount: 1
+            };
+          }
+          return { rows: [], rowCount: 1 };
+        }
+      },
+      fence,
+      signingKey: "test-signing-key-with-sufficient-length",
+      maxMarketAgeSeconds: 1_800,
+      now: new Date("2026-07-22T17:00:00.000Z")
+    }),
+    /POSTGRES_REVIEW_MARKET_EVIDENCE_STALE:SPY/
+  );
+  assert.equal(
+    sql.some((statement) => statement.includes("INSERT INTO execution_reviews")),
+    false
+  );
+});
+
 const repeatedExitSource = (marketPrice: string, marketTimestamp: string) => ({
   position_id: "position-repeated-exit", candidate_id: null,
   symbol: "SPY", order_symbol: "SPY260722P00748000", asset_class: "option",
@@ -1196,6 +1456,9 @@ test("repeated exit evidence for one position and account snapshot is an idempot
       }
       if (statement.includes("INSERT INTO execution_reviews")) {
         reviewInserts += 1;
+        if (reviewInserts === 1 && statement.includes("INSERT INTO order_intents")) {
+          intentInserts += 1;
+        }
         if (reviewInserts === 2) {
           if (!/ON CONFLICT \(account_id, client_order_id\)[\s\S]*DO NOTHING/.test(statement)) {
             const error = new Error(
@@ -1207,10 +1470,6 @@ test("repeated exit evidence for one position and account snapshot is an idempot
           return { rows: [{ fence_held: true, inserted_count: 0 }], rowCount: 1 };
         }
         return { rows: [{ fence_held: true, inserted_count: 1 }], rowCount: 1 };
-      }
-      if (statement.includes("INSERT INTO order_intents")) {
-        intentInserts += 1;
-        return { rows: [], rowCount: 1 };
       }
       return { rows: [], rowCount: 0 };
     }

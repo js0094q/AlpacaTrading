@@ -529,6 +529,22 @@ describe("paper exit review equities", () => {
     assert.equal(result.exitCandidates[0]?.reason, "EQUITY_TAKE_PROFIT_8");
   });
 
+  test("a short equity exit creates an explicit buy-to-cover payload", async () => {
+    const result = await reviewWith([
+      equityPosition({
+        side: "short",
+        qty: "-2",
+        qty_available: "2",
+        unrealized_pl: "-20.00",
+        unrealized_plpc: "-0.06"
+      })
+    ]);
+
+    assert.equal(result.exitCandidates[0]?.orderPayload.side, "buy");
+    assert.equal(result.exitCandidates[0]?.orderPayload.operation, "buy_to_cover");
+    assert.equal(result.exitCandidates[0]?.orderPayload.qty, "2");
+  });
+
   test("equity within thresholds is skipped", async () => {
     const result = await reviewWith([
       equityPosition({ unrealized_pl: "10.00", unrealized_plpc: "0.01" })
@@ -689,6 +705,42 @@ describe("paper exit execution guardrails", () => {
     assert.equal(submitted.length, 1);
     assert.equal(submitted[0]?.symbol, "SPY260707C00750000");
     assert.equal(submitted[0]?.position_intent, "sell_to_close");
+  });
+
+  test("legacy exit execution maps an already validated buy-to-cover operation to Alpaca buy", async () => {
+    process.env.PAPER_ORDER_EXECUTION_ENABLED = "true";
+    const submitted: AlpacaPaperOrderRequest[] = [];
+    const shortCoverCandidate = executionCandidate({
+      assetClass: "us_equity",
+      symbol: "AAPL",
+      positionClass: "equity",
+      orderPayload: {
+        ...executionCandidate().orderPayload,
+        assetClass: "us_equity",
+        symbol: "AAPL",
+        side: "buy" as never,
+        operation: "buy_to_cover" as never,
+        orderType: "market",
+        clientOrderId: "paper-exit-equity-AAPL-20260707150000-1"
+      }
+    });
+    const result = await buildPaperExitExecutionResult({ confirmPaper: true }, {
+      buildReview: async () => reviewResult({
+        exitCandidates: [shortCoverCandidate]
+      }),
+      submitPaperOrder: async (payload) => {
+        submitted.push(payload);
+        return response({
+          id: "short-cover-order-1",
+          client_order_id: payload.client_order_id,
+          status: "accepted"
+        }, "short-cover-request-id");
+      }
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(submitted[0]?.side, "buy");
+    assert.equal(submitted[0]?.position_intent, undefined);
   });
 
   test("execution never sells LEAPS unless includeLEAPS is explicit", async () => {
