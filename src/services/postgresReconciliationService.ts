@@ -268,8 +268,8 @@ const syncBrokerAccountAndPositions = async (input: {
          unrealized_pnl, source_account_snapshot_id, opened_at,
          last_reconciled_at, created_at, updated_at
        ) SELECT $1, $2, $3, $4, $5, NULL, $6, $7, $8, $9, $10, 'open',
-                $11, $12, $13, $14, $15, $16, $17, $18, $19, $19, $19, $19
-         WHERE ${fenceSql(20)}
+                $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $20, $20
+         WHERE ${fenceSql(21)}
        ON CONFLICT (account_id, broker_position_key) DO UPDATE SET
          candidate_id = CASE
            WHEN positions.status = 'closed' THEN EXCLUDED.candidate_id
@@ -321,6 +321,7 @@ const syncBrokerAccountAndPositions = async (input: {
         position.unrealizedPnl,
         accountSnapshotId,
         openingFilledAt,
+        snapshot.capturedAt,
         ...fenceValues(input.fence)
       ]
     );

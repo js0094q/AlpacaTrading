@@ -535,7 +535,8 @@ test("position reconciliation carries matching filled entry lineage through a sa
           return {
             rows: [{
               candidate_id: "candidate-autonomous-1",
-              opening_order_id: "order-entry-1"
+              opening_order_id: "order-entry-1",
+              opening_filled_at: "2026-07-20T21:59:58.000Z"
             }],
             rowCount: 1
           };
@@ -609,7 +610,13 @@ test("position reconciliation carries matching filled entry lineage through a sa
   assert.ok(positionInsert);
   assert.equal(positionInsert.values[3], "candidate-autonomous-1");
   assert.equal(positionInsert.values[4], "order-entry-1");
+  assert.equal(positionInsert.values[18], "2026-07-20T21:59:58.000Z");
+  assert.equal(positionInsert.values[19], "2026-07-20T22:00:00.000Z");
   assert.match(positionInsert.sql, /ON CONFLICT \(account_id, broker_position_key\)/);
+  assert.match(
+    positionInsert.sql,
+    /opened_at,\s*last_reconciled_at, created_at, updated_at[\s\S]*\$19,\s*\$20,\s*\$20,\s*\$20/
+  );
   assert.match(
     positionInsert.sql,
     /candidate_id = CASE[\s\S]*positions\.status = 'closed'[\s\S]*EXCLUDED\.candidate_id[\s\S]*COALESCE\(positions\.candidate_id, EXCLUDED\.candidate_id\)/
