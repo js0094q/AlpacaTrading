@@ -142,7 +142,11 @@ BEGIN
   IF NEW.from_state IS NOT NULL AND EXISTS (
     SELECT 1
     FROM (VALUES
+      ('candidate_created','failed_terminal'),
+      ('review_created','failed_terminal'),
+      ('confirmed','failed_terminal'),
       ('submission_ambiguous','broker_order_discovered'),
+      ('submission_ambiguous','failed_terminal'),
       ('broker_order_discovered','cancelled'),
       ('broker_order_accepted','cancelled'),
       ('broker_order_accepted','rejected'),
@@ -150,7 +154,10 @@ BEGIN
       ('partially_filled','cancelled'),
       ('partially_filled','rejected'),
       ('partially_filled','expired'),
+      ('filled','exit_evaluated'),
+      ('exit_evaluated','closed'),
       ('exit_submission_ambiguous','exit_broker_order_discovered'),
+      ('exit_submission_ambiguous','failed_terminal'),
       ('exit_broker_order_discovered','cancelled'),
       ('exit_partially_filled','cancelled'),
       ('exit_partially_filled','rejected'),

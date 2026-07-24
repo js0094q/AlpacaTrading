@@ -206,6 +206,10 @@ const transitions: Readonly<Record<AutonomousTradeLifecycleState, readonly Auton
   expired: [],
   failed_terminal: []
 };
+export const AUTONOMOUS_TRADE_LIFECYCLE_EDGES = AUTONOMOUS_TRADE_LIFECYCLE_STATES
+  .flatMap((fromState) =>
+    transitions[fromState].map((toState) => `${fromState}->${toState}`)
+  );
 export const validateLifecycleTransition = (from: AutonomousTradeLifecycleState | string, to: AutonomousTradeLifecycleState | string): void => { if (!(transitions[from as AutonomousTradeLifecycleState]?.includes(to as AutonomousTradeLifecycleState))) throw new Error(`INVALID_LIFECYCLE_TRANSITION:${from}->${to}`); };
 export const isTerminalLifecycleState = (state: AutonomousTradeLifecycleState) => ["closed", "cancelled", "rejected", "expired", "failed_terminal"].includes(state);
 

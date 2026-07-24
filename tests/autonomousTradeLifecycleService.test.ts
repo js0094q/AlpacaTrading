@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
+  AUTONOMOUS_TRADE_LIFECYCLE_EDGES,
   AUTONOMOUS_TRADE_LIFECYCLE_STATES,
   DomainInvariantError,
   STRATEGY_CLASSIFICATIONS,
@@ -495,4 +496,30 @@ test("migration 006 contains durable lifecycle lineage and terminal transition t
       );
     }
   }
+});
+
+test("migration 006 and TypeScript enforce the complete identical lifecycle graph", async () => {
+  const sql = await readFile(
+    new URL(
+      "../src/lib/database/migrations/006_autonomous_trade_lifecycle.sql",
+      import.meta.url
+    ),
+    "utf8"
+  );
+  const lifecycleStates = new Set<string>(AUTONOMOUS_TRADE_LIFECYCLE_STATES);
+  const sqlEdges = new Set(
+    [...sql.matchAll(/\('([a-z_]+)'\s*,\s*'([a-z_]+)'\)/g)]
+      .filter((match) =>
+        lifecycleStates.has(match[1]!) && lifecycleStates.has(match[2]!)
+      )
+      .map((match) => `${match[1]}->${match[2]}`)
+  );
+  const typescriptEdges = new Set(AUTONOMOUS_TRADE_LIFECYCLE_EDGES);
+
+  assert.equal(typescriptEdges.size, 72);
+  assert.equal(sqlEdges.size, 72);
+  assert.deepEqual(
+    [...sqlEdges].sort(),
+    [...typescriptEdges].sort()
+  );
 });
