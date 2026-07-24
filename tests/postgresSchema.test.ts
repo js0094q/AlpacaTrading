@@ -65,10 +65,6 @@ const poolWith = (options: {
           tableName: "order_intents",
           indexdef: "CREATE INDEX order_intents_autonomous_cycle_idx ON order_intents (autonomous_cycle_id, workstream_execution_id, created_at DESC)"
         },
-        order_intents_cycle_workstream_idx: {
-          tableName: "order_intents",
-          indexdef: "CREATE INDEX order_intents_cycle_workstream_idx ON order_intents (autonomous_cycle_id, workstream_execution_id, created_at DESC)"
-        },
         autonomous_trade_lifecycle_transitions_intent_idx: {
           tableName: "autonomous_trade_lifecycle_transitions",
           indexdef: "CREATE INDEX autonomous_trade_lifecycle_transitions_intent_idx ON autonomous_trade_lifecycle_transitions (order_intent_id, occurred_at DESC)"

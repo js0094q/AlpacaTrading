@@ -17,27 +17,75 @@ ALTER TABLE order_intents
   ADD COLUMN IF NOT EXISTS quantity text,
   ADD COLUMN IF NOT EXISTS limit_price text;
 
--- Ambiguous historical values fail closed instead of being guessed.
-UPDATE order_intents SET lifecycle_state = CASE
-  WHEN status = 'created' THEN 'candidate_created'
-  WHEN status IN ('ready_for_submission', 'submission_pending') THEN 'ready_for_submission'
-  WHEN status = 'submitted' THEN 'broker_order_accepted'
-  WHEN status = 'reconciled' THEN 'position_reconciled'
-  WHEN status = 'cancelled' THEN 'cancelled'
-  WHEN status = 'failed' THEN 'failed_terminal'
+-- Ambiguous historical values fail closed instead of being guessed. A submitted
+-- intent is only marked discovered when a durable broker identifier exists.
+UPDATE order_intents AS intent SET lifecycle_state = CASE
+  WHEN intent.status = 'created' THEN 'review_created'
+  WHEN intent.status = 'ready_for_submission' THEN 'ready_for_submission'
+  WHEN intent.status = 'submission_pending' THEN 'submission_attempt_persisted'
+  WHEN intent.status = 'ambiguous' THEN 'submission_ambiguous'
+  WHEN intent.status = 'submitted' AND EXISTS (
+    SELECT 1 FROM orders AS broker_order
+    WHERE broker_order.order_intent_id = intent.id
+      AND broker_order.broker_order_id IS NOT NULL
+  ) THEN 'broker_order_discovered'
+  WHEN intent.status = 'submitted' THEN 'submission_ambiguous'
+  WHEN intent.status = 'reconciled' AND EXISTS (
+    SELECT 1 FROM orders AS broker_order
+    WHERE broker_order.order_intent_id = intent.id
+      AND broker_order.status = 'filled'
+  ) THEN 'filled'
+  WHEN intent.status = 'reconciled' AND EXISTS (
+    SELECT 1 FROM orders AS broker_order
+    WHERE broker_order.order_intent_id = intent.id
+      AND broker_order.status IN ('canceled', 'cancelled')
+  ) THEN 'cancelled'
+  WHEN intent.status = 'cancelled' THEN 'cancelled'
+  WHEN intent.status = 'failed' THEN 'failed_terminal'
   ELSE 'failed_terminal' END
-WHERE lifecycle_state IS NULL;
-UPDATE order_intents SET operation = CASE
-  WHEN side IN ('buy_to_open', 'sell_to_open', 'sell_to_close', 'buy_to_cover') THEN side
+WHERE intent.lifecycle_state IS NULL;
+
+UPDATE order_intents AS intent
+SET operation = CASE
+  WHEN intent.side = 'buy_to_open' THEN 'buy_to_open'
+  WHEN intent.side = 'sell_to_close' THEN 'sell_to_close'
+  WHEN review.review_type = 'entry' AND intent.side = 'sell' THEN 'sell_to_open'
+  WHEN review.review_type = 'entry' AND intent.side = 'buy' THEN 'buy_to_open'
+  WHEN review.review_type = 'exit' AND intent.side = 'sell' THEN 'sell_to_close'
+  WHEN review.review_type = 'exit' AND intent.side = 'buy' THEN 'buy_to_cover'
   ELSE NULL END
-WHERE operation IS NULL;
-UPDATE order_intents SET strategy_classification = CASE
-  WHEN asset_class = 'equity' AND request_payload->>'position_intent' = 'short' THEN 'equity_short'
-  WHEN asset_class = 'equity' THEN 'equity_long'
-  WHEN asset_class = 'option' AND request_payload->>'option_type' = 'call' THEN 'standard_long_call'
-  WHEN asset_class = 'option' AND request_payload->>'option_type' = 'put' THEN 'standard_long_put'
+FROM execution_reviews AS review
+WHERE review.id = intent.execution_review_id
+  AND intent.operation IS NULL;
+
+UPDATE order_intents AS intent
+SET strategy_classification = CASE
+  WHEN candidate.direction = 'short' THEN 'equity_short'
+  WHEN candidate.direction = 'long' THEN 'equity_long'
   ELSE NULL END
-WHERE strategy_classification IS NULL;
+FROM candidates AS candidate
+WHERE candidate.id = intent.candidate_id
+  AND intent.asset_class = 'equity'
+  AND intent.strategy_classification IS NULL;
+
+UPDATE order_intents AS intent
+SET contract_id = COALESCE(intent.contract_id, contract.contract_id, contract.option_symbol),
+    strategy_classification = CASE
+      WHEN contract.expiration_date = intent.created_at::date AND contract.type = 'call'
+        THEN 'zero_dte_long_call'
+      WHEN contract.expiration_date = intent.created_at::date AND contract.type = 'put'
+        THEN 'zero_dte_long_put'
+      WHEN contract.expiration_date >= intent.created_at::date + 365 AND contract.type = 'call'
+        THEN 'leaps_long_call'
+      WHEN contract.expiration_date >= intent.created_at::date + 365 AND contract.type = 'put'
+        THEN 'leaps_long_put'
+      WHEN contract.type = 'call' THEN 'standard_long_call'
+      WHEN contract.type = 'put' THEN 'standard_long_put'
+      ELSE NULL END
+FROM option_contracts AS contract
+WHERE contract.option_symbol = intent.symbol
+  AND intent.asset_class = 'option'
+  AND intent.strategy_classification IS NULL;
 
 DO $$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'order_intents_operation_contract') THEN

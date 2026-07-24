@@ -92,6 +92,12 @@ test("migration 006 contains durable lifecycle lineage and terminal transition t
   assert.match(sql, /INVALID_LIFECYCLE_TRANSITION/i);
   assert.match(sql, /reservation_release_reason_contract/i);
   assert.match(sql, /reservation_terminal_transitions_append_only/i);
+  assert.doesNotMatch(
+    sql,
+    /WHEN\s+status\s*=\s*'submitted'\s+THEN\s+'broker_order_accepted'/i
+  );
+  assert.match(sql, /FROM\s+option_contracts/i);
+  assert.match(sql, /expiration_date/i);
   assert.match(sql, /CREATE TABLE(?: IF NOT EXISTS)? autonomous_trade_lifecycle_transitions/i);
   assert.match(sql, /append-only|ON CONFLICT/i);
   assert.match(sql, /CREATE TABLE(?: IF NOT EXISTS)? reservation_terminal_transitions/i);

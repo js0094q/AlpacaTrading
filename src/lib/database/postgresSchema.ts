@@ -111,7 +111,6 @@ export const POSTGRES_OPERATIONAL_INDEXES = [
   "lifecycle_fingerprints_intent_idx",
   "order_intents_lifecycle_state_idx",
   "order_intents_autonomous_cycle_idx",
-  "order_intents_cycle_workstream_idx",
   "autonomous_trade_lifecycle_transitions_intent_idx"
 ] as const;
 
@@ -236,7 +235,6 @@ const release3ConstraintDefinitions: Readonly<
 const autonomousIndexDefinitions: Readonly<Record<string, { readonly table: string; readonly unique: boolean; readonly fragments: readonly string[] }>> = {
   order_intents_lifecycle_state_idx: { table: "order_intents", unique: false, fragments: ["(lifecycle_state, updated_at"] },
   order_intents_autonomous_cycle_idx: { table: "order_intents", unique: false, fragments: ["(autonomous_cycle_id, workstream_execution_id"] },
-  order_intents_cycle_workstream_idx: { table: "order_intents", unique: false, fragments: ["(autonomous_cycle_id, workstream_execution_id"] },
   autonomous_trade_lifecycle_transitions_intent_idx: { table: "autonomous_trade_lifecycle_transitions", unique: false, fragments: ["(order_intent_id, occurred_at"] }
 };
 const autonomousConstraintDefinitions: Readonly<Record<string, { readonly table: string; readonly fragments: readonly string[] }>> = {
