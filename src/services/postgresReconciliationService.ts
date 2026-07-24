@@ -958,7 +958,11 @@ export const reconcilePostgresPaperOrders = async (input: {
                last_broker_update_at = EXCLUDED.last_broker_update_at,
                raw_status = EXCLUDED.raw_status,
                version = orders.version + 1,
-               updated_at = EXCLUDED.updated_at
+               updated_at = GREATEST(
+                 orders.updated_at,
+                 orders.created_at,
+                 EXCLUDED.updated_at
+               )
              RETURNING id
            ), partial_reservation AS (
              UPDATE buying_power_reservations reservation
@@ -1169,7 +1173,11 @@ export const reconcilePostgresPaperOrders = async (input: {
                last_broker_update_at = EXCLUDED.last_broker_update_at,
                raw_status = EXCLUDED.raw_status,
                version = orders.version + 1,
-               updated_at = EXCLUDED.updated_at
+               updated_at = GREATEST(
+                 orders.updated_at,
+                 orders.created_at,
+                 EXCLUDED.updated_at
+               )
              RETURNING id
            ), lifecycle_transition AS (
              INSERT INTO autonomous_trade_lifecycle_transitions(
@@ -1306,7 +1314,20 @@ export const reconcilePostgresPaperOrders = async (input: {
           `${target.reservation_id}:${reservationTerminalState}`
         )}`;
         const reservation = await input.query.query(
-          `WITH existing_transition AS MATERIALIZED (
+          `WITH current_order_intent AS MATERIALIZED (
+             SELECT current_intent.id, current_intent.status,
+                    current_intent.lifecycle_state, current_intent.created_at
+             FROM order_intents current_intent
+             WHERE current_intent.id = $2
+               AND current_intent.status = 'reconciled'
+               AND current_intent.lifecycle_state = $13
+               AND ${fenceSql(8)}
+             FOR SHARE
+           ), lifecycle_cutover AS MATERIALIZED (
+             SELECT migration.applied_at
+             FROM schema_migrations migration
+             WHERE migration.version = 6
+           ), existing_transition AS MATERIALIZED (
              SELECT transition.id
              FROM reservation_terminal_transitions transition
              WHERE transition.reservation_id = $1
@@ -1320,8 +1341,8 @@ export const reconcilePostgresPaperOrders = async (input: {
              FROM buying_power_reservations reservation
              WHERE reservation.id = $1
                AND reservation.status IN ('active', 'committed')
+               AND EXISTS (SELECT 1 FROM current_order_intent)
                AND NOT EXISTS (SELECT 1 FROM existing_transition)
-               AND ${fenceSql(8)}
              FOR UPDATE
            ), locked_allocation AS MATERIALIZED (
              SELECT allocation.id, allocation.account_id,
@@ -1332,18 +1353,36 @@ export const reconcilePostgresPaperOrders = async (input: {
               AND reservation.strategy_key = allocation.strategy_key
              WHERE allocation.status = 'active'
                AND allocation.effective_to IS NULL
-               AND allocation.reserved_amount >= reservation.amount
              FOR UPDATE
+           ), settlement_candidate AS MATERIALIZED (
+             SELECT reservation.id, reservation.account_id,
+                    reservation.strategy_key, reservation.amount,
+                    'fresh'::text AS settlement_kind
+             FROM locked_reservation reservation
+             JOIN locked_allocation allocation
+               ON allocation.account_id = reservation.account_id
+              AND allocation.strategy_key = reservation.strategy_key
+             WHERE allocation.reserved_amount >= reservation.amount
+             UNION ALL
+             SELECT reservation.id, reservation.account_id,
+                    reservation.strategy_key, reservation.amount,
+                    'legacy_unrepresented'::text AS settlement_kind
+             FROM locked_reservation reservation
+             JOIN locked_allocation allocation
+               ON allocation.account_id = reservation.account_id
+              AND allocation.strategy_key = reservation.strategy_key
+             CROSS JOIN current_order_intent
+             CROSS JOIN lifecycle_cutover
+             WHERE allocation.reserved_amount = 0
+               AND reservation.amount > 0
+               AND current_order_intent.created_at < lifecycle_cutover.applied_at
            ), terminal_transition AS (
              INSERT INTO reservation_terminal_transitions(
                id, reservation_id, order_intent_id, terminal_state,
                release_reason, idempotency_key, occurred_at
              )
-             SELECT $6, reservation.id, $2, $4, $5, $7, $3
-             FROM locked_reservation reservation
-             JOIN locked_allocation allocation
-               ON allocation.account_id = reservation.account_id
-              AND allocation.strategy_key = reservation.strategy_key
+             SELECT $6, settlement.id, $2, $4, $5, $7, $3
+             FROM settlement_candidate settlement
              ON CONFLICT (reservation_id) DO NOTHING
              RETURNING reservation_id
            ), released AS (
@@ -1355,7 +1394,7 @@ export const reconcilePostgresPaperOrders = async (input: {
              WHERE reservation.id = transition.reservation_id
                AND reservation.status IN ('active', 'committed')
              RETURNING reservation.account_id, reservation.strategy_key,
-                       reservation.amount
+                       reservation.id, reservation.amount
            ), adjusted AS (
              UPDATE strategy_allocations allocation
              SET reserved_amount = GREATEST(0, allocation.reserved_amount - released.amount),
@@ -1363,17 +1402,28 @@ export const reconcilePostgresPaperOrders = async (input: {
                    CASE WHEN $4 = 'filled' THEN released.amount ELSE 0 END,
                  updated_at = $3, version = allocation.version + 1
              FROM released
+             JOIN settlement_candidate settlement
+               ON settlement.id = released.id
              WHERE allocation.account_id = released.account_id
                AND allocation.strategy_key = released.strategy_key
                AND allocation.status = 'active' AND allocation.effective_to IS NULL
+               AND settlement.settlement_kind = 'fresh'
              RETURNING allocation.id
+           ), legacy_settlement AS (
+             SELECT released.id
+             FROM released
+             JOIN settlement_candidate settlement
+               ON settlement.id = released.id
+             WHERE settlement.settlement_kind = 'legacy_unrepresented'
            )
            SELECT
              (SELECT COUNT(*) FROM released)::text AS released_reservation_count,
              (SELECT COUNT(*) FROM adjusted)::text AS adjusted_allocation_count,
              (SELECT COUNT(*) FROM terminal_transition)::text AS terminal_transition_count,
              (SELECT COUNT(*) FROM existing_transition)::text
-               AS existing_terminal_transition_count`,
+               AS existing_terminal_transition_count,
+             (SELECT COUNT(*) FROM legacy_settlement)::text
+               AS legacy_settlement_count`,
           [
             target.reservation_id,
             target.order_intent_id,
@@ -1382,7 +1432,8 @@ export const reconcilePostgresPaperOrders = async (input: {
             reservationReleaseReason,
             terminalTransitionId,
             `${target.order_intent_id}:${reservationTerminalState}`,
-            ...fenceValues(input.fence)
+            ...fenceValues(input.fence),
+            lifecycleState
           ]
         );
         const releasedCount = Number(
@@ -1397,18 +1448,30 @@ export const reconcilePostgresPaperOrders = async (input: {
         const existingTerminalTransitionCount = Number(
           reservation.rows[0]?.existing_terminal_transition_count ?? 0
         );
+        const legacySettlementCount = Number(
+          reservation.rows[0]?.legacy_settlement_count ?? 0
+        );
         const freshSettlement =
           releasedCount === 1 &&
           adjustedCount === 1 &&
           terminalTransitionCount === 1 &&
-          existingTerminalTransitionCount === 0;
+          existingTerminalTransitionCount === 0 &&
+          legacySettlementCount === 0;
+        const legacySettlement =
+          releasedCount === 1 &&
+          adjustedCount === 0 &&
+          terminalTransitionCount === 1 &&
+          existingTerminalTransitionCount === 0 &&
+          legacySettlementCount === 1;
         const replayedSettlement =
           releasedCount === 0 &&
           adjustedCount === 0 &&
           terminalTransitionCount === 0 &&
-          existingTerminalTransitionCount === 1;
+          existingTerminalTransitionCount === 1 &&
+          legacySettlementCount === 0;
         if (
           !freshSettlement &&
+          !legacySettlement &&
           !replayedSettlement
         ) {
           throw new Error("POSTGRES_RECONCILIATION_RESERVATION_RELEASE_FAILED");
