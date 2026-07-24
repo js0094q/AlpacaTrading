@@ -253,13 +253,30 @@ export const runAutonomousPostgresRecovery = async (
                AND (SELECT outcome = 'ok' FROM validation)
                AND ${fenceSqlAt(3)}
              RETURNING intent.id, intent.account_id, intent.reservation_id
+           ), terminal_transition AS (
+             INSERT INTO reservation_terminal_transitions(
+               id, reservation_id, order_intent_id, terminal_state,
+               release_reason, idempotency_key, occurred_at
+             )
+             SELECT 'reservation_transition_' || encode(sha256(convert_to(
+                      concat_ws('|', reservation.id, cancelled.id, 'cancelled',
+                        'stale_intent_recovery'), 'UTF8')), 'hex'),
+                    reservation.id, cancelled.id, 'cancelled',
+                    'stale_intent_recovery',
+                    cancelled.id || ':stale_intent_recovery', $2
+             FROM locked_reservation reservation
+             JOIN cancelled ON cancelled.reservation_id = reservation.id
+             ON CONFLICT (reservation_id) DO NOTHING
+             RETURNING reservation_id
            ), released AS (
              UPDATE buying_power_reservations reservation
              SET status = 'released', released_at = $2,
-                 release_reason = 'STALE_READY_INTENT_RECOVERY',
+                 release_reason = 'stale_intent_recovery',
                  updated_at = $2, version = reservation.version + 1
              FROM cancelled
-             WHERE reservation.id = cancelled.reservation_id
+             JOIN terminal_transition transition
+               ON transition.reservation_id = cancelled.reservation_id
+             WHERE reservation.id = transition.reservation_id
                AND reservation.status IN ('active', 'committed')
                AND (SELECT outcome = 'ok' FROM validation)
                AND ${fenceSqlAt(3)}
@@ -277,7 +294,9 @@ export const runAutonomousPostgresRecovery = async (
              RETURNING allocation.id
            )
            SELECT (SELECT outcome FROM validation) AS outcome,
+                  (SELECT COUNT(*) FROM locked_reservation)::text AS locked_reservation_count,
                   (SELECT COUNT(*) FROM cancelled)::text AS cancelled_count,
+                  (SELECT COUNT(*) FROM terminal_transition)::text AS terminal_transition_count,
                   (SELECT COUNT(*) FROM released)::text AS released_count,
                   (SELECT COUNT(*) FROM adjusted)::text AS adjusted_count`,
           [row.id, now.toISOString(), ...values.slice(1)]
@@ -288,7 +307,31 @@ export const runAutonomousPostgresRecovery = async (
         if (Number(cancelled.rows[0]?.cancelled_count ?? 0) !== 1) continue;
         const releasedCount = Number(cancelled.rows[0]?.released_count ?? 0);
         const adjustedCount = Number(cancelled.rows[0]?.adjusted_count ?? 0);
-        if (releasedCount > 0 && adjustedCount !== releasedCount) {
+        const lockedReservationCount = Number(
+          cancelled.rows[0]?.locked_reservation_count ?? 0
+        );
+        const terminalTransitionCount = Number(
+          cancelled.rows[0]?.terminal_transition_count ?? 0
+        );
+        if (
+          lockedReservationCount > 1 ||
+          (
+            lockedReservationCount === 1 &&
+            (
+              releasedCount !== 1 ||
+              adjustedCount !== 1 ||
+              terminalTransitionCount !== 1
+            )
+          ) ||
+          (
+            lockedReservationCount === 0 &&
+            (
+              releasedCount !== 0 ||
+              adjustedCount !== 0 ||
+              terminalTransitionCount !== 0
+            )
+          )
+        ) {
           throw new Error("POSTGRES_STALE_READY_RESERVATION_RELEASE_FAILED");
         }
         staleReadyCancelled += 1;
@@ -310,7 +353,14 @@ export const runAutonomousPostgresRecovery = async (
   const reservations = await query.query(
     `WITH locked_reservations AS MATERIALIZED (
        SELECT reservation.id, reservation.account_id, reservation.strategy_key,
-              reservation.amount
+              reservation.amount,
+              (
+                SELECT intent.id
+                FROM order_intents intent
+                WHERE intent.reservation_id = reservation.id
+                ORDER BY intent.created_at DESC, intent.id DESC
+                LIMIT 1
+              ) AS order_intent_id
        FROM buying_power_reservations reservation
        WHERE reservation.status = 'active' AND reservation.expires_at <= $1
          AND ${fenceSql}
@@ -342,10 +392,28 @@ export const runAutonomousPostgresRecovery = async (
             OR grouped.allocation_reserved < grouped.expired_sum
        ) > 0 THEN 'mismatch' ELSE 'ok' END AS outcome
        FROM grouped
+     ), terminal_transitions AS (
+       INSERT INTO reservation_terminal_transitions(
+         id, reservation_id, order_intent_id, terminal_state,
+         release_reason, idempotency_key, occurred_at
+       )
+       SELECT 'reservation_transition_' || encode(sha256(convert_to(
+                concat_ws('|', reservation.id, 'expired',
+                  'stale_intent_recovery'), 'UTF8')), 'hex'),
+              reservation.id, reservation.order_intent_id, 'expired',
+              'stale_intent_recovery',
+              reservation.id || ':stale_intent_recovery', $1
+       FROM locked_reservations reservation, validation
+       WHERE validation.outcome = 'ok'
+       ON CONFLICT (reservation_id) DO NOTHING
+       RETURNING reservation_id
      ), totals AS (
-       SELECT account_id, strategy_key, SUM(amount) AS amount
-       FROM locked_reservations
-       GROUP BY account_id, strategy_key
+       SELECT reservation.account_id, reservation.strategy_key,
+              SUM(reservation.amount) AS amount
+       FROM locked_reservations reservation
+       JOIN terminal_transitions transition
+         ON transition.reservation_id = reservation.id
+       GROUP BY reservation.account_id, reservation.strategy_key
      ), allocation_updates AS (
        UPDATE strategy_allocations allocation
        SET reserved_amount = allocation.reserved_amount - totals.amount,
@@ -360,20 +428,35 @@ export const runAutonomousPostgresRecovery = async (
        RETURNING allocation.id
      ), expired AS (
        UPDATE buying_power_reservations reservation
-       SET status = 'expired', released_at = $1, release_reason = 'expired',
+       SET status = 'expired', released_at = $1,
+           release_reason = 'stale_intent_recovery',
            updated_at = $1, version = version + 1
-       FROM locked_reservations locked, validation
+       FROM locked_reservations locked
+       JOIN terminal_transitions transition
+         ON transition.reservation_id = locked.id,
+         validation
        WHERE reservation.id = locked.id
          AND validation.outcome = 'ok'
          AND reservation.status = 'active' AND reservation.expires_at <= $1
+         AND EXISTS (
+           SELECT 1
+           FROM allocation_updates updated
+           JOIN locked_allocations allocation ON allocation.id = updated.id
+           WHERE allocation.account_id = locked.account_id
+             AND allocation.strategy_key = locked.strategy_key
+         )
          AND ${fenceSql}
        RETURNING reservation.id
      )
      SELECT validation.outcome,
+            (SELECT COUNT(*) FROM locked_reservations)::text
+              AS locked_reservation_count,
+            (SELECT COUNT(*) FROM terminal_transitions)::text
+              AS terminal_transition_count,
             (SELECT COUNT(*) FROM expired)::text AS expired_reservation_count
      FROM validation
      UNION ALL
-     SELECT 'ok', '0'
+     SELECT 'ok', '0', '0', '0'
      WHERE NOT EXISTS (SELECT 1 FROM validation)`,
     values
   );
@@ -382,6 +465,18 @@ export const runAutonomousPostgresRecovery = async (
     throw new Error("POSTGRES_RECOVERY_RESERVATION_ALLOCATION_MISMATCH");
   }
   const expiredReservationCount = Number(reservations.rows[0]?.expired_reservation_count ?? 0);
+  const lockedReservationCount = Number(
+    reservations.rows[0]?.locked_reservation_count ?? 0
+  );
+  const terminalTransitionCount = Number(
+    reservations.rows[0]?.terminal_transition_count ?? 0
+  );
+  if (
+    expiredReservationCount !== lockedReservationCount ||
+    terminalTransitionCount !== lockedReservationCount
+  ) {
+    throw new Error("POSTGRES_RECOVERY_RESERVATION_TERMINAL_TRANSITION_FAILED");
+  }
   if (!Number.isSafeInteger(expiredReservationCount) || expiredReservationCount < 0) {
     throw new Error("POSTGRES_RECOVERY_RESERVATION_ALLOCATION_MISMATCH");
   }

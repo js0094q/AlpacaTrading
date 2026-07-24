@@ -116,7 +116,58 @@ export interface AutonomousTradeLifecycleService {
 }
 
 const transitions: Readonly<Record<AutonomousTradeLifecycleState, readonly AutonomousTradeLifecycleState[]>> = {
-  candidate_created: ["review_created", "failed_terminal"], review_created: ["confirmed", "failed_terminal"], confirmed: ["ready_for_submission", "failed_terminal"], ready_for_submission: ["submission_attempt_persisted", "cancel_requested"], submission_attempt_persisted: ["submission_ambiguous", "broker_order_discovered", "cancelled", "rejected", "expired", "cancel_requested"], submission_ambiguous: ["broker_order_discovered", "failed_terminal"], broker_order_discovered: ["broker_order_accepted", "rejected", "expired"], broker_order_accepted: ["partially_filled", "filled", "cancel_requested"], partially_filled: ["filled", "position_reconciled", "cancel_requested"], filled: ["position_reconciled", "exit_evaluated"], position_reconciled: ["exit_evaluated"], exit_evaluated: ["exit_review_created", "closed"], exit_review_created: ["exit_confirmed"], exit_confirmed: ["exit_ready_for_submission"], exit_ready_for_submission: ["exit_submission_attempt_persisted", "cancel_requested"], exit_submission_attempt_persisted: ["exit_submission_ambiguous", "exit_broker_order_discovered", "cancelled", "rejected", "expired"], exit_submission_ambiguous: ["exit_broker_order_discovered", "failed_terminal"], exit_broker_order_discovered: ["exit_partially_filled", "closed", "rejected", "expired"], exit_partially_filled: ["closed"], closed: [], cancel_requested: ["cancel_ambiguous", "cancelled", "expired"], cancel_ambiguous: ["cancelled", "expired", "failed_terminal"], cancelled: [], rejected: [], expired: [], failed_terminal: []
+  candidate_created: ["review_created", "failed_terminal"],
+  review_created: ["confirmed", "failed_terminal"],
+  confirmed: ["ready_for_submission", "failed_terminal"],
+  ready_for_submission: ["submission_attempt_persisted", "cancel_requested"],
+  submission_attempt_persisted: [
+    "submission_ambiguous",
+    "broker_order_discovered",
+    "cancelled",
+    "rejected",
+    "expired"
+  ],
+  submission_ambiguous: ["broker_order_discovered", "failed_terminal"],
+  broker_order_discovered: [
+    "broker_order_accepted",
+    "rejected",
+    "expired",
+    "cancel_requested"
+  ],
+  broker_order_accepted: ["partially_filled", "filled", "cancel_requested"],
+  partially_filled: ["filled", "position_reconciled", "cancel_requested"],
+  filled: ["position_reconciled", "exit_evaluated"],
+  position_reconciled: ["exit_evaluated"],
+  exit_evaluated: ["exit_review_created", "closed"],
+  exit_review_created: ["exit_confirmed"],
+  exit_confirmed: ["exit_ready_for_submission"],
+  exit_ready_for_submission: [
+    "exit_submission_attempt_persisted",
+    "cancel_requested"
+  ],
+  exit_submission_attempt_persisted: [
+    "exit_submission_ambiguous",
+    "exit_broker_order_discovered",
+    "cancelled",
+    "rejected",
+    "expired"
+  ],
+  exit_submission_ambiguous: ["exit_broker_order_discovered", "failed_terminal"],
+  exit_broker_order_discovered: [
+    "exit_partially_filled",
+    "closed",
+    "rejected",
+    "expired",
+    "cancel_requested"
+  ],
+  exit_partially_filled: ["closed", "cancel_requested"],
+  closed: [],
+  cancel_requested: ["cancel_ambiguous", "cancelled", "expired"],
+  cancel_ambiguous: ["cancelled", "expired", "failed_terminal"],
+  cancelled: [],
+  rejected: [],
+  expired: [],
+  failed_terminal: []
 };
 export const validateLifecycleTransition = (from: AutonomousTradeLifecycleState | string, to: AutonomousTradeLifecycleState | string): void => { if (!(transitions[from as AutonomousTradeLifecycleState]?.includes(to as AutonomousTradeLifecycleState))) throw new Error(`INVALID_LIFECYCLE_TRANSITION:${from}->${to}`); };
 export const isTerminalLifecycleState = (state: AutonomousTradeLifecycleState) => ["closed", "cancelled", "rejected", "expired", "failed_terminal"].includes(state);

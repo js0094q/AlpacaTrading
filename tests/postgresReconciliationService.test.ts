@@ -428,6 +428,241 @@ test("terminal fill transfers the reservation into deployed allocation exactly o
   assert.match(release, /INSERT INTO reservation_terminal_transitions/);
 });
 
+test("partial fill resizes only the remaining reservation and allocation atomically", async () => {
+  const statements: Array<{ sql: string; values: readonly unknown[] }> = [];
+  const result = await reconcilePostgresPaperOrders({
+    query: {
+      query: async (sql: string, values?: readonly unknown[]) => {
+        statements.push({ sql, values: values ?? [] });
+        if (sql.includes("FROM order_intents intent")) {
+          return {
+            rows: [{
+              order_intent_id: "intent-partial",
+              account_id: "account-1",
+              client_order_id: "client-partial",
+              broker_order_id: "broker-partial",
+              reservation_id: "reservation-partial",
+              strategy_key: "baseline",
+              review_type: "entry",
+              symbol: "AAPL",
+              asset_class: "equity",
+              side: "buy",
+              order_type: "limit",
+              time_in_force: "day",
+              quantity: "10",
+              notional: null,
+              limit_price: "100",
+              intent_status: "submitted",
+              lifecycle_state: "broker_order_accepted",
+              prior_filled_quantity: "0"
+            }],
+            rowCount: 1
+          };
+        }
+        if (sql.includes("partial_reservation_count")) {
+          return {
+            rows: [{
+              partial_reservation_count: "1",
+              adjusted_allocation_count: "1"
+            }],
+            rowCount: 1
+          };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    syncBrokerState: false,
+    now: new Date("2026-07-20T22:00:00.000Z"),
+    getOrderByClientOrderId: async () => ({
+      status: 200,
+      data: {
+        id: "broker-partial",
+        client_order_id: "client-partial",
+        symbol: "AAPL",
+        asset_class: "us_equity",
+        side: "buy",
+        type: "limit",
+        time_in_force: "day",
+        status: "partially_filled",
+        qty: "10",
+        limit_price: "100",
+        filled_qty: "4",
+        filled_avg_price: "99",
+        submitted_at: "2026-07-20T21:59:00.000Z",
+        updated_at: "2026-07-20T21:59:30.000Z"
+      }
+    }) as never
+  });
+
+  assert.equal(result.partial, 1);
+  const partial = statements.find(({ sql }) =>
+    sql.includes("partial_reservation_count")
+  );
+  assert.ok(partial);
+  assert.match(partial.sql, /UPDATE buying_power_reservations/);
+  assert.match(partial.sql, /amount = resized\.remaining_amount/);
+  assert.match(partial.sql, /reserved_amount = allocation\.reserved_amount - resized\.settled_amount/);
+  assert.match(partial.sql, /deployed_amount = allocation\.deployed_amount \+ resized\.settled_amount/);
+  assert.doesNotMatch(partial.sql, /reservation_terminal_transitions/);
+  assert.deepEqual(partial.values.slice(3, 6), ["4", "10", "0"]);
+});
+
+test("terminal reservation settlement is a successful replay after its unique transition exists", async () => {
+  let settlementCalls = 0;
+  const result = await reconcilePostgresPaperOrders({
+    query: {
+      query: async (sql: string) => {
+        if (sql.includes("FROM order_intents intent")) {
+          return {
+            rows: [{
+              order_intent_id: "intent-cancel-replay",
+              account_id: "account-1",
+              client_order_id: "client-cancel-replay",
+              broker_order_id: "broker-cancel-replay",
+              reservation_id: "reservation-cancel-replay",
+              strategy_key: "baseline",
+              review_type: "entry",
+              symbol: "AAPL",
+              asset_class: "equity",
+              side: "buy",
+              order_type: "limit",
+              time_in_force: "day",
+              quantity: "1",
+              notional: null,
+              limit_price: "1",
+              intent_status: "submitted",
+              lifecycle_state: "cancel_ambiguous",
+              prior_filled_quantity: "0"
+            }],
+            rowCount: 1
+          };
+        }
+        if (sql.includes("released_reservation_count")) {
+          settlementCalls += 1;
+          return {
+            rows: [{
+              released_reservation_count: "0",
+              adjusted_allocation_count: "0",
+              terminal_transition_count: "0",
+              existing_terminal_transition_count: "1"
+            }],
+            rowCount: 1
+          };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    syncBrokerState: false,
+    now: new Date("2026-07-20T22:00:00.000Z"),
+    getOrderByClientOrderId: async () => ({
+      status: 200,
+      data: {
+        id: "broker-cancel-replay",
+        client_order_id: "client-cancel-replay",
+        symbol: "AAPL",
+        asset_class: "us_equity",
+        side: "buy",
+        type: "limit",
+        time_in_force: "day",
+        status: "canceled",
+        qty: "1",
+        limit_price: "1",
+        filled_qty: "0",
+        submitted_at: "2026-07-20T21:59:00.000Z",
+        updated_at: "2026-07-20T21:59:30.000Z",
+        canceled_at: "2026-07-20T21:59:30.000Z"
+      }
+    }) as never
+  });
+
+  assert.equal(result.terminal, 1);
+  assert.equal(result.errors.length, 0);
+  assert.equal(settlementCalls, 1);
+});
+
+test("restart can reselect a reconciled intent whose terminal reservation settlement is pending", async () => {
+  const statements: string[] = [];
+  const result = await reconcilePostgresPaperOrders({
+    query: {
+      query: async (sql: string) => {
+        statements.push(sql);
+        if (sql.includes("FROM order_intents intent")) {
+          return {
+            rows: [{
+              order_intent_id: "intent-terminal-retry",
+              account_id: "account-1",
+              client_order_id: "client-terminal-retry",
+              broker_order_id: "broker-terminal-retry",
+              reservation_id: "reservation-terminal-retry",
+              strategy_key: "baseline",
+              review_type: "entry",
+              symbol: "AAPL",
+              asset_class: "equity",
+              side: "buy",
+              order_type: "limit",
+              time_in_force: "day",
+              quantity: "1",
+              notional: null,
+              limit_price: "1",
+              intent_status: "reconciled",
+              lifecycle_state: "cancelled",
+              prior_filled_quantity: "0"
+            }],
+            rowCount: 1
+          };
+        }
+        if (sql.includes("released_reservation_count")) {
+          return {
+            rows: [{
+              released_reservation_count: "1",
+              adjusted_allocation_count: "1",
+              terminal_transition_count: "1",
+              existing_terminal_transition_count: "0"
+            }],
+            rowCount: 1
+          };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    syncBrokerState: false,
+    now: new Date("2026-07-20T22:00:00.000Z"),
+    getOrderByClientOrderId: async () => ({
+      status: 200,
+      data: {
+        id: "broker-terminal-retry",
+        client_order_id: "client-terminal-retry",
+        symbol: "AAPL",
+        asset_class: "us_equity",
+        side: "buy",
+        type: "limit",
+        time_in_force: "day",
+        status: "canceled",
+        qty: "1",
+        limit_price: "1",
+        filled_qty: "0",
+        submitted_at: "2026-07-20T21:59:00.000Z",
+        updated_at: "2026-07-20T21:59:30.000Z",
+        canceled_at: "2026-07-20T21:59:30.000Z"
+      }
+    }) as never
+  });
+
+  assert.equal(result.terminal, 1);
+  const selection = statements.find((sql) =>
+    sql.includes("FROM order_intents intent")
+  );
+  assert.match(selection ?? "", /intent\.status = 'reconciled'/);
+  assert.match(selection ?? "", /reservation_terminal_transitions/);
+  const intentUpdate = statements.find((sql) =>
+    sql.includes("UPDATE order_intents SET status")
+  );
+  assert.match(intentUpdate ?? "", /'reconciled'/);
+});
+
 test("an externally originated broker order is observed without fabricating an intent", async () => {
   const statements: Array<{ sql: string; values?: readonly unknown[] }> = [];
   const result = await reconcilePostgresPaperOrders({

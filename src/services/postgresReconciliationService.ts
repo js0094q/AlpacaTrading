@@ -41,6 +41,8 @@ type Target = Record<string, unknown> & {
   limit_price: string | null;
   intent_status: string;
   intent_updated_at: string;
+  lifecycle_state: string;
+  prior_filled_quantity: string | null;
 };
 
 const fenceSql = (start: number) => `EXISTS (
@@ -69,7 +71,9 @@ const targetsSql = `SELECT intent.id AS order_intent_id, intent.candidate_id,
        intent.symbol, intent.asset_class, intent.side, intent.order_type,
        intent.time_in_force, intent.quantity::text, intent.notional::text,
        intent.limit_price::text, intent.status AS intent_status,
-       intent.updated_at::text AS intent_updated_at
+       intent.updated_at::text AS intent_updated_at,
+       intent.lifecycle_state,
+       broker_order.filled_quantity::text AS prior_filled_quantity
 FROM order_intents intent
 JOIN execution_reviews review ON review.id = intent.execution_review_id
 LEFT JOIN LATERAL (
@@ -77,7 +81,18 @@ LEFT JOIN LATERAL (
   ORDER BY created_at DESC, id DESC LIMIT 1
 ) broker_order ON true
 WHERE intent.environment = 'paper'
-  AND intent.status IN ('submission_pending', 'submitted', 'ambiguous')
+  AND (
+    intent.status IN ('submission_pending', 'submitted', 'ambiguous')
+    OR (
+      intent.status = 'reconciled'
+      AND intent.reservation_id IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1
+        FROM reservation_terminal_transitions transition
+        WHERE transition.reservation_id = intent.reservation_id
+      )
+    )
+  )
   AND ($1 = '' OR intent.client_order_id = $1)
 ORDER BY intent.created_at, intent.id`;
 
@@ -773,6 +788,9 @@ export const reconcilePostgresPaperOrders = async (input: {
         throw new Error("POSTGRES_RECONCILIATION_BROKER_IDENTITY_MISMATCH");
       }
       const status = required(response.data.status, "POSTGRES_RECONCILIATION_STATUS_MISSING").toLowerCase();
+      if (target.intent_status === "reconciled" && !terminalStatuses.has(status)) {
+        throw new Error("POSTGRES_RECONCILIATION_TERMINAL_SETTLEMENT_STATE_INVALID");
+      }
       const raw = response.data as unknown as Record<string, unknown>;
       const occurredAt = required(
         response.data.filled_at ?? raw.canceled_at ?? raw.cancelled_at ?? raw.expired_at ??
@@ -827,19 +845,136 @@ export const reconcilePostgresPaperOrders = async (input: {
           now.toISOString(), ...fenceValues(input.fence)]
       );
       const intentStatus = terminalStatuses.has(status) ? "reconciled" : "submitted";
-      const lifecycleState = lifecycleStateForBrokerStatus(target.review_type, status);
+      const lifecycleState = (
+        !terminalStatuses.has(status) &&
+        ["cancel_requested", "cancel_ambiguous"].includes(
+          String(target.lifecycle_state ?? "")
+        )
+      )
+        ? target.lifecycle_state
+        : lifecycleStateForBrokerStatus(target.review_type, status);
       const updated = await input.query.query(
         `UPDATE order_intents SET status = $2,
            lifecycle_state = $5,
            submitted_at = COALESCE(submitted_at, $3),
            terminal_at = CASE WHEN $2 = 'reconciled' THEN $4 ELSE terminal_at END,
            updated_at = $4, version = version + 1
-         WHERE id = $1 AND status IN ('submission_pending','submitted','ambiguous')
+         WHERE id = $1
+           AND status IN ('submission_pending','submitted','ambiguous','reconciled')
            AND ${fenceSql(6)}`,
         [target.order_intent_id, intentStatus, optional(response.data.submitted_at) ?? now.toISOString(),
           now.toISOString(), lifecycleState, ...fenceValues(input.fence)]
       );
       if (updated.rowCount !== 1) throw new Error("POSTGRES_RECONCILIATION_INTENT_PERSISTENCE_FAILED");
+      if (status === "partially_filled" && target.reservation_id) {
+        const filledQuantity = optional(response.data.filled_qty) ?? "0";
+        const orderedQuantity = optional(response.data.qty ?? target.quantity);
+        const priorFilledQuantity = optional(target.prior_filled_quantity) ?? "0";
+        const filled = Number(filledQuantity);
+        const ordered = Number(orderedQuantity);
+        const priorFilled = Number(priorFilledQuantity);
+        if (
+          !Number.isFinite(filled) ||
+          !Number.isFinite(ordered) ||
+          !Number.isFinite(priorFilled) ||
+          ordered <= 0 ||
+          priorFilled < 0 ||
+          filled <= priorFilled ||
+          filled >= ordered
+        ) {
+          throw new Error("POSTGRES_RECONCILIATION_PARTIAL_QUANTITY_INVALID");
+        }
+        const partialReservation = await input.query.query(
+          `WITH locked_reservation AS MATERIALIZED (
+             SELECT reservation.id, reservation.account_id,
+                    reservation.strategy_key, reservation.amount
+             FROM buying_power_reservations reservation
+             WHERE reservation.id = $1
+               AND reservation.status IN ('active', 'committed')
+               AND ${fenceSql(7)}
+             FOR UPDATE
+           ), locked_allocation AS MATERIALIZED (
+             SELECT allocation.id, allocation.account_id,
+                    allocation.strategy_key, allocation.reserved_amount,
+                    allocation.deployed_amount
+             FROM strategy_allocations allocation
+             JOIN locked_reservation reservation
+               ON reservation.account_id = allocation.account_id
+              AND reservation.strategy_key = allocation.strategy_key
+             WHERE allocation.status = 'active'
+               AND allocation.effective_to IS NULL
+             FOR UPDATE
+           ), resized AS (
+             SELECT reservation.id, reservation.account_id,
+                    reservation.strategy_key,
+                    reservation.amount *
+                      (($5::numeric - $4::numeric) /
+                       NULLIF($5::numeric - $6::numeric, 0))
+                      AS remaining_amount,
+                    reservation.amount - (
+                      reservation.amount *
+                        (($5::numeric - $4::numeric) /
+                         NULLIF($5::numeric - $6::numeric, 0))
+                    ) AS settled_amount
+             FROM locked_reservation reservation
+             JOIN locked_allocation allocation
+               ON allocation.account_id = reservation.account_id
+              AND allocation.strategy_key = reservation.strategy_key
+             WHERE $4::numeric > $6::numeric
+               AND $4::numeric < $5::numeric
+               AND allocation.reserved_amount >= reservation.amount -
+                 (reservation.amount *
+                   (($5::numeric - $4::numeric) /
+                    NULLIF($5::numeric - $6::numeric, 0)))
+           ), partial_reservation AS (
+             UPDATE buying_power_reservations reservation
+             SET amount = resized.remaining_amount,
+                 updated_at = $3, version = reservation.version + 1
+             FROM resized
+             WHERE reservation.id = resized.id
+               AND resized.settled_amount > 0
+             RETURNING resized.account_id, resized.strategy_key,
+                       resized.settled_amount
+           ), adjusted AS (
+             UPDATE strategy_allocations allocation
+             SET reserved_amount = allocation.reserved_amount - resized.settled_amount,
+                 deployed_amount = allocation.deployed_amount + resized.settled_amount,
+                 updated_at = $3, version = allocation.version + 1
+             FROM partial_reservation resized
+             WHERE allocation.account_id = resized.account_id
+               AND allocation.strategy_key = resized.strategy_key
+               AND allocation.status = 'active'
+               AND allocation.effective_to IS NULL
+             RETURNING allocation.id
+           )
+           SELECT
+             (SELECT COUNT(*) FROM partial_reservation)::text
+               AS partial_reservation_count,
+             (SELECT COUNT(*) FROM adjusted)::text
+               AS adjusted_allocation_count`,
+          [
+            target.reservation_id,
+            target.order_intent_id,
+            now.toISOString(),
+            filledQuantity,
+            orderedQuantity,
+            priorFilledQuantity,
+            ...fenceValues(input.fence)
+          ]
+        );
+        const partialReservationCount = Number(
+          partialReservation.rows[0]?.partial_reservation_count ?? 0
+        );
+        const adjustedAllocationCount = Number(
+          partialReservation.rows[0]?.adjusted_allocation_count ?? 0
+        );
+        if (
+          partialReservationCount !== adjustedAllocationCount ||
+          partialReservationCount > 1
+        ) {
+          throw new Error("POSTGRES_RECONCILIATION_PARTIAL_RESERVATION_FAILED");
+        }
+      }
       if (terminalStatuses.has(status) && target.reservation_id) {
         const reservationTerminalState = status === "canceled"
           ? "cancelled"
@@ -856,14 +991,54 @@ export const reconcilePostgresPaperOrders = async (input: {
           `${target.reservation_id}:${reservationTerminalState}`
         )}`;
         const reservation = await input.query.query(
-          `WITH released AS (
+          `WITH existing_transition AS MATERIALIZED (
+             SELECT transition.id
+             FROM reservation_terminal_transitions transition
+             WHERE transition.reservation_id = $1
+               AND transition.order_intent_id = $2
+               AND transition.terminal_state = $4
+               AND transition.release_reason = $5
+             FOR SHARE
+           ), locked_reservation AS MATERIALIZED (
+             SELECT reservation.id, reservation.account_id,
+                    reservation.strategy_key, reservation.amount
+             FROM buying_power_reservations reservation
+             WHERE reservation.id = $1
+               AND reservation.status IN ('active', 'committed')
+               AND NOT EXISTS (SELECT 1 FROM existing_transition)
+               AND ${fenceSql(8)}
+             FOR UPDATE
+           ), locked_allocation AS MATERIALIZED (
+             SELECT allocation.id, allocation.account_id,
+                    allocation.strategy_key, allocation.reserved_amount
+             FROM strategy_allocations allocation
+             JOIN locked_reservation reservation
+               ON reservation.account_id = allocation.account_id
+              AND reservation.strategy_key = allocation.strategy_key
+             WHERE allocation.status = 'active'
+               AND allocation.effective_to IS NULL
+               AND allocation.reserved_amount >= reservation.amount
+             FOR UPDATE
+           ), terminal_transition AS (
+             INSERT INTO reservation_terminal_transitions(
+               id, reservation_id, order_intent_id, terminal_state,
+               release_reason, idempotency_key, occurred_at
+             )
+             SELECT $6, reservation.id, $2, $4, $5, $7, $3
+             FROM locked_reservation reservation
+             JOIN locked_allocation allocation
+               ON allocation.account_id = reservation.account_id
+              AND allocation.strategy_key = reservation.strategy_key
+             ON CONFLICT (reservation_id) DO NOTHING
+             RETURNING reservation_id
+           ), released AS (
              UPDATE buying_power_reservations reservation
              SET status = 'released', released_at = $3,
                  release_reason = $5,
                  updated_at = $3, version = reservation.version + 1
-             WHERE reservation.id = $1
+             FROM terminal_transition transition
+             WHERE reservation.id = transition.reservation_id
                AND reservation.status IN ('active', 'committed')
-               AND ${fenceSql(8)}
              RETURNING reservation.account_id, reservation.strategy_key,
                        reservation.amount
            ), adjusted AS (
@@ -877,19 +1052,13 @@ export const reconcilePostgresPaperOrders = async (input: {
                AND allocation.strategy_key = released.strategy_key
                AND allocation.status = 'active' AND allocation.effective_to IS NULL
              RETURNING allocation.id
-           ), terminal_transition AS (
-             INSERT INTO reservation_terminal_transitions(
-               id, reservation_id, order_intent_id, terminal_state,
-               release_reason, idempotency_key, occurred_at
-             )
-             SELECT $6, $1, $2, $4, $5, $7, $3 FROM released
-             ON CONFLICT (reservation_id) DO NOTHING
-             RETURNING id
            )
            SELECT
              (SELECT COUNT(*) FROM released)::text AS released_reservation_count,
              (SELECT COUNT(*) FROM adjusted)::text AS adjusted_allocation_count,
-             (SELECT COUNT(*) FROM terminal_transition)::text AS terminal_transition_count`,
+             (SELECT COUNT(*) FROM terminal_transition)::text AS terminal_transition_count,
+             (SELECT COUNT(*) FROM existing_transition)::text
+               AS existing_terminal_transition_count`,
           [
             target.reservation_id,
             target.order_intent_id,
@@ -910,10 +1079,22 @@ export const reconcilePostgresPaperOrders = async (input: {
         const terminalTransitionCount = Number(
           reservation.rows[0]?.terminal_transition_count ?? 0
         );
+        const existingTerminalTransitionCount = Number(
+          reservation.rows[0]?.existing_terminal_transition_count ?? 0
+        );
+        const freshSettlement =
+          releasedCount === 1 &&
+          adjustedCount === 1 &&
+          terminalTransitionCount === 1 &&
+          existingTerminalTransitionCount === 0;
+        const replayedSettlement =
+          releasedCount === 0 &&
+          adjustedCount === 0 &&
+          terminalTransitionCount === 0 &&
+          existingTerminalTransitionCount === 1;
         if (
-          releasedCount !== 1 ||
-          adjustedCount !== 1 ||
-          terminalTransitionCount !== 1
+          !freshSettlement &&
+          !replayedSettlement
         ) {
           throw new Error("POSTGRES_RECONCILIATION_RESERVATION_RELEASE_FAILED");
         }

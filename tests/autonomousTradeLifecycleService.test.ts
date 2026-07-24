@@ -85,6 +85,38 @@ test("rejects invalid lifecycle transitions", () => {
   }
 });
 
+test("permits cancellation only from maintained nonterminal entry and exit states", () => {
+  const cancellableSources = [
+    "ready_for_submission",
+    "broker_order_discovered",
+    "broker_order_accepted",
+    "partially_filled",
+    "exit_ready_for_submission",
+    "exit_broker_order_discovered",
+    "exit_partially_filled"
+  ] as const;
+  for (const source of cancellableSources) {
+    assert.doesNotThrow(() =>
+      validateLifecycleTransition(source, "cancel_requested")
+    );
+  }
+  for (
+    const source of [
+      "filled",
+      "closed",
+      "cancelled",
+      "rejected",
+      "expired",
+      "failed_terminal"
+    ] as const
+  ) {
+    assert.throws(
+      () => validateLifecycleTransition(source, "cancel_requested"),
+      new RegExp(`INVALID_LIFECYCLE_TRANSITION:${source}->cancel_requested`)
+    );
+  }
+});
+
 test("migration 006 contains durable lifecycle lineage and terminal transition tables", async () => {
   const sql = await readFile(new URL("../src/lib/database/migrations/006_autonomous_trade_lifecycle.sql", import.meta.url), "utf8");
   assert.match(sql, /ALTER TABLE order_intents/i);
@@ -125,4 +157,35 @@ test("migration 006 contains durable lifecycle lineage and terminal transition t
   assert.match(sql, /append-only|ON CONFLICT/i);
   assert.match(sql, /CREATE TABLE(?: IF NOT EXISTS)? reservation_terminal_transitions/i);
   assert.match(sql, /UNIQUE\s*\(reservation_id\)/i);
+  for (
+    const source of [
+      "ready_for_submission",
+      "broker_order_discovered",
+      "broker_order_accepted",
+      "partially_filled",
+      "exit_ready_for_submission",
+      "exit_broker_order_discovered",
+      "exit_partially_filled"
+    ]
+  ) {
+    assert.match(
+      sql,
+      new RegExp(`\\('${source}','cancel_requested'\\)`)
+    );
+  }
+  for (
+    const source of [
+      "filled",
+      "closed",
+      "cancelled",
+      "rejected",
+      "expired",
+      "failed_terminal"
+    ]
+  ) {
+    assert.doesNotMatch(
+      sql,
+      new RegExp(`\\('${source}','cancel_requested'\\)`)
+    );
+  }
 });

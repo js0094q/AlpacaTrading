@@ -81,7 +81,15 @@ test("system recovery performs bounded fenced PostgreSQL recovery before evaluat
       calls.push(sql);
       if (sql.includes("UPDATE research_runs")) return { rows: [], rowCount: 1 };
       if (sql.includes("UPDATE buying_power_reservations")) {
-        return { rows: [{ outcome: "ok", expired_reservation_count: "2" }], rowCount: 1 };
+        return {
+          rows: [{
+            outcome: "ok",
+            locked_reservation_count: "2",
+            terminal_transition_count: "2",
+            expired_reservation_count: "2"
+          }],
+          rowCount: 1
+        };
       }
       if (sql.includes("UPDATE execution_reviews")) return { rows: [], rowCount: 3 };
       if (sql.includes("UPDATE confirmation_evidence")) return { rows: [], rowCount: 4 };
@@ -125,7 +133,15 @@ test("system recovery cancels only provably stale created intents and fences all
       calls.push(sql);
       if (sql.includes("UPDATE research_runs")) return { rows: [], rowCount: 0 };
       if (sql.includes("UPDATE buying_power_reservations")) {
-        return { rows: [{ outcome: "ok", expired_reservation_count: "2" }], rowCount: 1 };
+        return {
+          rows: [{
+            outcome: "ok",
+            locked_reservation_count: "2",
+            terminal_transition_count: "2",
+            expired_reservation_count: "2"
+          }],
+          rowCount: 1
+        };
       }
       if (sql.includes("UPDATE execution_reviews")) return { rows: [], rowCount: 0 };
       if (sql.includes("UPDATE confirmation_evidence")) return { rows: [], rowCount: 0 };
@@ -158,6 +174,8 @@ test("system recovery cancels only provably stale created intents and fences all
   assert.match(reservationSql ?? "", /reserved_amount >=/);
   assert.match(reservationSql ?? "", /mismatch/);
   assert.match(reservationSql ?? "", /reserved_amount = allocation\.reserved_amount - totals\.amount/);
+  assert.match(reservationSql ?? "", /INSERT INTO reservation_terminal_transitions/);
+  assert.match(reservationSql ?? "", /ON CONFLICT \(reservation_id\) DO NOTHING/);
   assert.match(reservationSql ?? "", /scheduler_leases/);
   assert.match(intentSql ?? "", /intent\.status = 'created'/);
   assert.match(intentSql ?? "", /review\.status IN \('expired', 'revoked', 'blocked'\)/);
@@ -228,6 +246,7 @@ test("recovery terminalizes the observed SMCI-style orphan without a broker muta
         return {
           rows: [{
             outcome: "ok",
+            locked_reservation_count: "0",
             cancelled_count: "1",
             released_count: "0",
             adjusted_count: "0"
@@ -235,7 +254,17 @@ test("recovery terminalizes the observed SMCI-style orphan without a broker muta
           rowCount: 1
         };
       }
-      if (sql.includes("UPDATE buying_power_reservations")) return { rows: [{ outcome: "ok", expired_reservation_count: "0" }], rowCount: 1 };
+      if (sql.includes("UPDATE buying_power_reservations")) {
+        return {
+          rows: [{
+            outcome: "ok",
+            locked_reservation_count: "0",
+            terminal_transition_count: "0",
+            expired_reservation_count: "0"
+          }],
+          rowCount: 1
+        };
+      }
       if (sql.includes("UPDATE order_intents")) return { rows: [], rowCount: 1 };
       return { rows: [], rowCount: 1 };
     }
@@ -291,6 +320,9 @@ test("recovery terminalizes the observed SMCI-style orphan without a broker muta
   assert.match(recoverySql?.sql ?? "", /reserved_amount/);
   assert.match(recoverySql?.sql ?? "", /outcome = 'ok'/);
   assert.match(recoverySql?.sql ?? "", /NOT EXISTS \(\s*SELECT 1 FROM orders/);
+  assert.match(recoverySql?.sql ?? "", /INSERT INTO reservation_terminal_transitions/);
+  assert.match(recoverySql?.sql ?? "", /ON CONFLICT \(reservation_id\) DO NOTHING/);
+  assert.match(recoverySql?.sql ?? "", /locked_reservation_count/);
 });
 
 test("stale-ready recovery releases a surviving reservation only with one sufficient allocation", async () => {
@@ -306,7 +338,9 @@ test("stale-ready recovery releases a surviving reservation only with one suffic
         return {
           rows: [{
             outcome: "ok",
+            locked_reservation_count: "1",
             cancelled_count: "1",
+            terminal_transition_count: "1",
             released_count: "1",
             adjusted_count: "1"
           }],
@@ -314,7 +348,15 @@ test("stale-ready recovery releases a surviving reservation only with one suffic
         };
       }
       if (sql.includes("UPDATE buying_power_reservations")) {
-        return { rows: [{ outcome: "ok", expired_reservation_count: "0" }], rowCount: 1 };
+        return {
+          rows: [{
+            outcome: "ok",
+            locked_reservation_count: "0",
+            terminal_transition_count: "0",
+            expired_reservation_count: "0"
+          }],
+          rowCount: 1
+        };
       }
       return { rows: [], rowCount: 0 };
     }
@@ -390,7 +432,17 @@ test("recovery preserves a broker order found for a stale ready intent", async (
       if (sql.includes("FROM order_intents intent") && sql.includes("ready_for_submission")) {
         return { rows: [{ id: "intent-stale-ready", client_order_id: "E2E-stale-ready", reservation_id: "reservation-stale" }], rowCount: 1 };
       }
-      if (sql.includes("UPDATE buying_power_reservations")) return { rows: [{ outcome: "ok", expired_reservation_count: "0" }], rowCount: 1 };
+      if (sql.includes("UPDATE buying_power_reservations")) {
+        return {
+          rows: [{
+            outcome: "ok",
+            locked_reservation_count: "0",
+            terminal_transition_count: "0",
+            expired_reservation_count: "0"
+          }],
+          rowCount: 1
+        };
+      }
       return { rows: [], rowCount: 1 };
     }
   };
