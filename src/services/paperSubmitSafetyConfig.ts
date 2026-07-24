@@ -123,7 +123,7 @@ export const loadPaperSubmitSafetyConfig = (
     ),
     optionMaxPortfolioRiskPct: percent(env.PAPER_OPTIONS_MAX_PORTFOLIO_RISK_PCT, 20),
     optionMaxPositionRiskPct: percent(env.PAPER_OPTIONS_MAX_POSITION_RISK_PCT, 5),
-    quoteMaxAgeSeconds: positive(env.PAPER_SUBMIT_QUOTE_MAX_AGE_SECONDS, 60),
+    quoteMaxAgeSeconds: positive(env.PAPER_SUBMIT_QUOTE_MAX_AGE_SECONDS, 1_200),
     maxPriceDriftPct: percent(env.PAPER_SUBMIT_MAX_PRICE_DRIFT_PCT, 10),
     zeroDteMaxTradesPerDay: processRuntime
       ? nonNegativeInteger(env.ZERO_DTE_MAX_TRADES_PER_DAY, 3)

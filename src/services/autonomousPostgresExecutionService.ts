@@ -1018,7 +1018,18 @@ export const runAutonomousPostgresExecutionCommand = async <
   const filter = commandFilter(input.command);
   const countResult = await input.query.query(
     `SELECT
-       COUNT(*) FILTER (WHERE intent.status = 'ready_for_submission') AS ready_count,
+       COUNT(*) FILTER (
+         WHERE intent.status = 'ready_for_submission'
+           AND review.status = 'valid' AND review.expires_at > now()
+           AND EXISTS (
+             SELECT 1
+             FROM confirmation_evidence current_confirmation
+             WHERE current_confirmation.id = intent.confirmation_evidence_id
+               AND current_confirmation.status = 'valid'
+               AND current_confirmation.paper_only
+               AND current_confirmation.expires_at > now()
+           )
+       ) AS ready_count,
        COUNT(*) FILTER (
          WHERE intent.status = 'created'
            AND review.status = 'valid' AND review.expires_at > now()

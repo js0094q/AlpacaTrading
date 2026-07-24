@@ -203,11 +203,13 @@ test("confirmation promotion atomically readies an entry intent with a buying-po
 
 test("paper execution promotes a confirmed created intent before broker submission", async () => {
   let countReads = 0;
+  let countSql = "";
   const transactionStatements: string[] = [];
   const result = await runAutonomousPostgresExecutionCommand({
     command: "paper:execute:reviewed",
     query: {
-      query: async () => {
+      query: async (sql: string) => {
+        countSql = sql;
         countReads += 1;
         return {
           rows: [{
@@ -308,6 +310,9 @@ test("paper execution promotes a confirmed created intent before broker submissi
   assert.equal(result.status, "completed");
   assert.equal(result.submittedOrderCount, 1);
   assert.equal(transactionStatements.some((sql) => sql.includes("INSERT INTO confirmation_evidence")), true);
+  assert.match(countSql, /review\.expires_at > now\(\)/);
+  assert.match(countSql, /FROM confirmation_evidence current_confirmation/);
+  assert.match(countSql, /current_confirmation\.expires_at > now\(\)/);
 });
 
 test("paper execution persists one captured broker snapshot before promotion and submission", async () => {
