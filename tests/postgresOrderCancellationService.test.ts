@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  runAutonomousPostgresPaperOrderCancellation,
   runPostgresPaperOrderCancellation
 } from "../src/services/postgresOrderCancellationService.js";
 
@@ -36,9 +37,11 @@ const brokerOrder = (status: string) => ({
 test("production cancellation verifies broker identity, cancels, and reconciles PostgreSQL", async () => {
   let cancelCalls = 0;
   let reconcileCalls = 0;
+  const statements: string[] = [];
   const result = await runPostgresPaperOrderCancellation({
     query: {
       query: async (sql: string) => {
+        statements.push(sql);
         if (sql.includes("FROM orders broker_order")) {
           return {
             rows: [{
@@ -67,6 +70,14 @@ test("production cancellation verifies broker identity, cancels, and reconciles 
     getOrderById: async () => brokerOrder("accepted") as never,
     cancelOrder: async (orderId) => {
       cancelCalls += 1;
+      assert.equal(
+        statements.some((sql) =>
+          sql.includes("INSERT INTO broker_events") &&
+          sql.includes("order_cancellation_request")
+        ),
+        true,
+        "the cancellation request must be durable before DELETE reaches Alpaca"
+      );
       assert.equal(orderId, "broker-order-1");
       return { data: null, status: 204, url: "paper" };
     },
@@ -86,7 +97,10 @@ test("production cancellation verifies broker identity, cancels, and reconciles 
         filled: 0,
         partial: 0,
         terminal: 1,
+        pending: 0,
+        failedAbsent: 0,
         brokerState: null,
+        orders: [],
         errors: []
       };
     }
@@ -98,6 +112,77 @@ test("production cancellation verifies broker identity, cancels, and reconciles 
   assert.equal(result.brokerStatus, "canceled");
   assert.equal(cancelCalls, 1);
   assert.equal(reconcileCalls, 1);
+});
+
+test("autonomous cancellation selects a stale eligible order and runs the production path", async () => {
+  const selectedSql: string[] = [];
+  let cancellationCalls = 0;
+  const result = await runAutonomousPostgresPaperOrderCancellation({
+    query: {
+      query: async (sql: string) => {
+        selectedSql.push(sql);
+        if (sql.includes("autonomous_cancellation_target")) {
+          return {
+            rows: [{
+              broker_order_id: "broker-stale",
+              client_order_id: "client-stale"
+            }],
+            rowCount: 1
+          };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    confirmPaper: true,
+    now: new Date("2026-07-23T18:45:00.000Z"),
+    staleAfterMinutes: 30,
+    runCancellation: async (input) => {
+      cancellationCalls += 1;
+      assert.equal(input.brokerOrderId, "broker-stale");
+      assert.equal(input.clientOrderId, "client-stale");
+      return {
+        status: "canceled",
+        paperOnly: true,
+        liveTradingEnabled: false,
+        brokerOrderId: "broker-stale",
+        clientOrderId: "client-stale",
+        brokerStatus: "canceled",
+        reconciliation: { errors: [] }
+      } as never;
+    }
+  });
+
+  assert.equal(cancellationCalls, 1);
+  assert.equal(result.status, "canceled");
+  assert.equal(
+    selectedSql.some((sql) =>
+      sql.includes("review.expires_at") &&
+      sql.includes("candidate.lifecycle_status") &&
+      sql.includes("cancellable")
+    ),
+    true
+  );
+});
+
+test("autonomous cancellation treats an empty policy selection as successful no-action", async () => {
+  const result = await runAutonomousPostgresPaperOrderCancellation({
+    query: {
+      query: async () => ({ rows: [], rowCount: 0 })
+    },
+    fence,
+    confirmPaper: true,
+    runCancellation: async () => {
+      throw new Error("must not cancel");
+    }
+  });
+
+  assert.deepEqual(result, {
+    status: "no_op",
+    code: "NO_CANCELLABLE_POSTGRES_ORDERS",
+    canceledOrderCount: 0,
+    paperOnly: true
+  });
 });
 
 test("already-terminal cancellation is idempotent and does not call DELETE again", async () => {
@@ -142,7 +227,10 @@ test("already-terminal cancellation is idempotent and does not call DELETE again
       filled: 0,
       partial: 0,
       terminal: 1,
+      pending: 0,
+      failedAbsent: 0,
       brokerState: null,
+      orders: [],
       errors: []
     })
   });

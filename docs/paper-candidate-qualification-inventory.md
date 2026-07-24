@@ -13,10 +13,11 @@ originate here:
 | `NO_ELIGIBLE_POSTGRES_CANDIDATES` | `runPostgresReviewWorkflow` in `src/services/postgresReviewWorkflowService.ts` | The authoritative entry-review query returned no selected candidate that was eligible for this review command. | `classification=no_action`, `code=WORKSTREAM_NO_ACTION`, exit 0 |
 | `NO_POSTGRES_EXIT_TRIGGER` | `runExitReview` in `src/services/postgresReviewWorkflowService.ts` | Authoritative open positions were evaluated and none met an existing protective exit rule. | `classification=no_action`, `code=WORKSTREAM_NO_ACTION`, exit 0 |
 | `NO_READY_POSTGRES_ORDER_INTENTS` | `runAutonomousPostgresExecutionCommand` in `src/services/autonomousPostgresExecutionService.ts` | No PostgreSQL intent was ready or confirmable for submission. | `classification=no_action`, `code=WORKSTREAM_NO_ACTION`, exit 0 |
+| `NO_CANCELLABLE_POSTGRES_ORDERS` | `runAutonomousPostgresPaperOrderCancellation` in `src/services/postgresOrderCancellationService.ts` | No unfilled broker order met the existing stale, expired, invalidated, explicitly cancellable, or replace-first policy. | `classification=no_action`, `code=WORKSTREAM_NO_ACTION`, exit 0 |
 | `NO_RECONCILIABLE_POSTGRES_ORDERS` | `runAutonomousPostgresCommand` in `src/services/autonomousPostgresCommandService.ts` | The learning workstream found no completed PostgreSQL order eligible for reconciliation-based learning. | `classification=no_action`, `code=WORKSTREAM_NO_ACTION`, exit 0 |
 
 `scripts/autonomous-paper-worker.mjs` performs the worker classification. Only
-those four exact reason codes receive the successful `no_action`
+those five exact reason codes receive the successful `no_action`
 classification. Other `blocked` results and any operational inability to
 continue retain `WORKSTREAM_BLOCKED` or a more specific failure/deferred code.
 

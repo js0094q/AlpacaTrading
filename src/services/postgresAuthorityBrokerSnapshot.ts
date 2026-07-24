@@ -37,20 +37,22 @@ export type AuthorityBrokerOrder = {
   limitPrice: number | null;
 };
 
+export type AuthorityBrokerAccount = {
+  status: string;
+  currency: string;
+  cash: number;
+  equity: number;
+  buyingPower: number;
+  optionsBuyingPower: number;
+  optionsApprovalLevel: number;
+  tradingBlocked: boolean;
+  accountBlocked: boolean;
+};
+
 export type PostgresAuthorityBrokerSnapshot = {
   capturedAt: string;
   accountIdentityHash: string;
-  account: {
-    status: string;
-    currency: string;
-    cash: number;
-    equity: number;
-    buyingPower: number;
-    optionsBuyingPower: number;
-    optionsApprovalLevel: number;
-    tradingBlocked: boolean;
-    accountBlocked: boolean;
-  };
+  account: AuthorityBrokerAccount;
   configuration: PaperSubmitConfiguration;
   configurationFingerprint: string;
   positions: AuthorityBrokerPosition[];
@@ -86,6 +88,30 @@ const optionUnderlying = (symbol: string) => {
   const matched = symbol.match(/^([A-Z.]+)\d{6}[CP]\d{8}$/);
   return matched?.[1] ?? null;
 };
+
+export const buildStructuralPortfolioFingerprint = (
+  accountIdentityHash: string,
+  account: AuthorityBrokerAccount,
+  positions: readonly AuthorityBrokerPosition[],
+  orders: readonly AuthorityBrokerOrder[]
+) => canonicalJsonHash({
+  accountIdentityHash,
+  accountStatus: account.status,
+  accountCurrency: account.currency,
+  accountCash: account.cash,
+  accountBlocked: account.accountBlocked,
+  tradingBlocked: account.tradingBlocked,
+  optionsApprovalLevel: account.optionsApprovalLevel,
+  positions: positions.map((position) => ({
+    brokerPositionKey: position.brokerPositionKey,
+    side: position.side,
+    quantity: position.quantity,
+    availableQuantity: position.availableQuantity,
+    averageEntryPrice: position.averageEntryPrice,
+    costBasis: position.costBasis
+  })),
+  openOrders: orders
+});
 
 export const capturePostgresAuthorityBrokerSnapshot = async (
   capturedAt = new Date().toISOString()
@@ -188,18 +214,18 @@ export const capturePostgresAuthorityBrokerSnapshot = async (
   }).sort((left, right) => left.brokerOrderId.localeCompare(right.brokerOrderId));
 
   const accountIdentityHash = canonicalJsonHash({ accountId });
-  const structuralState = {
+  const structuralPortfolioFingerprint = buildStructuralPortfolioFingerprint(
     accountIdentityHash,
-    accountStatus: account.status,
-    accountBlocked: account.accountBlocked,
-    tradingBlocked: account.tradingBlocked,
-    positions: positions.map(({ brokerPositionKey, quantity }) => ({
-      brokerPositionKey,
-      quantity
-    })),
+    account,
+    positions,
+    orders
+  );
+  const portfolioState = {
+    accountIdentityHash,
+    account,
+    positions,
     openOrders: orders
   };
-  const portfolioState = { ...structuralState, account, positions };
   return {
     capturedAt,
     accountIdentityHash,
@@ -208,7 +234,7 @@ export const capturePostgresAuthorityBrokerSnapshot = async (
     configurationFingerprint: canonicalJsonHash(configuration),
     positions,
     orders,
-    structuralPortfolioFingerprint: canonicalJsonHash(structuralState),
+    structuralPortfolioFingerprint,
     portfolioFingerprint: canonicalJsonHash(portfolioState)
   };
 };

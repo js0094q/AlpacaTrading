@@ -265,13 +265,33 @@ const scoreTarget = (target: FeatureTargetResult["targets"][number], now: Date) 
   const freshness = clamp(15 - clamp(ageDays * 0.8, 0, 15), 0, 15);
   const option = target.optionsStrategy?.optionsCandidate as { liquidityScore?: unknown } | null | undefined;
   const liquidity = Number(option?.liquidityScore ?? 0);
-  let score = target.confidence * 42;
-  score += clamp((target.expectedReturn ?? 0) * 100, -10, 20) * 1.7;
-  score += clamp((target.volatilityAdjustedScore ?? 1) * 3, -4, 8);
-  score += freshness;
-  if (target.preferredExpression !== "shares") score += clamp(liquidity * 18, 0, 18) + 4;
-  if (target.riskProfile === "aggressive") score += 6;
-  return clamp(score, 0, 100);
+  const components = {
+    confidence: target.confidence * 42,
+    expectedReturn: clamp((target.expectedReturn ?? 0) * 100, -10, 20) * 1.7,
+    volatilityAdjusted: clamp((target.volatilityAdjustedScore ?? 1) * 3, -4, 8),
+    freshness,
+    optionLiquidity: target.preferredExpression !== "shares"
+      ? clamp(liquidity * 18, 0, 18) + 4
+      : 0,
+    riskProfile: target.riskProfile === "aggressive" ? 6 : 0
+  };
+  return {
+    total: clamp(
+      Object.values(components).reduce((sum, value) => sum + value, 0),
+      0,
+      100
+    ),
+    inputs: {
+      confidence: target.confidence,
+      expectedReturn: target.expectedReturn,
+      volatilityAdjustedScore: target.volatilityAdjustedScore,
+      ageDays,
+      optionLiquidityScore: liquidity,
+      preferredExpression: target.preferredExpression,
+      riskProfile: target.riskProfile
+    },
+    components
+  };
 };
 
 const persistEvidence = async (input: {
@@ -538,6 +558,7 @@ const persistCandidates = async (input: {
         ? optionDaysToExpiration(expirationDate, input.now.toISOString())
         : null;
       const leapsPolicy = postgresLeapsPolicy();
+      const candidateScore = scoreTarget(target, input.now);
       const strategyFamily = optionSymbol
         ? target.symbol === "SPY" && expirationDate === newYorkDate(input.now)
           ? "zero_dte_spy"
@@ -554,7 +575,8 @@ const persistCandidates = async (input: {
         optionDte,
         leapsPolicy,
         strategyFamily,
-        score: scoreTarget(target, input.now),
+        score: candidateScore.total,
+        candidateScore,
         reasons
       };
     })
@@ -585,6 +607,7 @@ const persistCandidates = async (input: {
       leapsPolicy,
       strategyFamily,
       score,
+      candidateScore,
       selected,
       reasons
     } = decisions[index]!;
@@ -605,6 +628,7 @@ const persistCandidates = async (input: {
         leapsMinDte: leapsPolicy.minDte,
         leapsMaxDte: leapsPolicy.maxDte
       },
+      candidateScore,
       decisionGates: {
         profile: paperExplorationProfile(input.explorationThresholds),
         outcome: selected ? "passed" : "failed",

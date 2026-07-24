@@ -10,12 +10,39 @@
 - Option liquidity remains `0.10`, maximum spread remains `15%`, candidate
   count remains `25`, and maximum order notional remains `$1,000`.
 - `NO_ELIGIBLE_POSTGRES_CANDIDATES`, `NO_POSTGRES_EXIT_TRIGGER`,
-  `NO_READY_POSTGRES_ORDER_INTENTS`, and
+  `NO_READY_POSTGRES_ORDER_INTENTS`, `NO_CANCELLABLE_POSTGRES_ORDERS`, and
   `NO_RECONCILIABLE_POSTGRES_ORDERS` now complete with
   `classification=no_action`, `code=WORKSTREAM_NO_ACTION`, exit 0, and their
   exact domain `reasonCode`. Genuine blocked/failure outcomes remain blocked.
 - The full runtime threshold inventory and unchanged safety boundary are in
   `docs/paper-candidate-qualification-inventory.md`.
+
+## Self-operating execution transaction boundary (2026-07-24)
+
+- Every entry and exit command now captures and persists one current Alpaca
+  paper broker snapshot before confirmation promotion and claim.
+- Review authorization identity excludes quote-driven mark, equity,
+  buying-power, and unrealized-P&L drift. It retains stable account, cash,
+  position, and open-order identity. Material structural changes still
+  invalidate authorization.
+- Intent claim no longer requires the reservation's historical snapshot row to
+  equal the newest snapshot row. It rechecks the latest structural fingerprint
+  and current reservation, buying-power, cash-reserve, portfolio, allocation,
+  symbol, position-count, and order-count capacity under the scheduler fence.
+- The client order ID and `order_submission_attempt` event are durable before
+  Alpaca mutation. Unknown responses trigger bounded exact-client-ID lookup and
+  reconciliation without resubmission. Confirmed absence requires four
+  persisted observations spanning at least 120 seconds before failure and
+  reservation release; restart recovery resumes the persisted ambiguous work.
+- The worker's 20 ordered workstreams reconcile before research, after entry,
+  after exits, and after autonomous cancellation. `paper:order:cancel
+  --autonomous --confirmPaper` queries broker state first, persists its request,
+  cancels only policy-eligible unfilled orders, reconciles, and releases
+  reservations through the normal reconciliation service.
+- Candidate scoring persists the exact production inputs, score components,
+  and total alongside the existing SIP/OPRA, Greeks, implied-volatility,
+  spread, volume, open-interest, liquidity, underlying, and historical-bar
+  decision evidence.
 
 ## Autonomous PostgreSQL lifecycle shutdown repair (2026-07-23)
 

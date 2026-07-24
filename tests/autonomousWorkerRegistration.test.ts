@@ -10,6 +10,7 @@ const REQUIRED_COMMANDS = [
   "paper:review",
   "paper:portfolio:review",
   "paper:options:discover",
+  "paper:order:cancel",
   "paper:ops:review",
   "paper:exit:review",
   "paper:exit:execute",
@@ -69,4 +70,18 @@ test("research and review dispatch real PostgreSQL workflows", async () => {
   const source = await readFile(new URL("../src/postgresOnlyCli.ts", import.meta.url), "utf8");
   assert.match(source, /runPostgresResearchWorkflow/);
   assert.match(source, /runPostgresReviewWorkflow/);
+});
+
+test("production execution wires snapshot persistence and bounded ambiguous recovery in-process", async () => {
+  const source = await readFile(new URL("../src/postgresOnlyCli.ts", import.meta.url), "utf8");
+  assert.match(source, /persistBrokerSnapshot:\s*async/);
+  assert.match(source, /persistPostgresAuthorityBrokerSnapshot/);
+  assert.match(source, /recoverAmbiguousSubmission:\s*async/);
+  assert.match(source, /recoverAmbiguousPostgresSubmission/);
+});
+
+test("production cancellation supports a scheduler-owned autonomous policy selector", async () => {
+  const source = await readFile(new URL("../src/postgresOnlyCli.ts", import.meta.url), "utf8");
+  assert.match(source, /runAutonomousPostgresPaperOrderCancellation/);
+  assert.match(source, /args\.autonomous/);
 });

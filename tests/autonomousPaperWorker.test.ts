@@ -18,19 +18,23 @@ const repoRoot = process.cwd();
 const workerPath = join(repoRoot, "scripts/autonomous-paper-worker.mjs");
 
 const workstreams = [
+  "zero-dte:reconcile",
   "research:daily",
+  "paper:options:discover",
   "paper:review",
   "paper:portfolio:review",
-  "paper:options:discover",
   "paper:ops:review",
-  "zero-dte:exit:review",
-  "paper:exit:review",
-  "paper:exit:execute",
-  "paper:execute:reviewed",
   "hedge:review",
-  "hedge:exit:review",
-  "hedge:exit:execute",
+  "paper:execute:reviewed",
   "zero-dte:engine",
+  "zero-dte:reconcile",
+  "paper:exit:review",
+  "zero-dte:exit:review",
+  "hedge:exit:review",
+  "paper:exit:execute",
+  "hedge:exit:execute",
+  "zero-dte:reconcile",
+  "paper:order:cancel",
   "zero-dte:reconcile",
   "paper:learn",
   "system:recover"
@@ -361,16 +365,30 @@ test("approved worker validates the production contract and persists a complete 
   assert.deepEqual(workstreamCalls.map((call) => call.command), workstreams);
   assert.ok(workstreamCalls.every((call) => call.cycleId === states[0]?.cycleId));
   assert.ok(workstreamCalls.every((call) => call.workstream === call.command));
-  assert.equal(workstreamCalls[0]!.args.includes("--maxCandidates=25"), true);
+  assert.equal(
+    workstreamCalls.find((call) => call.command === "research:daily")
+      ?.args.includes("--maxCandidates=25"),
+    true
+  );
   assert.ok(calls.every((call) => call.safety.alpacaEnv === "paper"));
   assert.ok(calls.every((call) => call.safety.tradingMode === "paper"));
   assert.ok(calls.every((call) => call.safety.alpacaLiveTrade === "false"));
   assert.ok(calls.every((call) => call.safety.liveTradingEnabled === "false"));
-  for (const index of [7, 8, 11, 12]) {
-    assert.equal(workstreamCalls[index]!.args.includes("--confirmPaper"), true);
+  for (const command of [
+    "paper:execute:reviewed",
+    "zero-dte:engine",
+    "paper:exit:execute",
+    "hedge:exit:execute",
+    "paper:order:cancel"
+  ]) {
+    const call = workstreamCalls.find((candidate) => candidate.command === command);
+    assert.equal(call?.args.includes("--confirmPaper"), true, command);
   }
+  const cancellation = workstreamCalls.find((call) => call.command === "paper:order:cancel");
+  assert.equal(cancellation?.args.includes("--autonomous"), true);
+  const entryExecution = workstreamCalls.find((call) => call.command === "paper:execute:reviewed");
   assert.equal(
-    workstreamCalls[8]!.args.includes("--sections=equityBuys,equityAdds,optionBuys"),
+    entryExecution?.args.includes("--sections=equityBuys,equityAdds,optionBuys"),
     true
   );
 
@@ -419,7 +437,7 @@ globalThis.setInterval = (callback, delay, ...args) =>
     assert.ok(heartbeat, result.stdout);
     assert.equal(heartbeat.cycle, 1);
     assert.equal(heartbeat.position, 1);
-    assert.equal(heartbeat.workstream, "research:daily");
+    assert.equal(heartbeat.workstream, "zero-dte:reconcile");
     assert.match(String(heartbeat.cycleId), /^[0-9a-f-]{36}$/i);
     assert.equal(Number.isSafeInteger(heartbeat.childPid), true);
     assert.equal(typeof heartbeat.elapsedMs, "number");
@@ -450,7 +468,7 @@ test("successful workstreams forward structured PostgreSQL telemetry with cycle 
   );
   assert.ok(batch, result.stdout);
   assert.equal(batch.cycle, 1);
-  assert.equal(batch.position, 1);
+  assert.equal(batch.position, 2);
   assert.equal(batch.workstream, "research:daily");
   assert.match(String(batch.cycleId), /^[0-9a-f-]{36}$/i);
   assert.equal(batch.batchNumber, 1);
@@ -465,10 +483,14 @@ test("an ordinary workstream failure fails fast with durable terminal state", ()
   assert.notEqual(result.status, 0, result.stderr || result.stdout);
   assert.deepEqual(
     calls.filter((call) => call.command !== "worker:state").map((call) => call.command),
-    ["research:daily", "paper:review"]
+    ["zero-dte:reconcile", "research:daily", "paper:options:discover", "paper:review"]
   );
   assert.deepEqual(states.map((state) => state.eventType), [
     "cycle_started",
+    "workstream_started",
+    "workstream_completed",
+    "workstream_started",
+    "workstream_completed",
     "workstream_started",
     "workstream_completed",
     "workstream_started",
@@ -524,11 +546,12 @@ test("expected closed-market readiness conditions defer without stopping the wor
   }
 });
 
-test("legitimate PostgreSQL empty-work outcomes are no-action completions across all 16 workstreams", () => {
+test("legitimate PostgreSQL empty-work outcomes are no-action completions across the full lifecycle", () => {
   const expected = {
     "paper:review": "NO_ELIGIBLE_POSTGRES_CANDIDATES",
     "paper:exit:review": "NO_POSTGRES_EXIT_TRIGGER",
     "paper:execute:reviewed": "NO_READY_POSTGRES_ORDER_INTENTS",
+    "paper:order:cancel": "NO_CANCELLABLE_POSTGRES_ORDERS",
     "paper:learn": "NO_RECONCILIABLE_POSTGRES_ORDERS"
   } as const;
   const { result, calls, states } = runWorker({
@@ -545,7 +568,7 @@ test("legitimate PostgreSQL empty-work outcomes are no-action completions across
     workstreams
   );
   const completions = states.filter((state) => state.eventType === "workstream_completed");
-  assert.equal(completions.length, 16);
+  assert.equal(completions.length, workstreams.length);
   for (const [workstream, reasonCode] of Object.entries(expected)) {
     const completion = completions.find((state) => state.payload.workstream === workstream);
     assert.equal(completion?.payload.classification, "no_action");
@@ -769,7 +792,7 @@ test("workstream timeout emits telemetry and terminates the full process group",
     assert.ok(timeout, worker.stdout());
     assert.equal(timeout.cycle, 1);
     assert.equal(timeout.position, 1);
-    assert.equal(timeout.workstream, "research:daily");
+    assert.equal(timeout.workstream, "zero-dte:reconcile");
     assert.equal(timeout.childPid, commandPid);
     assert.equal(typeof timeout.elapsedMs, "number");
     assert.deepEqual(

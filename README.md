@@ -13,7 +13,7 @@ writes, control-plane/scheduler/execution-state authority, both shadow flags
 off, and `SQLITE_AUDIT_MIRROR_ENABLED=false`. Missing PostgreSQL connectivity
 or an incomplete authority configuration fails closed. Dashboard reads require
 the PostgreSQL-backed VPS bridge. The autonomous paper worker is restored only
-through `src/postgresOnlyCli.ts`; its 16 registered workstreams and lifecycle
+through `src/postgresOnlyCli.ts`; its 20 dependency-ordered workstreams and lifecycle
 events have no production import path to SQLite. Historical timers remain
 disabled so that systemd has one scheduler authority.
 
@@ -42,11 +42,39 @@ row, and the scheduler releases its lease as failed before the command exits.
 The parent worker does not persist `worker_stopped` until the detached
 workstream process group is gone. Successful PostgreSQL empty-work results
 `NO_ELIGIBLE_POSTGRES_CANDIDATES`, `NO_POSTGRES_EXIT_TRIGGER`, and
-`NO_READY_POSTGRES_ORDER_INTENTS`, plus the learning result
+`NO_READY_POSTGRES_ORDER_INTENTS`, the cancellation result
+`NO_CANCELLABLE_POSTGRES_ORDERS`, plus the learning result
 `NO_RECONCILIABLE_POSTGRES_ORDERS`, retain their exact domain `reasonCode`
 under `classification=no_action` and `code=WORKSTREAM_NO_ACTION`. Genuine
 operational inability to continue remains blocked. Lifecycle audit rows and
 the active-workstream uniqueness index remain intact.
+
+## Durable autonomous execution boundary (2026-07-24)
+
+Each execution workstream captures one current Alpaca paper account/order/
+position snapshot, persists it to PostgreSQL, and uses that evidence for
+confirmation promotion, intent claim, authorization, and the single broker
+mutation. Authorization identity uses stable account, cash, position, and open
+order fields; quote-driven mark, equity, buying-power, and unrealized-P&L
+movement remains audit evidence but does not create a false identity conflict.
+The claim still revalidates current buying-power, cash-reserve, deployment,
+strategy-allocation, symbol, position-count, order-count, reservation,
+freshness, and scheduler-fence limits before submission.
+
+The client order ID, intent, and durable `order_submission_attempt` broker event
+exist before Alpaca is called. A timeout, disconnect, or unknown response never
+causes a resubmit: the worker performs bounded exact-client-order-ID lookups and
+reconciles a discovered broker order. A confirmed broker absence requires both
+four persisted absence observations and at least 120 seconds before the intent
+is terminalized and its reservation is released. Restart recovery resumes the
+same persisted ambiguous intent.
+
+The worker reconciles before research, between entry and exit phases, and after
+exit/cancellation. Its production cancellation workstream queries Alpaca first,
+persists the request before mutation, skips filled or terminal orders, then
+reconciles the terminal state and reservation. No external snapshot handoff,
+manual intent creation, or temporary execution harness is part of this runtime
+path.
 
 OPRA snapshot persistence commits symbol-scoped batches of at most 250 rows and
 immediately reads each exact identity back before the next batch begins. Each
@@ -106,7 +134,9 @@ stale option evidence is withheld from option paths while independently current
 equity evidence may proceed.
 Reviews create signed, unconfirmed PostgreSQL intents; they do not manufacture
 confirmation or bypass the existing paper execution gates. Reconciliation
-keeps unresolved ambiguous submissions available for a later broker lookup.
+recovers unresolved ambiguous submissions by exact client order ID in the
+autonomous service and keeps bounded not-yet-found results pending without
+duplicating the order.
 
 Supported authority operations are:
 

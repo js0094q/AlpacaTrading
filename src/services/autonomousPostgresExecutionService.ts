@@ -68,6 +68,19 @@ export type AutonomousExecutionTransaction = <T>(
   operation: (query: AutonomousExecutionQuery) => Promise<T>
 ) => Promise<T>;
 
+export type AmbiguousSubmissionRecovery =
+  | {
+      readonly status: "recovered";
+      readonly orderId: string;
+      readonly brokerOrderId: string;
+      readonly brokerStatus: string;
+    }
+  | {
+      readonly status: "pending";
+      readonly attempts: number;
+      readonly code: "POSTGRES_BROKER_SUBMISSION_RECOVERY_PENDING";
+    };
+
 const text = (value: unknown) => typeof value === "string" ? value.trim() : "";
 const positive = (value: unknown) => {
   const parsed = Number(value);
@@ -115,9 +128,6 @@ export const validateAutonomousExecutionEvidence = (
   const brokerAccountIdentity = broker.brokerAccountId ?? broker.accountIdentityHash;
   if (brokerAccountIdentity !== intent.broker_account_id) {
     throw new Error("POSTGRES_BROKER_ACCOUNT_IDENTITY_CONFLICT");
-  }
-  if (broker.portfolioFingerprint !== intent.account_snapshot_fingerprint) {
-    throw new Error("POSTGRES_BROKER_PORTFOLIO_EVIDENCE_CONFLICT");
   }
   if (broker.structuralPortfolioFingerprint !== intent.review_account_fingerprint) {
     throw new Error("POSTGRES_REVIEW_ACCOUNT_EVIDENCE_CONFLICT");
@@ -613,14 +623,60 @@ const claimIntent = async (
        ON allocation.account_id = intent.account_id
       AND allocation.strategy_key = intent.strategy_key
       AND allocation.status = 'active' AND allocation.effective_to IS NULL
-     JOIN risk_limits limits ON limits.account_id = intent.account_id
-      AND limits.status = 'active' AND limits.effective_to IS NULL
+     JOIN LATERAL (
+       SELECT *
+       FROM risk_limits current_limits
+       WHERE current_limits.account_id = intent.account_id
+         AND current_limits.status = 'active' AND current_limits.effective_to IS NULL
+       ORDER BY CASE WHEN current_limits.scope_type = 'portfolio' THEN 0 ELSE 1 END,
+                current_limits.updated_at DESC
+       LIMIT 1
+     ) limits ON true
      JOIN LATERAL (
        SELECT id FROM portfolio_exposure exposure
        WHERE exposure.account_id = intent.account_id
        ORDER BY exposure.observed_at DESC, exposure.id DESC LIMIT 1
      ) exposure ON true
      LEFT JOIN buying_power_reservations reservation ON reservation.id = intent.reservation_id
+     JOIN LATERAL (
+       SELECT COALESCE(SUM(active_reservation.amount), 0) AS total,
+              COALESCE(SUM(active_reservation.amount)
+                FILTER (WHERE active_reservation.symbol = intent.symbol), 0) AS symbol_total
+       FROM buying_power_reservations active_reservation
+       WHERE active_reservation.account_id = intent.account_id
+         AND active_reservation.status = 'active'
+         AND active_reservation.expires_at > $1
+     ) reservation_state ON true
+     JOIN LATERAL (
+       SELECT COALESCE(SUM(COALESCE(
+                open_order.notional,
+                open_order.quantity * open_order.limit_price *
+                  CASE WHEN open_order.asset_class = 'option' THEN 100 ELSE 1 END
+              )), 0) AS total,
+              COALESCE(SUM(COALESCE(
+                open_order.notional,
+                open_order.quantity * open_order.limit_price *
+                  CASE WHEN open_order.asset_class = 'option' THEN 100 ELSE 1 END
+              )) FILTER (WHERE open_order.symbol = intent.symbol), 0) AS symbol_total,
+              COUNT(*) AS count
+       FROM orders open_order
+       WHERE open_order.account_id = intent.account_id
+         AND open_order.status IN (
+           'new', 'accepted', 'pending_new', 'partially_filled', 'held', 'replaced'
+         )
+     ) open_order_state ON true
+     JOIN LATERAL (
+       SELECT COALESCE(SUM(ABS(COALESCE(
+                current_position.market_value, current_position.cost_basis, 0
+              ))), 0) AS total,
+              COALESCE(SUM(ABS(COALESCE(
+                current_position.market_value, current_position.cost_basis, 0
+              ))) FILTER (WHERE current_position.symbol = intent.symbol), 0) AS symbol_total,
+              COUNT(*) AS count
+       FROM positions current_position
+       WHERE current_position.account_id = intent.account_id
+         AND current_position.status IN ('open', 'closing')
+     ) position_state ON true
      WHERE intent.status = 'ready_for_submission' AND intent.environment = 'paper'
        AND ${commandFilter(command)}
        AND review.status = 'valid' AND review.environment = 'paper'
@@ -628,10 +684,51 @@ const claimIntent = async (
        AND review.expires_at > $1
        AND confirmation.status = 'valid' AND confirmation.paper_only
        AND confirmation.expires_at > $1
+       AND snapshot.evidence->>'structuralPortfolioFingerprint' = review.account_fingerprint
        AND (
          intent.reservation_id IS NULL OR
          (reservation.status = 'active' AND reservation.expires_at > $1
-          AND reservation.account_snapshot_id = snapshot.id)
+          AND COALESCE(snapshot.buying_power, 0)
+                - reservation_state.total
+                - open_order_state.total
+                - GREATEST(
+                    COALESCE(limits.cash_reserve_amount, 0),
+                    COALESCE(snapshot.equity, 0) *
+                      COALESCE(limits.cash_reserve_ratio, 0)
+                  ) >= 0
+          AND (
+            limits.max_deployment_amount IS NULL OR
+            position_state.total + open_order_state.total + reservation_state.total
+              <= limits.max_deployment_amount
+          )
+          AND (
+            limits.max_deployment_ratio IS NULL OR
+            position_state.total + open_order_state.total + reservation_state.total
+              <= COALESCE(snapshot.equity, 0) * limits.max_deployment_ratio
+          )
+          AND (
+            allocation.allocation_amount IS NULL OR
+            allocation.deployed_amount + allocation.reserved_amount
+              <= allocation.allocation_amount
+          )
+          AND (
+            allocation.allocation_ratio IS NULL OR
+            allocation.deployed_amount + allocation.reserved_amount
+              <= COALESCE(snapshot.equity, 0) * allocation.allocation_ratio
+          )
+          AND (
+            limits.max_symbol_notional IS NULL OR
+            position_state.symbol_total + open_order_state.symbol_total +
+              reservation_state.symbol_total <= limits.max_symbol_notional
+          )
+          AND (
+            limits.max_position_count IS NULL OR
+            position_state.count < limits.max_position_count
+          )
+          AND (
+            limits.max_order_count IS NULL OR
+            open_order_state.count < limits.max_order_count
+          ))
        )
      ORDER BY intent.ready_at, intent.created_at, intent.id
      LIMIT 1
@@ -782,6 +879,47 @@ const recordSubmission = async (
   return { orderId, brokerOrderId, status };
 };
 
+const recordSubmissionAttempt = async (
+  query: AutonomousExecutionQuery,
+  intent: AutonomousExecutionIntentRow,
+  payload: AlpacaPaperOrderRequest,
+  fence: SchedulerFence,
+  now: Date
+) => {
+  const evidence = {
+    command: "submit_order",
+    clientOrderId: intent.client_order_id,
+    payload
+  };
+  const eventId = `broker_event_${stableRecordId(
+    "alpaca_broker_submission_attempt",
+    `${intent.account_id}:${intent.order_intent_id}:${intent.client_order_id}`
+  )}`;
+  const inserted = await query.query(
+    `INSERT INTO broker_events(
+       event_id, account_id, order_intent_id, client_order_id,
+       event_type, event_status, retryable, response_payload,
+       response_fingerprint, occurred_at, received_at
+     ) SELECT $1, $2, $3, $4, 'order_submission_attempt', 'pending', true,
+              $5::jsonb, $6, $7, $7
+       WHERE ${fenceSql(8)}
+     ON CONFLICT (event_id) DO NOTHING`,
+    [
+      eventId,
+      intent.account_id,
+      intent.order_intent_id,
+      intent.client_order_id,
+      JSON.stringify(evidence),
+      canonicalJsonHash(evidence),
+      now.toISOString(),
+      ...fenceValues(fence)
+    ]
+  );
+  if (inserted.rowCount !== 0 && inserted.rowCount !== 1) {
+    throw new Error("POSTGRES_BROKER_SUBMISSION_ATTEMPT_PERSISTENCE_FAILED");
+  }
+};
+
 const recordAmbiguousSubmission = async (
   query: AutonomousExecutionQuery,
   intent: AutonomousExecutionIntentRow,
@@ -849,15 +987,23 @@ const assertSafety = (safety: AutonomousExecutionSafety, confirmPaper: boolean) 
   if (!confirmPaper) throw new Error("PAPER_CONFIRMATION_REQUIRED");
 };
 
-export const runAutonomousPostgresExecutionCommand = async (input: {
+export const runAutonomousPostgresExecutionCommand = async <
+  BrokerSnapshot extends AutonomousExecutionBrokerSnapshot
+>(input: {
   readonly command: string;
   readonly query: AutonomousExecutionQuery;
   readonly transaction: AutonomousExecutionTransaction;
   readonly marketOpen?: () => Promise<boolean>;
-  readonly captureBrokerSnapshot: () => Promise<AutonomousExecutionBrokerSnapshot>;
+  readonly captureBrokerSnapshot: () => Promise<BrokerSnapshot>;
+  readonly persistBrokerSnapshot?: (
+    snapshot: BrokerSnapshot
+  ) => Promise<void>;
   readonly submitOrder: (
     payload: AlpacaPaperOrderRequest
   ) => Promise<AlpacaApiResponse<AlpacaSubmittedOrder>>;
+  readonly recoverAmbiguousSubmission?: (
+    clientOrderId: string
+  ) => Promise<AmbiguousSubmissionRecovery>;
   readonly checkAsset?: (
     symbol: string
   ) => Promise<AlpacaAssetTradabilityResult>;
@@ -913,6 +1059,8 @@ export const runAutonomousPostgresExecutionCommand = async (input: {
   }
 
   const now = input.now ?? new Date();
+  const broker = await input.captureBrokerSnapshot();
+  await input.persistBrokerSnapshot?.(broker);
   let promotion: Awaited<ReturnType<typeof promoteNextConfirmedPostgresIntent>> | undefined;
   if (readyCount === 0 && confirmableCount > 0) {
     const signingKey = input.confirmationSigningKey ??
@@ -943,7 +1091,6 @@ export const runAutonomousPostgresExecutionCommand = async (input: {
     }
     readyCount = 1;
   }
-  const broker = await input.captureBrokerSnapshot();
   const intent = await input.transaction((query) =>
     claimIntent(query, input.command, input.fence, now, input.expectedPayloadSignature)
   );
@@ -983,6 +1130,19 @@ export const runAutonomousPostgresExecutionCommand = async (input: {
     );
     throw error;
   }
+  try {
+    await input.transaction((query) =>
+      recordSubmissionAttempt(query, intent, payload, input.fence, now)
+    );
+  } catch (error) {
+    const reason = error instanceof Error
+      ? error.message.slice(0, 240)
+      : "POSTGRES_BROKER_SUBMISSION_ATTEMPT_PERSISTENCE_FAILED";
+    await input.transaction((query) =>
+      releaseClaim(query, intent, input.fence, now, reason)
+    );
+    throw error;
+  }
   let recorded: Awaited<ReturnType<typeof recordSubmission>>;
   try {
     const response = await input.submitOrder(payload);
@@ -993,7 +1153,50 @@ export const runAutonomousPostgresExecutionCommand = async (input: {
     await input.transaction((query) =>
       recordAmbiguousSubmission(query, intent, error, input.fence, now)
     );
-    throw new Error("POSTGRES_BROKER_SUBMISSION_AMBIGUOUS");
+    if (!input.recoverAmbiguousSubmission) {
+      throw new Error("POSTGRES_BROKER_SUBMISSION_AMBIGUOUS");
+    }
+    const recovery = await input.recoverAmbiguousSubmission(intent.client_order_id);
+    if (recovery.status === "pending") {
+      return {
+        status: "recovery_pending" as const,
+        code: recovery.code,
+        submittedOrderCount: 0,
+        evidence: {
+          readyIntentCount: readyCount,
+          confirmableIntentCount: confirmableCount,
+          confirmationPromoted: promotion?.status === "promoted",
+          orderIntentId: intent.order_intent_id,
+          clientOrderId: intent.client_order_id,
+          recoveredFromAmbiguous: false,
+          recoveryAttempts: recovery.attempts
+        }
+      };
+    }
+    await input.transaction((query) =>
+      persistCandidateExecutionStage(
+        query,
+        intent,
+        input.fence,
+        now,
+        "executed",
+        "PAPER_ORDER_RECOVERED_BY_CLIENT_ID"
+      )
+    );
+    return {
+      status: "completed" as const,
+      submittedOrderCount: 1,
+      evidence: {
+        readyIntentCount: readyCount,
+        confirmableIntentCount: confirmableCount,
+        confirmationPromoted: promotion?.status === "promoted",
+        orderIntentId: intent.order_intent_id,
+        orderId: recovery.orderId,
+        brokerOrderId: recovery.brokerOrderId,
+        brokerStatus: recovery.brokerStatus,
+        recoveredFromAmbiguous: true
+      }
+    };
   }
   return {
     status: "completed" as const,

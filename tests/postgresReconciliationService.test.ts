@@ -1,14 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { reconcilePostgresPaperOrders } from "../src/services/postgresReconciliationService.js";
+import {
+  persistPostgresAuthorityBrokerSnapshot,
+  reconcilePostgresPaperOrders,
+  recoverAmbiguousPostgresSubmission
+} from "../src/services/postgresReconciliationService.js";
 
 const fence = {
   jobName: "reconciliation", workstream: "reconciliation", ownerId: "worker",
   runId: "run", fencingToken: "7"
 };
 
-test("ambiguous submissions remain ambiguous when broker identity cannot be resolved", async () => {
+test("recent ambiguous broker absence remains pending without blocking the worker", async () => {
   const updates: string[] = [];
   const result = await reconcilePostgresPaperOrders({
     query: {
@@ -19,8 +23,18 @@ test("ambiguous submissions remain ambiguous when broker identity cannot be reso
             client_order_id: "client-1", broker_order_id: null,
             symbol: "SPY", asset_class: "equity", side: "buy",
             order_type: "market", time_in_force: "day", quantity: null,
-            notional: "1000", limit_price: null, intent_status: "ambiguous"
+            notional: "1000", limit_price: null, intent_status: "ambiguous",
+            intent_updated_at: "2026-07-20T21:59:45.000Z"
           }], rowCount: 1 };
+        }
+        if (sql.includes("AS prior_absence_count")) {
+          return {
+            rows: [{
+              prior_absence_count: "0",
+              first_attempt_at: "2026-07-20T21:59:45.000Z"
+            }],
+            rowCount: 1
+          };
         }
         updates.push(sql);
         return { rows: [], rowCount: 1 };
@@ -28,12 +42,185 @@ test("ambiguous submissions remain ambiguous when broker identity cannot be reso
     },
     fence,
     syncBrokerState: false,
-    getOrderByClientOrderId: async () => { throw new Error("not found"); }
+    now: new Date("2026-07-20T22:00:00.000Z"),
+    getOrderByClientOrderId: async () => { throw new Error("404 order not found"); }
   });
 
   assert.equal(result.checked, 1);
-  assert.equal(result.errors.length, 1);
+  assert.equal(result.pending, 1);
+  assert.equal(result.errors.length, 0);
   assert.equal(updates.some((sql) => sql.includes("UPDATE order_intents")), false);
+});
+
+test("defined terminal broker-absence policy fails the intent and releases its reservation", async () => {
+  const statements: string[] = [];
+  const result = await reconcilePostgresPaperOrders({
+    query: {
+      query: async (sql: string) => {
+        statements.push(sql);
+        if (sql.includes("FROM order_intents intent")) {
+          return {
+            rows: [{
+              order_intent_id: "intent-absent",
+              account_id: "account-1",
+              client_order_id: "client-absent",
+              broker_order_id: null,
+              reservation_id: "reservation-absent",
+              strategy_key: "baseline",
+              symbol: "AAPL",
+              asset_class: "equity",
+              side: "buy",
+              order_type: "market",
+              time_in_force: "day",
+              quantity: "1",
+              notional: null,
+              limit_price: null,
+              intent_status: "ambiguous",
+              intent_updated_at: "2026-07-20T21:55:00.000Z"
+            }],
+            rowCount: 1
+          };
+        }
+        if (sql.includes("AS prior_absence_count")) {
+          return {
+            rows: [{
+              prior_absence_count: "3",
+              first_attempt_at: "2026-07-20T21:55:00.000Z"
+            }],
+            rowCount: 1
+          };
+        }
+        if (sql.includes("failed_intent_count")) {
+          return {
+            rows: [{
+              failed_intent_count: "1",
+              released_reservation_count: "1",
+              adjusted_allocation_count: "1"
+            }],
+            rowCount: 1
+          };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    syncBrokerState: false,
+    now: new Date("2026-07-20T22:00:00.000Z"),
+    getOrderByClientOrderId: async () => { throw new Error("404 order not found"); }
+  });
+
+  assert.equal(result.failedAbsent, 1);
+  assert.equal(result.pending, 0);
+  assert.equal(result.errors.length, 0);
+  assert.equal(
+    statements.some((sql) =>
+      sql.includes("SET status = 'failed'") &&
+      sql.includes("status = 'released'")
+    ),
+    true
+  );
+});
+
+test("a worker restart resumes persisted ambiguous submission by exact client identity without resubmission", async () => {
+  const lookups: string[] = [];
+  const waits: number[] = [];
+  const queryValues: Array<readonly unknown[]> = [];
+  const result = await recoverAmbiguousPostgresSubmission({
+    query: {
+      query: async (sql: string, values?: readonly unknown[]) => {
+        queryValues.push(values ?? []);
+        if (sql.includes("FROM order_intents intent")) {
+          return {
+            rows: [{
+              order_intent_id: "intent-recovery",
+              account_id: "account-1",
+              client_order_id: "client-recovery",
+              broker_order_id: null,
+              reservation_id: null,
+              strategy_key: "baseline",
+              symbol: "AAPL",
+              asset_class: "equity",
+              side: "buy",
+              order_type: "market",
+              time_in_force: "day",
+              quantity: "1",
+              notional: null,
+              limit_price: null,
+              intent_status: "ambiguous"
+            }],
+            rowCount: 1
+          };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    clientOrderId: "client-recovery",
+    maxAttempts: 3,
+    retryDelayMs: 25,
+    sleep: async (delayMs) => {
+      waits.push(delayMs);
+    },
+    syncBrokerState: false,
+    getOrderByClientOrderId: async (clientOrderId) => {
+      lookups.push(clientOrderId);
+      if (lookups.length === 1) throw new Error("not found yet");
+      return {
+        status: 200,
+        requestId: "request-recovery",
+        data: {
+          id: "broker-recovery",
+          client_order_id: clientOrderId,
+          symbol: "AAPL",
+          asset_class: "us_equity",
+          side: "buy",
+          type: "market",
+          time_in_force: "day",
+          status: "accepted",
+          qty: "1",
+          filled_qty: "0",
+          submitted_at: "2026-07-20T22:00:00.000Z"
+        }
+      } as never;
+    }
+  });
+
+  assert.deepEqual(lookups, ["client-recovery", "client-recovery"]);
+  assert.deepEqual(waits, [25]);
+  assert.equal(result.status, "recovered");
+  assert.equal(result.brokerOrderId, "broker-recovery");
+  assert.equal(result.attempts, 2);
+  assert.equal(
+    queryValues.some((values) => values[0] === "client-recovery"),
+    true,
+    "reconciliation must select only the ambiguous client order"
+  );
+});
+
+test("ambiguous submission recovery remains pending after the bounded absence policy", async () => {
+  let lookups = 0;
+  const result = await recoverAmbiguousPostgresSubmission({
+    query: {
+      query: async () => ({ rows: [], rowCount: 0 })
+    },
+    fence,
+    clientOrderId: "client-not-yet-visible",
+    maxAttempts: 3,
+    retryDelayMs: 1,
+    sleep: async () => undefined,
+    syncBrokerState: false,
+    getOrderByClientOrderId: async () => {
+      lookups += 1;
+      throw new Error("broker identity not visible");
+    }
+  });
+
+  assert.equal(lookups, 3);
+  assert.deepEqual(result, {
+    status: "pending",
+    attempts: 3,
+    code: "POSTGRES_BROKER_SUBMISSION_RECOVERY_PENDING"
+  });
 });
 
 test("resolved broker submissions are recorded exclusively in PostgreSQL", async () => {
@@ -316,6 +503,7 @@ test("reconciliation synchronizes broker account and positions into PostgreSQL a
 
   assert.deepEqual(result.brokerState, {
     accountId: "account_paper-account-hash",
+    accountSnapshotId: "snapshot_f2f45d97351ef778512afc5229ed862ec0db5c09611dd892f758b59fca52b663",
     accountSnapshotStored: true,
     positionsObserved: 1,
     positionsUpserted: 1
@@ -332,4 +520,49 @@ test("reconciliation synchronizes broker account and positions into PostgreSQL a
   assert.ok(positionInsert);
   assert.equal(positionInsert.values[3], "AAPL");
   assert.equal(positionInsert.values[7], "short");
+});
+
+test("the execution transaction can persist its exact captured broker snapshot", async () => {
+  const statements: string[] = [];
+  const result = await persistPostgresAuthorityBrokerSnapshot({
+    query: {
+      query: async (sql: string) => {
+        statements.push(sql);
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    snapshot: {
+      capturedAt: "2026-07-20T22:00:00.000Z",
+      accountIdentityHash: "paper-account-hash",
+      account: {
+        status: "ACTIVE",
+        currency: "USD",
+        cash: 10_000,
+        equity: 20_000,
+        buyingPower: 30_000,
+        optionsBuyingPower: 15_000,
+        optionsApprovalLevel: 3,
+        tradingBlocked: false,
+        accountBlocked: false
+      },
+      configuration: {
+        environment: "paper",
+        tradingMode: "paper",
+        liveTradingEnabled: false
+      },
+      configurationFingerprint: "configuration-fingerprint",
+      positions: [],
+      orders: [],
+      structuralPortfolioFingerprint: "structural-fingerprint",
+      portfolioFingerprint: "portfolio-fingerprint"
+    } as never
+  });
+
+  assert.equal(result.accountId, "account_paper-account-hash");
+  assert.equal(typeof result.accountSnapshotId, "string");
+  assert.equal(
+    statements.some((sql) => sql.includes("INSERT INTO account_snapshots")),
+    true
+  );
 });

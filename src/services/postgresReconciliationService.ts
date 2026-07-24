@@ -23,6 +23,7 @@ type ReconciliationQuery = {
 
 type Target = Record<string, unknown> & {
   order_intent_id: string;
+  candidate_id: string | null;
   account_id: string;
   client_order_id: string;
   broker_order_id: string | null;
@@ -37,6 +38,7 @@ type Target = Record<string, unknown> & {
   notional: string | null;
   limit_price: string | null;
   intent_status: string;
+  intent_updated_at: string;
 };
 
 const fenceSql = (start: number) => `EXISTS (
@@ -58,12 +60,14 @@ const optional = (value: unknown) => value === null || value === undefined || va
   ? null
   : String(value);
 
-const targetsSql = `SELECT intent.id AS order_intent_id, intent.account_id,
+const targetsSql = `SELECT intent.id AS order_intent_id, intent.candidate_id,
+       intent.account_id,
        intent.client_order_id, broker_order.broker_order_id,
        intent.reservation_id, intent.strategy_key,
        intent.symbol, intent.asset_class, intent.side, intent.order_type,
        intent.time_in_force, intent.quantity::text, intent.notional::text,
-       intent.limit_price::text, intent.status AS intent_status
+       intent.limit_price::text, intent.status AS intent_status,
+       intent.updated_at::text AS intent_updated_at
 FROM order_intents intent
 LEFT JOIN LATERAL (
   SELECT * FROM orders WHERE order_intent_id = intent.id
@@ -71,9 +75,18 @@ LEFT JOIN LATERAL (
 ) broker_order ON true
 WHERE intent.environment = 'paper'
   AND intent.status IN ('submission_pending', 'submitted', 'ambiguous')
+  AND ($1 = '' OR intent.client_order_id = $1)
 ORDER BY intent.created_at, intent.id`;
 
 const terminalStatuses = new Set(["filled", "canceled", "cancelled", "expired", "rejected"]);
+const BROKER_ABSENCE_TERMINAL_OBSERVATIONS = 4;
+const BROKER_ABSENCE_TERMINAL_AGE_MS = 120_000;
+
+const brokerOrderAbsent = (error: unknown) => {
+  const status = Number((error as { status?: unknown } | null)?.status);
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return status === 404 || /\b404\b|order not found/i.test(message);
+};
 
 type ExternalOrderObservation = {
   brokerOrderId: string;
@@ -240,10 +253,192 @@ const syncBrokerAccountAndPositions = async (input: {
   }
   return {
     accountId,
+    accountSnapshotId,
     accountSnapshotStored: accountSnapshot.rowCount === 1,
     positionsObserved: snapshot.positions.length,
     positionsUpserted
   };
+};
+
+export const persistPostgresAuthorityBrokerSnapshot = syncBrokerAccountAndPositions;
+
+const recordBrokerOrderAbsence = async (input: {
+  query: ReconciliationQuery;
+  fence: SchedulerFence;
+  target: Target;
+  now: Date;
+}) => {
+  const observed = await input.query.query(
+    `SELECT
+       COUNT(*) FILTER (
+         WHERE event_type = 'order_submission_absence'
+       )::text AS prior_absence_count,
+       COALESCE(
+         MIN(occurred_at) FILTER (
+           WHERE event_type = 'order_submission_attempt'
+         ),
+         $3::timestamptz
+       )::text AS first_attempt_at
+     FROM broker_events
+     WHERE order_intent_id = $1 AND client_order_id = $2
+       AND event_type IN (
+         'order_submission_attempt', 'order_submission_absence'
+       )`,
+    [
+      input.target.order_intent_id,
+      input.target.client_order_id,
+      input.target.intent_updated_at
+    ]
+  );
+  const priorAbsenceCount = Number(
+    observed.rows[0]?.prior_absence_count ?? 0
+  );
+  const firstAttemptAt = Date.parse(String(
+    observed.rows[0]?.first_attempt_at ?? input.target.intent_updated_at
+  ));
+  if (
+    !Number.isSafeInteger(priorAbsenceCount) ||
+    priorAbsenceCount < 0 ||
+    !Number.isFinite(firstAttemptAt)
+  ) {
+    throw new Error("POSTGRES_BROKER_ABSENCE_EVIDENCE_INVALID");
+  }
+  const observation = priorAbsenceCount + 1;
+  const terminal = observation >= BROKER_ABSENCE_TERMINAL_OBSERVATIONS &&
+    input.now.getTime() - firstAttemptAt >= BROKER_ABSENCE_TERMINAL_AGE_MS;
+  const evidence = {
+    code: terminal
+      ? "POSTGRES_BROKER_SUBMISSION_ABSENCE_CONFIRMED"
+      : "POSTGRES_BROKER_SUBMISSION_RECOVERY_PENDING",
+    clientOrderId: input.target.client_order_id,
+    observation,
+    requiredObservations: BROKER_ABSENCE_TERMINAL_OBSERVATIONS,
+    firstAttemptAt: new Date(firstAttemptAt).toISOString(),
+    terminalAfterMs: BROKER_ABSENCE_TERMINAL_AGE_MS
+  };
+  const eventId = `broker_event_${stableRecordId(
+    "alpaca_broker_submission_absence",
+    `${input.target.account_id}:${input.target.client_order_id}:${observation}`
+  )}`;
+  if (!terminal) {
+    const event = await input.query.query(
+      `INSERT INTO broker_events(
+         event_id, account_id, order_intent_id, client_order_id,
+         event_type, event_status, error_classification, retryable,
+         response_payload, response_fingerprint, occurred_at, received_at
+       ) SELECT $1, $2, $3, $4, 'order_submission_absence', 'pending',
+                'broker_order_not_found', true, $5::jsonb, $6, $7, $7
+         WHERE ${fenceSql(8)}
+       ON CONFLICT (event_id) DO NOTHING`,
+      [
+        eventId,
+        input.target.account_id,
+        input.target.order_intent_id,
+        input.target.client_order_id,
+        JSON.stringify(evidence),
+        canonicalJsonHash(evidence),
+        input.now.toISOString(),
+        ...fenceValues(input.fence)
+      ]
+    );
+    if (event.rowCount !== 0 && event.rowCount !== 1) {
+      throw new Error("POSTGRES_BROKER_ABSENCE_PERSISTENCE_FAILED");
+    }
+    return { status: "pending" as const, observation };
+  }
+
+  const terminalized = await input.query.query(
+    `WITH absence_event AS (
+       INSERT INTO broker_events(
+         event_id, account_id, order_intent_id, client_order_id,
+         event_type, event_status, error_classification, retryable,
+         response_payload, response_fingerprint, occurred_at, received_at
+       ) SELECT $1, $2, $3, $4, 'order_submission_absence', 'terminal',
+                'broker_order_absence_confirmed', false, $5::jsonb, $6, $7, $7
+         WHERE ${fenceSql(8)}
+       ON CONFLICT (event_id) DO NOTHING
+       RETURNING event_id
+     ), failed_intent AS (
+       UPDATE order_intents intent
+       SET status = 'failed', terminal_at = $7, updated_at = $7,
+           version = intent.version + 1
+       WHERE intent.id = $3
+         AND intent.status IN ('submission_pending', 'ambiguous')
+         AND EXISTS (SELECT 1 FROM absence_event)
+         AND ${fenceSql(8)}
+       RETURNING intent.reservation_id
+     ), released AS (
+       UPDATE buying_power_reservations reservation
+       SET status = 'released', released_at = $7,
+           release_reason = 'broker_order_absence_confirmed',
+           updated_at = $7, version = reservation.version + 1
+       FROM failed_intent
+       WHERE reservation.id = failed_intent.reservation_id
+         AND reservation.status IN ('active', 'committed')
+         AND ${fenceSql(8)}
+       RETURNING reservation.account_id, reservation.strategy_key,
+                 reservation.amount
+     ), adjusted AS (
+       UPDATE strategy_allocations allocation
+       SET reserved_amount = GREATEST(
+             0, allocation.reserved_amount - released.amount
+           ),
+           updated_at = $7, version = allocation.version + 1
+       FROM released
+       WHERE allocation.account_id = released.account_id
+         AND allocation.strategy_key = released.strategy_key
+         AND allocation.status = 'active' AND allocation.effective_to IS NULL
+       RETURNING allocation.id
+     )
+     SELECT
+       (SELECT COUNT(*) FROM failed_intent)::text AS failed_intent_count,
+       (SELECT COUNT(*) FROM released)::text AS released_reservation_count,
+       (SELECT COUNT(*) FROM adjusted)::text AS adjusted_allocation_count`,
+    [
+      eventId,
+      input.target.account_id,
+      input.target.order_intent_id,
+      input.target.client_order_id,
+      JSON.stringify(evidence),
+      canonicalJsonHash(evidence),
+      input.now.toISOString(),
+      ...fenceValues(input.fence)
+    ]
+  );
+  const row = terminalized.rows[0] ?? {};
+  const failedIntentCount = Number(row.failed_intent_count ?? 0);
+  const releasedReservationCount = Number(
+    row.released_reservation_count ?? 0
+  );
+  const adjustedAllocationCount = Number(
+    row.adjusted_allocation_count ?? 0
+  );
+  const reservationExpected = Boolean(input.target.reservation_id);
+  if (
+    failedIntentCount !== 1 ||
+    releasedReservationCount !== (reservationExpected ? 1 : 0) ||
+    adjustedAllocationCount !== (reservationExpected ? 1 : 0)
+  ) {
+    throw new Error("POSTGRES_BROKER_ABSENCE_TERMINALIZATION_FAILED");
+  }
+  if (input.target.candidate_id) {
+    const candidate = await input.query.query(
+      `UPDATE candidates
+       SET lifecycle_status = 'execution_deferred',
+           decision_reason = 'POSTGRES_BROKER_SUBMISSION_ABSENCE_CONFIRMED',
+           updated_at = $2, version = version + 1
+       WHERE id = $1 AND decision = 'selected' AND ${fenceSql(3)}`,
+      [
+        input.target.candidate_id,
+        input.now.toISOString(),
+        ...fenceValues(input.fence)
+      ]
+    );
+    if (candidate.rowCount !== 1) {
+      throw new Error("POSTGRES_BROKER_ABSENCE_CANDIDATE_PERSISTENCE_FAILED");
+    }
+  }
+  return { status: "failed" as const, observation };
 };
 
 const observeExternalBrokerOrder = async (input: {
@@ -402,6 +597,7 @@ export const reconcilePostgresPaperOrders = async (input: {
   captureBrokerSnapshot?: (
     capturedAt?: string
   ) => Promise<PostgresAuthorityBrokerSnapshot>;
+  clientOrderId?: string;
 }) => {
   const now = input.now ?? new Date();
   const externalObservation = input.externalBrokerOrderId
@@ -415,7 +611,10 @@ export const reconcilePostgresPaperOrders = async (input: {
         safety: input.safety ?? paperSubmitConfiguration()
       })
     : null;
-  const listed = await input.query.query(targetsSql);
+  const listed = await input.query.query(
+    targetsSql,
+    [String(input.clientOrderId ?? "").trim()]
+  );
   const targets = listed.rows as Target[];
   const result = {
     status: "reconciled" as const,
@@ -426,7 +625,16 @@ export const reconcilePostgresPaperOrders = async (input: {
     filled: 0,
     partial: 0,
     terminal: 0,
+    pending: 0,
+    failedAbsent: 0,
     brokerState: null as Awaited<ReturnType<typeof syncBrokerAccountAndPositions>> | null,
+    orders: [] as Array<{
+      orderId: string;
+      orderIntentId: string;
+      brokerOrderId: string;
+      clientOrderId: string;
+      status: string;
+    }>,
     errors: [] as Array<{ orderIntentId: string; code: string }>
   };
   const lookup = input.getOrderByClientOrderId ?? getPaperOrderByClientOrderId;
@@ -551,10 +759,41 @@ export const reconcilePostgresPaperOrders = async (input: {
       }
       if (event.rowCount === 0) result.replayed += 1;
       else result.recorded += 1;
+      result.orders.push({
+        orderId,
+        orderIntentId: target.order_intent_id,
+        brokerOrderId: brokerId,
+        clientOrderId: clientId,
+        status
+      });
       if (status === "filled") result.filled += 1;
       else if (status === "partially_filled") result.partial += 1;
       else if (terminalStatuses.has(status)) result.terminal += 1;
     } catch (error) {
+      if (
+        ["submission_pending", "ambiguous"].includes(target.intent_status) &&
+        brokerOrderAbsent(error)
+      ) {
+        try {
+          const absence = await recordBrokerOrderAbsence({
+            query: input.query,
+            fence: input.fence,
+            target,
+            now
+          });
+          if (absence.status === "pending") result.pending += 1;
+          else result.failedAbsent += 1;
+          continue;
+        } catch (absenceError) {
+          result.errors.push({
+            orderIntentId: target.order_intent_id,
+            code: absenceError instanceof Error
+              ? absenceError.message.split(":", 1)[0]
+              : "POSTGRES_BROKER_ABSENCE_PERSISTENCE_FAILED"
+          });
+          continue;
+        }
+      }
       result.errors.push({
         orderIntentId: target.order_intent_id,
         code: error instanceof Error ? error.message.split(":", 1)[0] : "POSTGRES_RECONCILIATION_FAILED"
@@ -581,4 +820,96 @@ export const reconcilePostgresPaperOrders = async (input: {
     }
   }
   return result;
+};
+
+const boundedSleep = (milliseconds: number) =>
+  new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
+
+export const recoverAmbiguousPostgresSubmission = async (input: {
+  query: ReconciliationQuery;
+  fence: SchedulerFence;
+  clientOrderId: string;
+  maxAttempts?: number;
+  retryDelayMs?: number;
+  sleep?: (milliseconds: number) => Promise<void>;
+  getOrderByClientOrderId?: (
+    clientOrderId: string
+  ) => Promise<AlpacaApiResponse<AlpacaSubmittedOrder>>;
+  syncBrokerState?: boolean;
+  captureBrokerSnapshot?: (
+    capturedAt?: string
+  ) => Promise<PostgresAuthorityBrokerSnapshot>;
+}) => {
+  const clientOrderId = required(
+    input.clientOrderId,
+    "POSTGRES_BROKER_SUBMISSION_RECOVERY_CLIENT_ID_REQUIRED"
+  );
+  const maxAttempts = input.maxAttempts ?? 4;
+  const retryDelayMs = input.retryDelayMs ?? 750;
+  if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 10) {
+    throw new Error("POSTGRES_BROKER_SUBMISSION_RECOVERY_POLICY_INVALID");
+  }
+  if (
+    !Number.isSafeInteger(retryDelayMs) ||
+    retryDelayMs < 0 ||
+    retryDelayMs > 10_000
+  ) {
+    throw new Error("POSTGRES_BROKER_SUBMISSION_RECOVERY_POLICY_INVALID");
+  }
+  const lookup = input.getOrderByClientOrderId ?? getPaperOrderByClientOrderId;
+  const sleep = input.sleep ?? boundedSleep;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    let response: AlpacaApiResponse<AlpacaSubmittedOrder>;
+    try {
+      response = await lookup(clientOrderId);
+    } catch {
+      if (attempt < maxAttempts) await sleep(retryDelayMs);
+      continue;
+    }
+    const brokerOrderId = required(
+      response.data.id,
+      "POSTGRES_RECONCILIATION_BROKER_ID_MISSING"
+    );
+    const brokerStatus = required(
+      response.data.status,
+      "POSTGRES_RECONCILIATION_STATUS_MISSING"
+    ).toLowerCase();
+    if (
+      required(
+        response.data.client_order_id,
+        "POSTGRES_RECONCILIATION_CLIENT_ID_MISSING"
+      ) !== clientOrderId
+    ) {
+      throw new Error("POSTGRES_RECONCILIATION_BROKER_IDENTITY_MISMATCH");
+    }
+    const reconciliation = await reconcilePostgresPaperOrders({
+      query: input.query,
+      fence: input.fence,
+      clientOrderId,
+      getOrderByClientOrderId: async () => response,
+      syncBrokerState: input.syncBrokerState,
+      captureBrokerSnapshot: input.captureBrokerSnapshot
+    });
+    if (reconciliation.errors.length > 0) {
+      throw new Error("POSTGRES_BROKER_SUBMISSION_RECOVERY_RECONCILIATION_FAILED");
+    }
+    const order = reconciliation.orders.find(
+      (candidate) => candidate.clientOrderId === clientOrderId
+    );
+    if (!order) {
+      throw new Error("POSTGRES_BROKER_SUBMISSION_RECOVERY_ORDER_MISSING");
+    }
+    return {
+      status: "recovered" as const,
+      attempts: attempt,
+      orderId: order.orderId,
+      brokerOrderId,
+      brokerStatus
+    };
+  }
+  return {
+    status: "pending" as const,
+    attempts: maxAttempts,
+    code: "POSTGRES_BROKER_SUBMISSION_RECOVERY_PENDING" as const
+  };
 };

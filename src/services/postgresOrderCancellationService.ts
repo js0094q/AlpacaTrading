@@ -1,4 +1,6 @@
+import { canonicalJsonHash } from "../lib/canonicalJson.js";
 import type { SchedulerFence } from "../repositories/contracts/common.js";
+import { stableRecordId } from "../repositories/postgres/postgresRepositorySupport.js";
 import {
   cancelPaperOrder,
   getPaperOrder,
@@ -155,6 +157,44 @@ export const runPostgresPaperOrderCancellation = async (input: {
   if (terminalStatuses.has(beforeStatus)) {
     status = "already_terminal";
   } else {
+    const cancellationEvidence = {
+      brokerOrderId: expectedBrokerId,
+      clientOrderId: expectedClientId,
+      brokerStatus: beforeStatus,
+      requestedBy: "autonomous_postgres_cancellation"
+    };
+    const cancellationEventId = `broker_event_${stableRecordId(
+      "alpaca_order_cancellation_request",
+      `${target.account_id}:${expectedBrokerId}:${expectedClientId}`
+    )}`;
+    const cancellationRequest = await input.query.query(
+      `INSERT INTO broker_events(
+         event_id, account_id, order_id, order_intent_id, broker_order_id,
+         client_order_id, event_type, event_status, retryable,
+         response_payload, response_fingerprint, occurred_at, received_at
+       ) SELECT $1, $2, $3, $4, $5, $6, 'order_cancellation_request',
+                'pending', true, $7::jsonb, $8, $9, $9
+         WHERE ${fenceSql(10)}
+       ON CONFLICT (event_id) DO NOTHING`,
+      [
+        cancellationEventId,
+        target.account_id,
+        target.order_id,
+        target.order_intent_id,
+        expectedBrokerId,
+        expectedClientId,
+        JSON.stringify(cancellationEvidence),
+        canonicalJsonHash(cancellationEvidence),
+        new Date().toISOString(),
+        ...fenceValues(input.fence)
+      ]
+    );
+    if (
+      cancellationRequest.rowCount !== 0 &&
+      cancellationRequest.rowCount !== 1
+    ) {
+      throw new Error("POSTGRES_CANCEL_REQUEST_PERSISTENCE_FAILED");
+    }
     try {
       await (input.cancelOrder ?? cancelPaperOrder)(expectedBrokerId);
     } catch (error) {
@@ -205,4 +245,96 @@ export const runPostgresPaperOrderCancellation = async (input: {
       .toLowerCase(),
     reconciliation
   };
+};
+
+export const runAutonomousPostgresPaperOrderCancellation = async (input: {
+  query: CancellationQuery;
+  fence: SchedulerFence;
+  confirmPaper: boolean;
+  now?: Date;
+  staleAfterMinutes?: number;
+  safety?: CancellationSafety;
+  getOrderById?: (
+    orderId: string
+  ) => Promise<AlpacaApiResponse<AlpacaSubmittedOrder>>;
+  getOrderByClientOrderId?: (
+    clientOrderId: string
+  ) => Promise<AlpacaApiResponse<AlpacaSubmittedOrder>>;
+  cancelOrder?: typeof cancelPaperOrder;
+  reconcile?: typeof reconcilePostgresPaperOrders;
+  runCancellation?: typeof runPostgresPaperOrderCancellation;
+}) => {
+  const safety = input.safety ?? paperSubmitConfiguration();
+  assertSafety(safety, input.confirmPaper);
+  const staleAfterMinutes = input.staleAfterMinutes ?? 30;
+  if (
+    !Number.isSafeInteger(staleAfterMinutes) ||
+    staleAfterMinutes < 1 ||
+    staleAfterMinutes > 24 * 60
+  ) {
+    throw new Error("POSTGRES_AUTONOMOUS_CANCEL_POLICY_INVALID");
+  }
+  const now = input.now ?? new Date();
+  const selected = await input.query.query(
+    `WITH autonomous_cancellation_target AS (
+       SELECT broker_order.broker_order_id, broker_order.client_order_id
+       FROM orders broker_order
+       JOIN order_intents intent ON intent.id = broker_order.order_intent_id
+       LEFT JOIN execution_reviews review ON review.id = intent.execution_review_id
+       LEFT JOIN candidates candidate ON candidate.id = intent.candidate_id
+       WHERE broker_order.environment = 'paper'
+         AND broker_order.status IN (
+           'new', 'accepted', 'pending_new', 'partially_filled', 'held',
+           'pending_replace', 'pending_cancel'
+         )
+         AND COALESCE(broker_order.filled_quantity, 0) = 0
+         AND (
+           broker_order.submitted_at <=
+             $1::timestamptz - ($2::integer * interval '1 minute')
+           OR review.expires_at <= $1
+           OR candidate.lifecycle_status IN (
+             'expired', 'rejected', 'blocked', 'execution_deferred'
+           )
+           OR intent.request_payload->>'cancellable' = 'true'
+           OR intent.request_payload->>'cancelBeforeReplace' = 'true'
+         )
+         AND broker_order.broker_order_id IS NOT NULL
+         AND broker_order.client_order_id IS NOT NULL
+         AND ${fenceSql(3)}
+       ORDER BY broker_order.submitted_at, broker_order.created_at, broker_order.id
+       LIMIT 1
+     )
+     SELECT broker_order_id, client_order_id
+     FROM autonomous_cancellation_target`,
+    [now.toISOString(), staleAfterMinutes, ...fenceValues(input.fence)]
+  );
+  const target = selected.rows[0];
+  if (!target) {
+    return {
+      status: "no_op" as const,
+      code: "NO_CANCELLABLE_POSTGRES_ORDERS",
+      canceledOrderCount: 0,
+      paperOnly: true as const
+    };
+  }
+  const runCancellation = input.runCancellation ??
+    runPostgresPaperOrderCancellation;
+  return runCancellation({
+    query: input.query,
+    fence: input.fence,
+    brokerOrderId: required(
+      target.broker_order_id,
+      "POSTGRES_CANCEL_BROKER_ORDER_ID_MISSING"
+    ),
+    clientOrderId: required(
+      target.client_order_id,
+      "POSTGRES_CANCEL_CLIENT_ORDER_ID_MISSING"
+    ),
+    confirmPaper: input.confirmPaper,
+    safety,
+    getOrderById: input.getOrderById,
+    getOrderByClientOrderId: input.getOrderByClientOrderId,
+    cancelOrder: input.cancelOrder,
+    reconcile: input.reconcile
+  });
 };

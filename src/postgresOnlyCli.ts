@@ -52,8 +52,15 @@ import {
 import { runAutonomousPostgresCommand } from "./services/autonomousPostgresCommandService.js";
 import { runAutonomousPostgresExecutionCommand } from "./services/autonomousPostgresExecutionService.js";
 import { capturePostgresAuthorityBrokerSnapshot } from "./services/postgresAuthorityBrokerSnapshot.js";
-import { reconcilePostgresPaperOrders } from "./services/postgresReconciliationService.js";
-import { runPostgresPaperOrderCancellation } from "./services/postgresOrderCancellationService.js";
+import {
+  persistPostgresAuthorityBrokerSnapshot,
+  reconcilePostgresPaperOrders,
+  recoverAmbiguousPostgresSubmission
+} from "./services/postgresReconciliationService.js";
+import {
+  runAutonomousPostgresPaperOrderCancellation,
+  runPostgresPaperOrderCancellation
+} from "./services/postgresOrderCancellationService.js";
 import { runPostgresResearchWorkflow } from "./services/postgresResearchWorkflowService.js";
 import { runPostgresReviewWorkflow } from "./services/postgresReviewWorkflowService.js";
 import { paperSubmitConfiguration } from "./services/paperSubmitSafetyConfig.js";
@@ -411,13 +418,22 @@ const run = async (scheduledContext?: PostgresScheduledCommandOperationContext) 
 
   if (command === "paper:order:cancel") {
     const context = requireScheduledContext(scheduledContext);
-    const result = await runPostgresPaperOrderCancellation({
-      query: queryAdapter(context.pool),
-      fence: context.fence,
-      brokerOrderId: String(args.brokerOrderId || ""),
-      clientOrderId: String(args.clientOrderId || ""),
-      confirmPaper: Object.prototype.hasOwnProperty.call(args, "confirmPaper")
-    });
+    const confirmPaper = Object.prototype.hasOwnProperty.call(args, "confirmPaper");
+    const autonomous = Object.prototype.hasOwnProperty.call(args, "autonomous") ||
+      ["true", "1"].includes(String(args.autonomous || "").toLowerCase());
+    const result = autonomous
+      ? await runAutonomousPostgresPaperOrderCancellation({
+          query: queryAdapter(context.pool),
+          fence: context.fence,
+          confirmPaper
+        })
+      : await runPostgresPaperOrderCancellation({
+          query: queryAdapter(context.pool),
+          fence: context.fence,
+          brokerOrderId: String(args.brokerOrderId || ""),
+          clientOrderId: String(args.clientOrderId || ""),
+          confirmPaper
+        });
     print({ ...paperEnvelope(), command, ...result });
     return;
   }
@@ -488,7 +504,24 @@ const run = async (scheduledContext?: PostgresScheduledCommandOperationContext) 
       ),
       marketOpen: async () => Boolean((await getAlpacaMarketClock()).isOpen),
       captureBrokerSnapshot: capturePostgresAuthorityBrokerSnapshot,
+      persistBrokerSnapshot: async (snapshot) => {
+        await withPostgresTransaction(
+          context.pool,
+          context.config,
+          (client) => persistPostgresAuthorityBrokerSnapshot({
+            query: queryAdapter(client),
+            fence: context.fence,
+            snapshot
+          })
+        );
+      },
       submitOrder: submitPaperOrder,
+      recoverAmbiguousSubmission: async (clientOrderId) =>
+        recoverAmbiguousPostgresSubmission({
+          query: queryAdapter(context.pool),
+          fence: context.fence,
+          clientOrderId
+        }),
       fence: context.fence,
       safety: {
         environment: safety.environment,

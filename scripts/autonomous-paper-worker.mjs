@@ -24,6 +24,7 @@ const SUCCESSFUL_NO_ACTION_REASON_CODES = new Set([
   "NO_ELIGIBLE_POSTGRES_CANDIDATES",
   "NO_POSTGRES_EXIT_TRIGGER",
   "NO_READY_POSTGRES_ORDER_INTENTS",
+  "NO_CANCELLABLE_POSTGRES_ORDERS",
   "NO_RECONCILIABLE_POSTGRES_ORDERS"
 ]);
 const configuredMaxCandidates = Number(process.env.PAPER_EXPLORATION_MAX_CANDIDATES ?? 25);
@@ -35,26 +36,33 @@ const PAPER_EXPLORATION_MAX_CANDIDATES =
     : 25;
 
 const WORKSTREAMS = [
+  ["zero-dte:reconcile", ["--format=json"]],
   ["research:daily", ["--riskProfile=aggressive", "--optionsEnabled=true", `--maxCandidates=${PAPER_EXPLORATION_MAX_CANDIDATES}`, "--assetClass=all", "--format=json"]],
+  ["paper:options:discover", ["--underlying=SPY", "--dte=0", "--format=json"]],
   ["paper:review", ["--riskProfile=aggressive", "--optionsEnabled=true", `--maxCandidates=${PAPER_EXPLORATION_MAX_CANDIDATES}`, "--format=json"]],
   ["paper:portfolio:review", ["--format=json"]],
-  ["paper:options:discover", ["--underlying=SPY", "--dte=0", "--format=json"]],
   ["paper:ops:review", ["--format=json"]],
-  ["zero-dte:exit:review", ["--format=json"]],
-  ["paper:exit:review", ["--format=json"]],
-  ["paper:exit:execute", ["--confirmPaper", "--format=json"]],
-  ["paper:execute:reviewed", ["--confirmPaper", "--sections=equityBuys,equityAdds,optionBuys", "--format=json"]],
   ["hedge:review", ["--format=json"]],
-  ["hedge:exit:review", ["--format=json"]],
-  ["hedge:exit:execute", ["--confirmPaper", "--format=json"]],
+  ["paper:execute:reviewed", ["--confirmPaper", "--sections=equityBuys,equityAdds,optionBuys", "--format=json"]],
   ["zero-dte:engine", ["--confirmPaper", "--format=json"]],
+  ["zero-dte:reconcile", ["--format=json"]],
+  ["paper:exit:review", ["--format=json"]],
+  ["zero-dte:exit:review", ["--format=json"]],
+  ["hedge:exit:review", ["--format=json"]],
+  ["paper:exit:execute", ["--confirmPaper", "--format=json"]],
+  ["hedge:exit:execute", ["--confirmPaper", "--format=json"]],
+  ["zero-dte:reconcile", ["--format=json"]],
+  ["paper:order:cancel", ["--autonomous", "--confirmPaper", "--format=json"]],
   ["zero-dte:reconcile", ["--format=json"]],
   ["paper:learn", ["--format=json"]],
   ["system:recover", ["--format=json"]]
 ];
 
 const STATE_COMMAND = "worker:state";
-const REQUIRED_COMMANDS = [...WORKSTREAMS.map(([command]) => command), STATE_COMMAND];
+const REQUIRED_COMMANDS = [
+  ...new Set(WORKSTREAMS.map(([command]) => command)),
+  STATE_COMMAND
+];
 const EXPECTED_CONTRACT_ENTRY = {
   allowed: true,
   persistence: "postgres",

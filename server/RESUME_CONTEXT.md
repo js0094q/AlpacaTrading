@@ -8,7 +8,8 @@ shadow, mirror, fallback, or historical import command.
 
 The repository worker uses paper exploration V3 and narrowly classifies
 `NO_ELIGIBLE_POSTGRES_CANDIDATES`, `NO_POSTGRES_EXIT_TRIGGER`, and
-`NO_READY_POSTGRES_ORDER_INTENTS`, plus the learning result
+`NO_READY_POSTGRES_ORDER_INTENTS`, the cancellation result
+`NO_CANCELLABLE_POSTGRES_ORDERS`, plus the learning result
 `NO_RECONCILIABLE_POSTGRES_ORDERS`, as successful `WORKSTREAM_NO_ACTION`
 outcomes. Require the checked-in unit's paper/live-off assertions, unchanged
 liquidity/spread/notional gates, and all PostgreSQL/reconciliation controls.
@@ -29,7 +30,7 @@ liquidity/spread/notional gates, and all PostgreSQL/reconciliation controls.
 7. Run one current `research:daily` refresh and verify genuine PostgreSQL market
    bars, stock/option snapshots, features, targets, and research evidence.
 8. Run `zero-dte:reconcile` against the Alpaca paper account; retain unresolved
-   ambiguous submissions for later resolution.
+   ambiguous submissions for the worker's bounded exact-client-ID recovery.
 9. Install the checked-in dashboard-control and autonomous-worker units,
    daemon-reload, and start
    `alpaca-dashboard-control.service`.

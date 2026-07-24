@@ -55,15 +55,25 @@ test("the execution gate rejects missing current market timestamp before submiss
   );
 });
 
-test("the execution gate rejects broker and PostgreSQL portfolio disagreement", () => {
+test("the execution gate accepts mark-to-market drift when material portfolio structure is unchanged", () => {
+  const payload = validateAutonomousExecutionEvidence(
+    intent(),
+    { ...broker, portfolioFingerprint: "valuation-drifted" },
+    new Date("2026-07-20T22:00:00.000Z"),
+    60
+  );
+  assert.equal(payload.client_order_id, "worker-order-1");
+});
+
+test("the execution gate still rejects material portfolio structure changes", () => {
   assert.throws(
     () => validateAutonomousExecutionEvidence(
       intent(),
-      { ...broker, portfolioFingerprint: "different" },
+      { ...broker, structuralPortfolioFingerprint: "position-or-order-changed" },
       new Date("2026-07-20T22:00:00.000Z"),
       60
     ),
-    /POSTGRES_BROKER_PORTFOLIO_EVIDENCE_CONFLICT/
+    /POSTGRES_REVIEW_ACCOUNT_EVIDENCE_CONFLICT/
   );
 });
 
@@ -300,6 +310,127 @@ test("paper execution promotes a confirmed created intent before broker submissi
   assert.equal(transactionStatements.some((sql) => sql.includes("INSERT INTO confirmation_evidence")), true);
 });
 
+test("paper execution persists one captured broker snapshot before promotion and submission", async () => {
+  const sequence: string[] = [];
+  let countReads = 0;
+  await runAutonomousPostgresExecutionCommand({
+    command: "paper:execute:reviewed",
+    query: {
+      query: async () => {
+        countReads += 1;
+        return {
+          rows: [{
+            ready_count: countReads === 1 ? "0" : "1",
+            confirmable_count: countReads === 1 ? "1" : "0"
+          }],
+          rowCount: 1
+        };
+      }
+    },
+    transaction: async (operation) => operation({
+      query: async (sql: string) => {
+        if (sql.includes("intent.status = 'created'")) {
+          sequence.push("promotion");
+          return {
+            rows: [{
+              order_intent_id: "intent-created",
+              candidate_id: "candidate-1",
+              account_id: "account-1",
+              account_snapshot_id: "snapshot-1",
+              strategy_key: "baseline",
+              symbol: "AAPL",
+              asset_class: "equity",
+              side: "buy",
+              max_risk: "100",
+              execution_review_id: "review-1",
+              review_type: "entry",
+              review_payload_fingerprint: "review-payload",
+              review_signature: "review-signature",
+              review_expires_at: "2026-07-20T22:15:00.000Z"
+            }],
+            rowCount: 1
+          };
+        }
+        if (sql.includes("AS buying_power_allowed")) {
+          return {
+            rows: [{
+              buying_power_allowed: true,
+              deployment_allowed: true,
+              strategy_allowed: true,
+              symbol_allowed: true,
+              position_count_allowed: true,
+              order_count_allowed: true
+            }],
+            rowCount: 1
+          };
+        }
+        if (sql.includes("FROM order_intents intent")) {
+          sequence.push("claim");
+          return {
+            rows: [intent({
+              order_intent_id: "intent-created",
+              confirmation_evidence_id: "confirmation-ready",
+              reservation_id: "reservation-ready"
+            }) as unknown as Record<string, unknown>],
+            rowCount: 1
+          };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    }),
+    marketOpen: async () => true,
+    captureBrokerSnapshot: async () => {
+      sequence.push("capture");
+      return broker;
+    },
+    persistBrokerSnapshot: async (snapshot) => {
+      assert.equal(snapshot, broker);
+      sequence.push("persist");
+    },
+    submitOrder: async (payload) => {
+      sequence.push("submit");
+      return {
+        data: {
+          id: "broker-order-snapshot",
+          client_order_id: payload.client_order_id,
+          status: "accepted",
+          symbol: payload.symbol,
+          side: payload.side,
+          type: payload.type,
+          time_in_force: payload.time_in_force,
+          qty: payload.qty,
+          submitted_at: "2026-07-20T22:00:00.000Z"
+        },
+        status: 200,
+        url: "paper"
+      };
+    },
+    safety: {
+      environment: "paper",
+      tradingMode: "paper",
+      liveTradingEnabled: false,
+      paperOrderExecutionEnabled: true,
+      paperOptionsExecutionEnabled: true,
+      quoteMaxAgeSeconds: 60
+    },
+    confirmPaper: true,
+    confirmationSigningKey: "test-signing-key-with-sufficient-length",
+    fence: {
+      jobName: "paper-execution",
+      workstream: "paper_execution",
+      ownerId: "owner",
+      runId: "run",
+      fencingToken: "10"
+    },
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.deepEqual(
+    sequence.filter((step) => ["capture", "persist", "promotion", "claim", "submit"].includes(step)),
+    ["capture", "persist", "promotion", "claim", "submit"]
+  );
+});
+
 test("an execution command with no ready PostgreSQL intent makes no broker call", async () => {
   let brokerCalls = 0;
   const result = await runAutonomousPostgresExecutionCommand({
@@ -456,9 +587,11 @@ test("a closed paper market blocks a ready intent without account sync or submis
   assert.equal(submitCalls, 0);
 });
 
-test("an uncertain broker submission is persisted as ambiguous before the command fails", async () => {
+test("an uncertain broker submission recovers by client order ID without a duplicate submit", async () => {
   const transactionSql: string[] = [];
   const transactionValues: Array<readonly unknown[]> = [];
+  let submitCalls = 0;
+  let recoveryCalls = 0;
   const transaction = async <T>(
     operation: (query: { query: (sql: string, values?: readonly unknown[]) => Promise<{ rows: Record<string, unknown>[]; rowCount: number }> }) => Promise<T>
   ) => operation({
@@ -472,14 +605,160 @@ test("an uncertain broker submission is persisted as ambiguous before the comman
     }
   });
 
+  const result = await runAutonomousPostgresExecutionCommand({
+    command: "paper:execute:reviewed",
+    query: { query: async () => ({ rows: [{ ready_count: "1" }], rowCount: 1 }) },
+    transaction,
+    marketOpen: async () => true,
+    captureBrokerSnapshot: async () => broker,
+    submitOrder: async () => {
+      submitCalls += 1;
+      throw new Error("socket closed before response");
+    },
+    recoverAmbiguousSubmission: async (clientOrderId) => {
+      recoveryCalls += 1;
+      assert.equal(clientOrderId, "worker-order-1");
+      return {
+        status: "recovered",
+        orderId: "order-recovered",
+        brokerOrderId: "broker-order-recovered",
+        brokerStatus: "accepted"
+      };
+    },
+    safety: {
+      environment: "paper",
+      tradingMode: "paper",
+      liveTradingEnabled: false,
+      paperOrderExecutionEnabled: true,
+      paperOptionsExecutionEnabled: true,
+      quoteMaxAgeSeconds: 60
+    },
+    confirmPaper: true,
+    fence: {
+      jobName: "paper-execution",
+      workstream: "paper_execution",
+      ownerId: "owner",
+      runId: "run",
+      fencingToken: "12"
+    },
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(transactionSql.some((sql) => /SET status = 'ambiguous'/.test(sql)), true);
+  assert.equal(transactionSql.some((sql) => /INSERT INTO broker_events/.test(sql)), true);
+  assert.equal(submitCalls, 1);
+  assert.equal(recoveryCalls, 1);
+  assert.equal(result.status, "completed");
+  assert.equal(result.evidence.recoveredFromAmbiguous, true);
+  assert.equal(result.evidence.brokerOrderId, "broker-order-recovered");
+  const candidateUpdate = transactionSql.findIndex((sql) => sql.includes("UPDATE candidates"));
+  assert.notEqual(candidateUpdate, -1);
+  assert.equal(
+    transactionValues.some((values) =>
+      values[1] === "execution_ambiguous" &&
+      values[2] === "POSTGRES_BROKER_SUBMISSION_AMBIGUOUS"
+    ),
+    true
+  );
+  assert.equal(
+    transactionValues.some((values) =>
+      values[1] === "executed" &&
+      values[2] === "PAPER_ORDER_RECOVERED_BY_CLIENT_ID"
+    ),
+    true
+  );
+});
+
+test("the durable submission-attempt event is written before the broker mutation", async () => {
+  const statements: string[] = [];
+  let submitCalls = 0;
+  const result = await runAutonomousPostgresExecutionCommand({
+    command: "paper:execute:reviewed",
+    query: { query: async () => ({ rows: [{ ready_count: "1" }], rowCount: 1 }) },
+    transaction: async (operation) => operation({
+      query: async (sql: string) => {
+        statements.push(sql);
+        if (sql.includes("FROM order_intents intent")) {
+          return { rows: [intent() as unknown as Record<string, unknown>], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    }),
+    marketOpen: async () => true,
+    captureBrokerSnapshot: async () => broker,
+    submitOrder: async (payload) => {
+      submitCalls += 1;
+      assert.equal(
+        statements.some((sql) =>
+          sql.includes("INSERT INTO broker_events") &&
+          sql.includes("order_submission_attempt")
+        ),
+        true
+      );
+      return {
+        data: {
+          id: "broker-order-attempt",
+          client_order_id: payload.client_order_id,
+          status: "accepted",
+          symbol: payload.symbol,
+          side: payload.side,
+          type: payload.type,
+          time_in_force: payload.time_in_force,
+          qty: payload.qty,
+          submitted_at: "2026-07-20T22:00:00.000Z"
+        },
+        status: 200,
+        url: "paper"
+      };
+    },
+    safety: {
+      environment: "paper",
+      tradingMode: "paper",
+      liveTradingEnabled: false,
+      paperOrderExecutionEnabled: true,
+      paperOptionsExecutionEnabled: true,
+      quoteMaxAgeSeconds: 60
+    },
+    confirmPaper: true,
+    fence: {
+      jobName: "paper-execution",
+      workstream: "paper_execution",
+      ownerId: "owner",
+      runId: "run",
+      fencingToken: "12"
+    },
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(submitCalls, 1);
+  assert.equal(result.status, "completed");
+});
+
+test("a failed pre-mutation attempt write releases the claim and never calls Alpaca", async () => {
+  const statements: string[] = [];
+  let submitCalls = 0;
   await assert.rejects(
     runAutonomousPostgresExecutionCommand({
       command: "paper:execute:reviewed",
       query: { query: async () => ({ rows: [{ ready_count: "1" }], rowCount: 1 }) },
-      transaction,
+      transaction: async (operation) => operation({
+        query: async (sql: string) => {
+          statements.push(sql);
+          if (sql.includes("FROM order_intents intent")) {
+            return { rows: [intent() as unknown as Record<string, unknown>], rowCount: 1 };
+          }
+          if (sql.includes("order_submission_attempt")) {
+            throw new Error("attempt persistence unavailable");
+          }
+          return { rows: [], rowCount: 1 };
+        }
+      }),
       marketOpen: async () => true,
       captureBrokerSnapshot: async () => broker,
-      submitOrder: async () => { throw new Error("socket closed before response"); },
+      submitOrder: async () => {
+        submitCalls += 1;
+        throw new Error("must not submit");
+      },
       safety: {
         environment: "paper",
         tradingMode: "paper",
@@ -498,15 +777,14 @@ test("an uncertain broker submission is persisted as ambiguous before the comman
       },
       now: new Date("2026-07-20T22:00:00.000Z")
     }),
-    /POSTGRES_BROKER_SUBMISSION_AMBIGUOUS/
+    /attempt persistence unavailable/
   );
 
-  assert.equal(transactionSql.some((sql) => /SET status = 'ambiguous'/.test(sql)), true);
-  assert.equal(transactionSql.some((sql) => /INSERT INTO broker_events/.test(sql)), true);
-  const candidateUpdate = transactionSql.findIndex((sql) => sql.includes("UPDATE candidates"));
-  assert.notEqual(candidateUpdate, -1);
-  assert.equal(transactionValues[candidateUpdate]?.[1], "execution_ambiguous");
-  assert.equal(transactionValues[candidateUpdate]?.[2], "POSTGRES_BROKER_SUBMISSION_AMBIGUOUS");
+  assert.equal(submitCalls, 0);
+  assert.equal(
+    statements.some((sql) => /SET status = 'ready_for_submission'/.test(sql)),
+    true
+  );
 });
 
 test("claiming an unreserved intent does not lock the nullable reservation join", async () => {
@@ -543,6 +821,58 @@ test("claiming an unreserved intent does not lock the nullable reservation join"
   );
   const select = statements.find((sql) => sql.includes("FROM order_intents intent"))!;
   assert.doesNotMatch(select, /FOR UPDATE OF[^\n]*reservation/);
+});
+
+test("claiming a reserved intent revalidates current structural and capacity state without snapshot row identity", async () => {
+  const statements: string[] = [];
+  await assert.rejects(
+    runAutonomousPostgresExecutionCommand({
+      command: "paper:execute:reviewed",
+      query: { query: async () => ({ rows: [{ ready_count: "1" }], rowCount: 1 }) },
+      transaction: async (operation) => operation({
+        query: async (sql: string) => {
+          statements.push(sql);
+          if (sql.includes("FROM order_intents intent")) {
+            return { rows: [intent() as unknown as Record<string, unknown>], rowCount: 1 };
+          }
+          return { rows: [], rowCount: 1 };
+        }
+      }),
+      marketOpen: async () => true,
+      captureBrokerSnapshot: async () => broker,
+      submitOrder: async () => {
+        throw new Error("ambiguous");
+      },
+      safety: {
+        environment: "paper",
+        tradingMode: "paper",
+        liveTradingEnabled: false,
+        paperOrderExecutionEnabled: true,
+        paperOptionsExecutionEnabled: true,
+        quoteMaxAgeSeconds: 60
+      },
+      confirmPaper: true,
+      fence: {
+        jobName: "execution",
+        workstream: "execution",
+        ownerId: "owner",
+        runId: "run",
+        fencingToken: "14"
+      },
+      now: new Date("2026-07-20T22:00:00.000Z")
+    }),
+    /POSTGRES_BROKER_SUBMISSION_AMBIGUOUS/
+  );
+
+  const select = statements.find((sql) => sql.includes("FROM order_intents intent"))!;
+  assert.match(
+    select,
+    /snapshot\.evidence->>'structuralPortfolioFingerprint' = review\.account_fingerprint/
+  );
+  assert.match(select, /snapshot\.buying_power/);
+  assert.match(select, /reservation_state\.total/);
+  assert.match(select, /allocation\.deployed_amount \+ allocation\.reserved_amount/);
+  assert.doesNotMatch(select, /reservation\.account_snapshot_id = snapshot\.id/);
 });
 
 test("a deterministic pre-submit rejection releases the claimed intent without broker submission", async () => {

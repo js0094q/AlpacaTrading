@@ -93,8 +93,12 @@ test("research persists current PostgreSQL evidence and selected candidates befo
   assert.equal(sql.some((statement) => /id, decision_id, research_run_id/.test(statement)), true);
   assert.equal(sql.some((statement) => /SET status = 'completed'/.test(statement)), true);
   const signalInputs = JSON.parse(String(candidateValues[25]));
+  const {
+    candidateScore: _candidateScore,
+    ...signalInputsWithoutScore
+  } = signalInputs;
   assert.deepEqual({
-    ...signalInputs,
+    ...signalInputsWithoutScore,
     decisionGates: undefined
   }, {
     targetSourceFingerprint: "target-fingerprint", marketEvidenceTimestamp: bar.observedAt,
@@ -122,6 +126,27 @@ test("research persists current PostgreSQL evidence and selected candidates befo
   assert.equal(signalInputs.decisionGates.outcome, "passed");
   assert.deepEqual(signalInputs.decisionGates.reasons, ["RANKED_SELECTED"]);
   assert.equal(signalInputs.decisionGates.profile.scope, "paper_only");
+  assert.deepEqual(signalInputs.candidateScore.inputs, {
+    confidence: 0.9,
+    expectedReturn: 1.5,
+    volatilityAdjustedScore: 1.2,
+    ageDays: 0.08333333333333333,
+    optionLiquidityScore: 0,
+    preferredExpression: "shares",
+    riskProfile: "aggressive"
+  });
+  assert.equal(signalInputs.candidateScore.total, Number(candidateValues[13]));
+  assert.deepEqual(
+    Object.keys(signalInputs.candidateScore.components).sort(),
+    [
+      "confidence",
+      "expectedReturn",
+      "freshness",
+      "optionLiquidity",
+      "riskProfile",
+      "volatilityAdjusted"
+    ]
+  );
 });
 
 test("paper exploration persists selected and rejected candidate decisions with reversible gates", async () => {

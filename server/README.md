@@ -10,7 +10,7 @@ off. PostgreSQL failure is terminal.
 
 After a passed fresh PostgreSQL authority checkpoint and migration 003, the
 checked-in `alpaca-autonomous-paper.service` is the sole autonomous scheduler.
-It runs all 16 workstreams through the PostgreSQL-only CLI and persists worker
+It runs all 20 dependency-ordered workstreams through the PostgreSQL-only CLI and persists worker
 lifecycle evidence. Keep every legacy paper, research, observatory, and 0DTE
 timer disabled. Dashboard-control remains bound to `127.0.0.1:4100`.
 
@@ -25,15 +25,19 @@ The autonomous unit fixes paper exploration V3 strategy gates at
 `0.04` directional score, `0.05` directional confidence,
 `0.20/0.35/0.45` option confidence, and `0.20%/0.40%` option expected return.
 Liquidity remains `0.10`, spread remains capped at `15%`, and new-order
-notional remains capped at `$1,000`. The worker records the four legitimate
-PostgreSQL empty-work results listed in
+notional remains capped at `$1,000`. The worker records the documented
+PostgreSQL empty-work results, including `NO_CANCELLABLE_POSTGRES_ORDERS`, in
 `docs/paper-candidate-qualification-inventory.md` as successful `no_action`
 events; actual operational blocks remain blocked.
 
 Before enabling the worker, run current SIP/OPRA market-data ingestion, verify
 the PostgreSQL market/feature/target/research rows, and reconcile against the
-Alpaca paper account. Missing or stale evidence is terminal for the workstream;
-unresolved ambiguous submissions remain pending. The unit hard-codes paper
+Alpaca paper account. Missing or stale evidence is terminal for the workstream.
+Unresolved ambiguous submissions are recovered by exact client order ID without
+resubmission, and bounded not-yet-found results remain pending. Entry and exit
+commands persist a single current broker snapshot before promotion and claim;
+stable structural authorization ignores normal mark drift while current
+reservation and risk capacity are still revalidated. The unit hard-codes paper
 mode and live-off flags and must never be changed to a live environment.
 
 On a systemd stop, scheduler-registered commands cooperatively abort their
