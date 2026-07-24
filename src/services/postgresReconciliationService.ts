@@ -9,6 +9,7 @@ import {
   type AlpacaSubmittedOrder
 } from "./alpacaClient.js";
 import { paperSubmitConfiguration } from "./paperSubmitSafetyConfig.js";
+import { lifecycleStateForBrokerStatus } from "./autonomousTradeLifecycleService.js";
 import {
   capturePostgresAuthorityBrokerSnapshot,
   type PostgresAuthorityBrokerSnapshot
@@ -87,7 +88,8 @@ const BROKER_ABSENCE_TERMINAL_AGE_MS = 120_000;
 const brokerOrderAbsent = (error: unknown) => {
   const status = Number((error as { status?: unknown } | null)?.status);
   const message = error instanceof Error ? error.message : String(error ?? "");
-  return status === 404 || /\b404\b|order not found|not visible/i.test(message);
+  if (Number.isFinite(status)) return status === 404;
+  return /\b404\b|order not found|not visible/i.test(message);
 };
 
 type ExternalOrderObservation = {
@@ -783,9 +785,7 @@ export const reconcilePostgresPaperOrders = async (input: {
           now.toISOString(), ...fenceValues(input.fence)]
       );
       const intentStatus = terminalStatuses.has(status) ? "reconciled" : "submitted";
-      const lifecycleState = target.review_type === "exit"
-        ? (status === "partially_filled" ? "exit_partially_filled" : "exit_broker_order_discovered")
-        : (status === "partially_filled" ? "partially_filled" : status === "filled" ? "filled" : "broker_order_accepted");
+      const lifecycleState = lifecycleStateForBrokerStatus(target.review_type, status);
       const updated = await input.query.query(
         `UPDATE order_intents SET status = $2,
            lifecycle_state = $5,

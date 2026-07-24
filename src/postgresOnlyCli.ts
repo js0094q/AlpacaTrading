@@ -50,7 +50,10 @@ import {
   type AutonomousWorkerEventType
 } from "./services/autonomousWorkerStateService.js";
 import { runAutonomousPostgresCommand } from "./services/autonomousPostgresCommandService.js";
-import { runAutonomousPostgresExecutionCommand } from "./services/autonomousPostgresExecutionService.js";
+import {
+  autonomousLifecycleContextFromRuntime,
+  runAutonomousPostgresExecutionCommand
+} from "./services/autonomousPostgresExecutionService.js";
 import { capturePostgresAuthorityBrokerSnapshot } from "./services/postgresAuthorityBrokerSnapshot.js";
 import {
   persistPostgresAuthorityBrokerSnapshot,
@@ -534,10 +537,7 @@ const run = async (scheduledContext?: PostgresScheduledCommandOperationContext) 
             if (lease.rowCount !== 1) throw new Error("SCHEDULER_FENCE_LOST");
           }
         }),
-      lifecycleContext: {
-        cycleId: process.env.AUTONOMOUS_CYCLE_ID?.trim() || context.fence.runId,
-        workstreamExecutionId: context.fence.runId
-      },
+      lifecycleContext: autonomousLifecycleContextFromRuntime(process.env, context.fence),
       fence: context.fence,
       safety: {
         environment: safety.environment,

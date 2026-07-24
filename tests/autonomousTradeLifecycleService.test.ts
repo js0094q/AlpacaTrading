@@ -75,6 +75,14 @@ test("rejects invalid lifecycle transitions", () => {
   assert.doesNotThrow(() =>
     validateLifecycleTransition("ready_for_submission", "submission_attempt_persisted")
   );
+  for (const terminalState of ["cancelled", "rejected", "expired"] as const) {
+    assert.doesNotThrow(() =>
+      validateLifecycleTransition("submission_attempt_persisted", terminalState)
+    );
+    assert.doesNotThrow(() =>
+      validateLifecycleTransition("exit_submission_attempt_persisted", terminalState)
+    );
+  }
 });
 
 test("migration 006 contains durable lifecycle lineage and terminal transition tables", async () => {

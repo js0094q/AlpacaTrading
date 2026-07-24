@@ -246,6 +246,27 @@ test("default ambiguous recovery uses eight exponential lookups capped at five s
   });
 });
 
+test("HTTP 500 lookup errors mentioning visibility remain infrastructure failures", async () => {
+  await assert.rejects(
+    recoverAmbiguousPostgresSubmission({
+      query: { query: async () => ({ rows: [], rowCount: 0 }) },
+      fence,
+      clientOrderId: "client-infrastructure-failure",
+      maxAttempts: 2,
+      retryDelayMs: 1,
+      sleep: async () => undefined,
+      syncBrokerState: false,
+      getOrderByClientOrderId: async () => {
+        throw Object.assign(
+          new Error("order not visible while broker unavailable"),
+          { status: 500 }
+        );
+      }
+    }),
+    /POSTGRES_BROKER_SUBMISSION_RECOVERY_INFRASTRUCTURE_UNRESOLVED/
+  );
+});
+
 test("resolved broker submissions are recorded exclusively in PostgreSQL", async () => {
   const sql: string[] = [];
   const result = await reconcilePostgresPaperOrders({

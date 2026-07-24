@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  autonomousLifecycleContextFromRuntime,
+  lifecycleStateForBrokerStatus,
   promoteNextConfirmedPostgresIntent,
   runAutonomousPostgresExecutionCommand,
   validateAutonomousExecutionEvidence,
@@ -42,6 +44,30 @@ const broker = {
   portfolioFingerprint: "portfolio-fingerprint",
   structuralPortfolioFingerprint: "structural-fingerprint"
 };
+
+test("broker statuses map to exact entry and exit lifecycle states", () => {
+  assert.equal(lifecycleStateForBrokerStatus("entry", "accepted"), "broker_order_accepted");
+  assert.equal(lifecycleStateForBrokerStatus("entry", "partially_filled"), "partially_filled");
+  assert.equal(lifecycleStateForBrokerStatus("entry", "filled"), "filled");
+  assert.equal(lifecycleStateForBrokerStatus("exit", "accepted"), "exit_broker_order_discovered");
+  assert.equal(lifecycleStateForBrokerStatus("exit", "partially_filled"), "exit_partially_filled");
+  assert.equal(lifecycleStateForBrokerStatus("exit", "filled"), "exit_broker_order_discovered");
+  for (const terminal of ["canceled", "cancelled", "rejected", "expired"] as const) {
+    const expected = terminal === "canceled" ? "cancelled" : terminal;
+    assert.equal(lifecycleStateForBrokerStatus("entry", terminal), expected);
+    assert.equal(lifecycleStateForBrokerStatus("exit", terminal), expected);
+  }
+});
+
+test("autonomous lifecycle identity preserves the worker cycle and unique invocation", () => {
+  assert.deepEqual(
+    autonomousLifecycleContextFromRuntime(
+      { AUTONOMOUS_CYCLE_ID: "cycle-123" },
+      { runId: "invocation-456" }
+    ),
+    { cycleId: "cycle-123", workstreamExecutionId: "invocation-456" }
+  );
+});
 
 test("the execution gate rejects missing current market timestamp before submission", () => {
   assert.throws(
@@ -893,6 +919,52 @@ test("a failed pre-mutation attempt write releases the claim and never calls Alp
     statements.some((sql) => /SET status = 'ready_for_submission'/.test(sql)),
     true
   );
+});
+
+test("a zero-row fenced lifecycle attempt aborts before the broker mutation", async () => {
+  let submitCalls = 0;
+  await assert.rejects(
+    runAutonomousPostgresExecutionCommand({
+      command: "paper:execute:reviewed",
+      query: { query: async () => ({ rows: [{ ready_count: "1" }], rowCount: 1 }) },
+      transaction: async (operation) => operation({
+        query: async (sql: string) => {
+          if (sql.includes("FROM order_intents intent")) {
+            return { rows: [intent() as unknown as Record<string, unknown>], rowCount: 1 };
+          }
+          if (sql.includes("SET lifecycle_state = $2")) {
+            return { rows: [], rowCount: 0 };
+          }
+          return { rows: [], rowCount: 1 };
+        }
+      }),
+      marketOpen: async () => true,
+      captureBrokerSnapshot: async () => broker,
+      submitOrder: async () => {
+        submitCalls += 1;
+        throw new Error("must not submit");
+      },
+      safety: {
+        environment: "paper",
+        tradingMode: "paper",
+        liveTradingEnabled: false,
+        paperOrderExecutionEnabled: true,
+        paperOptionsExecutionEnabled: true,
+        quoteMaxAgeSeconds: 60
+      },
+      confirmPaper: true,
+      fence: {
+        jobName: "paper-execution",
+        workstream: "paper_execution",
+        ownerId: "owner",
+        runId: "run",
+        fencingToken: "12"
+      },
+      now: new Date("2026-07-20T22:00:00.000Z")
+    }),
+    /POSTGRES_BROKER_SUBMISSION_ATTEMPT_LIFECYCLE_PERSISTENCE_FAILED/
+  );
+  assert.equal(submitCalls, 0);
 });
 
 test("claiming an unreserved intent does not lock the nullable reservation join", async () => {

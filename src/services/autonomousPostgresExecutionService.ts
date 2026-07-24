@@ -14,7 +14,16 @@ import {
   type AlpacaAssetTradabilityResult
 } from "./alpacaAssetService.js";
 import { optionsQuoteConfig } from "./optionQuoteNormalizer.js";
+import {
+  autonomousLifecycleContextFromRuntime,
+  lifecycleStateForBrokerStatus
+} from "./autonomousTradeLifecycleService.js";
 import type { PostgresAuthorityBrokerSnapshot } from "./postgresAuthorityBrokerSnapshot.js";
+
+export {
+  autonomousLifecycleContextFromRuntime,
+  lifecycleStateForBrokerStatus
+} from "./autonomousTradeLifecycleService.js";
 
 export type AutonomousExecutionIntentRow = {
   order_intent_id: string;
@@ -889,24 +898,104 @@ const recordSubmission = async (
       JSON.stringify(payload), canonicalJsonHash(payload), occurredAt, now.toISOString()
     ]
   );
-  const lifecycleState = intent.review_type === "exit"
-    ? (status === "partially_filled" ? "exit_partially_filled" : "exit_broker_order_discovered")
-    : (status === "partially_filled" ? "partially_filled" : status === "filled" ? "filled" : "broker_order_accepted");
+  const lifecycleState = lifecycleStateForBrokerStatus(intent.review_type, status);
+  const terminalWithoutFill = ["cancelled", "rejected", "expired"].includes(lifecycleState);
+  const reservationReleaseReason = lifecycleState === "cancelled"
+    ? "broker_terminal_cancelled"
+    : lifecycleState === "rejected"
+      ? "broker_terminal_rejected"
+      : lifecycleState === "expired"
+        ? "broker_terminal_expired"
+        : null;
+  const intentStatus = terminalWithoutFill
+    ? (lifecycleState === "cancelled" ? "cancelled" : "failed")
+    : "submitted";
   const updated = await query.query(
     `UPDATE order_intents
-     SET status = 'submitted', lifecycle_state = $3,
-         submitted_at = $2, updated_at = $2, version = version + 1
-     WHERE id = $1 AND status = 'submission_pending' AND ${fenceSql(4)}`,
-    [intent.order_intent_id, now.toISOString(), lifecycleState, ...values]
+     SET status = $3, lifecycle_state = $4,
+         submitted_at = $2,
+         terminal_at = CASE WHEN $5 THEN $2 ELSE terminal_at END,
+         reservation_release_reason = COALESCE($6, reservation_release_reason),
+         updated_at = $2, version = version + 1
+     WHERE id = $1 AND status = 'submission_pending' AND ${fenceSql(7)}`,
+    [
+      intent.order_intent_id,
+      now.toISOString(),
+      intentStatus,
+      lifecycleState,
+      terminalWithoutFill,
+      reservationReleaseReason,
+      ...values
+    ]
   );
   if (updated.rowCount !== 1) throw new Error("POSTGRES_EXECUTION_RESULT_PERSISTENCE_FAILED");
-  if (intent.reservation_id) {
+  if (intent.reservation_id && terminalWithoutFill && reservationReleaseReason) {
+    const reservation = await query.query(
+      `WITH released AS (
+         UPDATE buying_power_reservations reservation
+         SET status = 'released', released_at = $3, release_reason = $2,
+             updated_at = $3, version = reservation.version + 1
+         WHERE reservation.id = $1
+           AND reservation.status IN ('active', 'committed')
+           AND ${fenceSql(4)}
+         RETURNING reservation.account_id, reservation.strategy_key,
+                   reservation.amount
+       ), adjusted AS (
+         UPDATE strategy_allocations allocation
+         SET reserved_amount = GREATEST(0, allocation.reserved_amount - released.amount),
+             updated_at = $3, version = allocation.version + 1
+         FROM released
+         WHERE allocation.account_id = released.account_id
+           AND allocation.strategy_key = released.strategy_key
+           AND allocation.status = 'active' AND allocation.effective_to IS NULL
+         RETURNING allocation.id
+       )
+       SELECT
+         (SELECT COUNT(*) FROM released)::text AS released_reservation_count,
+         (SELECT COUNT(*) FROM adjusted)::text AS adjusted_allocation_count`,
+      [
+        intent.reservation_id,
+        reservationReleaseReason,
+        now.toISOString(),
+        ...values
+      ]
+    );
+    if (
+      Number(reservation.rows[0]?.released_reservation_count ?? 0) !== 1 ||
+      Number(reservation.rows[0]?.adjusted_allocation_count ?? 0) !== 1
+    ) {
+      throw new Error("POSTGRES_EXECUTION_TERMINAL_RESERVATION_RELEASE_FAILED");
+    }
+    const transitionId = `reservation_transition_${stableRecordId(
+      "reservation_terminal",
+      `${intent.reservation_id}:${lifecycleState}`
+    )}`;
     await query.query(
+      `INSERT INTO reservation_terminal_transitions(
+         id, reservation_id, order_intent_id, terminal_state,
+         release_reason, idempotency_key, occurred_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (reservation_id) DO NOTHING`,
+      [
+        transitionId,
+        intent.reservation_id,
+        intent.order_intent_id,
+        lifecycleState,
+        reservationReleaseReason,
+        `${intent.order_intent_id}:${lifecycleState}`,
+        now.toISOString()
+      ]
+    );
+  } else if (intent.reservation_id) {
+    const reservation = await query.query(
       `UPDATE buying_power_reservations
        SET status = 'committed', committed_at = $2, updated_at = $2, version = version + 1
        WHERE id = $1 AND status = 'active' AND ${fenceSql(3)}`,
       [intent.reservation_id, now.toISOString(), ...values]
     );
+    if (reservation.rowCount !== 1) {
+      throw new Error("POSTGRES_EXECUTION_RESERVATION_COMMIT_FAILED");
+    }
   }
   await query.query(
     `UPDATE execution_reviews
@@ -925,8 +1014,8 @@ const recordSubmission = async (
     intent,
     fence,
     now,
-    "executed",
-    "PAPER_ORDER_SUBMITTED"
+    terminalWithoutFill ? "execution_deferred" : "executed",
+    terminalWithoutFill ? `PAPER_ORDER_${status.toUpperCase()}` : "PAPER_ORDER_SUBMITTED"
   );
   return { orderId, brokerOrderId, status };
 };
