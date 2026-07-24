@@ -37,6 +37,10 @@
   `NO_RECONCILIABLE_POSTGRES_ORDERS` now complete with
   `classification=no_action`, `code=WORKSTREAM_NO_ACTION`, exit 0, and their
   exact domain `reasonCode`. Genuine blocked/failure outcomes remain blocked.
+- A structurally valid terminal recovery envelope with all counters at zero
+  completes as `NO_RECOVERABLE_POSTGRES_STATE`. Missing status, missing or
+  extra counters, coerced values, and other malformed recovery evidence fail
+  closed.
 - The full runtime threshold inventory and unchanged safety boundary are in
   `docs/paper-candidate-qualification-inventory.md`.
 
@@ -57,8 +61,12 @@
   reconciliation without resubmission. Confirmed absence requires four
   persisted observations spanning at least 120 seconds before failure and
   reservation release; restart recovery resumes the persisted ambiguous work.
-- The worker's 20 ordered workstreams reconcile before research, after entry,
-  after exits, and after autonomous cancellation. `paper:order:cancel
+- The worker's 20 public workstreams retain portfolio review and signed ops
+  review before entry execution, reconcile before research and immediately
+  after every entry, exit, and cancellation broker mutation, refresh
+  dashboard-facing state, and run recovery last. Two reconciliations run
+  internally so the public state sequence remains exactly 20, and a fatal
+  mutation is reconciled before the cycle records failure. `paper:order:cancel
   --autonomous --confirmPaper` queries broker state first, persists its request,
   cancels only policy-eligible unfilled orders, reconciles, and releases
   reservations through the normal reconciliation service.
@@ -66,6 +74,13 @@
   and total alongside the existing SIP/OPRA, Greeks, implied-volatility,
   spread, volume, open-interest, liquidity, underlying, and historical-bar
   decision evidence.
+- The dashboard bridge projects strict allowlisted lifecycle evidence for
+  current, interrupted, last-completed, and last-failed cycles. It renders
+  candidate/review/confirmation/intent lineage, operation and strategy
+  classification, client and broker IDs/status, reservation release,
+  position reconciliation, exit trigger/reason, and allowlisted premium-data
+  inputs. Dates normalize to ISO strings or `null`, absent Greeks remain
+  `null`, and unknown, credential, header, and raw payload fields are excluded.
 
 ## Autonomous PostgreSQL lifecycle shutdown repair (2026-07-23)
 

@@ -138,6 +138,12 @@ Migration `005_market_data_ingestion_observability.sql` adds cycle, workstream,
 symbol, endpoint, pagination, provider-time range, freshness counts, rejection,
 and persistence-result fields for that audit trail.
 
+Migration `006_autonomous_trade_lifecycle.sql` adds the append-only autonomous
+trade lifecycle, stable entry/exit lineage, broker-mutation attempts,
+cancellation recovery, and database-enforced lifecycle transition graph. The
+TypeScript and PostgreSQL transition edge sets are required to remain exactly
+equal.
+
 Execution-state projection refreshes `/v2/positions` directly at the PostgreSQL
 projection boundary. A successful empty array is authoritative; a failed or
 malformed position response fails closed, and no-intent state capture still
@@ -154,6 +160,20 @@ confirmation or bypass the existing paper execution gates. Reconciliation
 recovers unresolved ambiguous submissions by exact client order ID in the
 autonomous service and keeps bounded not-yet-found results pending without
 duplicating the order.
+
+The autonomous worker retains exactly 20 public workstreams. Portfolio review
+and signed ops review run before entry execution; every broker-mutating command
+is followed immediately by reconciliation, including an internal
+reconciliation before a fatal mutation result can end the cycle. Recovery is
+the terminal workstream. A valid empty recovery envelope is recorded as
+`NO_RECOVERABLE_POSTGRES_STATE`; malformed recovery output fails closed.
+
+The PostgreSQL dashboard bridge projects current, interrupted, last-completed,
+and last-failed cycle evidence plus trade lineage, operation and strategy
+classification, broker IDs/status, reservation settlement, reconciliation
+timestamps, exit trigger/reason, and allowlisted premium-data decision
+evidence. Timestamps are normalized to ISO strings or `null`, missing Greeks
+remain `null`, and unknown or sensitive payload fields are not exposed.
 
 Supported authority operations are:
 
