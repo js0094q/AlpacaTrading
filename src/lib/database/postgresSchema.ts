@@ -33,7 +33,9 @@ export const POSTGRES_OPERATIONAL_TABLES = [
   "orders",
   "positions",
   "broker_events",
-  "lifecycle_fingerprints"
+  "lifecycle_fingerprints",
+  "autonomous_trade_lifecycle_transitions",
+  "reservation_terminal_transitions"
 ] as const;
 
 export const POSTGRES_OPERATIONAL_INDEXES = [
@@ -106,7 +108,10 @@ export const POSTGRES_OPERATIONAL_INDEXES = [
   "broker_events_ambiguous_idx",
   "lifecycle_fingerprints_entity_time_idx",
   "lifecycle_fingerprints_candidate_idx",
-  "lifecycle_fingerprints_intent_idx"
+  "lifecycle_fingerprints_intent_idx",
+  "order_intents_lifecycle_state_idx",
+  "order_intents_cycle_workstream_idx",
+  "autonomous_trade_lifecycle_transitions_intent_idx"
 ] as const;
 
 export const POSTGRES_RELEASE_3_COLUMNS = [
@@ -137,6 +142,16 @@ export const POSTGRES_RELEASE_3_COLUMNS = [
   "market_data_ingestion_runs.freshness_threshold_seconds",
   "market_data_ingestion_runs.rejection_reason",
   "market_data_ingestion_runs.persistence_result"
+  ,"order_intents.operation",
+  "order_intents.strategy_classification",
+  "order_intents.lifecycle_state",
+  "order_intents.cycle_id",
+  "order_intents.workstream",
+  "order_intents.snapshot_id",
+  "order_intents.parent_intent_id",
+  "order_intents.opening_intent_id",
+  "order_intents.broker_order_id",
+  "order_intents.reservation_release_reason"
 ] as const;
 
 export const POSTGRES_RELEASE_3_CONSTRAINTS = [
