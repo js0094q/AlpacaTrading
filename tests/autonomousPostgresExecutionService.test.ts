@@ -69,6 +69,75 @@ test("autonomous lifecycle identity preserves the worker cycle and unique invoca
   );
 });
 
+test("a direct terminal broker response settles reservation and audit under one fence", async () => {
+  const statements: Array<{ sql: string; values: readonly unknown[] }> = [];
+  const result = await runAutonomousPostgresExecutionCommand({
+    command: "paper:execute:reviewed",
+    query: { query: async () => ({ rows: [{ ready_count: "1" }], rowCount: 1 }) },
+    transaction: async (operation) => operation({
+      query: async (sql: string, values?: readonly unknown[]) => {
+        statements.push({ sql, values: values ?? [] });
+        if (sql.includes("FROM order_intents intent")) {
+          return { rows: [intent() as unknown as Record<string, unknown>], rowCount: 1 };
+        }
+        if (sql.includes("released_reservation_count")) {
+          return {
+            rows: [{
+              released_reservation_count: "1",
+              adjusted_allocation_count: "1",
+              terminal_transition_count: "1"
+            }],
+            rowCount: 1
+          };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    }),
+    marketOpen: async () => true,
+    captureBrokerSnapshot: async () => broker,
+    submitOrder: async (payload) => ({
+      status: 200,
+      url: "paper",
+      data: {
+        id: "broker-rejected",
+        client_order_id: payload.client_order_id,
+        symbol: payload.symbol,
+        side: payload.side,
+        type: payload.type,
+        time_in_force: payload.time_in_force,
+        status: "rejected",
+        qty: payload.qty,
+        submitted_at: "2026-07-20T22:00:00.000Z"
+      }
+    }),
+    safety: {
+      environment: "paper",
+      tradingMode: "paper",
+      liveTradingEnabled: false,
+      paperOrderExecutionEnabled: true,
+      paperOptionsExecutionEnabled: true,
+      quoteMaxAgeSeconds: 60
+    },
+    confirmPaper: true,
+    fence: {
+      jobName: "paper-execution",
+      workstream: "paper_execution",
+      ownerId: "owner",
+      runId: "run",
+      fencingToken: "12"
+    },
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.evidence.brokerStatus, "rejected");
+  const settlement = statements.find(({ sql }) => sql.includes("released_reservation_count"));
+  assert.ok(settlement);
+  assert.match(settlement.sql, /INSERT INTO reservation_terminal_transitions/);
+  assert.match(settlement.sql, /FROM scheduler_leases/);
+  assert.equal(settlement.values[4], "rejected");
+  assert.equal(settlement.values[1], "broker_terminal_rejected");
+});
+
 test("the execution gate rejects missing current market timestamp before submission", () => {
   assert.throws(
     () => validateAutonomousExecutionEvidence(

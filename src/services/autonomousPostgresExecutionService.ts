@@ -930,6 +930,10 @@ const recordSubmission = async (
   );
   if (updated.rowCount !== 1) throw new Error("POSTGRES_EXECUTION_RESULT_PERSISTENCE_FAILED");
   if (intent.reservation_id && terminalWithoutFill && reservationReleaseReason) {
+    const transitionId = `reservation_transition_${stableRecordId(
+      "reservation_terminal",
+      `${intent.reservation_id}:${lifecycleState}`
+    )}`;
     const reservation = await query.query(
       `WITH released AS (
          UPDATE buying_power_reservations reservation
@@ -937,7 +941,7 @@ const recordSubmission = async (
              updated_at = $3, version = reservation.version + 1
          WHERE reservation.id = $1
            AND reservation.status IN ('active', 'committed')
-           AND ${fenceSql(4)}
+           AND ${fenceSql(8)}
          RETURNING reservation.account_id, reservation.strategy_key,
                    reservation.amount
        ), adjusted AS (
@@ -949,43 +953,37 @@ const recordSubmission = async (
            AND allocation.strategy_key = released.strategy_key
            AND allocation.status = 'active' AND allocation.effective_to IS NULL
          RETURNING allocation.id
+       ), terminal_transition AS (
+         INSERT INTO reservation_terminal_transitions(
+           id, reservation_id, order_intent_id, terminal_state,
+           release_reason, idempotency_key, occurred_at
+         )
+         SELECT $6, $1, $4, $5, $2, $7, $3 FROM released
+         ON CONFLICT (reservation_id) DO NOTHING
+         RETURNING id
        )
        SELECT
          (SELECT COUNT(*) FROM released)::text AS released_reservation_count,
-         (SELECT COUNT(*) FROM adjusted)::text AS adjusted_allocation_count`,
+         (SELECT COUNT(*) FROM adjusted)::text AS adjusted_allocation_count,
+         (SELECT COUNT(*) FROM terminal_transition)::text AS terminal_transition_count`,
       [
         intent.reservation_id,
         reservationReleaseReason,
         now.toISOString(),
+        intent.order_intent_id,
+        lifecycleState,
+        transitionId,
+        `${intent.order_intent_id}:${lifecycleState}`,
         ...values
       ]
     );
     if (
       Number(reservation.rows[0]?.released_reservation_count ?? 0) !== 1 ||
-      Number(reservation.rows[0]?.adjusted_allocation_count ?? 0) !== 1
+      Number(reservation.rows[0]?.adjusted_allocation_count ?? 0) !== 1 ||
+      Number(reservation.rows[0]?.terminal_transition_count ?? 0) !== 1
     ) {
       throw new Error("POSTGRES_EXECUTION_TERMINAL_RESERVATION_RELEASE_FAILED");
     }
-    const transitionId = `reservation_transition_${stableRecordId(
-      "reservation_terminal",
-      `${intent.reservation_id}:${lifecycleState}`
-    )}`;
-    await query.query(
-      `INSERT INTO reservation_terminal_transitions(
-         id, reservation_id, order_intent_id, terminal_state,
-         release_reason, idempotency_key, occurred_at
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-       ON CONFLICT (reservation_id) DO NOTHING`,
-      [
-        transitionId,
-        intent.reservation_id,
-        intent.order_intent_id,
-        lifecycleState,
-        reservationReleaseReason,
-        `${intent.order_intent_id}:${lifecycleState}`,
-        now.toISOString()
-      ]
-    );
   } else if (intent.reservation_id) {
     const reservation = await query.query(
       `UPDATE buying_power_reservations
