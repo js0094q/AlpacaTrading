@@ -25,7 +25,7 @@ The autonomous unit fixes paper exploration V3 strategy gates at
 `0.04` directional score, `0.05` directional confidence,
 `0.20/0.35/0.45` option confidence, and `0.20%/0.40%` option expected return.
 Liquidity remains `0.10`, spread remains capped at `15%`, and new-order
-notional remains capped at `$1,000`. The worker records the three legitimate
+notional remains capped at `$1,000`. The worker records the four legitimate
 PostgreSQL empty-work results listed in
 `docs/paper-candidate-qualification-inventory.md` as successful `no_action`
 events; actual operational blocks remain blocked.

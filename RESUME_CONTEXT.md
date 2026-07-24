@@ -9,8 +9,9 @@
   `0.20%/0.40%`.
 - Option liquidity remains `0.10`, maximum spread remains `15%`, candidate
   count remains `25`, and maximum order notional remains `$1,000`.
-- `NO_ELIGIBLE_POSTGRES_CANDIDATES`, `NO_POSTGRES_EXIT_TRIGGER`, and
-  `NO_READY_POSTGRES_ORDER_INTENTS` now complete with
+- `NO_ELIGIBLE_POSTGRES_CANDIDATES`, `NO_POSTGRES_EXIT_TRIGGER`,
+  `NO_READY_POSTGRES_ORDER_INTENTS`, and
+  `NO_RECONCILIABLE_POSTGRES_ORDERS` now complete with
   `classification=no_action`, `code=WORKSTREAM_NO_ACTION`, exit 0, and their
   exact domain `reasonCode`. Genuine blocked/failure outcomes remain blocked.
 - The full runtime threshold inventory and unchanged safety boundary are in
@@ -30,7 +31,7 @@
   default grace period before process-group `SIGKILL`, below systemd's
   30-second `TimeoutStopSec`.
 - Other successful `blocked` and `no_op` command results keep their exact
-  domain `reasonCode` under `WORKSTREAM_BLOCKED`; the three legitimate
+  domain `reasonCode` under `WORKSTREAM_BLOCKED`; the four legitimate
   empty-work codes listed above are the narrow `WORKSTREAM_NO_ACTION`
   exceptions.
 - The repair preserves lifecycle rows, fencing, and

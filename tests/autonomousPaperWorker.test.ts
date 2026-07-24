@@ -528,7 +528,8 @@ test("legitimate PostgreSQL empty-work outcomes are no-action completions across
   const expected = {
     "paper:review": "NO_ELIGIBLE_POSTGRES_CANDIDATES",
     "paper:exit:review": "NO_POSTGRES_EXIT_TRIGGER",
-    "paper:execute:reviewed": "NO_READY_POSTGRES_ORDER_INTENTS"
+    "paper:execute:reviewed": "NO_READY_POSTGRES_ORDER_INTENTS",
+    "paper:learn": "NO_RECONCILIABLE_POSTGRES_ORDERS"
   } as const;
   const { result, calls, states } = runWorker({
     successOutputs: Object.fromEntries(
@@ -556,6 +557,35 @@ test("legitimate PostgreSQL empty-work outcomes are no-action completions across
     false
   );
   assert.equal(states.some((state) => state.eventType === "cycle_completed"), true);
+});
+
+test("learning authority, reconciliation, and database blockers remain blocked", () => {
+  for (const reasonCode of [
+    "POSTGRES_CONTROL_PLANE_AUTHORITY_REQUIRED",
+    "POSTGRES_RECONCILIATION_ACCOUNT_PERSISTENCE_FAILED",
+    "POSTGRES_RESEARCH_EVIDENCE_PERSISTENCE_FAILED"
+  ]) {
+    const { result, calls, states } = runWorker({
+      successOutputs: {
+        "paper:learn": JSON.stringify({ status: "blocked", code: reasonCode })
+      }
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.deepEqual(
+      calls.filter((call) => call.command !== "worker:state").map((call) => call.command),
+      workstreams
+    );
+    const learningCompletion = states.find((state) =>
+      state.eventType === "workstream_completed" &&
+      state.payload.workstream === "paper:learn"
+    );
+    assert.equal(learningCompletion?.payload.classification, "blocked");
+    assert.equal(learningCompletion?.payload.code, "WORKSTREAM_BLOCKED");
+    assert.equal(learningCompletion?.payload.reasonCode, reasonCode);
+    assert.equal(states.some((state) => state.eventType === "workstream_failed"), false);
+    assert.equal(states.some((state) => state.eventType === "cycle_failed"), false);
+    assert.equal(states.some((state) => state.eventType === "cycle_completed"), true);
+  }
 });
 
 test("a worker-state persistence failure is fatal before the workstream starts", () => {

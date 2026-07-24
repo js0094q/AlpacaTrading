@@ -6,9 +6,10 @@ The VPS must run the exact validated cutover commit with PostgreSQL as its sole
 runtime authority. Do not run any SQLite migration, backfill, reconciliation,
 shadow, mirror, fallback, or historical import command.
 
-The current deployment adds paper exploration V3 and narrowly classifies
+The repository worker uses paper exploration V3 and narrowly classifies
 `NO_ELIGIBLE_POSTGRES_CANDIDATES`, `NO_POSTGRES_EXIT_TRIGGER`, and
-`NO_READY_POSTGRES_ORDER_INTENTS` as successful `WORKSTREAM_NO_ACTION`
+`NO_READY_POSTGRES_ORDER_INTENTS`, plus the learning result
+`NO_RECONCILIABLE_POSTGRES_ORDERS`, as successful `WORKSTREAM_NO_ACTION`
 outcomes. Require the checked-in unit's paper/live-off assertions, unchanged
 liquidity/spread/notional gates, and all PostgreSQL/reconciliation controls.
 

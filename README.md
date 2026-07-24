@@ -42,10 +42,11 @@ row, and the scheduler releases its lease as failed before the command exits.
 The parent worker does not persist `worker_stopped` until the detached
 workstream process group is gone. Successful PostgreSQL empty-work results
 `NO_ELIGIBLE_POSTGRES_CANDIDATES`, `NO_POSTGRES_EXIT_TRIGGER`, and
-`NO_READY_POSTGRES_ORDER_INTENTS` retain their exact domain `reasonCode` under
-`classification=no_action` and `code=WORKSTREAM_NO_ACTION`. Genuine
-operational inability to continue remains blocked. Lifecycle audit rows and the
-active-workstream uniqueness index remain intact.
+`NO_READY_POSTGRES_ORDER_INTENTS`, plus the learning result
+`NO_RECONCILIABLE_POSTGRES_ORDERS`, retain their exact domain `reasonCode`
+under `classification=no_action` and `code=WORKSTREAM_NO_ACTION`. Genuine
+operational inability to continue remains blocked. Lifecycle audit rows and
+the active-workstream uniqueness index remain intact.
 
 OPRA snapshot persistence commits symbol-scoped batches of at most 250 rows and
 immediately reads each exact identity back before the next batch begins. Each
