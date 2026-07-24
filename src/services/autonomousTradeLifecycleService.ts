@@ -287,7 +287,7 @@ export const resolveBrokerReconciliationLifecyclePath = (input: {
 };
 
 export const autonomousLifecycleContextFromRuntime = (
-  environment: { readonly AUTONOMOUS_CYCLE_ID?: string },
+  environment: Readonly<Record<string, string | undefined>>,
   fence: { readonly runId: string }
 ): Pick<WorkerExecutionContext, "cycleId" | "workstreamExecutionId"> => ({
   cycleId: environment.AUTONOMOUS_CYCLE_ID?.trim() || fence.runId,

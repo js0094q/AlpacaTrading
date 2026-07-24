@@ -102,6 +102,7 @@ export const persistAutonomousWorkerStateWithClient = async (
   }
   const occurredAt = new Date(input.occurredAt);
   if (!Number.isFinite(occurredAt.getTime())) fail("AUTONOMOUS_WORKER_EVENT_TIME_INVALID");
+  let resumedCycleId: string | null = null;
 
   if (input.eventType === "cycle_started") {
     const active = await client.query<{ entity_id: string }>(
@@ -125,6 +126,7 @@ export const persistAutonomousWorkerStateWithClient = async (
     );
     const orphanedCycleId = active.rows[0]?.entity_id;
     if (orphanedCycleId) {
+      resumedCycleId = orphanedCycleId;
       const orphanPayload = asJsonPayload({
         code: "AUTONOMOUS_CYCLE_ORPHANED_ON_RESTART",
         message: "A nonterminal autonomous cycle was closed before its replacement started.",
@@ -250,7 +252,11 @@ export const persistAutonomousWorkerStateWithClient = async (
     );
   }
 
-  return { status: "persisted" as const, eventId };
+  return {
+    status: "persisted" as const,
+    eventId,
+    ...(resumedCycleId ? { resumedCycleId } : {})
+  };
 };
 
 export const persistAutonomousWorkerState = (

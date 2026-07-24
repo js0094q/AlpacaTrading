@@ -23,16 +23,16 @@ const workstreams = [
   "research:daily",
   "paper:options:discover",
   "paper:review",
-  "paper:portfolio:review",
-  "paper:ops:review",
   "hedge:review",
   "paper:execute:reviewed",
+  "zero-dte:reconcile",
   "zero-dte:engine",
   "zero-dte:reconcile",
   "paper:exit:review",
   "zero-dte:exit:review",
   "hedge:exit:review",
   "paper:exit:execute",
+  "zero-dte:reconcile",
   "hedge:exit:execute",
   "zero-dte:reconcile",
   "paper:order:cancel",
@@ -64,6 +64,7 @@ type FakeCall = {
   command: string;
   args: string[];
   cycleId?: string;
+  resumeCycleId?: string;
   workstream?: string;
   safety: {
     alpacaEnv?: string;
@@ -95,6 +96,7 @@ const runWorker = (options: {
   successCommand?: string;
   successOutput?: string;
   successOutputs?: Record<string, string>;
+  resumeCycleId?: string;
   environment?: Record<string, string>;
 } = {}) => {
   const directory = mkdtempSync(join(tmpdir(), "autonomous-paper-worker-"));
@@ -113,6 +115,7 @@ appendFileSync(process.env.WORKER_CALLS_PATH, JSON.stringify({
   command,
   args,
   cycleId: process.env.AUTONOMOUS_CYCLE_ID,
+  resumeCycleId: process.env.AUTONOMOUS_RESUME_CYCLE_ID,
   workstream: process.env.AUTONOMOUS_WORKSTREAM,
   safety: {
     alpacaEnv: process.env.ALPACA_ENV,
@@ -134,7 +137,12 @@ if (command === "worker:state") {
     process.stdout.write(JSON.stringify({ error: "worker-test-secret-state-failure" }));
     process.exit(1);
   }
-  process.stdout.write(JSON.stringify({ status: "persisted" }));
+  process.stdout.write(JSON.stringify({
+    status: "persisted",
+    ...(state.eventType === "cycle_started" && process.env.WORKER_RESUME_CYCLE_ID
+      ? { resumedCycleId: process.env.WORKER_RESUME_CYCLE_ID }
+      : {})
+  }, null, 2));
   process.exit(0);
 }
 if (existsSync(process.env.WORKER_ACTIVE_PATH)) {
@@ -182,7 +190,8 @@ process.stdout.write(JSON.stringify({ status: "success" }));
           WORKER_FAIL_STATE_EVENT: options.failStateEvent ?? "",
           WORKER_SUCCESS_COMMAND: options.successCommand ?? "",
           WORKER_SUCCESS_OUTPUT: options.successOutput ?? "",
-          WORKER_SUCCESS_OUTPUTS: JSON.stringify(options.successOutputs ?? {})
+          WORKER_SUCCESS_OUTPUTS: JSON.stringify(options.successOutputs ?? {}),
+          WORKER_RESUME_CYCLE_ID: options.resumeCycleId ?? ""
         },
         encoding: "utf8",
         timeout: 15_000
@@ -411,6 +420,113 @@ test("approved worker validates the production contract and persists a complete 
   assert.doesNotMatch(result.stdout + result.stderr, /worker-test-secret/);
 });
 
+test("the 20 public workstreams enforce lifecycle phase order and publish dashboard-ready state", () => {
+  const { result, calls, states } = runWorker();
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(workstreams.length, 20);
+  assert.deepEqual(
+    calls
+      .filter((call) => call.command !== "worker:state")
+      .map((call) => call.command),
+    workstreams
+  );
+  assert.equal(workstreams[0], "zero-dte:reconcile");
+  assert.equal(workstreams.at(-1), "system:recover");
+
+  const reconciliations = workstreams
+    .map((workstream, index) => ({ workstream, index }))
+    .filter(({ workstream }) => workstream === "zero-dte:reconcile")
+    .map(({ index }) => index);
+  assert.deepEqual(reconciliations, [0, 6, 8, 13, 15, 17]);
+  for (const mutation of [
+    "paper:execute:reviewed",
+    "zero-dte:engine",
+    "paper:exit:execute",
+    "hedge:exit:execute",
+    "paper:order:cancel"
+  ] as const) {
+    assert.equal(
+      workstreams[workstreams.indexOf(mutation) + 1],
+      "zero-dte:reconcile",
+      `${mutation} must be immediately followed by reconciliation`
+    );
+  }
+  assert.ok(reconciliations[2]! < workstreams.indexOf("paper:exit:review"));
+  assert.ok(reconciliations[4]! < workstreams.indexOf("paper:order:cancel"));
+
+  const dashboardRefresh = states.find(
+    (state) =>
+      state.eventType === "workstream_completed" &&
+      state.payload.workstream === "paper:learn"
+  );
+  assert.equal(dashboardRefresh?.payload.dashboardProjectionReady, true);
+  assert.equal(dashboardRefresh?.payload.dashboardProjectionAuthority, "postgres");
+});
+
+test("an unresolved reconciliation prevents later broker mutations but still reaches terminal recovery", () => {
+  const { result, calls, states } = runWorker({
+    successOutputs: {
+      "zero-dte:reconcile": JSON.stringify({
+        status: "blocked",
+        code: "POSTGRES_RECONCILIATION_UNRESOLVED"
+      })
+    }
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+
+  const brokerMutations = new Set([
+    "paper:execute:reviewed",
+    "zero-dte:engine",
+    "paper:exit:execute",
+    "hedge:exit:execute",
+    "paper:order:cancel"
+  ]);
+  const invoked = calls
+    .filter((call) => call.command !== "worker:state")
+    .map((call) => call.command);
+  assert.equal(invoked.some((command) => brokerMutations.has(command)), false);
+  assert.equal(invoked.at(-1), "system:recover");
+
+  for (const workstream of brokerMutations) {
+    const completion = states.find(
+      (state) =>
+        state.eventType === "workstream_completed" &&
+        state.payload.workstream === workstream
+    );
+    assert.equal(completion?.payload.classification, "blocked", workstream);
+    assert.equal(completion?.payload.code, "WORKSTREAM_BLOCKED", workstream);
+    assert.equal(
+      completion?.payload.reasonCode,
+      "UNRESOLVED_PRIOR_MUTATION",
+      workstream
+    );
+  }
+  assert.equal(
+    states.some(
+      (state) =>
+        state.eventType === "workstream_completed" &&
+        state.payload.workstream === "system:recover"
+    ),
+    true
+  );
+});
+
+test("worker restart passes persisted cycle context into initial reconciliation", () => {
+  const resumedCycleId = "81ef842a-c66e-4f91-944d-65b78102ea50";
+  const { result, calls, states } = runWorker({ resumeCycleId: resumedCycleId });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const firstWorkstream = calls.find((call) => call.command !== "worker:state");
+  assert.equal(firstWorkstream?.command, "zero-dte:reconcile");
+  assert.equal(firstWorkstream?.resumeCycleId, resumedCycleId);
+  const initialCompletion = states.find(
+    (state) =>
+      state.eventType === "workstream_completed" &&
+      state.payload.position === 1
+  );
+  assert.equal(initialCompletion?.payload.resumedCycleId, resumedCycleId);
+  assert.match(result.stdout, /"event":"cycle_resuming"/);
+});
+
 test("a running workstream emits a 30-second heartbeat with cycle and child identity", () => {
   const directory = mkdtempSync(join(tmpdir(), "autonomous-paper-worker-heartbeat-"));
   const preloadPath = join(directory, "accelerate-heartbeat.mjs");
@@ -583,11 +699,48 @@ test("legitimate PostgreSQL empty-work outcomes are no-action completions across
   assert.equal(states.some((state) => state.eventType === "cycle_completed"), true);
 });
 
+test("empty terminal recovery is a successful no-action outcome", () => {
+  const { result, states } = runWorker({
+    successOutputs: {
+      "system:recover": JSON.stringify({
+        status: "completed",
+        recovery: {
+          researchRuns: 0,
+          reservations: 0,
+          reviews: 0,
+          confirmations: 0,
+          intents: 0,
+          staleReadyIntents: 0,
+          staleReadyCancelled: 0,
+          staleReadyPreserved: 0,
+          staleReadyReservationsReleased: 0,
+          staleReadyAllocationsAdjusted: 0
+        }
+      }, null, 2)
+    }
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const recovery = states.find(
+    (state) =>
+      state.eventType === "workstream_completed" &&
+      state.payload.workstream === "system:recover"
+  );
+  assert.equal(recovery?.payload.classification, "no_action");
+  assert.equal(recovery?.payload.code, "WORKSTREAM_NO_ACTION");
+  assert.equal(
+    recovery?.payload.reasonCode,
+    "NO_RECOVERABLE_POSTGRES_STATE"
+  );
+});
+
 test("learning authority, reconciliation, and database blockers remain blocked", () => {
   for (const reasonCode of [
     "POSTGRES_CONTROL_PLANE_AUTHORITY_REQUIRED",
     "POSTGRES_RECONCILIATION_ACCOUNT_PERSISTENCE_FAILED",
-    "POSTGRES_RESEARCH_EVIDENCE_PERSISTENCE_FAILED"
+    "POSTGRES_RESEARCH_EVIDENCE_PERSISTENCE_FAILED",
+    "SCHEDULER_FENCE_LOST",
+    "BROKER_ORDER_LOOKUP_FAILED",
+    "MALFORMED_BROKER_RESPONSE"
   ]) {
     const { result, calls, states } = runWorker({
       successOutputs: {

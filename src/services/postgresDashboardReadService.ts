@@ -1,5 +1,7 @@
 import type { QueryResult } from "pg";
 
+import { redactSensitiveText } from "../lib/securityRedaction.js";
+
 export type PostgresDashboardQuery = {
   query: (
     sql: string,
@@ -25,10 +27,129 @@ const textValue = (value: unknown, fallback: string | null = null) => {
   return text || fallback;
 };
 
+const timestampValue = (value: unknown): string | null => {
+  if (value instanceof Date) {
+    return Number.isFinite(value.getTime()) ? value.toISOString() : null;
+  }
+  if (typeof value !== "string" || !value.trim()) return null;
+  const parsed = new Date(value);
+  return Number.isFinite(parsed.getTime()) ? parsed.toISOString() : null;
+};
+
 const objectValue = (value: unknown): Record<string, unknown> =>
   value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
     : {};
+
+const sensitiveDashboardKey = (key: string) =>
+  /(?:authorization|cookie|password|secret|token|api[_-]?key|raw[_-]?headers?|^headers?$)/i
+    .test(key);
+
+const sanitizeDashboardValue = (value: unknown): unknown => {
+  if (value instanceof Date) return timestampValue(value);
+  if (typeof value === "string") return redactSensitiveText(value);
+  if (Array.isArray(value)) return value.map(sanitizeDashboardValue);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter(([key]) => !sensitiveDashboardKey(key))
+      .map(([key, entry]) => [key, sanitizeDashboardValue(entry)])
+  );
+};
+
+const selectedObject = (
+  value: unknown,
+  fields: readonly string[]
+): Record<string, unknown> | null => {
+  const source = objectValue(value);
+  if (Object.keys(source).length === 0) return null;
+  return Object.fromEntries(fields.map((field) => [
+    field,
+    sanitizeDashboardValue(source[field] ?? null)
+  ]));
+};
+
+const premiumDecisionEvidence = (value: unknown): Record<string, unknown> => {
+  const source = objectValue(value);
+  const scalarFields = [
+    "sipPrice",
+    "sipFreshnessStatus",
+    "opraFeed",
+    "bid",
+    "ask",
+    "spread",
+    "spreadPct",
+    "volume",
+    "openInterest",
+    "impliedVolatility",
+    "delta",
+    "gamma",
+    "theta",
+    "vega",
+    "rho",
+    "historicalBarCount",
+    "realizedVolatility",
+    "liquidityScore",
+    "finalConfidence",
+    "expectedReturn"
+  ] as const;
+  return {
+    ...Object.fromEntries(
+      scalarFields.map((field) => [field, sanitizeDashboardValue(source[field] ?? null)])
+    ),
+    historicalBarStart: timestampValue(source.historicalBarStart),
+    historicalBarEnd: timestampValue(source.historicalBarEnd),
+    scoreComponents: selectedObject(source.scoreComponents, [
+      "confidence",
+      "expectedReturn",
+      "volatilityAdjusted",
+      "freshness",
+      "optionLiquidity",
+      "riskProfile"
+    ]),
+    strategyClassification: selectedObject(source.strategyClassification, [
+      "family",
+      "daysToExpiration",
+      "leapsMinDte",
+      "leapsMaxDte"
+    ]),
+    positionSizingInput: selectedObject(source.positionSizingInput, [
+      "quantity",
+      "notional",
+      "referencePrice",
+      "allocationAmount"
+    ]),
+    limitPriceConstruction: selectedObject(source.limitPriceConstruction, [
+      "limitPrice",
+      "bid",
+      "ask",
+      "midpoint",
+      "referencePrice"
+    ])
+  };
+};
+
+const normalizeDashboardRow = (
+  row: Record<string, unknown>
+): Record<string, unknown> => {
+  const normalized: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(row)) {
+    if (sensitiveDashboardKey(key)) continue;
+    if (key === "premium_decision_evidence" || key === "decision_evidence") {
+      normalized[key] = premiumDecisionEvidence(value);
+      continue;
+    }
+    if (/(?:_at|_timestamp)$/.test(key)) {
+      normalized[key] = timestampValue(value);
+      continue;
+    }
+    normalized[key] = sanitizeDashboardValue(value);
+  }
+  return normalized;
+};
+
+const normalizeDashboardRows = (rows: Array<Record<string, unknown>>) =>
+  rows.map(normalizeDashboardRow);
 
 const newYorkDate = (now: Date) => {
   const parts = new Intl.DateTimeFormat("en-US", {
@@ -87,7 +208,7 @@ export const readPostgresWorkerHealth = async (
     };
   }
 
-  const lastEventAt = textValue(row.occurred_at);
+  const lastEventAt = timestampValue(row.occurred_at);
   const ageMs = lastEventAt ? now.getTime() - Date.parse(lastEventAt) : Number.POSITIVE_INFINITY;
   const stale = !Number.isFinite(ageMs) || ageMs > 6 * 60 * 60 * 1_000;
   const eventType = textValue(row.event_type);
@@ -105,7 +226,7 @@ export const readPostgresWorkerHealth = async (
     lastEventType: eventType,
     lastEventAt,
     cycleId: textValue(row.entity_id),
-    lastCycleCompletedAt: textValue(row.last_cycle_completed_at)
+    lastCycleCompletedAt: timestampValue(row.last_cycle_completed_at)
   };
 };
 
@@ -362,12 +483,24 @@ export const readPostgresDashboardData = async (
               confirmation.confirmed_at, confirmation.expires_at AS confirmation_expires_at,
               confirmation.created_at AS confirmation_created_at,
               intent.id AS intent_id, intent.client_order_id,
-              intent.status AS intent_status,
+              intent.status AS intent_status, intent.operation,
+              intent.strategy_classification, intent.lifecycle_state,
+              intent.autonomous_cycle_id, intent.workstream_execution_id,
+              intent.parent_position_id, intent.opening_intent_id,
               COALESCE(
                 intent.request_payload->>'terminalReasonCode',
                 intent.request_payload->>'recoveryReason',
                 intent.request_payload #>> '{staleReadyRecovery,reason}'
               ) AS intent_terminal_reason,
+              COALESCE(
+                review.portfolio_evidence #>> '{trigger,reason}',
+                intent.request_payload->>'exitTrigger'
+              ) AS exit_trigger,
+              COALESCE(
+                intent.request_payload->>'reasonCode',
+                review.portfolio_evidence #>> '{trigger,reason}',
+                candidate.decision_reason
+              ) AS lifecycle_reason_code,
               intent.ready_at, intent.submitted_at AS intent_submitted_at,
               intent.terminal_at, intent.created_at AS intent_created_at,
               intent.updated_at AS intent_updated_at,
@@ -593,11 +726,24 @@ export const readPostgresDashboardData = async (
               reservation.released_at AS reservation_released_at,
               intent.symbol, intent.asset_class, intent.side,
               intent.status AS intent_status, intent.client_order_id,
+              intent.operation, intent.strategy_classification,
+              intent.lifecycle_state, intent.autonomous_cycle_id,
+              intent.workstream_execution_id, intent.parent_position_id,
+              intent.opening_intent_id,
               COALESCE(
                 intent.request_payload->>'terminalReasonCode',
                 intent.request_payload->>'recoveryReason',
                 intent.request_payload #>> '{staleReadyRecovery,reason}'
               ) AS intent_terminal_reason,
+              COALESCE(
+                review.portfolio_evidence #>> '{trigger,reason}',
+                intent.request_payload->>'exitTrigger'
+              ) AS exit_trigger,
+              COALESCE(
+                intent.request_payload->>'reasonCode',
+                review.portfolio_evidence #>> '{trigger,reason}',
+                candidate.decision_reason
+              ) AS lifecycle_reason_code,
               intent.ready_at, intent.submitted_at AS intent_submitted_at,
               intent.terminal_at, intent.created_at AS intent_created_at,
               intent.updated_at AS intent_updated_at,
@@ -650,6 +796,10 @@ export const readPostgresDashboardData = async (
       `SELECT order_row.id, order_row.id AS broker_execution_id,
               order_row.order_intent_id, intent.execution_review_id,
               intent.candidate_id, intent.reservation_id,
+              intent.operation, intent.strategy_classification,
+              intent.lifecycle_state, intent.autonomous_cycle_id,
+              intent.workstream_execution_id, intent.parent_position_id,
+              intent.opening_intent_id,
               order_row.broker_order_id, order_row.client_order_id,
               order_row.symbol, order_row.asset_class, order_row.side,
               order_row.order_type, order_row.time_in_force, order_row.status,
@@ -717,33 +867,180 @@ export const readPostgresDashboardData = async (
            AND event_type IN ('cycle_completed', 'cycle_failed')
          ORDER BY occurred_at DESC, event_id DESC
          LIMIT 1
-       )
-       SELECT event.entity_id AS cycle_id, event.event_type,
-              event.payload->>'workstream' AS workstream,
-              CASE WHEN event.payload->>'position' ~ '^[0-9]+$'
-                THEN (event.payload->>'position')::integer ELSE NULL END AS position,
-              CASE
-                WHEN event.event_type = 'cycle_completed' THEN 'success'
-                WHEN event.event_type = 'cycle_failed'
-                  THEN COALESCE(event.payload->>'classification', 'blocked')
-                ELSE event.payload->>'classification'
-              END AS classification,
-              COALESCE(event.payload->>'reasonCode', event.payload->>'code')
-                AS reason_code,
-              CASE WHEN event.payload->>'durationMs' ~ '^[0-9]+(\\.[0-9]+)?$'
-                THEN (event.payload->>'durationMs')::numeric ELSE NULL END
-                AS duration_ms,
-              event.occurred_at
-       FROM workstream_events event
-       JOIN latest_terminal terminal ON terminal.entity_id = event.entity_id
-       WHERE event.workstream = 'autonomous_worker'
-         AND event.event_type IN (
-           'workstream_completed', 'workstream_failed',
-           'cycle_completed', 'cycle_failed'
+       ), current_cycle AS (
+         SELECT started.entity_id
+         FROM workstream_events started
+         WHERE started.workstream = 'autonomous_worker'
+           AND started.event_type = 'cycle_started'
+           AND NOT EXISTS (
+             SELECT 1
+             FROM workstream_events terminal
+             WHERE terminal.workstream = 'autonomous_worker'
+               AND terminal.entity_id = started.entity_id
+               AND terminal.event_type IN (
+                 'cycle_completed', 'cycle_failed', 'worker_stopped'
+               )
+           )
+         ORDER BY started.occurred_at DESC, started.event_id DESC
+         LIMIT 1
+       ), cycle_scope AS (
+         SELECT current_cycle.entity_id AS cycle_id, 'current'::text AS cycle_scope
+         FROM current_cycle
+         UNION ALL
+         SELECT latest_terminal.entity_id, 'last_completed'::text
+         FROM latest_terminal
+         WHERE NOT EXISTS (
+           SELECT 1 FROM current_cycle
+           WHERE current_cycle.entity_id = latest_terminal.entity_id
          )
-       ORDER BY position NULLS LAST, event.occurred_at, event.event_id
+       ), worker_projection AS (
+         SELECT 'workstream'::text AS row_kind, scope.cycle_scope,
+                event.entity_id AS cycle_id, event.event_type,
+                event.payload->>'workstream' AS workstream,
+                CASE WHEN event.payload->>'position' ~ '^[0-9]+$'
+                  THEN (event.payload->>'position')::integer ELSE NULL END AS position,
+                CASE
+                  WHEN event.event_type = 'cycle_completed' THEN 'success'
+                  WHEN event.event_type = 'cycle_failed'
+                    THEN COALESCE(event.payload->>'classification', 'blocked')
+                  WHEN event.event_type IN ('cycle_started', 'workstream_started')
+                    THEN 'running'
+                  ELSE event.payload->>'classification'
+                END AS classification,
+                COALESCE(event.payload->>'reasonCode', event.payload->>'code')
+                  AS reason_code,
+                CASE WHEN event.payload->>'durationMs' ~ '^[0-9]+(\\.[0-9]+)?$'
+                  THEN (event.payload->>'durationMs')::numeric ELSE NULL END
+                  AS duration_ms,
+                event.occurred_at,
+                NULL::text AS candidate_id, NULL::text AS review_id,
+                NULL::text AS confirmation_id, NULL::text AS intent_id,
+                NULL::text AS parent_position_id, NULL::text AS opening_intent_id,
+                NULL::text AS client_order_id, NULL::text AS broker_order_id,
+                NULL::text AS broker_status, NULL::text AS operation,
+                NULL::text AS strategy_classification,
+                NULL::text AS lifecycle_state, NULL::text AS reservation_state,
+                NULL::text AS reservation_release_reason,
+                NULL::text AS position_id, NULL::text AS position_side,
+                NULL::text AS open_quantity,
+                NULL::timestamptz AS latest_reconciled_at,
+                event.entity_id AS autonomous_cycle_id,
+                event.payload->>'workstreamExecutionId' AS workstream_execution_id,
+                NULL::text AS exit_trigger,
+                COALESCE(event.payload->>'reasonCode', event.payload->>'code')
+                  AS lifecycle_reason_code,
+                NULL::jsonb AS decision_evidence
+         FROM workstream_events event
+         JOIN cycle_scope scope ON scope.cycle_id = event.entity_id
+         WHERE event.workstream = 'autonomous_worker'
+           AND event.event_type IN (
+             'cycle_started', 'workstream_started', 'workstream_completed',
+             'workstream_failed', 'cycle_completed', 'cycle_failed'
+           )
+       ), trade_projection AS (
+         SELECT 'trade_lifecycle'::text AS row_kind, scope.cycle_scope,
+                intent.autonomous_cycle_id AS cycle_id,
+                NULL::text AS event_type,
+                intent.workstream_execution_id AS workstream,
+                NULL::integer AS position,
+                CASE
+                  WHEN intent.lifecycle_state IN ('closed', 'cancelled') THEN 'success'
+                  WHEN intent.lifecycle_state IN (
+                    'rejected', 'expired', 'failed_terminal'
+                  ) THEN 'blocked'
+                  ELSE 'pending'
+                END AS classification,
+                COALESCE(
+                  intent.request_payload->>'reasonCode',
+                  intent.request_payload->>'terminalReasonCode',
+                  review.portfolio_evidence #>> '{trigger,reason}',
+                  candidate.decision_reason
+                ) AS reason_code,
+                NULL::numeric AS duration_ms,
+                intent.updated_at AS occurred_at,
+                intent.candidate_id, intent.execution_review_id AS review_id,
+                intent.confirmation_evidence_id AS confirmation_id,
+                intent.id AS intent_id, intent.parent_position_id,
+                intent.opening_intent_id, intent.client_order_id,
+                order_row.broker_order_id,
+                COALESCE(
+                  order_row.status,
+                  broker_event.event_status
+                ) AS broker_status,
+                intent.operation, intent.strategy_classification,
+                intent.lifecycle_state, reservation.status AS reservation_state,
+                reservation.release_reason AS reservation_release_reason,
+                position.id AS position_id, position.side AS position_side,
+                position.quantity::text AS open_quantity,
+                position.last_reconciled_at AS latest_reconciled_at,
+                intent.autonomous_cycle_id, intent.workstream_execution_id,
+                COALESCE(
+                  review.portfolio_evidence #>> '{trigger,reason}',
+                  intent.request_payload->>'exitTrigger'
+                ) AS exit_trigger,
+                COALESCE(
+                  intent.request_payload->>'reasonCode',
+                  review.portfolio_evidence #>> '{trigger,reason}',
+                  candidate.decision_reason
+                ) AS lifecycle_reason_code,
+                jsonb_build_object(
+                  'opraFeed', COALESCE(
+                    review.market_evidence->0->>'effectiveFeed',
+                    candidate.signal_inputs #>> '{marketDecisionInputs,option,feed}'
+                  ),
+                  'bid', review.market_evidence->0->'bid',
+                  'ask', review.market_evidence->0->'ask',
+                  'spreadPct', review.market_evidence->0->'spreadPct',
+                  'volume', review.market_evidence->0->'volume',
+                  'openInterest', review.market_evidence->0->'openInterest',
+                  'impliedVolatility', review.market_evidence->0->'impliedVolatility',
+                  'delta', review.market_evidence->0->'delta',
+                  'gamma', review.market_evidence->0->'gamma',
+                  'theta', review.market_evidence->0->'theta',
+                  'vega', review.market_evidence->0->'vega',
+                  'rho', review.market_evidence->0->'rho',
+                  'finalConfidence', to_jsonb(candidate.confidence),
+                  'expectedReturn', to_jsonb(candidate.expected_return),
+                  'liquidityScore', to_jsonb(candidate.option_liquidity_score)
+                ) AS decision_evidence
+         FROM order_intents intent
+         JOIN cycle_scope scope ON scope.cycle_id = intent.autonomous_cycle_id
+         LEFT JOIN candidates candidate ON candidate.id = intent.candidate_id
+         LEFT JOIN execution_reviews review
+           ON review.id = intent.execution_review_id
+         LEFT JOIN buying_power_reservations reservation
+           ON reservation.id = intent.reservation_id
+         LEFT JOIN LATERAL (
+           SELECT broker_order.*
+           FROM orders broker_order
+           WHERE broker_order.order_intent_id = intent.id
+           ORDER BY broker_order.updated_at DESC, broker_order.id DESC
+           LIMIT 1
+         ) order_row ON true
+         LEFT JOIN LATERAL (
+           SELECT event.event_status
+           FROM broker_events event
+           WHERE event.order_intent_id = intent.id
+           ORDER BY event.occurred_at DESC, event.event_id DESC
+           LIMIT 1
+         ) broker_event ON true
+         LEFT JOIN LATERAL (
+           SELECT reconciled_position.*
+           FROM positions reconciled_position
+           WHERE reconciled_position.id = intent.parent_position_id
+              OR reconciled_position.opening_order_id = order_row.id
+              OR reconciled_position.closing_order_id = order_row.id
+           ORDER BY reconciled_position.updated_at DESC,
+                    reconciled_position.id DESC
+           LIMIT 1
+         ) position ON true
+       )
+       SELECT * FROM worker_projection
+       UNION ALL
+       SELECT * FROM trade_projection
+       ORDER BY cycle_scope, position NULLS LAST, occurred_at, intent_id
        LIMIT $1`,
-      [Math.max(21, boundedLimit)]
+      [Math.min(200, Math.max(42, boundedLimit * 4))]
     ),
     query.query(
       `SELECT COUNT(*) AS ready_count
@@ -752,16 +1049,23 @@ export const readPostgresDashboardData = async (
       []
     )
   ]);
+  const latestResearch = normalizeDashboardRows(research.rows);
+  const latestPaperPlans = normalizeDashboardRows(plans.rows);
+  const normalizedReviews = normalizeDashboardRows(reviews.rows);
+  const orderIntents = normalizeDashboardRows(intents.rows);
+  const executions = normalizeDashboardRows(orders.rows);
+  const optionContracts = normalizeDashboardRows(options.rows);
+  const autonomousLifecycle = normalizeDashboardRows(lifecycle.rows);
   return {
-    latestResearch: research.rows,
-    latestPaperPlans: plans.rows,
-    reviews: reviews.rows,
-    orderIntents: intents.rows,
-    executions: orders.rows,
-    optionContracts: options.rows,
-    autonomousLifecycle: lifecycle.rows,
+    latestResearch,
+    latestPaperPlans,
+    reviews: normalizedReviews,
+    orderIntents,
+    executions,
+    optionContracts,
+    autonomousLifecycle,
     readyIntentCount: integerValue(readyIntents.rows[0]?.ready_count),
-    requestIds: research.rows
+    requestIds: latestResearch
       .map((row) => textValue(row.request_id))
       .filter((value): value is string => Boolean(value))
   };

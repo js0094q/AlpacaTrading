@@ -79,6 +79,15 @@ type PaperDryRunSnapshot = {
   assetClass: string;
 };
 
+type AutonomousWorkerSnapshot = {
+  status?: "running" | "stopped" | "failed" | "stale" | "unknown";
+  active?: boolean;
+  lastEventType?: string | null;
+  lastEventAt?: string | null;
+  cycleId?: string | null;
+  lastCycleCompletedAt?: string | null;
+};
+
 type PaperExecutionSnapshot = {
   symbol?: string;
   id?: string;
@@ -194,6 +203,13 @@ export default async function DashboardPage() {
   const dryRun = snapshot
     ? asResult<PaperDryRunSnapshot>(snapshot.dryRun as DashboardCaptureResult<PaperDryRunSnapshot> | DashboardCaptureError)
     : null;
+  const worker = snapshot
+    ? asResult<AutonomousWorkerSnapshot>(
+        snapshot.runtime as
+          | DashboardCaptureResult<AutonomousWorkerSnapshot>
+          | DashboardCaptureError
+      )
+    : null;
   const executions = snapshot
     ? asResult<PaperExecutionSnapshot[]>(snapshot.executions as DashboardCaptureResult<PaperExecutionSnapshot[]> | DashboardCaptureError)
     : null;
@@ -258,6 +274,25 @@ export default async function DashboardPage() {
           <Metric label="Alpaca env" value={snapshot?.environment || "-"} />
           <Metric label="Live trading enabled" value={String(Boolean(snapshot?.liveTradingEnabled))} />
           <Metric label="Paper only" value={String(Boolean(snapshot?.paperOnly))} />
+        </div>
+
+        <div className="panel">
+          <h2>Autonomous Worker</h2>
+          {worker?.ok ? (
+            <>
+              <Metric label="Status" value={worker.data.status || "unknown"} />
+              <Metric label="Active" value={String(Boolean(worker.data.active))} />
+              <Metric label="Current cycle" value={worker.data.cycleId || "-"} />
+              <Metric label="Last event" value={worker.data.lastEventType || "-"} />
+              <Metric label="Last event at" value={worker.data.lastEventAt || "-"} />
+              <Metric
+                label="Last completed cycle"
+                value={worker.data.lastCycleCompletedAt || "-"}
+              />
+            </>
+          ) : (
+            <p className="warning">{worker?.error || "Unavailable"}</p>
+          )}
         </div>
 
         <div className="panel">

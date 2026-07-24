@@ -25,8 +25,29 @@ const SUCCESSFUL_NO_ACTION_REASON_CODES = new Set([
   "NO_POSTGRES_EXIT_TRIGGER",
   "NO_READY_POSTGRES_ORDER_INTENTS",
   "NO_CANCELLABLE_POSTGRES_ORDERS",
-  "NO_RECONCILIABLE_POSTGRES_ORDERS"
+  "NO_RECONCILIABLE_POSTGRES_ORDERS",
+  "NO_RECOVERABLE_POSTGRES_STATE"
 ]);
+const BROKER_MUTATION_WORKSTREAMS = new Set([
+  "paper:execute:reviewed",
+  "zero-dte:engine",
+  "paper:exit:execute",
+  "hedge:exit:execute",
+  "paper:order:cancel"
+]);
+const RECONCILIATION_WORKSTREAM = "zero-dte:reconcile";
+const RECOVERY_COUNT_FIELDS = [
+  "researchRuns",
+  "reservations",
+  "reviews",
+  "confirmations",
+  "intents",
+  "staleReadyIntents",
+  "staleReadyCancelled",
+  "staleReadyPreserved",
+  "staleReadyReservationsReleased",
+  "staleReadyAllocationsAdjusted"
+];
 const configuredMaxCandidates = Number(process.env.PAPER_EXPLORATION_MAX_CANDIDATES ?? 25);
 const PAPER_EXPLORATION_MAX_CANDIDATES =
   Number.isSafeInteger(configuredMaxCandidates) &&
@@ -40,16 +61,16 @@ const WORKSTREAMS = [
   ["research:daily", ["--riskProfile=aggressive", "--optionsEnabled=true", `--maxCandidates=${PAPER_EXPLORATION_MAX_CANDIDATES}`, "--assetClass=all", "--format=json"]],
   ["paper:options:discover", ["--underlying=SPY", "--dte=0", "--format=json"]],
   ["paper:review", ["--riskProfile=aggressive", "--optionsEnabled=true", `--maxCandidates=${PAPER_EXPLORATION_MAX_CANDIDATES}`, "--format=json"]],
-  ["paper:portfolio:review", ["--format=json"]],
-  ["paper:ops:review", ["--format=json"]],
   ["hedge:review", ["--format=json"]],
   ["paper:execute:reviewed", ["--confirmPaper", "--sections=equityBuys,equityAdds,optionBuys", "--format=json"]],
+  ["zero-dte:reconcile", ["--format=json"]],
   ["zero-dte:engine", ["--confirmPaper", "--format=json"]],
   ["zero-dte:reconcile", ["--format=json"]],
   ["paper:exit:review", ["--format=json"]],
   ["zero-dte:exit:review", ["--format=json"]],
   ["hedge:exit:review", ["--format=json"]],
   ["paper:exit:execute", ["--confirmPaper", "--format=json"]],
+  ["zero-dte:reconcile", ["--format=json"]],
   ["hedge:exit:execute", ["--confirmPaper", "--format=json"]],
   ["zero-dte:reconcile", ["--format=json"]],
   ["paper:order:cancel", ["--autonomous", "--confirmPaper", "--format=json"]],
@@ -60,7 +81,11 @@ const WORKSTREAMS = [
 
 const STATE_COMMAND = "worker:state";
 const REQUIRED_COMMANDS = [
-  ...new Set(WORKSTREAMS.map(([command]) => command)),
+  ...new Set([
+    ...WORKSTREAMS.map(([command]) => command),
+    "paper:portfolio:review",
+    "paper:ops:review"
+  ]),
   STATE_COMMAND
 ];
 const EXPECTED_CONTRACT_ENTRY = {
@@ -435,7 +460,72 @@ const structuredReasonCode = (output) => {
   return matches.at(-1)?.[1] ?? null;
 };
 
-const classify = ({ exitCode, output, spawnError, timedOut }) => {
+const latestStructuredOutput = (output) => {
+  let latest = null;
+  let cursor = 0;
+  while (cursor < output.length) {
+    const start = output.indexOf("{", cursor);
+    if (start === -1) break;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    let end = -1;
+    for (let index = start; index < output.length; index += 1) {
+      const character = output[index];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (character === "\\") {
+          escaped = true;
+        } else if (character === "\"") {
+          inString = false;
+        }
+        continue;
+      }
+      if (character === "\"") {
+        inString = true;
+      } else if (character === "{") {
+        depth += 1;
+      } else if (character === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          end = index;
+          break;
+        }
+      }
+    }
+    if (end === -1) {
+      cursor = start + 1;
+      continue;
+    }
+    try {
+      const value = JSON.parse(output.slice(start, end + 1));
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        latest = value;
+        cursor = end + 1;
+        continue;
+      }
+    } catch {
+      // Command wrappers may emit diagnostics containing braces around JSON.
+    }
+    cursor = start + 1;
+  }
+  return latest;
+};
+
+const emptyRecoveryResult = (output) => {
+  const recovery = latestStructuredOutput(output)?.recovery;
+  if (!recovery || typeof recovery !== "object" || Array.isArray(recovery)) return false;
+  if (!Object.keys(recovery).every((field) => RECOVERY_COUNT_FIELDS.includes(field))) {
+    return false;
+  }
+  return RECOVERY_COUNT_FIELDS.every((field) => {
+    const value = Number(recovery[field]);
+    return Number.isFinite(value) && value === 0;
+  });
+};
+
+const classify = ({ exitCode, output, spawnError, timedOut }, script) => {
   if (spawnError) return { classification: "runner_unavailable", code: "WORKSTREAM_RUNNER_UNAVAILABLE" };
   if (timedOut) return { classification: "timed_out", code: "WORKSTREAM_TIMEOUT" };
   if (exitCode === 0) {
@@ -443,6 +533,13 @@ const classify = ({ exitCode, output, spawnError, timedOut }) => {
       return { classification: "failed", code: "WORKSTREAM_COMMAND_FAILED" };
     }
     const reasonCode = structuredReasonCode(output);
+    if (script === "system:recover" && emptyRecoveryResult(output)) {
+      return {
+        classification: "no_action",
+        code: "WORKSTREAM_NO_ACTION",
+        reasonCode: "NO_RECOVERABLE_POSTGRES_STATE"
+      };
+    }
     if (
       /"status"\s*:\s*"no_op"/i.test(output) &&
       reasonCode &&
@@ -493,9 +590,18 @@ const classify = ({ exitCode, output, spawnError, timedOut }) => {
   return { classification: "failed", code: "WORKSTREAM_COMMAND_FAILED" };
 };
 
-const runWorkstream = async (script, args, timeoutMs, cycle, cycleId, position) => {
+const runWorkstream = async (
+  script,
+  args,
+  timeoutMs,
+  cycle,
+  cycleId,
+  position,
+  resumedCycleId
+) => {
   const raw = await runNpmCommand(script, args, timeoutMs, "workstream", {
     AUTONOMOUS_CYCLE_ID: cycleId,
+    ...(resumedCycleId ? { AUTONOMOUS_RESUME_CYCLE_ID: resumedCycleId } : {}),
     AUTONOMOUS_WORKSTREAM: script
   }, {
     cycle,
@@ -503,7 +609,7 @@ const runWorkstream = async (script, args, timeoutMs, cycle, cycleId, position) 
     position,
     workstream: script
   });
-  const result = classify(raw);
+  const result = classify(raw, script);
   return {
     ...result,
     exitCode: raw.exitCode,
@@ -523,6 +629,7 @@ const persistState = async (cycleId, eventType, payload) => {
   if (result.exitCode !== 0 || result.spawnError || result.timedOut) {
     throw codedError("AUTONOMOUS_WORKER_STATE_PERSIST_FAILED");
   }
+  return latestStructuredOutput(result.output);
 };
 
 const wait = (milliseconds) =>
@@ -573,18 +680,28 @@ const main = async () => {
     cycle += 1;
     const cycleId = cycle === 1 ? preflightCycleId : randomUUID();
     lastCycleId = cycleId;
-    await persistState(cycleId, "cycle_started", statePayload(cycle, {
+    const cycleStartState = await persistState(cycleId, "cycle_started", statePayload(cycle, {
       workerPid: process.pid,
       workstreamCount: WORKSTREAMS.length
     }));
+    const resumedCycleId =
+      typeof cycleStartState?.resumedCycleId === "string" &&
+      cycleStartState.resumedCycleId.trim()
+        ? cycleStartState.resumedCycleId.trim()
+        : null;
+    if (resumedCycleId) {
+      emitEvent({ event: "cycle_resuming", cycle, cycleId, resumedCycleId });
+    }
     emitEvent({ event: "cycle_started", cycle, cycleId, workstreamCount: WORKSTREAMS.length });
+    let unresolvedPriorMutation = false;
 
     for (let index = 0; index < WORKSTREAMS.length; index += 1) {
       if (stopRequested) break;
       const [script, args] = WORKSTREAMS[index];
       const basePayload = statePayload(cycle, {
         position: index + 1,
-        workstream: script
+        workstream: script,
+        ...(resumedCycleId ? { resumedCycleId } : {})
       });
       await persistState(cycleId, "workstream_started", basePayload);
       emitEvent({ event: "workstream_started", cycle, cycleId, position: index + 1, workstream: script });
@@ -598,14 +715,36 @@ const main = async () => {
         emitEvent({ event: "worker_stopped", cycle, cycleId, reason: "signal" });
         return;
       }
-      const result = await runWorkstream(
-        script,
-        args,
-        workstreamTimeoutMs,
-        cycle,
-        cycleId,
-        index + 1
-      );
+      const result =
+        unresolvedPriorMutation && BROKER_MUTATION_WORKSTREAMS.has(script)
+          ? {
+              classification: "blocked",
+              code: "WORKSTREAM_BLOCKED",
+              reasonCode: "UNRESOLVED_PRIOR_MUTATION",
+              exitCode: null,
+              durationMs: 0
+            }
+          : await runWorkstream(
+              script,
+              args,
+              workstreamTimeoutMs,
+              cycle,
+              cycleId,
+              index + 1,
+              resumedCycleId
+            );
+
+      if (script === RECONCILIATION_WORKSTREAM) {
+        unresolvedPriorMutation = !["success", "no_action"].includes(
+          result.classification
+        );
+      } else if (
+        BROKER_MUTATION_WORKSTREAMS.has(script) &&
+        result.classification === "blocked" &&
+        result.reasonCode !== "UNRESOLVED_PRIOR_MUTATION"
+      ) {
+        unresolvedPriorMutation = true;
+      }
 
       if (stopRequested) {
         await persistState(cycleId, "worker_stopped", statePayload(cycle, {
@@ -645,7 +784,16 @@ const main = async () => {
         throw codedError(result.code);
       }
 
-      const completionPayload = { ...basePayload, ...result };
+      const completionPayload = {
+        ...basePayload,
+        ...result,
+        ...(script === "paper:learn"
+          ? {
+              dashboardProjectionReady: true,
+              dashboardProjectionAuthority: "postgres"
+            }
+          : {})
+      };
       await persistState(cycleId, "workstream_completed", completionPayload);
       emitEvent({ event: "workstream_completed", cycle, cycleId, position: index + 1, workstream: script, ...result });
     }
