@@ -3,7 +3,8 @@
 ## Shared stock-snapshot readiness stabilization (2026-07-27)
 
 - `POSTGRES_STOCK_SNAPSHOT_STALE` remains a failed PostgreSQL research run and
-  stale SIP evidence is never persisted or used as current decision evidence.
+  `POSTGRES_REVIEW_MARKET_EVIDENCE_STALE` remains a failed review command; stale
+  SIP evidence is never persisted or used as current decision evidence.
 - The autonomous worker records that bounded market-data readiness condition as
   `WORKSTREAM_DEFERRED` and continues the lifecycle instead of exiting into a
   systemd restart loop. Other PostgreSQL failures remain fatal.

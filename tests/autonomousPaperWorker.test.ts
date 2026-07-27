@@ -857,6 +857,7 @@ test("a PostgreSQL workstream failure preserves the exact safe dependency code",
 test("expected market-data readiness conditions defer without stopping the worker", () => {
   for (const reasonCode of [
     "POSTGRES_STOCK_SNAPSHOT_STALE",
+    "POSTGRES_REVIEW_MARKET_EVIDENCE_STALE",
     "POSTGRES_OPTION_SNAPSHOTS_CURRENT_MISSING",
     "POSTGRES_DECISION_MARKET_SESSION_INELIGIBLE",
     "NO_ELIGIBLE_POSTGRES_CANDIDATES",
