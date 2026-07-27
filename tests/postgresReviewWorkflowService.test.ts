@@ -124,7 +124,7 @@ test("entry review persists signed PostgreSQL review and unconfirmed pending int
   assert.match(sourceSql, /LIMIT 25$/);
 });
 
-test("a newly qualifying paper option candidate propagates into a PostgreSQL order intent", async () => {
+test("a PostgreSQL Date option expiration propagates into an order intent", async () => {
   const exploration = paperExplorationThresholds({
     ALPACA_ENV: "paper",
     TRADING_MODE: "paper",
@@ -159,6 +159,7 @@ test("a newly qualifying paper option candidate propagates into a PostgreSQL ord
             rows: [{
               ...candidate,
               ...observedOptionContract,
+              contract_expiration_date: new Date("2026-08-21T00:00:00.000Z"),
               candidate_id: "candidate-new-threshold-option",
               asset_class: "option",
               option_symbol: "SPY260821C00560000",

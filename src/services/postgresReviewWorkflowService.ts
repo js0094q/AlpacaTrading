@@ -114,6 +114,10 @@ const positiveOrInfinity = (value: unknown) => {
   const parsed = finite(value);
   return parsed !== null && parsed >= 0 ? parsed : Number.POSITIVE_INFINITY;
 };
+const isoDateOnly = (value: Date | string | null | undefined) =>
+  value instanceof Date && Number.isFinite(value.getTime())
+    ? value.toISOString().slice(0, 10)
+    : String(value ?? "").slice(0, 10);
 const jsonRecord = (value: unknown): Record<string, unknown> => {
   if (value && typeof value === "object" && !Array.isArray(value)) {
     return value as Record<string, unknown>;
@@ -262,7 +266,7 @@ const assertObservedOptionContract = (row: ReviewSourceRow) => {
     .toUpperCase();
   const parsed = parseOptionSymbol(optionSymbol);
   const observedAt = Date.parse(String(row.contract_observed_at ?? ""));
-  const expirationDate = String(row.contract_expiration_date ?? "").slice(0, 10);
+  const expirationDate = isoDateOnly(row.contract_expiration_date);
   const contractType = String(row.contract_type ?? "").trim().toLowerCase();
   if (
     !parsed.ok ||
@@ -1300,7 +1304,7 @@ export const runPostgresReviewWorkflow = async (input: {
     const strategyClassification: StrategyClassification = option
       ? classifyOptionStrategy(
           {
-            expirationDate: String(row.contract_expiration_date).slice(0, 10),
+            expirationDate: isoDateOnly(row.contract_expiration_date),
             optionType: String(row.contract_type) as "call" | "put"
           },
           now.toISOString().slice(0, 10)

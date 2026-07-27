@@ -467,7 +467,7 @@ const structuredReasonCode = (output) => {
   return matches.at(-1)?.[1] ?? null;
 };
 
-const latestStructuredOutput = (output) => {
+const latestStructuredOutput = (output, accept = () => true) => {
   let latest = null;
   let cursor = 0;
   while (cursor < output.length) {
@@ -508,7 +508,7 @@ const latestStructuredOutput = (output) => {
     try {
       const value = JSON.parse(output.slice(start, end + 1));
       if (value && typeof value === "object" && !Array.isArray(value)) {
-        latest = value;
+        if (accept(value)) latest = value;
         cursor = end + 1;
         continue;
       }
@@ -521,7 +521,10 @@ const latestStructuredOutput = (output) => {
 };
 
 const recoveryEnvelope = (output) => {
-  const envelope = latestStructuredOutput(output);
+  const envelope = latestStructuredOutput(
+    output,
+    (value) => Object.prototype.hasOwnProperty.call(value, "recovery")
+  );
   if (
     !envelope ||
     !["completed", "no_op"].includes(envelope.status) ||

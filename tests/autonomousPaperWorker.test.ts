@@ -850,6 +850,33 @@ test("empty terminal recovery is a successful no-action outcome", () => {
   );
 });
 
+test("empty terminal recovery remains no-action before trailing scheduler telemetry", () => {
+  const { result, states } = runWorker({
+    successOutputs: {
+      "system:recover": [
+        JSON.stringify({ event: "postgres_scheduler_lease_acquired" }),
+        JSON.stringify({
+          status: "completed",
+          recovery: emptyRecoveryCounters
+        }, null, 2),
+        JSON.stringify({
+          event: "postgres_scheduler_lease_released",
+          releaseReason: "completed"
+        })
+      ].join("\n")
+    }
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const recovery = states.find(
+    (state) =>
+      state.eventType === "workstream_completed" &&
+      state.payload.workstream === "system:recover"
+  );
+  assert.equal(recovery?.payload.classification, "no_action");
+  assert.equal(recovery?.payload.reasonCode, "NO_RECOVERABLE_POSTGRES_STATE");
+  assert.equal(states.some((state) => state.eventType === "cycle_completed"), true);
+});
+
 test("malformed empty recovery envelopes fail closed instead of becoming no-action", () => {
   const malformed = [
     {
