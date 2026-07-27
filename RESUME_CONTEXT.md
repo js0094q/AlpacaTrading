@@ -1,5 +1,13 @@
 # Resume Context: Alpaca Trading Research Infra
 
+## Shared stock-snapshot readiness stabilization (2026-07-27)
+
+- `POSTGRES_STOCK_SNAPSHOT_STALE` remains a failed PostgreSQL research run and
+  stale SIP evidence is never persisted or used as current decision evidence.
+- The autonomous worker records that bounded market-data readiness condition as
+  `WORKSTREAM_DEFERRED` and continues the lifecycle instead of exiting into a
+  systemd restart loop. Other PostgreSQL failures remain fatal.
+
 ## Autonomous 30-minute evidence and position lifecycle (2026-07-24)
 
 - The applicable autonomous SIP/OPRA evidence window is exactly 1,800 seconds

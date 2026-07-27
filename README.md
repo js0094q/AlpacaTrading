@@ -17,9 +17,11 @@ through `src/postgresOnlyCli.ts`; its 20 dependency-ordered workstreams and life
 events have no production import path to SQLite. Historical timers remain
 disabled so that systemd has one scheduler authority.
 
-The worker records closed-session missing-current-option evidence and market
-session ineligibility as deferred workstream outcomes, then continues its cycle.
-Those outcomes do not relax market-data freshness or paper-execution gates.
+The worker records stale SIP stock-snapshot readiness, closed-session
+missing-current-option evidence, and market session ineligibility as deferred
+workstream outcomes, then continues its cycle. The failed research run remains
+durable, and those outcomes do not relax market-data freshness or
+paper-execution gates.
 Repeated entry-review workstreams skip a candidate and account-snapshot identity
 that already has a persisted entry review, preserving the database client-order
 uniqueness contract across continuously refreshed market evidence.
