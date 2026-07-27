@@ -899,6 +899,10 @@ test("terminal reconciliation preserves monotonic order timestamps when the brok
     terminalPersistence ?? "",
     /updated_at = GREATEST\(\s*orders\.updated_at,\s*orders\.created_at,\s*EXCLUDED\.updated_at\s*\)/
   );
+  assert.match(
+    terminalPersistence ?? "",
+    /last_broker_update_at = GREATEST\(\s*orders\.last_broker_update_at,\s*EXCLUDED\.last_broker_update_at\s*\)/
+  );
 });
 
 test("pre-lifecycle terminal replay releases an unrepresented committed reservation without changing allocation", async () => {
@@ -992,6 +996,197 @@ test("pre-lifecycle terminal replay releases an unrepresented committed reservat
   assert.match(settlement ?? "", /current_order_intent\.created_at < lifecycle_cutover\.applied_at/);
   assert.match(settlement ?? "", /allocation\.reserved_amount = 0/);
   assert.match(settlement ?? "", /settlement_kind = 'legacy_unrepresented'/);
+});
+
+test("overlapping terminal settlement verifies an all-zero stale snapshot in a new fenced statement", async () => {
+  const statements: string[] = [];
+  const result = await reconcilePostgresPaperOrders({
+    query: {
+      query: async (sql: string) => {
+        statements.push(sql);
+        if (sql.includes("FROM order_intents intent")) {
+          return {
+            rows: [{
+              order_intent_id: "intent-concurrent-terminal",
+              account_id: "account-1",
+              client_order_id: "client-concurrent-terminal",
+              broker_order_id: "broker-concurrent-terminal",
+              reservation_id: "reservation-concurrent-terminal",
+              strategy_key: "baseline",
+              review_type: "entry",
+              symbol: "AAPL",
+              asset_class: "equity",
+              side: "buy",
+              order_type: "market",
+              time_in_force: "day",
+              quantity: "1",
+              notional: null,
+              limit_price: null,
+              intent_status: "reconciled",
+              lifecycle_state: "filled",
+              prior_filled_quantity: "1"
+            }],
+            rowCount: 1
+          };
+        }
+        if (sql.includes("stored_order_count")) {
+          return {
+            rows: [{
+              stored_order_count: "1",
+              event_count: "0",
+              updated_intent_count: "1",
+              lifecycle_transition_count: "0"
+            }],
+            rowCount: 1
+          };
+        }
+        if (sql.includes("released_reservation_count")) {
+          return {
+            rows: [{
+              released_reservation_count: "0",
+              adjusted_allocation_count: "0",
+              terminal_transition_count: "0",
+              existing_terminal_transition_count: "0",
+              legacy_settlement_count: "0"
+            }],
+            rowCount: 1
+          };
+        }
+        if (sql.includes("concurrent_replay_count")) {
+          return {
+            rows: [{ concurrent_replay_count: "1" }],
+            rowCount: 1
+          };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    syncBrokerState: false,
+    now: new Date("2026-07-24T22:00:00.000Z"),
+    getOrderByClientOrderId: async () => ({
+      status: 200,
+      data: {
+        id: "broker-concurrent-terminal",
+        client_order_id: "client-concurrent-terminal",
+        symbol: "AAPL",
+        asset_class: "us_equity",
+        side: "buy",
+        type: "market",
+        time_in_force: "day",
+        status: "filled",
+        qty: "1",
+        filled_qty: "1",
+        filled_avg_price: "200",
+        submitted_at: "2026-07-17T17:41:53.778Z",
+        filled_at: "2026-07-17T17:41:53.784Z",
+        updated_at: "2026-07-17T17:41:53.785Z"
+      }
+    }) as never
+  });
+
+  assert.equal(result.filled, 1);
+  assert.equal(result.errors.length, 0);
+  const replayVerification = statements.find((sql) =>
+    sql.includes("concurrent_replay_count")
+  );
+  assert.match(replayVerification ?? "", /reservation\.status = 'released'/);
+  assert.match(replayVerification ?? "", /reservation\.release_reason = \$4/);
+  assert.match(replayVerification ?? "", /transition\.terminal_state = \$3/);
+  assert.match(replayVerification ?? "", /transition\.release_reason = \$4/);
+  assert.match(replayVerification ?? "", /scheduler_leases/);
+});
+
+test("all-zero terminal settlement still fails closed when no exact concurrent replay exists", async () => {
+  const result = await reconcilePostgresPaperOrders({
+    query: {
+      query: async (sql: string) => {
+        if (sql.includes("FROM order_intents intent")) {
+          return {
+            rows: [{
+              order_intent_id: "intent-zero-terminal",
+              account_id: "account-1",
+              client_order_id: "client-zero-terminal",
+              broker_order_id: "broker-zero-terminal",
+              reservation_id: "reservation-zero-terminal",
+              strategy_key: "baseline",
+              review_type: "entry",
+              symbol: "AAPL",
+              asset_class: "equity",
+              side: "buy",
+              order_type: "market",
+              time_in_force: "day",
+              quantity: "1",
+              notional: null,
+              limit_price: null,
+              intent_status: "reconciled",
+              lifecycle_state: "filled",
+              prior_filled_quantity: "1"
+            }],
+            rowCount: 1
+          };
+        }
+        if (sql.includes("stored_order_count")) {
+          return {
+            rows: [{
+              stored_order_count: "1",
+              event_count: "0",
+              updated_intent_count: "1",
+              lifecycle_transition_count: "0"
+            }],
+            rowCount: 1
+          };
+        }
+        if (sql.includes("released_reservation_count")) {
+          return {
+            rows: [{
+              released_reservation_count: "0",
+              adjusted_allocation_count: "0",
+              terminal_transition_count: "0",
+              existing_terminal_transition_count: "0",
+              legacy_settlement_count: "0"
+            }],
+            rowCount: 1
+          };
+        }
+        if (sql.includes("concurrent_replay_count")) {
+          return {
+            rows: [{ concurrent_replay_count: "0" }],
+            rowCount: 1
+          };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    syncBrokerState: false,
+    now: new Date("2026-07-24T22:00:00.000Z"),
+    getOrderByClientOrderId: async () => ({
+      status: 200,
+      data: {
+        id: "broker-zero-terminal",
+        client_order_id: "client-zero-terminal",
+        symbol: "AAPL",
+        asset_class: "us_equity",
+        side: "buy",
+        type: "market",
+        time_in_force: "day",
+        status: "filled",
+        qty: "1",
+        filled_qty: "1",
+        filled_avg_price: "200",
+        submitted_at: "2026-07-17T17:41:53.778Z",
+        filled_at: "2026-07-17T17:41:53.784Z",
+        updated_at: "2026-07-17T17:41:53.785Z"
+      }
+    }) as never
+  });
+
+  assert.equal(result.filled, 0);
+  assert.deepEqual(result.errors, [{
+    orderIntentId: "intent-zero-terminal",
+    code: "POSTGRES_RECONCILIATION_RESERVATION_RELEASE_FAILED"
+  }]);
 });
 
 test("restart can reselect a reconciled intent whose terminal reservation settlement is pending", async () => {

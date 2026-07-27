@@ -955,7 +955,10 @@ export const reconcilePostgresPaperOrders = async (input: {
                filled_quantity = EXCLUDED.filled_quantity,
                filled_average_price = EXCLUDED.filled_average_price,
                broker_request_id = EXCLUDED.broker_request_id,
-               last_broker_update_at = EXCLUDED.last_broker_update_at,
+               last_broker_update_at = GREATEST(
+                 orders.last_broker_update_at,
+                 EXCLUDED.last_broker_update_at
+               ),
                raw_status = EXCLUDED.raw_status,
                version = orders.version + 1,
                updated_at = GREATEST(
@@ -1170,7 +1173,10 @@ export const reconcilePostgresPaperOrders = async (input: {
                filled_quantity = EXCLUDED.filled_quantity,
                filled_average_price = EXCLUDED.filled_average_price,
                broker_request_id = EXCLUDED.broker_request_id,
-               last_broker_update_at = EXCLUDED.last_broker_update_at,
+               last_broker_update_at = GREATEST(
+                 orders.last_broker_update_at,
+                 EXCLUDED.last_broker_update_at
+               ),
                raw_status = EXCLUDED.raw_status,
                version = orders.version + 1,
                updated_at = GREATEST(
@@ -1469,10 +1475,43 @@ export const reconcilePostgresPaperOrders = async (input: {
           terminalTransitionCount === 0 &&
           existingTerminalTransitionCount === 1 &&
           legacySettlementCount === 0;
+        const allZeroSettlement =
+          releasedCount === 0 &&
+          adjustedCount === 0 &&
+          terminalTransitionCount === 0 &&
+          existingTerminalTransitionCount === 0 &&
+          legacySettlementCount === 0;
+        let concurrentReplayedSettlement = false;
+        if (allZeroSettlement) {
+          const concurrentReplay = await input.query.query(
+            `SELECT COUNT(*)::text AS concurrent_replay_count
+             FROM buying_power_reservations reservation
+             JOIN reservation_terminal_transitions transition
+               ON transition.reservation_id = reservation.id
+             WHERE reservation.id = $1
+               AND transition.order_intent_id = $2
+               AND transition.terminal_state = $3
+               AND transition.release_reason = $4
+               AND reservation.status = 'released'
+               AND reservation.release_reason = $4
+               AND reservation.released_at IS NOT NULL
+               AND ${fenceSql(5)}`,
+            [
+              target.reservation_id,
+              target.order_intent_id,
+              reservationTerminalState,
+              reservationReleaseReason,
+              ...fenceValues(input.fence)
+            ]
+          );
+          concurrentReplayedSettlement =
+            Number(concurrentReplay.rows[0]?.concurrent_replay_count ?? 0) === 1;
+        }
         if (
           !freshSettlement &&
           !legacySettlement &&
-          !replayedSettlement
+          !replayedSettlement &&
+          !concurrentReplayedSettlement
         ) {
           throw new Error("POSTGRES_RECONCILIATION_RESERVATION_RELEASE_FAILED");
         }
