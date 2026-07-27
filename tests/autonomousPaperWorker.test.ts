@@ -568,6 +568,41 @@ test("the worker preserves canonical success results from research output", () =
   assert.deepEqual(completion?.payload.workstreamResults, workstreamResults);
 });
 
+test("the worker preserves canonical results from a large research envelope", () => {
+  const workstreamResults = [
+    {
+      cycle_id: "research-cycle-large",
+      lane: "equity",
+      started_at: "2026-07-27T12:00:00.000Z",
+      completed_at: "2026-07-27T12:00:01.000Z",
+      outcome: "success",
+      proposals: [{ id: "equity-proposal", detail: "x".repeat(40 * 1024) }],
+      evidence_references: ["candidate:equity"],
+      reason_codes: ["RANKED_SELECTED"],
+      diagnostic_summary: "Lane produced one proposal."
+    }
+  ];
+  const researchOutput = JSON.stringify({
+    status: "completed",
+    workstreamResults
+  });
+  assert.ok(Buffer.byteLength(researchOutput) > 32 * 1024);
+
+  const { result, states } = runWorker({
+    successOutputs: {
+      "research:daily": researchOutput
+    }
+  });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const completion = states.find(
+    (state) =>
+      state.eventType === "workstream_completed" &&
+      state.payload.workstream === "research:daily"
+  );
+  assert.deepEqual(completion?.payload.workstreamResults, workstreamResults);
+});
+
 test("a 0DTE lane failure is isolated while other broker mutation failures remain fatal", () => {
   const brokerMutations = [
     "paper:execute:reviewed",

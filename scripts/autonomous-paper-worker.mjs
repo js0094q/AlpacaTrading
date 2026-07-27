@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-const MAX_CAPTURE_BYTES = 32 * 1024;
+const MAX_CAPTURE_BYTES = 256 * 1024;
 const DEFAULT_CYCLE_DELAY_MS = 30_000;
 const DEFAULT_WORKSTREAM_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_WORKSTREAM_TIMEOUT_MS = 6 * 60 * 60 * 1000;
