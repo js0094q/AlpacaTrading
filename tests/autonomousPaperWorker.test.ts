@@ -536,7 +536,39 @@ test("the 20 public workstreams enforce lifecycle phase order and publish dashbo
   assert.equal(dashboardRefresh?.payload.dashboardProjectionAuthority, "postgres");
 });
 
-test("every failing broker mutation reconciles before the cycle fails or considers later mutations", () => {
+test("the worker preserves canonical success results from research output", () => {
+  const workstreamResults = [
+    {
+      cycle_id: "research-cycle",
+      lane: "equity",
+      started_at: "2026-07-27T12:00:00.000Z",
+      completed_at: "2026-07-27T12:00:01.000Z",
+      outcome: "success",
+      proposals: [{ id: "equity-proposal" }],
+      evidence_references: ["candidate:equity"],
+      reason_codes: ["RANKED_SELECTED"],
+      diagnostic_summary: "Lane produced one proposal."
+    }
+  ];
+  const { result, states } = runWorker({
+    successOutputs: {
+      "research:daily": JSON.stringify({
+        status: "completed",
+        workstreamResults
+      })
+    }
+  });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const completion = states.find(
+    (state) =>
+      state.eventType === "workstream_completed" &&
+      state.payload.workstream === "research:daily"
+  );
+  assert.deepEqual(completion?.payload.workstreamResults, workstreamResults);
+});
+
+test("a 0DTE lane failure is isolated while other broker mutation failures remain fatal", () => {
   const brokerMutations = [
     "paper:execute:reviewed",
     "zero-dte:engine",
@@ -553,11 +585,6 @@ test("every failing broker mutation reconciles before the cycle fails or conside
         code: "BROKER_SUBMISSION_AMBIGUOUS"
       })
     });
-    assert.notEqual(
-      result.status,
-      0,
-      `${mutation}: ${result.stderr || result.stdout}`
-    );
     const invoked = calls
       .filter((call) => call.command !== "worker:state")
       .map((call) => call.command);
@@ -567,6 +594,35 @@ test("every failing broker mutation reconciles before the cycle fails or conside
       invoked[mutationIndex + 1],
       "zero-dte:reconcile",
       mutation
+    );
+    if (mutation === "zero-dte:engine") {
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      assert.equal(invoked.at(-1), "system:recover");
+      const completion = states.find(
+        (state) =>
+          state.eventType === "workstream_completed" &&
+          state.payload.workstream === mutation
+      );
+      const [laneResult] = completion?.payload.workstreamResults as Array<{
+        cycle_id: string;
+        lane: string;
+        outcome: string;
+        reason_codes: string[];
+        diagnostic_summary: string;
+      }>;
+      assert.equal(completion?.payload.classification, "lane_error");
+      assert.equal(laneResult?.cycle_id, completion?.cycleId);
+      assert.equal(laneResult?.lane, "options_0dte");
+      assert.equal(laneResult?.outcome, "error");
+      assert.deepEqual(laneResult?.reason_codes, ["BROKER_SUBMISSION_AMBIGUOUS"]);
+      assert.ok(laneResult.diagnostic_summary.length <= 240);
+      assert.equal(states.at(-2)?.eventType, "cycle_completed");
+      continue;
+    }
+    assert.notEqual(
+      result.status,
+      0,
+      `${mutation}: ${result.stderr || result.stdout}`
     );
     for (const laterMutation of brokerMutations.slice(mutationPosition + 1)) {
       assert.equal(invoked.includes(laterMutation), false, laterMutation);

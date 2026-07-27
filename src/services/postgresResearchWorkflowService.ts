@@ -16,6 +16,7 @@ import {
   paperExplorationThresholds,
   type PaperExplorationThresholds
 } from "./paperExplorationConfig.js";
+import { executeWorkstreamLanes } from "./canonicalWorkstreamResult.js";
 import { buildPostgresFeaturesAndTargets } from "./postgresFeatureTargetService.js";
 import { refreshPostgresMarketData } from "./postgresMarketDataService.js";
 
@@ -538,6 +539,7 @@ const persistCandidates = async (input: {
   query: PostgresResearchQuery;
   fence: SchedulerFence;
   researchRunId: string;
+  cycleId: string;
   targets: FeatureTargetResult["targets"];
   maxCandidates: number;
   now: Date;
@@ -585,8 +587,9 @@ const persistCandidates = async (input: {
   const selectedKeys = new Set(
     eligible.slice(0, input.maxCandidates).map((row) => row.target.sourceFingerprint)
   );
-  const decisions = evaluated.map((row) => ({
+  const decisions = evaluated.map((row, index) => ({
     ...row,
+    rank: index + 1,
     selected: selectedKeys.has(row.target.sourceFingerprint),
     reasons: row.reasons.length > 0
       ? row.reasons
@@ -598,81 +601,112 @@ const persistCandidates = async (input: {
   const learningModelCapability = selectedCount > 0
     ? await resolvePostgresLearningModelCapability(input.query, input.now.toISOString())
     : null;
-  for (let index = 0; index < decisions.length; index += 1) {
-    const {
-      target,
-      option,
-      optionSymbol,
-      optionDte,
-      leapsPolicy,
-      strategyFamily,
-      score,
-      candidateScore,
-      selected,
-      reasons
-    } = decisions[index]!;
-    const id = `candidate_${canonicalJsonHash({ run: input.researchRunId, source: target.sourceFingerprint })}`;
-    const signalInputs = {
-      targetSourceFingerprint: target.sourceFingerprint,
-      marketEvidenceTimestamp: target.asOf,
-      entryReference: target.entryReference,
-      stopLoss: target.stopLoss,
-      takeProfit: target.takeProfit,
-      marketDecisionInputs: {
-        ...(target.optionsStrategy?.decisionInputs as Record<string, unknown> | undefined),
-        option: option?.decisionInputs ?? null
-      },
-      strategyClassification: {
-        family: strategyFamily,
-        daysToExpiration: optionDte,
-        leapsMinDte: leapsPolicy.minDte,
-        leapsMaxDte: leapsPolicy.maxDte
-      },
-      candidateScore,
-      decisionGates: {
-        profile: paperExplorationProfile(input.explorationThresholds),
-        outcome: selected ? "passed" : "failed",
-        reasons
-      },
-      learningAdjustmentStatus: "not_applicable_no_postgres_learning_model",
-      learningModelCapability
+  const persistDecisionRows = async (rows: typeof decisions) => {
+    for (const row of rows) {
+      const {
+        target, option, optionSymbol, optionDte, leapsPolicy, strategyFamily,
+        score, candidateScore, rank, selected, reasons
+      } = row;
+      const id = `candidate_${canonicalJsonHash({ run: input.researchRunId, source: target.sourceFingerprint })}`;
+      const signalInputs = {
+        targetSourceFingerprint: target.sourceFingerprint,
+        marketEvidenceTimestamp: target.asOf,
+        entryReference: target.entryReference,
+        stopLoss: target.stopLoss,
+        takeProfit: target.takeProfit,
+        marketDecisionInputs: {
+          ...(target.optionsStrategy?.decisionInputs as Record<string, unknown> | undefined),
+          option: option?.decisionInputs ?? null
+        },
+        strategyClassification: {
+          family: strategyFamily,
+          daysToExpiration: optionDte,
+          leapsMinDte: leapsPolicy.minDte,
+          leapsMaxDte: leapsPolicy.maxDte
+        },
+        candidateScore,
+        decisionGates: {
+          profile: paperExplorationProfile(input.explorationThresholds),
+          outcome: selected ? "passed" : "failed",
+          reasons
+        },
+        learningAdjustmentStatus: "not_applicable_no_postgres_learning_model",
+        learningModelCapability
+      };
+      const result = await input.query.query(
+        `INSERT INTO candidates(
+           id, decision_id, research_run_id, candidate_key, symbol, underlying_symbol,
+           option_symbol, asset_class, as_of, rank, direction, horizon,
+           risk_profile, preferred_expression, strategy_family, score, confidence,
+           expected_return, estimated_max_loss, estimated_max_profit,
+           option_liquidity_score, volatility_score, strike, decision,
+           lifecycle_status, decision_reason, rationale, signal_inputs,
+           data_quality_status, created_at, updated_at
+         ) SELECT $1, $1, $2, $1, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                  $13, $14, $15, $16, $17, $18, $19, $20, $21,
+                  $22, $23, $24, $25::jsonb,
+                  $26::jsonb, 'CURRENT_POSTGRES_MARKET_EVIDENCE', $27, $27
+           WHERE ${fenceSql(28)}
+         ON CONFLICT (id) DO NOTHING`,
+        [
+          id, input.researchRunId, target.symbol, optionSymbol ? target.symbol : null,
+          optionSymbol, optionSymbol ? "option" : "equity", target.asOf, rank,
+          target.direction, target.horizon, target.riskProfile,
+          target.preferredExpression, strategyFamily, score, target.confidence, target.expectedReturn,
+          target.stopLoss === null ? null : Math.abs(target.entryReference - target.stopLoss),
+          target.takeProfit === null ? null : Math.abs(target.takeProfit - target.entryReference),
+          Number(option?.liquidityScore ?? 0), target.volatilityAdjustedScore,
+          typeof option?.strike === "number" ? option.strike : null,
+          selected ? "selected" : "rejected",
+          selected ? "selected" : "rejected",
+          reasons[0],
+          JSON.stringify(target.rationale), JSON.stringify(signalInputs),
+          input.now.toISOString(), ...fenceValues(input.fence)
+        ]
+      );
+      if (result.rowCount !== 1 && result.rowCount !== 0) {
+        throw new Error("POSTGRES_CANDIDATE_PERSISTENCE_FAILED");
+      }
+    }
+    const selected = rows.filter((row) => row.selected);
+    return {
+      proposals: selected.map((row) => row.target),
+      evidence_references: [
+        `research_run:${input.researchRunId}`,
+        ...selected.map((row) => `target:${row.target.sourceFingerprint}`)
+      ],
+      confidence: selected.length
+        ? Math.max(...selected.map((row) => row.target.confidence))
+        : undefined,
+      reason_codes: selected.length
+        ? ["RANKED_SELECTED"]
+        : ["NO_ELIGIBLE_POSTGRES_CANDIDATES"]
     };
-    const result = await input.query.query(
-      `INSERT INTO candidates(
-         id, decision_id, research_run_id, candidate_key, symbol, underlying_symbol,
-         option_symbol, asset_class, as_of, rank, direction, horizon,
-         risk_profile, preferred_expression, strategy_family, score, confidence,
-         expected_return, estimated_max_loss, estimated_max_profit,
-         option_liquidity_score, volatility_score, strike, decision,
-         lifecycle_status, decision_reason, rationale, signal_inputs,
-         data_quality_status, created_at, updated_at
-       ) SELECT $1, $1, $2, $1, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                $13, $14, $15, $16, $17, $18, $19, $20, $21,
-                $22, $23, $24, $25::jsonb,
-                $26::jsonb, 'CURRENT_POSTGRES_MARKET_EVIDENCE', $27, $27
-         WHERE ${fenceSql(28)}
-       ON CONFLICT (id) DO NOTHING`,
-      [
-        id, input.researchRunId, target.symbol, optionSymbol ? target.symbol : null,
-        optionSymbol, optionSymbol ? "option" : "equity", target.asOf, index + 1,
-        target.direction, target.horizon, target.riskProfile,
-        target.preferredExpression, strategyFamily, score, target.confidence, target.expectedReturn,
-        target.stopLoss === null ? null : Math.abs(target.entryReference - target.stopLoss),
-        target.takeProfit === null ? null : Math.abs(target.takeProfit - target.entryReference),
-        Number(option?.liquidityScore ?? 0), target.volatilityAdjustedScore,
-        typeof option?.strike === "number" ? option.strike : null,
-        selected ? "selected" : "rejected",
-        selected ? "selected" : "rejected",
-        reasons[0],
-        JSON.stringify(target.rationale), JSON.stringify(signalInputs),
-        input.now.toISOString(), ...fenceValues(input.fence)
-      ]
-    );
-    if (result.rowCount !== 1 && result.rowCount !== 0) throw new Error("POSTGRES_CANDIDATE_PERSISTENCE_FAILED");
-  }
+  };
+  const laneFamilies = [
+    ["equity", "equity"],
+    ["options_0dte", "zero_dte_spy"],
+    ["options_leaps", "leaps"]
+  ] as const;
+  const workstreamResults = await executeWorkstreamLanes({
+    cycleId: input.cycleId,
+    lanes: laneFamilies.map(([lane, family]) => ({
+      lane,
+      execute: () => persistDecisionRows(
+        decisions.filter((row) => row.strategyFamily === family)
+      )
+    }))
+  });
+  const standardOptionResult = await persistDecisionRows(
+    decisions.filter((row) => row.strategyFamily === "standard_option")
+  );
   return {
-    selected: selectedCount,
-    rejected: decisions.length - selectedCount
+    selected: workstreamResults.reduce(
+      (count, result) => count + result.proposals.length,
+      standardOptionResult.proposals.length
+    ),
+    rejected: decisions.length - selectedCount,
+    workstreamResults
   };
 };
 
@@ -682,6 +716,7 @@ export const runPostgresResearchWorkflow = async (input: {
   riskProfile: RiskProfile;
   optionsEnabled: boolean;
   maxCandidates: number;
+  cycleId?: string;
   now?: Date;
   signal?: AbortSignal;
   dependencies?: Partial<ResearchDependencies>;
@@ -776,6 +811,7 @@ export const runPostgresResearchWorkflow = async (input: {
     });
     const candidateDecisions = await persistCandidates({
       query: input.query, fence: input.fence, researchRunId: runId,
+      cycleId: input.cycleId ?? process.env.AUTONOMOUS_CYCLE_ID?.trim() ?? runId,
       targets: generated.targets, maxCandidates: input.maxCandidates, now,
       explorationThresholds: {
         ...explorationThresholds,
@@ -792,7 +828,11 @@ export const runPostgresResearchWorkflow = async (input: {
         JSON.stringify({
           ...market.summary,
           evidenceStored,
-          candidateDecisionCounts: candidateDecisions,
+          candidateDecisionCounts: {
+            selected: candidateDecisions.selected,
+            rejected: candidateDecisions.rejected
+          },
+          workstreamResults: candidateDecisions.workstreamResults,
           explorationProfile
         }), nowIso,
         ...fenceValues(input.fence)]
@@ -805,6 +845,7 @@ export const runPostgresResearchWorkflow = async (input: {
       targetsGenerated: generated.targets.length,
       candidatesSelected: candidateDecisions.selected,
       candidatesRejected: candidateDecisions.rejected,
+      workstreamResults: candidateDecisions.workstreamResults,
       evidenceStored,
       market: market.summary
     };

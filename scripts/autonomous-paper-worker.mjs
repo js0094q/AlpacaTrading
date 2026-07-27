@@ -631,6 +631,21 @@ const classify = ({ exitCode, output, spawnError, timedOut }, script) => {
 const workstreamResultIsFatal = (result) =>
   Boolean(result.code) && !NON_FATAL_WORKSTREAM_CODES.has(result.code);
 
+const canonicalResultsFromOutput = (output) => {
+  const envelope = latestStructuredOutput(
+    output,
+    (value) => Array.isArray(value.workstreamResults)
+  );
+  if (!envelope) return [];
+  return envelope.workstreamResults.filter(
+    (result) =>
+      result &&
+      typeof result === "object" &&
+      ["equity", "options_0dte", "options_leaps"].includes(result.lane) &&
+      ["success", "no_action", "error"].includes(result.outcome)
+  );
+};
+
 const reconciliationResolved = (result) =>
   ["success", "no_action"].includes(result.classification);
 
@@ -643,6 +658,7 @@ const runWorkstream = async (
   position,
   resumedCycleId
 ) => {
+  const startedAt = new Date().toISOString();
   const raw = await runNpmCommand(script, args, timeoutMs, "workstream", {
     AUTONOMOUS_CYCLE_ID: cycleId,
     ...(resumedCycleId ? { AUTONOMOUS_RESUME_CYCLE_ID: resumedCycleId } : {}),
@@ -653,11 +669,36 @@ const runWorkstream = async (
     position,
     workstream: script
   });
-  const result = classify(raw, script);
+  let result = classify(raw, script);
+  let workstreamResults = canonicalResultsFromOutput(raw.output);
+  if (script === "zero-dte:engine" && workstreamResultIsFatal(result)) {
+    const reasonCode =
+      structuredReasonCode(raw.output) ??
+      result.reasonCode ??
+      result.code ??
+      "LANE_EXECUTION_ERROR";
+    workstreamResults = [{
+      cycle_id: cycleId,
+      lane: "options_0dte",
+      started_at: startedAt,
+      completed_at: new Date().toISOString(),
+      outcome: "error",
+      proposals: [],
+      evidence_references: ["workstream:zero-dte:engine"],
+      reason_codes: [reasonCode],
+      diagnostic_summary: reasonCode.slice(0, 240)
+    }];
+    result = {
+      classification: "lane_error",
+      code: null,
+      reasonCode
+    };
+  }
   return {
     ...result,
     exitCode: raw.exitCode,
-    durationMs: raw.durationMs
+    durationMs: raw.durationMs,
+    ...(workstreamResults.length ? { workstreamResults } : {})
   };
 };
 
