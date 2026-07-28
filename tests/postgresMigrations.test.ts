@@ -100,10 +100,10 @@ test("discovers ordered, checksummed PostgreSQL migrations", async () => {
   }
 });
 
-test("repository includes the autonomous trade lifecycle migration", async () => {
+test("repository includes the public equity research signals migration", async () => {
   const migrations = await listPostgresMigrations(join(process.cwd(), "src/lib/database/migrations"));
-  assert.equal(migrations.at(-1)?.version, 6);
-  assert.equal(migrations.at(-1)?.name, "autonomous_trade_lifecycle");
+  assert.equal(migrations.at(-1)?.version, 7);
+  assert.equal(migrations.at(-1)?.name, "public_equity_research_signals");
 });
 
 test("applies a migration exactly once and reports the second run as idempotent", async () => {

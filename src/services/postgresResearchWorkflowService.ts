@@ -10,6 +10,7 @@ import {
 import type { SchedulerFence } from "../repositories/contracts/common.js";
 import { PostgresMarketDataRepository } from "../repositories/postgres/postgresMarketDataRepository.js";
 import type { FencedPostgresRepositoryContext } from "../repositories/postgres/postgresRepositorySupport.js";
+import { loadResearchSignalsForSymbols } from "../repositories/postgres/postgresResearchSignalRepository.js";
 import type { RiskProfile } from "../types.js";
 import {
   paperExplorationProfile,
@@ -23,6 +24,14 @@ import {
 import { runInvestmentOrchestrator } from "./investmentOrchestratorService.js";
 import { buildPostgresFeaturesAndTargets } from "./postgresFeatureTargetService.js";
 import { refreshPostgresMarketData } from "./postgresMarketDataService.js";
+import {
+  buildLaneResearchInfluence,
+  researchSignalConfiguration,
+  type LaneResearchInfluence,
+  type NormalizedResearchSignal,
+  type ResearchDecisionLane,
+  type ResearchSignalConfiguration
+} from "./researchSignalAdapterService.js";
 
 export type PostgresResearchQuery = {
   telemetryEnabled?: boolean;
@@ -46,6 +55,7 @@ type ResearchDependencies = {
   symbols: readonly string[];
   refreshMarketData: typeof refreshPostgresMarketData;
   buildFeaturesAndTargets: typeof buildPostgresFeaturesAndTargets;
+  loadResearchSignals: typeof loadResearchSignalsForSymbols;
   dataHub: Pick<typeof alpacaDataHub, "hydrateCycle">;
 };
 
@@ -53,6 +63,7 @@ const dependencies: ResearchDependencies = {
   symbols: seedUniverse,
   refreshMarketData: refreshPostgresMarketData,
   buildFeaturesAndTargets: buildPostgresFeaturesAndTargets,
+  loadResearchSignals: loadResearchSignalsForSymbols,
   dataHub: alpacaDataHub
 };
 const INVESTMENT_LANE_FAMILIES = [
@@ -109,6 +120,28 @@ const optionDecisionInputsForFamily = (
       : null;
   return profile ? { ...option, evidenceProfile: profile } : option;
 };
+
+const researchLaneForStrategyFamily = (
+  family: string
+): ResearchDecisionLane | null =>
+  family === "equity"
+    ? "equity"
+    : family === "zero_dte_spy"
+      ? "options_0dte"
+      : family === "leaps"
+        ? "options_leaps"
+        : null;
+
+const nonApplicableResearchInfluence = (): LaneResearchInfluence => ({
+  signalId: null,
+  provider: null,
+  asOf: null,
+  horizon: null,
+  sourceReferences: [],
+  state: "unavailable",
+  scoreAdjustment: 0,
+  reasonCodes: ["RESEARCH_NOT_APPLICABLE_STANDARD_OPTION"]
+});
 
 const zeroDteOpraBoundedResult = (
   summary: MarketResult["summary"]
@@ -620,6 +653,9 @@ const persistCandidates = async (input: {
   maxCandidates: number;
   now: Date;
   explorationThresholds: PaperExplorationThresholds;
+  researchSignals: readonly NormalizedResearchSignal[];
+  researchConfiguration: ResearchSignalConfiguration;
+  researchUnavailableReasonCode: string | null;
   marketSummary: MarketResult["summary"];
   cycleData: AlpacaDataCycle<MarketResult>;
   emitTelemetry?: (event: Record<string, unknown>) => void;
@@ -642,7 +678,6 @@ const persistCandidates = async (input: {
           )
         : null;
       const leapsPolicy = postgresLeapsPolicy();
-      const candidateScore = scoreTarget(target, input.now);
       const strategyFamily = optionSymbol
         ? target.symbol === "SPY" && expirationDate === newYorkDate(input.now)
           ? "zero_dte_spy"
@@ -652,6 +687,30 @@ const persistCandidates = async (input: {
             ? "leaps"
             : "standard_option"
         : "equity";
+      const baseCandidateScore = scoreTarget(target, input.now);
+      const researchLane = researchLaneForStrategyFamily(strategyFamily);
+      const researchInfluence = researchLane
+        ? buildLaneResearchInfluence({
+            signals: input.researchSignals.filter(
+              (signal) => signal.symbol === target.symbol
+            ),
+            lane: researchLane,
+            targetDirection: target.direction,
+            now: input.now,
+            config: input.researchConfiguration,
+            unavailableReasonCode: input.researchUnavailableReasonCode
+          })
+        : nonApplicableResearchInfluence();
+      const candidateScore = {
+        ...baseCandidateScore,
+        baseTotal: baseCandidateScore.total,
+        research: researchInfluence,
+        total: clamp(
+          baseCandidateScore.total + researchInfluence.scoreAdjustment,
+          0,
+          100
+        )
+      };
       return {
         target,
         option,
@@ -661,6 +720,7 @@ const persistCandidates = async (input: {
         strategyFamily,
         score: candidateScore.total,
         candidateScore,
+        researchInfluence,
         reasons
       };
     })
@@ -696,7 +756,7 @@ const persistCandidates = async (input: {
     for (const row of rows) {
       const {
         target, option, optionSymbol, optionDte, leapsPolicy, strategyFamily,
-        score, candidateScore, rank, selected, reasons
+        score, candidateScore, researchInfluence, rank, selected, reasons
       } = row;
       const id = `candidate_${canonicalJsonHash({ run: input.researchRunId, source: target.sourceFingerprint })}`;
       const signalInputs = {
@@ -720,6 +780,7 @@ const persistCandidates = async (input: {
           leapsMinDte: leapsPolicy.minDte,
           leapsMaxDte: leapsPolicy.maxDte
         },
+        researchEvidence: researchInfluence,
         candidateScore,
         decisionGates: {
           profile: paperExplorationProfile(input.explorationThresholds),
@@ -788,6 +849,11 @@ const persistCandidates = async (input: {
       evidence_references: [
         `research_run:${input.researchRunId}`,
         ...selected.map((row) => `target:${row.target.sourceFingerprint}`),
+        ...selected.flatMap((row) =>
+          row.researchInfluence.signalId
+            ? [`research_signal:${row.researchInfluence.signalId}`]
+            : []
+        ),
         ...quoteReferences
       ],
       confidence: selected.length
@@ -865,6 +931,7 @@ export const runPostgresResearchWorkflow = async (input: {
   const runId = `research_${randomUUID()}`;
   const cycleId = input.cycleId ?? process.env.AUTONOMOUS_CYCLE_ID?.trim() ?? runId;
   const explorationThresholds = input.explorationThresholds ?? paperExplorationThresholds();
+  const researchConfiguration = researchSignalConfiguration();
   const explorationProfile = paperExplorationProfile({
     ...explorationThresholds,
     maxCandidates: input.maxCandidates
@@ -877,6 +944,10 @@ export const runPostgresResearchWorkflow = async (input: {
     marketDataAuthority: "postgres",
     stockFeed: "sip",
     optionFeed: "opra",
+    researchAdapter: {
+      mode: "structured_json_import",
+      ...researchConfiguration
+    },
     explorationProfile
   };
   await input.query.query(
@@ -947,6 +1018,24 @@ export const runPostgresResearchWorkflow = async (input: {
       repository,
       context
     });
+    let researchSignals: readonly NormalizedResearchSignal[] = [];
+    let researchUnavailableReasonCode: string | null = null;
+    try {
+      researchSignals = await deps.loadResearchSignals({
+        query: input.query,
+        symbols: generated.targets.map(({ symbol }) => symbol)
+      });
+    } catch {
+      researchUnavailableReasonCode = "RESEARCH_LOOKUP_UNAVAILABLE";
+      input.emitTelemetry?.({
+        event: "postgres_research_signal_lookup",
+        researchRunId: runId,
+        cycleId,
+        outcome: "unavailable",
+        reasonCode: researchUnavailableReasonCode,
+        retryCount: 0
+      });
+    }
     const evidenceStored = await persistEvidence({
       query: input.query, fence: input.fence, researchRunId: runId,
       market, features: generated.features, targets: generated.targets, now: nowIso,
@@ -961,6 +1050,9 @@ export const runPostgresResearchWorkflow = async (input: {
         ...explorationThresholds,
         maxCandidates: input.maxCandidates
       },
+      researchSignals,
+      researchConfiguration,
+      researchUnavailableReasonCode,
       marketSummary: market.summary,
       cycleData: marketCycle,
       emitTelemetry: input.emitTelemetry
@@ -980,6 +1072,12 @@ export const runPostgresResearchWorkflow = async (input: {
             rejected: candidateDecisions.rejected
           },
           workstreamResults: candidateDecisions.workstreamResults,
+          researchAdapter: {
+            mode: "structured_json_import",
+            storedSignalCount: researchSignals.length,
+            lookupStatus:
+              researchUnavailableReasonCode ?? "RESEARCH_LOOKUP_COMPLETED"
+          },
           explorationProfile
         }), nowIso,
         ...fenceValues(input.fence)]
@@ -994,6 +1092,11 @@ export const runPostgresResearchWorkflow = async (input: {
       candidatesRejected: candidateDecisions.rejected,
       workstreamResults: candidateDecisions.workstreamResults,
       evidenceStored,
+      research: {
+        storedSignalCount: researchSignals.length,
+        lookupStatus:
+          researchUnavailableReasonCode ?? "RESEARCH_LOOKUP_COMPLETED"
+      },
       market: market.summary
     };
   } catch (error) {

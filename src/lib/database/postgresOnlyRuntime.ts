@@ -25,6 +25,7 @@ const SAFE_PRODUCTION_CLI_COMMANDS = new Set([
   "paper:reconcile:external-order",
   "paper:review",
   "research:daily",
+  "research:import",
   "system:recover",
   "worker:state",
   "zero-dte:engine",

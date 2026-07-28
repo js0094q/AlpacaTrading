@@ -31,7 +31,8 @@ test("research, observatory, and market-data aliases converge on stable jobs", (
   assertAliasesResolveTo(
     [
       { command: "research", action: "daily" },
-      { command: "research:daily" }
+      { command: "research:daily" },
+      { command: "research:import" }
     ],
     POSTGRES_SCHEDULER_JOBS.research
   );

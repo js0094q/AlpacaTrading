@@ -252,6 +252,7 @@ test("PostgreSQL schema contains only the validated authority migrations", async
     "003_market_data_authority.sql",
     "004_option_contract_evidence.sql",
     "005_market_data_ingestion_observability.sql",
-    "006_autonomous_trade_lifecycle.sql"
+    "006_autonomous_trade_lifecycle.sql",
+    "007_public_equity_research_signals.sql"
   ]);
 });

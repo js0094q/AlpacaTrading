@@ -1,5 +1,36 @@
 # Resume Context: Alpaca Trading Research Infra
 
+## Provider-neutral public-equity research adapter (2026-07-28)
+
+- No repository provider, installed connector, or documented consumer ChatGPT
+  interface exposed a verified machine-callable Public Equity Investing API.
+  Section 8 therefore uses a scheduler-fenced `research:import` command that
+  reads bounded structured JSON only from standard input. It adds no browser
+  automation, Markdown parser, file-path input, background service, or
+  undocumented API.
+- Schema version 1 normalizes provider/source provenance, provider signal ID,
+  symbol, distinct `as_of`/ingestion/expiry timestamps, horizon, optional
+  thesis direction/confidence, bounded thesis/catalyst/risk/invalidation/
+  valuation fields, explicit contradiction state, and a deterministic content
+  hash. Unknown optional values stay unknown; all broker execution fields are
+  rejected.
+- `research_signals` is the sole PostgreSQL research-signal authority.
+  Deterministic identity and unique constraints make exact reimport a no-op.
+  Candidate decision evidence references the stored signal identity and a
+  bounded provenance/state snapshot rather than duplicating the full payload.
+- Current equity and long-horizon LEAPS direction may adjust the existing score
+  by the conservative configured default of 3 points, still clamped to 0–100
+  and inside all current sizing/capital limits. LEAPS option-chain, quote,
+  liquidity, expiry, spread, IV, and Greek evidence remains mandatory and
+  unchanged. 0DTE can record only a current-session dated catalyst and receives
+  zero research score adjustment.
+- Expired, contradicted, missing, invalid, and lookup-unavailable research is
+  lane-scoped. Lookup failure records `RESEARCH_LOOKUP_UNAVAILABLE`, performs
+  zero retry in the cycle, and does not stop equity, LEAPS, 0DTE, other symbols,
+  recovery, or reconciliation. Research modules have no import path to Alpaca
+  mutation or the order manager; review, intent, execution, and reconciliation
+  remain the existing PostgreSQL-authoritative paper-only path.
+
 ## Verified options evidence and lane-specific inputs (2026-07-28)
 
 - Live paper/OPRA reads and the installed official Alpaca CLI `v0.0.13`

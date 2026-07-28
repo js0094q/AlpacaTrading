@@ -183,10 +183,14 @@ test("schema verification requires every operational table, index, and fencing s
   assert.equal(result.presentTableCount, POSTGRES_OPERATIONAL_TABLES.length);
   assert.ok(POSTGRES_OPERATIONAL_TABLES.includes("market_bars"));
   assert.ok(POSTGRES_OPERATIONAL_TABLES.includes("research_evidence"));
+  assert.ok(POSTGRES_OPERATIONAL_TABLES.includes("research_signals"));
   assert.ok(POSTGRES_OPERATIONAL_TABLES.includes("reconciliation_discrepancies"));
   assert.ok(POSTGRES_OPERATIONAL_INDEXES.includes("candidates_decision_id_idx"));
   assert.ok(
     POSTGRES_OPERATIONAL_INDEXES.includes("reconciliation_discrepancies_checkpoint_idx")
+  );
+  assert.ok(
+    POSTGRES_OPERATIONAL_INDEXES.includes("research_signals_symbol_as_of_idx")
   );
   for (const column of [
     "option_contracts.contract_id",

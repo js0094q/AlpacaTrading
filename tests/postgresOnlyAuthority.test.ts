@@ -141,7 +141,7 @@ test("production CLI allows only broker reads, PostgreSQL authority, and audited
     );
   }
   const autonomous = new Set([
-    "research:daily", "paper:review", "paper:portfolio:review",
+    "research:daily", "research:import", "paper:review", "paper:portfolio:review",
     "paper:options:discover", "paper:ops:review", "paper:exit:review",
     "paper:exit:execute", "paper:execute:reviewed", "hedge:review",
     "hedge:exit:review", "hedge:exit:execute", "zero-dte:engine",
@@ -193,7 +193,7 @@ test("package scripts expose no SQLite migration, backfill, reconciliation, or m
     assert.equal(packageJson.scripts[retired], undefined, retired);
   }
   for (const restored of [
-    "research:daily", "paper:review", "paper:portfolio:review",
+    "research:daily", "research:import", "paper:review", "paper:portfolio:review",
     "paper:options:discover", "paper:ops:review", "paper:exit:review",
     "paper:exit:execute", "paper:execute:reviewed", "hedge:review",
     "hedge:exit:review", "hedge:exit:execute", "zero-dte:engine",

@@ -68,6 +68,8 @@ import {
   runPostgresPaperOrderCancellation
 } from "./services/postgresOrderCancellationService.js";
 import { runPostgresResearchWorkflow } from "./services/postgresResearchWorkflowService.js";
+import { importResearchSignals } from "./repositories/postgres/postgresResearchSignalRepository.js";
+import { readBoundedResearchImportJson } from "./services/researchImportInputService.js";
 import { runPostgresReviewWorkflow } from "./services/postgresReviewWorkflowService.js";
 import { paperSubmitConfiguration } from "./services/paperSubmitSafetyConfig.js";
 import { submitPaperOrder } from "./services/alpacaClient.js";
@@ -483,6 +485,26 @@ const run = async (scheduledContext?: PostgresScheduledCommandOperationContext) 
           confirmPaper
         });
     print({ ...paperEnvelope(), command, ...result });
+    return;
+  }
+
+  if (command === "research:import") {
+    const context = requireScheduledContext(scheduledContext);
+    if (process.stdin.isTTY) throw new Error("RESEARCH_IMPORT_INPUT_REQUIRED");
+    const payload = await readBoundedResearchImportJson(process.stdin);
+    const result = await importResearchSignals({
+      query: queryAdapter(context.pool),
+      fence: context.fence,
+      payload
+    });
+    print({
+      ...paperEnvelope(),
+      command,
+      researchOnly: true,
+      brokerMutationPerformed: false,
+      ...result
+    });
+    if (result.status === "rejected") process.exitCode = 1;
     return;
   }
 

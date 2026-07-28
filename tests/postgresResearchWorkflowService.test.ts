@@ -122,6 +122,16 @@ test("research persists current PostgreSQL evidence and selected candidates befo
       leapsMinDte: 180,
       leapsMaxDte: 730
     },
+    researchEvidence: {
+      signalId: null,
+      provider: null,
+      asOf: null,
+      horizon: null,
+      sourceReferences: [],
+      state: "unavailable",
+      scoreAdjustment: 0,
+      reasonCodes: ["RESEARCH_UNAVAILABLE"]
+    },
     learningAdjustmentStatus: "not_applicable_no_postgres_learning_model",
     learningModelCapability: {
       authority: "postgres",
@@ -828,5 +838,412 @@ test("research classifies a production long-dated option with repository LEAPS p
       "impliedVolatility", "delta", "gamma", "theta", "vega", "rho",
       "underlyingHistoricalVolatility"
     ]
+  });
+});
+
+const storedResearchSignal = (overrides: Record<string, unknown> = {}) => ({
+  id: "research_signal_" + "a".repeat(64),
+  provider: "public-equity-export",
+  providerSignalId: "spy-2026-07-20",
+  symbol: "SPY",
+  asOf: "2026-07-20T20:00:00.000Z",
+  horizon: "long_term",
+  thesisSummary: "Imported long-duration thesis.",
+  thesisDirection: "bullish",
+  confidence: 0.7,
+  catalysts: ["Earnings"],
+  catalystDates: ["2026-07-20T19:00:00.000Z"],
+  risks: ["Margin compression"],
+  invalidationConditions: ["Guidance reduction"],
+  contradictionStatus: "not_contradicted",
+  contradictionReason: null,
+  valuationSummary: "Imported valuation context.",
+  sourceReferences: ["research://public-equity-export/spy-2026-07-20"],
+  expiresOrReviewAt: "2026-08-20T20:00:00.000Z",
+  ingestionTimestamp: "2026-07-20T20:30:00.000Z",
+  contentHash: "b".repeat(64),
+  schemaVersion: 1,
+  ...overrides
+});
+
+const researchAwareQuery = (
+  onCandidate: (values: readonly unknown[]) => void
+) => ({
+  query: async (statement: string, values?: readonly unknown[]) => {
+    if (statement.includes("INSERT INTO candidates")) onCandidate(values ?? []);
+    if (statement.includes("to_regclass('public.learning_runs')")) {
+      return { rows: [{ learning_model_relation: null }], rowCount: 1 };
+    }
+    return {
+      rows: statement.includes("INSERT INTO research_runs")
+        ? [{ version: "1" }]
+        : [],
+      rowCount: 1
+    };
+  }
+});
+
+test("current stored research changes equity score and records bounded provenance", async () => {
+  let candidateValues: readonly unknown[] = [];
+  const result = await runPostgresResearchWorkflow({
+    query: researchAwareQuery((values) => { candidateValues = values; }),
+    fence,
+    riskProfile: "aggressive",
+    optionsEnabled: false,
+    maxCandidates: 10,
+    now: new Date("2026-07-20T22:00:00.000Z"),
+    dependencies: {
+      refreshMarketData: async () => ({
+        bars: [bar],
+        stockSnapshots: [],
+        optionContracts: [],
+        optionSnapshots: [],
+        summary: {}
+      }) as never,
+      buildFeaturesAndTargets: async () => ({
+        features: [],
+        targets: [{
+          ...target,
+          confidence: 0.5,
+          expectedReturn: 0.05,
+          volatilityAdjustedScore: 0.2
+        }]
+      }),
+      loadResearchSignals: async () => [storedResearchSignal()] as never,
+      symbols: ["SPY"]
+    }
+  });
+
+  const signalInputs = JSON.parse(String(candidateValues[25]));
+  assert.equal(signalInputs.candidateScore.research.scoreAdjustment, 3);
+  assert.equal(
+    signalInputs.candidateScore.total,
+    signalInputs.candidateScore.baseTotal + 3
+  );
+  assert.equal(candidateValues[13], signalInputs.candidateScore.total);
+  assert.deepEqual(signalInputs.researchEvidence, {
+    signalId: "research_signal_" + "a".repeat(64),
+    provider: "public-equity-export",
+    asOf: "2026-07-20T20:00:00.000Z",
+    horizon: "long_term",
+    sourceReferences: [
+      "research://public-equity-export/spy-2026-07-20"
+    ],
+    state: "current",
+    scoreAdjustment: 3,
+    reasonCodes: ["RESEARCH_CURRENT", "RESEARCH_DIRECTION_ALIGNED"]
+  });
+  assert.ok(
+    result.workstreamResults[0]?.evidence_references.includes(
+      "research_signal:" + "research_signal_" + "a".repeat(64)
+    )
+  );
+});
+
+test("LEAPS consumes only current long-horizon research without replacing option evidence", async () => {
+  let candidateValues: readonly unknown[] = [];
+  const leapsTarget = {
+    ...target,
+    confidence: 0.5,
+    expectedReturn: 0.05,
+    volatilityAdjustedScore: 0.2,
+    preferredExpression: "long_call" as const,
+    optionsStrategy: {
+      alternatives: ["shares"],
+      rationale: [],
+      optionsCandidate: {
+        optionSymbol: "SPY270416C00600000",
+        type: "call",
+        expirationDate: "2027-04-16",
+        strike: 600,
+        estimatedEntryPrice: 20,
+        liquidityScore: 0.9,
+        decisionInputs: {
+          daysToExpiration: 270,
+          moneyness: 0.08,
+          openInterest: 8_000,
+          openInterestDate: "2026-07-17",
+          spreadDollars: 0.5,
+          spreadPct: 0.025,
+          impliedVolatility: 0.24,
+          delta: 0.4,
+          underlyingHistoricalVolatility: 0.2
+        }
+      }
+    }
+  };
+
+  await runPostgresResearchWorkflow({
+    query: researchAwareQuery((values) => { candidateValues = values; }),
+    fence,
+    riskProfile: "aggressive",
+    optionsEnabled: true,
+    maxCandidates: 10,
+    now: new Date("2026-07-20T18:00:00.000Z"),
+    dependencies: {
+      refreshMarketData: async () => ({
+        bars: [bar],
+        stockSnapshots: [],
+        optionContracts: [],
+        optionSnapshots: [],
+        summary: {}
+      }) as never,
+      buildFeaturesAndTargets: async () => ({
+        features: [],
+        targets: [leapsTarget]
+      }),
+      loadResearchSignals: async () => [storedResearchSignal({
+        asOf: "2026-07-20T16:00:00.000Z"
+      })] as never,
+      symbols: ["SPY"]
+    }
+  });
+
+  const signalInputs = JSON.parse(String(candidateValues[25]));
+  assert.equal(candidateValues[12], "leaps");
+  assert.equal(signalInputs.researchEvidence.state, "current");
+  assert.equal(signalInputs.researchEvidence.scoreAdjustment, 3);
+  assert.deepEqual(signalInputs.marketDecisionInputs.option.evidenceProfile, {
+    lane: "options_leaps",
+    horizon: "long_horizon",
+    priorityInputs: [
+      "expirationDate", "daysToExpiration", "strike", "moneyness",
+      "openInterest", "openInterestDate", "spreadDollars", "spreadPct",
+      "impliedVolatility", "delta", "gamma", "theta", "vega", "rho",
+      "underlyingHistoricalVolatility"
+    ]
+  });
+});
+
+test("0DTE remains independent and records only a current-session catalyst", async () => {
+  const run = async (signals: readonly unknown[]) => {
+    let candidateValues: readonly unknown[] = [];
+    let lookupCount = 0;
+    const zeroDteTarget = {
+      ...target,
+      confidence: 0.5,
+      expectedReturn: 0.05,
+      volatilityAdjustedScore: 0.2,
+      preferredExpression: "long_call" as const,
+      optionsStrategy: {
+        alternatives: ["shares"],
+        rationale: [],
+        optionsCandidate: {
+          optionSymbol: "SPY260720C00555000",
+          type: "call",
+          expirationDate: "2026-07-20",
+          strike: 555,
+          estimatedEntryPrice: 2,
+          liquidityScore: 0.9,
+          decisionInputs: {
+            bid: 1.98,
+            ask: 2.02,
+            spreadDollars: 0.04,
+            spreadPct: 0.02,
+            quoteTimestamp: "2026-07-20T19:59:59.000Z",
+            intradayVolatility: 0.018,
+            hoursToExpiration: 0.5
+          }
+        }
+      }
+    };
+    const result = await runPostgresResearchWorkflow({
+      query: researchAwareQuery((values) => { candidateValues = values; }),
+      fence,
+      riskProfile: "aggressive",
+      optionsEnabled: true,
+      maxCandidates: 10,
+      now: new Date("2026-07-21T00:30:00.000Z"),
+      dependencies: {
+        refreshMarketData: async () => ({
+          bars: [bar],
+          stockSnapshots: [],
+          optionContracts: [],
+          optionSnapshots: [],
+          summary: {}
+        }) as never,
+        buildFeaturesAndTargets: async () => ({
+          features: [],
+          targets: [zeroDteTarget]
+        }),
+        loadResearchSignals: async () => {
+          lookupCount += 1;
+          return signals as never;
+        },
+        symbols: ["SPY"]
+      }
+    });
+    return {
+      result,
+      lookupCount,
+      signalInputs: JSON.parse(String(candidateValues[25]))
+    };
+  };
+
+  const withCatalyst = await run([storedResearchSignal()]);
+  const withoutResearch = await run([]);
+
+  assert.equal(withCatalyst.result.candidatesSelected, 1);
+  assert.equal(withCatalyst.lookupCount, 1);
+  assert.equal(withCatalyst.signalInputs.researchEvidence.scoreAdjustment, 0);
+  assert.deepEqual(withCatalyst.signalInputs.researchEvidence.reasonCodes, [
+    "RESEARCH_CURRENT",
+    "RESEARCH_CURRENT_SESSION_CATALYST"
+  ]);
+  assert.equal("thesisSummary" in withCatalyst.signalInputs.researchEvidence, false);
+  assert.equal("valuationSummary" in withCatalyst.signalInputs.researchEvidence, false);
+  assert.equal(withoutResearch.result.candidatesSelected, 1);
+  assert.equal(withoutResearch.lookupCount, 1);
+  assert.deepEqual(withoutResearch.signalInputs.researchEvidence, {
+    signalId: null,
+    provider: null,
+    asOf: null,
+    horizon: null,
+    sourceReferences: [],
+    state: "unavailable",
+    scoreAdjustment: 0,
+    reasonCodes: ["RESEARCH_0DTE_NO_CURRENT_SESSION_CATALYST"]
+  });
+});
+
+test("research lookup failure is bounded to evidence and does not stop lane evaluation", async () => {
+  let candidateValues: readonly unknown[] = [];
+  const telemetry: Record<string, unknown>[] = [];
+  const result = await runPostgresResearchWorkflow({
+    query: researchAwareQuery((values) => { candidateValues = values; }),
+    fence,
+    riskProfile: "aggressive",
+    optionsEnabled: true,
+    maxCandidates: 10,
+    now: new Date("2026-07-20T22:00:00.000Z"),
+    emitTelemetry: (event) => { telemetry.push(event); },
+    dependencies: {
+      refreshMarketData: async () => ({
+        bars: [bar],
+        stockSnapshots: [],
+        optionContracts: [],
+        optionSnapshots: [],
+        summary: {}
+      }) as never,
+      buildFeaturesAndTargets: async () => ({
+        features: [],
+        targets: [target]
+      }),
+      loadResearchSignals: async () => {
+        throw new Error("provider details must not escape into decision evidence");
+      },
+      symbols: ["SPY"]
+    }
+  });
+
+  const signalInputs = JSON.parse(String(candidateValues[25]));
+  assert.equal(result.status, "completed");
+  assert.equal(result.candidatesSelected, 1);
+  assert.equal(result.research.lookupStatus, "RESEARCH_LOOKUP_UNAVAILABLE");
+  assert.deepEqual(signalInputs.researchEvidence.reasonCodes, [
+    "RESEARCH_LOOKUP_UNAVAILABLE"
+  ]);
+  assert.deepEqual(
+    telemetry.find(({ event }) => event === "postgres_research_signal_lookup"),
+    {
+      event: "postgres_research_signal_lookup",
+      researchRunId: result.runId,
+      cycleId: result.runId,
+      outcome: "unavailable",
+      reasonCode: "RESEARCH_LOOKUP_UNAVAILABLE",
+      retryCount: 0
+    }
+  );
+});
+
+test("research for one symbol does not change an unrelated symbol", async () => {
+  const candidates = new Map<string, Record<string, unknown>>();
+  await runPostgresResearchWorkflow({
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("INSERT INTO candidates")) {
+          candidates.set(
+            String(values?.[2]),
+            JSON.parse(String(values?.[25])) as Record<string, unknown>
+          );
+        }
+        if (statement.includes("to_regclass('public.learning_runs')")) {
+          return { rows: [{ learning_model_relation: null }], rowCount: 1 };
+        }
+        return {
+          rows: statement.includes("INSERT INTO research_runs")
+            ? [{ version: "1" }]
+            : [],
+          rowCount: 1
+        };
+      }
+    },
+    fence,
+    riskProfile: "aggressive",
+    optionsEnabled: false,
+    maxCandidates: 10,
+    now: new Date("2026-07-20T22:00:00.000Z"),
+    dependencies: {
+      refreshMarketData: async () => ({
+        bars: [bar],
+        stockSnapshots: [],
+        optionContracts: [],
+        optionSnapshots: [],
+        summary: {}
+      }) as never,
+      buildFeaturesAndTargets: async () => ({
+        features: [],
+        targets: [
+          {
+            ...target,
+            confidence: 0.5,
+            expectedReturn: 0.05,
+            volatilityAdjustedScore: 0.2
+          },
+          {
+            ...target,
+            symbol: "QQQ",
+            sourceFingerprint: "qqq-target-fingerprint",
+            confidence: 0.5,
+            expectedReturn: 0.05,
+            volatilityAdjustedScore: 0.2
+          }
+        ]
+      }),
+      loadResearchSignals: async ({ symbols }) => {
+        assert.deepEqual(symbols, ["SPY", "QQQ"]);
+        return [storedResearchSignal()] as never;
+      },
+      symbols: ["SPY", "QQQ"]
+    }
+  });
+
+  const spy = candidates.get("SPY") as {
+    researchEvidence: { state: string; scoreAdjustment: number };
+  };
+  const qqq = candidates.get("QQQ") as {
+    researchEvidence: { state: string; scoreAdjustment: number };
+  };
+  assert.deepEqual(spy.researchEvidence, {
+    signalId: "research_signal_" + "a".repeat(64),
+    provider: "public-equity-export",
+    asOf: "2026-07-20T20:00:00.000Z",
+    horizon: "long_term",
+    sourceReferences: [
+      "research://public-equity-export/spy-2026-07-20"
+    ],
+    state: "current",
+    scoreAdjustment: 3,
+    reasonCodes: ["RESEARCH_CURRENT", "RESEARCH_DIRECTION_ALIGNED"]
+  });
+  assert.deepEqual(qqq.researchEvidence, {
+    signalId: null,
+    provider: null,
+    asOf: null,
+    horizon: null,
+    sourceReferences: [],
+    state: "unavailable",
+    scoreAdjustment: 0,
+    reasonCodes: ["RESEARCH_UNAVAILABLE"]
   });
 });

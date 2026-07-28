@@ -1,5 +1,57 @@
 # Alpaca Trading Research Infrastructure
 
+## Provider-neutral public-equity research adapter (2026-07-28)
+
+The runtime has no verified machine-callable Public Equity Investing provider
+or documented consumer ChatGPT API. Section 8 therefore uses the minimum
+provider-neutral path: bounded JSON from standard input, schema validation,
+deterministic normalization, and one idempotent PostgreSQL
+`research_signals` record. There is no browser automation, Markdown parser,
+file-path input, background ingestion service, provider retry loop, or
+research-to-order callback.
+
+Import a structured export through the scheduler-fenced PostgreSQL-only CLI:
+
+```bash
+printf '%s\n' '{
+  "schema_version": 1,
+  "signals": [{
+    "provider": "approved-export",
+    "provider_signal_id": "SPY-2026-07-28",
+    "symbol": "SPY",
+    "as_of": "2026-07-28T14:00:00.000Z",
+    "horizon": "long_term",
+    "thesis_direction": "bullish",
+    "source_references": ["research://approved-export/SPY-2026-07-28"],
+    "expires_or_review_at": "2026-08-28T14:00:00.000Z"
+  }]
+}' | npm run research:import
+```
+
+Input is capped at 1,000,000 bytes and 100 signals. Provider, symbol,
+timestamps, horizon, optional direction/confidence, bounded thesis/catalyst/
+risk/invalidation/valuation fields, contradiction state, and source references
+are validated as untrusted data. Missing optional values remain `null` or empty;
+ingestion time is distinct from `as_of`; and broker quantity, side, order type,
+prices, client order ID, payload, and execution-method fields are rejected.
+Identity is deterministic from provider, symbol, provider/source identity,
+`as_of`, and normalized content hash. Exact replay is a no-op.
+
+Only current lane-applicable research can influence a candidate. Equity and
+long-horizon LEAPS direction alignment use the conservative configurable
+`RESEARCH_DIRECTION_SCORE_ADJUSTMENT=3` default, clamped inside the existing
+0–100 score and all existing sizing/capital limits. LEAPS still requires the
+complete Section 7 option evidence. 0DTE receives only a current-session dated
+catalyst reason, never long-form thesis or valuation, and gets no research score
+adjustment. Expired, contradicted, invalid, missing, and unavailable research is
+recorded as lane-scoped evidence and never becomes a global gate.
+
+The decision stores the research signal ID, provider, source references,
+`as_of`, horizon, decision-time usability state, score adjustment, and reason
+codes. Full research content remains stored once in PostgreSQL. The
+orchestrator remains the decision coordinator, and the existing review, intent,
+order-manager, and paper-only Alpaca boundaries are unchanged.
+
 ## Verified options evidence and lane-specific inputs (2026-07-28)
 
 The PostgreSQL option proposal retains the selected contract ID, underlying,
@@ -48,8 +100,9 @@ REST hydration is limited to startup, explicit refresh, or recovery. Broker
 order updates remain reconciliation-oriented, while account activities can be
 polled without overlap for option assignment, exercise, and expiration events
 not available from the stream. SIP, IEX, delayed, and OPRA evidence remain
-feed-distinct. This phase does not add scoring, a research adapter, order
-submission, or any live path.
+feed-distinct. Section 6 itself did not add scoring, a research adapter, order
+submission, or any live path. The later Section 8 adapter described above
+consumes the same cycle evidence without changing Section 6 stream ownership.
 
 ## Autonomous worker-state persistence continuity (2026-07-28)
 
