@@ -16,7 +16,7 @@ import {
   paperExplorationThresholds,
   type PaperExplorationThresholds
 } from "./paperExplorationConfig.js";
-import { executeWorkstreamLanes } from "./canonicalWorkstreamResult.js";
+import { runInvestmentOrchestrator } from "./investmentOrchestratorService.js";
 import { buildPostgresFeaturesAndTargets } from "./postgresFeatureTargetService.js";
 import { refreshPostgresMarketData } from "./postgresMarketDataService.js";
 
@@ -540,10 +540,12 @@ const persistCandidates = async (input: {
   fence: SchedulerFence;
   researchRunId: string;
   cycleId: string;
+  optionsEnabled: boolean;
   targets: FeatureTargetResult["targets"];
   maxCandidates: number;
   now: Date;
   explorationThresholds: PaperExplorationThresholds;
+  emitTelemetry?: (event: Record<string, unknown>) => void;
 }) => {
   const evaluated = input.targets
     .map((target) => {
@@ -688,25 +690,39 @@ const persistCandidates = async (input: {
     ["options_0dte", "zero_dte_spy"],
     ["options_leaps", "leaps"]
   ] as const;
-  const workstreamResults = await executeWorkstreamLanes({
+  const investmentCycle = await runInvestmentOrchestrator<
+    typeof decisions,
+    FeatureTargetResult["targets"][number]
+  >({
     cycleId: input.cycleId,
+    loadSharedContext: async () => decisions,
     lanes: laneFamilies.map(([lane, family]) => ({
       lane,
-      execute: () => persistDecisionRows(
-        decisions.filter((row) => row.strategyFamily === family)
+      enabled: lane === "equity" || input.optionsEnabled,
+      execute: (sharedDecisions) => persistDecisionRows(
+        sharedDecisions.filter((row) => row.strategyFamily === family)
       )
+    }))
+  });
+  input.emitTelemetry?.({
+    event: "postgres_investment_orchestrator_completed",
+    researchRunId: input.researchRunId,
+    cycleId: investmentCycle.cycleId,
+    enabledLanes: investmentCycle.enabledLanes,
+    laneResults: investmentCycle.workstreamResults.map((result) => ({
+      lane: result.lane,
+      outcome: result.outcome,
+      proposalCount: result.proposals.length,
+      reasonCodes: result.reason_codes
     }))
   });
   const standardOptionResult = await persistDecisionRows(
     decisions.filter((row) => row.strategyFamily === "standard_option")
   );
   return {
-    selected: workstreamResults.reduce(
-      (count, result) => count + result.proposals.length,
-      standardOptionResult.proposals.length
-    ),
+    selected: investmentCycle.proposals.length + standardOptionResult.proposals.length,
     rejected: decisions.length - selectedCount,
-    workstreamResults
+    workstreamResults: investmentCycle.workstreamResults
   };
 };
 
@@ -812,11 +828,13 @@ export const runPostgresResearchWorkflow = async (input: {
     const candidateDecisions = await persistCandidates({
       query: input.query, fence: input.fence, researchRunId: runId,
       cycleId: input.cycleId ?? process.env.AUTONOMOUS_CYCLE_ID?.trim() ?? runId,
+      optionsEnabled: input.optionsEnabled,
       targets: generated.targets, maxCandidates: input.maxCandidates, now,
       explorationThresholds: {
         ...explorationThresholds,
         maxCandidates: input.maxCandidates
-      }
+      },
+      emitTelemetry: input.emitTelemetry
     });
     const completed = await input.query.query(
       `UPDATE research_runs

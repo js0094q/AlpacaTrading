@@ -36,6 +36,7 @@ const target = {
 
 test("research persists current PostgreSQL evidence and selected candidates before completing", async () => {
   const sql: string[] = [];
+  const telemetry: Record<string, unknown>[] = [];
   let candidateValues: readonly unknown[] = [];
   const cancellation = new AbortController();
   let observedSignal: AbortSignal | undefined;
@@ -56,6 +57,7 @@ test("research persists current PostgreSQL evidence and selected candidates befo
     maxCandidates: 10,
     now: new Date("2026-07-20T22:00:00.000Z"),
     signal: cancellation.signal,
+    emitTelemetry: (event) => { telemetry.push(event); },
     dependencies: {
       refreshMarketData: async (input) => {
         observedSignal = input.signal;
@@ -86,6 +88,12 @@ test("research persists current PostgreSQL evidence and selected candidates befo
   });
 
   assert.equal(result.status, "completed");
+  assert.deepEqual(result.workstreamResults.map(({ lane }) => lane), ["equity"]);
+  assert.deepEqual(
+    telemetry.find(({ event }) => event === "postgres_investment_orchestrator_completed")
+      ?.enabledLanes,
+    ["equity"]
+  );
   assert.equal(observedSignal, cancellation.signal);
   assert.equal(result.candidatesSelected, 1);
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO research_evidence")), true);
