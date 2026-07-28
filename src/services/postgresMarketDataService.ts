@@ -138,7 +138,13 @@ const optionQuoteIsUsable = (
   maxAgeMs: number
 ) => {
   const quoteTimestamp = row.quoteTimestamp ? Date.parse(row.quoteTimestamp) : Number.NaN;
-  const age = nowMs - quoteTimestamp;
+  const retrievedTimestamp = row.retrievedAt
+    ? Date.parse(row.retrievedAt)
+    : Number.NaN;
+  const referenceTimestamp = Number.isFinite(retrievedTimestamp)
+    ? Math.max(nowMs, retrievedTimestamp)
+    : nowMs;
+  const age = referenceTimestamp - quoteTimestamp;
   return (
     row.requestedFeed?.toLowerCase() === "opra" &&
     (row.effectiveFeed?.toLowerCase() === "opra" ||

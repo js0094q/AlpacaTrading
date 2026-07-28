@@ -1734,6 +1734,55 @@ test("an OPRA request without a response feed header preserves request validatio
   );
 });
 
+test("OPRA quote freshness uses provider receipt time when a bounded chain request outlives the cycle start", async () => {
+  const result = await runSingleOptionRefresh({
+    chain: {
+      underlyingSymbol: "SPY",
+      pagesConsumed: 1,
+      snapshots: [{
+        symbol: "SPY260724C00744000",
+        raw: {
+          latestQuote: {
+            bp: 3.1,
+            ap: 3.2,
+            bs: 10,
+            as: 12,
+            t: "2026-07-21T13:44:09.000Z"
+          },
+          latestTrade: {
+            p: 3.15,
+            t: "2026-07-21T13:44:08.000Z"
+          },
+          dailyBar: { v: 321 },
+          impliedVolatility: 0.1663,
+          greeks: {
+            delta: 0.5276,
+            gamma: 0.0355,
+            theta: -0.7831,
+            vega: 0.2686,
+            rho: 0.0319
+          }
+        },
+        requestId: "rest-SPY",
+        endpoint: "/v1beta1/options/snapshots/SPY?feed=opra&limit=1000",
+        underlyingSymbol: "SPY",
+        requestedFeed: "opra",
+        effectiveFeed: null,
+        validationBasis: "request_feed_opra",
+        pageToken: null,
+        retrievedAt: "2026-07-21T13:44:10.000Z"
+      }]
+    }
+  });
+
+  assert.equal(result.optionSnapshots.length, 1);
+  assert.equal(
+    result.summary.optionEvidenceByUnderlying.SPY?.finalBoundedResult,
+    "OPRA_EVIDENCE_CURRENT"
+  );
+  assert.deepEqual(result.summary.optionDataRejectionReasons, []);
+});
+
 test("OPRA authorization failure is explicit and is not reported as a generic missing candidate", async () => {
   const result = await runSingleOptionRefresh({
     chainError: new Error(
