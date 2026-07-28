@@ -165,14 +165,24 @@ result. Same-day SPY expiration is evaluated against the
 `America/New_York` trading date and remains DTE zero.
 
 New autonomous LEAPS entries use the independent paper-only
-`LEAPS_MAX_ENTRY_CAPITAL_USD=5000` ceiling and remain limited to one integer
-contract. Contract cost is executable premium times the observed standard
-multiplier of 100 exactly once. A cost above the ceiling is persisted as
+`LEAPS_MAX_ENTRY_CAPITAL_USD=5000` ceiling for each independently qualified
+position. Contract cost is executable premium times the observed standard
+multiplier of 100 exactly once, and quantity is the integer floor of the lower
+of that per-position ceiling and independently validated available capital,
+divided by contract cost. There is no separate LEAPS contract, daily, cycle,
+position-count, lane, or aggregate-allocation cap. A cost above the
+per-position ceiling is persisted as
 `LEAPS_CONTRACT_COST_EXCEEDS_ALLOCATION`, and deterministic sibling review
-continues. Buying power, cash reserve, strategy allocation, portfolio and
-symbol risk limits, contract validity, OPRA quote quality, duplicate checks,
-authorization, reconciliation, and exits still bind independently. The equity
-exploration ceiling remains `$1,000`.
+continues.
+
+The resulting full position cost, `quantity * premium * 100`, is the amount
+persisted for premium, max risk, reservation, and downstream capacity checks.
+Buying power, cash reserve, strategy allocation, portfolio and symbol risk
+limits, position/order limits, contract validity, OPRA quote quality, duplicate
+checks, authorization, reconciliation, and exits still bind independently.
+The equity exploration ceiling remains `$1,000`. Historical
+`PAPER_LEAPS_MAX_CONTRACTS` settings belong to the retired legacy planner and
+do not govern the PostgreSQL-only autonomous LEAPS lane.
 
 Migration `005_market_data_ingestion_observability.sql` adds cycle, workstream,
 symbol, endpoint, pagination, provider-time range, freshness counts, rejection,

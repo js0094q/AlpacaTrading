@@ -1323,7 +1323,7 @@ export const runPostgresReviewWorkflow = async (input: {
         independentlyValidatedAvailableCapitalUsd:
           independentlyValidatedAvailableCapital(row)
       });
-      amount = leapsSizing.contractCostUsd;
+      amount = leapsSizing.positionCostUsd;
       if (leapsSizing.quantity === 0 || amount === null) {
         capacityBlocked += 1;
         capacityRows.push({
@@ -1446,12 +1446,12 @@ export const runPostgresReviewWorkflow = async (input: {
       : shortEquity
         ? Math.floor(amount / price)
         : null;
-    const optionContractCost = option
-      ? leapsSizing?.contractCostUsd ?? price * 100 * (quantity ?? 0)
+    const optionPositionCost = option
+      ? leapsSizing?.positionCostUsd ?? price * 100 * (quantity ?? 0)
       : null;
     const effectiveRisk = shortEquity
       ? price * (quantity ?? 0)
-      : optionContractCost ?? amount;
+      : optionPositionCost ?? amount;
     const orderSymbol = row.option_symbol ?? row.symbol;
     const clientOrderId = `pg-${canonicalJsonHash({ account: row.account_id, candidate: row.candidate_id, snapshot: row.account_snapshot_id }).slice(0, 32)}`;
     const marketEvidence = [{
@@ -1496,8 +1496,7 @@ export const runPostgresReviewWorkflow = async (input: {
       cashReserveAmount: row.cash_reserve_amount,
       cashReserveRatio: row.cash_reserve_ratio,
       ...(leapsSizing ? {
-        leapsMaxEntryCapitalUsd: leapsSizing.configuredPerEntryAllocationUsd,
-        leapsMaxContracts: leapsSizing.maxContracts
+        leapsMaxEntryCapitalUsd: leapsSizing.configuredPerEntryAllocationUsd
       } : {})
     };
     const payload = {
@@ -1555,7 +1554,7 @@ export const runPostgresReviewWorkflow = async (input: {
         option ? row.symbol : null, row.asset_class, entrySide,
         option ? "limit" : "market", quantity,
         option || shortEquity ? null : amount,
-        option ? price : null, optionContractCost,
+        option ? price : null, optionPositionCost,
         effectiveRisk, intentFingerprint, canonicalJsonHash({ status: "created", at: now.toISOString() }),
         JSON.stringify(orderIntent), now.toISOString(), operation,
         strategyClassification, option ? String(row.contract_id) : null,

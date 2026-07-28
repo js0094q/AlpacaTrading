@@ -877,7 +877,7 @@ test("entry review classifies same-day expiration against the New York trading d
   assert.equal(orderIntent?.strategyClassification, "zero_dte_long_call");
 });
 
-test("LEAPS uses the independent $5,000 ceiling and persists one integer contract", async () => {
+test("LEAPS uses the independent $5,000 ceiling and persists an integer contract quantity", async () => {
   let orderIntent: Record<string, unknown> | undefined;
   let marketEvidence: Array<Record<string, unknown>> = [];
   const result = await runPostgresReviewWorkflow({
@@ -944,7 +944,7 @@ test("LEAPS uses the independent $5,000 ceiling and persists one integer contrac
   );
 });
 
-test("an exactly $5,000 LEAPS contract remains limited to one contract", async () => {
+test("an exactly $5,000 LEAPS contract produces one contract", async () => {
   let orderIntent: Record<string, unknown> | undefined;
   const result = await runPostgresReviewWorkflow({
     command: "paper:review",
@@ -999,6 +999,321 @@ test("an exactly $5,000 LEAPS contract remains limited to one contract", async (
 
   assert.equal(result.reviewsCreated, 1);
   assert.equal(orderIntent?.quantity, 1);
+});
+
+test("a $1,000 LEAPS contract produces five contracts and reserves the full $5,000 position cost", async () => {
+  let orderIntent: Record<string, unknown> | undefined;
+  let marketEvidence: Array<Record<string, unknown>> = [];
+  let persistedIntentValues: readonly unknown[] = [];
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("FROM candidates candidate")) {
+          return {
+            rows: [{
+              ...candidate,
+              ...observedOptionContract,
+              candidate_id: "leaps-five-contracts",
+              candidate_strategy_family: "leaps",
+              asset_class: "option",
+              option_symbol: "SPY260821C00560000",
+              preferred_expression: "option",
+              market_price: "10",
+              buying_power: "100000",
+              cash: "100000",
+              equity: "100000",
+              allocation_amount: "100000",
+              max_position_notional: "100000",
+              max_symbol_notional: "100000",
+              max_deployment_amount: "100000",
+              cash_reserve_amount: "0",
+              market_evidence: {
+                bid: 9.9,
+                ask: 10.1,
+                midpoint: 10,
+                spreadPct: 0.02,
+                volume: 5_000,
+                openInterest: 8_000,
+                underlyingPrice: 555,
+                requestedFeed: "opra",
+                effectiveFeed: "opra",
+                provider: "alpaca"
+              }
+            }],
+            rowCount: 1
+          };
+        }
+        if (statement.includes("INSERT INTO execution_reviews")) {
+          orderIntent = JSON.parse(String(values?.[9])) as Record<string, unknown>;
+          marketEvidence = JSON.parse(
+            String(values?.[10])
+          ) as Array<Record<string, unknown>>;
+        }
+        if (statement.includes("INSERT INTO order_intents")) {
+          persistedIntentValues = values ?? [];
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    leapsEntryAllocationEnv: paperLeapsEnvironment,
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.reviewsCreated, 1);
+  assert.equal(orderIntent?.quantity, 5);
+  assert.equal(Number.isInteger(Number(orderIntent?.quantity)), true);
+  assert.equal(persistedIntentValues[12], 5);
+  assert.equal(persistedIntentValues[15], 5_000);
+  assert.equal(persistedIntentValues[16], 5_000);
+  assert.equal(
+    (marketEvidence[0]?.leapsSizing as Record<string, unknown>)?.positionCostUsd,
+    5_000
+  );
+});
+
+test("validated buying power reduces LEAPS quantity without creating a fractional contract", async () => {
+  let orderIntent: Record<string, unknown> | undefined;
+  let persistedIntentValues: readonly unknown[] = [];
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("FROM candidates candidate")) {
+          return {
+            rows: [{
+              ...candidate,
+              ...observedOptionContract,
+              candidate_id: "leaps-buying-power-reduces-quantity",
+              candidate_strategy_family: "leaps",
+              asset_class: "option",
+              option_symbol: "SPY260821C00560000",
+              preferred_expression: "option",
+              market_price: "10",
+              buying_power: "2500",
+              cash: "100000",
+              equity: "100000",
+              allocation_amount: "100000",
+              max_position_notional: "100000",
+              max_symbol_notional: "100000",
+              max_deployment_amount: "100000",
+              cash_reserve_amount: "0",
+              market_evidence: {
+                bid: 9.9,
+                ask: 10.1,
+                midpoint: 10,
+                spreadPct: 0.02,
+                volume: 5_000,
+                openInterest: 8_000,
+                underlyingPrice: 555,
+                requestedFeed: "opra",
+                effectiveFeed: "opra",
+                provider: "alpaca"
+              }
+            }],
+            rowCount: 1
+          };
+        }
+        if (statement.includes("INSERT INTO execution_reviews")) {
+          orderIntent = JSON.parse(String(values?.[9])) as Record<string, unknown>;
+        }
+        if (statement.includes("INSERT INTO order_intents")) {
+          persistedIntentValues = values ?? [];
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    leapsEntryAllocationEnv: paperLeapsEnvironment,
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.reviewsCreated, 1);
+  assert.equal(orderIntent?.quantity, 2);
+  assert.equal(Number.isInteger(Number(orderIntent?.quantity)), true);
+  assert.equal(persistedIntentValues[15], 2_000);
+  assert.equal(persistedIntentValues[16], 2_000);
+});
+
+test("LEAPS concentration and portfolio limits remain authoritative sizing inputs", async () => {
+  const scenarios = [
+    {
+      candidateId: "leaps-symbol-limit",
+      maxSymbolNotional: "999",
+      maxDeploymentAmount: "100000",
+      expectedQuantity: null,
+      expectedReason: "LEAPS_VALIDATED_AVAILABLE_CAPITAL_INSUFFICIENT"
+    },
+    {
+      candidateId: "leaps-portfolio-limit",
+      maxSymbolNotional: "100000",
+      maxDeploymentAmount: "2500",
+      expectedQuantity: 2,
+      expectedReason: null
+    }
+  ] as const;
+
+  for (const scenario of scenarios) {
+    let orderIntent: Record<string, unknown> | undefined;
+    let candidateUpdate: readonly unknown[] = [];
+    const result = await runPostgresReviewWorkflow({
+      command: "paper:review",
+      query: {
+        query: async (statement: string, values?: readonly unknown[]) => {
+          if (statement.includes("FROM candidates candidate")) {
+            return {
+              rows: [{
+                ...candidate,
+                ...observedOptionContract,
+                candidate_id: scenario.candidateId,
+                candidate_strategy_family: "leaps",
+                asset_class: "option",
+                option_symbol: "SPY260821C00560000",
+                preferred_expression: "option",
+                market_price: "10",
+                buying_power: "100000",
+                cash: "100000",
+                equity: "100000",
+                allocation_amount: "100000",
+                max_position_notional: "100000",
+                max_symbol_notional: scenario.maxSymbolNotional,
+                max_deployment_amount: scenario.maxDeploymentAmount,
+                cash_reserve_amount: "0",
+                market_evidence: {
+                  bid: 9.9,
+                  ask: 10.1,
+                  midpoint: 10,
+                  spreadPct: 0.02,
+                  volume: 5_000,
+                  openInterest: 8_000,
+                  underlyingPrice: 555,
+                  requestedFeed: "opra",
+                  effectiveFeed: "opra",
+                  provider: "alpaca"
+                }
+              }],
+              rowCount: 1
+            };
+          }
+          if (statement.includes("INSERT INTO execution_reviews")) {
+            orderIntent = JSON.parse(
+              String(values?.[9])
+            ) as Record<string, unknown>;
+          }
+          if (statement.includes("UPDATE candidates")) {
+            candidateUpdate = values ?? [];
+          }
+          return { rows: [], rowCount: 1 };
+        }
+      },
+      fence,
+      signingKey: "test-signing-key-with-sufficient-length",
+      leapsEntryAllocationEnv: paperLeapsEnvironment,
+      now: new Date("2026-07-20T22:00:00.000Z")
+    });
+
+    if (scenario.expectedQuantity === null) {
+      assert.equal(result.reviewsCreated, 0);
+      assert.equal(candidateUpdate[2], scenario.expectedReason);
+    } else {
+      assert.equal(result.reviewsCreated, 1);
+      assert.equal(orderIntent?.quantity, scenario.expectedQuantity);
+      assert.equal(Number.isInteger(Number(orderIntent?.quantity)), true);
+    }
+  }
+});
+
+test("multiple independently qualified LEAPS positions create separate same-cycle intents", async () => {
+  const orderIntents: Array<Record<string, unknown>> = [];
+  const persistedQuantities: unknown[] = [];
+  const optionRow = {
+    ...candidate,
+    ...observedOptionContract,
+    candidate_strategy_family: "leaps",
+    asset_class: "option" as const,
+    preferred_expression: "option",
+    buying_power: "100000",
+    cash: "100000",
+    equity: "100000",
+    allocation_amount: "100000",
+    max_position_notional: "100000",
+    max_symbol_notional: "100000",
+    max_deployment_amount: "100000",
+    cash_reserve_amount: "0",
+    market_evidence: {
+      bid: 9.9,
+      ask: 10.1,
+      midpoint: 10,
+      spreadPct: 0.02,
+      volume: 5_000,
+      openInterest: 8_000,
+      underlyingPrice: 555,
+      requestedFeed: "opra",
+      effectiveFeed: "opra",
+      provider: "alpaca"
+    }
+  };
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("FROM candidates candidate")) {
+          return {
+            rows: [
+              {
+                ...optionRow,
+                candidate_id: "leaps-position-one",
+                option_symbol: "SPY260821C00560000",
+                contract_option_symbol: "SPY260821C00560000",
+                contract_id: "contract-leaps-position-one",
+                market_price: "10"
+              },
+              {
+                ...optionRow,
+                candidate_id: "leaps-position-two",
+                option_symbol: "SPY260821C00570000",
+                contract_option_symbol: "SPY260821C00570000",
+                contract_id: "contract-leaps-position-two",
+                market_price: "24",
+                market_evidence: {
+                  ...optionRow.market_evidence,
+                  bid: 23.9,
+                  ask: 24.1,
+                  midpoint: 24,
+                  spreadPct: 0.00833
+                }
+              }
+            ],
+            rowCount: 2
+          };
+        }
+        if (statement.includes("INSERT INTO execution_reviews")) {
+          orderIntents.push(
+            JSON.parse(String(values?.[9])) as Record<string, unknown>
+          );
+        }
+        if (statement.includes("INSERT INTO order_intents")) {
+          persistedQuantities.push(values?.[12]);
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    leapsEntryAllocationEnv: paperLeapsEnvironment,
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.reviewsCreated, 2);
+  assert.equal(result.pendingIntentsCreated, 2);
+  assert.deepEqual(
+    orderIntents.map((intent) => intent.quantity),
+    [5, 2]
+  );
+  assert.deepEqual(persistedQuantities, [5, 2]);
 });
 
 test("buying power still rejects an otherwise allocation-affordable LEAPS contract", async () => {

@@ -2,7 +2,6 @@ export const DEFAULT_LEAPS_MAX_ENTRY_CAPITAL_USD = 5_000;
 export const MAX_LEAPS_ENTRY_CAPITAL_USD =
   DEFAULT_LEAPS_MAX_ENTRY_CAPITAL_USD;
 export const LEAPS_CONTRACT_MULTIPLIER = 100;
-export const LEAPS_MAX_NEW_POSITION_CONTRACTS = 1 as const;
 
 export type LeapsEntryAllocationFailureReason =
   | "LEAPS_ENTRY_ALLOCATION_INVALID"
@@ -12,14 +11,12 @@ export type LeapsEntryAllocationResolution =
   | {
       readonly ok: true;
       readonly maxEntryCapitalUsd: number;
-      readonly maxContracts: 1;
       readonly source: "environment" | "paper_default";
       readonly reason: null;
     }
   | {
       readonly ok: false;
       readonly maxEntryCapitalUsd: null;
-      readonly maxContracts: 0;
       readonly source: "invalid";
       readonly reason: LeapsEntryAllocationFailureReason;
     };
@@ -28,6 +25,7 @@ export type LeapsEntrySizingFailureReason =
   | "LEAPS_CONTRACT_COST_EXCEEDS_ALLOCATION"
   | "LEAPS_CONTRACT_MULTIPLIER_INVALID"
   | "LEAPS_ENTRY_ALLOCATION_INVALID"
+  | "LEAPS_ENTRY_QUANTITY_INVALID"
   | "LEAPS_EXECUTABLE_PREMIUM_INVALID"
   | "LEAPS_VALIDATED_AVAILABLE_CAPITAL_INSUFFICIENT"
   | "LEAPS_VALIDATED_AVAILABLE_CAPITAL_INVALID";
@@ -44,9 +42,9 @@ export type LeapsEntrySizingResult = {
   readonly executablePremium: number;
   readonly contractMultiplier: number;
   readonly contractCostUsd: number | null;
+  readonly positionCostUsd: number;
   readonly independentlyValidatedAvailableCapitalUsd: number;
-  readonly quantity: 0 | 1;
-  readonly maxContracts: 1;
+  readonly quantity: number;
   readonly reason: LeapsEntrySizingFailureReason | null;
 };
 
@@ -71,7 +69,6 @@ export const resolveLeapsEntryAllocation = (
     return {
       ok: false,
       maxEntryCapitalUsd: null,
-      maxContracts: 0,
       source: "invalid",
       reason: "LEAPS_PAPER_ONLY_REQUIRED"
     };
@@ -82,7 +79,6 @@ export const resolveLeapsEntryAllocation = (
     return {
       ok: true,
       maxEntryCapitalUsd: DEFAULT_LEAPS_MAX_ENTRY_CAPITAL_USD,
-      maxContracts: LEAPS_MAX_NEW_POSITION_CONTRACTS,
       source: "paper_default",
       reason: null
     };
@@ -92,7 +88,6 @@ export const resolveLeapsEntryAllocation = (
     return {
       ok: false,
       maxEntryCapitalUsd: null,
-      maxContracts: 0,
       source: "invalid",
       reason: "LEAPS_ENTRY_ALLOCATION_INVALID"
     };
@@ -103,7 +98,6 @@ export const resolveLeapsEntryAllocation = (
     return {
       ok: false,
       maxEntryCapitalUsd: null,
-      maxContracts: 0,
       source: "invalid",
       reason: "LEAPS_ENTRY_ALLOCATION_INVALID"
     };
@@ -112,7 +106,6 @@ export const resolveLeapsEntryAllocation = (
   return {
     ok: true,
     maxEntryCapitalUsd,
-    maxContracts: LEAPS_MAX_NEW_POSITION_CONTRACTS,
     source: "environment",
     reason: null
   };
@@ -121,17 +114,18 @@ export const resolveLeapsEntryAllocation = (
 const sizingResult = (
   input: LeapsEntrySizingInput,
   contractCostUsd: number | null,
-  quantity: 0 | 1,
+  quantity: number,
   reason: LeapsEntrySizingFailureReason | null
 ): LeapsEntrySizingResult => ({
   configuredPerEntryAllocationUsd: input.maxEntryCapitalUsd,
   executablePremium: input.executablePremium,
   contractMultiplier: input.contractMultiplier,
   contractCostUsd,
+  positionCostUsd:
+    contractCostUsd === null ? 0 : contractCostUsd * quantity,
   independentlyValidatedAvailableCapitalUsd:
     input.independentlyValidatedAvailableCapitalUsd,
   quantity,
-  maxContracts: LEAPS_MAX_NEW_POSITION_CONTRACTS,
   reason
 });
 
@@ -161,6 +155,14 @@ export const sizeLeapsEntry = (
 
   const contractCostUsd =
     input.executablePremium * input.contractMultiplier;
+  if (!Number.isFinite(contractCostUsd) || contractCostUsd <= 0) {
+    return sizingResult(
+      input,
+      null,
+      0,
+      "LEAPS_EXECUTABLE_PREMIUM_INVALID"
+    );
+  }
 
   if (!validAllocation(input.maxEntryCapitalUsd)) {
     return sizingResult(
@@ -204,5 +206,19 @@ export const sizeLeapsEntry = (
     );
   }
 
-  return sizingResult(input, contractCostUsd, 1, null);
+  const quantity = Math.floor(
+    Math.min(
+      input.maxEntryCapitalUsd,
+      input.independentlyValidatedAvailableCapitalUsd
+    ) / contractCostUsd
+  );
+  if (!Number.isSafeInteger(quantity) || quantity < 1) {
+    return sizingResult(
+      input,
+      contractCostUsd,
+      0,
+      "LEAPS_ENTRY_QUANTITY_INVALID"
+    );
+  }
+  return sizingResult(input, contractCostUsd, quantity, null);
 };

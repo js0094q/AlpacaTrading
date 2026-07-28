@@ -279,6 +279,46 @@ test("the execution gate rejects a fresh option intent with an unusable quote", 
   );
 });
 
+test("the execution gate preserves an integer multi-contract LEAPS quantity", () => {
+  const optionSymbol = "SPY260821C00560000";
+  const payload = validateAutonomousExecutionEvidence(
+    intent({
+      asset_class: "option",
+      underlying_symbol: "SPY",
+      side: "buy_to_open",
+      symbol: optionSymbol,
+      operation: "buy_to_open",
+      strategy_classification: "standard_long_call",
+      contract_id: `contract-${optionSymbol}`,
+      quantity: "5",
+      notional: null,
+      limit_price: "10",
+      market_evidence: [{
+        symbol: optionSymbol,
+        referencePrice: 10,
+        timestamp: "2026-07-20T21:59:30.000Z",
+        bid: 9.9,
+        ask: 10.1,
+        spreadPct: 0.02,
+        maximumSpreadPct: 0.15,
+        underlyingPrice: 555,
+        volume: 5_000,
+        openInterest: 8_000,
+        requestedFeed: "opra",
+        effectiveFeed: "opra",
+        source: "postgres.option_snapshots",
+        underlyingSip: optionUnderlyingSip()
+      }]
+    }),
+    broker,
+    new Date("2026-07-20T22:00:00.000Z"),
+    1_800
+  );
+
+  assert.equal(payload.qty, "5");
+  assert.equal(payload.symbol, optionSymbol);
+});
+
 test("the execution gate preserves the stricter 15-minute option quote age", () => {
   assert.throws(
     () => validateAutonomousExecutionEvidence(

@@ -14,10 +14,14 @@
   reporting a generic no-candidate result.
 - Same-day expiration uses the `America/New_York` trading date and remains DTE
   zero.
-- New paper LEAPS entries use independent
-  `LEAPS_MAX_ENTRY_CAPITAL_USD=5000` sizing and a one-contract maximum.
-  Executable premium is multiplied by the observed standard multiplier 100
-  exactly once; over-ceiling contracts persist
+- New paper LEAPS entries use independent per-position
+  `LEAPS_MAX_ENTRY_CAPITAL_USD=5000` sizing. Executable premium is multiplied
+  by the observed standard multiplier 100 exactly once, and integer quantity
+  is the floor of the lower of the per-position ceiling and independently
+  validated available capital divided by that contract cost. There is no
+  separate LEAPS contract, daily, cycle, position-count, lane, or aggregate
+  allocation cap; each qualified sibling is sized independently. The full
+  position cost is reserved and risk-checked. Over-ceiling contracts persist
   `LEAPS_CONTRACT_COST_EXCEEDS_ALLOCATION`, and affordable ranked siblings
   continue.
 - The equity `$1,000` exploration cap, account buying power, cash reserve,
