@@ -1423,6 +1423,61 @@ test("reconciliation synchronizes broker account and positions into PostgreSQL a
   assert.equal(positionInsert.values[9], "short");
 });
 
+test("duplicate broker snapshots reuse the existing canonical ID for positions", async () => {
+  const existingSnapshotId = "snapshot-existing";
+  let referencedSnapshotId = "";
+  const result = await reconcilePostgresPaperOrders({
+    query: { query: async (sql: string, values?: readonly unknown[]) => {
+      if (sql.includes("FROM order_intents intent")) return { rows: [], rowCount: 0 };
+      if (sql.includes("INSERT INTO account_snapshots")) return { rows: [], rowCount: 0 };
+      if (sql.includes("SELECT id FROM account_snapshots")) {
+        return { rows: [{ id: existingSnapshotId }], rowCount: 1 };
+      }
+      if (sql.includes("INSERT INTO positions")) {
+        referencedSnapshotId = String(values?.[17] ?? "");
+        if (referencedSnapshotId !== existingSnapshotId) {
+          throw new Error("positions_source_account_snapshot_id_fkey");
+        }
+      }
+      return { rows: [], rowCount: 1 };
+    } },
+    fence,
+    captureBrokerSnapshot: async () => ({
+      capturedAt: "2026-07-20T22:01:00.000Z",
+      accountIdentityHash: "paper-account-hash",
+      account: { status: "ACTIVE", currency: "USD", cash: 10_000, equity: 20_000,
+        buyingPower: 30_000, optionsBuyingPower: 15_000, optionsApprovalLevel: 3,
+        tradingBlocked: false, accountBlocked: false },
+      configuration: { environment: "paper", tradingMode: "paper", liveTradingEnabled: false },
+      configurationFingerprint: "configuration-fingerprint",
+      positions: [{ brokerPositionKey: "equity:AAPL", symbol: "AAPL",
+        underlyingSymbol: null, optionSymbol: null, assetClass: "equity", side: "long",
+        quantity: 1, availableQuantity: 1, averageEntryPrice: 200, currentPrice: 201,
+        marketValue: 201, costBasis: 200, unrealizedPnl: 1 }],
+      orders: [], structuralPortfolioFingerprint: "structural-fingerprint",
+      portfolioFingerprint: "portfolio-fingerprint"
+    }) as never
+  });
+
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.checked, 0);
+  assert.equal(result.brokerState?.accountSnapshotStored, false);
+  assert.equal(result.brokerState?.accountSnapshotId, existingSnapshotId);
+  assert.equal(referencedSnapshotId, existingSnapshotId);
+});
+
+test("genuine broker-state persistence failures remain reconciliation errors", async () => {
+  const result = await reconcilePostgresPaperOrders({
+    query: { query: async () => ({ rows: [], rowCount: 0 }) },
+    fence,
+    captureBrokerSnapshot: async () => { throw new Error("BROKER_STATE_PERSISTENCE_FAILED"); }
+  });
+
+  assert.deepEqual(result.errors, [{
+    orderIntentId: "__broker_state__", code: "BROKER_STATE_PERSISTENCE_FAILED"
+  }]);
+});
+
 test("position reconciliation carries matching filled entry lineage through a safe upsert", async () => {
   const statements: Array<{ sql: string; values: readonly unknown[] }> = [];
   const result = await reconcilePostgresPaperOrders({

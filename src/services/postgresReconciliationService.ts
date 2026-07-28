@@ -202,6 +202,18 @@ const syncBrokerAccountAndPositions = async (input: {
   if (accountSnapshot.rowCount !== 0 && accountSnapshot.rowCount !== 1) {
     throw new Error("POSTGRES_RECONCILIATION_ACCOUNT_SNAPSHOT_PERSISTENCE_FAILED");
   }
+  let persistedAccountSnapshotId = accountSnapshotId;
+  if (accountSnapshot.rowCount === 0) {
+    const existingAccountSnapshot = await input.query.query(
+      `SELECT id FROM account_snapshots
+       WHERE account_id = $1 AND snapshot_fingerprint = $2`,
+      [accountId, snapshot.portfolioFingerprint]
+    );
+    persistedAccountSnapshotId = required(
+      existingAccountSnapshot.rows[0]?.id,
+      "POSTGRES_RECONCILIATION_ACCOUNT_SNAPSHOT_PERSISTENCE_FAILED"
+    );
+  }
   const activeKeys = snapshot.positions.map((position) => position.brokerPositionKey);
   const closed = await input.query.query(
     `UPDATE positions
@@ -388,7 +400,7 @@ const syncBrokerAccountAndPositions = async (input: {
         position.marketValue,
         position.costBasis,
         position.unrealizedPnl,
-        accountSnapshotId,
+        persistedAccountSnapshotId,
         openingFilledAt,
         snapshot.capturedAt,
         ...fenceValues(input.fence)
@@ -401,7 +413,7 @@ const syncBrokerAccountAndPositions = async (input: {
   }
   return {
     accountId,
-    accountSnapshotId,
+    accountSnapshotId: persistedAccountSnapshotId,
     accountSnapshotStored: accountSnapshot.rowCount === 1,
     positionsObserved: snapshot.positions.length,
     positionsUpserted
