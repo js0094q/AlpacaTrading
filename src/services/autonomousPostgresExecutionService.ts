@@ -42,6 +42,8 @@ export type AutonomousExecutionIntentRow = {
   confirmation_evidence_id: string;
   review_signature?: string | null;
   payload_fingerprint?: string | null;
+  review_client_order_id?: string | null;
+  review_order_intent?: unknown;
   client_order_id: string;
   strategy_key: string;
   symbol: string;
@@ -105,10 +107,106 @@ export type AmbiguousSubmissionRecovery =
       readonly code: "POSTGRES_BROKER_SUBMISSION_RECOVERY_PENDING";
     };
 
+export type BrokerMutationOutcome =
+  | "submission_attempted"
+  | "submission_acknowledged"
+  | "submission_rejected"
+  | "submission_transport_unknown"
+  | "submission_reconciled";
+
+export type BrokerMutationReceipt = {
+  readonly mutationReceiptId: string;
+  readonly environment: "paper";
+  readonly intentId: string;
+  readonly cycleId: string;
+  readonly workstream: string;
+  readonly schedulerRunId: string;
+  readonly fencingToken: string;
+  readonly deterministicClientOrderId: string;
+  readonly submissionAttemptSequence: number;
+  readonly submissionAction: "opening" | "closing";
+  readonly brokerOrderId: string | null;
+  readonly requestFingerprint: string;
+  readonly requestedSymbol: string;
+  readonly requestedSide: string;
+  readonly requestedQuantity: string | null;
+  readonly requestedNotional: string | null;
+  readonly requestedOrderType: string;
+  readonly requestedLimitPrice: string | null;
+  readonly requestedStopPrice: string | null;
+  readonly requestedPositionIntent: string;
+  readonly submissionAttemptTimestamp: string;
+  readonly brokerAcknowledgementTimestamp: string | null;
+  readonly outcomeClassification: BrokerMutationOutcome;
+  readonly resultingLifecycleState: string;
+};
+
 const text = (value: unknown) => typeof value === "string" ? value.trim() : "";
 const positive = (value: unknown) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+};
+const record = (value: unknown): Record<string, unknown> | null =>
+  value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+const decimalText = (value: unknown) => {
+  if (value === null || value === undefined || value === "") return null;
+  const raw = String(value).trim();
+  if (!/^-?\d+(?:\.\d+)?$/.test(raw)) return raw;
+  const negative = raw.startsWith("-");
+  const unsigned = negative ? raw.slice(1) : raw;
+  const [whole, fraction = ""] = unsigned.split(".");
+  const normalizedWhole = whole!.replace(/^0+(?=\d)/, "");
+  const normalizedFraction = fraction.replace(/0+$/, "");
+  return `${negative ? "-" : ""}${normalizedWhole}${
+    normalizedFraction ? `.${normalizedFraction}` : ""
+  }`;
+};
+
+const assertExactReviewAuthorization = (
+  intent: AutonomousExecutionIntentRow
+) => {
+  if (!text(intent.order_intent_id)) {
+    throw new Error("POSTGRES_EXECUTION_INTENT_ID_REQUIRED");
+  }
+  if (
+    !text(intent.execution_review_id) ||
+    !text(intent.confirmation_evidence_id)
+  ) {
+    throw new Error("POSTGRES_EXECUTION_REVIEW_LINEAGE_REQUIRED");
+  }
+  const reviewed = record(intent.review_order_intent);
+  if (!reviewed) {
+    throw new Error("POSTGRES_REVIEW_INTENT_AUTHORIZATION_MISMATCH");
+  }
+  const comparisons: ReadonlyArray<readonly [unknown, unknown]> = [
+    [intent.review_client_order_id, intent.client_order_id],
+    [reviewed.clientOrderId, intent.client_order_id],
+    [reviewed.symbol, intent.symbol],
+    [reviewed.assetClass, intent.asset_class],
+    [reviewed.side, intent.side],
+    [reviewed.operation, intent.operation],
+    [reviewed.orderType, intent.order_type],
+    [reviewed.timeInForce, intent.time_in_force],
+    [reviewed.strategyKey, intent.strategy_key]
+  ];
+  const decimals: ReadonlyArray<readonly [unknown, unknown]> = [
+    [reviewed.quantity, intent.quantity],
+    [reviewed.notional, intent.notional],
+    [reviewed.limitPrice, intent.limit_price],
+    [reviewed.stopPrice, intent.stop_price]
+  ];
+  if (
+    comparisons.some(([authorized, requested]) =>
+      text(authorized) !== text(requested)
+    ) ||
+    decimals.some(([authorized, requested]) =>
+      decimalText(authorized) !== decimalText(requested)
+    )
+  ) {
+    throw new Error("POSTGRES_REVIEW_INTENT_AUTHORIZATION_MISMATCH");
+  }
 };
 
 const marketEvidence = (
@@ -350,6 +448,64 @@ const commandFilter = (command: string) => {
   }
   throw new Error(`POSTGRES_EXECUTION_COMMAND_UNSUPPORTED: ${command}`);
 };
+
+const reviewedNumericMatchesIntentSql = (
+  jsonField: string,
+  intentColumn: string
+) => `(
+  (
+    intent.${intentColumn} IS NULL
+    AND NULLIF(review.order_intent->>'${jsonField}', '') IS NULL
+  )
+  OR (
+    intent.${intentColumn} IS NOT NULL
+    AND review.order_intent->>'${jsonField}' ~ '^[0-9]+([.][0-9]+)?$'
+    AND (review.order_intent->>'${jsonField}')::numeric = intent.${intentColumn}
+  )
+)`;
+
+const exactReviewAuthorizationSql = `
+  review.client_order_id = intent.client_order_id
+  AND review.order_intent->>'clientOrderId' = intent.client_order_id
+  AND review.order_intent->>'symbol' = intent.symbol
+  AND review.order_intent->>'assetClass' = intent.asset_class
+  AND review.order_intent->>'side' = intent.side
+  AND review.order_intent->>'operation' = intent.operation
+  AND review.order_intent->>'orderType' = intent.order_type
+  AND review.order_intent->>'timeInForce' = intent.time_in_force
+  AND review.order_intent->>'strategyKey' = intent.strategy_key
+  AND ${reviewedNumericMatchesIntentSql("quantity", "quantity")}
+  AND ${reviewedNumericMatchesIntentSql("notional", "notional")}
+  AND ${reviewedNumericMatchesIntentSql("limitPrice", "limit_price")}
+  AND ${reviewedNumericMatchesIntentSql("stopPrice", "stop_price")}
+  AND review.blockers = '[]'::jsonb`;
+
+const noPriorBrokerAcknowledgementSql = `
+  NOT EXISTS (
+    SELECT 1
+    FROM orders acknowledged_order
+    WHERE acknowledged_order.account_id = intent.account_id
+      AND (
+        acknowledged_order.order_intent_id = intent.id
+        OR acknowledged_order.client_order_id = intent.client_order_id
+      )
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM broker_events acknowledged_event
+    WHERE acknowledged_event.account_id = intent.account_id
+      AND (
+        acknowledged_event.order_intent_id = intent.id
+        OR acknowledged_event.client_order_id = intent.client_order_id
+      )
+      AND (
+        acknowledged_event.broker_order_id IS NOT NULL
+        OR acknowledged_event.event_status IN (
+          'submission_acknowledged', 'submission_reconciled',
+          'accepted', 'new', 'pending_new', 'partially_filled', 'filled'
+        )
+      )
+  )`;
 
 const fenceSql = (start: number) => `EXISTS (
   SELECT 1 FROM scheduler_leases lease
@@ -766,7 +922,10 @@ const claimIntent = async (
             review.account_fingerprint AS review_account_fingerprint,
             intent.reservation_id, intent.execution_review_id, review.review_type,
             intent.confirmation_evidence_id, review.signature AS review_signature,
-            review.payload_fingerprint, intent.client_order_id,
+            review.payload_fingerprint,
+            review.client_order_id AS review_client_order_id,
+            review.order_intent AS review_order_intent,
+            intent.client_order_id,
             intent.strategy_key, intent.symbol, intent.asset_class,
             intent.underlying_symbol,
             intent.side, intent.order_type, intent.time_in_force,
@@ -797,6 +956,7 @@ const claimIntent = async (
      JOIN execution_reviews review ON review.id = intent.execution_review_id
      JOIN confirmation_evidence confirmation
        ON confirmation.id = intent.confirmation_evidence_id
+      AND confirmation.execution_review_id = review.id
      JOIN strategy_allocations allocation
        ON allocation.account_id = intent.account_id
       AND allocation.strategy_key = intent.strategy_key
@@ -860,8 +1020,10 @@ const claimIntent = async (
        AND review.status = 'valid' AND review.environment = 'paper'
        AND review.paper_only AND NOT review.live_trading_enabled
        AND review.expires_at > $1
+       AND ${exactReviewAuthorizationSql}
        AND confirmation.status = 'valid' AND confirmation.paper_only
        AND confirmation.expires_at > $1
+       AND ${noPriorBrokerAcknowledgementSql}
        AND snapshot.evidence->>'structuralPortfolioFingerprint' = review.account_fingerprint
        AND (
          intent.reservation_id IS NULL OR
@@ -915,6 +1077,7 @@ const claimIntent = async (
   );
   const intent = selected.rows[0] as AutonomousExecutionIntentRow | undefined;
   if (!intent) throw new Error("POSTGRES_EXECUTION_EVIDENCE_GATE_FAILED");
+  assertExactReviewAuthorization(intent);
   if (
     expectedPayloadSignature &&
     intent.review_signature !== expectedPayloadSignature &&
@@ -964,12 +1127,94 @@ const releaseClaim = async (
   );
 };
 
+const buildMutationReceipt = (input: {
+  intent: AutonomousExecutionIntentRow;
+  payload: AlpacaPaperOrderRequest;
+  command: string;
+  fence: SchedulerFence;
+  lifecycleContext: {
+    cycleId: string;
+    workstreamExecutionId: string;
+  };
+  attemptedAt: Date;
+}): BrokerMutationReceipt => {
+  const cycleId = text(input.lifecycleContext.cycleId);
+  const workstreamExecutionId = text(
+    input.lifecycleContext.workstreamExecutionId
+  );
+  if (!cycleId) throw new Error("POSTGRES_MUTATION_CYCLE_ID_REQUIRED");
+  if (!workstreamExecutionId) {
+    throw new Error("POSTGRES_MUTATION_WORKSTREAM_EXECUTION_ID_REQUIRED");
+  }
+  if (workstreamExecutionId !== input.fence.runId) {
+    throw new Error("POSTGRES_MUTATION_SCHEDULER_RUN_MISMATCH");
+  }
+  const intentId = text(input.intent.order_intent_id);
+  if (!intentId) throw new Error("POSTGRES_EXECUTION_INTENT_ID_REQUIRED");
+  const requestFingerprint = canonicalJsonHash(input.payload);
+  return {
+    mutationReceiptId: `mutation_receipt_${stableRecordId(
+      "alpaca_order_submission",
+      `${input.intent.account_id}:${intentId}:${input.intent.client_order_id}`
+    )}`,
+    environment: "paper",
+    intentId,
+    cycleId,
+    workstream: input.command,
+    schedulerRunId: input.fence.runId,
+    fencingToken: input.fence.fencingToken,
+    deterministicClientOrderId: input.intent.client_order_id,
+    submissionAttemptSequence: 1,
+    submissionAction: input.intent.review_type === "exit"
+      ? "closing"
+      : "opening",
+    brokerOrderId: null,
+    requestFingerprint,
+    requestedSymbol: input.payload.symbol,
+    requestedSide: input.payload.side,
+    requestedQuantity: input.payload.qty ?? null,
+    requestedNotional: input.payload.notional ?? null,
+    requestedOrderType: input.payload.type,
+    requestedLimitPrice: input.payload.limit_price ?? null,
+    requestedStopPrice: input.intent.stop_price,
+    requestedPositionIntent:
+      input.intent.operation ??
+      input.payload.position_intent ??
+      input.payload.side,
+    submissionAttemptTimestamp: input.attemptedAt.toISOString(),
+    brokerAcknowledgementTimestamp: null,
+    outcomeClassification: "submission_attempted",
+    resultingLifecycleState: input.intent.review_type === "exit"
+      ? "exit_submission_attempt_persisted"
+      : "submission_attempt_persisted"
+  };
+};
+
+const receiptWithOutcome = (
+  receipt: BrokerMutationReceipt,
+  input: {
+    outcomeClassification: BrokerMutationOutcome;
+    resultingLifecycleState: string;
+    brokerOrderId?: string | null;
+    brokerAcknowledgementTimestamp?: string | null;
+  }
+): BrokerMutationReceipt => ({
+  ...receipt,
+  brokerOrderId: input.brokerOrderId ?? receipt.brokerOrderId,
+  brokerAcknowledgementTimestamp:
+    input.brokerAcknowledgementTimestamp ??
+    receipt.brokerAcknowledgementTimestamp,
+  outcomeClassification: input.outcomeClassification,
+  resultingLifecycleState: input.resultingLifecycleState
+});
+
 const recordSubmission = async (
   query: AutonomousExecutionQuery,
   intent: AutonomousExecutionIntentRow,
   response: AlpacaApiResponse<AlpacaSubmittedOrder>,
+  receipt: BrokerMutationReceipt,
   fence: SchedulerFence,
-  now: Date
+  receivedAt: Date
 ) => {
   const brokerOrderId = text(response.data.id);
   const brokerClientOrderId = text(response.data.client_order_id);
@@ -978,11 +1223,21 @@ const recordSubmission = async (
     throw new Error("POSTGRES_BROKER_SUBMISSION_IDENTITY_INCOMPLETE");
   }
   const orderId = `order_${stableRecordId("alpaca_order", `${intent.account_id}:${brokerOrderId}`)}`;
-  const occurredAt = text(response.data.submitted_at || response.data.created_at) || now.toISOString();
+  const occurredAt = text(response.data.submitted_at || response.data.created_at) ||
+    receivedAt.toISOString();
   const payload = response.data as unknown as Record<string, unknown>;
   const eventId = `broker_event_${stableRecordId("alpaca_broker_event", `${orderId}:${status}:${occurredAt}`)}`;
+  const lifecycleState = lifecycleStateForBrokerStatus(intent.review_type, status);
+  const acknowledgedReceipt = receiptWithOutcome(receipt, {
+    outcomeClassification: status === "rejected"
+      ? "submission_rejected"
+      : "submission_acknowledged",
+    resultingLifecycleState: lifecycleState,
+    brokerOrderId,
+    brokerAcknowledgementTimestamp: receivedAt.toISOString()
+  });
   const values = fenceValues(fence);
-  await query.query(
+  const storedOrder = await query.query(
     `INSERT INTO orders(
        id, account_id, order_intent_id, broker_order_id, client_order_id,
        environment, symbol, asset_class, side, order_type, time_in_force,
@@ -1005,21 +1260,30 @@ const recordSubmission = async (
       response.requestId ?? null, occurredAt, JSON.stringify(payload), ...values
     ]
   );
-  await query.query(
+  if (storedOrder.rowCount !== 1) {
+    throw new Error("POSTGRES_BROKER_ORDER_LINEAGE_CONFLICT");
+  }
+  const storedEvent = await query.query(
     `INSERT INTO broker_events(
        event_id, account_id, order_id, order_intent_id, broker_order_id,
        client_order_id, event_type, event_status, request_id, http_status,
        response_payload, response_fingerprint, occurred_at, received_at
      ) VALUES ($1, $2, $3, $4, $5, $6, 'order_submission', $7, $8, $9,
-               $10::jsonb, $11, $12, $13)
+               $10::jsonb, $11, $12,
+               GREATEST($13::timestamptz, $12::timestamptz))
      ON CONFLICT (event_id) DO NOTHING`,
     [
       eventId, intent.account_id, orderId, intent.order_intent_id, brokerOrderId,
-      intent.client_order_id, status, response.requestId ?? null, response.status,
-      JSON.stringify(payload), canonicalJsonHash(payload), occurredAt, now.toISOString()
+      intent.client_order_id, acknowledgedReceipt.outcomeClassification,
+      response.requestId ?? null, response.status,
+      JSON.stringify(acknowledgedReceipt),
+      canonicalJsonHash(acknowledgedReceipt),
+      occurredAt, receivedAt.toISOString()
     ]
   );
-  const lifecycleState = lifecycleStateForBrokerStatus(intent.review_type, status);
+  if (storedEvent.rowCount !== 1) {
+    throw new Error("POSTGRES_MUTATION_RECEIPT_ACKNOWLEDGEMENT_PERSISTENCE_FAILED");
+  }
   const terminalWithoutFill = ["cancelled", "rejected", "expired"].includes(lifecycleState);
   const reservationReleaseReason = lifecycleState === "cancelled"
     ? "broker_terminal_cancelled"
@@ -1041,7 +1305,7 @@ const recordSubmission = async (
      WHERE id = $1 AND status = 'submission_pending' AND ${fenceSql(7)}`,
     [
       intent.order_intent_id,
-      now.toISOString(),
+      receivedAt.toISOString(),
       intentStatus,
       lifecycleState,
       terminalWithoutFill,
@@ -1090,7 +1354,7 @@ const recordSubmission = async (
       [
         intent.reservation_id,
         reservationReleaseReason,
-        now.toISOString(),
+        receivedAt.toISOString(),
         intent.order_intent_id,
         lifecycleState,
         transitionId,
@@ -1110,48 +1374,63 @@ const recordSubmission = async (
       `UPDATE buying_power_reservations
        SET status = 'committed', committed_at = $2, updated_at = $2, version = version + 1
        WHERE id = $1 AND status = 'active' AND ${fenceSql(3)}`,
-      [intent.reservation_id, now.toISOString(), ...values]
+      [intent.reservation_id, receivedAt.toISOString(), ...values]
     );
     if (reservation.rowCount !== 1) {
       throw new Error("POSTGRES_EXECUTION_RESERVATION_COMMIT_FAILED");
     }
   }
-  await query.query(
+  const consumedReview = await query.query(
     `UPDATE execution_reviews
      SET status = 'consumed', consumed_at = $2, updated_at = $2, version = version + 1
      WHERE id = $1 AND status = 'valid' AND ${fenceSql(3)}`,
-    [intent.execution_review_id, now.toISOString(), ...values]
+    [intent.execution_review_id, receivedAt.toISOString(), ...values]
   );
-  await query.query(
+  if (consumedReview.rowCount !== 1) {
+    throw new Error("POSTGRES_EXECUTION_REVIEW_CONSUMPTION_FAILED");
+  }
+  const consumedConfirmation = await query.query(
     `UPDATE confirmation_evidence
      SET status = 'consumed', consumed_at = $2, updated_at = $2, version = version + 1
      WHERE id = $1 AND status = 'valid' AND ${fenceSql(3)}`,
-    [intent.confirmation_evidence_id, now.toISOString(), ...values]
+    [intent.confirmation_evidence_id, receivedAt.toISOString(), ...values]
   );
+  if (consumedConfirmation.rowCount !== 1) {
+    throw new Error("POSTGRES_EXECUTION_CONFIRMATION_CONSUMPTION_FAILED");
+  }
   await persistCandidateExecutionStage(
     query,
     intent,
     fence,
-    now,
+    receivedAt,
     terminalWithoutFill ? "execution_deferred" : "executed",
     terminalWithoutFill ? `PAPER_ORDER_${status.toUpperCase()}` : "PAPER_ORDER_SUBMITTED"
   );
-  return { orderId, brokerOrderId, status };
+  return {
+    orderId,
+    brokerOrderId,
+    status,
+    mutationReceipt: acknowledgedReceipt
+  };
 };
 
 const recordSubmissionAttempt = async (
   query: AutonomousExecutionQuery,
   intent: AutonomousExecutionIntentRow,
   payload: AlpacaPaperOrderRequest,
+  command: string,
   fence: SchedulerFence,
   now: Date,
-  lifecycleContext?: { cycleId: string; workstreamExecutionId: string }
+  lifecycleContext: { cycleId: string; workstreamExecutionId: string }
 ) => {
-  const evidence = {
-    command: "submit_order",
-    clientOrderId: intent.client_order_id,
-    payload
-  };
+  const receipt = buildMutationReceipt({
+    intent,
+    payload,
+    command,
+    fence,
+    lifecycleContext,
+    attemptedAt: now
+  });
   const eventId = `broker_event_${stableRecordId(
     "alpaca_broker_submission_attempt",
     `${intent.account_id}:${intent.order_intent_id}:${intent.client_order_id}`
@@ -1161,7 +1440,8 @@ const recordSubmissionAttempt = async (
        event_id, account_id, order_intent_id, client_order_id,
        event_type, event_status, retryable, response_payload,
        response_fingerprint, occurred_at, received_at
-     ) SELECT $1, $2, $3, $4, 'order_submission_attempt', 'pending', true,
+     ) SELECT $1, $2, $3, $4, 'order_submission_attempt',
+              'submission_attempted', true,
               $5::jsonb, $6, $7, $7
        WHERE ${fenceSql(8)}
      ON CONFLICT (event_id) DO NOTHING`,
@@ -1170,13 +1450,13 @@ const recordSubmissionAttempt = async (
       intent.account_id,
       intent.order_intent_id,
       intent.client_order_id,
-      JSON.stringify(evidence),
-      canonicalJsonHash(evidence),
+      JSON.stringify(receipt),
+      canonicalJsonHash(receipt),
       now.toISOString(),
       ...fenceValues(fence)
     ]
   );
-  if (inserted.rowCount !== 0 && inserted.rowCount !== 1) {
+  if (inserted.rowCount !== 1) {
     throw new Error("POSTGRES_BROKER_SUBMISSION_ATTEMPT_PERSISTENCE_FAILED");
   }
   const lifecycleState = intent.review_type === "exit"
@@ -1195,19 +1475,26 @@ const recordSubmissionAttempt = async (
   if (lifecycleUpdated.rowCount !== 1) {
     throw new Error("POSTGRES_BROKER_SUBMISSION_ATTEMPT_LIFECYCLE_PERSISTENCE_FAILED");
   }
+  return receipt;
 };
 
 const recordAmbiguousSubmission = async (
   query: AutonomousExecutionQuery,
   intent: AutonomousExecutionIntentRow,
+  receipt: BrokerMutationReceipt,
   error: unknown,
   fence: SchedulerFence,
-  now: Date
+  now: Date,
+  errorClassification = "ambiguous_network_result"
 ) => {
   const message = error instanceof Error
     ? error.message.slice(0, 500)
     : "Broker submission ended without a verified response.";
-  const payload = { code: "POSTGRES_BROKER_SUBMISSION_AMBIGUOUS", message };
+  const payload = {
+    ...receipt,
+    code: "POSTGRES_BROKER_SUBMISSION_AMBIGUOUS",
+    message
+  };
   const eventId = `broker_event_${stableRecordId(
     "alpaca_broker_submission_ambiguous",
     `${intent.account_id}:${intent.client_order_id}:${now.toISOString()}`
@@ -1228,15 +1515,17 @@ const recordAmbiguousSubmission = async (
        event_id, account_id, order_intent_id, client_order_id,
        event_type, event_status, error_classification, retryable,
        response_payload, response_fingerprint, occurred_at, received_at
-     ) SELECT $1, $2, $3, $4, 'order_submission', 'ambiguous',
-              'ambiguous_network_result', true, $5::jsonb, $6, $7, $7
-       WHERE ${fenceSql(8)}
+     ) SELECT $1, $2, $3, $4, 'order_submission', $5,
+              $6, true, $7::jsonb, $8, $9, $9
+       WHERE ${fenceSql(10)}
      ON CONFLICT (event_id) DO NOTHING`,
     [
       eventId,
       intent.account_id,
       intent.order_intent_id,
       intent.client_order_id,
+      receipt.outcomeClassification,
+      errorClassification,
       JSON.stringify(payload),
       canonicalJsonHash(payload),
       now.toISOString(),
@@ -1254,6 +1543,7 @@ const recordAmbiguousSubmission = async (
     "execution_ambiguous",
     "POSTGRES_BROKER_SUBMISSION_AMBIGUOUS"
   );
+  return receipt;
 };
 
 const isAmbiguousSubmissionError = (error: unknown) => {
@@ -1268,12 +1558,21 @@ const isAmbiguousSubmissionError = (error: unknown) => {
 const recordDeterministicSubmissionFailure = async (
   query: AutonomousExecutionQuery,
   intent: AutonomousExecutionIntentRow,
+  receipt: BrokerMutationReceipt,
   error: unknown,
   fence: SchedulerFence,
   now: Date
 ) => {
   const message = error instanceof Error ? error.message.slice(0, 500) : "Broker rejected the order.";
-  const payload = { code: "POSTGRES_BROKER_SUBMISSION_REJECTED", message };
+  const rejectedReceipt = receiptWithOutcome(receipt, {
+    outcomeClassification: "submission_rejected",
+    resultingLifecycleState: "failed_terminal"
+  });
+  const payload = {
+    ...rejectedReceipt,
+    code: "POSTGRES_BROKER_SUBMISSION_REJECTED",
+    message
+  };
   const values = fenceValues(fence);
   const updated = await query.query(
     `UPDATE order_intents
@@ -1283,12 +1582,12 @@ const recordDeterministicSubmissionFailure = async (
     [intent.order_intent_id, now.toISOString(), ...values]
   );
   if (updated.rowCount !== 1) throw new Error("POSTGRES_BROKER_SUBMISSION_REJECTION_PERSISTENCE_FAILED");
-  await query.query(
+  const inserted = await query.query(
     `INSERT INTO broker_events(
        event_id, account_id, order_intent_id, client_order_id,
        event_type, event_status, error_classification, retryable,
        response_payload, response_fingerprint, occurred_at, received_at
-     ) SELECT $1, $2, $3, $4, 'order_submission', 'rejected',
+     ) SELECT $1, $2, $3, $4, 'order_submission', 'submission_rejected',
               'deterministic_broker_rejection', false, $5::jsonb, $6, $7, $7
        WHERE ${fenceSql(8)}
      ON CONFLICT (event_id) DO NOTHING`,
@@ -1298,6 +1597,86 @@ const recordDeterministicSubmissionFailure = async (
       JSON.stringify(payload), canonicalJsonHash(payload), now.toISOString(), ...values
     ]
   );
+  if (inserted.rowCount !== 1) {
+    throw new Error("POSTGRES_MUTATION_RECEIPT_REJECTION_PERSISTENCE_FAILED");
+  }
+  return rejectedReceipt;
+};
+
+const recordReconciledSubmissionReceipt = async (
+  query: AutonomousExecutionQuery,
+  intent: AutonomousExecutionIntentRow,
+  receipt: BrokerMutationReceipt,
+  recovery: Extract<AmbiguousSubmissionRecovery, { status: "recovered" }>,
+  fence: SchedulerFence,
+  now: Date
+) => {
+  const reconciledReceipt = receiptWithOutcome(receipt, {
+    outcomeClassification: "submission_reconciled",
+    resultingLifecycleState: lifecycleStateForBrokerStatus(
+      intent.review_type,
+      recovery.brokerStatus
+    ),
+    brokerOrderId: recovery.brokerOrderId,
+    brokerAcknowledgementTimestamp: now.toISOString()
+  });
+  const eventId = `broker_event_${stableRecordId(
+    "alpaca_broker_submission_receipt_reconciled",
+    `${intent.account_id}:${intent.client_order_id}:${recovery.brokerOrderId}`
+  )}`;
+  const inserted = await query.query(
+    `INSERT INTO broker_events(
+       event_id, account_id, order_id, order_intent_id, broker_order_id,
+       client_order_id, event_type, event_status, retryable,
+       response_payload, response_fingerprint, occurred_at, received_at
+     ) SELECT $1, $2, $3, $4, $5, $6,
+              'order_submission_receipt', 'submission_reconciled', false,
+              $7::jsonb, $8, $9, $9
+       WHERE ${fenceSql(10)}
+     ON CONFLICT (event_id) DO NOTHING`,
+    [
+      eventId,
+      intent.account_id,
+      recovery.orderId,
+      intent.order_intent_id,
+      recovery.brokerOrderId,
+      intent.client_order_id,
+      JSON.stringify(reconciledReceipt),
+      canonicalJsonHash(reconciledReceipt),
+      now.toISOString(),
+      ...fenceValues(fence)
+    ]
+  );
+  if (inserted.rowCount !== 1) {
+    throw new Error("POSTGRES_MUTATION_RECEIPT_RECONCILIATION_PERSISTENCE_FAILED");
+  }
+  const consumedReview = await query.query(
+    `UPDATE execution_reviews
+     SET status = 'consumed', consumed_at = $2, updated_at = $2,
+         version = version + 1
+     WHERE id = $1 AND status IN ('valid', 'expired')
+       AND ${fenceSql(3)}`,
+    [intent.execution_review_id, now.toISOString(), ...fenceValues(fence)]
+  );
+  if (consumedReview.rowCount !== 1) {
+    throw new Error("POSTGRES_EXECUTION_REVIEW_CONSUMPTION_FAILED");
+  }
+  const consumedConfirmation = await query.query(
+    `UPDATE confirmation_evidence
+     SET status = 'consumed', consumed_at = $2, updated_at = $2,
+         version = version + 1
+     WHERE id = $1 AND status IN ('valid', 'expired')
+       AND ${fenceSql(3)}`,
+    [
+      intent.confirmation_evidence_id,
+      now.toISOString(),
+      ...fenceValues(fence)
+    ]
+  );
+  if (consumedConfirmation.rowCount !== 1) {
+    throw new Error("POSTGRES_EXECUTION_CONFIRMATION_CONSUMPTION_FAILED");
+  }
+  return reconciledReceipt;
 };
 
 const assertSafety = (safety: AutonomousExecutionSafety, confirmPaper: boolean) => {
@@ -1347,10 +1726,13 @@ export const runAutonomousPostgresExecutionCommand = async <
        COUNT(*) FILTER (
          WHERE intent.status = 'ready_for_submission'
            AND review.status = 'valid' AND review.expires_at > now()
+           AND ${exactReviewAuthorizationSql}
+           AND ${noPriorBrokerAcknowledgementSql}
            AND EXISTS (
              SELECT 1
              FROM confirmation_evidence current_confirmation
              WHERE current_confirmation.id = intent.confirmation_evidence_id
+               AND current_confirmation.execution_review_id = review.id
                AND current_confirmation.status = 'valid'
                AND current_confirmation.paper_only
                AND current_confirmation.expires_at > now()
@@ -1359,6 +1741,8 @@ export const runAutonomousPostgresExecutionCommand = async <
        COUNT(*) FILTER (
          WHERE intent.status = 'created'
            AND review.status = 'valid' AND review.expires_at > now()
+           AND ${exactReviewAuthorizationSql}
+           AND ${noPriorBrokerAcknowledgementSql}
        ) AS confirmable_count
      FROM order_intents intent
      JOIN execution_reviews review ON review.id = intent.execution_review_id
@@ -1467,9 +1851,22 @@ export const runAutonomousPostgresExecutionCommand = async <
     );
     throw error;
   }
+  const lifecycleContext = input.lifecycleContext ?? {
+    cycleId: input.fence.runId,
+    workstreamExecutionId: input.fence.runId
+  };
+  let mutationReceipt: BrokerMutationReceipt;
   try {
-    await input.transaction((query) =>
-      recordSubmissionAttempt(query, intent, payload, input.fence, now, input.lifecycleContext)
+    mutationReceipt = await input.transaction((query) =>
+      recordSubmissionAttempt(
+        query,
+        intent,
+        payload,
+        input.command,
+        input.fence,
+        now,
+        lifecycleContext
+      )
     );
   } catch (error) {
     const reason = error instanceof Error
@@ -1480,26 +1877,16 @@ export const runAutonomousPostgresExecutionCommand = async <
     );
     throw error;
   }
-  let recorded: Awaited<ReturnType<typeof recordSubmission>>;
-  try {
-    const response = await input.submitOrder(payload);
-    recorded = await input.transaction((query) =>
-      recordSubmission(query, intent, response, input.fence, now)
-    );
-  } catch (error) {
-    if (!isAmbiguousSubmissionError(error)) {
-      await input.transaction((query) =>
-        recordDeterministicSubmissionFailure(query, intent, error, input.fence, now)
-      );
-      throw error;
-    }
-    await input.transaction((query) =>
-      recordAmbiguousSubmission(query, intent, error, input.fence, now)
-    );
+
+  const recoverSubmission = async (
+    uncertainReceipt: BrokerMutationReceipt
+  ) => {
     if (!input.recoverAmbiguousSubmission) {
       throw new Error("POSTGRES_BROKER_SUBMISSION_AMBIGUOUS");
     }
-    const recovery = await input.recoverAmbiguousSubmission(intent.client_order_id);
+    const recovery = await input.recoverAmbiguousSubmission(
+      intent.client_order_id
+    );
     if (recovery.status === "pending") {
       return {
         status: "recovery_pending" as const,
@@ -1512,20 +1899,33 @@ export const runAutonomousPostgresExecutionCommand = async <
           orderIntentId: intent.order_intent_id,
           clientOrderId: intent.client_order_id,
           recoveredFromAmbiguous: false,
-          recoveryAttempts: recovery.attempts
+          recoveryAttempts: recovery.attempts,
+          mutationReceipt: uncertainReceipt
         }
       };
     }
-    await input.transaction((query) =>
-      persistCandidateExecutionStage(
+    const reconciledAt = new Date(
+      Math.max(Date.now(), now.getTime())
+    );
+    const reconciledReceipt = await input.transaction(async (query) => {
+      const persistedReceipt = await recordReconciledSubmissionReceipt(
+        query,
+        intent,
+        uncertainReceipt,
+        recovery,
+        input.fence,
+        reconciledAt
+      );
+      await persistCandidateExecutionStage(
         query,
         intent,
         input.fence,
-        now,
+        reconciledAt,
         "executed",
         "PAPER_ORDER_RECOVERED_BY_CLIENT_ID"
-      )
-    );
+      );
+      return persistedReceipt;
+    });
     return {
       status: "completed" as const,
       submittedOrderCount: 1,
@@ -1537,9 +1937,107 @@ export const runAutonomousPostgresExecutionCommand = async <
         orderId: recovery.orderId,
         brokerOrderId: recovery.brokerOrderId,
         brokerStatus: recovery.brokerStatus,
-        recoveredFromAmbiguous: true
+        recoveredFromAmbiguous: true,
+        mutationReceipt: reconciledReceipt
       }
     };
+  };
+
+  let response: AlpacaApiResponse<AlpacaSubmittedOrder>;
+  try {
+    response = await input.submitOrder(payload);
+  } catch (error) {
+    const failedAt = new Date(Math.max(Date.now(), now.getTime()));
+    if (!isAmbiguousSubmissionError(error)) {
+      await input.transaction((query) =>
+        recordDeterministicSubmissionFailure(
+          query,
+          intent,
+          mutationReceipt,
+          error,
+          input.fence,
+          failedAt
+        )
+      );
+      throw error;
+    }
+    const uncertainReceipt = receiptWithOutcome(mutationReceipt, {
+      outcomeClassification: "submission_transport_unknown",
+      resultingLifecycleState: intent.review_type === "exit"
+        ? "exit_submission_ambiguous"
+        : "submission_ambiguous"
+    });
+    await input.transaction((query) =>
+      recordAmbiguousSubmission(
+        query,
+        intent,
+        uncertainReceipt,
+        error,
+        input.fence,
+        failedAt
+      )
+    );
+    return recoverSubmission(uncertainReceipt);
+  }
+
+  const brokerOccurredAt = Date.parse(
+    text(response.data.submitted_at || response.data.created_at)
+  );
+  const acknowledgementAt = new Date(
+    Math.max(
+      Date.now(),
+      now.getTime(),
+      Number.isFinite(brokerOccurredAt) ? brokerOccurredAt : 0
+    ) + (Number.isFinite(brokerOccurredAt) ? 1 : 0)
+  );
+  let recorded: Awaited<ReturnType<typeof recordSubmission>>;
+  try {
+    recorded = await input.transaction((query) =>
+      recordSubmission(
+        query,
+        intent,
+        response,
+        mutationReceipt,
+        input.fence,
+        acknowledgementAt
+      )
+    );
+  } catch (error) {
+    const brokerOrderId = text(response.data.id);
+    const brokerStatus = text(response.data.status).toLowerCase();
+    const acknowledgementReceipt =
+      brokerOrderId && brokerStatus
+        ? receiptWithOutcome(mutationReceipt, {
+            outcomeClassification: brokerStatus === "rejected"
+              ? "submission_rejected"
+              : "submission_acknowledged",
+            resultingLifecycleState: lifecycleStateForBrokerStatus(
+              intent.review_type,
+              brokerStatus
+            ),
+            brokerOrderId,
+            brokerAcknowledgementTimestamp: acknowledgementAt.toISOString()
+          })
+        : receiptWithOutcome(mutationReceipt, {
+            outcomeClassification: "submission_transport_unknown",
+            resultingLifecycleState: intent.review_type === "exit"
+              ? "exit_submission_ambiguous"
+              : "submission_ambiguous"
+          });
+    await input.transaction((query) =>
+      recordAmbiguousSubmission(
+        query,
+        intent,
+        acknowledgementReceipt,
+        error,
+        input.fence,
+        acknowledgementAt,
+        brokerOrderId
+          ? "acknowledgement_persistence_failure"
+          : "malformed_broker_acknowledgement"
+      )
+    );
+    return recoverSubmission(acknowledgementReceipt);
   }
   return {
     status: "completed" as const,
@@ -1551,7 +2049,9 @@ export const runAutonomousPostgresExecutionCommand = async <
       orderIntentId: intent.order_intent_id,
       orderId: recorded.orderId,
       brokerOrderId: recorded.brokerOrderId,
-      brokerStatus: recorded.status
+      brokerStatus: recorded.status,
+      recoveredFromAmbiguous: false,
+      mutationReceipt: recorded.mutationReceipt
     }
   };
 };

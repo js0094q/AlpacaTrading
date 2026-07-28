@@ -102,6 +102,16 @@ four persisted absence observations and at least 120 seconds before the intent
 is terminalized and its reservation is released. Restart recovery resumes the
 same persisted ambiguous intent.
 
+The submission claim also requires the review's exact client ID and serialized
+order shape to match the same intent, rejects any prior broker acknowledgement,
+and persists a deterministic mutation receipt in `broker_events` before the
+call. Receipt outcomes distinguish attempted, acknowledged, rejected,
+transport-unknown, and reconciled submissions. Broker acknowledgement events
+use a fresh receipt timestamp that cannot precede the broker event timestamp,
+and the autonomous worker carries the receipt's safe lineage summary into the
+authoritative workstream result. A broker-mutating workstream therefore cannot
+be recorded as `no_action`.
+
 The worker reconciles before research, between entry and exit phases, and after
 exit/cancellation. Its production cancellation workstream queries Alpaca first,
 persists the request before mutation, skips filled or terminal orders, then

@@ -130,6 +130,14 @@
   reconciliation without resubmission. Confirmed absence requires four
   persisted observations spanning at least 120 seconds before failure and
   reservation release; restart recovery resumes the persisted ambiguous work.
+- Submission now requires the review's exact client ID and serialized order
+  shape to match the same PostgreSQL intent and excludes any intent with a
+  prior broker acknowledgement. The durable pre-call event carries a complete
+  deterministic mutation receipt; acknowledged, rejected, transport-unknown,
+  and reconciled outcomes append receipt state under the same lineage.
+  Acknowledgement persistence uses a fresh timestamp no earlier than the broker
+  event, and the worker persists a safe mutation summary instead of allowing a
+  broker-mutating result to become `no_action`.
 - The worker's 20 public workstreams retain portfolio review and signed ops
   review before entry execution, reconcile before research and immediately
   after every entry, exit, and cancellation broker mutation, refresh

@@ -578,12 +578,102 @@ const recoveryEnvelope = (output) => {
   return { empty };
 };
 
+const MUTATION_OUTCOMES = new Set([
+  "submission_attempted",
+  "submission_acknowledged",
+  "submission_rejected",
+  "submission_transport_unknown",
+  "submission_reconciled"
+]);
+
+const mutationEnvelope = (output) => {
+  const envelope = latestStructuredOutput(
+    output,
+    (value) =>
+      Number.isSafeInteger(value.submittedOrderCount) &&
+      value.submittedOrderCount >= 0
+  );
+  if (!envelope) return null;
+  const receipt = envelope.evidence?.mutationReceipt;
+  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) {
+    return envelope.submittedOrderCount > 0
+      ? { invalid: true, reasonCode: "MUTATION_RECEIPT_MISSING" }
+      : null;
+  }
+  const requiredStrings = [
+    "mutationReceiptId",
+    "environment",
+    "intentId",
+    "cycleId",
+    "workstream",
+    "schedulerRunId",
+    "fencingToken",
+    "deterministicClientOrderId",
+    "submissionAction",
+    "requestFingerprint",
+    "requestedSymbol",
+    "requestedSide",
+    "requestedOrderType",
+    "requestedPositionIntent",
+    "submissionAttemptTimestamp",
+    "outcomeClassification",
+    "resultingLifecycleState"
+  ];
+  if (
+    !requiredStrings.every(
+      (field) => typeof receipt[field] === "string" && receipt[field].trim()
+    ) ||
+    receipt.environment !== "paper" ||
+    receipt.submissionAttemptSequence !== 1 ||
+    !["opening", "closing"].includes(receipt.submissionAction) ||
+    !MUTATION_OUTCOMES.has(receipt.outcomeClassification)
+  ) {
+    return { invalid: true, reasonCode: "MUTATION_RECEIPT_INVALID" };
+  }
+  return {
+    invalid: false,
+    outcomeClassification: receipt.outcomeClassification,
+    mutationSummary: {
+      mutationReceiptId: receipt.mutationReceiptId,
+      intentId: receipt.intentId,
+      clientOrderId: receipt.deterministicClientOrderId,
+      brokerOrderId:
+        typeof receipt.brokerOrderId === "string" && receipt.brokerOrderId.trim()
+          ? receipt.brokerOrderId
+          : null,
+      outcomeClassification: receipt.outcomeClassification,
+      resultingLifecycleState: receipt.resultingLifecycleState
+    }
+  };
+};
+
 const classify = ({ exitCode, output, spawnError, timedOut }, script) => {
   if (spawnError) return { classification: "runner_unavailable", code: "WORKSTREAM_RUNNER_UNAVAILABLE" };
   if (timedOut) return { classification: "timed_out", code: "WORKSTREAM_TIMEOUT" };
   if (exitCode === 0) {
     if (/"status"\s*:\s*"(failed|rejected)"/i.test(output)) {
       return { classification: "failed", code: "WORKSTREAM_COMMAND_FAILED" };
+    }
+    const mutation = mutationEnvelope(output);
+    if (mutation?.invalid) {
+      return {
+        classification: "mutation_indeterminate",
+        code: null,
+        reasonCode: mutation.reasonCode
+      };
+    }
+    if (mutation) {
+      return {
+        classification:
+          mutation.outcomeClassification === "submission_transport_unknown"
+            ? "mutation_indeterminate"
+            : "success",
+        code: null,
+        ...(mutation.outcomeClassification === "submission_transport_unknown"
+          ? { reasonCode: "BROKER_MUTATION_OUTCOME_INDETERMINATE" }
+          : {}),
+        mutationSummary: mutation.mutationSummary
+      };
     }
     const reasonCode = structuredReasonCode(output);
     if (script === "system:recover") {

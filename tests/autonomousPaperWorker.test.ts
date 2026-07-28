@@ -79,6 +79,33 @@ const emptyRecoveryCounters = {
   staleReadyAllocationsAdjusted: 0
 } as const;
 
+const acknowledgedMutationReceipt = {
+  mutationReceiptId: "mutation_receipt_test",
+  environment: "paper",
+  intentId: "intent-test",
+  cycleId: "cycle-test",
+  workstream: "paper:execute:reviewed",
+  schedulerRunId: "run-test",
+  fencingToken: "42",
+  deterministicClientOrderId: "pg-test",
+  submissionAttemptSequence: 1,
+  submissionAction: "opening",
+  brokerOrderId: "broker-test",
+  requestFingerprint: "a".repeat(64),
+  requestedSymbol: "AAPL",
+  requestedSide: "buy",
+  requestedQuantity: "1",
+  requestedNotional: null,
+  requestedOrderType: "market",
+  requestedLimitPrice: null,
+  requestedStopPrice: null,
+  requestedPositionIntent: "buy_to_open",
+  submissionAttemptTimestamp: "2026-07-28T16:00:00.000Z",
+  brokerAcknowledgementTimestamp: "2026-07-28T16:00:01.000Z",
+  outcomeClassification: "submission_acknowledged",
+  resultingLifecycleState: "broker_order_accepted"
+} as const;
+
 const completePostgresOnlyEnvironment = {
   ...process.env,
   ALPACA_ENV: "paper",
@@ -1146,6 +1173,90 @@ test("legitimate PostgreSQL empty-work outcomes are no-action completions across
     false
   );
   assert.equal(states.some((state) => state.eventType === "cycle_completed"), true);
+});
+
+test("an acknowledged broker mutation is persisted as a mutation-bearing workstream success", () => {
+  const { result, states } = runWorker({
+    successOutputs: {
+      "paper:execute:reviewed": JSON.stringify({
+        status: "completed",
+        submittedOrderCount: 1,
+        evidence: { mutationReceipt: acknowledgedMutationReceipt }
+      })
+    }
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const completion = states.find(
+    (state) =>
+      state.eventType === "workstream_completed" &&
+      state.payload.workstream === "paper:execute:reviewed"
+  );
+  assert.equal(completion?.payload.classification, "success");
+  assert.deepEqual(completion?.payload.mutationSummary, {
+    mutationReceiptId: "mutation_receipt_test",
+    intentId: "intent-test",
+    clientOrderId: "pg-test",
+    brokerOrderId: "broker-test",
+    outcomeClassification: "submission_acknowledged",
+    resultingLifecycleState: "broker_order_accepted"
+  });
+});
+
+test("a workstream with a broker mutation cannot be persisted as no_action", () => {
+  const { result, states } = runWorker({
+    successOutputs: {
+      "paper:execute:reviewed": JSON.stringify({
+        status: "no_op",
+        code: "NO_READY_POSTGRES_ORDER_INTENTS",
+        submittedOrderCount: 1,
+        evidence: { mutationReceipt: acknowledgedMutationReceipt }
+      })
+    }
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const completion = states.find(
+    (state) =>
+      state.eventType === "workstream_completed" &&
+      state.payload.workstream === "paper:execute:reviewed"
+  );
+  assert.notEqual(completion?.payload.classification, "no_action");
+  assert.equal(completion?.payload.mutationSummary !== undefined, true);
+});
+
+test("a transport-unknown submission is mutation-indeterminate and lookup-oriented", () => {
+  const receipt = {
+    ...acknowledgedMutationReceipt,
+    brokerOrderId: null,
+    brokerAcknowledgementTimestamp: null,
+    outcomeClassification: "submission_transport_unknown",
+    resultingLifecycleState: "submission_ambiguous"
+  };
+  const { result, states } = runWorker({
+    successOutputs: {
+      "paper:execute:reviewed": JSON.stringify({
+        status: "recovery_pending",
+        code: "POSTGRES_BROKER_SUBMISSION_RECOVERY_PENDING",
+        submittedOrderCount: 0,
+        evidence: {
+          recoveredFromAmbiguous: false,
+          recoveryAttempts: 8,
+          mutationReceipt: receipt
+        }
+      })
+    }
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const completion = states.find(
+    (state) =>
+      state.eventType === "workstream_completed" &&
+      state.payload.workstream === "paper:execute:reviewed"
+  );
+  assert.equal(completion?.payload.classification, "mutation_indeterminate");
+  assert.equal(
+    (completion?.payload.mutationSummary as Record<string, unknown>)
+      ?.outcomeClassification,
+    "submission_transport_unknown"
+  );
 });
 
 test("empty terminal recovery is a successful no-action outcome", () => {

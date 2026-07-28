@@ -10,41 +10,73 @@ import {
   type AutonomousExecutionIntentRow
 } from "../src/services/autonomousPostgresExecutionService.js";
 
-const intent = (overrides: Partial<AutonomousExecutionIntentRow> = {}): AutonomousExecutionIntentRow => ({
-  order_intent_id: "intent-1",
-  candidate_id: "candidate-1",
-  account_id: "account-1",
-  broker_account_id: "broker-account-1",
-  account_snapshot_fingerprint: "portfolio-fingerprint",
-  review_account_fingerprint: "structural-fingerprint",
-  reservation_id: "reservation-1",
-  execution_review_id: "review-1",
-  review_type: "entry",
-  confirmation_evidence_id: "confirmation-1",
-  client_order_id: "worker-order-1",
-  strategy_key: "baseline",
-  symbol: "AAPL",
-  asset_class: "equity",
-  side: "buy",
-  order_type: "limit",
-  time_in_force: "day",
-  quantity: "1",
-  notional: null,
-  limit_price: "200",
-  stop_price: null,
-  intent_version: "2",
-  operation: "buy_to_open",
-  strategy_classification: "equity_long",
-  parent_position_id: null,
-  opening_intent_id: null,
-  contract_id: null,
-  position_side: null,
-  position_available_quantity: null,
-  position_option_symbol: null,
-  position_contract_id: null,
-  market_evidence: [{ symbol: "AAPL", referencePrice: 200, timestamp: "2026-07-20T21:59:30.000Z" }],
-  ...overrides
-});
+const intent = (
+  overrides: Partial<AutonomousExecutionIntentRow> = {}
+): AutonomousExecutionIntentRow => {
+  const row: AutonomousExecutionIntentRow = {
+    order_intent_id: "intent-1",
+    candidate_id: "candidate-1",
+    account_id: "account-1",
+    broker_account_id: "broker-account-1",
+    account_snapshot_fingerprint: "portfolio-fingerprint",
+    review_account_fingerprint: "structural-fingerprint",
+    reservation_id: "reservation-1",
+    execution_review_id: "review-1",
+    review_type: "entry",
+    confirmation_evidence_id: "confirmation-1",
+    client_order_id: "worker-order-1",
+    strategy_key: "baseline",
+    symbol: "AAPL",
+    asset_class: "equity",
+    side: "buy",
+    order_type: "limit",
+    time_in_force: "day",
+    quantity: "1",
+    notional: null,
+    limit_price: "200",
+    stop_price: null,
+    intent_version: "2",
+    operation: "buy_to_open",
+    strategy_classification: "equity_long",
+    parent_position_id: null,
+    opening_intent_id: null,
+    contract_id: null,
+    position_side: null,
+    position_available_quantity: null,
+    position_option_symbol: null,
+    position_contract_id: null,
+    market_evidence: [{
+      symbol: "AAPL",
+      referencePrice: 200,
+      timestamp: "2026-07-20T21:59:30.000Z"
+    }],
+    ...overrides
+  };
+  return {
+    ...row,
+    review_client_order_id:
+      Object.prototype.hasOwnProperty.call(overrides, "review_client_order_id")
+        ? overrides.review_client_order_id
+        : row.client_order_id,
+    review_order_intent:
+      Object.prototype.hasOwnProperty.call(overrides, "review_order_intent")
+        ? overrides.review_order_intent
+        : {
+            clientOrderId: row.client_order_id,
+            symbol: row.symbol,
+            assetClass: row.asset_class,
+            side: row.side,
+            operation: row.operation,
+            orderType: row.order_type,
+            timeInForce: row.time_in_force,
+            strategyKey: row.strategy_key,
+            quantity: row.quantity,
+            notional: row.notional,
+            limitPrice: row.limit_price,
+            stopPrice: row.stop_price
+          }
+  };
+};
 
 const broker = {
   capturedAt: "2026-07-20T22:00:00.000Z",
@@ -154,7 +186,12 @@ test("a direct terminal broker response settles reservation and audit under one 
     now: new Date("2026-07-20T22:00:00.000Z")
   });
 
-  assert.equal(result.evidence.brokerStatus, "rejected");
+  assert.equal(
+    "brokerStatus" in result.evidence
+      ? result.evidence.brokerStatus
+      : undefined,
+    "rejected"
+  );
   const settlement = statements.find(({ sql }) => sql.includes("released_reservation_count"));
   assert.ok(settlement);
   assert.match(settlement.sql, /INSERT INTO reservation_terminal_transitions/);
@@ -1108,6 +1145,32 @@ test("an uncertain broker submission recovers by client order ID without a dupli
   assert.equal(result.status, "completed");
   assert.equal(result.evidence.recoveredFromAmbiguous, true);
   assert.equal(result.evidence.brokerOrderId, "broker-order-recovered");
+  const recoveredReceipt = "mutationReceipt" in result.evidence
+    ? result.evidence.mutationReceipt
+    : undefined;
+  assert.ok(recoveredReceipt);
+  assert.equal(
+    recoveredReceipt.outcomeClassification,
+    "submission_reconciled"
+  );
+  assert.equal(
+    recoveredReceipt.brokerOrderId,
+    "broker-order-recovered"
+  );
+  assert.equal(
+    transactionSql.some((sql) =>
+      sql.includes("UPDATE execution_reviews") &&
+      sql.includes("status IN ('valid', 'expired')")
+    ),
+    true
+  );
+  assert.equal(
+    transactionSql.some((sql) =>
+      sql.includes("UPDATE confirmation_evidence") &&
+      sql.includes("status IN ('valid', 'expired')")
+    ),
+    true
+  );
   const candidateUpdate = transactionSql.findIndex((sql) => sql.includes("UPDATE candidates"));
   assert.notEqual(candidateUpdate, -1);
   assert.equal(
@@ -1189,6 +1252,385 @@ test("the durable submission-attempt event is written before the broker mutation
 
   assert.equal(submitCalls, 1);
   assert.equal(result.status, "completed");
+});
+
+test("a broker acknowledgement later than the cycle timestamp persists without a false transport ambiguity", async () => {
+  let submitCalls = 0;
+  let recoveryCalls = 0;
+  let acknowledgementInsertSql = "";
+  const result = await runAutonomousPostgresExecutionCommand({
+    command: "paper:execute:reviewed",
+    query: { query: async () => ({ rows: [{ ready_count: "1" }], rowCount: 1 }) },
+    transaction: async (operation) => operation({
+      query: async (sql: string, values?: readonly unknown[]) => {
+        if (sql.includes("FROM order_intents intent")) {
+          return { rows: [intent() as unknown as Record<string, unknown>], rowCount: 1 };
+        }
+        if (
+          sql.includes("INSERT INTO broker_events") &&
+          sql.includes("'order_submission'") &&
+          !sql.includes("'order_submission_attempt'")
+        ) {
+          acknowledgementInsertSql = sql;
+          const occurredAt = Date.parse(String(values?.at(-2)));
+          const receivedAt = Date.parse(String(values?.at(-1)));
+          if (receivedAt < occurredAt) {
+            throw new Error(
+              'new row for relation "broker_events" violates check constraint "broker_events_received_after_occurred"'
+            );
+          }
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    }),
+    marketOpen: async () => true,
+    captureBrokerSnapshot: async () => broker,
+    submitOrder: async (payload) => {
+      submitCalls += 1;
+      return {
+        data: {
+          id: "broker-order-later-timestamp",
+          client_order_id: payload.client_order_id,
+          status: "accepted",
+          symbol: payload.symbol,
+          side: payload.side,
+          type: payload.type,
+          time_in_force: payload.time_in_force,
+          qty: payload.qty,
+          submitted_at: "2026-07-20T22:00:08.000999Z"
+        },
+        status: 200,
+        url: "paper"
+      };
+    },
+    recoverAmbiguousSubmission: async () => {
+      recoveryCalls += 1;
+      throw new Error("recovery must not run for a broker acknowledgement");
+    },
+    safety: {
+      environment: "paper",
+      tradingMode: "paper",
+      liveTradingEnabled: false,
+      paperOrderExecutionEnabled: true,
+      paperOptionsExecutionEnabled: true,
+      quoteMaxAgeSeconds: 60
+    },
+    confirmPaper: true,
+    lifecycleContext: {
+      cycleId: "cycle-later-timestamp",
+      workstreamExecutionId: "run-later-timestamp"
+    },
+    fence: {
+      jobName: "paper-execution",
+      workstream: "paper:execute:reviewed",
+      ownerId: "owner",
+      runId: "run-later-timestamp",
+      fencingToken: "16"
+    },
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(submitCalls, 1);
+  assert.equal(recoveryCalls, 0);
+  assert.equal(result.status, "completed");
+  assert.equal(result.evidence.brokerOrderId, "broker-order-later-timestamp");
+  assert.match(
+    acknowledgementInsertSql,
+    /GREATEST\(\$13::timestamptz,\s*\$12::timestamptz\)/
+  );
+});
+
+test("every broker submission persists and returns a complete mutation receipt", async () => {
+  const statements: Array<{ sql: string; values: readonly unknown[] }> = [];
+  const result = await runAutonomousPostgresExecutionCommand({
+    command: "paper:execute:reviewed",
+    query: { query: async () => ({ rows: [{ ready_count: "1" }], rowCount: 1 }) },
+    transaction: async (operation) => operation({
+      query: async (sql: string, values?: readonly unknown[]) => {
+        statements.push({ sql, values: values ?? [] });
+        if (sql.includes("FROM order_intents intent")) {
+          return { rows: [intent() as unknown as Record<string, unknown>], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    }),
+    marketOpen: async () => true,
+    captureBrokerSnapshot: async () => broker,
+    submitOrder: async (payload) => ({
+      data: {
+        id: "broker-order-receipt",
+        client_order_id: payload.client_order_id,
+        status: "accepted",
+        symbol: payload.symbol,
+        side: payload.side,
+        type: payload.type,
+        time_in_force: payload.time_in_force,
+        qty: payload.qty,
+        limit_price: payload.limit_price,
+        submitted_at: "2026-07-20T22:00:01.000Z"
+      },
+      status: 200,
+      url: "paper"
+    }),
+    safety: {
+      environment: "paper",
+      tradingMode: "paper",
+      liveTradingEnabled: false,
+      paperOrderExecutionEnabled: true,
+      paperOptionsExecutionEnabled: true,
+      quoteMaxAgeSeconds: 60
+    },
+    confirmPaper: true,
+    lifecycleContext: {
+      cycleId: "cycle-receipt",
+      workstreamExecutionId: "run-receipt"
+    },
+    fence: {
+      jobName: "paper-execution",
+      workstream: "paper:execute:reviewed",
+      ownerId: "owner",
+      runId: "run-receipt",
+      fencingToken: "17"
+    },
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  const attempt = statements.find(({ sql }) =>
+    sql.includes("INSERT INTO broker_events") &&
+    sql.includes("'order_submission_attempt'")
+  );
+  assert.ok(attempt);
+  const persisted = JSON.parse(String(attempt.values[4])) as Record<string, unknown>;
+  assert.match(String(persisted.mutationReceiptId), /^mutation_receipt_/);
+  assert.equal(persisted.environment, "paper");
+  assert.equal(persisted.intentId, "intent-1");
+  assert.equal(persisted.cycleId, "cycle-receipt");
+  assert.equal(persisted.workstream, "paper:execute:reviewed");
+  assert.equal(persisted.schedulerRunId, "run-receipt");
+  assert.equal(persisted.fencingToken, "17");
+  assert.equal(persisted.deterministicClientOrderId, "worker-order-1");
+  assert.equal(persisted.submissionAttemptSequence, 1);
+  assert.equal(persisted.submissionAction, "opening");
+  assert.match(String(persisted.requestFingerprint), /^[0-9a-f]{64}$/);
+  assert.equal(persisted.requestedSymbol, "AAPL");
+  assert.equal(persisted.requestedSide, "buy");
+  assert.equal(persisted.requestedQuantity, "1");
+  assert.equal(persisted.requestedOrderType, "limit");
+  assert.equal(persisted.requestedLimitPrice, "200");
+  assert.equal(persisted.requestedStopPrice, null);
+  assert.equal(persisted.outcomeClassification, "submission_attempted");
+
+  const receipt = "mutationReceipt" in result.evidence
+    ? result.evidence.mutationReceipt
+    : undefined;
+  assert.ok(receipt);
+  assert.equal(receipt.intentId, "intent-1");
+  assert.equal(receipt.brokerOrderId, "broker-order-receipt");
+  assert.equal(receipt.outcomeClassification, "submission_acknowledged");
+  assert.equal(receipt.resultingLifecycleState, "broker_order_accepted");
+  assert.ok(receipt.brokerAcknowledgementTimestamp);
+  assert.ok(Date.parse(receipt.brokerAcknowledgementTimestamp) >= Date.parse("2026-07-20T22:00:01.000Z"));
+});
+
+test("an exact review for another order shape cannot authorize submission", async () => {
+  let submitCalls = 0;
+  await assert.rejects(
+    runAutonomousPostgresExecutionCommand({
+      command: "paper:execute:reviewed",
+      query: { query: async () => ({ rows: [{ ready_count: "1" }], rowCount: 1 }) },
+      transaction: async (operation) => operation({
+        query: async (sql: string) => {
+          if (sql.includes("FROM order_intents intent")) {
+            return {
+              rows: [{
+                ...intent(),
+                review_client_order_id: "worker-order-1",
+                review_order_intent: {
+                  symbol: "MSFT",
+                  assetClass: "equity",
+                  side: "buy",
+                  operation: "buy_to_open",
+                  orderType: "limit",
+                  timeInForce: "day",
+                  quantity: "2",
+                  notional: null,
+                  limitPrice: 200,
+                  stopPrice: null,
+                  clientOrderId: "worker-order-1",
+                  strategyKey: "baseline"
+                }
+              }],
+              rowCount: 1
+            };
+          }
+          return { rows: [], rowCount: 1 };
+        }
+      }),
+      marketOpen: async () => true,
+      captureBrokerSnapshot: async () => broker,
+      submitOrder: async () => {
+        submitCalls += 1;
+        throw new Error("must not submit");
+      },
+      safety: {
+        environment: "paper",
+        tradingMode: "paper",
+        liveTradingEnabled: false,
+        paperOrderExecutionEnabled: true,
+        paperOptionsExecutionEnabled: true,
+        quoteMaxAgeSeconds: 60
+      },
+      confirmPaper: true,
+      fence: {
+        jobName: "paper-execution",
+        workstream: "paper:execute:reviewed",
+        ownerId: "owner",
+        runId: "run-review-mismatch",
+        fencingToken: "18"
+      },
+      now: new Date("2026-07-20T22:00:00.000Z")
+    }),
+    /POSTGRES_REVIEW_INTENT_AUTHORIZATION_MISMATCH/
+  );
+  assert.equal(submitCalls, 0);
+});
+
+test("a claimed intent without its exact serialized review cannot reach the broker", async () => {
+  let submitCalls = 0;
+  await assert.rejects(
+    runAutonomousPostgresExecutionCommand({
+      command: "paper:execute:reviewed",
+      query: { query: async () => ({ rows: [{ ready_count: "1" }], rowCount: 1 }) },
+      transaction: async (operation) => operation({
+        query: async (sql: string) => sql.includes("FROM order_intents intent")
+          ? {
+              rows: [
+                intent({ review_order_intent: null }) as unknown as Record<string, unknown>
+              ],
+              rowCount: 1
+            }
+          : { rows: [], rowCount: 1 }
+      }),
+      marketOpen: async () => true,
+      captureBrokerSnapshot: async () => broker,
+      submitOrder: async () => {
+        submitCalls += 1;
+        throw new Error("must not submit");
+      },
+      safety: {
+        environment: "paper",
+        tradingMode: "paper",
+        liveTradingEnabled: false,
+        paperOrderExecutionEnabled: true,
+        paperOptionsExecutionEnabled: true,
+        quoteMaxAgeSeconds: 60
+      },
+      confirmPaper: true,
+      fence: {
+        jobName: "paper-execution",
+        workstream: "paper:execute:reviewed",
+        ownerId: "owner",
+        runId: "run-missing-review",
+        fencingToken: "18a"
+      },
+      now: new Date("2026-07-20T22:00:00.000Z")
+    }),
+    /POSTGRES_REVIEW_INTENT_AUTHORIZATION_MISMATCH/
+  );
+  assert.equal(submitCalls, 0);
+});
+
+test("a blank persisted intent identity cannot reach the broker", async () => {
+  let submitCalls = 0;
+  await assert.rejects(
+    runAutonomousPostgresExecutionCommand({
+      command: "paper:execute:reviewed",
+      query: { query: async () => ({ rows: [{ ready_count: "1" }], rowCount: 1 }) },
+      transaction: async (operation) => operation({
+        query: async (sql: string) => sql.includes("FROM order_intents intent")
+          ? {
+              rows: [intent({ order_intent_id: "" }) as unknown as Record<string, unknown>],
+              rowCount: 1
+            }
+          : { rows: [], rowCount: 1 }
+      }),
+      marketOpen: async () => true,
+      captureBrokerSnapshot: async () => broker,
+      submitOrder: async () => {
+        submitCalls += 1;
+        throw new Error("must not submit");
+      },
+      safety: {
+        environment: "paper",
+        tradingMode: "paper",
+        liveTradingEnabled: false,
+        paperOrderExecutionEnabled: true,
+        paperOptionsExecutionEnabled: true,
+        quoteMaxAgeSeconds: 60
+      },
+      confirmPaper: true,
+      fence: {
+        jobName: "paper-execution",
+        workstream: "paper:execute:reviewed",
+        ownerId: "owner",
+        runId: "run-missing-intent",
+        fencingToken: "19"
+      },
+      now: new Date("2026-07-20T22:00:00.000Z")
+    }),
+    /POSTGRES_EXECUTION_INTENT_ID_REQUIRED/
+  );
+  assert.equal(submitCalls, 0);
+});
+
+test("an already acknowledged intent is excluded before broker submission", async () => {
+  let submitCalls = 0;
+  let countSql = "";
+  const result = await runAutonomousPostgresExecutionCommand({
+    command: "paper:execute:reviewed",
+    query: {
+      query: async (sql: string) => {
+        countSql = sql;
+        const guarded = /NOT EXISTS\s*\(\s*SELECT 1\s+FROM orders acknowledged_order/s.test(sql);
+        return {
+          rows: [{ ready_count: guarded ? "0" : "1", confirmable_count: "0" }],
+          rowCount: 1
+        };
+      }
+    },
+    transaction: async (operation) => operation({
+      query: async (sql: string) => sql.includes("FROM order_intents intent")
+        ? { rows: [intent() as unknown as Record<string, unknown>], rowCount: 1 }
+        : { rows: [], rowCount: 1 }
+    }),
+    marketOpen: async () => true,
+    captureBrokerSnapshot: async () => broker,
+    submitOrder: async () => {
+      submitCalls += 1;
+      throw new Error("must not submit");
+    },
+    safety: {
+      environment: "paper",
+      tradingMode: "paper",
+      liveTradingEnabled: false,
+      paperOrderExecutionEnabled: true,
+      paperOptionsExecutionEnabled: true,
+      quoteMaxAgeSeconds: 60
+    },
+    confirmPaper: true,
+    fence: {
+      jobName: "paper-execution",
+      workstream: "paper:execute:reviewed",
+      ownerId: "owner",
+      runId: "run-already-acknowledged",
+      fencingToken: "20"
+    },
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.match(countSql, /NOT EXISTS\s*\(\s*SELECT 1\s+FROM orders acknowledged_order/s);
+  assert.equal(result.status, "no_op");
+  assert.equal(submitCalls, 0);
 });
 
 test("a failed pre-mutation attempt write releases the claim and never calls Alpaca", async () => {
