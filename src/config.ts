@@ -17,6 +17,7 @@ export interface AlpacaStockStreamConfig {
   quotes: boolean;
   bars: boolean;
   reconnectMs: number;
+  reconnectMaxMs: number;
   staleAfterMs: number;
 }
 
@@ -72,6 +73,10 @@ const stockStream: AlpacaStockStreamConfig = {
   quotes: parseBooleanDefaultWhenBlank(process.env.ALPACA_STOCK_STREAM_QUOTES, true),
   bars: parseBooleanDefaultWhenBlank(process.env.ALPACA_STOCK_STREAM_BARS, true),
   reconnectMs: parseInteger(process.env.ALPACA_STOCK_STREAM_RECONNECT_MS, 5_000),
+  reconnectMaxMs: Math.max(
+    parseInteger(process.env.ALPACA_STOCK_STREAM_RECONNECT_MS, 5_000),
+    parseInteger(process.env.ALPACA_STOCK_STREAM_RECONNECT_MAX_MS, 60_000)
+  ),
   staleAfterMs: Math.max(
     1,
     parseInteger(process.env.ALPACA_STOCK_STREAM_STALE_AFTER_MS, 30_000)

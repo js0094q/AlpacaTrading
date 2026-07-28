@@ -13,6 +13,9 @@ import {
 export type StockMarketDataSource = "alpaca_sip_stream" | "alpaca_sip_rest";
 
 export interface LatestStockQuoteRead {
+  provider: "alpaca";
+  environment: "paper";
+  eventType: "latest_quote";
   symbol: string;
   bidPrice: number | null;
   bidSize: number | null;
@@ -28,6 +31,9 @@ export interface LatestStockQuoteRead {
 }
 
 export interface LatestStockTradeRead {
+  provider: "alpaca";
+  environment: "paper";
+  eventType: "latest_trade";
   symbol: string;
   price: number | null;
   size: number | null;
@@ -40,6 +46,9 @@ export interface LatestStockTradeRead {
 }
 
 export interface LatestStockPriceRead {
+  provider: "alpaca";
+  environment: "paper";
+  eventType: "current_price";
   symbol: string;
   price: number | null;
   timestamp: string | null;
@@ -228,6 +237,9 @@ const receivedAt = (deps: StockMarketDataAccessorDeps): string =>
   deps.now?.() ?? new Date().toISOString();
 
 const mapStreamQuote = (event: StockQuoteEvent): LatestStockQuoteRead => ({
+  provider: "alpaca",
+  environment: "paper",
+  eventType: "latest_quote",
   symbol: normalizeSymbol(event.symbol),
   bidPrice: event.bidPrice,
   bidSize: event.bidSize,
@@ -243,6 +255,9 @@ const mapStreamQuote = (event: StockQuoteEvent): LatestStockQuoteRead => ({
 });
 
 const mapStreamTrade = (event: StockTradeEvent): LatestStockTradeRead => ({
+  provider: "alpaca",
+  environment: "paper",
+  eventType: "latest_trade",
   symbol: normalizeSymbol(event.symbol),
   price: event.price,
   size: event.size,
@@ -261,11 +276,16 @@ const mapRestQuote = (
 ): LatestStockQuoteRead => {
   const timestamp = validTimestamp(snapshot.latestQuote?.t) ? snapshot.latestQuote.t : null;
   return {
+    provider: "alpaca",
+    environment: "paper",
+    eventType: "latest_quote",
     symbol,
     bidPrice: finiteNumber(snapshot.latestQuote?.bp),
-    bidSize: null,
+    bidSize: finiteNumber(snapshot.latestQuote?.bs),
     askPrice: finiteNumber(snapshot.latestQuote?.ap),
-    askSize: null,
+    askSize: finiteNumber(snapshot.latestQuote?.as),
+    ...(snapshot.latestQuote?.bx ? { bidExchange: snapshot.latestQuote.bx } : {}),
+    ...(snapshot.latestQuote?.ax ? { askExchange: snapshot.latestQuote.ax } : {}),
     timestamp,
     receivedAt: receivedAtValue,
     feed: "sip",
@@ -281,9 +301,13 @@ const mapRestTrade = (
 ): LatestStockTradeRead => {
   const timestamp = validTimestamp(snapshot.latestTrade?.t) ? snapshot.latestTrade.t : null;
   return {
+    provider: "alpaca",
+    environment: "paper",
+    eventType: "latest_trade",
     symbol,
     price: finiteNumber(snapshot.latestTrade?.p),
-    size: null,
+    size: finiteNumber(snapshot.latestTrade?.s),
+    ...(snapshot.latestTrade?.x ? { exchange: snapshot.latestTrade.x } : {}),
     timestamp,
     receivedAt: receivedAtValue,
     feed: "sip",
@@ -324,6 +348,9 @@ const mapRestPrice = (
 ): LatestStockPriceRead => {
   const current = snapshotPrice(snapshot);
   return {
+    provider: "alpaca",
+    environment: "paper",
+    eventType: "current_price",
     symbol,
     price: current.price,
     timestamp: current.timestamp,
@@ -398,6 +425,9 @@ const getStreamPrice = (
   const trade = readFreshTrade(symbol, context, debug);
   if (trade) {
     return {
+      provider: "alpaca",
+      environment: "paper",
+      eventType: "current_price",
       symbol,
       price: trade.price,
       timestamp: trade.timestamp,
@@ -413,6 +443,9 @@ const getStreamPrice = (
     return undefined;
   }
   return {
+    provider: "alpaca",
+    environment: "paper",
+    eventType: "current_price",
     symbol,
     price: Number(((quote.bidPrice + quote.askPrice) / 2).toFixed(4)),
     timestamp: quote.timestamp,

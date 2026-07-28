@@ -10,8 +10,19 @@ export interface AlpacaStockStreamConfig {
   quotes: boolean;
   bars: boolean;
   reconnectMs: number;
+  reconnectMaxMs: number;
   staleAfterMs: number;
 }
+
+export type AlpacaStockFeed =
+  | "sip"
+  | "iex"
+  | "delayed_sip"
+  | "boats"
+  | "overnight"
+  | "otc"
+  | "test"
+  | "unknown";
 
 export interface StockTradeEvent {
   type: "trade";
@@ -21,7 +32,11 @@ export interface StockTradeEvent {
   exchange?: string;
   timestamp: string;
   receivedAt: string;
-  feed: "sip";
+  feed: AlpacaStockFeed;
+  provider: "alpaca";
+  environment: "paper";
+  providerTimestamp: string;
+  receiptTimestamp: string;
 }
 
 export interface StockQuoteEvent {
@@ -35,7 +50,11 @@ export interface StockQuoteEvent {
   askExchange?: string;
   timestamp: string;
   receivedAt: string;
-  feed: "sip";
+  feed: AlpacaStockFeed;
+  provider: "alpaca";
+  environment: "paper";
+  providerTimestamp: string;
+  receiptTimestamp: string;
 }
 
 export interface StockBarEvent {
@@ -50,7 +69,11 @@ export interface StockBarEvent {
   vwap?: number;
   timestamp: string;
   receivedAt: string;
-  feed: "sip";
+  feed: AlpacaStockFeed;
+  provider: "alpaca";
+  environment: "paper";
+  providerTimestamp: string;
+  receiptTimestamp: string;
 }
 
 export interface AlpacaStockStreamStatus {
@@ -58,11 +81,17 @@ export interface AlpacaStockStreamStatus {
   connected: boolean;
   authenticated: boolean;
   subscribed: boolean;
-  feed: "sip";
+  provider: "alpaca";
+  feed: AlpacaStockFeed;
+  environment: "paper";
   symbols: string[];
   connectedAt?: string;
   lastMessageAt?: string;
   reconnectAttempts: number;
+  reconnectBaseMs: number;
+  reconnectMaxMs: number;
+  lastReconnectDelayMs?: number;
+  nextReconnectAt?: string;
   lastError?: string;
 }
 
@@ -102,6 +131,10 @@ export interface AlpacaStockStreamOptions {
 }
 
 type StreamMessage = Record<string, unknown>;
+export type AlpacaStockStreamEvent = StockTradeEvent | StockQuoteEvent | StockBarEvent;
+export type AlpacaStockStreamSubscriber = (
+  event: AlpacaStockStreamEvent
+) => void | Promise<void>;
 
 const OPEN_STATE = 1;
 
@@ -121,6 +154,10 @@ const defaultStreamConfig = (): AlpacaStockStreamConfig => ({
   quotes: boolean(process.env.ALPACA_STOCK_STREAM_QUOTES, true),
   bars: boolean(process.env.ALPACA_STOCK_STREAM_BARS, true),
   reconnectMs: integer(process.env.ALPACA_STOCK_STREAM_RECONNECT_MS, 5_000),
+  reconnectMaxMs: Math.max(
+    integer(process.env.ALPACA_STOCK_STREAM_RECONNECT_MS, 5_000),
+    integer(process.env.ALPACA_STOCK_STREAM_RECONNECT_MAX_MS, 60_000)
+  ),
   staleAfterMs: Math.max(1, integer(process.env.ALPACA_STOCK_STREAM_STALE_AFTER_MS, 30_000))
 });
 
@@ -139,6 +176,27 @@ export const normalizeStockSymbols = (symbols: string[]): string[] =>
         .filter(Boolean)
     )
   );
+
+const supportedFeeds = new Set<AlpacaStockFeed>([
+  "sip",
+  "iex",
+  "delayed_sip",
+  "boats",
+  "overnight",
+  "otc",
+  "test"
+]);
+
+export const stockFeedFromStreamUrl = (url: string): AlpacaStockFeed => {
+  try {
+    const segment = new URL(url).pathname.split("/").filter(Boolean).at(-1)?.toLowerCase();
+    return segment && supportedFeeds.has(segment as AlpacaStockFeed)
+      ? segment as AlpacaStockFeed
+      : "unknown";
+  } catch {
+    return "unknown";
+  }
+};
 
 const toFiniteNumber = (value: unknown): number | undefined => {
   if (value === undefined || value === null || value === "") {
@@ -193,7 +251,8 @@ export class AlpacaStockStreamService {
     delayMs: number
   ) => ReturnType<typeof setTimeout>;
   private readonly clearTimeoutFn: (handle: ReturnType<typeof setTimeout>) => void;
-  private readonly onEvent?: AlpacaStockStreamOptions["onEvent"];
+  private readonly eventSubscribers = new Set<AlpacaStockStreamSubscriber>();
+  private readonly feed: AlpacaStockFeed;
 
   private symbols: string[];
   private socket: AlpacaStockWebSocket | undefined;
@@ -207,12 +266,15 @@ export class AlpacaStockStreamService {
   private lastMessageAt: string | undefined;
   private lastError: string | undefined;
   private reconnectAttempts = 0;
+  private lastReconnectDelayMs: number | undefined;
+  private nextReconnectAt: string | undefined;
   private readonly latestTrades = new Map<string, StockTradeEvent>();
   private readonly latestQuotes = new Map<string, StockQuoteEvent>();
   private readonly latestBars = new Map<string, StockBarEvent>();
 
   constructor(options: AlpacaStockStreamOptions = {}) {
     this.streamConfig = options.config ?? defaultStreamConfig();
+    this.feed = stockFeedFromStreamUrl(this.streamConfig.url);
     this.symbols = normalizeStockSymbols(this.streamConfig.symbols);
     this.credentialsProvider =
       options.credentialsProvider ?? (() => {
@@ -225,7 +287,9 @@ export class AlpacaStockStreamService {
     this.now = options.now ?? (() => new Date());
     this.setTimeoutFn = options.setTimeoutFn ?? ((callback, delayMs) => setTimeout(callback, delayMs));
     this.clearTimeoutFn = options.clearTimeoutFn ?? ((handle) => clearTimeout(handle));
-    this.onEvent = options.onEvent;
+    if (options.onEvent) {
+      this.eventSubscribers.add(options.onEvent);
+    }
   }
 
   async start(): Promise<void> {
@@ -258,6 +322,7 @@ export class AlpacaStockStreamService {
     this.authenticated = false;
     this.subscribed = false;
     this.connectedAt = undefined;
+    this.nextReconnectAt = undefined;
 
     if (socket && socket.readyState !== 3) {
       try {
@@ -286,6 +351,13 @@ export class AlpacaStockStreamService {
     }
   }
 
+  subscribe(subscriber: AlpacaStockStreamSubscriber): () => void {
+    this.eventSubscribers.add(subscriber);
+    return () => {
+      this.eventSubscribers.delete(subscriber);
+    };
+  }
+
   getLatestTrade(symbol: string): StockTradeEvent | undefined {
     return this.latestTrades.get(this.normalizeLookupSymbol(symbol));
   }
@@ -304,9 +376,13 @@ export class AlpacaStockStreamService {
       connected: this.connected,
       authenticated: this.authenticated,
       subscribed: this.subscribed,
-      feed: "sip",
+      provider: "alpaca",
+      feed: this.feed,
+      environment: "paper",
       symbols: [...this.symbols],
-      reconnectAttempts: this.reconnectAttempts
+      reconnectAttempts: this.reconnectAttempts,
+      reconnectBaseMs: this.streamConfig.reconnectMs,
+      reconnectMaxMs: this.streamConfig.reconnectMaxMs
     };
     if (this.connectedAt) {
       status.connectedAt = this.connectedAt;
@@ -316,6 +392,12 @@ export class AlpacaStockStreamService {
     }
     if (this.lastError) {
       status.lastError = this.lastError;
+    }
+    if (this.lastReconnectDelayMs !== undefined) {
+      status.lastReconnectDelayMs = this.lastReconnectDelayMs;
+    }
+    if (this.nextReconnectAt) {
+      status.nextReconnectAt = this.nextReconnectAt;
     }
     return status;
   }
@@ -382,6 +464,7 @@ export class AlpacaStockStreamService {
       this.authenticated = false;
       this.subscribed = false;
       this.connectedAt = this.now().toISOString();
+      this.nextReconnectAt = undefined;
       this.lastError = undefined;
       this.send({ action: "auth", key: credentials.apiKey, secret: credentials.secretKey });
     });
@@ -428,6 +511,8 @@ export class AlpacaStockStreamService {
     if (messageType === "success" && message.msg === "authenticated") {
       this.authenticated = true;
       this.reconnectAttempts = 0;
+      this.lastReconnectDelayMs = undefined;
+      this.nextReconnectAt = undefined;
       this.lastError = undefined;
       this.logger.info("Alpaca SIP stream authenticated");
       this.subscribed = this.sendSubscription("subscribe", this.symbols);
@@ -490,7 +575,11 @@ export class AlpacaStockStreamService {
       ...(toOptionalString(message.x) ? { exchange: toOptionalString(message.x) } : {}),
       timestamp,
       receivedAt,
-      feed: "sip"
+      feed: this.feed,
+      provider: "alpaca",
+      environment: "paper",
+      providerTimestamp: timestamp,
+      receiptTimestamp: receivedAt
     };
   }
 
@@ -522,7 +611,11 @@ export class AlpacaStockStreamService {
       ...(toOptionalString(message.ax) ? { askExchange: toOptionalString(message.ax) } : {}),
       timestamp,
       receivedAt,
-      feed: "sip"
+      feed: this.feed,
+      provider: "alpaca",
+      environment: "paper",
+      providerTimestamp: timestamp,
+      receiptTimestamp: receivedAt
     };
   }
 
@@ -559,7 +652,11 @@ export class AlpacaStockStreamService {
       ...(vwap !== undefined ? { vwap } : {}),
       timestamp,
       receivedAt,
-      feed: "sip"
+      feed: this.feed,
+      provider: "alpaca",
+      environment: "paper",
+      providerTimestamp: timestamp,
+      receiptTimestamp: receivedAt
     };
   }
 
@@ -619,10 +716,17 @@ export class AlpacaStockStreamService {
       return;
     }
     this.reconnectAttempts += 1;
+    const exponent = Math.min(this.reconnectAttempts - 1, 30);
+    const delayMs = Math.min(
+      this.streamConfig.reconnectMaxMs,
+      this.streamConfig.reconnectMs * 2 ** exponent
+    );
+    this.lastReconnectDelayMs = delayMs;
+    this.nextReconnectAt = new Date(this.now().getTime() + delayMs).toISOString();
     this.reconnectTimer = this.setTimeoutFn(() => {
       this.reconnectTimer = undefined;
       this.connect();
-    }, this.streamConfig.reconnectMs);
+    }, delayMs);
     this.logger.info("Alpaca SIP stream reconnect scheduled");
   }
 
@@ -630,14 +734,47 @@ export class AlpacaStockStreamService {
     return symbol.trim().toUpperCase();
   }
 
-  private persistEvent(event: StockTradeEvent | StockQuoteEvent | StockBarEvent): void {
-    if (!this.onEvent) return;
-    Promise.resolve(this.onEvent(event)).catch(() => {
-      this.lastError = "postgres_stream_persistence_failed";
-      const socket = this.socket;
-      if (socket) this.handleSocketError(socket);
-    });
+  private persistEvent(event: AlpacaStockStreamEvent): void {
+    for (const subscriber of this.eventSubscribers) {
+      Promise.resolve().then(() => subscriber(event)).catch(() => {
+        this.lastError = "stream_consumer_failed";
+        this.logger.warn("Alpaca stock stream consumer failed");
+      });
+    }
   }
 }
 
-export const alpacaStockStream = new AlpacaStockStreamService();
+const sharedStockStreams = new Map<string, AlpacaStockStreamService>();
+
+const sharedStreamKey = (config: AlpacaStockStreamConfig) => {
+  try {
+    const url = new URL(config.url);
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return config.url.trim();
+  }
+};
+
+export const getSharedAlpacaStockStream = (
+  options: AlpacaStockStreamOptions = {}
+): AlpacaStockStreamService => {
+  const config = options.config ?? defaultStreamConfig();
+  const key = sharedStreamKey(config);
+  const existing = sharedStockStreams.get(key);
+  if (existing) {
+    if (options.onEvent) {
+      existing.subscribe(options.onEvent);
+    }
+    void existing.setSymbols(normalizeStockSymbols([
+      ...existing.getStatus().symbols,
+      ...config.symbols
+    ]));
+    return existing;
+  }
+  const created = new AlpacaStockStreamService({ ...options, config });
+  sharedStockStreams.set(key, created);
+  return created;
+};
+
+export const alpacaStockStream = getSharedAlpacaStockStream();

@@ -1,5 +1,29 @@
 # Alpaca Trading Research Infrastructure
 
+## Central Alpaca data hub and event fan-out (2026-07-28)
+
+The three investment lanes now receive one cycle-scoped Alpaca data view.
+`research:daily` performs its existing PostgreSQL-authoritative SIP/OPRA refresh
+once, hydrates the shared hub once for the cycle, and passes stable quote,
+trade, bar, contract, and snapshot objects through the existing orchestrator.
+Repeated lane reads reuse the same object and cannot trigger a second REST
+refresh for that cycle.
+
+The shared stock-stream registry permits one connection per configured endpoint
+and feed. Stream events retain provider, feed, symbol, provider timestamp,
+receipt timestamp, and paper environment before fan-out. Reconnect delay grows
+exponentially from `ALPACA_STOCK_STREAM_RECONNECT_MS` and is capped by
+`ALPACA_STOCK_STREAM_RECONNECT_MAX_MS`; attempts and the next bounded delay are
+reported in sanitized status. A disconnected stream or failed consumer is
+contained and does not clear last-known state or terminate another lane.
+
+REST hydration is limited to startup, explicit refresh, or recovery. Broker
+order updates remain reconciliation-oriented, while account activities can be
+polled without overlap for option assignment, exercise, and expiration events
+not available from the stream. SIP, IEX, delayed, and OPRA evidence remain
+feed-distinct. This phase does not add scoring, a research adapter, order
+submission, or any live path.
+
 ## Autonomous worker-state persistence continuity (2026-07-28)
 
 Worker lifecycle payloads use the same bounded 256-KiB envelope as the parent
@@ -374,6 +398,7 @@ ALPACA_STOCK_STREAM_TRADES=true
 ALPACA_STOCK_STREAM_QUOTES=true
 ALPACA_STOCK_STREAM_BARS=true
 ALPACA_STOCK_STREAM_RECONNECT_MS=5000
+ALPACA_STOCK_STREAM_RECONNECT_MAX_MS=60000
 ALPACA_STOCK_STREAM_STALE_AFTER_MS=30000
 MARKET_DATA_PROVIDER=alpaca
 TRADING_MODE=paper
@@ -555,6 +580,7 @@ ALPACA_STOCK_STREAM_TRADES=true
 ALPACA_STOCK_STREAM_QUOTES=true
 ALPACA_STOCK_STREAM_BARS=true
 ALPACA_STOCK_STREAM_RECONNECT_MS=5000
+ALPACA_STOCK_STREAM_RECONNECT_MAX_MS=60000
 ALPACA_STOCK_STREAM_STALE_AFTER_MS=30000
 ALPACA_ENV=paper
 ALPACA_PAPER_API_KEY=replace_me
@@ -584,9 +610,9 @@ structured metadata and abort in-flight fetch work.
 
 ### Optional SIP stock stream
 
-The stock WebSocket service is disabled by default. Set `ALPACA_STOCK_STREAM_ENABLED=true` in the applicable local/VPS runtime environment to start one SIP stream from the long-running dashboard-control process. When no explicit symbol list is configured, it uses the active stock universe; otherwise it normalizes `ALPACA_STOCK_STREAM_SYMBOLS` by trimming, uppercasing, and deduplicating symbols. The service keeps latest trades, quotes, and minute bars in memory, and the dashboard-control health response includes its sanitized status under `data.stockStream`.
+The stock WebSocket service is disabled by default. When enabled, the `research:daily` command owns one central hub for the complete orchestrator cycle: it starts at most one stream for the configured endpoint/feed, authenticates once, fans out normalized events to internal consumers, and stops the socket during command cleanup. When no explicit symbol list is configured, it uses the active stock universe; otherwise it normalizes `ALPACA_STOCK_STREAM_SYMBOLS` by trimming, uppercasing, and deduplicating symbols. The service keeps latest trades, quotes, and minute bars in memory. Reconnect uses bounded exponential backoff from `ALPACA_STOCK_STREAM_RECONNECT_MS` through `ALPACA_STOCK_STREAM_RECONNECT_MAX_MS`; sanitized status includes the attempt count, last delay, and next reconnect time.
 
-For activation, preserve `ALPACA_STOCK_STREAM_URL=wss://stream.data.alpaca.markets/v2/sip` and set the non-secret stream controls documented in `.env.example`, including an explicit universe such as `ALPACA_STOCK_STREAM_SYMBOLS=AAPL,MSFT,SPY`. Do not edit or commit a local `.env` file. After changing the runtime environment, restart `alpaca-dashboard-control` and verify `enabled`, `connected`, `authenticated`, `subscribed`, and `feed: "sip"`.
+For activation, preserve `ALPACA_STOCK_STREAM_URL=wss://stream.data.alpaca.markets/v2/sip` and set the non-secret stream controls documented in `.env.example`, including an explicit universe such as `ALPACA_STOCK_STREAM_SYMBOLS=AAPL,MSFT,SPY`. Do not edit or commit a local `.env` file. On the next `research:daily` cycle, verify sanitized hub status reports `enabled`, `connected`, `authenticated`, `subscribed`, and `feed: "sip"`.
 
 The shared current-market-data accessor prefers a covered, fresh SIP stream trade or quote for current price/quote reads and falls back to the existing SIP REST request when the stream is unavailable, incomplete, malformed, or stale. Historical bars, research backfills, complete snapshots, and their required fields remain REST-backed.
 
@@ -1522,6 +1548,7 @@ Validate quickly with:
 ```bash
 npm run lint
 npm run test
+npm run test:alpaca-data-hub
 npm run test:stock-market-data
 npm run typecheck
 npm run build

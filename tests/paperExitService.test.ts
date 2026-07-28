@@ -499,6 +499,9 @@ describe("paper exit review equities", () => {
         stockPrices: async () => ({
           data: {
             AAPL: {
+              provider: "alpaca",
+              environment: "paper",
+              eventType: "current_price",
               symbol: "AAPL",
               price: 101.25,
               timestamp: generatedAt,

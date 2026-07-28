@@ -1,8 +1,9 @@
 import { spawnSync } from "node:child_process";
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
+import { fileURLToPath } from "node:url";
 
-const repoRoot = "/Users/josephstewart/Documents/Alpaca Trading";
+const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 
 process.env.TRADING_MODE = "paper";
 process.env.ALPACA_ENV = "paper";
@@ -37,6 +38,7 @@ type AlpacaStockStreamConfig = {
   quotes: boolean;
   bars: boolean;
   reconnectMs: number;
+  reconnectMaxMs: number;
   staleAfterMs: number;
 };
 
@@ -106,11 +108,13 @@ class MockWebSocket {
 
 class ManualTimers {
   readonly callbacks: Array<() => void> = [];
+  readonly delays: number[] = [];
   readonly cleared = new Set<ReturnType<typeof setTimeout>>();
 
-  setTimeout = (callback: () => void, _delayMs: number) => {
+  setTimeout = (callback: () => void, delayMs: number) => {
     const handle = this.callbacks.length + 1 as unknown as ReturnType<typeof setTimeout>;
     this.callbacks.push(callback);
+    this.delays.push(delayMs);
     return handle;
   };
 
@@ -133,6 +137,7 @@ const makeConfig = (overrides: Partial<AlpacaStockStreamConfig> = {}): AlpacaSto
   quotes: true,
   bars: true,
   reconnectMs: 5_000,
+  reconnectMaxMs: 60_000,
   staleAfterMs: 30_000,
   ...overrides
 });
@@ -206,6 +211,7 @@ const runConfigProbe = (values: Record<string, string>) => {
         ALPACA_STOCK_STREAM_QUOTES: "",
         ALPACA_STOCK_STREAM_BARS: "",
         ALPACA_STOCK_STREAM_RECONNECT_MS: "",
+        ALPACA_STOCK_STREAM_RECONNECT_MAX_MS: "",
         ALPACA_STOCK_STREAM_STALE_AFTER_MS: "",
         ALPACA_STOCK_STREAM_URL: "",
         ...values
@@ -227,6 +233,7 @@ describe("Alpaca SIP stock stream configuration", () => {
       quotes: true,
       bars: true,
       reconnectMs: 5_000,
+      reconnectMaxMs: 60_000,
       staleAfterMs: 30_000
     });
   });
@@ -239,6 +246,7 @@ describe("Alpaca SIP stock stream configuration", () => {
     assert.equal(resolved.quotes, true);
     assert.equal(resolved.bars, true);
     assert.equal(resolved.reconnectMs, 5_000);
+    assert.equal(resolved.reconnectMaxMs, 60_000);
     assert.equal(resolved.staleAfterMs, 30_000);
     assert.equal(resolved.symbols.includes("SPY"), true);
     assert.equal(resolved.symbols.includes("*"), false);
@@ -252,6 +260,7 @@ describe("Alpaca SIP stock stream configuration", () => {
       ALPACA_STOCK_STREAM_QUOTES: "true",
       ALPACA_STOCK_STREAM_BARS: "false",
       ALPACA_STOCK_STREAM_RECONNECT_MS: "2500",
+      ALPACA_STOCK_STREAM_RECONNECT_MAX_MS: "10000",
       ALPACA_STOCK_STREAM_STALE_AFTER_MS: "45000",
       ALPACA_STOCK_STREAM_URL: "wss://stream.data.alpaca.markets/v2/sip"
     });
@@ -263,6 +272,7 @@ describe("Alpaca SIP stock stream configuration", () => {
       quotes: true,
       bars: false,
       reconnectMs: 2500,
+      reconnectMaxMs: 10000,
       staleAfterMs: 45000
     });
   });
@@ -360,7 +370,11 @@ describe("Alpaca SIP stock stream service", () => {
       exchange: "D",
       timestamp: "2026-07-16T15:00:00.000Z",
       receivedAt: "2026-07-16T15:00:30.000Z",
-      feed: "sip"
+      feed: "sip",
+      provider: "alpaca",
+      environment: "paper",
+      providerTimestamp: "2026-07-16T15:00:00.000Z",
+      receiptTimestamp: "2026-07-16T15:00:30.000Z"
     });
     assert.deepEqual(fixture.service.getLatestQuote("msft"), {
       type: "quote",
@@ -373,7 +387,11 @@ describe("Alpaca SIP stock stream service", () => {
       askExchange: "Q",
       timestamp: "2026-07-16T15:00:01.000Z",
       receivedAt: "2026-07-16T15:00:30.000Z",
-      feed: "sip"
+      feed: "sip",
+      provider: "alpaca",
+      environment: "paper",
+      providerTimestamp: "2026-07-16T15:00:01.000Z",
+      receiptTimestamp: "2026-07-16T15:00:30.000Z"
     });
     assert.deepEqual(fixture.service.getLatestBar("SPY"), {
       type: "bar",
@@ -387,7 +405,11 @@ describe("Alpaca SIP stock stream service", () => {
       vwap: 600.25,
       timestamp: "2026-07-16T15:00:00.000Z",
       receivedAt: "2026-07-16T15:00:30.000Z",
-      feed: "sip"
+      feed: "sip",
+      provider: "alpaca",
+      environment: "paper",
+      providerTimestamp: "2026-07-16T15:00:00.000Z",
+      receiptTimestamp: "2026-07-16T15:00:30.000Z"
     });
     assert.equal(fixture.service.getStatus().lastMessageAt, "2026-07-16T15:00:30.000Z");
   });
@@ -403,6 +425,36 @@ describe("Alpaca SIP stock stream service", () => {
       fixture.sockets[0]!.message({ T: "t", S: "AAPL", p: "bad", s: 1, t: "bad" });
     });
     assert.equal(fixture.service.getLatestTrade("AAPL"), undefined);
+  });
+
+  test("contains a synchronous consumer failure without disconnecting the stream", async () => {
+    const fixture = makeFixture();
+    fixture.service.subscribe(() => {
+      throw new Error("consumer failed");
+    });
+    await fixture.service.start();
+    authenticate(fixture.sockets[0]!);
+
+    assert.doesNotThrow(() => {
+      fixture.sockets[0]!.message({
+        T: "q",
+        S: "AAPL",
+        bp: 123.4,
+        bs: 2,
+        ap: 123.5,
+        as: 3,
+        t: "2026-07-16T15:00:01.000Z"
+      });
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(fixture.service.getStatus().connected, true);
+    assert.equal(fixture.service.getStatus().reconnectAttempts, 0);
+    assert.equal(fixture.timers.callbacks.length, 0);
+    assert.equal(
+      fixture.logs.entries.includes("warn:Alpaca stock stream consumer failed"),
+      true
+    );
   });
 
   test("detects stale timestamps without changing consumer behavior", () => {
@@ -421,6 +473,7 @@ describe("Alpaca SIP stock stream service", () => {
 
     assert.equal(fixture.service.getStatus().connected, false);
     assert.equal(fixture.service.getStatus().reconnectAttempts, 1);
+    assert.equal(fixture.service.getStatus().lastReconnectDelayMs, 5_000);
     assert.equal(fixture.timers.callbacks.length, 1);
     assert.equal(fixture.logs.entries.includes("info:Alpaca SIP stream reconnect scheduled"), true);
 
@@ -437,6 +490,23 @@ describe("Alpaca SIP stock stream service", () => {
       }
     ]);
     assert.equal(fixture.service.getStatus().reconnectAttempts, 0);
+  });
+
+  test("uses bounded exponential reconnect backoff and exposes each delay", async () => {
+    const fixture = makeFixture({ reconnectMs: 1_000, reconnectMaxMs: 2_500 });
+    await fixture.service.start();
+
+    fixture.sockets[0]!.closeUnexpectedly();
+    fixture.timers.runNext();
+    fixture.sockets[1]!.closeUnexpectedly();
+    fixture.timers.runNext();
+    fixture.sockets[2]!.closeUnexpectedly();
+    fixture.timers.runNext();
+    fixture.sockets[3]!.closeUnexpectedly();
+
+    assert.deepEqual(fixture.timers.delays, [1_000, 2_000, 2_500, 2_500]);
+    assert.equal(fixture.service.getStatus().reconnectAttempts, 4);
+    assert.equal(fixture.service.getStatus().lastReconnectDelayMs, 2_500);
   });
 
   test("reconnects after socket error without creating duplicate sockets", async () => {
@@ -512,11 +582,15 @@ describe("Alpaca SIP stock stream service", () => {
       connected: true,
       authenticated: true,
       subscribed: true,
+      provider: "alpaca",
       feed: "sip",
+      environment: "paper",
       symbols: ["AAPL", "MSFT"],
       connectedAt: "2026-07-16T15:00:30.000Z",
       lastMessageAt: "2026-07-16T15:00:30.000Z",
-      reconnectAttempts: 0
+      reconnectAttempts: 0,
+      reconnectBaseMs: 5_000,
+      reconnectMaxMs: 60_000
     });
     const health = fixture.service.getHealth({ marketActive: true });
     assert.equal(health.healthy, true);

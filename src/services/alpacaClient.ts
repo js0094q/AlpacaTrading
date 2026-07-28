@@ -128,21 +128,48 @@ export interface AlpacaPositionRaw {
 export interface AlpacaStockSnapshotRaw {
   latestTrade?: {
     p?: number | string | null;
+    s?: number | string | null;
+    x?: string | null;
     t?: string | null;
   };
   latestQuote?: {
     bp?: number | string | null;
+    bs?: number | string | null;
     ap?: number | string | null;
+    as?: number | string | null;
+    bx?: string | null;
+    ax?: string | null;
     t?: string | null;
   };
   dailyBar?: {
+    o?: number | string | null;
+    h?: number | string | null;
+    l?: number | string | null;
     c?: number | string | null;
+    v?: number | string | null;
+    n?: number | string | null;
+    vw?: number | string | null;
+    t?: string | null;
   };
   minuteBar?: {
+    o?: number | string | null;
+    h?: number | string | null;
+    l?: number | string | null;
     c?: number | string | null;
+    v?: number | string | null;
+    n?: number | string | null;
+    vw?: number | string | null;
+    t?: string | null;
   };
   prevDailyBar?: {
+    o?: number | string | null;
+    h?: number | string | null;
+    l?: number | string | null;
     c?: number | string | null;
+    v?: number | string | null;
+    n?: number | string | null;
+    vw?: number | string | null;
+    t?: string | null;
   };
 }
 

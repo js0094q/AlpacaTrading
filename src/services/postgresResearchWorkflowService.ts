@@ -16,6 +16,10 @@ import {
   paperExplorationThresholds,
   type PaperExplorationThresholds
 } from "./paperExplorationConfig.js";
+import {
+  alpacaDataHub,
+  type AlpacaDataCycle
+} from "./alpacaDataHubService.js";
 import { runInvestmentOrchestrator } from "./investmentOrchestratorService.js";
 import { buildPostgresFeaturesAndTargets } from "./postgresFeatureTargetService.js";
 import { refreshPostgresMarketData } from "./postgresMarketDataService.js";
@@ -42,12 +46,14 @@ type ResearchDependencies = {
   symbols: readonly string[];
   refreshMarketData: typeof refreshPostgresMarketData;
   buildFeaturesAndTargets: typeof buildPostgresFeaturesAndTargets;
+  dataHub: Pick<typeof alpacaDataHub, "hydrateCycle">;
 };
 
 const dependencies: ResearchDependencies = {
   symbols: seedUniverse,
   refreshMarketData: refreshPostgresMarketData,
-  buildFeaturesAndTargets: buildPostgresFeaturesAndTargets
+  buildFeaturesAndTargets: buildPostgresFeaturesAndTargets,
+  dataHub: alpacaDataHub
 };
 const INVESTMENT_LANE_FAMILIES = [
   ["equity", "equity"],
@@ -580,6 +586,7 @@ const persistCandidates = async (input: {
   now: Date;
   explorationThresholds: PaperExplorationThresholds;
   marketSummary: MarketResult["summary"];
+  cycleData: AlpacaDataCycle<MarketResult>;
   emitTelemetry?: (event: Record<string, unknown>) => void;
 }) => {
   const evaluated = input.targets
@@ -645,6 +652,12 @@ const persistCandidates = async (input: {
     rows: typeof decisions,
     emptyReasonCode?: string | null
   ) => {
+    const sharedQuotes = new Map(
+      rows.map((row) => [
+        row.target.symbol,
+        input.cycleData.getLatestQuote(row.target.symbol)
+      ])
+    );
     for (const row of rows) {
       const {
         target, option, optionSymbol, optionDte, leapsPolicy, strategyFamily,
@@ -712,11 +725,30 @@ const persistCandidates = async (input: {
       }
     }
     const selected = rows.filter((row) => row.selected);
+    const quoteReferences = Array.from(
+      new Set(
+        selected.flatMap((row) => {
+          const quote = sharedQuotes.get(row.target.symbol);
+          return quote
+            ? [
+                [
+                  "alpaca_quote",
+                  quote.provenance.feed,
+                  quote.provenance.symbol,
+                  quote.provenance.providerTimestamp,
+                  quote.provenance.receiptTimestamp
+                ].join(":")
+              ]
+            : [];
+        })
+      )
+    );
     return {
       proposals: selected.map((row) => row.target),
       evidence_references: [
         `research_run:${input.researchRunId}`,
-        ...selected.map((row) => `target:${row.target.sourceFingerprint}`)
+        ...selected.map((row) => `target:${row.target.sourceFingerprint}`),
+        ...quoteReferences
       ],
       confidence: selected.length
         ? Math.max(...selected.map((row) => row.target.confidence))
@@ -847,17 +879,23 @@ export const runPostgresResearchWorkflow = async (input: {
     profileOptionReadbackQuery: input.query.telemetryEnabled === true
   } as unknown as FencedPostgresRepositoryContext;
   try {
-    const market = await deps.refreshMarketData({
-      symbols: deps.symbols,
-      timeframe: "1Day",
-      start: new Date(now.getTime() - 365 * 86_400_000).toISOString(),
-      end: nowIso,
-      optionsEnabled: input.optionsEnabled,
-      now,
-      signal: input.signal,
-      repository,
-      context
+    const marketCycle = await deps.dataHub.hydrateCycle({
+      cycleId,
+      reason: "startup",
+      feed: "sip",
+      load: () => deps.refreshMarketData({
+        symbols: deps.symbols,
+        timeframe: "1Day",
+        start: new Date(now.getTime() - 365 * 86_400_000).toISOString(),
+        end: nowIso,
+        optionsEnabled: input.optionsEnabled,
+        now,
+        signal: input.signal,
+        repository,
+        context
+      })
     });
+    const market = marketCycle.payload;
     const generated = await deps.buildFeaturesAndTargets({
       bars: market.bars,
       stockSnapshots: market.stockSnapshots,
@@ -884,6 +922,7 @@ export const runPostgresResearchWorkflow = async (input: {
         maxCandidates: input.maxCandidates
       },
       marketSummary: market.summary,
+      cycleData: marketCycle,
       emitTelemetry: input.emitTelemetry
     });
     const completed = await input.query.query(

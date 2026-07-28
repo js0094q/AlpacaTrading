@@ -2,7 +2,7 @@ import { canonicalJsonHash } from "../lib/canonicalJson.js";
 import type { FencedPostgresRepositoryContext } from "../repositories/postgres/postgresRepositorySupport.js";
 import { PostgresMarketDataRepository } from "../repositories/postgres/postgresMarketDataRepository.js";
 import {
-  AlpacaStockStreamService,
+  getSharedAlpacaStockStream,
   type AlpacaStockStreamOptions,
   StockBarEvent,
   StockQuoteEvent,
@@ -56,7 +56,11 @@ export const createPostgresStockStreamEventSink = (input: {
           midpoint: (event.bidPrice + event.askPrice) / 2,
           quoteTimestamp: event.timestamp,
           receivedAt: event.receivedAt,
-          feed: event.feed
+          feed: event.feed,
+          provider: "alpaca",
+          environment: "paper",
+          providerTimestamp: event.timestamp,
+          receiptTimestamp: event.receivedAt
         }
       : {
           eventType: event.type,
@@ -65,7 +69,11 @@ export const createPostgresStockStreamEventSink = (input: {
           latestTradeSize: event.size,
           tradeTimestamp: event.timestamp,
           receivedAt: event.receivedAt,
-          feed: event.feed
+          feed: event.feed,
+          provider: "alpaca",
+          environment: "paper",
+          providerTimestamp: event.timestamp,
+          receiptTimestamp: event.receivedAt
         };
     await repository.upsertStockSnapshots([{
       id: `stock_snapshot_${canonicalJsonHash(evidence)}`,
@@ -85,7 +93,7 @@ export const createPostgresBackedStockStream = (input: {
   repository?: StreamWriter;
   context: FencedPostgresRepositoryContext;
   stream?: Omit<AlpacaStockStreamOptions, "onEvent">;
-}) => new AlpacaStockStreamService({
+}) => getSharedAlpacaStockStream({
   ...input.stream,
   onEvent: createPostgresStockStreamEventSink({
     repository: input.repository,

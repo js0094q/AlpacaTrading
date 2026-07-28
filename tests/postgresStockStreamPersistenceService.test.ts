@@ -27,7 +27,10 @@ test("SIP stream bars and quotes persist through PostgreSQL market repositories"
   await sink({
     type: "bar", symbol: "SPY", open: 600, high: 601, low: 599,
     close: 600.5, volume: 1_000, timestamp: "2026-07-20T21:59:00.000Z",
-    receivedAt: "2026-07-20T21:59:01.000Z", feed: "sip"
+    receivedAt: "2026-07-20T21:59:01.000Z", feed: "sip",
+    provider: "alpaca", environment: "paper",
+    providerTimestamp: "2026-07-20T21:59:00.000Z",
+    receiptTimestamp: "2026-07-20T21:59:01.000Z"
   });
   assert.equal(stored.bars?.length, 1);
   assert.equal((stored.bars![0] as { timeframe: string }).timeframe, "1Min");
@@ -35,7 +38,10 @@ test("SIP stream bars and quotes persist through PostgreSQL market repositories"
   await sink({
     type: "quote", symbol: "SPY", bidPrice: 600.4, bidSize: 5,
     askPrice: 600.6, askSize: 6, timestamp: "2026-07-20T21:59:02.000Z",
-    receivedAt: "2026-07-20T21:59:03.000Z", feed: "sip"
+    receivedAt: "2026-07-20T21:59:03.000Z", feed: "sip",
+    provider: "alpaca", environment: "paper",
+    providerTimestamp: "2026-07-20T21:59:02.000Z",
+    receiptTimestamp: "2026-07-20T21:59:03.000Z"
   });
   const snapshot = stored.snapshots?.[0] as { sourceTimestamp: string; evidence: { midpoint: number } };
   assert.equal(snapshot.sourceTimestamp, "2026-07-20T21:59:02.000Z");

@@ -25,9 +25,13 @@ const streamStatus = (overrides: Partial<AlpacaStockStreamStatus> = {}): AlpacaS
   connected: true,
   authenticated: true,
   subscribed: true,
+  provider: "alpaca",
   feed: "sip",
+  environment: "paper",
   symbols: ["AAPL", "MSFT", "SPY"],
   reconnectAttempts: 0,
+  reconnectBaseMs: 5_000,
+  reconnectMaxMs: 60_000,
   ...overrides
 });
 
@@ -43,6 +47,10 @@ const quoteEvent = (overrides: Partial<StockQuoteEvent> = {}): StockQuoteEvent =
   timestamp: eventTimestamp,
   receivedAt: now,
   feed: "sip",
+  provider: "alpaca",
+  environment: "paper",
+  providerTimestamp: eventTimestamp,
+  receiptTimestamp: now,
   ...overrides
 });
 
@@ -55,6 +63,10 @@ const tradeEvent = (overrides: Partial<StockTradeEvent> = {}): StockTradeEvent =
   timestamp: eventTimestamp,
   receivedAt: now,
   feed: "sip",
+  provider: "alpaca",
+  environment: "paper",
+  providerTimestamp: eventTimestamp,
+  receiptTimestamp: now,
   ...overrides
 });
 
@@ -69,6 +81,10 @@ const barEvent = (overrides: Partial<StockBarEvent> = {}): StockBarEvent => ({
   timestamp: eventTimestamp,
   receivedAt: now,
   feed: "sip",
+  provider: "alpaca",
+  environment: "paper",
+  providerTimestamp: eventTimestamp,
+  receiptTimestamp: now,
   ...overrides
 });
 

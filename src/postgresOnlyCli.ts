@@ -27,6 +27,7 @@ import { getAlpacaAccountSnapshot } from "./services/alpacaAccountService.js";
 import { checkAlpacaSymbolTradability } from "./services/alpacaAssetService.js";
 import { AlpacaApiError, getPaperOrderByClientOrderId } from "./services/alpacaClient.js";
 import { buildAlpacaConfigDiagnostic } from "./services/alpacaConfigDiagnosticService.js";
+import { alpacaDataHub } from "./services/alpacaDataHubService.js";
 import { getAlpacaMarketClock } from "./services/alpacaMarketClockService.js";
 import { listAlpacaOpenOrders } from "./services/alpacaOrderReadService.js";
 import { listAlpacaPositions } from "./services/alpacaPositionService.js";
@@ -492,16 +493,24 @@ const run = async (scheduledContext?: PostgresScheduledCommandOperationContext) 
       ? String(args.riskProfile) as "aggressive" | "moderate" | "conservative"
       : "moderate";
     const maxCandidates = Math.max(1, Math.min(25, Number.parseInt(String(args.maxCandidates || "10"), 10) || 10));
-    const result = await runPostgresResearchWorkflow({
-      query: researchQuery,
-      fence: context.fence,
-      riskProfile,
-      optionsEnabled: ["true", "1"].includes(String(args.optionsEnabled).toLowerCase()),
-      maxCandidates,
-      signal: context.signal,
-      emitTelemetry: emitRuntimeTelemetry
-    });
-    print({ ...paperEnvelope(), command, ...result });
+    await alpacaDataHub.start();
+    try {
+      const [result] = await Promise.all([
+        runPostgresResearchWorkflow({
+          query: researchQuery,
+          fence: context.fence,
+          riskProfile,
+          optionsEnabled: ["true", "1"].includes(String(args.optionsEnabled).toLowerCase()),
+          maxCandidates,
+          signal: context.signal,
+          emitTelemetry: emitRuntimeTelemetry
+        }),
+        alpacaDataHub.pollAccountActivitiesOnce()
+      ]);
+      print({ ...paperEnvelope(), command, ...result });
+    } finally {
+      await alpacaDataHub.stop();
+    }
     return;
   }
 
