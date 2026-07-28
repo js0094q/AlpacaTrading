@@ -287,6 +287,56 @@ const assertObservedOptionContract = (row: ReviewSourceRow) => {
     );
   }
 };
+const validateEntryReviewEvidence = (input: {
+  row: ReviewSourceRow;
+  now: Date;
+  maxMarketAgeSeconds: number;
+  maximumOptionSpreadPct: number;
+}) => {
+  const marketTimestamp = new Date(input.row.market_timestamp).toISOString();
+  const age = input.now.getTime() - Date.parse(marketTimestamp);
+  const maxAge = Math.min(
+    input.maxMarketAgeSeconds,
+    input.row.asset_class === "option"
+      ? optionsQuoteConfig().maxAgeMs / 1_000
+      : Number.POSITIVE_INFINITY
+  ) * 1_000;
+  if (!Number.isFinite(age) || age < -60_000 || age > maxAge) {
+    throw new Error(
+      `POSTGRES_REVIEW_MARKET_EVIDENCE_STALE:${input.row.symbol}`
+    );
+  }
+  const price = finite(input.row.market_price);
+  if (price === null || price <= 0) {
+    throw new Error(
+      `POSTGRES_REVIEW_MARKET_PRICE_MISSING:${input.row.symbol}`
+    );
+  }
+  assertObservedOptionContract(input.row);
+  const underlyingSip = assertFreshAlpacaSipUnderlying({
+    row: input.row,
+    now: input.now,
+    maxAgeSeconds: input.maxMarketAgeSeconds,
+    errorScope: "REVIEW"
+  });
+  assertExecutableOptionReviewEvidence(
+    input.row,
+    input.maximumOptionSpreadPct
+  );
+  return { marketTimestamp, price, underlyingSip };
+};
+const REVIEW_PROPOSAL_ERROR_PREFIXES = [
+  "POSTGRES_REVIEW_MARKET_EVIDENCE_STALE:",
+  "POSTGRES_REVIEW_OPTION_CONTRACT_INVALID:"
+] as const;
+const scopedReviewProposalReason = (error: unknown) => {
+  const message = error instanceof Error ? error.message : String(error);
+  return REVIEW_PROPOSAL_ERROR_PREFIXES.some((prefix) =>
+    message.startsWith(prefix)
+  )
+    ? message
+    : null;
+};
 const optionSizingScale = (row: ReviewSourceRow) => {
   if (row.asset_class !== "option") return 1;
   const decisionInputs = optionDecisionInputs(row);
@@ -1166,13 +1216,17 @@ export const runPostgresReviewWorkflow = async (input: {
   if (!rows.length) {
     return { status: "no_op" as const, code: "NO_ELIGIBLE_POSTGRES_CANDIDATES", reviewsCreated: 0, pendingIntentsCreated: 0, capacityBlocked: 0 };
   }
-  // Classify already-held / already-ordered candidates as row-level skips. Validate
-  // every remaining row before writing anything so stale or incomplete evidence
-  // still fails closed for the entire review batch.
+  // Classify candidate-scoped duplicate and selected evidence failures without
+  // weakening shared account, scheduler-fence, or submission-time safety.
   let skipped = 0;
   let capacityBlocked = 0;
-  const eligibleRows: Array<{ row: ReviewSourceRow; amount: number }> = [];
+  const eligibleRows: Array<{
+    row: ReviewSourceRow;
+    amount: number;
+    evidence: ReturnType<typeof validateEntryReviewEvidence>;
+  }> = [];
   const skippedRows: ReviewSourceRow[] = [];
+  const blockedRows: Array<{ row: ReviewSourceRow; reason: string }> = [];
   const capacityRows: Array<{
     row: ReviewSourceRow;
     reason:
@@ -1189,33 +1243,23 @@ export const runPostgresReviewWorkflow = async (input: {
       skippedRows.push(row);
       continue;
     }
-    const marketTimestamp = new Date(row.market_timestamp).toISOString();
-    const age = now.getTime() - Date.parse(marketTimestamp);
-    const maxAge = Math.min(
-      input.maxMarketAgeSeconds ??
-      AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS,
-      row.asset_class === "option"
-        ? optionsQuoteConfig().maxAgeMs / 1_000
-        : Number.POSITIVE_INFINITY
-    ) * 1_000;
-    if (!Number.isFinite(age) || age < -60_000 || age > maxAge) {
-      throw new Error(`POSTGRES_REVIEW_MARKET_EVIDENCE_STALE:${row.symbol}`);
+    let evidence: ReturnType<typeof validateEntryReviewEvidence>;
+    try {
+      evidence = validateEntryReviewEvidence({
+        row,
+        now,
+        maxMarketAgeSeconds:
+          input.maxMarketAgeSeconds ??
+          AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS,
+        maximumOptionSpreadPct: exploration.maximumOptionSpreadPct
+      });
+    } catch (error) {
+      const reason = scopedReviewProposalReason(error);
+      if (!reason) throw error;
+      blockedRows.push({ row, reason });
+      continue;
     }
-    const price = finite(row.market_price);
-    if (price === null || price <= 0) throw new Error(`POSTGRES_REVIEW_MARKET_PRICE_MISSING:${row.symbol}`);
-    assertObservedOptionContract(row);
-    assertFreshAlpacaSipUnderlying({
-      row,
-      now,
-      maxAgeSeconds:
-        input.maxMarketAgeSeconds ??
-        AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS,
-      errorScope: "REVIEW"
-    });
-    assertExecutableOptionReviewEvidence(
-      row,
-      exploration.maximumOptionSpreadPct
-    );
+    const price = evidence.price;
     const amount = sizing(row, exploration.maxOrderNotional);
     if (amount === null) {
       capacityBlocked += 1;
@@ -1236,7 +1280,7 @@ export const runPostgresReviewWorkflow = async (input: {
       capacityRows.push({ row, reason: "POSTGRES_REVIEW_SHORT_CAPACITY_INSUFFICIENT" });
       continue;
     }
-    eligibleRows.push({ row, amount });
+    eligibleRows.push({ row, amount, evidence });
   }
   for (const row of skippedRows) {
     await persistCandidateStage({
@@ -1245,6 +1289,16 @@ export const runPostgresReviewWorkflow = async (input: {
       candidateId: row.candidate_id,
       status: "skipped",
       reason: "POSTGRES_REVIEW_POSITION_OR_ORDER_EXISTS",
+      now: now.toISOString()
+    });
+  }
+  for (const { row, reason } of blockedRows) {
+    await persistCandidateStage({
+      query: input.query,
+      fence: input.fence,
+      candidateId: row.candidate_id,
+      status: "blocked",
+      reason,
       now: now.toISOString()
     });
   }
@@ -1259,6 +1313,19 @@ export const runPostgresReviewWorkflow = async (input: {
     });
   }
   if (!eligibleRows.length) {
+    if (blockedRows.length > 0) {
+      return {
+        status: "no_op" as const,
+        code: "NO_ELIGIBLE_POSTGRES_CANDIDATES",
+        command: input.command,
+        reviewsCreated: 0,
+        pendingIntentsCreated: 0,
+        skipped,
+        capacityBlocked,
+        confirmationCreated: false,
+        paperOnly: true
+      };
+    }
     return {
       status: "completed" as const, command: input.command, reviewsCreated: 0,
       pendingIntentsCreated: 0, skipped, capacityBlocked,
@@ -1267,33 +1334,8 @@ export const runPostgresReviewWorkflow = async (input: {
     };
   }
   let created = 0;
-  for (const { row, amount } of eligibleRows) {
-    const marketTimestamp = new Date(row.market_timestamp).toISOString();
-    const age = now.getTime() - Date.parse(marketTimestamp);
-    const maxAge = Math.min(
-      input.maxMarketAgeSeconds ??
-      AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS,
-      row.asset_class === "option"
-        ? optionsQuoteConfig().maxAgeMs / 1_000
-        : Number.POSITIVE_INFINITY
-    ) * 1_000;
-    if (!Number.isFinite(age) || age < -60_000 || age > maxAge) {
-      throw new Error(`POSTGRES_REVIEW_MARKET_EVIDENCE_STALE:${row.symbol}`);
-    }
-    const price = finite(row.market_price);
-    if (price === null || price <= 0) throw new Error(`POSTGRES_REVIEW_MARKET_PRICE_MISSING:${row.symbol}`);
-    const underlyingSip = assertFreshAlpacaSipUnderlying({
-      row,
-      now,
-      maxAgeSeconds:
-        input.maxMarketAgeSeconds ??
-        AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS,
-      errorScope: "REVIEW"
-    });
-    assertExecutableOptionReviewEvidence(
-      row,
-      exploration.maximumOptionSpreadPct
-    );
+  for (const { row, amount, evidence } of eligibleRows) {
+    const { marketTimestamp, price, underlyingSip } = evidence;
     const option = row.asset_class === "option";
     const shortEquity = !option && row.direction === "short";
     const operation: TradeOperation = option

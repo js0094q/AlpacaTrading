@@ -397,26 +397,29 @@ test("entry review skips an existing candidate and account-snapshot review ident
   assert.equal(sourceReads, 2);
 });
 
-test("review fails closed before persistence when market evidence is stale", async () => {
+test("a single stale proposal becomes canonical no-action after a bounded rejection", async () => {
   const sql: string[] = [];
-  await assert.rejects(
-    runPostgresReviewWorkflow({
-      command: "paper:review",
-      query: {
-        query: async (statement: string) => {
-          sql.push(statement);
-          if (statement.includes("FROM candidates candidate")) {
-            return { rows: [{ ...candidate, market_timestamp: "2026-07-15T20:00:00.000Z" }], rowCount: 1 };
-          }
-          return { rows: [], rowCount: 1 };
+  let candidateUpdateValues: readonly unknown[] = [];
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        sql.push(statement);
+        if (statement.includes("FROM candidates candidate")) {
+          return { rows: [{ ...candidate, market_timestamp: "2026-07-15T20:00:00.000Z" }], rowCount: 1 };
         }
-      },
-      fence,
-      signingKey: "test-signing-key-with-sufficient-length",
-      now: new Date("2026-07-20T22:00:00.000Z")
-    }),
-    /POSTGRES_REVIEW_MARKET_EVIDENCE_STALE:SPY/
-  );
+        if (statement.includes("UPDATE candidates")) candidateUpdateValues = values ?? [];
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+  assert.equal(result.status, "no_op");
+  assert.equal(result.code, "NO_ELIGIBLE_POSTGRES_CANDIDATES");
+  assert.equal(candidateUpdateValues[1], "blocked");
+  assert.equal(candidateUpdateValues[2], "POSTGRES_REVIEW_MARKET_EVIDENCE_STALE:SPY");
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO execution_reviews")), false);
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO order_intents")), false);
 });
@@ -449,36 +452,6 @@ test("entry review accepts market evidence that is fresh through the 30-minute b
   assert.equal(result.reviewsCreated, 1);
   assert.equal(result.pendingIntentsCreated, 1);
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO execution_reviews")), true);
-});
-
-test("entry review rejects market evidence older than 30 minutes before persistence", async () => {
-  const sql: string[] = [];
-  await assert.rejects(
-    runPostgresReviewWorkflow({
-      command: "paper:review",
-      query: {
-        query: async (statement: string) => {
-          sql.push(statement);
-          if (statement.includes("FROM candidates candidate")) {
-            return {
-              rows: [{
-                ...candidate,
-                market_timestamp: "2026-07-20T21:29:59.000Z"
-              }],
-              rowCount: 1
-            };
-          }
-          return { rows: [], rowCount: 1 };
-        }
-      },
-      fence,
-      signingKey: "test-signing-key-with-sufficient-length",
-      now: new Date("2026-07-20T22:00:00.000Z")
-    }),
-    /POSTGRES_REVIEW_MARKET_EVIDENCE_STALE:SPY/
-  );
-  assert.equal(sql.some((statement) => statement.includes("INSERT INTO execution_reviews")), false);
-  assert.equal(sql.some((statement) => statement.includes("INSERT INTO order_intents")), false);
 });
 
 for (const [label, sipOverride, expected] of [
@@ -625,17 +598,10 @@ for (const [label, marketEvidence] of [
   });
 }
 
-test("option review rejects an untradable or unobserved contract before persistence", async () => {
+test("invalid option contract blocks only that proposal and preserves valid equity work", async () => {
   const sql: string[] = [];
-  await assert.rejects(
-    runPostgresReviewWorkflow({
-      command: "paper:review",
-      query: {
-        query: async (statement: string) => {
-          sql.push(statement);
-          if (statement.includes("FROM candidates candidate")) {
-            return {
-              rows: [{
+  const candidateUpdates: Array<readonly unknown[]> = [];
+  const invalidOption = {
                 ...candidate,
                 candidate_id: "candidate-option-untradable",
                 asset_class: "option",
@@ -672,21 +638,40 @@ test("option review rejects an untradable or unobserved contract before persiste
                     }
                   }
                 }
-              }],
-              rowCount: 1
-            };
-          }
-          return { rows: [], rowCount: 1 };
+  };
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        sql.push(statement);
+        if (statement.includes("FROM candidates candidate")) {
+          return {
+            rows: [
+              { ...candidate, candidate_id: "valid-equity", symbol: "QQQ" },
+              invalidOption
+            ],
+            rowCount: 2
+          };
         }
-      },
-      fence,
-      signingKey: "test-signing-key-with-sufficient-length",
-      now: new Date("2026-07-20T22:00:00.000Z")
-    }),
-    /POSTGRES_REVIEW_OPTION_CONTRACT_INVALID:SPY260821C00560000/
-  );
-  assert.equal(sql.some((statement) => statement.includes("INSERT INTO execution_reviews")), false);
-  assert.equal(sql.some((statement) => statement.includes("INSERT INTO order_intents")), false);
+        if (statement.includes("UPDATE candidates")) candidateUpdates.push(values ?? []);
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.status, "completed");
+  assert.equal(result.reviewsCreated, 1);
+  assert.equal(result.pendingIntentsCreated, 1);
+  assert.equal(sql.filter((statement) => statement.includes("INSERT INTO execution_reviews")).length, 1);
+  assert.equal(sql.filter((statement) => statement.includes("INSERT INTO order_intents")).length, 1);
+  assert.equal(candidateUpdates.some((values) =>
+    values[0] === "candidate-option-untradable" &&
+    values[1] === "blocked" &&
+    values[2] === "POSTGRES_REVIEW_OPTION_CONTRACT_INVALID:SPY260821C00560000"
+  ), true);
 });
 
 test("entry review skips held/open-order candidates and reviews the remaining candidates", async () => {
@@ -724,28 +709,36 @@ test("entry review skips held/open-order candidates and reviews the remaining ca
   ), true);
 });
 
-test("stale evidence fails closed before any candidate review is persisted", async () => {
+test("stale proposal evidence blocks only that candidate and preserves valid siblings", async () => {
   const sql: string[] = [];
-  await assert.rejects(
-    runPostgresReviewWorkflow({
-      command: "paper:review",
-      query: {
-        query: async (statement: string) => {
-          sql.push(statement);
-          if (statement.includes("FROM candidates candidate")) {
-            return { rows: [candidate, { ...candidate, candidate_id: "stale-candidate", symbol: "QQQ", market_timestamp: "2026-07-15T20:00:00.000Z" }], rowCount: 2 };
-          }
-          return { rows: [], rowCount: 1 };
+  const candidateUpdates: Array<readonly unknown[]> = [];
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        sql.push(statement);
+        if (statement.includes("FROM candidates candidate")) {
+          return { rows: [candidate, { ...candidate, candidate_id: "stale-candidate", symbol: "QQQ", market_timestamp: "2026-07-15T20:00:00.000Z" }], rowCount: 2 };
         }
-      },
-      fence,
-      signingKey: "test-signing-key-with-sufficient-length",
-      now: new Date("2026-07-20T22:00:00.000Z")
-    }),
-    /POSTGRES_REVIEW_MARKET_EVIDENCE_STALE:QQQ/
-  );
-  assert.equal(sql.some((statement) => statement.includes("INSERT INTO execution_reviews")), false);
-  assert.equal(sql.some((statement) => statement.includes("INSERT INTO order_intents")), false);
+        if (statement.includes("UPDATE candidates")) candidateUpdates.push(values ?? []);
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.status, "completed");
+  assert.equal(result.reviewsCreated, 1);
+  assert.equal(result.pendingIntentsCreated, 1);
+  assert.equal(sql.filter((statement) => statement.includes("INSERT INTO execution_reviews")).length, 1);
+  assert.equal(sql.filter((statement) => statement.includes("INSERT INTO order_intents")).length, 1);
+  assert.equal(candidateUpdates.some((values) =>
+    values[0] === "stale-candidate" &&
+    values[1] === "blocked" &&
+    values[2] === "POSTGRES_REVIEW_MARKET_EVIDENCE_STALE:QQQ"
+  ), true);
 });
 
 test("option capacity insufficiency blocks only that candidate and preserves preceding eligible work", async () => {

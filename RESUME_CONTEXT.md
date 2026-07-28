@@ -1,5 +1,11 @@
 # Resume Context: Alpaca Trading Research Infra
 
+## Proposal-scoped entry review (2026-07-28)
+
+- Stale entry market evidence and invalid observed option contracts block only
+  the affected candidate; valid siblings continue and an all-blocked batch is
+  canonical `NO_ELIGIBLE_POSTGRES_CANDIDATES` no-action.
+
 ## Shared stock-snapshot readiness stabilization (2026-07-27)
 
 - `POSTGRES_STOCK_SNAPSHOT_STALE` remains a failed PostgreSQL research run and

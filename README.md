@@ -1,5 +1,11 @@
 # Alpaca Trading Research Infrastructure
 
+## Proposal-scoped entry review (2026-07-28)
+
+Stale entry market evidence and invalid observed option contracts now block only
+the affected candidate. Valid siblings continue, an all-blocked batch returns
+`NO_ELIGIBLE_POSTGRES_CANDIDATES`, and submission-time safety remains unchanged.
+
 ## PostgreSQL-only runtime authority (2026-07-20)
 
 PostgreSQL is the sole production runtime authority. SQLite migration,
