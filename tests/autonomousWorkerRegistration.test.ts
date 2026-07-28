@@ -80,6 +80,16 @@ test("production execution wires snapshot persistence and bounded ambiguous reco
   assert.match(source, /recoverAmbiguousPostgresSubmission/);
 });
 
+test("worker-state persistence is fenced and returns structured failure evidence", async () => {
+  const source = await readFile(new URL("../src/postgresOnlyCli.ts", import.meta.url), "utf8");
+  assert.match(
+    source,
+    /persistAutonomousWorkerState\(context\.pool,\s*context\.config,[\s\S]*?context\.fence\)/
+  );
+  assert.match(source, /error instanceof AutonomousWorkerPersistenceError/);
+  assert.match(source, /persistence:\s*error\.evidence/);
+});
+
 test("production cancellation supports a scheduler-owned autonomous policy selector", async () => {
   const source = await readFile(new URL("../src/postgresOnlyCli.ts", import.meta.url), "utf8");
   assert.match(source, /runAutonomousPostgresPaperOrderCancellation/);

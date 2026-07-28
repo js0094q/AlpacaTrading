@@ -1,5 +1,30 @@
 # Alpaca Trading Research Infrastructure
 
+## Autonomous worker-state persistence continuity (2026-07-28)
+
+Worker lifecycle payloads use the same bounded 256-KiB envelope as the parent
+worker capture. The former 32-KiB decoder limit could reject a valid large
+research completion before any PostgreSQL operation; it is no longer the
+service-level restart boundary.
+
+Cycle and workstream lifecycle writes are recoverable authoritative state.
+They run in a fresh serializable transaction on each of at most three attempts,
+with deterministic event IDs, exact replay detection, current scheduler-fence
+verification, and bounded exponential jitter only for supported transient
+PostgreSQL or connection codes. Rollback and client release finish before any
+retry delay. Invalid input, schema failures, lifecycle conflicts, and fence
+loss do not retry. `preflight_failed` remains supplemental observability and
+cannot alter trading authorization.
+
+When recoverable state persistence exhausts its bounds, the worker records a
+sanitized operation/error/disposition event, terminalizes the affected cycle
+when possible, and keeps the persistent process alive for the next
+reconciliation-first cycle. Explicit shutdown remains clean. Invalid runtime
+posture, production-command contract, or paper/live safety still fails the
+service closed. Execution intent, idempotency, reservation, broker result, and
+reconciliation authority are unchanged and remain PostgreSQL-only and
+fail-closed.
+
 ## Proposal-scoped entry review (2026-07-28)
 
 Stale entry market evidence and invalid observed option contracts now block only

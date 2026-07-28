@@ -45,6 +45,8 @@ import {
 import { resolvePostgresSchedulerJob } from "./services/postgresSchedulerCommandRegistry.js";
 import {
   AUTONOMOUS_WORKER_EVENT_TYPES,
+  AutonomousWorkerPersistenceError,
+  autonomousWorkerPersistenceClassification,
   decodeAutonomousWorkerStatePayload,
   persistAutonomousWorkerState,
   type AutonomousWorkerEventType
@@ -383,13 +385,47 @@ const run = async (scheduledContext?: PostgresScheduledCommandOperationContext) 
     if (!(AUTONOMOUS_WORKER_EVENT_TYPES as readonly string[]).includes(eventType)) {
       throw new Error("AUTONOMOUS_WORKER_EVENT_TYPE_INVALID");
     }
-    const payload = decodeAutonomousWorkerStatePayload(String(args.payload || ""));
+    const workerEventType = eventType as AutonomousWorkerEventType;
+    const cycleId = String(args.cycleId || "");
+    let payload: Record<string, unknown>;
+    try {
+      payload = decodeAutonomousWorkerStatePayload(String(args.payload || ""));
+    } catch (error) {
+      const errorCode =
+        error instanceof Error && /^[A-Z][A-Z0-9_]+$/.test(error.message)
+          ? error.message
+          : "AUTONOMOUS_WORKER_STATE_PAYLOAD_INVALID";
+      const persistenceClassification =
+        autonomousWorkerPersistenceClassification(workerEventType);
+      throw new AutonomousWorkerPersistenceError(
+        {
+          operationName: `decode_autonomous_worker_state:${workerEventType}`,
+          persistenceClassification,
+          cycleId: cycleId.slice(0, 64),
+          workstreamName: "autonomous_worker",
+          lifecycleState: workerEventType,
+          retryAttempt: 0,
+          maximumAttempts: 1,
+          errorCode,
+          postgresErrorCode: null,
+          retryable: false,
+          schedulerFenceStatus: "held",
+          transactionStatus: "rolled_back_or_not_started",
+          finalDisposition:
+            persistenceClassification === "OBSERVABILITY_SUPPLEMENTAL"
+              ? "SUPPLEMENTAL_WRITE_SKIPPED"
+              : "NONRETRYABLE_PERSISTENCE_FAILURE",
+          timestamp: new Date().toISOString()
+        },
+        error
+      );
+    }
     const result = await persistAutonomousWorkerState(context.pool, context.config, {
-      cycleId: String(args.cycleId || ""),
-      eventType: eventType as AutonomousWorkerEventType,
+      cycleId,
+      eventType: workerEventType,
       payload,
       occurredAt: String(args.occurredAt || new Date().toISOString())
-    });
+    }, context.fence);
     print({ ...paperEnvelope(), command, ...result });
     return;
   }
@@ -574,6 +610,13 @@ try {
   removeTerminationHandlers();
 } catch (error) {
   removeTerminationHandlers();
+  if (error instanceof AutonomousWorkerPersistenceError) {
+    print({
+      error: { code: error.code, message: error.message },
+      persistence: error.evidence
+    });
+    process.exit(1);
+  }
   if (error instanceof AlpacaOperationDeadlineError) {
     print({ error: { code: error.code, message: error.message }, deadline: error.metadata });
     process.exit(1);

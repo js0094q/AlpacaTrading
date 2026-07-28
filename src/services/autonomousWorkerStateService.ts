@@ -1,8 +1,12 @@
 import type { Pool, PoolClient } from "pg";
 
-import type { JsonValue } from "../repositories/contracts/common.js";
+import type {
+  JsonValue,
+  SchedulerFence
+} from "../repositories/contracts/common.js";
 import {
   canonicalJson,
+  fenceValues,
   parseJsonValue,
   stableRecordId
 } from "../repositories/postgres/postgresRepositorySupport.js";
@@ -10,9 +14,32 @@ import type { DatabaseConfig } from "../lib/database/config.js";
 import { withPostgresTransaction } from "../lib/database/postgresTransaction.js";
 import { redactSensitiveData } from "../lib/securityRedaction.js";
 
-const MAX_PAYLOAD_BYTES = 32 * 1024;
+export const AUTONOMOUS_WORKER_STATE_MAX_PAYLOAD_BYTES = 256 * 1024;
 const ACTIVE_CYCLE_WINDOW_HOURS = 6;
 const CYCLE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const DEFAULT_MAXIMUM_PERSISTENCE_ATTEMPTS = 3;
+const DEFAULT_PERSISTENCE_RETRY_BASE_DELAY_MS = 100;
+const DEFAULT_PERSISTENCE_RETRY_MAXIMUM_DELAY_MS = 1_000;
+const RETRYABLE_POSTGRES_CODES = new Set([
+  "40001",
+  "40P01",
+  "53300",
+  "55P03",
+  "57P01",
+  "57P02",
+  "57P03"
+]);
+const RETRYABLE_SYSTEM_CODES = new Set([
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EHOSTUNREACH",
+  "ENETDOWN",
+  "ENETUNREACH",
+  "EPIPE",
+  "ETIMEDOUT"
+]);
+const SQLSTATE_PATTERN = /^(?:(?:[0-9]{2}|[0-9][A-Z])|P0|XX)[0-9A-Z]{3}$/;
+const APPLICATION_ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,159}$/;
 
 export const AUTONOMOUS_WORKER_EVENT_TYPES = [
   "preflight_failed",
@@ -28,11 +55,292 @@ export const AUTONOMOUS_WORKER_EVENT_TYPES = [
 export type AutonomousWorkerEventType =
   (typeof AUTONOMOUS_WORKER_EVENT_TYPES)[number];
 
+export type AutonomousWorkerPersistenceClassification =
+  | "AUTHORITATIVE_REQUIRED"
+  | "AUTHORITATIVE_RECOVERABLE"
+  | "OBSERVABILITY_SUPPLEMENTAL";
+
+export type AutonomousWorkerPersistenceDisposition =
+  | "PERSISTED"
+  | "PERSISTED_AFTER_RETRY"
+  | "CYCLE_FAILED_WORKER_CONTINUED"
+  | "SUPPLEMENTAL_WRITE_SKIPPED"
+  | "NONRETRYABLE_PERSISTENCE_FAILURE"
+  | "SCHEDULER_FENCE_LOST";
+
+export type AutonomousWorkerPersistenceEvidence = {
+  readonly operationName: string;
+  readonly persistenceClassification: AutonomousWorkerPersistenceClassification;
+  readonly cycleId: string;
+  readonly workstreamName: string;
+  readonly lifecycleState: string;
+  readonly retryAttempt: number;
+  readonly maximumAttempts: number;
+  readonly errorCode: string | null;
+  readonly postgresErrorCode: string | null;
+  readonly retryable: boolean;
+  readonly schedulerFenceStatus: "held" | "lost" | "not_applicable";
+  readonly transactionStatus: "committed" | "rolled_back_or_not_started";
+  readonly finalDisposition: AutonomousWorkerPersistenceDisposition;
+  readonly timestamp: string;
+};
+
+export class AutonomousWorkerPersistenceError extends Error {
+  readonly code = "AUTONOMOUS_WORKER_STATE_PERSIST_FAILED";
+  readonly evidence: AutonomousWorkerPersistenceEvidence;
+  override readonly cause?: unknown;
+
+  constructor(evidence: AutonomousWorkerPersistenceEvidence, cause?: unknown) {
+    super("AUTONOMOUS_WORKER_STATE_PERSIST_FAILED");
+    this.name = "AutonomousWorkerPersistenceError";
+    this.evidence = evidence;
+    this.cause = cause;
+  }
+}
+
 export type AutonomousWorkerStateInput = {
   readonly cycleId: string;
   readonly eventType: AutonomousWorkerEventType;
   readonly payload: Readonly<Record<string, unknown>>;
   readonly occurredAt: string;
+};
+
+export const autonomousWorkerPersistenceClassification = (
+  eventType: AutonomousWorkerEventType
+): AutonomousWorkerPersistenceClassification =>
+  eventType === "preflight_failed"
+    ? "OBSERVABILITY_SUPPLEMENTAL"
+    : "AUTHORITATIVE_RECOVERABLE";
+
+type AutonomousWorkerPersistenceOperationInput<T> = {
+  readonly operationName: string;
+  readonly persistenceClassification: AutonomousWorkerPersistenceClassification;
+  readonly cycleId: string;
+  readonly workstreamName: string;
+  readonly lifecycleState: string;
+  readonly schedulerFenceStatus: "held" | "not_applicable";
+  readonly operation: () => Promise<T>;
+};
+
+type AutonomousWorkerPersistenceDependencies = {
+  readonly maximumAttempts?: number;
+  readonly baseDelayMs?: number;
+  readonly maximumDelayMs?: number;
+  readonly wait?: (milliseconds: number) => Promise<void>;
+  readonly random?: () => number;
+  readonly now?: () => Date;
+  readonly emit?: (evidence: Readonly<Record<string, unknown>>) => void;
+};
+
+const waitFor = (milliseconds: number) =>
+  new Promise<void>((resolve) => {
+    setTimeout(resolve, milliseconds);
+  });
+
+const errorIdentity = (error: unknown) => {
+  const pending: unknown[] = [error];
+  const seen = new Set<unknown>();
+  let fallbackCode: string | null = null;
+  while (pending.length > 0 && seen.size < 16) {
+    const candidate = pending.shift();
+    if (
+      candidate === null ||
+      typeof candidate !== "object" ||
+      seen.has(candidate)
+    ) {
+      continue;
+    }
+    seen.add(candidate);
+    const record = candidate as {
+      code?: unknown;
+      message?: unknown;
+      cause?: unknown;
+      errors?: unknown;
+    };
+    if (typeof record.code === "string" && record.code.trim()) {
+      const code = record.code.trim().toUpperCase();
+      if (
+        code === "SCHEDULER_FENCE_LOST" ||
+        (SQLSTATE_PATTERN.test(code) && code.startsWith("08")) ||
+        RETRYABLE_POSTGRES_CODES.has(code) ||
+        RETRYABLE_SYSTEM_CODES.has(code) ||
+        SQLSTATE_PATTERN.test(code)
+      ) {
+        return {
+          errorCode: code,
+          postgresErrorCode: SQLSTATE_PATTERN.test(code) ? code : null
+        };
+      }
+      if (APPLICATION_ERROR_CODE_PATTERN.test(code)) fallbackCode ??= code;
+    }
+    if (
+      typeof record.message === "string" &&
+      APPLICATION_ERROR_CODE_PATTERN.test(record.message.trim())
+    ) {
+      fallbackCode ??= record.message.trim();
+    }
+    if (record.cause !== undefined) pending.push(record.cause);
+    if (Array.isArray(record.errors)) pending.push(...record.errors);
+  }
+  return {
+    errorCode: fallbackCode,
+    postgresErrorCode:
+      fallbackCode && SQLSTATE_PATTERN.test(fallbackCode)
+        ? fallbackCode
+        : null
+  };
+};
+
+const retryablePersistenceError = (code: string | null) =>
+  Boolean(
+    code &&
+    (
+      (SQLSTATE_PATTERN.test(code) && code.startsWith("08")) ||
+      RETRYABLE_POSTGRES_CODES.has(code) ||
+      RETRYABLE_SYSTEM_CODES.has(code)
+    )
+  );
+
+const boundedRetryDelay = (
+  retryAttempt: number,
+  baseDelayMs: number,
+  maximumDelayMs: number,
+  random: () => number
+) => {
+  const exponential = Math.min(
+    maximumDelayMs,
+    baseDelayMs * (2 ** Math.max(0, retryAttempt - 1))
+  );
+  const jitter = Math.min(1, Math.max(0, random()));
+  return Math.min(
+    maximumDelayMs,
+    Math.max(0, Math.floor(exponential * (0.5 + jitter * 0.5)))
+  );
+};
+
+export const runAutonomousWorkerPersistence = async <T>(
+  input: AutonomousWorkerPersistenceOperationInput<T>,
+  dependencies: AutonomousWorkerPersistenceDependencies = {}
+) => {
+  const maximumAttempts = Math.max(
+    1,
+    Math.min(
+      5,
+      Math.floor(
+        dependencies.maximumAttempts ??
+          DEFAULT_MAXIMUM_PERSISTENCE_ATTEMPTS
+      )
+    )
+  );
+  const baseDelayMs = Math.max(
+    0,
+    Math.floor(
+      dependencies.baseDelayMs ??
+        DEFAULT_PERSISTENCE_RETRY_BASE_DELAY_MS
+    )
+  );
+  const maximumDelayMs = Math.max(
+    baseDelayMs,
+    Math.floor(
+      dependencies.maximumDelayMs ??
+        DEFAULT_PERSISTENCE_RETRY_MAXIMUM_DELAY_MS
+    )
+  );
+  const wait = dependencies.wait ?? waitFor;
+  const random = dependencies.random ?? Math.random;
+  const now = dependencies.now ?? (() => new Date());
+  let lastErrorCode: string | null = null;
+  let lastPostgresErrorCode: string | null = null;
+  let lastRetryable = false;
+
+  for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
+    try {
+      const value = await input.operation();
+      const evidence: AutonomousWorkerPersistenceEvidence = {
+        operationName: input.operationName,
+        persistenceClassification: input.persistenceClassification,
+        cycleId: input.cycleId,
+        workstreamName: input.workstreamName,
+        lifecycleState: input.lifecycleState,
+        retryAttempt: attempt - 1,
+        maximumAttempts,
+        errorCode: lastErrorCode,
+        postgresErrorCode: lastPostgresErrorCode,
+        retryable: lastRetryable,
+        schedulerFenceStatus: input.schedulerFenceStatus,
+        transactionStatus: "committed",
+        finalDisposition:
+          attempt === 1 ? "PERSISTED" : "PERSISTED_AFTER_RETRY",
+        timestamp: now().toISOString()
+      };
+      dependencies.emit?.(evidence);
+      return { value, evidence };
+    } catch (error) {
+      const identity = errorIdentity(error);
+      const fenceLost = identity.errorCode === "SCHEDULER_FENCE_LOST";
+      const retryable =
+        !fenceLost && retryablePersistenceError(identity.errorCode);
+      lastErrorCode = identity.errorCode;
+      lastPostgresErrorCode = identity.postgresErrorCode;
+      lastRetryable = retryable;
+      const canRetry = retryable && attempt < maximumAttempts;
+      if (canRetry) {
+        const retryDelayMs = boundedRetryDelay(
+          attempt,
+          baseDelayMs,
+          maximumDelayMs,
+          random
+        );
+        dependencies.emit?.({
+          operationName: input.operationName,
+          persistenceClassification: input.persistenceClassification,
+          cycleId: input.cycleId,
+          workstreamName: input.workstreamName,
+          lifecycleState: input.lifecycleState,
+          retryAttempt: attempt,
+          maximumAttempts,
+          errorCode: identity.errorCode,
+          postgresErrorCode: identity.postgresErrorCode,
+          retryable,
+          schedulerFenceStatus: input.schedulerFenceStatus,
+          transactionStatus: "rolled_back_or_not_started",
+          retryDelayMs,
+          timestamp: now().toISOString()
+        });
+        await wait(retryDelayMs);
+        continue;
+      }
+
+      const evidence: AutonomousWorkerPersistenceEvidence = {
+        operationName: input.operationName,
+        persistenceClassification: input.persistenceClassification,
+        cycleId: input.cycleId,
+        workstreamName: input.workstreamName,
+        lifecycleState: input.lifecycleState,
+        retryAttempt: attempt - 1,
+        maximumAttempts,
+        errorCode: identity.errorCode,
+        postgresErrorCode: identity.postgresErrorCode,
+        retryable,
+        schedulerFenceStatus: fenceLost
+          ? "lost"
+          : input.schedulerFenceStatus,
+        transactionStatus: "rolled_back_or_not_started",
+        finalDisposition: fenceLost
+          ? "SCHEDULER_FENCE_LOST"
+          : input.persistenceClassification === "OBSERVABILITY_SUPPLEMENTAL"
+            ? "SUPPLEMENTAL_WRITE_SKIPPED"
+            : retryable
+              ? "CYCLE_FAILED_WORKER_CONTINUED"
+              : "NONRETRYABLE_PERSISTENCE_FAILURE",
+        timestamp: now().toISOString()
+      };
+      dependencies.emit?.(evidence);
+      throw new AutonomousWorkerPersistenceError(evidence, error);
+    }
+  }
+
+  throw new Error("AUTONOMOUS_WORKER_PERSISTENCE_RETRY_BOUNDS_INVALID");
 };
 
 const fail = (code: string): never => {
@@ -53,7 +361,7 @@ export const decodeAutonomousWorkerStatePayload = (encoded: string) => {
   } catch {
     return fail("AUTONOMOUS_WORKER_STATE_PAYLOAD_INVALID");
   }
-  if (decoded.byteLength > MAX_PAYLOAD_BYTES) {
+  if (decoded.byteLength > AUTONOMOUS_WORKER_STATE_MAX_PAYLOAD_BYTES) {
     return fail("AUTONOMOUS_WORKER_STATE_PAYLOAD_TOO_LARGE");
   }
   try {
@@ -94,7 +402,8 @@ const allowedTransition = (
 
 export const persistAutonomousWorkerStateWithClient = async (
   client: PoolClient,
-  input: AutonomousWorkerStateInput
+  input: AutonomousWorkerStateInput,
+  fence?: SchedulerFence
 ) => {
   if (!CYCLE_ID.test(input.cycleId)) fail("AUTONOMOUS_WORKER_CYCLE_ID_INVALID");
   if (!(AUTONOMOUS_WORKER_EVENT_TYPES as readonly string[]).includes(input.eventType)) {
@@ -102,6 +411,50 @@ export const persistAutonomousWorkerStateWithClient = async (
   }
   const occurredAt = new Date(input.occurredAt);
   if (!Number.isFinite(occurredAt.getTime())) fail("AUTONOMOUS_WORKER_EVENT_TIME_INVALID");
+  if (fence) {
+    const currentFence = await client.query(
+      `SELECT 1
+       FROM scheduler_leases
+       WHERE job_name = $1 AND workstream = $2 AND owner_id = $3
+         AND run_id = $4 AND fencing_token = $5 AND status = 'held'
+         AND expires_at > clock_timestamp()
+       FOR UPDATE`,
+      [...fenceValues(fence)]
+    );
+    if (currentFence.rowCount !== 1) fail("SCHEDULER_FENCE_LOST");
+  }
+
+  const payload = asJsonPayload(input.payload);
+  const workstreamName =
+    typeof input.payload.workstream === "string"
+      ? input.payload.workstream.trim()
+      : "";
+  if (input.eventType.startsWith("workstream_") && !workstreamName) {
+    fail("AUTONOMOUS_WORKER_WORKSTREAM_IDENTITY_REQUIRED");
+  }
+  const eventKey = canonicalJson({
+    cycleId: input.cycleId,
+    eventType: input.eventType,
+    occurredAt: occurredAt.toISOString(),
+    payload
+  });
+  const eventId = `autonomous_${stableRecordId("autonomous_worker_event", eventKey)}`;
+  const fingerprint = stableRecordId("autonomous_worker_payload", canonicalJson(payload));
+  const replay = await client.query<{ event_id: string }>(
+    `SELECT event_id
+     FROM workstream_events
+     WHERE event_id = $1
+     FOR UPDATE`,
+    [eventId]
+  );
+  if (replay.rows[0]?.event_id) {
+    return {
+      status: "persisted" as const,
+      eventId,
+      replayed: true as const
+    };
+  }
+
   let resumedCycleId: string | null = null;
 
   if (input.eventType === "cycle_started") {
@@ -187,8 +540,11 @@ export const persistAutonomousWorkerStateWithClient = async (
     }
   }
 
-  const previousResult = await client.query<{ event_type: AutonomousWorkerEventType }>(
-    `SELECT event_type
+  const previousResult = await client.query<{
+    event_type: AutonomousWorkerEventType;
+    workstream: string | null;
+  }>(
+    `SELECT event_type, payload->>'workstream' AS workstream
      FROM workstream_events
      WHERE workstream = 'autonomous_worker' AND entity_id = $1
      ORDER BY occurred_at DESC, event_id DESC
@@ -196,20 +552,19 @@ export const persistAutonomousWorkerStateWithClient = async (
      FOR UPDATE`,
     [input.cycleId]
   );
-  const previous = previousResult.rows[0]?.event_type ?? null;
+  const previousRow = previousResult.rows[0];
+  const previous = previousRow?.event_type ?? null;
   if (!allowedTransition(previous, input.eventType)) {
     fail("AUTONOMOUS_WORKER_STATE_TRANSITION_INVALID");
   }
+  if (
+    ["workstream_completed", "workstream_failed"].includes(input.eventType) &&
+    previous === "workstream_started" &&
+    previousRow?.workstream !== workstreamName
+  ) {
+    fail("AUTONOMOUS_WORKER_WORKSTREAM_IDENTITY_MISMATCH");
+  }
 
-  const payload = asJsonPayload(input.payload);
-  const eventKey = canonicalJson({
-    cycleId: input.cycleId,
-    eventType: input.eventType,
-    occurredAt: occurredAt.toISOString(),
-    payload
-  });
-  const eventId = `autonomous_${stableRecordId("autonomous_worker_event", eventKey)}`;
-  const fingerprint = stableRecordId("autonomous_worker_payload", canonicalJson(payload));
   await client.query(
     `INSERT INTO workstream_events(
        event_id, workstream, event_type, entity_type, entity_id,
@@ -262,10 +617,32 @@ export const persistAutonomousWorkerStateWithClient = async (
 export const persistAutonomousWorkerState = (
   pool: Pool,
   config: DatabaseConfig,
-  input: AutonomousWorkerStateInput
-) => withPostgresTransaction(
-  pool,
-  config,
-  (client) => persistAutonomousWorkerStateWithClient(client, input),
-  { isolationLevel: "serializable" }
-);
+  input: AutonomousWorkerStateInput,
+  fence?: SchedulerFence,
+  dependencies: AutonomousWorkerPersistenceDependencies = {}
+) => runAutonomousWorkerPersistence(
+  {
+    operationName: `persist_autonomous_worker_state:${input.eventType}`,
+    persistenceClassification:
+      autonomousWorkerPersistenceClassification(input.eventType),
+    cycleId: input.cycleId,
+    workstreamName: boundedText(
+      input.payload.workstream,
+      "autonomous_worker",
+      160
+    ),
+    lifecycleState: input.eventType,
+    schedulerFenceStatus: fence ? "held" : "not_applicable",
+    operation: () => withPostgresTransaction(
+      pool,
+      config,
+      (client) =>
+        persistAutonomousWorkerStateWithClient(client, input, fence),
+      { isolationLevel: "serializable" }
+    )
+  },
+  dependencies
+).then(({ value, evidence }) => ({
+  ...value,
+  persistence: evidence
+}));

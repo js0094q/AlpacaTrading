@@ -101,6 +101,7 @@ const completePostgresOnlyEnvironment = {
 type FakeCall = {
   command: string;
   args: string[];
+  workerPid?: number;
   cycleId?: string;
   resumeCycleId?: string;
   workstream?: string;
@@ -131,6 +132,10 @@ const runWorker = (options: {
   failCommand?: string;
   failOutput?: string;
   failStateEvent?: string;
+  failStateEventOnce?: string;
+  invalidStateEvent?: string;
+  stopAfterCycleStarts?: number;
+  once?: boolean;
   successCommand?: string;
   successOutput?: string;
   successOutputs?: Record<string, string>;
@@ -142,6 +147,8 @@ const runWorker = (options: {
   const statesPath = join(directory, "states.jsonl");
   const activePath = join(directory, "active");
   const overlapPath = join(directory, "overlap");
+  const stateFailurePath = join(directory, "state-failure");
+  const cycleCountPath = join(directory, "cycle-count");
   const fakeNpm = join(directory, "npm");
   writeFileSync(
     fakeNpm,
@@ -152,6 +159,7 @@ const args = process.argv.slice(4);
 appendFileSync(process.env.WORKER_CALLS_PATH, JSON.stringify({
   command,
   args,
+  workerPid: process.ppid,
   cycleId: process.env.AUTONOMOUS_CYCLE_ID,
   resumeCycleId: process.env.AUTONOMOUS_RESUME_CYCLE_ID,
   workstream: process.env.AUTONOMOUS_WORKSTREAM,
@@ -171,9 +179,55 @@ if (command === "worker:state") {
     payload: JSON.parse(Buffer.from(value("payload"), "base64url").toString("utf8"))
   };
   appendFileSync(process.env.WORKER_STATES_PATH, JSON.stringify(state) + "\\n");
-  if (state.eventType === process.env.WORKER_FAIL_STATE_EVENT) {
-    process.stdout.write(JSON.stringify({ error: "worker-test-secret-state-failure" }));
+  const failOnce =
+    state.eventType === process.env.WORKER_FAIL_STATE_EVENT_ONCE &&
+    !existsSync(process.env.WORKER_STATE_FAILURE_PATH);
+  if (failOnce) writeFileSync(process.env.WORKER_STATE_FAILURE_PATH, "failed");
+  if (state.eventType === process.env.WORKER_FAIL_STATE_EVENT || failOnce) {
+    const persistenceClassification =
+      state.eventType === "preflight_failed"
+        ? "OBSERVABILITY_SUPPLEMENTAL"
+        : "AUTHORITATIVE_RECOVERABLE";
+    process.stdout.write(JSON.stringify({
+      error: {
+        code: "AUTONOMOUS_WORKER_STATE_PERSIST_FAILED",
+        message: "worker-test-secret-state-failure"
+      },
+      persistence: {
+        operationName: "persist_autonomous_worker_state:" + state.eventType,
+        persistenceClassification,
+        cycleId: state.cycleId,
+        workstreamName: String(state.payload.workstream || "autonomous_worker"),
+        lifecycleState: state.eventType,
+        retryAttempt: 2,
+        maximumAttempts: 3,
+        errorCode: "08006",
+        postgresErrorCode: "08006",
+        retryable: true,
+        schedulerFenceStatus: "held",
+        transactionStatus: "rolled_back_or_not_started",
+        finalDisposition:
+          persistenceClassification === "OBSERVABILITY_SUPPLEMENTAL"
+            ? "SUPPLEMENTAL_WRITE_SKIPPED"
+            : "CYCLE_FAILED_WORKER_CONTINUED",
+        timestamp: "2026-07-28T15:00:00.000Z"
+      }
+    }));
     process.exit(1);
+  }
+  if (state.eventType === process.env.WORKER_INVALID_STATE_EVENT) {
+    process.stdout.write(JSON.stringify({ status: "unexpected" }));
+    process.exit(0);
+  }
+  if (state.eventType === "cycle_started") {
+    const prior = existsSync(process.env.WORKER_CYCLE_COUNT_PATH)
+      ? Number(require("node:fs").readFileSync(process.env.WORKER_CYCLE_COUNT_PATH, "utf8"))
+      : 0;
+    const count = prior + 1;
+    writeFileSync(process.env.WORKER_CYCLE_COUNT_PATH, String(count));
+    if (count === Number(process.env.WORKER_STOP_AFTER_CYCLE_STARTS || 0)) {
+      process.kill(process.ppid, "SIGTERM");
+    }
   }
   process.stdout.write(JSON.stringify({
     status: "persisted",
@@ -230,7 +284,11 @@ process.stdout.write(JSON.stringify({ status: "success" }));
   try {
     const result = spawnSync(
       process.execPath,
-      [workerPath, "--once", "--cycle-delay-ms=0"],
+      [
+        workerPath,
+        ...(options.once === false ? [] : ["--once"]),
+        "--cycle-delay-ms=0"
+      ],
       {
         cwd: options.cwd ?? repoRoot,
         env: {
@@ -241,9 +299,14 @@ process.stdout.write(JSON.stringify({ status: "success" }));
           WORKER_STATES_PATH: statesPath,
           WORKER_ACTIVE_PATH: activePath,
           WORKER_OVERLAP_PATH: overlapPath,
+          WORKER_STATE_FAILURE_PATH: stateFailurePath,
+          WORKER_CYCLE_COUNT_PATH: cycleCountPath,
           WORKER_FAIL_COMMAND: options.failCommand ?? "",
           WORKER_FAIL_OUTPUT: options.failOutput ?? "",
           WORKER_FAIL_STATE_EVENT: options.failStateEvent ?? "",
+          WORKER_FAIL_STATE_EVENT_ONCE: options.failStateEventOnce ?? "",
+          WORKER_INVALID_STATE_EVENT: options.invalidStateEvent ?? "",
+          WORKER_STOP_AFTER_CYCLE_STARTS: String(options.stopAfterCycleStarts ?? 0),
           WORKER_SUCCESS_COMMAND: options.successCommand ?? "",
           WORKER_SUCCESS_OUTPUT: options.successOutput ?? "",
           WORKER_SUCCESS_OUTPUTS: JSON.stringify(options.successOutputs ?? {}),
@@ -1076,16 +1139,79 @@ test("learning authority, reconciliation, and database blockers remain blocked",
   }
 });
 
-test("a worker-state persistence failure is fatal before the workstream starts", () => {
-  const { result, calls, states } = runWorker({ failStateEvent: "workstream_started" });
-  assert.notEqual(result.status, 0, result.stderr || result.stdout);
-  assert.deepEqual(calls.map((call) => call.command), ["worker:state", "worker:state"]);
-  assert.deepEqual(states.map((state) => state.eventType), [
-    "cycle_started",
-    "workstream_started"
-  ]);
-  assert.match(result.stdout, /AUTONOMOUS_WORKER_STATE_PERSIST_FAILED/);
+test("a recoverable worker-state persistence failure scopes the cycle and the same worker starts the next cycle", () => {
+  const { result, calls, states } = runWorker({
+    failStateEventOnce: "workstream_started",
+    stopAfterCycleStarts: 2,
+    once: false
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const cycleStarts = states.filter((state) => state.eventType === "cycle_started");
+  assert.equal(cycleStarts.length, 2);
+  assert.notEqual(cycleStarts[0]?.cycleId, cycleStarts[1]?.cycleId);
+  assert.equal(new Set(calls.map((call) => call.workerPid)).size, 1);
+  assert.equal(
+    states.some(
+      (state) =>
+        state.eventType === "cycle_failed" &&
+        state.cycleId === cycleStarts[0]?.cycleId
+    ),
+    true
+  );
+  assert.equal(
+    calls.some(
+      (call) =>
+        call.command !== "worker:state" &&
+        call.cycleId === cycleStarts[0]?.cycleId
+    ),
+    false,
+    "a workstream must not run when its authoritative checkpoint did not persist"
+  );
+  assert.match(result.stdout, /"event":"autonomous_worker_state_persistence_failure"/);
+  assert.match(result.stdout, /"postgresErrorCode":"08006"/);
+  assert.match(result.stdout, /"finalDisposition":"CYCLE_FAILED_WORKER_CONTINUED"/);
+  assert.match(result.stdout, /"persistenceFailureCount":1/);
   assert.doesNotMatch(result.stdout + result.stderr, /worker-test-secret-state-failure/);
+});
+
+test("a failed workstream-completion checkpoint does not replay the workstream before the next cycle", () => {
+  const { result, calls, states } = runWorker({
+    failStateEventOnce: "workstream_completed",
+    stopAfterCycleStarts: 2,
+    once: false
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const cycleStarts = states.filter((state) => state.eventType === "cycle_started");
+  assert.equal(cycleStarts.length, 2);
+  assert.equal(new Set(calls.map((call) => call.workerPid)).size, 1);
+  assert.deepEqual(
+    calls
+      .filter(
+        (call) =>
+          call.command !== "worker:state" &&
+          call.cycleId === cycleStarts[0]?.cycleId
+      )
+      .map((call) => call.command),
+    ["zero-dte:reconcile"]
+  );
+  assert.equal(
+    calls.some(
+      (call) =>
+        call.command !== "worker:state" &&
+        call.cycleId === cycleStarts[1]?.cycleId
+    ),
+    false
+  );
+  assert.equal(
+    states.some(
+      (state) =>
+        state.eventType === "cycle_failed" &&
+        state.cycleId === cycleStarts[0]?.cycleId
+    ),
+    true
+  );
+  assert.match(result.stdout, /"event":"cycle_failed_worker_continued"/);
+  assert.doesNotMatch(result.stdout + result.stderr, /"event":"worker_failed"/);
 });
 
 test("SIGTERM during workstream-start persistence stops before launching the workstream", async () => {
@@ -1280,12 +1406,29 @@ test("a mismatched production command entry persists preflight_failed and runs n
     readFileSync(join(repoRoot, "scripts", "autonomous-worker-command-contract.json"), "utf8")
   );
   try {
-    const { result, calls, states } = runWorker({ cwd: directory });
-    assert.notEqual(result.status, 0, result.stderr || result.stdout);
-    assert.deepEqual(calls.map((call) => call.command), ["worker:state"]);
-    assert.deepEqual(states.map((state) => state.eventType), ["preflight_failed"]);
-    assert.equal(states[0]?.payload.code, "AUTONOMOUS_WORKER_COMMAND_CONTRACT_INVALID");
-    assert.match(result.stdout, /AUTONOMOUS_WORKER_COMMAND_CONTRACT_INVALID/);
+    for (const stateFailure of [
+      {},
+      { failStateEvent: "preflight_failed" },
+      { invalidStateEvent: "preflight_failed" }
+    ] as const) {
+      const { result, calls, states } = runWorker({
+        cwd: directory,
+        ...stateFailure
+      });
+      assert.notEqual(result.status, 0, result.stderr || result.stdout);
+      assert.deepEqual(calls.map((call) => call.command), ["worker:state"]);
+      assert.deepEqual(states.map((state) => state.eventType), ["preflight_failed"]);
+      assert.equal(states[0]?.payload.code, "AUTONOMOUS_WORKER_COMMAND_CONTRACT_INVALID");
+      assert.match(result.stdout, /AUTONOMOUS_WORKER_COMMAND_CONTRACT_INVALID/);
+      if ("failStateEvent" in stateFailure) {
+        assert.match(result.stdout, /"finalDisposition":"SUPPLEMENTAL_WRITE_SKIPPED"/);
+        assert.match(result.stdout, /"persistenceFailureCount":1/);
+        assert.doesNotMatch(result.stdout + result.stderr, /worker-test-secret-state-failure/);
+      } else if ("invalidStateEvent" in stateFailure) {
+        assert.match(result.stdout, /"finalDisposition":"SUPPLEMENTAL_WRITE_SKIPPED"/);
+        assert.match(result.stdout, /"persistenceFailureCount":1/);
+      }
+    }
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

@@ -47,6 +47,23 @@ const NON_FATAL_WORKSTREAM_CODES = new Set([
   "WORKSTREAM_DEFERRED",
   "WORKSTREAM_NO_ACTION"
 ]);
+const SERVICE_FATAL_CODES = new Set([
+  "PAPER_RUNTIME_REQUIRED",
+  "LIVE_TRADING_DISABLED_REQUIRED",
+  "POSTGRES_BACKEND_REQUIRED",
+  "POSTGRES_READS_REQUIRED",
+  "POSTGRES_WRITES_REQUIRED",
+  "POSTGRES_CONTROL_PLANE_AUTHORITY_REQUIRED",
+  "POSTGRES_SCHEDULER_AUTHORITY_REQUIRED",
+  "POSTGRES_EXECUTION_STATE_AUTHORITY_REQUIRED",
+  "POSTGRES_SHADOW_COMPARE_DISABLED_REQUIRED",
+  "POSTGRES_EXECUTION_STATE_SHADOW_DISABLED_REQUIRED",
+  "SQLITE_AUDIT_MIRROR_DISABLED_REQUIRED",
+  "EVIDENCE_UTILIZATION_RUNTIME_AUDIT_REQUIRED",
+  "AUTONOMOUS_WORKER_COMMAND_CONTRACT_INVALID",
+  "PAPER_SAFETY_GUARD_FAILED",
+  "WORKSTREAM_COMMAND_REJECTED"
+]);
 const RECOVERY_COUNT_FIELDS = [
   "researchRuns",
   "reservations",
@@ -295,6 +312,7 @@ let activeChildPurpose = null;
 let wakeDelay = null;
 let stopRequested = false;
 let stopSignal = null;
+let statePersistenceFailureCount = 0;
 let shutdownForceKillTimer = null;
 let shutdownForceKillChild = null;
 
@@ -703,6 +721,10 @@ const runWorkstream = async (
 };
 
 const persistState = async (cycleId, eventType, payload) => {
+  const persistenceClassification =
+    eventType === "preflight_failed"
+      ? "OBSERVABILITY_SUPPLEMENTAL"
+      : "AUTHORITATIVE_RECOVERABLE";
   const occurredAt = new Date().toISOString();
   const encodedPayload = Buffer.from(JSON.stringify(payload)).toString("base64url");
   const result = await runNpmCommand(STATE_COMMAND, [
@@ -711,10 +733,128 @@ const persistState = async (cycleId, eventType, payload) => {
     `--payload=${encodedPayload}`,
     `--occurredAt=${occurredAt}`
   ], STATE_PERSIST_TIMEOUT_MS, "state");
+  const envelope = latestStructuredOutput(result.output);
   if (result.exitCode !== 0 || result.spawnError || result.timedOut) {
-    throw codedError("AUTONOMOUS_WORKER_STATE_PERSIST_FAILED");
+    statePersistenceFailureCount += 1;
+    const source =
+      envelope?.persistence &&
+      typeof envelope.persistence === "object" &&
+      !Array.isArray(envelope.persistence)
+        ? envelope.persistence
+        : {};
+    const evidence = {
+      operationName:
+        typeof source.operationName === "string"
+          ? source.operationName
+          : `persist_autonomous_worker_state:${eventType}`,
+      persistenceClassification:
+        typeof source.persistenceClassification === "string"
+          ? source.persistenceClassification
+          : persistenceClassification,
+      cycleId,
+      workstreamName:
+        typeof source.workstreamName === "string"
+          ? source.workstreamName
+          : typeof payload.workstream === "string"
+            ? payload.workstream
+            : "autonomous_worker",
+      lifecycleState: eventType,
+      retryAttempt:
+        Number.isSafeInteger(source.retryAttempt) && source.retryAttempt >= 0
+          ? source.retryAttempt
+          : 0,
+      maximumAttempts:
+        Number.isSafeInteger(source.maximumAttempts) && source.maximumAttempts > 0
+          ? source.maximumAttempts
+          : 1,
+      errorCode:
+        typeof source.errorCode === "string"
+          ? source.errorCode
+          : result.timedOut
+            ? "AUTONOMOUS_WORKER_STATE_PERSIST_TIMEOUT"
+            : result.spawnError
+              ? "AUTONOMOUS_WORKER_STATE_RUNNER_UNAVAILABLE"
+              : "AUTONOMOUS_WORKER_STATE_PERSIST_FAILED",
+      postgresErrorCode:
+        typeof source.postgresErrorCode === "string"
+          ? source.postgresErrorCode
+          : null,
+      retryable: source.retryable === true,
+      schedulerFenceStatus:
+        typeof source.schedulerFenceStatus === "string"
+          ? source.schedulerFenceStatus
+          : "unknown",
+      transactionStatus:
+        typeof source.transactionStatus === "string"
+          ? source.transactionStatus
+          : "unknown",
+      finalDisposition:
+        typeof source.finalDisposition === "string"
+          ? source.finalDisposition
+          : persistenceClassification === "OBSERVABILITY_SUPPLEMENTAL"
+            ? "SUPPLEMENTAL_WRITE_SKIPPED"
+            : "NONRETRYABLE_PERSISTENCE_FAILURE",
+      timestamp:
+        typeof source.timestamp === "string"
+          ? source.timestamp
+          : new Date().toISOString(),
+      persistenceFailureCount: statePersistenceFailureCount
+    };
+    emitEvent({
+      event: "autonomous_worker_state_persistence_failure",
+      code: "AUTONOMOUS_WORKER_STATE_PERSIST_FAILED",
+      ...evidence
+    });
+    if (persistenceClassification === "OBSERVABILITY_SUPPLEMENTAL") {
+      return { status: "skipped", persistence: evidence };
+    }
+    const error = codedError("AUTONOMOUS_WORKER_STATE_PERSIST_FAILED");
+    error.persistence = evidence;
+    throw error;
   }
-  return latestStructuredOutput(result.output);
+  if (!envelope || envelope.status !== "persisted") {
+    statePersistenceFailureCount += 1;
+    const error = codedError("AUTONOMOUS_WORKER_STATE_RESPONSE_INVALID");
+    error.persistence = {
+      operationName: `persist_autonomous_worker_state:${eventType}`,
+      persistenceClassification,
+      cycleId,
+      workstreamName:
+        typeof payload.workstream === "string"
+          ? payload.workstream
+          : "autonomous_worker",
+      lifecycleState: eventType,
+      retryAttempt: 0,
+      maximumAttempts: 1,
+      errorCode: "AUTONOMOUS_WORKER_STATE_RESPONSE_INVALID",
+      postgresErrorCode: null,
+      retryable: false,
+      schedulerFenceStatus: "unknown",
+      transactionStatus: "unknown",
+      finalDisposition:
+        persistenceClassification === "OBSERVABILITY_SUPPLEMENTAL"
+          ? "SUPPLEMENTAL_WRITE_SKIPPED"
+          : "NONRETRYABLE_PERSISTENCE_FAILURE",
+      timestamp: new Date().toISOString(),
+      persistenceFailureCount: statePersistenceFailureCount
+    };
+    emitEvent({
+      event: "autonomous_worker_state_persistence_failure",
+      code: "AUTONOMOUS_WORKER_STATE_PERSIST_FAILED",
+      ...error.persistence
+    });
+    if (persistenceClassification === "OBSERVABILITY_SUPPLEMENTAL") {
+      return { status: "skipped", persistence: error.persistence };
+    }
+    throw error;
+  }
+  if (envelope.persistence?.finalDisposition === "PERSISTED_AFTER_RETRY") {
+    emitEvent({
+      event: "autonomous_worker_state_persistence_recovered",
+      ...envelope.persistence
+    });
+  }
+  return envelope;
 };
 
 const wait = (milliseconds) =>
@@ -765,201 +905,259 @@ const main = async () => {
     cycle += 1;
     const cycleId = cycle === 1 ? preflightCycleId : randomUUID();
     lastCycleId = cycleId;
-    const cycleStartState = await persistState(cycleId, "cycle_started", statePayload(cycle, {
-      workerPid: process.pid,
-      workstreamCount: WORKSTREAMS.length
-    }));
-    const resumedCycleId =
-      typeof cycleStartState?.resumedCycleId === "string" &&
-      cycleStartState.resumedCycleId.trim()
-        ? cycleStartState.resumedCycleId.trim()
-        : null;
-    if (resumedCycleId) {
-      emitEvent({ event: "cycle_resuming", cycle, cycleId, resumedCycleId });
-    }
-    emitEvent({ event: "cycle_started", cycle, cycleId, workstreamCount: WORKSTREAMS.length });
-    let unresolvedPriorMutation = false;
-
-    for (let index = 0; index < WORKSTREAMS.length; index += 1) {
-      if (stopRequested) break;
-      const [script, args] = WORKSTREAMS[index];
-      const basePayload = statePayload(cycle, {
-        position: index + 1,
-        workstream: script,
-        ...(resumedCycleId ? { resumedCycleId } : {})
-      });
-      await persistState(cycleId, "workstream_started", basePayload);
-      emitEvent({ event: "workstream_started", cycle, cycleId, position: index + 1, workstream: script });
-      if (stopRequested) {
-        await persistState(cycleId, "worker_stopped", statePayload(cycle, {
-          reason: "signal",
-          signal: stopSignal,
-          position: index + 1,
-          workstream: script
-        }));
-        emitEvent({ event: "worker_stopped", cycle, cycleId, reason: "signal" });
-        return;
+    let cycleStartedPersisted = false;
+    let cycleTerminalPersisted = false;
+    try {
+      const cycleStartState = await persistState(
+        cycleId,
+        "cycle_started",
+        statePayload(cycle, {
+          workerPid: process.pid,
+          workstreamCount: WORKSTREAMS.length
+        })
+      );
+      cycleStartedPersisted = true;
+      const resumedCycleId =
+        typeof cycleStartState?.resumedCycleId === "string" &&
+        cycleStartState.resumedCycleId.trim()
+          ? cycleStartState.resumedCycleId.trim()
+          : null;
+      if (resumedCycleId) {
+        emitEvent({ event: "cycle_resuming", cycle, cycleId, resumedCycleId });
       }
-      const mutationSkippedForUnresolvedReconciliation =
-        unresolvedPriorMutation && BROKER_MUTATION_WORKSTREAMS.has(script);
-      let result =
-        mutationSkippedForUnresolvedReconciliation
-          ? {
+      emitEvent({ event: "cycle_started", cycle, cycleId, workstreamCount: WORKSTREAMS.length });
+      let unresolvedPriorMutation = false;
+
+      for (let index = 0; index < WORKSTREAMS.length; index += 1) {
+        if (stopRequested) break;
+        const [script, args] = WORKSTREAMS[index];
+        const basePayload = statePayload(cycle, {
+          position: index + 1,
+          workstream: script,
+          ...(resumedCycleId ? { resumedCycleId } : {})
+        });
+        await persistState(cycleId, "workstream_started", basePayload);
+        emitEvent({ event: "workstream_started", cycle, cycleId, position: index + 1, workstream: script });
+        if (stopRequested) {
+          await persistState(cycleId, "worker_stopped", statePayload(cycle, {
+            reason: "signal",
+            signal: stopSignal,
+            position: index + 1,
+            workstream: script
+          }));
+          emitEvent({ event: "worker_stopped", cycle, cycleId, reason: "signal" });
+          return;
+        }
+        const mutationSkippedForUnresolvedReconciliation =
+          unresolvedPriorMutation && BROKER_MUTATION_WORKSTREAMS.has(script);
+        let result =
+          mutationSkippedForUnresolvedReconciliation
+            ? {
+                classification: "blocked",
+                code: "WORKSTREAM_BLOCKED",
+                reasonCode: "UNRESOLVED_PRIOR_MUTATION",
+                exitCode: null,
+                durationMs: 0
+              }
+            : await runWorkstream(
+                script,
+                args,
+                workstreamTimeoutMs,
+                cycle,
+                cycleId,
+                index + 1,
+                resumedCycleId
+              );
+
+        let internalReconciliationResult = null;
+        const nextPublicWorkstream = WORKSTREAMS[index + 1]?.[0] ?? null;
+        const reconcileBeforeLeavingMutation =
+          BROKER_MUTATION_WORKSTREAMS.has(script) &&
+          (
+            INTERNAL_RECONCILIATION_AFTER.has(script) ||
+            (
+              nextPublicWorkstream === RECONCILIATION_WORKSTREAM &&
+              workstreamResultIsFatal(result)
+            )
+          );
+        if (reconcileBeforeLeavingMutation) {
+          const mutationResult = result;
+          internalReconciliationResult = await runWorkstream(
+            RECONCILIATION_WORKSTREAM,
+            RECONCILIATION_ARGS,
+            workstreamTimeoutMs,
+            cycle,
+            cycleId,
+            index + 1,
+            resumedCycleId
+          );
+          const reconciliationEvidence = {
+            classification: internalReconciliationResult.classification,
+            code: internalReconciliationResult.code,
+            reasonCode: internalReconciliationResult.reasonCode ?? null,
+            durationMs: internalReconciliationResult.durationMs
+          };
+          if (mutationSkippedForUnresolvedReconciliation) {
+            result = {
+              ...mutationResult,
+              postMutationReconciliation: reconciliationEvidence
+            };
+          } else if (workstreamResultIsFatal(internalReconciliationResult)) {
+            result = {
+              ...internalReconciliationResult,
+              mutationClassification: mutationResult.classification,
+              mutationCode: mutationResult.code,
+              postMutationReconciliation: reconciliationEvidence
+            };
+          } else if (
+            !reconciliationResolved(internalReconciliationResult) &&
+            !workstreamResultIsFatal(mutationResult)
+          ) {
+            result = {
+              ...mutationResult,
               classification: "blocked",
               code: "WORKSTREAM_BLOCKED",
-              reasonCode: "UNRESOLVED_PRIOR_MUTATION",
-              exitCode: null,
-              durationMs: 0
-            }
-          : await runWorkstream(
-              script,
-              args,
-              workstreamTimeoutMs,
-              cycle,
-              cycleId,
-              index + 1,
-              resumedCycleId
-            );
-
-      let internalReconciliationResult = null;
-      const nextPublicWorkstream = WORKSTREAMS[index + 1]?.[0] ?? null;
-      const reconcileBeforeLeavingMutation =
-        BROKER_MUTATION_WORKSTREAMS.has(script) &&
-        (
-          INTERNAL_RECONCILIATION_AFTER.has(script) ||
-          (
-            nextPublicWorkstream === RECONCILIATION_WORKSTREAM &&
-            workstreamResultIsFatal(result)
-          )
-        );
-      if (reconcileBeforeLeavingMutation) {
-        const mutationResult = result;
-        internalReconciliationResult = await runWorkstream(
-          RECONCILIATION_WORKSTREAM,
-          RECONCILIATION_ARGS,
-          workstreamTimeoutMs,
-          cycle,
-          cycleId,
-          index + 1,
-          resumedCycleId
-        );
-        const reconciliationEvidence = {
-          classification: internalReconciliationResult.classification,
-          code: internalReconciliationResult.code,
-          reasonCode: internalReconciliationResult.reasonCode ?? null,
-          durationMs: internalReconciliationResult.durationMs
-        };
-        if (mutationSkippedForUnresolvedReconciliation) {
-          result = {
-            ...mutationResult,
-            postMutationReconciliation: reconciliationEvidence
-          };
-        } else if (workstreamResultIsFatal(internalReconciliationResult)) {
-          result = {
-            ...internalReconciliationResult,
-            mutationClassification: mutationResult.classification,
-            mutationCode: mutationResult.code,
-            postMutationReconciliation: reconciliationEvidence
-          };
-        } else if (
-          !reconciliationResolved(internalReconciliationResult) &&
-          !workstreamResultIsFatal(mutationResult)
-        ) {
-          result = {
-            ...mutationResult,
-            classification: "blocked",
-            code: "WORKSTREAM_BLOCKED",
-            reasonCode:
-              internalReconciliationResult.reasonCode ??
-              internalReconciliationResult.code,
-            postMutationReconciliation: reconciliationEvidence
-          };
-        } else {
-          result = {
-            ...mutationResult,
-            postMutationReconciliation: reconciliationEvidence
-          };
+              reasonCode:
+                internalReconciliationResult.reasonCode ??
+                internalReconciliationResult.code,
+              postMutationReconciliation: reconciliationEvidence
+            };
+          } else {
+            result = {
+              ...mutationResult,
+              postMutationReconciliation: reconciliationEvidence
+            };
+          }
         }
-      }
 
-      if (internalReconciliationResult) {
-        unresolvedPriorMutation = !reconciliationResolved(
-          internalReconciliationResult
-        );
-      } else if (script === RECONCILIATION_WORKSTREAM) {
-        unresolvedPriorMutation = !reconciliationResolved(result);
-      } else if (
-        BROKER_MUTATION_WORKSTREAMS.has(script) &&
-        result.classification === "blocked" &&
-        result.reasonCode !== "UNRESOLVED_PRIOR_MUTATION"
-      ) {
-        unresolvedPriorMutation = true;
-      }
+        if (internalReconciliationResult) {
+          unresolvedPriorMutation = !reconciliationResolved(
+            internalReconciliationResult
+          );
+        } else if (script === RECONCILIATION_WORKSTREAM) {
+          unresolvedPriorMutation = !reconciliationResolved(result);
+        } else if (
+          BROKER_MUTATION_WORKSTREAMS.has(script) &&
+          result.classification === "blocked" &&
+          result.reasonCode !== "UNRESOLVED_PRIOR_MUTATION"
+        ) {
+          unresolvedPriorMutation = true;
+        }
 
-      if (stopRequested) {
-        await persistState(cycleId, "worker_stopped", statePayload(cycle, {
-          reason: "signal",
-          signal: stopSignal,
-          position: index + 1,
-          workstream: script
-        }));
-        emitEvent({ event: "worker_stopped", cycle, cycleId, reason: "signal" });
-        return;
-      }
+        if (stopRequested) {
+          await persistState(cycleId, "worker_stopped", statePayload(cycle, {
+            reason: "signal",
+            signal: stopSignal,
+            position: index + 1,
+            workstream: script
+          }));
+          emitEvent({ event: "worker_stopped", cycle, cycleId, reason: "signal" });
+          return;
+        }
 
-      if (
-        workstreamResultIsFatal(result)
-      ) {
-        const failurePayload = {
+        if (workstreamResultIsFatal(result)) {
+          const failurePayload = {
+            ...basePayload,
+            ...result,
+            message: "A required autonomous workstream failed."
+          };
+          await persistState(cycleId, "workstream_failed", failurePayload);
+          emitEvent({ event: "workstream_failed", cycle, cycleId, position: index + 1, workstream: script, ...result });
+          await persistState(cycleId, "cycle_failed", statePayload(cycle, {
+            classification: result.classification,
+            code: result.code,
+            message: "The autonomous cycle failed before completion.",
+            failedPosition: index + 1,
+            failedWorkstream: script
+          }));
+          cycleTerminalPersisted = true;
+          emitEvent({ event: "cycle_failed", cycle, cycleId, code: result.code, failedWorkstream: script });
+          throw codedError(result.code);
+        }
+
+        const completionPayload = {
           ...basePayload,
           ...result,
-          message: "A required autonomous workstream failed."
+          ...(script === "paper:learn"
+            ? {
+                dashboardProjectionReady: true,
+                dashboardProjectionAuthority: "postgres"
+              }
+            : {})
         };
-        await persistState(cycleId, "workstream_failed", failurePayload);
-        emitEvent({ event: "workstream_failed", cycle, cycleId, position: index + 1, workstream: script, ...result });
-        await persistState(cycleId, "cycle_failed", statePayload(cycle, {
-          classification: result.classification,
-          code: result.code,
-          message: "The autonomous cycle failed before completion.",
-          failedPosition: index + 1,
-          failedWorkstream: script
-        }));
-        emitEvent({ event: "cycle_failed", cycle, cycleId, code: result.code, failedWorkstream: script });
-        throw codedError(result.code);
+        await persistState(cycleId, "workstream_completed", completionPayload);
+        emitEvent({ event: "workstream_completed", cycle, cycleId, position: index + 1, workstream: script, ...result });
       }
 
-      const completionPayload = {
-        ...basePayload,
-        ...result,
-        ...(script === "paper:learn"
-          ? {
-              dashboardProjectionReady: true,
-              dashboardProjectionAuthority: "postgres"
-            }
-          : {})
-      };
-      await persistState(cycleId, "workstream_completed", completionPayload);
-      emitEvent({ event: "workstream_completed", cycle, cycleId, position: index + 1, workstream: script, ...result });
-    }
-
-    if (stopRequested) break;
-    await persistState(cycleId, "cycle_completed", statePayload(cycle, {
-      workstreamCount: WORKSTREAMS.length,
-      failed: 0
-    }));
-    emitEvent({ event: "cycle_completed", cycle, cycleId, workstreamCount: WORKSTREAMS.length, failed: 0 });
-    if (once) {
-      await persistState(cycleId, "worker_stopped", statePayload(cycle, { reason: "once" }));
-      emitEvent({ event: "worker_stopped", cycle, cycleId, reason: "once" });
-      return;
+      if (stopRequested) break;
+      await persistState(cycleId, "cycle_completed", statePayload(cycle, {
+        workstreamCount: WORKSTREAMS.length,
+        failed: 0
+      }));
+      cycleTerminalPersisted = true;
+      emitEvent({ event: "cycle_completed", cycle, cycleId, workstreamCount: WORKSTREAMS.length, failed: 0 });
+      if (once) {
+        await persistState(cycleId, "worker_stopped", statePayload(cycle, { reason: "once" }));
+        emitEvent({ event: "worker_stopped", cycle, cycleId, reason: "once" });
+        return;
+      }
+    } catch (error) {
+      const code = codeOf(error);
+      if (SERVICE_FATAL_CODES.has(code)) throw error;
+      if (stopRequested) break;
+      if (cycleStartedPersisted && !cycleTerminalPersisted) {
+        try {
+          await persistState(cycleId, "cycle_failed", statePayload(cycle, {
+            classification: "cycle_scoped_failure",
+            code,
+            message: "The autonomous cycle ended without weakening worker continuity.",
+            failedPersistenceOperation:
+              typeof error?.persistence?.operationName === "string"
+                ? error.persistence.operationName
+                : null
+          }));
+          cycleTerminalPersisted = true;
+          emitEvent({ event: "cycle_failed", cycle, cycleId, code });
+        } catch (terminalError) {
+          emitEvent({
+            event: "cycle_terminal_persistence_incomplete",
+            cycle,
+            cycleId,
+            code: codeOf(terminalError),
+            failedPersistenceOperation:
+              typeof terminalError?.persistence?.operationName === "string"
+                ? terminalError.persistence.operationName
+                : null
+          });
+        }
+      }
+      emitEvent({
+        event: cycleTerminalPersisted
+          ? "cycle_failed_worker_continued"
+          : "cycle_incomplete_worker_continued",
+        cycle,
+        cycleId,
+        code,
+        nextCycleDelayMs: cycleDelayMs
+      });
+      if (once) throw error;
     }
     await wait(cycleDelayMs);
   }
 
-  await persistState(lastCycleId, "worker_stopped", statePayload(cycle, {
-    reason: "signal",
-    signal: stopSignal
-  }));
+  try {
+    await persistState(lastCycleId, "worker_stopped", statePayload(cycle, {
+      reason: "signal",
+      signal: stopSignal
+    }));
+  } catch (error) {
+    emitEvent({
+      event: "worker_stop_state_incomplete",
+      cycle,
+      cycleId: lastCycleId,
+      code: codeOf(error)
+    });
+  }
   emitEvent({ event: "worker_stopped", cycle, cycleId: lastCycleId, reason: "signal" });
 };
 

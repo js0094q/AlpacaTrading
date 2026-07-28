@@ -1,5 +1,30 @@
 # Resume Context: Alpaca Trading Research Infra
 
+## Autonomous worker-state persistence continuity (2026-07-28)
+
+- Worker-state command payload decoding now accepts the worker's bounded
+  256-KiB capture envelope. This removes the prior 32-KiB validation mismatch
+  that rejected valid large `research:daily` completion state before a
+  PostgreSQL query was attempted.
+- `preflight_failed` is supplemental observability; cycle checkpoints,
+  workstream transitions, terminal-cycle summaries, and worker status are
+  recoverable authoritative lifecycle state. Recoverable writes use one
+  serializable transaction per attempt, deterministic event identities,
+  exact-replay detection, and at most three attempts with bounded exponential
+  jitter for supported transient PostgreSQL or connection codes. Fence loss,
+  invalid lifecycle state, schema errors, and malformed input do not retry.
+- Each retry verifies the current PostgreSQL scheduler lease and fencing token
+  inside its transaction. Failed transactions roll back and release their
+  client before backoff. No Alpaca operation runs inside this persistence
+  transaction, and each scheduled child remains the owner of its bounded pool.
+- Exhausted recoverable state persistence scopes the affected cycle as failed
+  or incomplete when possible and leaves the persistent worker alive for the
+  next reconciliation-first cycle. Supplemental failure records sanitized
+  evidence without changing authorization. Invalid runtime posture, command
+  contract, and paper/live safety invariants still terminate the service, and
+  required execution, reservation, idempotency, broker, and reconciliation
+  writes remain fail-closed.
+
 ## Autonomous OPRA and LEAPS allocation (2026-07-28)
 
 - The PostgreSQL research option path always requests paid Alpaca OPRA and
