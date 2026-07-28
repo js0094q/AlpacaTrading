@@ -1,5 +1,29 @@
 # Resume Context: Alpaca Trading Research Infra
 
+## Verified options evidence and lane-specific inputs (2026-07-28)
+
+- Live paper/OPRA reads and the installed official Alpaca CLI `v0.0.13`
+  (`13beb045d76be4af7c75f5743655de52562b0b52`) verified active LEAPS
+  snapshots with quote sizes/timestamps, trade/timestamp, daily volume,
+  implied volatility, and delta/gamma/theta/vega/rho. Contract reads verified
+  IDs, status, tradability, size/multiplier, open interest, and its date.
+- PostgreSQL selected-option proposal inputs now preserve those verified
+  fields plus underlying price, strike, expiration, DTE/hours, dollar and
+  percentage spread, provider/effective feed, provider timestamp, receipt
+  timestamp, and persistence timestamp. Unsupported or absent fields remain
+  `null`; no Greek or implied volatility is synthesized.
+- The existing expiration classifier attaches separate `options_0dte`
+  intraday and `options_leaps` long-horizon evidence profiles before candidate
+  persistence. Missing option data remains lane-scoped and cannot block equity;
+  incomplete Greek coverage continues to lower only the applicable option
+  selection score.
+- Entry review preserves the persisted candidate family as
+  `zero_dte_long_call`/`zero_dte_long_put` or
+  `leaps_long_call`/`leaps_long_put` order-intent metadata. The deterministic
+  client-order-ID contract, PostgreSQL lineage, paper-only gates, OPRA
+  authority, LEAPS `$5,000` ceiling/multi-contract sizing, and equity sizing
+  remain unchanged.
+
 ## Autonomous worker-state persistence continuity (2026-07-28)
 
 - Worker-state command payload decoding now accepts the worker's bounded

@@ -875,6 +875,95 @@ test("entry review classifies same-day expiration against the New York trading d
   });
 
   assert.equal(orderIntent?.strategyClassification, "zero_dte_long_call");
+  assert.match(String(orderIntent?.clientOrderId), /^pg-[a-f0-9]{32}$/);
+});
+
+test("entry review preserves the LEAPS lane classification and evidence profile in order lineage", async () => {
+  let orderIntent: Record<string, unknown> | undefined;
+  let marketEvidence: Array<Record<string, unknown>> = [];
+  let persistedIntentValues: readonly unknown[] = [];
+  await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("FROM candidates candidate")) {
+          return {
+            rows: [{
+              ...candidate,
+              ...observedOptionContract,
+              candidate_id: "leaps-profile-lineage",
+              candidate_strategy_family: "leaps",
+              direction: "short",
+              asset_class: "option",
+              option_symbol: "SPY270416P00500000",
+              contract_option_symbol: "SPY270416P00500000",
+              contract_id: "option-contract-SPY270416P00500000",
+              contract_type: "put",
+              contract_expiration_date: "2027-04-16",
+              preferred_expression: "long_put",
+              market_price: "20",
+              max_position_notional: "10000",
+              max_symbol_notional: "10000",
+              market_evidence: {
+                bid: 19.9,
+                ask: 20.1,
+                midpoint: 20,
+                spreadPct: 0.01,
+                volume: 5_000,
+                openInterest: 8_000,
+                underlyingPrice: 555,
+                requestedFeed: "opra",
+                effectiveFeed: "opra",
+                provider: "alpaca"
+              },
+              signal_inputs: {
+                marketDecisionInputs: {
+                  option: {
+                    bid: 19.9,
+                    ask: 20.1,
+                    spreadPct: 0.01,
+                    volume: 5_000,
+                    openInterest: 8_000,
+                    requestedFeed: "opra",
+                    effectiveFeed: "opra",
+                    provider: "alpaca",
+                    evidenceProfile: {
+                      lane: "options_leaps",
+                      horizon: "long_horizon",
+                      priorityInputs: ["expirationDate", "openInterest"]
+                    }
+                  }
+                }
+              }
+            }],
+            rowCount: 1
+          };
+        }
+        if (statement.includes("INSERT INTO execution_reviews")) {
+          orderIntent = JSON.parse(String(values?.[9])) as Record<string, unknown>;
+          marketEvidence = JSON.parse(
+            String(values?.[10])
+          ) as Array<Record<string, unknown>>;
+        }
+        if (statement.includes("INSERT INTO order_intents")) {
+          persistedIntentValues = values ?? [];
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    leapsEntryAllocationEnv: paperLeapsEnvironment,
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(orderIntent?.strategyClassification, "leaps_long_put");
+  assert.match(String(orderIntent?.clientOrderId), /^pg-[a-f0-9]{32}$/);
+  assert.equal(persistedIntentValues.includes("leaps_long_put"), true);
+  assert.equal(
+    (marketEvidence[0]?.evidenceProfile as Record<string, unknown>)?.lane,
+    "options_leaps"
+  );
 });
 
 test("LEAPS uses the independent $5,000 ceiling and persists an integer contract quantity", async () => {

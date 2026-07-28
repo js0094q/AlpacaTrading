@@ -75,6 +75,41 @@ const OPRA_BOUNDED_RESULTS = new Set([
   "ALPACA_OPRA_GREEKS_UNAVAILABLE"
 ]);
 
+const OPTION_EVIDENCE_PROFILES = {
+  zero_dte_spy: {
+    lane: "options_0dte",
+    horizon: "intraday",
+    priorityInputs: [
+      "bid", "ask", "spreadDollars", "spreadPct", "quoteTimestamp",
+      "underlyingPrice", "intradayReturn", "intradayVolatility", "volume",
+      "openInterest", "hoursToExpiration", "delta", "gamma", "theta", "vega", "rho"
+    ]
+  },
+  leaps: {
+    lane: "options_leaps",
+    horizon: "long_horizon",
+    priorityInputs: [
+      "expirationDate", "daysToExpiration", "strike", "moneyness",
+      "openInterest", "openInterestDate", "spreadDollars", "spreadPct",
+      "impliedVolatility", "delta", "gamma", "theta", "vega", "rho",
+      "underlyingHistoricalVolatility"
+    ]
+  }
+} as const;
+
+const optionDecisionInputsForFamily = (
+  option: Record<string, unknown> | null,
+  family: string
+) => {
+  if (!option) return null;
+  const profile = family === "zero_dte_spy"
+    ? OPTION_EVIDENCE_PROFILES.zero_dte_spy
+    : family === "leaps"
+      ? OPTION_EVIDENCE_PROFILES.leaps
+      : null;
+  return profile ? { ...option, evidenceProfile: profile } : option;
+};
+
 const zeroDteOpraBoundedResult = (
   summary: MarketResult["summary"]
 ): string | null => {
@@ -672,7 +707,12 @@ const persistCandidates = async (input: {
         takeProfit: target.takeProfit,
         marketDecisionInputs: {
           ...(target.optionsStrategy?.decisionInputs as Record<string, unknown> | undefined),
-          option: option?.decisionInputs ?? null
+          option: optionDecisionInputsForFamily(
+            option?.decisionInputs && typeof option.decisionInputs === "object"
+              ? option.decisionInputs as Record<string, unknown>
+              : null,
+            strategyFamily
+          )
         },
         strategyClassification: {
           family: strategyFamily,

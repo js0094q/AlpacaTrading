@@ -1430,14 +1430,28 @@ export const runPostgresReviewWorkflow = async (input: {
       : shortEquity
         ? "sell_to_open"
         : "buy_to_open";
+    const optionType = option
+      ? String(row.contract_type) as "call" | "put"
+      : null;
+    const candidateStrategyFamily = String(
+      row.candidate_strategy_family ?? ""
+    ).trim().toLowerCase();
     const strategyClassification: StrategyClassification = option
-      ? classifyOptionStrategy(
-          {
-            expirationDate: isoDateOnly(row.contract_expiration_date),
-            optionType: String(row.contract_type) as "call" | "put"
-          },
-          newYorkTradingDate(now)
-        )
+      ? candidateStrategyFamily === "leaps"
+        ? optionType === "call"
+          ? "leaps_long_call"
+          : "leaps_long_put"
+        : candidateStrategyFamily === "zero_dte_spy"
+          ? optionType === "call"
+            ? "zero_dte_long_call"
+            : "zero_dte_long_put"
+          : classifyOptionStrategy(
+              {
+                expirationDate: isoDateOnly(row.contract_expiration_date),
+                optionType: optionType!
+              },
+              newYorkTradingDate(now)
+            )
       : shortEquity
         ? "equity_short"
         : "equity_long";

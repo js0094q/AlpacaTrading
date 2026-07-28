@@ -1,5 +1,32 @@
 # Alpaca Trading Research Infrastructure
 
+## Verified options evidence and lane-specific inputs (2026-07-28)
+
+The PostgreSQL option proposal retains the selected contract ID, underlying,
+call/put type, strike, expiration, DTE and hours remaining, tradability,
+status, observed contract size/multiplier, bid/ask and sizes, midpoint, dollar
+and percentage spread, last trade and timestamp, volume, open interest and its
+date, implied volatility, all five Greeks, and source/receipt/persistence
+timestamps. Requested and effective feeds remain separate; only validated OPRA
+evidence is labeled `feed=opra`.
+
+Missing provider fields remain `null`. They are never synthesized: incomplete
+Greek coverage can reduce the existing selection score without crashing the
+lane or blocking equities. Current field support was checked against live
+paper/OPRA responses, the installed application schemas, and Alpaca CLI
+`v0.0.13` at revision `13beb045d76be4af7c75f5743655de52562b0b52`.
+The CLI remains a verification source, not a runtime dependency.
+
+Selected option proposals persist an `options_0dte` intraday evidence profile
+or an `options_leaps` long-horizon evidence profile after the existing
+expiration-based lane classification. 0DTE prioritizes executable quote,
+spread, timestamp, underlying movement, intraday volatility when available,
+liquidity, time remaining, and verified Greeks. LEAPS prioritizes expiration,
+moneyness, dated open interest, spread, verified IV/Greeks, and underlying
+historical behavior. Review and order intents preserve the candidate's 0DTE or
+LEAPS strategy classification as reconciliation metadata while retaining the
+existing deterministic paper client-order ID.
+
 ## Central Alpaca data hub and event fan-out (2026-07-28)
 
 The three investment lanes now receive one cycle-scoped Alpaca data view.

@@ -75,6 +75,7 @@ const stockDecisionFeatures = (snapshot: PostgresStockSnapshot | null) => {
     absoluteSpread: numberValue(evidence.spread),
     percentageSpread: numberValue(evidence.spreadPct),
     intradayReturn: numberValue(evidence.returnFromOpen),
+    intradayVolatility: numberValue(evidence.intradayVolatility),
     snapshotDailyReturn: numberValue(evidence.dailyReturn),
     distanceFromVwap: numberValue(evidence.distanceFromVwap),
     snapshotRelativeVolume: numberValue(evidence.relativeCurrentDayVolume),
@@ -510,6 +511,27 @@ const buildOptionFeatures = (input: {
       liquidityScore: feature.liquidityScore,
       evidenceTimestamp: feature.sourceObservationTimestamp ?? input.asOf,
       decisionInputs: {
+        contractId: row.contract.contractId ?? null,
+        underlyingSymbol: row.contract.underlyingSymbol,
+        contractSymbol: row.contract.optionSymbol,
+        callOrPut: row.contract.type,
+        strike: row.contract.strike,
+        expirationDate: row.contract.expirationDate,
+        daysToExpiration: feature.daysToExpiration,
+        hoursToExpiration: feature.hoursToExpiration,
+        tradable: row.contract.tradable,
+        status: row.contract.status ?? null,
+        contractSize: row.contract.multiplier,
+        contractMultiplier: row.contract.multiplier,
+        underlyingPrice: feature.underlyingPrice,
+        bid: feature.bid,
+        ask: feature.ask,
+        midpoint: feature.midpoint,
+        spreadDollars: feature.spread,
+        bidSize: feature.bidSize,
+        askSize: feature.askSize,
+        lastTrade: feature.latestTrade,
+        lastTradeTimestamp: feature.tradeTimestamp,
         delta: row.snapshot.delta,
         gamma: row.snapshot.gamma ?? null,
         theta: row.snapshot.theta ?? null,
@@ -518,10 +540,22 @@ const buildOptionFeatures = (input: {
         impliedVolatility: row.snapshot.impliedVolatility,
         volume: feature.dailyVolume,
         openInterest: feature.openInterest,
+        openInterestDate: row.contract.openInterestDate ?? null,
         spreadPct: feature.spreadPct,
         moneyness: feature.moneyness,
+        quoteTimestamp: feature.quoteTimestamp,
+        quoteAgeSeconds: feature.quoteAgeSeconds,
         quoteFreshnessStatus: feature.quoteFreshnessStatus,
+        provider: ["alpaca", "alpaca_opra_stream"].includes(row.snapshot.source)
+          ? "alpaca"
+          : row.snapshot.source,
+        requestedFeed: feature.requestedFeed,
+        effectiveFeed: feature.effectiveFeed,
         feed: feature.feedValidated ? "opra" : null,
+        providerTimestamp: feature.sourceObservationTimestamp,
+        receiptTimestamp: row.snapshot.retrievedAt ?? row.snapshot.observedAt,
+        persistenceTimestamp: feature.persistenceTimestamp,
+        environment: "paper",
         selectionScore: feature.selectionScore
       }
     } as const;
@@ -734,6 +768,18 @@ const targetFromFeature = (input: {
       ? input.feature.optionCandidates.put
       : null;
   const optionDecisionInputs = optionCandidate?.decisionInputs;
+  const optionCandidateWithUnderlyingContext = optionCandidate
+    ? {
+        ...optionCandidate,
+        decisionInputs: {
+          ...optionCandidate.decisionInputs,
+          underlyingMovement: values.intradayReturn,
+          intradayVolatility: values.intradayVolatility,
+          underlyingHistoricalReturn20: values.multiPeriodReturn20,
+          underlyingHistoricalVolatility: values.realizedVolatility20
+        }
+      }
+    : null;
   const candidateImpliedVolatility = optionDecisionInputs &&
     typeof optionDecisionInputs.impliedVolatility === "number"
     ? optionDecisionInputs.impliedVolatility
@@ -799,7 +845,7 @@ const targetFromFeature = (input: {
     optionsStrategy: {
       alternatives: selector.alternatives,
       rationale: selector.rationale,
-      optionsCandidate: optionCandidate,
+      optionsCandidate: optionCandidateWithUnderlyingContext,
       decisionInputs: {
         currentTradablePrice: values.currentTradablePrice,
         intradayReturn: values.intradayReturn,

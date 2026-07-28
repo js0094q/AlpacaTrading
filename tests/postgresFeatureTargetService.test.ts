@@ -375,7 +375,22 @@ test("Alpaca option quote, liquidity, IV, and all five Greeks propagate into cla
   assert.equal(feature.optionQuoteFreshnessStatus, "fresh");
   assert.equal(feature.optionContractEligible, true);
   const candidate = result.targets[0]!.optionsStrategy?.optionsCandidate as Record<string, unknown>;
-  assert.deepEqual(candidate.decisionInputs, {
+  const decisionInputs = candidate.decisionInputs as Record<string, unknown>;
+  assert.deepEqual({
+    delta: decisionInputs.delta,
+    gamma: decisionInputs.gamma,
+    theta: decisionInputs.theta,
+    vega: decisionInputs.vega,
+    rho: decisionInputs.rho,
+    impliedVolatility: decisionInputs.impliedVolatility,
+    volume: decisionInputs.volume,
+    openInterest: decisionInputs.openInterest,
+    spreadPct: decisionInputs.spreadPct,
+    moneyness: decisionInputs.moneyness,
+    quoteFreshnessStatus: decisionInputs.quoteFreshnessStatus,
+    feed: decisionInputs.feed,
+    selectionScore: decisionInputs.selectionScore
+  }, {
     delta: 0.5,
     gamma: 0.02,
     theta: -0.08,
@@ -479,6 +494,93 @@ test("contract selection ranks OPRA Greeks, IV, spread, volume, and open interes
   assert.equal(inputs.impliedVolatility, 0.3);
   assert.equal(inputs.delta, 0.48);
   assert.equal(typeof inputs.selectionScore, "number");
+});
+
+test("selected option proposals retain the verified contract, quote, trade, and open-interest evidence", async () => {
+  const optionSymbol = "SPY260829C00560000";
+  const result = await buildOptionFeaturesFixture({
+    contracts: [optionContractFixture(optionSymbol, 560, {
+      contractId: "alpaca-contract-id",
+      openInterestDate: "2026-06-28"
+    })],
+    snapshots: [optionSnapshotFixture(optionSymbol, {
+      bid: 4.9,
+      ask: 5.1,
+      bidSize: 20,
+      askSize: 25,
+      midpoint: 5,
+      spread: 0.2,
+      spreadPct: 0.04,
+      last: 5.02,
+      tradeTimestamp: "2026-06-29T19:59:58.000Z",
+      rho: null
+    })]
+  });
+
+  const candidate = result.targets[0]!.optionsStrategy
+    ?.optionsCandidate as Record<string, unknown>;
+  const inputs = candidate.decisionInputs as Record<string, unknown>;
+  assert.deepEqual({
+    contractId: inputs.contractId,
+    underlyingSymbol: inputs.underlyingSymbol,
+    contractSymbol: inputs.contractSymbol,
+    callOrPut: inputs.callOrPut,
+    strike: inputs.strike,
+    expirationDate: inputs.expirationDate,
+    daysToExpiration: inputs.daysToExpiration,
+    tradable: inputs.tradable,
+    status: inputs.status,
+    contractSize: inputs.contractSize,
+    bid: inputs.bid,
+    ask: inputs.ask,
+    midpoint: inputs.midpoint,
+    spreadDollars: inputs.spreadDollars,
+    spreadPct: inputs.spreadPct,
+    bidSize: inputs.bidSize,
+    askSize: inputs.askSize,
+    lastTrade: inputs.lastTrade,
+    lastTradeTimestamp: inputs.lastTradeTimestamp,
+    volume: inputs.volume,
+    openInterest: inputs.openInterest,
+    openInterestDate: inputs.openInterestDate,
+    impliedVolatility: inputs.impliedVolatility,
+    rho: inputs.rho,
+    quoteTimestamp: inputs.quoteTimestamp,
+    provider: inputs.provider,
+    feed: inputs.feed,
+    providerTimestamp: inputs.providerTimestamp,
+    receiptTimestamp: inputs.receiptTimestamp
+  }, {
+    contractId: "alpaca-contract-id",
+    underlyingSymbol: "SPY",
+    contractSymbol: optionSymbol,
+    callOrPut: "call",
+    strike: 560,
+    expirationDate: "2026-08-29",
+    daysToExpiration: 61,
+    tradable: true,
+    status: "active",
+    contractSize: 100,
+    bid: 4.9,
+    ask: 5.1,
+    midpoint: 5,
+    spreadDollars: 0.2,
+    spreadPct: 0.04,
+    bidSize: 20,
+    askSize: 25,
+    lastTrade: 5.02,
+    lastTradeTimestamp: "2026-06-29T19:59:58.000Z",
+    volume: 500,
+    openInterest: 1_000,
+    openInterestDate: "2026-06-28",
+    impliedVolatility: 0.25,
+    rho: null,
+    quoteTimestamp: "2026-06-29T19:59:59.000Z",
+    provider: "alpaca",
+    feed: "opra",
+    providerTimestamp: "2026-06-29T19:59:59.000Z",
+    receiptTimestamp: "2026-06-29T20:00:00.000Z"
+  });
 });
 
 test("historical option evidence remains available only at matching historical as-of rows", async () => {

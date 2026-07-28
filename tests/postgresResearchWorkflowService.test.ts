@@ -710,7 +710,12 @@ test("research assigns zero_dte_spy only to a matching SPY same-day option expre
       alternatives: ["shares"], rationale: [],
       optionsCandidate: {
         optionSymbol: "SPY260720C00555000", type: "call", expirationDate: "2026-07-20",
-        strike: 555, estimatedEntryPrice: 2, liquidityScore: 0.9
+        strike: 555, estimatedEntryPrice: 2, liquidityScore: 0.9,
+        decisionInputs: {
+          bid: 1.98, ask: 2.02, spreadDollars: 0.04, spreadPct: 0.02,
+          quoteTimestamp: "2026-07-20T19:59:59.000Z",
+          intradayVolatility: 0.018, hoursToExpiration: 0.5
+        }
       }
     }
   };
@@ -739,6 +744,15 @@ test("research assigns zero_dte_spy only to a matching SPY same-day option expre
   assert.equal(candidateValues[12], "zero_dte_spy");
   const signalInputs = JSON.parse(String(candidateValues[25]));
   assert.equal(signalInputs.strategyClassification.daysToExpiration, 0);
+  assert.deepEqual(signalInputs.marketDecisionInputs.option.evidenceProfile, {
+    lane: "options_0dte",
+    horizon: "intraday",
+    priorityInputs: [
+      "bid", "ask", "spreadDollars", "spreadPct", "quoteTimestamp",
+      "underlyingPrice", "intradayReturn", "intradayVolatility", "volume",
+      "openInterest", "hoursToExpiration", "delta", "gamma", "theta", "vega", "rho"
+    ]
+  });
 });
 
 test("research classifies a production long-dated option with repository LEAPS policy", async () => {
@@ -756,7 +770,13 @@ test("research classifies a production long-dated option with repository LEAPS p
         expirationDate: "2027-04-16",
         strike: 500,
         estimatedEntryPrice: 20,
-        liquidityScore: 0.9
+        liquidityScore: 0.9,
+        decisionInputs: {
+          daysToExpiration: 270, moneyness: 0.1, openInterest: 8_000,
+          openInterestDate: "2026-07-17", spreadDollars: 0.5,
+          spreadPct: 0.025, impliedVolatility: 0.24, delta: -0.4,
+          underlyingHistoricalVolatility: 0.2
+        }
       }
     }
   };
@@ -798,4 +818,15 @@ test("research classifies a production long-dated option with repository LEAPS p
 
   assert.equal(candidateValues[4], "SPY270416P00500000");
   assert.equal(candidateValues[12], "leaps");
+  const signalInputs = JSON.parse(String(candidateValues[25]));
+  assert.deepEqual(signalInputs.marketDecisionInputs.option.evidenceProfile, {
+    lane: "options_leaps",
+    horizon: "long_horizon",
+    priorityInputs: [
+      "expirationDate", "daysToExpiration", "strike", "moneyness",
+      "openInterest", "openInterestDate", "spreadDollars", "spreadPct",
+      "impliedVolatility", "delta", "gamma", "theta", "vega", "rho",
+      "underlyingHistoricalVolatility"
+    ]
+  });
 });
