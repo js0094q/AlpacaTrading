@@ -328,6 +328,31 @@ test("research fails closed and records failure when current market evidence is 
   assert.equal(sql.some((statement) => /SET status = 'completed'/.test(statement)), false);
 });
 
+test("bounded shared readiness is classified for every enabled investment lane", async () => {
+  const telemetry: Record<string, unknown>[] = [];
+  await assert.rejects(runPostgresResearchWorkflow({
+    query: { query: async (statement: string) => ({
+      rows: statement.includes("INSERT INTO research_runs") ? [{ version: "1" }] : [],
+      rowCount: 1
+    }) },
+    fence, riskProfile: "aggressive", optionsEnabled: true, maxCandidates: 10,
+    emitTelemetry: (event) => { telemetry.push(event); },
+    dependencies: {
+      refreshMarketData: async () => { throw new Error("POSTGRES_STOCK_SNAPSHOT_STALE:SPY"); },
+      buildFeaturesAndTargets: async () => { throw new Error("must not build features"); },
+      symbols: ["SPY"]
+    }
+  }), /POSTGRES_STOCK_SNAPSHOT_STALE:SPY/);
+  const deferred = telemetry.find(
+    ({ event }) => event === "postgres_investment_orchestrator_deferred"
+  );
+  assert.deepEqual(deferred?.enabledLanes, ["equity", "options_0dte", "options_leaps"]);
+  assert.deepEqual(
+    (deferred?.workstreamResults as Array<{ outcome: string }>).map(({ outcome }) => outcome),
+    ["no_action", "no_action", "no_action"]
+  );
+});
+
 test("research closes its own run when failure terminalization loses the scheduler fence", async () => {
   const failureUpdates: string[] = [];
   await assert.rejects(

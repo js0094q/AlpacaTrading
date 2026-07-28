@@ -49,6 +49,18 @@ const dependencies: ResearchDependencies = {
   refreshMarketData: refreshPostgresMarketData,
   buildFeaturesAndTargets: buildPostgresFeaturesAndTargets
 };
+const INVESTMENT_LANE_FAMILIES = [
+  ["equity", "equity"],
+  ["options_0dte", "zero_dte_spy"],
+  ["options_leaps", "leaps"]
+] as const;
+const RESEARCH_READINESS_DEFERRALS = new Set([
+  "POSTGRES_STOCK_SNAPSHOT_STALE",
+  "POSTGRES_OPTION_SNAPSHOTS_CURRENT_MISSING",
+  "POSTGRES_DECISION_MARKET_SESSION_INELIGIBLE"
+]);
+const investmentLaneEnabled = (lane: string, optionsEnabled: boolean) =>
+  lane === "equity" || optionsEnabled;
 
 const fenceSql = (start: number) => `EXISTS (
   SELECT 1 FROM scheduler_leases lease
@@ -685,20 +697,15 @@ const persistCandidates = async (input: {
         : ["NO_ELIGIBLE_POSTGRES_CANDIDATES"]
     };
   };
-  const laneFamilies = [
-    ["equity", "equity"],
-    ["options_0dte", "zero_dte_spy"],
-    ["options_leaps", "leaps"]
-  ] as const;
   const investmentCycle = await runInvestmentOrchestrator<
     typeof decisions,
     FeatureTargetResult["targets"][number]
   >({
     cycleId: input.cycleId,
     loadSharedContext: async () => decisions,
-    lanes: laneFamilies.map(([lane, family]) => ({
+    lanes: INVESTMENT_LANE_FAMILIES.map(([lane, family]) => ({
       lane,
-      enabled: lane === "equity" || input.optionsEnabled,
+      enabled: investmentLaneEnabled(lane, input.optionsEnabled),
       execute: (sharedDecisions) => persistDecisionRows(
         sharedDecisions.filter((row) => row.strategyFamily === family)
       )
@@ -743,6 +750,7 @@ export const runPostgresResearchWorkflow = async (input: {
   const now = input.now ?? new Date();
   const nowIso = now.toISOString();
   const runId = `research_${randomUUID()}`;
+  const cycleId = input.cycleId ?? process.env.AUTONOMOUS_CYCLE_ID?.trim() ?? runId;
   const explorationThresholds = input.explorationThresholds ?? paperExplorationThresholds();
   const explorationProfile = paperExplorationProfile({
     ...explorationThresholds,
@@ -827,7 +835,7 @@ export const runPostgresResearchWorkflow = async (input: {
     });
     const candidateDecisions = await persistCandidates({
       query: input.query, fence: input.fence, researchRunId: runId,
-      cycleId: input.cycleId ?? process.env.AUTONOMOUS_CYCLE_ID?.trim() ?? runId,
+      cycleId,
       optionsEnabled: input.optionsEnabled,
       targets: generated.targets, maxCandidates: input.maxCandidates, now,
       explorationThresholds: {
@@ -869,6 +877,33 @@ export const runPostgresResearchWorkflow = async (input: {
     };
   } catch (error) {
     const message = error instanceof Error ? error.message.slice(0, 240) : "POSTGRES_RESEARCH_FAILED";
+    const reasonCode = message.split(":", 1)[0]!;
+    if (RESEARCH_READINESS_DEFERRALS.has(reasonCode)) {
+      const deferred = await runInvestmentOrchestrator<
+        { reasonCode: string },
+        FeatureTargetResult["targets"][number]
+      >({
+        cycleId,
+        loadSharedContext: async () => ({ reasonCode }),
+        lanes: INVESTMENT_LANE_FAMILIES.map(([lane]) => ({
+          lane,
+          enabled: investmentLaneEnabled(lane, input.optionsEnabled),
+          execute: async (context) => ({
+            proposals: [],
+            reason_codes: [context.reasonCode],
+            diagnostic_summary: `Lane deferred before evaluation: ${context.reasonCode}`
+          })
+        })),
+        now: () => now
+      });
+      input.emitTelemetry?.({
+        event: "postgres_investment_orchestrator_deferred",
+        researchRunId: runId,
+        cycleId,
+        enabledLanes: deferred.enabledLanes,
+        workstreamResults: deferred.workstreamResults
+      });
+    }
     await failResearchRun({ query: input.query, fence: input.fence, runId, message });
     throw error;
   }
