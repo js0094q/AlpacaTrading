@@ -157,6 +157,83 @@ test("research persists current PostgreSQL evidence and selected candidates befo
   );
 });
 
+for (const boundedResult of [
+  "ALPACA_OPRA_NOT_AUTHORIZED",
+  "ALPACA_OPRA_DATA_UNAVAILABLE",
+  "ALPACA_OPRA_QUOTE_STALE",
+  "ALPACA_OPRA_GREEKS_UNAVAILABLE"
+] as const) {
+  test(`0DTE reports ${boundedResult} without suppressing equity or LEAPS`, async () => {
+    const result = await runPostgresResearchWorkflow({
+      query: {
+        query: async (statement: string) => {
+          if (statement.includes("to_regclass('public.learning_runs')")) {
+            return {
+              rows: [{ learning_model_relation: null }],
+              rowCount: 1
+            };
+          }
+          return {
+            rows: statement.includes("INSERT INTO research_runs")
+              ? [{ version: "1" }]
+              : [],
+            rowCount: 1
+          };
+        }
+      },
+      fence,
+      riskProfile: "aggressive",
+      optionsEnabled: true,
+      maxCandidates: 10,
+      now: new Date("2026-07-20T22:00:00.000Z"),
+      dependencies: {
+        refreshMarketData: async () => ({
+          bars: [bar],
+          stockSnapshots: [],
+          optionContracts: [],
+          optionSnapshots: [],
+          summary: {
+            optionDataStatus: "degraded",
+            optionDataRejectionReasons: [`${boundedResult}:SPY`],
+            optionEvidenceByUnderlying: {
+              SPY: {
+                requestedFeed: "opra",
+                returnedFeed: null,
+                source: "rest",
+                contractCount: 0,
+                contractsWithUsableQuotes: 0,
+                contractsWithUsableGreeks: 0,
+                freshestQuoteTimestamp: null,
+                selectedContract: null,
+                finalBoundedResult: boundedResult
+              }
+            }
+          }
+        }) as never,
+        buildFeaturesAndTargets: async () => ({
+          features: [],
+          targets: [target]
+        }),
+        symbols: ["SPY"]
+      }
+    });
+
+    const byLane = new Map(
+      result.workstreamResults.map((lane) => [lane.lane, lane])
+    );
+    assert.equal(byLane.get("equity")?.outcome, "success");
+    assert.deepEqual(
+      byLane.get("options_0dte")?.reason_codes,
+      [boundedResult]
+    );
+    assert.equal(byLane.get("options_leaps")?.outcome, "no_action");
+    assert.deepEqual(
+      byLane.get("options_leaps")?.reason_codes,
+      ["NO_ELIGIBLE_POSTGRES_CANDIDATES"]
+    );
+  });
+}
+
 test("paper exploration persists selected and rejected candidate decisions with reversible gates", async () => {
   const candidateRows: Array<readonly unknown[]> = [];
   let researchConfig: Record<string, unknown> = {};
@@ -648,7 +725,7 @@ test("research assigns zero_dte_spy only to a matching SPY same-day option expre
       }
     },
     fence, riskProfile: "aggressive", optionsEnabled: true, maxCandidates: 10,
-    now: new Date("2026-07-20T18:00:00.000Z"),
+    now: new Date("2026-07-21T00:30:00.000Z"),
     dependencies: {
       refreshMarketData: async () => ({
         bars: [bar], stockSnapshots: [], optionContracts: [], optionSnapshots: [], summary: {}
@@ -660,6 +737,8 @@ test("research assigns zero_dte_spy only to a matching SPY same-day option expre
   assert.equal(candidateValues[4], "SPY260720C00555000");
   assert.equal(candidateValues[5], "option");
   assert.equal(candidateValues[12], "zero_dte_spy");
+  const signalInputs = JSON.parse(String(candidateValues[25]));
+  assert.equal(signalInputs.strategyClassification.daysToExpiration, 0);
 });
 
 test("research classifies a production long-dated option with repository LEAPS policy", async () => {

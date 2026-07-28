@@ -223,6 +223,7 @@ test("market-data writes are fenced PostgreSQL upserts with source provenance", 
   assert.equal(contractPayload[0]?.status, "active");
   assert.equal(contractPayload[0]?.open_interest, 1_000);
   const snapshotWrite = writes.find((entry) => entry.text.includes("INSERT INTO option_snapshots"))!;
+  assert.match(snapshotWrite.text, /source = EXCLUDED\.source/);
   const snapshotPayload = JSON.parse(String(snapshotWrite.values?.[0])) as Array<Record<string, unknown>>;
   const snapshotEvidence = snapshotPayload[0]?.evidence as Record<string, unknown>;
   assert.equal(snapshotEvidence.requestedFeed, "opra");
@@ -391,6 +392,56 @@ test("PostgreSQL option readback restores persisted contract, OPRA, and persiste
   assert.equal(snapshots[0]?.underlyingPrice, 744.36);
   assert.equal(snapshots[0]?.persistedAt, "2026-07-21T13:42:01.000Z");
   assert.equal(snapshots[0]?.evidenceFingerprint, "option-evidence-fingerprint");
+});
+
+test("fresh OPRA stream evidence read is bounded to requested contracts and the normalized stream source", async () => {
+  const queries: Array<{ text: string; values?: readonly unknown[] }> = [];
+  const client = {
+    query: async (text: string, values?: readonly unknown[]) => {
+      queries.push({ text, values });
+      if (text.includes("FROM scheduler_leases") && text.includes("FOR UPDATE")) {
+        return { rows: [currentFence], rowCount: 1 } as unknown as QueryResult;
+      }
+      if (text.includes("FROM option_snapshots")) {
+        return { rows: [{
+          option_symbol: "SPY260724C00744000", underlying_symbol: "SPY",
+          observed_at: "2026-07-21T13:41:58.000Z", quote_timestamp: "2026-07-21T13:41:58.000Z",
+          trade_timestamp: "2026-07-21T13:41:57.000Z", snapshot_timestamp: "2026-07-21T13:41:58.000Z",
+          bid: "3.1", ask: "3.2", midpoint: "3.15", last: "3.15", volume: "321",
+          open_interest: "1200", implied_volatility: "0.1663", delta: "0.5276",
+          gamma: "0.0355", theta: "-0.7831", vega: "0.2686", rho: "0.0319",
+          source: "alpaca_opra_stream", request_id: "stream-request",
+          evidence: {
+            underlyingPrice: 744.36,
+            bidSize: 10,
+            askSize: 12,
+            freshnessStatus: "fresh",
+            requestedFeed: "opra",
+            effectiveFeed: "opra",
+            transport: "stream"
+          },
+          evidence_fingerprint: "stream-evidence-fingerprint",
+          updated_at: "2026-07-21T13:42:00.000Z"
+        }], rowCount: 1 } as unknown as QueryResult;
+      }
+      throw new Error(`unexpected query: ${text}`);
+    }
+  } as unknown as PoolClient;
+
+  const snapshots = await new PostgresMarketDataRepository().listFreshOptionStreamSnapshots({
+    optionSymbols: ["SPY260724C00744000"],
+    observedAfter: "2026-07-21T13:12:00.000Z"
+  }, contextFor(client));
+
+  assert.equal(snapshots[0]?.source, "alpaca_opra_stream");
+  assert.equal(snapshots[0]?.rho, 0.0319);
+  const read = queries.find((entry) => entry.text.includes("FROM option_snapshots"));
+  assert.match(read?.text ?? "", /source = 'alpaca_opra_stream'/);
+  assert.match(read?.text ?? "", /DISTINCT ON \(option_symbol\)/);
+  assert.deepEqual(read?.values, [
+    ["SPY260724C00744000"],
+    "2026-07-21T13:12:00.000Z"
+  ]);
 });
 
 test("whole-universe option readback uses bounded PostgreSQL queries", async () => {

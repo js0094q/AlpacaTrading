@@ -31,6 +31,7 @@ type MarketDataWriter = Pick<
   | "listOptionContractsBySymbols"
   | "listOptionSnapshotsByIdentity"
 > & {
+  listFreshOptionStreamSnapshots?: PostgresMarketDataRepository["listFreshOptionStreamSnapshots"];
   recordMarketDataIngestionRun?: PostgresMarketDataRepository["recordMarketDataIngestionRun"];
   persistOptionSnapshotsWithReadback?: (
     rows: readonly PostgresOptionSnapshot[],
@@ -105,13 +106,103 @@ const record = (value: unknown): Record<string, unknown> =>
 const text = (value: unknown) =>
   typeof value === "string" && value.trim() ? value.trim() : null;
 
-const providerFailureCode = (error: unknown) => {
-  const message = error instanceof Error ? error.message.trim() : "";
-  if (/timed out/i.test(message)) return "ALPACA_REQUEST_TIMEOUT";
-  const candidate = message.split(":", 1)[0]?.trim() ?? "";
-  return /^[A-Z][A-Z0-9_]+$/.test(candidate)
-    ? candidate
-    : "OPTION_PROVIDER_REQUEST_FAILED";
+type OpraBoundedResult =
+  | "OPRA_EVIDENCE_CURRENT"
+  | "ALPACA_OPRA_NOT_AUTHORIZED"
+  | "ALPACA_OPRA_DATA_UNAVAILABLE"
+  | "ALPACA_OPRA_QUOTE_STALE"
+  | "ALPACA_OPRA_GREEKS_UNAVAILABLE";
+
+type OpraEvidenceObservability = {
+  requestedFeed: "opra";
+  returnedFeed: "opra" | null;
+  source: "stream" | "rest" | "none";
+  contractCount: number;
+  contractsWithUsableQuotes: number;
+  contractsWithUsableGreeks: number;
+  freshestQuoteTimestamp: string | null;
+  selectedContract: null;
+  finalBoundedResult: OpraBoundedResult;
+};
+
+const opraProviderFailureCode = (error: unknown): OpraBoundedResult => {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return /status=(401|403)\b|not[\s_-]*authorized|unauthorized|subscription|entitlement/i.test(message)
+    ? "ALPACA_OPRA_NOT_AUTHORIZED"
+    : "ALPACA_OPRA_DATA_UNAVAILABLE";
+};
+
+const optionQuoteIsUsable = (
+  row: PostgresOptionSnapshot,
+  nowMs: number,
+  maxAgeMs: number
+) => {
+  const quoteTimestamp = row.quoteTimestamp ? Date.parse(row.quoteTimestamp) : Number.NaN;
+  const age = nowMs - quoteTimestamp;
+  return (
+    row.requestedFeed?.toLowerCase() === "opra" &&
+    (row.effectiveFeed?.toLowerCase() === "opra" ||
+      row.validationBasis === "request_feed_opra") &&
+    row.freshnessStatus === "fresh" &&
+    Number.isFinite(quoteTimestamp) &&
+    age >= -60_000 &&
+    age <= maxAgeMs &&
+    row.bid !== null &&
+    row.ask !== null &&
+    row.bid > 0 &&
+    row.ask >= row.bid
+  );
+};
+
+const optionGreeksAreUsable = (row: PostgresOptionSnapshot) => [
+  row.impliedVolatility,
+  row.delta,
+  row.gamma,
+  row.theta,
+  row.vega,
+  row.rho
+].every((value) => value !== null && value !== undefined && Number.isFinite(value));
+
+const streamSnapshotIsReusable = (
+  row: PostgresOptionSnapshot,
+  nowMs: number,
+  maxAgeMs: number
+) =>
+  row.source === "alpaca_opra_stream" &&
+  row.effectiveFeed?.toLowerCase() === "opra" &&
+  optionQuoteIsUsable(row, nowMs, maxAgeMs) &&
+  optionGreeksAreUsable(row);
+
+const opraObservability = (input: {
+  rows: readonly PostgresOptionSnapshot[];
+  nowMs: number;
+  maxAgeMs: number;
+  source: OpraEvidenceObservability["source"];
+  returnedFeed: OpraEvidenceObservability["returnedFeed"];
+  contractCount: number;
+  finalBoundedResult: OpraBoundedResult;
+}): OpraEvidenceObservability => {
+  const usableQuoteRows = input.rows.filter((row) =>
+    optionQuoteIsUsable(row, input.nowMs, input.maxAgeMs)
+  );
+  const usableGreekRows = usableQuoteRows.filter(optionGreeksAreUsable);
+  const quoteTimestamps = input.rows
+    .map((row) => row.quoteTimestamp)
+    .filter((value): value is string =>
+      typeof value === "string" && Number.isFinite(Date.parse(value))
+    )
+    .sort((left, right) => Date.parse(right) - Date.parse(left));
+  return {
+    requestedFeed: "opra",
+    returnedFeed: input.returnedFeed,
+    source: input.source,
+    contractCount: input.contractCount,
+    contractsWithUsableQuotes: usableQuoteRows.length,
+    contractsWithUsableGreeks: usableGreekRows.length,
+    freshestQuoteTimestamp: quoteTimestamps[0] ?? null,
+    selectedContract: null,
+    finalBoundedResult: input.finalBoundedResult
+  };
 };
 
 const retrievalTimestamp = (value: unknown, fallback: string) => {
@@ -403,12 +494,12 @@ export const refreshPostgresMarketData = async (input: {
   const optionSnapshotsByUnderlying: Record<string, number> = {};
   const freshOptionSnapshotsByUnderlying: Record<string, number> = {};
   const optionDataRejectionReasons: string[] = [];
+  const optionEvidenceByUnderlying: Record<string, OpraEvidenceObservability> = {};
   const ingestionRuns: Parameters<
     NonNullable<MarketDataWriter["recordMarketDataIngestionRun"]>
   >[0][] = [];
   if (input.optionsEnabled) {
-    const optionFeed = process.env.ALPACA_OPTION_DATA_FEED?.trim().toLowerCase() || "opra";
-    if (optionFeed !== "opra") throw new Error(`POSTGRES_OPTION_FEED_INVALID:${optionFeed}`);
+    const optionFeed = "opra" as const;
     const contractsBySymbol = new Map<string, PostgresOptionContract>();
     for (const underlying of requestedSymbols) {
       const requestStartedAt = nowIso;
@@ -429,12 +520,24 @@ export const refreshPostgresMarketData = async (input: {
             ? input.signal.reason
             : new Error("SCHEDULER_COMMAND_TERMINATED: option-contract refresh cancelled.");
         }
-        const rejectionReason =
-          `POSTGRES_OPTION_CONTRACT_PROVIDER_UNAVAILABLE:${underlying}:${providerFailureCode(error)}`;
+        const boundedResult = opraProviderFailureCode(error);
+        const rejectionReason = `${boundedResult}:${underlying}`;
         optionContractsByUnderlying[underlying] = 0;
         optionSnapshotsByUnderlying[underlying] = 0;
         freshOptionSnapshotsByUnderlying[underlying] = 0;
         optionDataRejectionReasons.push(rejectionReason);
+        optionEvidenceByUnderlying[underlying] = opraObservability({
+          rows: [],
+          nowMs: now.getTime(),
+          maxAgeMs: (
+            input.maxOptionSnapshotAgeSeconds ??
+            AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS
+          ) * 1_000,
+          source: "rest",
+          returnedFeed: null,
+          contractCount: 0,
+          finalBoundedResult: boundedResult
+        });
         ingestionRuns.push({
           cycleId: process.env.AUTONOMOUS_CYCLE_ID?.trim() || null,
           workstream:
@@ -498,9 +601,7 @@ export const refreshPostgresMarketData = async (input: {
     optionContracts = [...contractsBySymbol.values()];
     if (
       optionContracts.length === 0 &&
-      !optionDataRejectionReasons.some((reason) =>
-        reason.startsWith("POSTGRES_OPTION_CONTRACT_PROVIDER_UNAVAILABLE:")
-      )
+      optionDataRejectionReasons.length === 0
     ) {
       throw new Error("POSTGRES_OPTION_CONTRACTS_MISSING");
     }
@@ -513,15 +614,93 @@ export const refreshPostgresMarketData = async (input: {
       input.maxOptionSnapshotAgeSeconds ??
       AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS
     ) * 1_000;
+    const streamSnapshots = repository.listFreshOptionStreamSnapshots
+      ? await repository.listFreshOptionStreamSnapshots({
+        optionSymbols: optionContracts.map((row) => row.optionSymbol),
+        observedAfter: new Date(now.getTime() - maxOptionAgeMs).toISOString()
+      }, input.context)
+      : [];
     for (const underlying of requestedSymbols) {
       const currentContracts = optionContracts.filter((row) => row.underlyingSymbol === underlying);
       if (!currentContracts.length) {
         optionSnapshotsByUnderlying[underlying] = 0;
         freshOptionSnapshotsByUnderlying[underlying] = 0;
+        optionEvidenceByUnderlying[underlying] ??= opraObservability({
+          rows: [],
+          nowMs: now.getTime(),
+          maxAgeMs: maxOptionAgeMs,
+          source: "none",
+          returnedFeed: null,
+          contractCount: 0,
+          finalBoundedResult: "ALPACA_OPRA_DATA_UNAVAILABLE"
+        });
         continue;
       }
       const contractBySymbol = new Map(currentContracts.map((row) => [row.optionSymbol, row]));
       const requestStartedAt = nowIso;
+      const reusableStreamBySymbol = new Map<string, PostgresOptionSnapshot>();
+      for (const row of streamSnapshots
+        .filter((candidate) =>
+          candidate.underlyingSymbol === underlying &&
+          contractBySymbol.has(candidate.optionSymbol) &&
+          streamSnapshotIsReusable(candidate, now.getTime(), maxOptionAgeMs)
+        )
+        .sort((left, right) => Date.parse(right.observedAt) - Date.parse(left.observedAt))) {
+        if (!reusableStreamBySymbol.has(row.optionSymbol)) {
+          reusableStreamBySymbol.set(row.optionSymbol, row);
+        }
+      }
+      if (reusableStreamBySymbol.size === currentContracts.length) {
+        const reusableRows = [...reusableStreamBySymbol.values()];
+        for (const row of reusableRows) {
+          snapshotsByIdentity.set(`${row.optionSymbol}:${row.observedAt}`, row);
+        }
+        optionSnapshotsByUnderlying[underlying] = reusableRows.length;
+        freshOptionSnapshotsByUnderlying[underlying] = reusableRows.length;
+        optionEvidenceByUnderlying[underlying] = opraObservability({
+          rows: reusableRows,
+          nowMs: now.getTime(),
+          maxAgeMs: maxOptionAgeMs,
+          source: "stream",
+          returnedFeed: "opra",
+          contractCount: currentContracts.length,
+          finalBoundedResult: "OPRA_EVIDENCE_CURRENT"
+        });
+        ingestionRuns.push({
+          cycleId: process.env.AUTONOMOUS_CYCLE_ID?.trim() || null,
+          workstream: process.env.AUTONOMOUS_WORKSTREAM?.trim() || input.context.schedulerFence.workstream,
+          symbol: underlying,
+          provider: "alpaca",
+          endpoint: "wss://stream.data.alpaca.markets/v1beta1/opra",
+          requestedFeed: "opra",
+          effectiveFeed: "opra",
+          requestStartedAt,
+          requestCompletedAt: nowIso,
+          pagesRetrieved: 0,
+          rowsReceived: reusableRows.length,
+          newestProviderTimestamp: reusableRows
+            .map((row) => row.quoteTimestamp)
+            .filter((value): value is string => Boolean(value))
+            .sort((left, right) => Date.parse(right) - Date.parse(left))[0] ?? null,
+          oldestProviderTimestamp: reusableRows
+            .map((row) => row.quoteTimestamp)
+            .filter((value): value is string => Boolean(value))
+            .sort((left, right) => Date.parse(left) - Date.parse(right))[0] ?? null,
+          newestProviderAgeSeconds: reusableRows[0]?.quoteTimestamp
+            ? (now.getTime() - Date.parse(reusableRows[0].quoteTimestamp)) / 1_000
+            : null,
+          acceptedRows: reusableRows.length,
+          staleRows: 0,
+          rejectedRows: 0,
+          freshnessThresholdSeconds: maxOptionAgeMs / 1_000,
+          rejectionReason: null,
+          persistenceResult: "pending_persistence",
+          requestIds: reusableRows
+            .map((row) => row.requestId)
+            .filter((value): value is string => Boolean(value))
+        });
+        continue;
+      }
       let chain: Awaited<ReturnType<typeof fetchOptionChainSnapshots>>;
       try {
         chain = await dependencies.fetchOptionChainSnapshots(underlying, {
@@ -535,13 +714,20 @@ export const refreshPostgresMarketData = async (input: {
             ? input.signal.reason
             : new Error("SCHEDULER_COMMAND_TERMINATED: market-data refresh cancelled.");
         }
-        const providerCode = error instanceof Error
-          ? error.message.split(":", 1)[0]
-          : "OPTION_PROVIDER_REQUEST_FAILED";
-        const rejectionReason = `POSTGRES_OPTION_PROVIDER_UNAVAILABLE:${underlying}:${providerCode}`;
+        const boundedResult = opraProviderFailureCode(error);
+        const rejectionReason = `${boundedResult}:${underlying}`;
         optionSnapshotsByUnderlying[underlying] = 0;
         freshOptionSnapshotsByUnderlying[underlying] = 0;
         optionDataRejectionReasons.push(rejectionReason);
+        optionEvidenceByUnderlying[underlying] = opraObservability({
+          rows: [],
+          nowMs: now.getTime(),
+          maxAgeMs: maxOptionAgeMs,
+          source: "rest",
+          returnedFeed: null,
+          contractCount: currentContracts.length,
+          finalBoundedResult: boundedResult
+        });
         ingestionRuns.push({
           cycleId: process.env.AUTONOMOUS_CYCLE_ID?.trim() || null,
           workstream: process.env.AUTONOMOUS_WORKSTREAM?.trim() || input.context.schedulerFence.workstream,
@@ -628,6 +814,14 @@ export const refreshPostgresMarketData = async (input: {
         const dailyVolume = number(dailyBar.v);
         const stock = stockRows.find((row) => row.symbol === underlying);
         const underlyingPrice = number(stock?.evidence.midpoint) ?? number(stock?.evidence.latestTradePrice);
+        const returnedFeed = fetched.effectiveFeed?.trim().toLowerCase() ?? null;
+        const validatedEffectiveFeed =
+          fetched.requestedFeed.trim().toLowerCase() === "opra" &&
+          (returnedFeed === "opra" ||
+            (returnedFeed === null &&
+              fetched.validationBasis === "request_feed_opra"))
+            ? "opra"
+            : null;
         const row: PostgresOptionSnapshot = {
           optionSymbol: normalized.symbol,
           underlyingSymbol: normalized.underlying,
@@ -654,7 +848,7 @@ export const refreshPostgresMarketData = async (input: {
           rho: normalized.greeks.rho,
           freshnessStatus,
           requestedFeed: fetched.requestedFeed,
-          effectiveFeed: fetched.effectiveFeed ?? undefined,
+          effectiveFeed: validatedEffectiveFeed ?? undefined,
           validationBasis: fetched.validationBasis ?? null,
           endpoint: fetched.endpoint,
           pageToken: fetched.pageToken,
@@ -665,7 +859,8 @@ export const refreshPostgresMarketData = async (input: {
             endpoint: fetched.endpoint,
             underlying,
             requestedFeed: fetched.requestedFeed,
-            effectiveFeed: fetched.effectiveFeed,
+            effectiveFeed: validatedEffectiveFeed,
+            returnedFeed,
             validationBasis: fetched.validationBasis ?? null,
             requestId: fetched.requestId,
             pageToken: fetched.pageToken,
@@ -699,12 +894,50 @@ export const refreshPostgresMarketData = async (input: {
       }
       optionSnapshotsByUnderlying[underlying] = acceptedRows;
       freshOptionSnapshotsByUnderlying[underlying] = acceptedRows;
-      const rejectionReason = acceptedRows === 0
-        ? `POSTGRES_OPTION_SNAPSHOTS_CURRENT_MISSING:${underlying}`
-        : null;
+      const underlyingRows = [...snapshotsByIdentity.values()]
+        .filter((row) => row.underlyingSymbol === underlying);
+      const usableQuoteCount = underlyingRows.filter((row) =>
+        optionQuoteIsUsable(row, now.getTime(), maxOptionAgeMs)
+      ).length;
+      const usableGreeksCount = underlyingRows.filter((row) =>
+        optionQuoteIsUsable(row, now.getTime(), maxOptionAgeMs) &&
+        optionGreeksAreUsable(row)
+      ).length;
+      const staleQuoteCount = underlyingRows.filter((row) => {
+        const quoteTimestamp = row.quoteTimestamp
+          ? Date.parse(row.quoteTimestamp)
+          : Number.NaN;
+        return Number.isFinite(quoteTimestamp) &&
+          now.getTime() - quoteTimestamp > maxOptionAgeMs;
+      }).length;
+      const boundedResult: OpraBoundedResult = acceptedRows === 0
+        ? staleRows > 0
+          ? "ALPACA_OPRA_QUOTE_STALE"
+          : "ALPACA_OPRA_DATA_UNAVAILABLE"
+        : usableQuoteCount === 0
+          ? staleQuoteCount > 0
+            ? "ALPACA_OPRA_QUOTE_STALE"
+            : "ALPACA_OPRA_DATA_UNAVAILABLE"
+          : usableGreeksCount === 0
+            ? "ALPACA_OPRA_GREEKS_UNAVAILABLE"
+            : "OPRA_EVIDENCE_CURRENT";
+      const rejectionReason = boundedResult === "OPRA_EVIDENCE_CURRENT"
+        ? null
+        : `${boundedResult}:${underlying}`;
       if (rejectionReason && requiredOptionUnderlyingSet.has(underlying)) {
         optionDataRejectionReasons.push(rejectionReason);
       }
+      const returnedFeed = chain.snapshots.find((row) => row.effectiveFeed)?.effectiveFeed
+        ?.trim().toLowerCase();
+      optionEvidenceByUnderlying[underlying] = opraObservability({
+        rows: underlyingRows,
+        nowMs: now.getTime(),
+        maxAgeMs: maxOptionAgeMs,
+        source: "rest",
+        returnedFeed: returnedFeed === "opra" ? "opra" : null,
+        contractCount: currentContracts.length,
+        finalBoundedResult: boundedResult
+      });
       const orderedProviderTimestamps = providerTimestamps
         .filter((timestamp) => Number.isFinite(Date.parse(timestamp)))
         .sort((left, right) => Date.parse(left) - Date.parse(right));
@@ -720,7 +953,7 @@ export const refreshPostgresMarketData = async (input: {
         provider: "alpaca",
         endpoint: chain.snapshots[0]?.endpoint ?? `/v1beta1/options/snapshots/${underlying}`,
         requestedFeed: optionFeed,
-        effectiveFeed: chain.snapshots.find((row) => row.effectiveFeed)?.effectiveFeed ?? null,
+        effectiveFeed: returnedFeed ?? null,
         requestStartedAt,
         requestCompletedAt,
         pagesRetrieved: chain.pagesConsumed,
@@ -857,6 +1090,7 @@ export const refreshPostgresMarketData = async (input: {
       optionContractsByUnderlying,
       optionSnapshotsByUnderlying,
       freshOptionSnapshotsByUnderlying,
+      optionEvidenceByUnderlying,
       optionDataStatus: !input.optionsEnabled
         ? "disabled"
         : optionDataRejectionReasons.length > 0

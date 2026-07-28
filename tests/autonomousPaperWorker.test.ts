@@ -1313,6 +1313,7 @@ test("autonomous service fixes paper-only authority and bounds failure restarts"
   assert.match(service, /^Environment=PAPER_EXPLORATION_MIN_DEFINED_RISK_EXPECTED_RETURN_PCT=0\.40$/m);
   assert.match(service, /^Environment=PAPER_EXPLORATION_MAX_CANDIDATES=25$/m);
   assert.match(service, /^Environment=PAPER_EXPLORATION_MAX_ORDER_NOTIONAL=1000$/m);
+  assert.match(service, /^Environment=LEAPS_MAX_ENTRY_CAPITAL_USD=5000$/m);
   assert.match(service, /^Environment=POSTGRES_READS_ENABLED=true$/m);
   assert.match(service, /^Environment=POSTGRES_WRITES_ENABLED=true$/m);
   assert.match(service, /^Environment=POSTGRES_CONTROL_PLANE_AUTHORITY_ENABLED=true$/m);

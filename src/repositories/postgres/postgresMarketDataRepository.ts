@@ -318,7 +318,8 @@ ON CONFLICT (option_symbol, observed_at) DO UPDATE SET
   midpoint = EXCLUDED.midpoint, last = EXCLUDED.last, volume = EXCLUDED.volume,
   open_interest = EXCLUDED.open_interest, implied_volatility = EXCLUDED.implied_volatility,
   delta = EXCLUDED.delta, gamma = EXCLUDED.gamma, theta = EXCLUDED.theta,
-  vega = EXCLUDED.vega, rho = EXCLUDED.rho, request_id = EXCLUDED.request_id,
+  vega = EXCLUDED.vega, rho = EXCLUDED.rho, source = EXCLUDED.source,
+  request_id = EXCLUDED.request_id,
   evidence = EXCLUDED.evidence, evidence_fingerprint = EXCLUDED.evidence_fingerprint,
   updated_at = now()
 RETURNING (xmax = 0) AS inserted`;
@@ -1076,6 +1077,41 @@ export class PostgresMarketDataRepository {
     for (const batch of chunks(input.identities, POSTGRES_OPTION_READ_BATCH_SIZE)) {
       const readback = await readOptionSnapshotBatch(batch, context);
       rows.push(...readback.result.rows);
+    }
+    return rows.map(optionSnapshotFromRow);
+  }
+
+  async listFreshOptionStreamSnapshots(
+    input: {
+      optionSymbols: readonly string[];
+      observedAfter: string;
+    },
+    context: FencedPostgresRepositoryContext
+  ): Promise<PostgresOptionSnapshot[]> {
+    await requireFence(context);
+    if (!input.optionSymbols.length) return [];
+    const rows: PostgresOptionSnapshotRow[] = [];
+    for (const batch of chunks(input.optionSymbols, POSTGRES_OPTION_READ_BATCH_SIZE)) {
+      const result = await context.transaction.query<PostgresOptionSnapshotRow>(
+        `SELECT DISTINCT ON (option_symbol)
+                option_symbol, underlying_symbol, observed_at, quote_timestamp,
+                trade_timestamp, snapshot_timestamp, bid, ask, midpoint, last,
+                volume, open_interest, implied_volatility, delta, gamma, theta,
+                vega, rho, source, request_id, evidence, evidence_fingerprint,
+                updated_at
+         FROM option_snapshots
+         WHERE option_symbol = ANY($1::text[])
+           AND observed_at >= $2::timestamptz
+           AND source = 'alpaca_opra_stream'
+           AND lower(COALESCE(evidence->>'requestedFeed', '')) = 'opra'
+           AND lower(COALESCE(evidence->>'effectiveFeed', '')) = 'opra'
+         ORDER BY option_symbol, observed_at DESC`,
+        [
+          batch.map(normalizedSymbol),
+          iso(input.observedAfter)
+        ]
+      );
+      rows.push(...result.rows);
     }
     return rows.map(optionSnapshotFromRow);
   }

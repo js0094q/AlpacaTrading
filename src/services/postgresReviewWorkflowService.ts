@@ -5,6 +5,11 @@ import type { SchedulerFence } from "../repositories/contracts/common.js";
 import { AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS } from "./autonomousFreshnessPolicy.js";
 import { paperLeapsExitConfig } from "./leapsExitPolicy.js";
 import {
+  resolveLeapsEntryAllocation,
+  sizeLeapsEntry,
+  type LeapsEntrySizingResult
+} from "./leapsEntryAllocationService.js";
+import {
   optionDaysToExpiration,
   parseOptionSymbol
 } from "./optionSymbolService.js";
@@ -44,6 +49,7 @@ type ReviewSourceRow = Record<string, unknown> & {
   cash: string | number;
   equity: string | number;
   strategy_key: string;
+  candidate_strategy_family?: string | null;
   allocation_amount: string | number | null;
   allocation_ratio: string | number | null;
   reserved_amount: string | number;
@@ -67,6 +73,7 @@ type ReviewSourceRow = Record<string, unknown> & {
   contract_status?: string | null;
   contract_source?: string | null;
   contract_observed_at?: Date | string | null;
+  contract_multiplier?: string | number | null;
   sip_underlying_symbol?: string | null;
   sip_market_price?: string | number | null;
   sip_market_timestamp?: Date | string | null;
@@ -359,11 +366,16 @@ const newYorkParts = (date: Date) => {
   return Object.fromEntries(parts.map((part) => [part.type, part.value]));
 };
 
+const newYorkTradingDate = (date: Date) => {
+  const parts = newYorkParts(date);
+  return `${parts.year}-${parts.month}-${parts.day}`;
+};
+
 const isFinalThirtyMinutesForZeroDte = (optionSymbol: string, now: Date) => {
   const parsed = parseOptionSymbol(optionSymbol);
   if (!parsed.ok) return false;
   const parts = newYorkParts(now);
-  const tradingDate = `${parts.year}-${parts.month}-${parts.day}`;
+  const tradingDate = newYorkTradingDate(now);
   const minutes = Number(parts.hour) * 60 + Number(parts.minute);
   return parsed.expirationDate === tradingDate && minutes >= 15 * 60 + 30 && minutes <= 16 * 60;
 };
@@ -375,17 +387,28 @@ const persistCandidateStage = async (input: {
   status: "skipped" | "blocked" | "sized";
   reason: string;
   now: string;
+  leapsSizing?: LeapsEntrySizingResult | null;
 }) => {
   const result = await input.query.query(
     `UPDATE candidates
      SET lifecycle_status = $2, decision_reason = $3, updated_at = $4,
+         signal_inputs = CASE
+           WHEN $5::jsonb IS NULL THEN signal_inputs
+           ELSE jsonb_set(
+             COALESCE(signal_inputs, '{}'::jsonb),
+             '{leapsSizing}',
+             $5::jsonb,
+             true
+           )
+         END,
          version = version + 1
-     WHERE id = $1 AND decision = 'selected' AND ${fenceSql(5)}`,
+     WHERE id = $1 AND decision = 'selected' AND ${fenceSql(6)}`,
     [
       input.candidateId,
       input.status,
       input.reason,
       input.now,
+      input.leapsSizing ? JSON.stringify(input.leapsSizing) : null,
       ...fenceValues(input.fence)
     ]
   );
@@ -401,7 +424,9 @@ const entrySourceSql = (command: string, maxCandidates: number) => `WITH latest_
 )
 SELECT candidate.id AS candidate_id, candidate.symbol, candidate.asset_class,
        candidate.option_symbol, candidate.preferred_expression,
-       candidate.direction, candidate.confidence, candidate.as_of AS candidate_as_of,
+       candidate.direction, candidate.confidence,
+       candidate.strategy_family AS candidate_strategy_family,
+       candidate.as_of AS candidate_as_of,
        candidate.signal_inputs,
        account.id AS account_id, snapshot.id AS account_snapshot_id,
        snapshot.snapshot_fingerprint,
@@ -423,6 +448,7 @@ SELECT candidate.id AS candidate_id, candidate.symbol, candidate.asset_class,
        contract.status AS contract_status,
        contract.source AS contract_source,
        contract.observed_at AS contract_observed_at,
+       contract.multiplier::text AS contract_multiplier,
        sip.sip_underlying_symbol, sip.sip_market_price,
        sip.sip_market_timestamp, sip.sip_bid_price, sip.sip_ask_price,
        sip.sip_requested_feed, sip.sip_effective_feed, sip.sip_provider,
@@ -501,7 +527,12 @@ JOIN LATERAL (
 	             'underlyingPrice', option_snapshot.evidence->'underlyingPrice',
 	             'requestedFeed', option_snapshot.evidence->>'requestedFeed',
 	             'effectiveFeed', option_snapshot.evidence->>'effectiveFeed',
-	             'provider', option_snapshot.source,
+	             'provider', CASE
+	               WHEN option_snapshot.source IN ('alpaca', 'alpaca_opra_stream')
+	                 THEN 'alpaca'
+	               ELSE option_snapshot.source
+	             END,
+	             'transport', option_snapshot.evidence->>'transport',
 	             'spread', option_snapshot.evidence->'spread',
 	             'spreadPct', option_snapshot.evidence->'spreadPct'
            ) AS market_evidence
@@ -663,7 +694,12 @@ JOIN LATERAL (
              'underlyingPrice', option_snapshot.evidence->'underlyingPrice',
              'requestedFeed', option_snapshot.evidence->>'requestedFeed',
              'effectiveFeed', option_snapshot.evidence->>'effectiveFeed',
-             'provider', option_snapshot.source,
+             'provider', CASE
+               WHEN option_snapshot.source IN ('alpaca', 'alpaca_opra_stream')
+                 THEN 'alpaca'
+               ELSE option_snapshot.source
+             END,
+             'transport', option_snapshot.evidence->>'transport',
              'spread', option_snapshot.evidence->'spread',
              'spreadPct', option_snapshot.evidence->'spreadPct'
            ) AS market_evidence
@@ -1127,10 +1163,9 @@ const runExitReview = async (input: {
   };
 };
 
-const sizing = (
-  row: ReviewSourceRow,
-  maxOrderNotional: number
-): number | null => {
+const independentlyValidatedAvailableCapital = (
+  row: ReviewSourceRow
+): number => {
   const buyingPower = finite(row.buying_power);
   const cash = finite(row.cash);
   const equity = finite(row.equity);
@@ -1147,13 +1182,23 @@ const sizing = (
     ? finite(row.cash_reserve_amount) ?? 0
     : equity * (finite(row.cash_reserve_ratio) ?? 0);
   const amount = Math.floor(Math.min(
-    maxOrderNotional * optionSizingScale(row),
     buyingPower,
     Math.max(0, cash - cashReserve),
     allocationRemaining,
     positiveOrInfinity(row.max_position_notional),
     positiveOrInfinity(row.max_symbol_notional),
     positiveOrInfinity(row.max_deployment_amount)
+  ) * 100) / 100;
+  return Number.isFinite(amount) && amount > 0 ? amount : 0;
+};
+
+const sizing = (
+  row: ReviewSourceRow,
+  maxOrderNotional: number
+): number | null => {
+  const amount = Math.floor(Math.min(
+    maxOrderNotional * optionSizingScale(row),
+    independentlyValidatedAvailableCapital(row)
   ) * 100) / 100;
   if (!Number.isFinite(amount) || amount <= 0) return null;
   return amount;
@@ -1170,6 +1215,7 @@ export const runPostgresReviewWorkflow = async (input: {
   dte?: number;
   maxCandidates?: number;
   explorationThresholds?: PaperExplorationThresholds;
+  leapsEntryAllocationEnv?: NodeJS.ProcessEnv;
 }) => {
   if (!ENTRY_REVIEW_COMMANDS.has(input.command) && !EXIT_REVIEW_COMMANDS.has(input.command)) {
     return { status: "no_op" as const, code: "NO_POSTGRES_REVIEW_SCOPE", reviewsCreated: 0, pendingIntentsCreated: 0, capacityBlocked: 0 };
@@ -1224,15 +1270,14 @@ export const runPostgresReviewWorkflow = async (input: {
     row: ReviewSourceRow;
     amount: number;
     evidence: ReturnType<typeof validateEntryReviewEvidence>;
+    leapsSizing: LeapsEntrySizingResult | null;
   }> = [];
   const skippedRows: ReviewSourceRow[] = [];
   const blockedRows: Array<{ row: ReviewSourceRow; reason: string }> = [];
   const capacityRows: Array<{
     row: ReviewSourceRow;
-    reason:
-      | "POSTGRES_REVIEW_CAPACITY_UNAVAILABLE"
-      | "POSTGRES_REVIEW_OPTION_CAPACITY_INSUFFICIENT"
-      | "POSTGRES_REVIEW_SHORT_CAPACITY_INSUFFICIENT";
+    reason: string;
+    leapsSizing?: LeapsEntrySizingResult | null;
   }> = [];
   for (const row of rows) {
     if (!row.structural_fingerprint || !row.snapshot_fingerprint) {
@@ -1260,13 +1305,50 @@ export const runPostgresReviewWorkflow = async (input: {
       continue;
     }
     const price = evidence.price;
-    const amount = sizing(row, exploration.maxOrderNotional);
+    const isLeaps = row.asset_class === "option" &&
+      String(row.candidate_strategy_family ?? "").trim().toLowerCase() ===
+        "leaps";
+    let leapsSizing: LeapsEntrySizingResult | null = null;
+    let amount: number | null;
+    if (isLeaps) {
+      const allocation = resolveLeapsEntryAllocation(
+        input.leapsEntryAllocationEnv ?? process.env
+      );
+      if (!allocation.ok) throw new Error(allocation.reason);
+      const multiplier = finite(row.contract_multiplier);
+      leapsSizing = sizeLeapsEntry({
+        executablePremium: price,
+        contractMultiplier: multiplier ?? Number.NaN,
+        maxEntryCapitalUsd: allocation.maxEntryCapitalUsd,
+        independentlyValidatedAvailableCapitalUsd:
+          independentlyValidatedAvailableCapital(row)
+      });
+      amount = leapsSizing.contractCostUsd;
+      if (leapsSizing.quantity === 0 || amount === null) {
+        capacityBlocked += 1;
+        capacityRows.push({
+          row,
+          reason: leapsSizing.reason ?? "POSTGRES_REVIEW_CAPACITY_UNAVAILABLE",
+          leapsSizing
+        });
+        continue;
+      }
+    } else {
+      amount = sizing(row, exploration.maxOrderNotional);
+    }
     if (amount === null) {
       capacityBlocked += 1;
-      capacityRows.push({ row, reason: "POSTGRES_REVIEW_CAPACITY_UNAVAILABLE" });
+      capacityRows.push({
+        row,
+        reason: "POSTGRES_REVIEW_CAPACITY_UNAVAILABLE"
+      });
       continue;
     }
-    if (row.asset_class === "option" && !Math.floor(amount / (price * 100))) {
+    if (
+      row.asset_class === "option" &&
+      !leapsSizing &&
+      !Math.floor(amount / (price * 100))
+    ) {
       capacityBlocked += 1;
       capacityRows.push({ row, reason: "POSTGRES_REVIEW_OPTION_CAPACITY_INSUFFICIENT" });
       continue;
@@ -1280,7 +1362,7 @@ export const runPostgresReviewWorkflow = async (input: {
       capacityRows.push({ row, reason: "POSTGRES_REVIEW_SHORT_CAPACITY_INSUFFICIENT" });
       continue;
     }
-    eligibleRows.push({ row, amount, evidence });
+    eligibleRows.push({ row, amount, evidence, leapsSizing });
   }
   for (const row of skippedRows) {
     await persistCandidateStage({
@@ -1302,13 +1384,14 @@ export const runPostgresReviewWorkflow = async (input: {
       now: now.toISOString()
     });
   }
-  for (const { row, reason } of capacityRows) {
+  for (const { row, reason, leapsSizing } of capacityRows) {
     await persistCandidateStage({
       query: input.query,
       fence: input.fence,
       candidateId: row.candidate_id,
       status: "blocked",
       reason,
+      leapsSizing,
       now: now.toISOString()
     });
   }
@@ -1329,12 +1412,16 @@ export const runPostgresReviewWorkflow = async (input: {
     return {
       status: "completed" as const, command: input.command, reviewsCreated: 0,
       pendingIntentsCreated: 0, skipped, capacityBlocked,
-      ...(capacityBlocked > 0 ? { code: "POSTGRES_REVIEW_CAPACITY_UNAVAILABLE" } : {}),
+      ...(capacityBlocked > 0 ? {
+        code: capacityRows.find((row) =>
+          row.reason === "LEAPS_CONTRACT_COST_EXCEEDS_ALLOCATION"
+        )?.reason ?? "POSTGRES_REVIEW_CAPACITY_UNAVAILABLE"
+      } : {}),
       confirmationCreated: false, paperOnly: true
     };
   }
   let created = 0;
-  for (const { row, amount, evidence } of eligibleRows) {
+  for (const { row, amount, evidence, leapsSizing } of eligibleRows) {
     const { marketTimestamp, price, underlyingSip } = evidence;
     const option = row.asset_class === "option";
     const shortEquity = !option && row.direction === "short";
@@ -1349,17 +1436,22 @@ export const runPostgresReviewWorkflow = async (input: {
             expirationDate: isoDateOnly(row.contract_expiration_date),
             optionType: String(row.contract_type) as "call" | "put"
           },
-          now.toISOString().slice(0, 10)
+          newYorkTradingDate(now)
         )
       : shortEquity
         ? "equity_short"
         : "equity_long";
     const quantity = option
-      ? Math.floor(amount / (price * 100))
+      ? leapsSizing?.quantity ?? Math.floor(amount / (price * 100))
       : shortEquity
         ? Math.floor(amount / price)
         : null;
-    const effectiveRisk = shortEquity ? price * (quantity ?? 0) : amount;
+    const optionContractCost = option
+      ? leapsSizing?.contractCostUsd ?? price * 100 * (quantity ?? 0)
+      : null;
+    const effectiveRisk = shortEquity
+      ? price * (quantity ?? 0)
+      : optionContractCost ?? amount;
     const orderSymbol = row.option_symbol ?? row.symbol;
     const clientOrderId = `pg-${canonicalJsonHash({ account: row.account_id, candidate: row.candidate_id, snapshot: row.account_snapshot_id }).slice(0, 32)}`;
     const marketEvidence = [{
@@ -1374,7 +1466,8 @@ export const runPostgresReviewWorkflow = async (input: {
       ...(option ? {
         underlyingPrice: underlyingSip?.referencePrice,
         underlyingSip,
-        maximumSpreadPct: exploration.maximumOptionSpreadPct
+        maximumSpreadPct: exploration.maximumOptionSpreadPct,
+        ...(leapsSizing ? { leapsSizing } : {})
       } : {})
     }];
     const entrySide = option ? "buy_to_open" : row.direction === "short" ? "sell" : "buy";
@@ -1401,7 +1494,11 @@ export const runPostgresReviewWorkflow = async (input: {
       maxSymbolNotional: row.max_symbol_notional,
       maxDeploymentAmount: row.max_deployment_amount,
       cashReserveAmount: row.cash_reserve_amount,
-      cashReserveRatio: row.cash_reserve_ratio
+      cashReserveRatio: row.cash_reserve_ratio,
+      ...(leapsSizing ? {
+        leapsMaxEntryCapitalUsd: leapsSizing.configuredPerEntryAllocationUsd,
+        leapsMaxContracts: leapsSizing.maxContracts
+      } : {})
     };
     const payload = {
       candidateId: row.candidate_id, accountSnapshotId: row.account_snapshot_id,
@@ -1458,7 +1555,7 @@ export const runPostgresReviewWorkflow = async (input: {
         option ? row.symbol : null, row.asset_class, entrySide,
         option ? "limit" : "market", quantity,
         option || shortEquity ? null : amount,
-        option ? price : null, option ? price * 100 * (quantity ?? 0) : null,
+        option ? price : null, optionContractCost,
         effectiveRisk, intentFingerprint, canonicalJsonHash({ status: "created", at: now.toISOString() }),
         JSON.stringify(orderIntent), now.toISOString(), operation,
         strategyClassification, option ? String(row.contract_id) : null,
@@ -1474,6 +1571,7 @@ export const runPostgresReviewWorkflow = async (input: {
       candidateId: row.candidate_id,
       status: "sized",
       reason: "PAPER_ORDER_INTENT_CREATED",
+      leapsSizing,
       now: now.toISOString()
     });
     created += review.rowCount === 1 ? 1 : 0;

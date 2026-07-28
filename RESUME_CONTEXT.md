@@ -1,5 +1,30 @@
 # Resume Context: Alpaca Trading Research Infra
 
+## Autonomous OPRA and LEAPS allocation (2026-07-28)
+
+- The PostgreSQL research option path always requests paid Alpaca OPRA and
+  never substitutes indicative evidence. Complete fresh normalized
+  `alpaca_opra_stream` snapshots are reused; bounded authenticated OPRA REST
+  chain requests refresh absent, stale, or incomplete stream evidence.
+- `research_runs.summary.optionEvidenceByUnderlying` records requested and
+  returned feed, stream/REST source, contract and usable quote/Greek counts,
+  freshest quote time, and an explicit OPRA result. The 0DTE lane preserves
+  `ALPACA_OPRA_NOT_AUTHORIZED`, `ALPACA_OPRA_DATA_UNAVAILABLE`,
+  `ALPACA_OPRA_QUOTE_STALE`, or `ALPACA_OPRA_GREEKS_UNAVAILABLE` instead of
+  reporting a generic no-candidate result.
+- Same-day expiration uses the `America/New_York` trading date and remains DTE
+  zero.
+- New paper LEAPS entries use independent
+  `LEAPS_MAX_ENTRY_CAPITAL_USD=5000` sizing and a one-contract maximum.
+  Executable premium is multiplied by the observed standard multiplier 100
+  exactly once; over-ceiling contracts persist
+  `LEAPS_CONTRACT_COST_EXCEEDS_ALLOCATION`, and affordable ranked siblings
+  continue.
+- The equity `$1,000` exploration cap, account buying power, cash reserve,
+  strategy allocation, portfolio/symbol risk, quote quality, authorization,
+  idempotency, paper-only, PostgreSQL-only, lifecycle, exit, and reconciliation
+  boundaries are unchanged.
+
 ## Proposal-scoped entry review (2026-07-28)
 
 - Stale entry market evidence and invalid observed option contracts block only

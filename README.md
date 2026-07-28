@@ -142,6 +142,38 @@ The complete qualification inventory, outcome source trace, and unchanged
 safety boundary are documented in
 `docs/paper-candidate-qualification-inventory.md`.
 
+## Autonomous OPRA and LEAPS entry allocation (2026-07-28)
+
+The PostgreSQL autonomous option path always requests Alpaca `feed=opra`; an
+`indicative` environment override is not accepted as execution evidence.
+Research first reuses complete, fresh normalized
+`source=alpaca_opra_stream` rows already present in `option_snapshots`, then
+uses the bounded authenticated Alpaca OPRA chain request when stream evidence
+is absent, stale, or missing a required quote, implied-volatility, or Greek
+field. The normalized row preserves quote and trade timestamps, bid/ask and
+sizes, IV, delta, gamma, theta, vega, rho, requested/effective feed,
+validation basis, request identity, and receipt time. It never synthesizes
+Greeks or silently falls back to indicative data.
+
+Each research run records requested and returned feed, stream/REST source,
+contract and usable-evidence counts, freshest quote time, and the bounded OPRA
+result. Authorization, availability, staleness, and missing-Greek failures use
+`ALPACA_OPRA_NOT_AUTHORIZED`, `ALPACA_OPRA_DATA_UNAVAILABLE`,
+`ALPACA_OPRA_QUOTE_STALE`, and `ALPACA_OPRA_GREEKS_UNAVAILABLE`; the 0DTE lane
+keeps those reasons instead of collapsing them into a generic no-candidate
+result. Same-day SPY expiration is evaluated against the
+`America/New_York` trading date and remains DTE zero.
+
+New autonomous LEAPS entries use the independent paper-only
+`LEAPS_MAX_ENTRY_CAPITAL_USD=5000` ceiling and remain limited to one integer
+contract. Contract cost is executable premium times the observed standard
+multiplier of 100 exactly once. A cost above the ceiling is persisted as
+`LEAPS_CONTRACT_COST_EXCEEDS_ALLOCATION`, and deterministic sibling review
+continues. Buying power, cash reserve, strategy allocation, portfolio and
+symbol risk limits, contract validity, OPRA quote quality, duplicate checks,
+authorization, reconciliation, and exits still bind independently. The equity
+exploration ceiling remains `$1,000`.
+
 Migration `005_market_data_ingestion_observability.sql` adds cycle, workstream,
 symbol, endpoint, pagination, provider-time range, freshness counts, rejection,
 and persistence-result fields for that audit trail.
@@ -308,6 +340,7 @@ PAPER_EQUITY_NOTIONAL_PER_ORDER=1000
 PAPER_EQUITY_MAX_NOTIONAL_PER_ORDER=5000
 PAPER_EQUITY_MAX_PORTFOLIO_DEPLOY_PCT=50
 PAPER_EQUITY_MAX_POSITION_PCT=10
+LEAPS_MAX_ENTRY_CAPITAL_USD=5000
 PAPER_EQUITY_MIN_CASH_RESERVE_PCT=20
 PAPER_OPTION_MAX_PREMIUM_PER_CONTRACT=1500
 PAPER_OPTION_MAX_ORDER_NOTIONAL=1500

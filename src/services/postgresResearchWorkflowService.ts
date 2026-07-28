@@ -62,6 +62,28 @@ const RESEARCH_READINESS_DEFERRALS = new Set([
 const investmentLaneEnabled = (lane: string, optionsEnabled: boolean) =>
   lane === "equity" || optionsEnabled;
 
+const OPRA_BOUNDED_RESULTS = new Set([
+  "ALPACA_OPRA_NOT_AUTHORIZED",
+  "ALPACA_OPRA_DATA_UNAVAILABLE",
+  "ALPACA_OPRA_QUOTE_STALE",
+  "ALPACA_OPRA_GREEKS_UNAVAILABLE"
+]);
+
+const zeroDteOpraBoundedResult = (
+  summary: MarketResult["summary"]
+): string | null => {
+  const evidence = summary.optionEvidenceByUnderlying?.SPY;
+  const direct = evidence?.finalBoundedResult;
+  if (typeof direct === "string" && OPRA_BOUNDED_RESULTS.has(direct)) {
+    return direct;
+  }
+  const rejection = (summary.optionDataRejectionReasons ?? []).find((reason) => {
+    const [code, symbol] = reason.split(":");
+    return symbol === "SPY" && OPRA_BOUNDED_RESULTS.has(code ?? "");
+  });
+  return rejection?.split(":", 1)[0] ?? null;
+};
+
 const fenceSql = (start: number) => `EXISTS (
   SELECT 1 FROM scheduler_leases lease
   WHERE lease.job_name = $${start} AND lease.workstream = $${start + 1}
@@ -557,6 +579,7 @@ const persistCandidates = async (input: {
   maxCandidates: number;
   now: Date;
   explorationThresholds: PaperExplorationThresholds;
+  marketSummary: MarketResult["summary"];
   emitTelemetry?: (event: Record<string, unknown>) => void;
 }) => {
   const evaluated = input.targets
@@ -571,7 +594,10 @@ const persistCandidates = async (input: {
       const optionSymbol = typeof option?.optionSymbol === "string" ? option.optionSymbol : null;
       const expirationDate = typeof option?.expirationDate === "string" ? option.expirationDate : null;
       const optionDte = expirationDate
-        ? optionDaysToExpiration(expirationDate, input.now.toISOString())
+        ? optionDaysToExpiration(
+            expirationDate,
+            `${newYorkDate(input.now)}T00:00:00.000Z`
+          )
         : null;
       const leapsPolicy = postgresLeapsPolicy();
       const candidateScore = scoreTarget(target, input.now);
@@ -615,7 +641,10 @@ const persistCandidates = async (input: {
   const learningModelCapability = selectedCount > 0
     ? await resolvePostgresLearningModelCapability(input.query, input.now.toISOString())
     : null;
-  const persistDecisionRows = async (rows: typeof decisions) => {
+  const persistDecisionRows = async (
+    rows: typeof decisions,
+    emptyReasonCode?: string | null
+  ) => {
     for (const row of rows) {
       const {
         target, option, optionSymbol, optionDte, leapsPolicy, strategyFamily,
@@ -694,7 +723,11 @@ const persistCandidates = async (input: {
         : undefined,
       reason_codes: selected.length
         ? ["RANKED_SELECTED"]
-        : ["NO_ELIGIBLE_POSTGRES_CANDIDATES"]
+        : [emptyReasonCode ?? "NO_ELIGIBLE_POSTGRES_CANDIDATES"],
+      ...(emptyReasonCode && selected.length === 0 ? {
+        diagnostic_summary:
+          `Lane could not evaluate current OPRA evidence: ${emptyReasonCode}`
+      } : {})
     };
   };
   const investmentCycle = await runInvestmentOrchestrator<
@@ -706,9 +739,17 @@ const persistCandidates = async (input: {
     lanes: INVESTMENT_LANE_FAMILIES.map(([lane, family]) => ({
       lane,
       enabled: investmentLaneEnabled(lane, input.optionsEnabled),
-      execute: (sharedDecisions) => persistDecisionRows(
-        sharedDecisions.filter((row) => row.strategyFamily === family)
-      )
+      execute: (sharedDecisions) => {
+        const laneDecisions = sharedDecisions.filter(
+          (row) => row.strategyFamily === family
+        );
+        return persistDecisionRows(
+          laneDecisions,
+          lane === "options_0dte" && laneDecisions.every((row) => !row.selected)
+            ? zeroDteOpraBoundedResult(input.marketSummary)
+            : null
+        );
+      }
     }))
   });
   input.emitTelemetry?.({
@@ -842,6 +883,7 @@ export const runPostgresResearchWorkflow = async (input: {
         ...explorationThresholds,
         maxCandidates: input.maxCandidates
       },
+      marketSummary: market.summary,
       emitTelemetry: input.emitTelemetry
     });
     const completed = await input.query.query(

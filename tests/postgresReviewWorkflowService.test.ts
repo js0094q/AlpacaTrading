@@ -18,6 +18,14 @@ const fence = {
   runId: "run", fencingToken: "9"
 };
 
+const paperLeapsEnvironment = {
+  ALPACA_ENV: "paper",
+  TRADING_MODE: "paper",
+  ALPACA_LIVE_TRADE: "false",
+  LIVE_TRADING_ENABLED: "false",
+  LEAPS_MAX_ENTRY_CAPITAL_USD: "5000"
+};
+
 const candidate = {
   candidate_id: "candidate-1", symbol: "SPY", asset_class: "equity",
   option_symbol: null, preferred_expression: "shares", direction: "long",
@@ -44,6 +52,7 @@ const observedOptionContract = {
   contract_status: "active",
   contract_source: "alpaca",
   contract_observed_at: "2026-07-20T21:59:00.000Z",
+  contract_multiplier: "100",
   sip_underlying_symbol: "SPY",
   sip_market_price: "555",
   sip_market_timestamp: "2026-07-20T21:59:30.000Z",
@@ -230,6 +239,10 @@ test("a PostgreSQL Date option expiration propagates into an order intent", asyn
   });
   assert.match(sourceSql, /FROM stock_snapshots stock/);
   assert.match(sourceSql, /contract\.underlying_symbol AS contract_underlying_symbol/);
+  assert.match(
+    sourceSql,
+    /option_snapshot\.source IN \('alpaca', 'alpaca_opra_stream'\)/
+  );
 });
 
 test("entry review maps a selected equity short to a sell order intent", async () => {
@@ -808,6 +821,334 @@ test("option capacity insufficiency blocks only that candidate and preserves pre
     values[0] === "option-candidate" &&
     values[1] === "blocked" &&
     values[2] === "POSTGRES_REVIEW_OPTION_CAPACITY_INSUFFICIENT"
+  ), true);
+});
+
+test("entry review classifies same-day expiration against the New York trading date", async () => {
+  let orderIntent: Record<string, unknown> | undefined;
+  await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("FROM candidates candidate")) {
+          return {
+            rows: [{
+              ...candidate,
+              ...observedOptionContract,
+              candidate_id: "zero-dte-new-york-date",
+              candidate_strategy_family: "zero_dte_spy",
+              asset_class: "option",
+              option_symbol: "SPY260720C00560000",
+              contract_option_symbol: "SPY260720C00560000",
+              contract_expiration_date: "2026-07-20",
+              preferred_expression: "option",
+              market_price: "2",
+              market_timestamp: "2026-07-21T00:29:30.000Z",
+              sip_market_timestamp: "2026-07-21T00:29:30.000Z",
+              market_evidence: {
+                bid: 1.98,
+                ask: 2.02,
+                midpoint: 2,
+                spreadPct: 0.02,
+                volume: 5_000,
+                openInterest: 8_000,
+                underlyingPrice: 555,
+                requestedFeed: "opra",
+                effectiveFeed: "opra",
+                provider: "alpaca"
+              }
+            }],
+            rowCount: 1
+          };
+        }
+        if (statement.includes("INSERT INTO execution_reviews")) {
+          orderIntent = JSON.parse(
+            String(values?.[9])
+          ) as Record<string, unknown>;
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    now: new Date("2026-07-21T00:30:00.000Z")
+  });
+
+  assert.equal(orderIntent?.strategyClassification, "zero_dte_long_call");
+});
+
+test("LEAPS uses the independent $5,000 ceiling and persists one integer contract", async () => {
+  let orderIntent: Record<string, unknown> | undefined;
+  let marketEvidence: Array<Record<string, unknown>> = [];
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("FROM candidates candidate")) {
+          return {
+            rows: [{
+              ...candidate,
+              ...observedOptionContract,
+              candidate_id: "leaps-3000",
+              candidate_strategy_family: "leaps",
+              asset_class: "option",
+              option_symbol: "SPY260821C00560000",
+              preferred_expression: "option",
+              market_price: "30",
+              max_position_notional: "10000",
+              max_symbol_notional: "10000",
+              market_evidence: {
+                bid: 29.9,
+                ask: 30.1,
+                midpoint: 30,
+                spreadPct: 0.00667,
+                volume: 5_000,
+                openInterest: 8_000,
+                underlyingPrice: 555,
+                requestedFeed: "opra",
+                effectiveFeed: "opra",
+                provider: "alpaca"
+              }
+            }],
+            rowCount: 1
+          };
+        }
+        if (statement.includes("INSERT INTO execution_reviews")) {
+          orderIntent = JSON.parse(String(values?.[9])) as Record<string, unknown>;
+          marketEvidence = JSON.parse(
+            String(values?.[10])
+          ) as Array<Record<string, unknown>>;
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    leapsEntryAllocationEnv: paperLeapsEnvironment,
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.reviewsCreated, 1);
+  assert.equal(orderIntent?.quantity, 1);
+  assert.equal(Number.isInteger(Number(orderIntent?.quantity)), true);
+  assert.equal(marketEvidence[0]?.leapsSizing &&
+    (marketEvidence[0].leapsSizing as Record<string, unknown>).configuredPerEntryAllocationUsd,
+  5_000);
+  assert.equal(
+    (marketEvidence[0]?.leapsSizing as Record<string, unknown>)?.contractCostUsd,
+    3_000
+  );
+  assert.equal(
+    (marketEvidence[0]?.leapsSizing as Record<string, unknown>)?.contractMultiplier,
+    100
+  );
+});
+
+test("an exactly $5,000 LEAPS contract remains limited to one contract", async () => {
+  let orderIntent: Record<string, unknown> | undefined;
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("FROM candidates candidate")) {
+          return {
+            rows: [{
+              ...candidate,
+              ...observedOptionContract,
+              candidate_id: "leaps-5000",
+              candidate_strategy_family: "leaps",
+              asset_class: "option",
+              option_symbol: "SPY260821C00560000",
+              preferred_expression: "option",
+              market_price: "50",
+              buying_power: "100000",
+              cash: "100000",
+              equity: "100000",
+              allocation_amount: "100000",
+              max_position_notional: "100000",
+              max_symbol_notional: "100000",
+              max_deployment_amount: "100000",
+              cash_reserve_amount: "0",
+              market_evidence: {
+                bid: 49.9,
+                ask: 50.1,
+                midpoint: 50,
+                spreadPct: 0.004,
+                volume: 5_000,
+                openInterest: 8_000,
+                underlyingPrice: 555,
+                requestedFeed: "opra",
+                effectiveFeed: "opra",
+                provider: "alpaca"
+              }
+            }],
+            rowCount: 1
+          };
+        }
+        if (statement.includes("INSERT INTO execution_reviews")) {
+          orderIntent = JSON.parse(String(values?.[9])) as Record<string, unknown>;
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    leapsEntryAllocationEnv: paperLeapsEnvironment,
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.reviewsCreated, 1);
+  assert.equal(orderIntent?.quantity, 1);
+});
+
+test("buying power still rejects an otherwise allocation-affordable LEAPS contract", async () => {
+  let candidateUpdate: readonly unknown[] = [];
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("FROM candidates candidate")) {
+          return {
+            rows: [{
+              ...candidate,
+              ...observedOptionContract,
+              candidate_id: "leaps-buying-power-block",
+              candidate_strategy_family: "leaps",
+              asset_class: "option",
+              option_symbol: "SPY260821C00560000",
+              preferred_expression: "option",
+              market_price: "30",
+              buying_power: "2500",
+              cash: "100000",
+              equity: "100000",
+              allocation_amount: "100000",
+              max_position_notional: "100000",
+              max_symbol_notional: "100000",
+              max_deployment_amount: "100000",
+              cash_reserve_amount: "0",
+              market_evidence: {
+                bid: 29.9,
+                ask: 30.1,
+                midpoint: 30,
+                spreadPct: 0.00667,
+                volume: 5_000,
+                openInterest: 8_000,
+                underlyingPrice: 555,
+                requestedFeed: "opra",
+                effectiveFeed: "opra",
+                provider: "alpaca"
+              }
+            }],
+            rowCount: 1
+          };
+        }
+        if (statement.includes("UPDATE candidates")) {
+          candidateUpdate = values ?? [];
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    leapsEntryAllocationEnv: paperLeapsEnvironment,
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.reviewsCreated, 0);
+  assert.equal(result.capacityBlocked, 1);
+  assert.equal(candidateUpdate[1], "blocked");
+  assert.equal(
+    candidateUpdate[2],
+    "LEAPS_VALIDATED_AVAILABLE_CAPITAL_INSUFFICIENT"
+  );
+});
+
+test("an unaffordable higher-ranked LEAPS contract is explicit and does not suppress an affordable sibling", async () => {
+  const candidateUpdates: Array<readonly unknown[]> = [];
+  const orderIntents: Array<Record<string, unknown>> = [];
+  const optionRow = {
+    ...candidate,
+    ...observedOptionContract,
+    candidate_strategy_family: "leaps",
+    asset_class: "option" as const,
+    preferred_expression: "option",
+    buying_power: "100000",
+    cash: "100000",
+    equity: "100000",
+    allocation_amount: "100000",
+    max_position_notional: "100000",
+    max_symbol_notional: "100000",
+    max_deployment_amount: "100000",
+    cash_reserve_amount: "0",
+    market_evidence: {
+      bid: 29.9,
+      ask: 30.1,
+      midpoint: 30,
+      spreadPct: 0.00667,
+      volume: 5_000,
+      openInterest: 8_000,
+      underlyingPrice: 555,
+      requestedFeed: "opra",
+      effectiveFeed: "opra",
+      provider: "alpaca"
+    }
+  };
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("FROM candidates candidate")) {
+          return {
+            rows: [
+              {
+                ...optionRow,
+                candidate_id: "leaps-unaffordable",
+                option_symbol: "SPY260821C00600000",
+                contract_option_symbol: "SPY260821C00600000",
+                market_price: "50.01",
+                market_evidence: {
+                  ...optionRow.market_evidence,
+                  bid: 50,
+                  ask: 50.02,
+                  midpoint: 50.01
+                }
+              },
+              {
+                ...optionRow,
+                candidate_id: "leaps-affordable",
+                option_symbol: "SPY260821C00560000",
+                contract_option_symbol: "SPY260821C00560000",
+                market_price: "30"
+              }
+            ],
+            rowCount: 2
+          };
+        }
+        if (statement.includes("UPDATE candidates")) {
+          candidateUpdates.push(values ?? []);
+        }
+        if (statement.includes("INSERT INTO execution_reviews")) {
+          orderIntents.push(
+            JSON.parse(String(values?.[9])) as Record<string, unknown>
+          );
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    leapsEntryAllocationEnv: paperLeapsEnvironment,
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.reviewsCreated, 1);
+  assert.equal(result.capacityBlocked, 1);
+  assert.equal(orderIntents[0]?.symbol, "SPY260821C00560000");
+  assert.equal(orderIntents[0]?.quantity, 1);
+  assert.equal(candidateUpdates.some((values) =>
+    values[0] === "leaps-unaffordable" &&
+    values[1] === "blocked" &&
+    values[2] === "LEAPS_CONTRACT_COST_EXCEEDS_ALLOCATION"
   ), true);
 });
 
