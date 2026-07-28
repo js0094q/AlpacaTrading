@@ -134,6 +134,15 @@ const runWorker = (options: {
   failStateEvent?: string;
   failStateEventOnce?: string;
   invalidStateEvent?: string;
+  stateResponseEvent?: string;
+  stateResponseOnce?: boolean;
+  stateResponseScenario?:
+    | "ambiguous"
+    | "canonical"
+    | "missing"
+    | "telemetry"
+    | "wrong_cycle"
+    | "wrong_operation";
   stopAfterCycleStarts?: number;
   once?: boolean;
   successCommand?: string;
@@ -148,6 +157,7 @@ const runWorker = (options: {
   const activePath = join(directory, "active");
   const overlapPath = join(directory, "overlap");
   const stateFailurePath = join(directory, "state-failure");
+  const stateResponsePath = join(directory, "state-response");
   const cycleCountPath = join(directory, "cycle-count");
   const fakeNpm = join(directory, "npm");
   writeFileSync(
@@ -215,10 +225,6 @@ if (command === "worker:state") {
     }));
     process.exit(1);
   }
-  if (state.eventType === process.env.WORKER_INVALID_STATE_EVENT) {
-    process.stdout.write(JSON.stringify({ status: "unexpected" }));
-    process.exit(0);
-  }
   if (state.eventType === "cycle_started") {
     const prior = existsSync(process.env.WORKER_CYCLE_COUNT_PATH)
       ? Number(require("node:fs").readFileSync(process.env.WORKER_CYCLE_COUNT_PATH, "utf8"))
@@ -229,12 +235,67 @@ if (command === "worker:state") {
       process.kill(process.ppid, "SIGTERM");
     }
   }
-  process.stdout.write(JSON.stringify({
+  const responseScenarioConfigured =
+    (
+      state.eventType === process.env.WORKER_STATE_RESPONSE_EVENT ||
+      process.env.WORKER_STATE_RESPONSE_EVENT === "*"
+    ) &&
+    (
+      process.env.WORKER_STATE_RESPONSE_ONCE !== "true" ||
+      !existsSync(process.env.WORKER_STATE_RESPONSE_PATH)
+    );
+  if (responseScenarioConfigured && process.env.WORKER_STATE_RESPONSE_ONCE === "true") {
+    writeFileSync(process.env.WORKER_STATE_RESPONSE_PATH, "used");
+  }
+  const responseScenario =
+    state.eventType === process.env.WORKER_INVALID_STATE_EVENT
+      ? "invalid"
+      : responseScenarioConfigured
+        ? process.env.WORKER_STATE_RESPONSE_SCENARIO
+        : "canonical";
+  const operation = "persist_autonomous_worker_state:" + state.eventType;
+  const canonical = {
+    environment: "paper",
+    paperOnly: true,
+    liveTradingEnabled: false,
+    command: "worker:state",
+    operation,
+    eventType: state.eventType,
+    cycleId: state.cycleId,
     status: "persisted",
+    persisted: true,
+    eventId: "worker-state-test-event",
     ...(state.eventType === "cycle_started" && process.env.WORKER_RESUME_CYCLE_ID
       ? { resumedCycleId: process.env.WORKER_RESUME_CYCLE_ID }
       : {})
-  }, null, 2));
+  };
+  const emit = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+  const leaseAcquired = {
+    event: "postgres_scheduler_lease_acquired",
+    command: "worker:state",
+    cycleId: state.cycleId
+  };
+  const leaseReleased = {
+    event: "postgres_scheduler_lease_released",
+    command: "worker:state",
+    cycleId: state.cycleId
+  };
+  if (responseScenario === "telemetry") emit(leaseAcquired);
+  if (responseScenario === "missing") {
+    emit(leaseReleased);
+  } else if (responseScenario === "wrong_operation") {
+    emit({ ...canonical, operation: "persist_autonomous_worker_state:cycle_failed" });
+  } else if (responseScenario === "wrong_cycle") {
+    emit({ ...canonical, cycleId: "00000000-0000-4000-8000-000000000000" });
+  } else if (responseScenario === "invalid") {
+    emit({ ...canonical, status: "unexpected", persisted: false });
+  } else if (responseScenario === "ambiguous") {
+    emit(canonical);
+    emit({ ...canonical, eventId: "worker-state-test-event-conflict" });
+  } else {
+    emit(canonical);
+  }
+  if (responseScenario === "telemetry") emit(leaseReleased);
   process.exit(0);
 }
 if (existsSync(process.env.WORKER_ACTIVE_PATH)) {
@@ -300,12 +361,16 @@ process.stdout.write(JSON.stringify({ status: "success" }));
           WORKER_ACTIVE_PATH: activePath,
           WORKER_OVERLAP_PATH: overlapPath,
           WORKER_STATE_FAILURE_PATH: stateFailurePath,
+          WORKER_STATE_RESPONSE_PATH: stateResponsePath,
           WORKER_CYCLE_COUNT_PATH: cycleCountPath,
           WORKER_FAIL_COMMAND: options.failCommand ?? "",
           WORKER_FAIL_OUTPUT: options.failOutput ?? "",
           WORKER_FAIL_STATE_EVENT: options.failStateEvent ?? "",
           WORKER_FAIL_STATE_EVENT_ONCE: options.failStateEventOnce ?? "",
           WORKER_INVALID_STATE_EVENT: options.invalidStateEvent ?? "",
+          WORKER_STATE_RESPONSE_EVENT: options.stateResponseEvent ?? "",
+          WORKER_STATE_RESPONSE_ONCE: String(options.stateResponseOnce ?? false),
+          WORKER_STATE_RESPONSE_SCENARIO: options.stateResponseScenario ?? "canonical",
           WORKER_STOP_AFTER_CYCLE_STARTS: String(options.stopAfterCycleStarts ?? 0),
           WORKER_SUCCESS_COMMAND: options.successCommand ?? "",
           WORKER_SUCCESS_OUTPUT: options.successOutput ?? "",
@@ -394,7 +459,17 @@ if (command === "worker:state") {
     payload: JSON.parse(Buffer.from(value("payload"), "base64url").toString("utf8")),
     workstreamProcessGroupAlive
   }) + "\\n");
-  process.stdout.write(JSON.stringify({ status: "persisted" }));
+  process.stdout.write(JSON.stringify({
+    environment: "paper",
+    paperOnly: true,
+    liveTradingEnabled: false,
+    command: "worker:state",
+    operation: "persist_autonomous_worker_state:" + value("eventType"),
+    eventType: value("eventType"),
+    cycleId: value("cycleId"),
+    status: "persisted",
+    persisted: true
+  }));
   process.exit(0);
 }
 const descendantSource = process.env.WORKER_DESCENDANT_IGNORES_SIGTERM === "true"
@@ -553,6 +628,96 @@ test("approved worker validates the production contract and persists a complete 
   assert.match(result.stdout, /"event":"cycle_completed"/);
   assert.match(result.stdout, /"event":"worker_stopped"/);
   assert.doesNotMatch(result.stdout + result.stderr, /worker-test-secret/);
+});
+
+test("cycle-start persistence selects the exact canonical response around scheduler telemetry", () => {
+  const { result, calls, states } = runWorker({
+    stateResponseEvent: "*",
+    stateResponseScenario: "telemetry"
+  });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(
+    calls.find((call) => call.command !== "worker:state")?.command,
+    "zero-dte:reconcile"
+  );
+  assert.equal(states.some((state) => state.eventType === "cycle_completed"), true);
+  assert.doesNotMatch(
+    result.stdout + result.stderr,
+    /AUTONOMOUS_(?:CYCLE_START|WORKER_STATE)_RESPONSE_(?:MISSING|INVALID|AMBIGUOUS)/
+  );
+});
+
+test("cycle-start persistence rejects missing, mismatched, invalid, and ambiguous canonical responses", () => {
+  for (const testCase of [
+    {
+      name: "wrong operation discriminator",
+      scenario: "wrong_operation",
+      expectedCode: "AUTONOMOUS_CYCLE_START_RESPONSE_MISSING"
+    },
+    {
+      name: "wrong cycle identity",
+      scenario: "wrong_cycle",
+      expectedCode: "AUTONOMOUS_CYCLE_START_RESPONSE_MISSING"
+    },
+    {
+      name: "no canonical result",
+      scenario: "missing",
+      expectedCode: "AUTONOMOUS_CYCLE_START_RESPONSE_MISSING"
+    },
+    {
+      name: "invalid canonical result",
+      scenario: "canonical",
+      invalidStateEvent: "cycle_started",
+      expectedCode: "AUTONOMOUS_CYCLE_START_RESPONSE_INVALID"
+    },
+    {
+      name: "conflicting canonical results",
+      scenario: "ambiguous",
+      expectedCode: "AUTONOMOUS_CYCLE_START_RESPONSE_AMBIGUOUS"
+    }
+  ] as const) {
+    const { result, calls } = runWorker({
+      stateResponseEvent: "cycle_started",
+      stateResponseScenario: testCase.scenario,
+      ...("invalidStateEvent" in testCase
+        ? { invalidStateEvent: testCase.invalidStateEvent }
+        : {})
+    });
+
+    assert.notEqual(result.status, 0, testCase.name);
+    assert.equal(
+      calls.some((call) => call.command !== "worker:state"),
+      false,
+      testCase.name
+    );
+    assert.match(result.stdout, new RegExp(testCase.expectedCode), testCase.name);
+  }
+});
+
+test("a cycle-start response-selection failure remains cycle-scoped in one worker process", () => {
+  const { result, calls, states } = runWorker({
+    once: false,
+    stateResponseEvent: "cycle_started",
+    stateResponseOnce: true,
+    stateResponseScenario: "missing",
+    stopAfterCycleStarts: 2
+  });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(
+    states.filter((state) => state.eventType === "cycle_started").length,
+    2
+  );
+  assert.equal(new Set(calls.map((call) => call.workerPid)).size, 1);
+  assert.equal(
+    calls.some((call) => call.command !== "worker:state"),
+    false,
+    "the worker must not launch a workstream before the second cycle-start checkpoint returns"
+  );
+  assert.match(result.stdout, /AUTONOMOUS_CYCLE_START_RESPONSE_MISSING/);
+  assert.match(result.stdout, /"event":"cycle_incomplete_worker_continued"/);
+  assert.doesNotMatch(result.stdout + result.stderr, /"event":"worker_failed"/);
 });
 
 test("the 20 public workstreams enforce lifecycle phase order and publish dashboard-ready state", () => {
@@ -1240,7 +1405,17 @@ if (state.eventType === "workstream_started") {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
 }
 appendFileSync(process.env.WORKER_STATES_PATH, JSON.stringify(state) + "\\n");
-process.stdout.write(JSON.stringify({ status: "persisted" }));
+process.stdout.write(JSON.stringify({
+  environment: "paper",
+  paperOnly: true,
+  liveTradingEnabled: false,
+  command: "worker:state",
+  operation: "persist_autonomous_worker_state:" + state.eventType,
+  eventType: state.eventType,
+  cycleId: state.cycleId,
+  status: "persisted",
+  persisted: true
+}));
 `,
     { mode: 0o700 }
   );

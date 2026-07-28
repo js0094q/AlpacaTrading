@@ -88,6 +88,12 @@ test("worker-state persistence is fenced and returns structured failure evidence
   );
   assert.match(source, /error instanceof AutonomousWorkerPersistenceError/);
   assert.match(source, /persistence:\s*error\.evidence/);
+  assert.match(
+    source,
+    /operation:\s*`persist_autonomous_worker_state:\$\{workerEventType\}`/
+  );
+  assert.match(source, /eventType:\s*workerEventType/);
+  assert.match(source, /cycleId,\s*[\s\S]*?persisted:\s*result\.status === "persisted"/);
 });
 
 test("production cancellation supports a scheduler-owned autonomous policy selector", async () => {

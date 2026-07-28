@@ -426,7 +426,15 @@ const run = async (scheduledContext?: PostgresScheduledCommandOperationContext) 
       payload,
       occurredAt: String(args.occurredAt || new Date().toISOString())
     }, context.fence);
-    print({ ...paperEnvelope(), command, ...result });
+    print({
+      ...paperEnvelope(),
+      command,
+      operation: `persist_autonomous_worker_state:${workerEventType}`,
+      eventType: workerEventType,
+      cycleId,
+      ...result,
+      persisted: result.status === "persisted"
+    });
     return;
   }
 

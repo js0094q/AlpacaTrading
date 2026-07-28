@@ -485,8 +485,8 @@ const structuredReasonCode = (output) => {
   return matches.at(-1)?.[1] ?? null;
 };
 
-const latestStructuredOutput = (output, accept = () => true) => {
-  let latest = null;
+const structuredOutputs = (output, accept = () => true) => {
+  const matches = [];
   let cursor = 0;
   while (cursor < output.length) {
     const start = output.indexOf("{", cursor);
@@ -526,7 +526,7 @@ const latestStructuredOutput = (output, accept = () => true) => {
     try {
       const value = JSON.parse(output.slice(start, end + 1));
       if (value && typeof value === "object" && !Array.isArray(value)) {
-        if (accept(value)) latest = value;
+        if (accept(value)) matches.push(value);
         cursor = end + 1;
         continue;
       }
@@ -535,8 +535,11 @@ const latestStructuredOutput = (output, accept = () => true) => {
     }
     cursor = start + 1;
   }
-  return latest;
+  return matches;
 };
+
+const latestStructuredOutput = (output, accept = () => true) =>
+  structuredOutputs(output, accept).at(-1) ?? null;
 
 const recoveryEnvelope = (output) => {
   const envelope = latestStructuredOutput(
@@ -725,6 +728,7 @@ const persistState = async (cycleId, eventType, payload) => {
     eventType === "preflight_failed"
       ? "OBSERVABILITY_SUPPLEMENTAL"
       : "AUTHORITATIVE_RECOVERABLE";
+  const operationName = `persist_autonomous_worker_state:${eventType}`;
   const occurredAt = new Date().toISOString();
   const encodedPayload = Buffer.from(JSON.stringify(payload)).toString("base64url");
   const result = await runNpmCommand(STATE_COMMAND, [
@@ -746,7 +750,7 @@ const persistState = async (cycleId, eventType, payload) => {
       operationName:
         typeof source.operationName === "string"
           ? source.operationName
-          : `persist_autonomous_worker_state:${eventType}`,
+          : operationName,
       persistenceClassification:
         typeof source.persistenceClassification === "string"
           ? source.persistenceClassification
@@ -812,11 +816,24 @@ const persistState = async (cycleId, eventType, payload) => {
     error.persistence = evidence;
     throw error;
   }
-  if (!envelope || envelope.status !== "persisted") {
+
+  const responseCandidates = structuredOutputs(
+    result.output,
+    (value) =>
+      value.command === STATE_COMMAND &&
+      value.operation === operationName &&
+      value.eventType === eventType &&
+      value.cycleId === cycleId
+  );
+  const responseCode = (classification) =>
+    eventType === "cycle_started"
+      ? `AUTONOMOUS_CYCLE_START_RESPONSE_${classification}`
+      : `AUTONOMOUS_WORKER_STATE_RESPONSE_${classification}`;
+  const failResponse = (errorCode) => {
     statePersistenceFailureCount += 1;
-    const error = codedError("AUTONOMOUS_WORKER_STATE_RESPONSE_INVALID");
+    const error = codedError(errorCode);
     error.persistence = {
-      operationName: `persist_autonomous_worker_state:${eventType}`,
+      operationName,
       persistenceClassification,
       cycleId,
       workstreamName:
@@ -826,7 +843,7 @@ const persistState = async (cycleId, eventType, payload) => {
       lifecycleState: eventType,
       retryAttempt: 0,
       maximumAttempts: 1,
-      errorCode: "AUTONOMOUS_WORKER_STATE_RESPONSE_INVALID",
+      errorCode,
       postgresErrorCode: null,
       retryable: false,
       schedulerFenceStatus: "unknown",
@@ -847,14 +864,31 @@ const persistState = async (cycleId, eventType, payload) => {
       return { status: "skipped", persistence: error.persistence };
     }
     throw error;
+  };
+
+  if (responseCandidates.length === 0) {
+    return failResponse(responseCode("MISSING"));
   }
-  if (envelope.persistence?.finalDisposition === "PERSISTED_AFTER_RETRY") {
+  if (responseCandidates.length > 1) {
+    return failResponse(responseCode("AMBIGUOUS"));
+  }
+  const [canonicalResponse] = responseCandidates;
+  if (
+    canonicalResponse.status !== "persisted" ||
+    canonicalResponse.persisted !== true ||
+    canonicalResponse.environment !== "paper" ||
+    canonicalResponse.paperOnly !== true ||
+    canonicalResponse.liveTradingEnabled !== false
+  ) {
+    return failResponse(responseCode("INVALID"));
+  }
+  if (canonicalResponse.persistence?.finalDisposition === "PERSISTED_AFTER_RETRY") {
     emitEvent({
       event: "autonomous_worker_state_persistence_recovered",
-      ...envelope.persistence
+      ...canonicalResponse.persistence
     });
   }
-  return envelope;
+  return canonicalResponse;
 };
 
 const wait = (milliseconds) =>
