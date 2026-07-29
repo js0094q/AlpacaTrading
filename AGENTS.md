@@ -7,7 +7,19 @@ This repository is for preparing infrastructure for a future paper-first Alpaca 
 - Do not connect to Alpaca from this repository unless the user explicitly requests it.
 - Do not request, print, commit, or copy real Alpaca API keys.
 - Do not configure live trading.
-- Do not deploy autonomous trading logic.
+- Do not deploy autonomous trading logic unless the user explicitly authorizes deployment of a specific verified commit SHA to the existing paper-only environment.
+- An authorized deployment must preserve all of the following:
+  - Paper-trading environment only.
+  - Live trading disabled.
+  - PostgreSQL as the sole operational authority.
+  - SQLite operational authority disabled.
+  - Existing reviewed deployment process.
+  - No secret or credential changes unless separately authorized.
+  - No broker order submitted, cancelled, replaced, closed, or manufactured for deployment validation.
+  - No more than one intentional worker restart unless separately authorized.
+  - Exact local, remote, and deployed SHA verification.
+  - Clean tracked checkout before and after deployment.
+  - Runtime validation and documented rollback.
 - Do not expose application ports publicly except through an explicitly configured reverse proxy.
 - Preserve key-based SSH access when changing server hardening.
 - Treat `.env*`, `*.env`, `secrets/`, `.ssh/`, `.APILIVEKEY`, and `.APIPAPERKEY` as sensitive local material.
