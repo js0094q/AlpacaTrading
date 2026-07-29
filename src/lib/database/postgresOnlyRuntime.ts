@@ -18,6 +18,7 @@ const SAFE_PRODUCTION_CLI_COMMANDS = new Set([
   "paper:exit:execute",
   "paper:exit:review",
   "paper:learn",
+  "paper:outcomes",
   "paper:ops:review",
   "paper:options:discover",
   "paper:order:cancel",

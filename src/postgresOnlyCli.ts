@@ -71,6 +71,12 @@ import { runPostgresResearchWorkflow } from "./services/postgresResearchWorkflow
 import { importResearchSignals } from "./repositories/postgres/postgresResearchSignalRepository.js";
 import { readBoundedResearchImportJson } from "./services/researchImportInputService.js";
 import { runPostgresReviewWorkflow } from "./services/postgresReviewWorkflowService.js";
+import {
+  parseOutcomeLearningWindow,
+  readBoundedHistoricalOutcomeAggregates,
+  readBoundedOutcomeLearningRecords,
+  runPostgresOutcomeLearningRefresh
+} from "./services/postgresOutcomeLearningService.js";
 import { paperSubmitConfiguration } from "./services/paperSubmitSafetyConfig.js";
 import { submitPaperOrder } from "./services/alpacaClient.js";
 import { getTradingSafetyState } from "./services/tradingSafetyService.js";
@@ -126,7 +132,6 @@ const paperEnvelope = () => {
 };
 
 const AUTONOMOUS_INSPECTION_COMMANDS = new Set([
-  "paper:learn",
   "system:recover"
 ]);
 
@@ -555,6 +560,88 @@ const run = async (scheduledContext?: PostgresScheduledCommandOperationContext) 
         : {})
     });
     print({ ...paperEnvelope(), command, ...result });
+    return;
+  }
+
+  if (command === "paper:learn") {
+    const context = requireScheduledContext(scheduledContext);
+    const safety = getTradingSafetyState();
+    if (
+      !safety.paperOnly ||
+      safety.alpacaEnv !== "paper" ||
+      safety.liveTradingEnabled
+    ) {
+      throw new Error("OUTCOME_LEARNING_PAPER_ONLY_RUNTIME_REQUIRED");
+    }
+    const explicitRange = Boolean(args.start || args.end);
+    const window = parseOutcomeLearningWindow({
+      mode: explicitRange ? "backfill" : "scheduled",
+      start: args.start,
+      end: args.end,
+      maxRecords: args.maxRecords,
+      now: new Date()
+    });
+    const result = await runPostgresOutcomeLearningRefresh({
+      query: queryAdapter(context.pool),
+      fence: context.fence,
+      environment: "paper",
+      ...window
+    });
+    print({ ...paperEnvelope(), command, ...result });
+    return;
+  }
+
+  if (command === "paper:outcomes") {
+    const context = requireScheduledContext(scheduledContext);
+    const safety = getTradingSafetyState();
+    if (
+      !safety.paperOnly ||
+      safety.alpacaEnv !== "paper" ||
+      safety.liveTradingEnabled
+    ) {
+      throw new Error("OUTCOME_LEARNING_PAPER_ONLY_RUNTIME_REQUIRED");
+    }
+    const window = parseOutcomeLearningWindow({
+      mode: "backfill",
+      start: args.start,
+      end: args.end,
+      maxRecords: args.limit || "50",
+      now: new Date()
+    });
+    const lane = String(args.lane || "").trim() || undefined;
+    const candidateId = String(args.candidateId || "").trim() || undefined;
+    const limit = window.maxRecords > 100 ? 100 : window.maxRecords;
+    const query = queryAdapter(context.pool);
+    const [outcomes, aggregates] = await Promise.all([
+      readBoundedOutcomeLearningRecords({
+        query,
+        start: window.start,
+        end: window.end,
+        environment: "paper",
+        lane,
+        candidateId,
+        limit
+      }),
+      readBoundedHistoricalOutcomeAggregates({
+        query,
+        start: window.start,
+        end: window.end,
+        environment: "paper",
+        lane,
+        limit
+      })
+    ]);
+    print({
+      ...paperEnvelope(),
+      command,
+      bounds: {
+        start: window.start,
+        end: window.end,
+        limit
+      },
+      outcomes,
+      aggregates
+    });
     return;
   }
 

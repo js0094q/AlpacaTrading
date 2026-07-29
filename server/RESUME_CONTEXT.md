@@ -1,6 +1,35 @@
 # Server Resume Context: PostgreSQL-Only Runtime
 
-Date: 2026-07-24
+Date: 2026-07-29
+
+## Section 10 bounded outcome-learning continuation
+
+The next exact deployment includes migration 009 and the derived, paper-only
+PostgreSQL outcome learner. It adds no Alpaca mutation path and leaves Section
+9 arbitration and all review/intent/order-manager authority unchanged.
+Historical evidence is read-only and must remain disabled by default:
+`OUTCOME_LEARNING_EVIDENCE_ENABLED=false`.
+
+After installing the exact validated commit and applying migrations, run the
+bounded backfill once and repeat it to prove deterministic no-op replay:
+
+```bash
+npm run paper:learn -- --start=2026-07-28T00:00:00Z --end=2026-07-29T00:00:00Z --maxRecords=250
+npm run paper:outcomes -- --start=2026-07-28T00:00:00Z --end=2026-07-29T00:00:00Z --limit=50
+```
+
+Require migration/index verification, bounded query plans, unchanged source
+and execution row counts, explicit join-quality limitations, and stable
+worker/dashboard services. Confirm the per-parent lifecycle caps remain visible
+in query plans and any cap hit makes aggregate evidence unusable. The worker's
+learning no-action codes are
+`NO_BOUNDED_OUTCOME_SOURCES` and
+`OUTCOME_LEARNING_REPLAY_UNCHANGED`;
+`NO_RECONCILIABLE_POSTGRES_ORDERS` is no longer the production learning result.
+The scheduled default covers only the prior UTC day, is capped, and has an
+accepted 45-second cycle-duration allowance.
+Rollback restores the prior code commit without dropping migration 009 or
+deleting append-only evidence.
 
 The VPS must run the exact validated cutover commit with PostgreSQL as its sole
 runtime authority. Do not run any SQLite migration, backfill, reconciliation,
@@ -10,7 +39,7 @@ The repository worker uses paper exploration V3 and narrowly classifies
 `NO_ELIGIBLE_POSTGRES_CANDIDATES`, `NO_POSTGRES_EXIT_TRIGGER`, and
 `NO_READY_POSTGRES_ORDER_INTENTS`, the cancellation result
 `NO_CANCELLABLE_POSTGRES_ORDERS`, plus the learning result
-`NO_RECONCILIABLE_POSTGRES_ORDERS`, as successful `WORKSTREAM_NO_ACTION`
+`NO_BOUNDED_OUTCOME_SOURCES`, as successful `WORKSTREAM_NO_ACTION`
 outcomes. Require the checked-in unit's paper/live-off assertions, unchanged
 liquidity/spread/notional gates, and all PostgreSQL/reconciliation controls.
 The unit and protected environment must both set

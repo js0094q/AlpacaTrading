@@ -100,7 +100,7 @@ export const POSTGRES_SCHEDULER_COMMAND_REGISTRY = [
   },
   {
     job: POSTGRES_SCHEDULER_JOBS.learning,
-    aliases: ["paper:learn"]
+    aliases: ["paper:learn", "paper:outcomes"]
   },
   {
     job: POSTGRES_SCHEDULER_JOBS.autonomousWorkerState,

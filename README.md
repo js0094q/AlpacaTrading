@@ -1,5 +1,53 @@
 # Alpaca Trading Research Infrastructure
 
+## Bounded PostgreSQL outcome learning (2026-07-29)
+
+Section 10 adds derived, paper-only outcome evidence without changing order
+submission, candidate scoring, allocation, review, or execution authority.
+Migration 009 creates normalized `outcome_learning_refresh_runs`,
+`outcome_learning_records`, and `historical_outcome_aggregates` tables.
+Candidate, research, review, intent, order, broker-event, position, and market
+evidence remain immutable source records; the learner stores only references,
+explicit join quality, bounded measurements, and aggregate evidence.
+
+The scheduled `paper:learn` workstream evaluates the prior UTC day. An operator
+may request an explicit bounded backfill of at most 500 candidates and 31 days:
+
+```bash
+npm run paper:learn
+npm run paper:learn -- --start=2026-07-28T00:00:00Z --end=2026-07-29T00:00:00Z --maxRecords=250
+npm run paper:outcomes -- --start=2026-07-28T00:00:00Z --end=2026-07-29T00:00:00Z --limit=50
+```
+
+The same range and source fingerprint replay as
+`OUTCOME_LEARNING_REPLAY_UNCHANGED`, a successful worker no-op. An empty
+bounded range reports `NO_BOUNDED_OUTCOME_SOURCES`. Later source evidence
+creates a new deterministic refresh, while candidate outcome identity remains
+stable. Submitted, rejected, cancelled, partially filled, and fully filled
+states stay distinct. Missing, ambiguous, and unsupported joins are explicit;
+unknown return, slippage, fill timing, realized P&L, or excursion values remain
+`null`. Equity excursions use bounded daily stock bars. Option excursions use
+the exact contract's bounded option snapshots and never substitute underlying
+prices. Current paper-account state is not presented as audited live
+performance, and paper results do not imply live performance.
+
+Historical aggregates require a minimum sample, acceptable incomplete-join
+ratio, current schema, lane/environment match, and non-stale bounded window.
+Each batch also hard-caps related rows per parent: 8 arbitrations, 16 reviews,
+32 intents, 16 positions, 8 orders per intent, 64 broker events per order or
+intent-only lineage, 16 research references per candidate, and 32 direct market
+evidence references per review. A cap hit marks the candidate partial and the
+whole source page truncated, so its aggregates cannot become strategy
+evidence. Broker-event references are retained only for the selected
+authoritative entry and exit chains.
+Research may attach that compact read-only evidence only when
+`OUTCOME_LEARNING_EVIDENCE_ENABLED=true`; the default is `false`. Even when
+enabled, evidence cannot adjust scores, tune thresholds, resize proposals,
+create orders, or call a broker. A scheduled learning run may add up to 45
+seconds to the existing autonomous cycle before it is treated as a performance
+regression. `paper:outcomes` is read-only and always requires an explicit
+range.
+
 ## Portfolio resource arbitration (2026-07-29)
 
 PostgreSQL entry review now inserts one bounded portfolio resource arbitration
@@ -225,11 +273,12 @@ The parent worker does not persist `worker_stopped` until the detached
 workstream process group is gone. Successful PostgreSQL empty-work results
 `NO_ELIGIBLE_POSTGRES_CANDIDATES`, `NO_POSTGRES_EXIT_TRIGGER`, and
 `NO_READY_POSTGRES_ORDER_INTENTS`, the cancellation result
-`NO_CANCELLABLE_POSTGRES_ORDERS`, plus the learning result
-`NO_RECONCILIABLE_POSTGRES_ORDERS`, retain their exact domain `reasonCode`
-under `classification=no_action` and `code=WORKSTREAM_NO_ACTION`. Genuine
-operational inability to continue remains blocked. Lifecycle audit rows and
-the active-workstream uniqueness index remain intact.
+`NO_CANCELLABLE_POSTGRES_ORDERS`, plus the learning results
+`NO_BOUNDED_OUTCOME_SOURCES` and `OUTCOME_LEARNING_REPLAY_UNCHANGED`, retain
+their exact domain `reasonCode` under `classification=no_action` and
+`code=WORKSTREAM_NO_ACTION`. Genuine operational inability to continue remains
+blocked. Lifecycle audit rows and the active-workstream uniqueness index remain
+intact.
 
 ## Durable autonomous execution boundary (2026-07-24)
 
@@ -839,7 +888,6 @@ npm run paper:execute -- --dryRun --riskProfile=aggressive --optionsEnabled=true
 npm run paper:ops:review -- --format=json
 npm run paper:execute -- --confirmPaper --format=json
 npm run paper:exit:execute -- --confirmPaper --format=json
-npm run paper:learn -- --format=json
 ```
 
 ### Paper option learning ledger
@@ -855,8 +903,10 @@ It does not enable live trading or automatic live promotion.
 Use `npm run options:diagnose -- --underlyings=SPY,QQQ` for a read-only provider/cache check.
 It reports the Alpaca contract endpoints used, local `option_contracts` cache counts, SPY same-day contracts, configured LEAPS counts by underlying, sample contract symbols, quote availability for sample contracts, and the exact zero-contract reason when filters or provider responses return no contracts.
 
-Use `npm run paper:learn -- --format=json` to evaluate pending learning rows when local option mark data exists.
-The command also reports promotion-readiness analytics using live-like profit factor, trade count, observed days, drawdown, and spread gates.
+The command description in this historical SQLite development section is
+retired. Production `paper:learn` now runs the bounded PostgreSQL outcome
+learner documented at the top of this file; it does not evaluate legacy local
+SQLite learning rows or report the legacy promotion-readiness analytics.
 
 ## Paper Trading Controls and Ops
 

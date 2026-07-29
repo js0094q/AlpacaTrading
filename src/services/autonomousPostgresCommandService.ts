@@ -47,7 +47,6 @@ const INSPECTION_COMMANDS = new Set([
   "hedge:exit:review",
   "zero-dte:exit:review",
   "zero-dte:reconcile",
-  "paper:learn",
   "system:recover"
 ]);
 
@@ -599,8 +598,6 @@ export const runAutonomousPostgresCommand = async (input: {
     evidence.eligibleCandidateCount === 0
   ) {
     code = "NO_ELIGIBLE_POSTGRES_CANDIDATES";
-  } else if (input.command === "paper:learn" && evidence.reconciliableOrderCount === 0) {
-    code = "NO_RECONCILIABLE_POSTGRES_ORDERS";
   } else if (input.command === "zero-dte:reconcile" && evidence.reconciliableOrderCount === 0) {
     code = "NO_RECONCILIABLE_POSTGRES_ORDERS";
   }

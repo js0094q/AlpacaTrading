@@ -1,5 +1,43 @@
 # Alpaca Investing VPS Bootstrap
 
+## Section 10 bounded outcome-learning operations (2026-07-29)
+
+Migration 009 adds three derived PostgreSQL tables:
+`outcome_learning_refresh_runs`, `outcome_learning_records`, and
+`historical_outcome_aggregates`. The learner is paper-only, reads bounded
+immutable source evidence, and cannot submit or cancel orders. Historical
+evidence remains disabled unless the protected environment explicitly sets
+`OUTCOME_LEARNING_EVIDENCE_ENABLED=true`; the checked-in default is `false`.
+
+For the validated Section 10 deployment, preserve the protected runtime
+environment and paper/live-off gates, stop the autonomous worker once, install
+the exact validated commit, build, run the normal PostgreSQL migration command,
+and start the worker once. Do not expose or replace secrets. Verify migration
+009 and all expected indexes before running the bounded backfill:
+
+```bash
+npm run paper:learn -- --start=2026-07-28T00:00:00Z --end=2026-07-29T00:00:00Z --maxRecords=250
+npm run paper:outcomes -- --start=2026-07-28T00:00:00Z --end=2026-07-29T00:00:00Z --limit=50
+```
+
+Repeat the exact `paper:learn` command and require a replay no-op. Record source
+and derived row counts before and after, verify no order, intent, broker-event,
+or position mutation, and inspect the bounded source/reference query plans.
+The lifecycle plans must retain their per-parent `LATERAL` caps: 8
+arbitrations, 16 reviews, 32 intents, 16 positions, 8 orders per intent, and 64
+broker events per order or intent-only lineage. A cap hit must produce
+`source_truncated=true`, not a silent partial data set.
+The autonomous worker treats `NO_BOUNDED_OUTCOME_SOURCES` and
+`OUTCOME_LEARNING_REPLAY_UNCHANGED` as successful `WORKSTREAM_NO_ACTION`
+results; operational database, fence, schema, or safety failures remain
+failures. The scheduled default evaluates only the prior UTC day and must not
+increase the pre-Section 10 cycle duration by more than 45 seconds.
+
+Rollback is code-only: stop the worker once, restore the accepted prior commit,
+rebuild, and start it once. Migration 009 and its append-only derived evidence
+may remain in place; do not drop tables or delete source/learning rows during an
+operational rollback.
+
 ## Current PostgreSQL-only runtime boundary (2026-07-24)
 
 PostgreSQL is the sole production runtime authority. Do not run historical

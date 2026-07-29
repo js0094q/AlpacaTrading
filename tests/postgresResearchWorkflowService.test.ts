@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { paperExplorationThresholds } from "../src/services/paperExplorationConfig.js";
+import { historicalOutcomeEvidenceConfig } from "../src/services/historicalOutcomeEvidenceService.js";
 import { runPostgresResearchWorkflow } from "../src/services/postgresResearchWorkflowService.js";
 
 const paperEnv = {
@@ -38,6 +39,7 @@ test("research persists current PostgreSQL evidence and selected candidates befo
   const sql: string[] = [];
   const telemetry: Record<string, unknown>[] = [];
   let candidateValues: readonly unknown[] = [];
+  let historicalEvidenceLoads = 0;
   const cancellation = new AbortController();
   let observedSignal: AbortSignal | undefined;
   const result = await runPostgresResearchWorkflow({
@@ -83,6 +85,42 @@ test("research persists current PostgreSQL evidence and selected candidates befo
           stockEvidenceFreshnessStatus: "FRESH", marketSessionEligible: true
         } } }]
       }),
+      loadHistoricalOutcomeEvidence: async () => {
+        historicalEvidenceLoads += 1;
+        return {
+          state: "available",
+          reasonCode: "HISTORICAL_OUTCOME_EVIDENCE_LOADED",
+          config: historicalOutcomeEvidenceConfig({
+            OUTCOME_LEARNING_EVIDENCE_ENABLED: "true"
+          }),
+          rows: [{
+            id: "aggregate-spy",
+            environment: "paper",
+            lane: "equity",
+            dimension: "symbol",
+            grouping_key: "SPY",
+            date_range_start: "2026-07-01T00:00:00.000Z",
+            date_range_end: "2026-07-20T00:00:00.000Z",
+            source_truncated: false,
+            sample_count: "10",
+            filled_count: "8",
+            rejected_count: "1",
+            canceled_count: "1",
+            average_time_to_first_fill_ms: "1200",
+            average_slippage_bps: "3.5",
+            realized_return_average: "0.02",
+            win_rate: "0.6",
+            missing_join_count: "1",
+            ambiguous_join_count: "0",
+            unsupported_metric_count: "2",
+            usable_as_evidence: true,
+            source_watermark: "2026-07-20T00:00:00.000Z",
+            calculated_at: "2026-07-20T21:30:00.000Z",
+            schema_version: 1,
+            content_hash: "a".repeat(64)
+          }]
+        } as never;
+      },
       symbols: ["SPY"]
     }
   });
@@ -96,6 +134,7 @@ test("research persists current PostgreSQL evidence and selected candidates befo
   );
   assert.equal(observedSignal, cancellation.signal);
   assert.equal(result.candidatesSelected, 1);
+  assert.equal(historicalEvidenceLoads, 1);
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO research_evidence")), true);
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO candidates")), true);
   assert.equal(sql.some((statement) => /id, decision_id, research_run_id/.test(statement)), true);
@@ -103,6 +142,7 @@ test("research persists current PostgreSQL evidence and selected candidates befo
   const signalInputs = JSON.parse(String(candidateValues[25]));
   const {
     candidateScore: _candidateScore,
+    historicalOutcomeEvidence,
     ...signalInputsWithoutScore
   } = signalInputs;
   assert.deepEqual({
@@ -144,6 +184,32 @@ test("research persists current PostgreSQL evidence and selected candidates befo
   assert.equal(signalInputs.decisionGates.outcome, "passed");
   assert.deepEqual(signalInputs.decisionGates.reasons, ["RANKED_SELECTED"]);
   assert.equal(signalInputs.decisionGates.profile.scope, "paper_only");
+  assert.deepEqual(historicalOutcomeEvidence, {
+    state: "available",
+    reasonCode: "HISTORICAL_OUTCOME_EVIDENCE_AVAILABLE",
+    aggregateId: "aggregate-spy",
+    environment: "paper",
+    lane: "equity",
+    dimension: "symbol",
+    groupingKey: "SPY",
+    dateRangeStart: "2026-07-01T00:00:00.000Z",
+    dateRangeEnd: "2026-07-20T00:00:00.000Z",
+    sampleCount: 10,
+    filledCount: 8,
+    rejectedCount: 1,
+    canceledCount: 1,
+    averageTimeToFirstFillMs: 1200,
+    averageSlippageBps: 3.5,
+    realizedReturnAverage: 0.02,
+    winRate: 0.6,
+    missingJoinCount: 1,
+    ambiguousJoinCount: 0,
+    unsupportedMetricCount: 2,
+    sourceWatermark: "2026-07-20T00:00:00.000Z",
+    calculatedAt: "2026-07-20T21:30:00.000Z",
+    schemaVersion: 1,
+    contentHash: "a".repeat(64)
+  });
   assert.deepEqual(signalInputs.candidateScore.inputs, {
     confidence: 0.9,
     expectedReturn: 1.5,

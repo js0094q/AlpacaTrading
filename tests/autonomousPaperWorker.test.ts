@@ -1145,7 +1145,7 @@ test("legitimate PostgreSQL empty-work outcomes are no-action completions across
     "paper:exit:review": "NO_POSTGRES_EXIT_TRIGGER",
     "paper:execute:reviewed": "NO_READY_POSTGRES_ORDER_INTENTS",
     "paper:order:cancel": "NO_CANCELLABLE_POSTGRES_ORDERS",
-    "paper:learn": "NO_RECONCILIABLE_POSTGRES_ORDERS"
+    "paper:learn": "NO_BOUNDED_OUTCOME_SOURCES"
   } as const;
   const { result, calls, states } = runWorker({
     successOutputs: Object.fromEntries(
@@ -1171,6 +1171,29 @@ test("legitimate PostgreSQL empty-work outcomes are no-action completions across
   assert.equal(
     completions.some((state) => state.payload.code === "WORKSTREAM_BLOCKED"),
     false
+  );
+  assert.equal(states.some((state) => state.eventType === "cycle_completed"), true);
+});
+
+test("an unchanged bounded learning replay is a successful no-action completion", () => {
+  const { result, states } = runWorker({
+    successOutputs: {
+      "paper:learn": JSON.stringify({
+        status: "no_op",
+        code: "OUTCOME_LEARNING_REPLAY_UNCHANGED"
+      })
+    }
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const completion = states.find((state) =>
+    state.eventType === "workstream_completed" &&
+    state.payload.workstream === "paper:learn"
+  );
+  assert.equal(completion?.payload.classification, "no_action");
+  assert.equal(completion?.payload.code, "WORKSTREAM_NO_ACTION");
+  assert.equal(
+    completion?.payload.reasonCode,
+    "OUTCOME_LEARNING_REPLAY_UNCHANGED"
   );
   assert.equal(states.some((state) => state.eventType === "cycle_completed"), true);
 });

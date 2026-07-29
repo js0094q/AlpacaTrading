@@ -32,6 +32,13 @@ import {
   type ResearchDecisionLane,
   type ResearchSignalConfiguration
 } from "./researchSignalAdapterService.js";
+import {
+  attachHistoricalOutcomeEvidence,
+  historicalOutcomeEvidenceConfig,
+  loadHistoricalOutcomeEvidence,
+  selectHistoricalOutcomeEvidence,
+  type HistoricalOutcomeEvidenceIndex
+} from "./historicalOutcomeEvidenceService.js";
 
 export type PostgresResearchQuery = {
   telemetryEnabled?: boolean;
@@ -56,6 +63,7 @@ type ResearchDependencies = {
   refreshMarketData: typeof refreshPostgresMarketData;
   buildFeaturesAndTargets: typeof buildPostgresFeaturesAndTargets;
   loadResearchSignals: typeof loadResearchSignalsForSymbols;
+  loadHistoricalOutcomeEvidence: typeof loadHistoricalOutcomeEvidence;
   dataHub: Pick<typeof alpacaDataHub, "hydrateCycle">;
 };
 
@@ -64,6 +72,7 @@ const dependencies: ResearchDependencies = {
   refreshMarketData: refreshPostgresMarketData,
   buildFeaturesAndTargets: buildPostgresFeaturesAndTargets,
   loadResearchSignals: loadResearchSignalsForSymbols,
+  loadHistoricalOutcomeEvidence,
   dataHub: alpacaDataHub
 };
 const INVESTMENT_LANE_FAMILIES = [
@@ -656,6 +665,7 @@ const persistCandidates = async (input: {
   researchSignals: readonly NormalizedResearchSignal[];
   researchConfiguration: ResearchSignalConfiguration;
   researchUnavailableReasonCode: string | null;
+  historicalOutcomeEvidence: HistoricalOutcomeEvidenceIndex;
   marketSummary: MarketResult["summary"];
   cycleData: AlpacaDataCycle<MarketResult>;
   emitTelemetry?: (event: Record<string, unknown>) => void;
@@ -701,6 +711,15 @@ const persistCandidates = async (input: {
             unavailableReasonCode: input.researchUnavailableReasonCode
           })
         : nonApplicableResearchInfluence();
+      const historicalEvidence = researchLane
+        ? selectHistoricalOutcomeEvidence(input.historicalOutcomeEvidence, {
+            environment: "paper",
+            lane: researchLane,
+            symbol: target.symbol,
+            underlyingSymbol: target.symbol,
+            now: input.now
+          })
+        : null;
       const candidateScore = {
         ...baseCandidateScore,
         baseTotal: baseCandidateScore.total,
@@ -721,6 +740,7 @@ const persistCandidates = async (input: {
         score: candidateScore.total,
         candidateScore,
         researchInfluence,
+        historicalEvidence,
         reasons
       };
     })
@@ -756,10 +776,11 @@ const persistCandidates = async (input: {
     for (const row of rows) {
       const {
         target, option, optionSymbol, optionDte, leapsPolicy, strategyFamily,
-        score, candidateScore, researchInfluence, rank, selected, reasons
+        score, candidateScore, researchInfluence, historicalEvidence, rank,
+        selected, reasons
       } = row;
       const id = `candidate_${canonicalJsonHash({ run: input.researchRunId, source: target.sourceFingerprint })}`;
-      const signalInputs = {
+      const signalInputs = attachHistoricalOutcomeEvidence({
         targetSourceFingerprint: target.sourceFingerprint,
         marketEvidenceTimestamp: target.asOf,
         entryReference: target.entryReference,
@@ -789,7 +810,7 @@ const persistCandidates = async (input: {
         },
         learningAdjustmentStatus: "not_applicable_no_postgres_learning_model",
         learningModelCapability
-      };
+      }, historicalEvidence);
       const result = await input.query.query(
         `INSERT INTO candidates(
            id, decision_id, research_run_id, candidate_key, symbol, underlying_symbol,
@@ -1036,6 +1057,12 @@ export const runPostgresResearchWorkflow = async (input: {
         retryCount: 0
       });
     }
+    const historicalOutcomeEvidence = await deps.loadHistoricalOutcomeEvidence({
+      query: input.query,
+      now,
+      environment: "paper",
+      config: historicalOutcomeEvidenceConfig()
+    });
     const evidenceStored = await persistEvidence({
       query: input.query, fence: input.fence, researchRunId: runId,
       market, features: generated.features, targets: generated.targets, now: nowIso,
@@ -1053,6 +1080,7 @@ export const runPostgresResearchWorkflow = async (input: {
       researchSignals,
       researchConfiguration,
       researchUnavailableReasonCode,
+      historicalOutcomeEvidence,
       marketSummary: market.summary,
       cycleData: marketCycle,
       emitTelemetry: input.emitTelemetry

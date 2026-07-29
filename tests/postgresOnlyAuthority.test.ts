@@ -145,7 +145,7 @@ test("production CLI allows only broker reads, PostgreSQL authority, and audited
     "paper:options:discover", "paper:ops:review", "paper:exit:review",
     "paper:exit:execute", "paper:execute:reviewed", "hedge:review",
     "hedge:exit:review", "hedge:exit:execute", "zero-dte:engine",
-    "zero-dte:exit:review", "zero-dte:reconcile", "paper:learn",
+    "zero-dte:exit:review", "zero-dte:reconcile", "paper:learn", "paper:outcomes",
     "paper:reconcile:external-order", "paper:order:cancel",
     "system:recover", "worker:state"
   ]);
@@ -197,7 +197,7 @@ test("package scripts expose no SQLite migration, backfill, reconciliation, or m
     "paper:options:discover", "paper:ops:review", "paper:exit:review",
     "paper:exit:execute", "paper:execute:reviewed", "hedge:review",
     "hedge:exit:review", "hedge:exit:execute", "zero-dte:engine",
-    "zero-dte:exit:review", "zero-dte:reconcile", "paper:learn",
+    "zero-dte:exit:review", "zero-dte:reconcile", "paper:learn", "paper:outcomes",
     "system:recover", "worker:state"
   ]) {
     assert.equal(

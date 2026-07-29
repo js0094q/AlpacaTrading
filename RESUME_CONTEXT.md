@@ -1,5 +1,43 @@
 # Resume Context: Alpaca Trading Research Infra
 
+## Bounded PostgreSQL outcome learning (2026-07-29)
+
+- Section 10 is implemented as derived, paper-only PostgreSQL evidence. It does
+  not change the Section 9 arbitrator, score candidates, tune strategy
+  thresholds, resize proposals, submit orders, or call Alpaca.
+- Migration 009 adds `outcome_learning_refresh_runs`,
+  `outcome_learning_records`, and `historical_outcome_aggregates` with bounded
+  range, environment/lane, lineage, join-quality, and schema-version
+  constraints. Source candidate, research, review, intent, order,
+  broker-event, position, and market rows remain immutable.
+- Scheduled `paper:learn` evaluates the prior UTC day. Explicit backfills use
+  `npm run paper:learn -- --start=<ISO> --end=<ISO> --maxRecords=<n>`, capped at
+  500 records and 31 days. Exact replay is a deterministic
+  `OUTCOME_LEARNING_REPLAY_UNCHANGED` no-op; an empty range reports
+  `NO_BOUNDED_OUTCOME_SOURCES`.
+- Read-only inspection uses
+  `npm run paper:outcomes -- --start=<ISO> --end=<ISO> --limit=<n>`.
+  Submitted, rejected, cancelled, partially filled, and fully filled outcomes
+  remain distinct. Missing, ambiguous, and unsupported joins are persisted
+  explicitly; unknown numerical outcomes remain `null`.
+- Equity excursion uses bounded daily stock bars. Option excursion uses only
+  the exact option contract's bounded snapshots. Paper outcomes are explicitly
+  limited and must not be represented as audited or live performance.
+- Related rows have hard per-parent caps (8 arbitrations, 16 reviews, 32
+  intents, 16 positions, 8 orders, 64 broker events, 16 research references,
+  and 32 direct market references). Any overflow marks the affected record
+  partial and the page truncated/unusable as aggregate evidence. Persisted
+  broker-event IDs are scoped to the selected entry and exit chains.
+- Historical evidence is disabled by default with
+  `OUTCOME_LEARNING_EVIDENCE_ENABLED=false`. If explicitly enabled, it is
+  read-only and must pass minimum-sample, incomplete-join, staleness, schema,
+  environment, and lane checks. Research score calculation remains unchanged.
+- The accepted scheduled-cycle regression allowance for this bounded derived
+  step is 45 seconds relative to the pre-Section 10 cycle baseline.
+- The validated production backfill window is
+  `[2026-07-28T00:00:00Z, 2026-07-29T00:00:00Z)` with
+  `maxRecords=250`.
+
 ## Portfolio resource arbitration (2026-07-29)
 
 - Entry review now creates one deterministic portfolio arbitration pass after
@@ -201,7 +239,8 @@
   count remains `25`, and maximum order notional remains `$1,000`.
 - `NO_ELIGIBLE_POSTGRES_CANDIDATES`, `NO_POSTGRES_EXIT_TRIGGER`,
   `NO_READY_POSTGRES_ORDER_INTENTS`, `NO_CANCELLABLE_POSTGRES_ORDERS`, and
-  `NO_RECONCILIABLE_POSTGRES_ORDERS` now complete with
+  the Section 10 learning results `NO_BOUNDED_OUTCOME_SOURCES` and
+  `OUTCOME_LEARNING_REPLAY_UNCHANGED` now complete with
   `classification=no_action`, `code=WORKSTREAM_NO_ACTION`, exit 0, and their
   exact domain `reasonCode`. Genuine blocked/failure outcomes remain blocked.
 - A structurally valid terminal recovery envelope with all counters at zero
@@ -642,7 +681,9 @@
   - `paper:plan` and `paper:review` refresh empty or stale explicit discovery contract windows from Alpaca, then refresh quotes for ranked discovery alternatives before deciding whether payloads are executable.
   - `npm run options:diagnose -- --underlyings=SPY,QQQ` is the read-only diagnostic for local cache counts, Alpaca contract endpoint availability, SPY same-day contracts, LEAPS counts, sample symbols, quote availability, and zero-contract reasons.
   - Wide spreads are warnings unless `PAPER_OPTIONS_HARD_SPREAD_CAP_ENABLED=true` or the family-specific hard-spread flag is enabled.
-  - `npm run paper:learn -- --format=json` evaluates pending learning rows when local option marks exist and reports promotion-readiness analytics using live-like fill profit factor.
+  - This historical SQLite learning command is retired. Production
+    `paper:learn` is the bounded PostgreSQL outcome learner described at the
+    top of this file and does not evaluate local SQLite learning rows.
 - Control bridge health:
   - `GET /api/v1/health` without token returns a healthy 200.
   - `POST /api/v1/refresh` without or with a bad token returns `401`.

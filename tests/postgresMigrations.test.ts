@@ -100,10 +100,11 @@ test("discovers ordered, checksummed PostgreSQL migrations", async () => {
   }
 });
 
-test("repository includes the portfolio resource arbitration migration", async () => {
+test("repository includes the bounded outcome learning migration after arbitration", async () => {
   const migrations = await listPostgresMigrations(join(process.cwd(), "src/lib/database/migrations"));
-  assert.equal(migrations.at(-1)?.version, 8);
-  assert.equal(migrations.at(-1)?.name, "portfolio_resource_arbitration");
+  assert.equal(migrations.at(-1)?.version, 9);
+  assert.equal(migrations.at(-1)?.name, "bounded_outcome_learning");
+  assert.equal(migrations.at(-2)?.name, "portfolio_resource_arbitration");
 });
 
 test("applies a migration exactly once and reports the second run as idempotent", async () => {
