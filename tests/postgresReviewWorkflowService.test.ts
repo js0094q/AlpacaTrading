@@ -27,13 +27,17 @@ const paperLeapsEnvironment = {
 };
 
 const candidate = {
-  candidate_id: "candidate-1", symbol: "SPY", asset_class: "equity",
+  candidate_id: "candidate-1", research_run_id: "research-run-1",
+  candidate_rank: "1", candidate_score: "0.9",
+  symbol: "SPY", asset_class: "equity",
   option_symbol: null, preferred_expression: "shares", direction: "long",
   confidence: "0.9", candidate_as_of: "2026-07-20T20:00:00.000Z",
   account_id: "account-1", account_snapshot_id: "snapshot-1",
+  account_snapshot_as_of: "2026-07-20T21:59:45.000Z",
   snapshot_fingerprint: "portfolio-fingerprint",
   structural_fingerprint: "structural-fingerprint", buying_power: "10000",
-  cash: "8000", equity: "20000", strategy_key: "baseline",
+  options_buying_power: "10000", cash: "8000", equity: "20000",
+  strategy_key: "baseline",
   allocation_amount: "5000", allocation_ratio: null, reserved_amount: "0",
   deployed_amount: "0", max_position_notional: "2000",
   max_symbol_notional: "2000", max_deployment_amount: "10000",
@@ -131,6 +135,15 @@ test("entry review persists signed PostgreSQL review and unconfirmed pending int
   assert.equal(candidateUpdateValues[1], "sized");
   assert.equal(candidateUpdateValues[2], "PAPER_ORDER_INTENT_CREATED");
   assert.match(sourceSql, /LIMIT 25$/);
+  assert.match(
+    sourceSql,
+    /WHERE mapped_order\.order_intent_id = intent\.id\s*\)/
+  );
+  assert.match(sourceSql, /snapshot\.options_buying_power::text/);
+  assert.match(
+    sourceSql,
+    /WHEN broker_order\.asset_class = 'option'\s+THEN COALESCE\(\s*intent\.max_risk,\s*intent\.estimated_premium\s*\)/
+  );
 });
 
 test("a PostgreSQL Date option expiration propagates into an order intent", async () => {
@@ -254,7 +267,12 @@ test("entry review maps a selected equity short to a sell order intent", async (
       query: async (statement: string, values?: readonly unknown[]) => {
         if (statement.includes("FROM candidates candidate")) {
           return {
-            rows: [{ ...candidate, candidate_id: "candidate-short", direction: "short" }],
+            rows: [{
+              ...candidate,
+              candidate_id: "candidate-short",
+              direction: "short",
+              market_price: "333.3333"
+            }],
             rowCount: 1
           };
         }
@@ -272,10 +290,10 @@ test("entry review maps a selected equity short to a sell order intent", async (
 
   assert.equal(result.status, "completed");
   assert.equal(reviewOrderIntent?.side, "sell");
-  assert.equal(reviewOrderIntent?.quantity, 1);
+  assert.equal(reviewOrderIntent?.quantity, 3);
   assert.equal(reviewOrderIntent?.notional, null);
   assert.equal(intentValues[10], "sell");
-  assert.equal(intentValues[12], 1);
+  assert.equal(intentValues[12], 3);
   assert.equal(intentValues[13], null);
 });
 
@@ -357,6 +375,66 @@ test("option review sizing is conservatively scaled by premium Alpaca decision e
   assert.equal(persistedMarketEvidence[0]?.selectionScore, 0.6);
   assert.equal(persistedMarketEvidence[0]?.delta, 0.48);
   assert.equal(persistedMarketEvidence[0]?.openInterest, 8_000);
+});
+
+test("option review rejects a nonstandard observed contract multiplier", async () => {
+  const sql: string[] = [];
+  const candidateUpdates: Array<readonly unknown[]> = [];
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        sql.push(statement);
+        if (statement.includes("FROM candidates candidate")) {
+          return {
+            rows: [{
+              ...candidate,
+              ...observedOptionContract,
+              candidate_id: "candidate-option-multiplier",
+              asset_class: "option",
+              option_symbol: "SPY260821C00560000",
+              preferred_expression: "long_call",
+              market_price: "2",
+              contract_multiplier: "50",
+              market_evidence: {
+                bid: 1.98,
+                ask: 2.02,
+                midpoint: 2,
+                spreadPct: 0.02,
+                volume: 5_000,
+                openInterest: 8_000,
+                underlyingPrice: 555,
+                requestedFeed: "opra",
+                effectiveFeed: "opra",
+                provider: "alpaca"
+              }
+            }],
+            rowCount: 1
+          };
+        }
+        if (statement.includes("UPDATE candidates")) {
+          candidateUpdates.push(values ?? []);
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    explorationThresholds: PAPER_EXPLORATION_V2_THRESHOLDS,
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.reviewsCreated, 0);
+  assert.equal(
+    sql.some((statement) => statement.includes("INSERT INTO order_intents")),
+    false
+  );
+  assert.equal(candidateUpdates.some((values) =>
+    values[0] === "candidate-option-multiplier" &&
+    values[1] === "blocked" &&
+    values[2] ===
+      "POSTGRES_REVIEW_OPTION_CONTRACT_INVALID:SPY260821C00560000"
+  ), true);
 });
 
 test("entry review skips an existing candidate and account-snapshot review identity", async () => {
@@ -718,7 +796,7 @@ test("entry review skips held/open-order candidates and reviews the remaining ca
   assert.equal(candidateUpdates.some((values) =>
     values[0] === "held-candidate" &&
     values[1] === "skipped" &&
-    values[2] === "POSTGRES_REVIEW_POSITION_OR_ORDER_EXISTS"
+    values[2] === "ARBITRATION_SKIPPED_SYMBOL_EXPOSURE"
   ), true);
 });
 
@@ -1685,6 +1763,451 @@ for (const field of ["buying_power", "cash", "equity"] as const) {
     assert.equal(sql.some((statement) => statement.includes("INSERT INTO order_intents")), false);
   });
 }
+
+test("entry review arbitrates one shared PostgreSQL context before creating approved intents", async () => {
+  const sql: string[] = [];
+  const intentNotionals: unknown[] = [];
+  const candidateUpdates: Array<readonly unknown[]> = [];
+  let persistedDecisions: Array<Record<string, unknown>> = [];
+  const rows = [
+    {
+      ...candidate,
+      candidate_id: "arbitration-high",
+      symbol: "AAPL",
+      candidate_score: "0.95",
+      candidate_rank: "1"
+    },
+    {
+      ...candidate,
+      candidate_id: "arbitration-resized",
+      symbol: "MSFT",
+      candidate_score: "0.90",
+      candidate_rank: "2"
+    },
+    {
+      ...candidate,
+      candidate_id: "arbitration-skipped",
+      symbol: "QQQ",
+      candidate_score: "0.85",
+      candidate_rank: "3"
+    }
+  ].map((row) => ({
+    ...row,
+    research_run_id: "research-cycle-9",
+    account_snapshot_as_of: "2026-07-20T21:59:45.000Z",
+    buying_power: "1500",
+    cash: "1500",
+    equity: "1500",
+    allocation_amount: "1500",
+    reserved_amount: "0",
+    deployed_amount: "0",
+    max_position_notional: "1000",
+    max_symbol_notional: "10000",
+    max_deployment_amount: "1500",
+    cash_reserve_amount: "0",
+    current_positions: [],
+    current_open_orders: [],
+    pending_commitments: []
+  }));
+
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        sql.push(statement);
+        if (statement.includes("FROM candidates candidate")) {
+          return { rows, rowCount: rows.length };
+        }
+        if (statement.includes("INSERT INTO portfolio_arbitration_decisions")) {
+          persistedDecisions = JSON.parse(
+            String(values?.[0])
+          ) as Array<Record<string, unknown>>;
+          return {
+            rows: [{
+              fence_held: true,
+              inserted_count: "3",
+              matched_count: "3"
+            }],
+            rowCount: 1
+          };
+        }
+        if (statement.includes("INSERT INTO order_intents")) {
+          intentNotionals.push(values?.[13]);
+        }
+        if (statement.includes("UPDATE candidates")) {
+          candidateUpdates.push(values ?? []);
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    explorationThresholds: PAPER_EXPLORATION_V2_THRESHOLDS,
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.status, "completed");
+  assert.equal(result.reviewsCreated, 2);
+  assert.equal(result.pendingIntentsCreated, 2);
+  assert.equal(result.arbitrationDecisions, 3);
+  assert.equal(result.arbitrationApproved, 1);
+  assert.equal(result.arbitrationResized, 1);
+  assert.equal(result.arbitrationSkipped, 1);
+  assert.deepEqual(intentNotionals, [1000, 500]);
+  assert.deepEqual(
+    persistedDecisions.map(({ proposal_id, action, approved_notional }) => ({
+      proposal_id,
+      action,
+      approved_notional
+    })),
+    [
+      {
+        proposal_id: "arbitration-high",
+        action: "approve",
+        approved_notional: 1000
+      },
+      {
+        proposal_id: "arbitration-resized",
+        action: "resize",
+        approved_notional: 500
+      },
+      {
+        proposal_id: "arbitration-skipped",
+        action: "skip",
+        approved_notional: null
+      }
+    ]
+  );
+  assert.equal(
+    candidateUpdates.some((values) =>
+      values[0] === "arbitration-skipped" &&
+      values[1] === "skipped" &&
+      values[2] === "ARBITRATION_SKIPPED_INSUFFICIENT_BUYING_POWER"
+    ),
+    true
+  );
+  assert.equal(
+    sql.filter((statement) =>
+      statement.includes("FROM candidates candidate")
+    ).length,
+    1
+  );
+  const sourceSql = sql.find((statement) =>
+    statement.includes("FROM candidates candidate")
+  ) ?? "";
+  assert.match(sourceSql, /shared_positions/);
+  assert.match(sourceSql, /shared_open_orders/);
+  assert.doesNotMatch(sourceSql, /\/v2\/orders|submit_order|alpacaClient/i);
+});
+
+test("entry arbitration counts an unreserved pending commitment once", async () => {
+  let intentNotional: unknown;
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("FROM candidates candidate")) {
+          return {
+            rows: [{
+              ...candidate,
+              candidate_id: "pending-capital-candidate",
+              symbol: "MSFT",
+              candidate_score: "0.9",
+              buying_power: "1500",
+              cash: "1500",
+              equity: "1500",
+              allocation_amount: "1500",
+              max_position_notional: "1000",
+              max_symbol_notional: "10000",
+              max_deployment_amount: "1500",
+              cash_reserve_amount: "0",
+              current_positions: [],
+              current_open_orders: [],
+              pending_commitments: [{
+                id: "pending-aapl",
+                symbol: "AAPL",
+                underlyingSymbol: "AAPL",
+                direction: "long",
+                resourceExposure: 750
+              }]
+            }],
+            rowCount: 1
+          };
+        }
+        if (statement.includes("INSERT INTO order_intents")) {
+          intentNotional = values?.[13];
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    explorationThresholds: PAPER_EXPLORATION_V2_THRESHOLDS,
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.reviewsCreated, 1);
+  assert.equal("arbitrationResized" in result, true);
+  if (!("arbitrationResized" in result)) assert.fail("arbitration result missing");
+  assert.equal(result.arbitrationResized, 1);
+  assert.equal(intentNotional, 750);
+});
+
+test("entry arbitration preserves the configured open-order exposure ceiling", async () => {
+  let intentNotional: unknown;
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("FROM candidates candidate")) {
+          return {
+            rows: [{
+              ...candidate,
+              candidate_id: "open-order-ceiling-candidate",
+              symbol: "MSFT",
+              candidate_score: "0.9",
+              buying_power: "5000",
+              cash: "5000",
+              equity: "5000",
+              allocation_amount: "5000",
+              max_position_notional: "1000",
+              max_symbol_notional: "10000",
+              max_deployment_amount: "5000",
+              max_open_order_exposure: "1000",
+              portfolio_open_order_exposure: "800",
+              cash_reserve_amount: "0",
+              current_positions: [],
+              current_open_orders: [],
+              pending_commitments: []
+            }],
+            rowCount: 1
+          };
+        }
+        if (statement.includes("INSERT INTO order_intents")) {
+          intentNotional = values?.[13];
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    explorationThresholds: PAPER_EXPLORATION_V2_THRESHOLDS,
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.reviewsCreated, 1);
+  assert.equal("arbitrationResized" in result, true);
+  if (!("arbitrationResized" in result)) assert.fail("arbitration result missing");
+  assert.equal(result.arbitrationResized, 1);
+  assert.equal(intentNotional, 200);
+});
+
+test("entry arbitration preserves the configured deployment-ratio ceiling", async () => {
+  let intentNotional: unknown;
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("FROM candidates candidate")) {
+          return {
+            rows: [{
+              ...candidate,
+              candidate_id: "deployment-ratio-candidate",
+              symbol: "MSFT",
+              candidate_score: "0.9",
+              buying_power: "10000",
+              options_buying_power: "10000",
+              cash: "10000",
+              equity: "2000",
+              allocation_amount: "10000",
+              max_position_notional: "1000",
+              max_symbol_notional: "10000",
+              max_deployment_amount: "10000",
+              max_deployment_ratio: "0.5",
+              portfolio_deployed_amount: "900",
+              cash_reserve_amount: "0",
+              current_positions: [],
+              current_open_orders: [],
+              pending_commitments: []
+            }],
+            rowCount: 1
+          };
+        }
+        if (statement.includes("INSERT INTO order_intents")) {
+          intentNotional = values?.[13];
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    explorationThresholds: PAPER_EXPLORATION_V2_THRESHOLDS,
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.reviewsCreated, 1);
+  assert.equal("arbitrationResized" in result, true);
+  if (!("arbitrationResized" in result)) assert.fail("arbitration result missing");
+  assert.equal(result.arbitrationResized, 1);
+  assert.equal(intentNotional, 100);
+});
+
+test("entry arbitration uses account-snapshot options buying power", async () => {
+  let intentValues: readonly unknown[] = [];
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("FROM candidates candidate")) {
+          return {
+            rows: [{
+              ...candidate,
+              ...observedOptionContract,
+              candidate_id: "options-buying-power-candidate",
+              asset_class: "option",
+              option_symbol: "SPY260821C00560000",
+              preferred_expression: "long_call",
+              market_price: "1",
+              buying_power: "5000",
+              options_buying_power: "250",
+              cash: "5000",
+              equity: "5000",
+              allocation_amount: "5000",
+              max_position_notional: "1000",
+              max_symbol_notional: "5000",
+              max_deployment_amount: "5000",
+              cash_reserve_amount: "0",
+              current_positions: [],
+              current_open_orders: [],
+              pending_commitments: [],
+              market_evidence: {
+                bid: 0.99,
+                ask: 1.01,
+                midpoint: 1,
+                spreadPct: 0.02,
+                volume: 5_000,
+                openInterest: 8_000,
+                underlyingPrice: 555,
+                requestedFeed: "opra",
+                effectiveFeed: "opra",
+                provider: "alpaca"
+              }
+            }],
+            rowCount: 1
+          };
+        }
+        if (statement.includes("INSERT INTO order_intents")) {
+          intentValues = values ?? [];
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    explorationThresholds: PAPER_EXPLORATION_V2_THRESHOLDS,
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.reviewsCreated, 1);
+  assert.equal("arbitrationResized" in result, true);
+  if (!("arbitrationResized" in result)) assert.fail("arbitration result missing");
+  assert.equal(result.arbitrationResized, 1);
+  assert.equal(intentValues[12], 2);
+  assert.equal(intentValues[15], 200);
+  assert.equal(intentValues[16], 200);
+});
+
+test("entry arbitration does not repurpose the symbol cap as an underlying-wide cap", async () => {
+  const intentSymbols: unknown[] = [];
+  const rows = [
+    {
+      ...candidate,
+      candidate_id: "symbol-cap-equity",
+      candidate_score: "0.95",
+      max_position_notional: "150",
+      max_symbol_notional: "150",
+      max_deployment_amount: "5000",
+      allocation_amount: "5000",
+      buying_power: "5000",
+      options_buying_power: "5000",
+      cash: "5000",
+      equity: "5000",
+      cash_reserve_amount: "0",
+      current_positions: [],
+      current_open_orders: [],
+      pending_commitments: []
+    },
+    {
+      ...candidate,
+      ...observedOptionContract,
+      candidate_id: "symbol-cap-option",
+      candidate_score: "0.90",
+      asset_class: "option",
+      option_symbol: "SPY260821C00560000",
+      preferred_expression: "long_call",
+      market_price: "1",
+      max_position_notional: "150",
+      max_symbol_notional: "150",
+      max_deployment_amount: "5000",
+      allocation_amount: "5000",
+      buying_power: "5000",
+      options_buying_power: "5000",
+      cash: "5000",
+      equity: "5000",
+      cash_reserve_amount: "0",
+      current_positions: [],
+      current_open_orders: [],
+      pending_commitments: [],
+      market_evidence: {
+        bid: 0.99,
+        ask: 1.01,
+        midpoint: 1,
+        spreadPct: 0.02,
+        volume: 5_000,
+        openInterest: 8_000,
+        underlyingPrice: 555,
+        requestedFeed: "opra",
+        effectiveFeed: "opra",
+        provider: "alpaca"
+      }
+    }
+  ];
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("FROM candidates candidate")) {
+          return { rows, rowCount: rows.length };
+        }
+        if (statement.includes("INSERT INTO portfolio_arbitration_decisions")) {
+          return {
+            rows: [{
+              fence_held: true,
+              inserted_count: "2",
+              matched_count: "2"
+            }],
+            rowCount: 1
+          };
+        }
+        if (statement.includes("INSERT INTO order_intents")) {
+          intentSymbols.push(values?.[7]);
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    explorationThresholds: PAPER_EXPLORATION_V2_THRESHOLDS,
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.reviewsCreated, 2);
+  assert.equal("arbitrationApproved" in result, true);
+  if (!("arbitrationApproved" in result)) assert.fail("arbitration result missing");
+  assert.equal(result.arbitrationApproved, 2);
+  assert.equal(result.arbitrationSkipped, 0);
+  assert.deepEqual(intentSymbols, ["SPY", "SPY260821C00560000"]);
+});
 
 test("exit review evaluates existing thresholds against PostgreSQL position and market evidence", async () => {
   const sql: string[] = [];

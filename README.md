@@ -1,5 +1,50 @@
 # Alpaca Trading Research Infrastructure
 
+## Portfolio resource arbitration (2026-07-29)
+
+PostgreSQL entry review now inserts one bounded portfolio resource arbitration
+pass after candidate-scoped eligibility, evidence, and existing sizing have
+produced proposals, and before signed reviews or order intents are persisted.
+The same source query hydrates the paper account snapshot, current positions,
+active non-terminal orders, unreserved pending intents, strategy allocation,
+portfolio exposure, and configured portfolio risk limits once for the batch.
+The arbitrator never queries Alpaca and never constructs or submits a broker
+order.
+
+Eligible proposals are ordered by the existing lane order (`equity`,
+`options_0dte`, `options_leaps`), then descending stored candidate score,
+descending confidence, normalized symbol, normalized contract identity, and
+proposal ID. Each approval or resize reserves its verified resource amount in
+the in-memory pass before the next proposal is evaluated. Long-equity notional
+may resize to cents because the existing path uses notional orders; equity
+shorts remain whole-share; options remain whole-contract using the observed
+premium and multiplier. The independent LEAPS per-position ceiling still
+applies before arbitration.
+
+Only genuine shared conflicts are resolved: general and options buying power,
+applicable cash, unreserved pending capital, configured amount/ratio
+deployment, gross, and open-order ceilings, configured concentration limits
+only under their exact authoritative semantics, exact positions or active
+orders, and duplicate or opposing same-instrument proposals. Terminal orders
+do not consume current context, and unrelated symbols or lanes continue. No
+delta, margin, sector, optimizer, or learned strategy-weight model is
+inferred.
+
+The current `max_symbol_notional` policy remains keyed to the exact order
+symbol, matching the downstream execution gate. It is not repurposed as an
+underlying-wide equity/options or cross-contract cap. The pure arbitrator can
+apply a distinct underlying limit only when authoritative context explicitly
+supplies one.
+
+Every eligible proposal receives an append-only
+`portfolio_arbitration_decisions` row with deterministic ranking evidence,
+original/approved size, approve/resize/skip reasons, competing lineage,
+snapshot timestamps, context fingerprint, cycle identity, and scheduler fence.
+Exact cycle replay is idempotent; mismatched or stale-fence persistence fails
+closed. Only approved or resized proposals continue through the unchanged
+signed review and `order_intents` path. Skipped proposals create no intent, and
+the existing order manager remains the sole broker-submission authority.
+
 ## Provider-neutral public-equity research adapter (2026-07-28)
 
 The runtime has no verified machine-callable Public Equity Investing provider

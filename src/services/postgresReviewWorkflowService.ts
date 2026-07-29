@@ -5,6 +5,7 @@ import type { SchedulerFence } from "../repositories/contracts/common.js";
 import { AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS } from "./autonomousFreshnessPolicy.js";
 import { paperLeapsExitConfig } from "./leapsExitPolicy.js";
 import {
+  LEAPS_CONTRACT_MULTIPLIER,
   resolveLeapsEntryAllocation,
   sizeLeapsEntry,
   type LeapsEntrySizingResult
@@ -24,6 +25,17 @@ import {
   type PaperExplorationThresholds
 } from "./paperExplorationConfig.js";
 import { optionsQuoteConfig } from "./optionQuoteNormalizer.js";
+import {
+  arbitratePortfolioResources,
+  type PortfolioArbitrationProposal,
+  type PortfolioOrderExposure,
+  type PortfolioPendingCommitment,
+  type PortfolioPositionExposure,
+  type PortfolioResourceContext
+} from "./portfolioResourceArbitrator.js";
+import {
+  persistPortfolioArbitrationDecisions
+} from "./postgresPortfolioArbitrationService.js";
 
 export type PostgresReviewQuery = {
   query: (sql: string, values?: readonly unknown[]) => Promise<{
@@ -34,6 +46,9 @@ export type PostgresReviewQuery = {
 
 type ReviewSourceRow = Record<string, unknown> & {
   candidate_id: string;
+  research_run_id: string;
+  candidate_rank: string | number;
+  candidate_score: string | number | null;
   symbol: string;
   asset_class: "equity" | "option";
   option_symbol: string | null;
@@ -43,9 +58,11 @@ type ReviewSourceRow = Record<string, unknown> & {
   candidate_as_of: Date | string;
   account_id: string;
   account_snapshot_id: string;
+  account_snapshot_as_of: Date | string;
   snapshot_fingerprint: string;
   structural_fingerprint: string;
   buying_power: string | number;
+  options_buying_power?: string | number | null;
   cash: string | number;
   equity: string | number;
   strategy_key: string;
@@ -57,8 +74,22 @@ type ReviewSourceRow = Record<string, unknown> & {
   max_position_notional: string | number | null;
   max_symbol_notional: string | number | null;
   max_deployment_amount: string | number | null;
+  max_deployment_ratio?: string | number | null;
   cash_reserve_amount: string | number | null;
   cash_reserve_ratio: string | number | null;
+  max_gross_exposure?: string | number | null;
+  max_open_order_exposure?: string | number | null;
+  portfolio_gross_exposure?: string | number | null;
+  portfolio_open_order_exposure?: string | number | null;
+  portfolio_deployed_amount?: string | number | null;
+  portfolio_exposure_fingerprint?: string | null;
+  risk_config_fingerprint?: string | null;
+  allocation_config_fingerprint?: string | null;
+  current_positions?: unknown;
+  current_open_orders?: unknown;
+  pending_commitments?: unknown;
+  position_snapshot_as_of?: Date | string | null;
+  open_order_snapshot_as_of?: Date | string | null;
   market_price: string | number;
   market_timestamp: Date | string;
   market_request_id: string | null;
@@ -287,6 +318,7 @@ const assertObservedOptionContract = (row: ReviewSourceRow) => {
     row.contract_tradable !== true ||
     String(row.contract_status ?? "").trim().toLowerCase() !== "active" ||
     String(row.contract_source ?? "").trim().toLowerCase() !== "alpaca" ||
+    finite(row.contract_multiplier) !== LEAPS_CONTRACT_MULTIPLIER ||
     !Number.isFinite(observedAt)
   ) {
     throw new Error(
@@ -421,22 +453,169 @@ const entrySourceSql = (command: string, maxCandidates: number) => `WITH latest_
 ), current_account AS (
   SELECT * FROM accounts WHERE environment = 'paper'
   ORDER BY updated_at DESC, id LIMIT 1
+), shared_positions AS (
+  SELECT
+    COALESCE(
+      jsonb_agg(
+        jsonb_build_object(
+          'id', position.id,
+          'symbol', COALESCE(position.option_symbol, position.symbol),
+          'underlyingSymbol', COALESCE(
+            position.underlying_symbol,
+            position.symbol
+          ),
+          'direction', position.side,
+          'resourceExposure', ABS(
+            COALESCE(position.market_value, position.cost_basis)
+          )
+        )
+        ORDER BY position.id
+      ) FILTER (WHERE position.id IS NOT NULL),
+      '[]'::jsonb
+    ) AS current_positions,
+    MAX(
+      COALESCE(position.last_reconciled_at, position.updated_at)
+    ) AS position_snapshot_as_of
+  FROM current_account account
+  LEFT JOIN positions position
+    ON position.account_id = account.id
+   AND position.status IN ('open', 'closing')
+), shared_open_orders AS (
+  SELECT
+    COALESCE(
+      jsonb_agg(
+        jsonb_build_object(
+          'id', broker_order.id,
+          'symbol', broker_order.symbol,
+          'underlyingSymbol', COALESCE(
+            intent.underlying_symbol,
+            broker_order.symbol
+          ),
+          'direction', CASE
+            WHEN broker_order.side IN ('buy', 'buy_to_open') THEN 'long'
+            ELSE 'short'
+          END,
+          'status', broker_order.status,
+          'resourceExposure', ABS(
+            CASE
+              WHEN broker_order.asset_class = 'option'
+                THEN COALESCE(
+                  intent.max_risk,
+                  intent.estimated_premium
+                )
+              ELSE COALESCE(
+                broker_order.notional,
+                broker_order.quantity * COALESCE(
+                  broker_order.limit_price,
+                  intent.limit_price
+                ),
+                intent.max_risk,
+                intent.estimated_premium
+              )
+            END
+          )
+        )
+        ORDER BY broker_order.id
+      ) FILTER (WHERE broker_order.id IS NOT NULL),
+      '[]'::jsonb
+    ) AS current_open_orders,
+    MAX(
+      COALESCE(
+        broker_order.last_broker_update_at,
+        broker_order.updated_at
+      )
+    ) AS open_order_snapshot_as_of
+  FROM current_account account
+  LEFT JOIN orders broker_order
+    ON broker_order.account_id = account.id
+   AND lower(btrim(broker_order.status)) NOT IN (
+     'canceled', 'cancelled', 'expired', 'filled', 'rejected', 'replaced'
+   )
+  LEFT JOIN order_intents intent
+    ON intent.id = broker_order.order_intent_id
+), shared_pending_commitments AS (
+  SELECT COALESCE(
+    jsonb_agg(
+      jsonb_build_object(
+        'id', intent.id,
+        'symbol', intent.symbol,
+        'underlyingSymbol', COALESCE(
+          intent.underlying_symbol,
+          intent.symbol
+        ),
+        'direction', CASE
+          WHEN intent.side IN ('buy', 'buy_to_open') THEN 'long'
+          ELSE 'short'
+        END,
+        'resourceExposure', ABS(
+          COALESCE(
+            intent.max_risk,
+            intent.notional,
+            intent.estimated_premium
+          )
+        )
+      )
+      ORDER BY intent.id
+    ) FILTER (WHERE intent.id IS NOT NULL),
+    '[]'::jsonb
+  ) AS pending_commitments
+  FROM current_account account
+  LEFT JOIN order_intents intent
+    ON intent.account_id = account.id
+   AND intent.reservation_id IS NULL
+   AND intent.status IN (
+     'created', 'ready_for_submission', 'submission_pending',
+     'submitted', 'ambiguous'
+   )
+   AND NOT EXISTS (
+     SELECT 1
+     FROM orders mapped_order
+     WHERE mapped_order.order_intent_id = intent.id
+   )
 )
-SELECT candidate.id AS candidate_id, candidate.symbol, candidate.asset_class,
+SELECT candidate.id AS candidate_id,
+       candidate.research_run_id,
+       candidate.rank AS candidate_rank,
+       candidate.score::text AS candidate_score,
+       candidate.symbol, candidate.asset_class,
        candidate.option_symbol, candidate.preferred_expression,
        candidate.direction, candidate.confidence,
        candidate.strategy_family AS candidate_strategy_family,
        candidate.as_of AS candidate_as_of,
        candidate.signal_inputs,
        account.id AS account_id, snapshot.id AS account_snapshot_id,
+       snapshot.observed_at AS account_snapshot_as_of,
        snapshot.snapshot_fingerprint,
        snapshot.evidence->>'structuralPortfolioFingerprint' AS structural_fingerprint,
-       snapshot.buying_power::text, snapshot.cash::text, snapshot.equity::text,
+       snapshot.buying_power::text, snapshot.options_buying_power::text,
+       snapshot.cash::text, snapshot.equity::text,
        allocation.strategy_key, allocation.allocation_amount::text,
        allocation.allocation_ratio::text, allocation.reserved_amount::text,
-       allocation.deployed_amount::text, limits.max_position_notional::text,
+       allocation.deployed_amount::text,
+       allocation.config_fingerprint AS allocation_config_fingerprint,
+       limits.config_fingerprint AS risk_config_fingerprint,
+       limits.max_position_notional::text,
        limits.max_symbol_notional::text, limits.max_deployment_amount::text,
+       limits.max_deployment_ratio::text,
        limits.cash_reserve_amount::text, limits.cash_reserve_ratio::text,
+       limits.max_gross_exposure::text,
+       limits.max_open_order_exposure::text,
+       portfolio.gross_exposure::text AS portfolio_gross_exposure,
+       portfolio.open_order_exposure::text
+         AS portfolio_open_order_exposure,
+       portfolio.deployed_amount::text AS portfolio_deployed_amount,
+       portfolio.exposure_fingerprint AS portfolio_exposure_fingerprint,
+       shared_positions.current_positions,
+       shared_open_orders.current_open_orders,
+       shared_pending_commitments.pending_commitments,
+       COALESCE(
+         shared_positions.position_snapshot_as_of,
+         snapshot.observed_at
+       ) AS position_snapshot_as_of,
+       COALESCE(
+         shared_open_orders.open_order_snapshot_as_of,
+         snapshot.observed_at
+       ) AS open_order_snapshot_as_of,
        market.market_price::text, market.market_timestamp,
        market.market_request_id, market.market_evidence,
        contract.option_symbol AS contract_option_symbol,
@@ -489,6 +668,9 @@ LEFT JOIN LATERAL (
   LIMIT 1
 ) sip ON candidate.option_symbol IS NOT NULL
 CROSS JOIN current_account account
+CROSS JOIN shared_positions
+CROSS JOIN shared_open_orders
+CROSS JOIN shared_pending_commitments
 JOIN LATERAL (
   SELECT * FROM account_snapshots WHERE account_id = account.id
   ORDER BY observed_at DESC, id DESC LIMIT 1
@@ -503,6 +685,17 @@ JOIN LATERAL (
     AND status = 'active' AND effective_to IS NULL
   ORDER BY CASE WHEN scope_type = 'portfolio' THEN 0 ELSE 1 END, updated_at DESC, id LIMIT 1
 ) limits ON true
+LEFT JOIN LATERAL (
+  SELECT exposure.gross_exposure, exposure.open_order_exposure,
+         exposure.deployed_amount,
+         exposure.exposure_fingerprint
+  FROM portfolio_exposure exposure
+  WHERE exposure.account_id = account.id
+    AND exposure.scope_type = 'portfolio'
+    AND exposure.scope_key = 'portfolio'
+  ORDER BY exposure.observed_at DESC, exposure.id DESC
+  LIMIT 1
+) portfolio ON true
 JOIN LATERAL (
   SELECT option_market.market_price, option_market.market_timestamp,
          option_market.market_request_id, option_market.market_evidence
@@ -1204,6 +1397,272 @@ const sizing = (
   return amount;
 };
 
+const jsonRecords = (value: unknown): Record<string, unknown>[] => {
+  if (Array.isArray(value)) {
+    return value.filter(
+      (entry): entry is Record<string, unknown> =>
+        Boolean(entry) && typeof entry === "object" && !Array.isArray(entry)
+    );
+  }
+  if (typeof value !== "string" || !value.trim()) return [];
+  try {
+    return jsonRecords(JSON.parse(value));
+  } catch {
+    return [];
+  }
+};
+
+const timestamp = (value: unknown): string | null => {
+  const parsed = value instanceof Date ? value : new Date(String(value ?? ""));
+  return Number.isFinite(parsed.getTime()) ? parsed.toISOString() : null;
+};
+
+const arbitrationLane = (
+  row: ReviewSourceRow
+): PortfolioArbitrationProposal["lane"] => {
+  const family = String(row.candidate_strategy_family ?? "")
+    .trim()
+    .toLowerCase();
+  return family === "zero_dte_spy"
+    ? "options_0dte"
+    : family === "leaps"
+      ? "options_leaps"
+      : "equity";
+};
+
+const arbitrationPriority = (
+  lane: PortfolioArbitrationProposal["lane"]
+) => lane === "equity" ? 0 : lane === "options_0dte" ? 1 : 2;
+
+const positionExposure = (
+  value: Record<string, unknown>
+): PortfolioPositionExposure | null => {
+  const id = String(value.id ?? "").trim();
+  const symbol = String(value.symbol ?? "").trim().toUpperCase();
+  const underlyingSymbol = String(
+    value.underlyingSymbol ?? value.underlying_symbol ?? ""
+  ).trim().toUpperCase();
+  const direction = String(value.direction ?? "").trim().toLowerCase();
+  const resourceExposure = finite(
+    value.resourceExposure ?? value.resource_exposure
+  );
+  return id && symbol && underlyingSymbol &&
+    (direction === "long" || direction === "short")
+    ? {
+        id,
+        symbol,
+        underlyingSymbol,
+        direction,
+        resourceExposure:
+          resourceExposure !== null && resourceExposure >= 0
+            ? resourceExposure
+            : null
+      }
+    : null;
+};
+
+const orderExposure = (
+  value: Record<string, unknown>
+): PortfolioOrderExposure | null => {
+  const base = positionExposure(value);
+  const status = String(value.status ?? "").trim();
+  return base && status ? { ...base, status } : null;
+};
+
+const portfolioResourceContext = (
+  rows: readonly ReviewSourceRow[]
+): PortfolioResourceContext => {
+  const shared = rows[0]!;
+  if (rows.some((row) =>
+    row.account_id !== shared.account_id ||
+    row.account_snapshot_id !== shared.account_snapshot_id ||
+    row.snapshot_fingerprint !== shared.snapshot_fingerprint
+  )) {
+    throw new Error("POSTGRES_PORTFOLIO_ARBITRATION_CONTEXT_MISMATCH");
+  }
+  const buyingPower = finite(shared.buying_power);
+  const cash = finite(shared.cash);
+  const equity = finite(shared.equity);
+  if (buyingPower === null || cash === null || equity === null) {
+    throw new Error("POSTGRES_REVIEW_ACCOUNT_SIZING_EVIDENCE_MISSING");
+  }
+  // Match the existing paper submit-state convention: use the dedicated
+  // options balance when the account snapshot supplies one, otherwise the
+  // verified general buying-power balance remains the conservative fallback.
+  const optionsBuyingPower =
+    finite(shared.options_buying_power) ?? buyingPower;
+  const cashReserve = shared.cash_reserve_amount !== null
+    ? finite(shared.cash_reserve_amount) ?? 0
+    : equity * (finite(shared.cash_reserve_ratio) ?? 0);
+  const allocationLimit = shared.allocation_amount !== null
+    ? finite(shared.allocation_amount)
+    : finite(shared.allocation_ratio) !== null
+      ? buyingPower * finite(shared.allocation_ratio)!
+      : buyingPower;
+  const reserved = finite(shared.reserved_amount) ?? 0;
+  const allocationDeployed = finite(shared.deployed_amount) ?? 0;
+  const portfolioDeployed = finite(shared.portfolio_deployed_amount) ??
+    allocationDeployed;
+  const grossExposure = finite(shared.portfolio_gross_exposure) ??
+    portfolioDeployed;
+  const deploymentAmountLimit = finite(shared.max_deployment_amount);
+  const deploymentRatio = finite(shared.max_deployment_ratio);
+  const grossLimit = finite(shared.max_gross_exposure);
+  const openOrderLimit = finite(shared.max_open_order_exposure);
+  const openOrderExposure = finite(
+    shared.portfolio_open_order_exposure
+  ) ?? 0;
+  const allocationRemaining = allocationLimit === null
+    ? 0
+    : Math.max(0, allocationLimit - reserved - allocationDeployed);
+  const deploymentAmountRemaining = deploymentAmountLimit === null
+    ? buyingPower
+    : Math.max(0, deploymentAmountLimit - portfolioDeployed);
+  const deploymentRatioRemaining = deploymentRatio === null
+    ? buyingPower
+    : Math.max(0, equity * deploymentRatio - portfolioDeployed);
+  const deploymentRemaining = Math.min(
+    deploymentAmountRemaining,
+    deploymentRatioRemaining
+  );
+  const grossRemaining = grossLimit === null
+    ? buyingPower
+    : Math.max(0, grossLimit - grossExposure);
+  const openOrderRemaining = openOrderLimit === null
+    ? buyingPower
+    : Math.max(0, openOrderLimit - openOrderExposure);
+  const accountSnapshotAsOf = timestamp(shared.account_snapshot_as_of);
+  if (!accountSnapshotAsOf) {
+    throw new Error("POSTGRES_PORTFOLIO_ARBITRATION_SNAPSHOT_TIME_MISSING");
+  }
+  const currentPositions = jsonRecords(shared.current_positions)
+    .map(positionExposure)
+    .filter((value): value is PortfolioPositionExposure => Boolean(value));
+  const currentOpenOrders = jsonRecords(shared.current_open_orders)
+    .map(orderExposure)
+    .filter((value): value is PortfolioOrderExposure => Boolean(value));
+  const pendingCommitments = jsonRecords(shared.pending_commitments)
+    .map(positionExposure)
+    .filter((value): value is PortfolioPendingCommitment => Boolean(value));
+  // An unknown unreserved commitment is unavailable shared buying-power
+  // context, not a proposal-local gap. Do not treat it as zero: the prompt
+  // permits the current pass to fail closed while unrelated cycles continue.
+  const pendingResource = pendingCommitments.every(
+    ({ resourceExposure }) => resourceExposure !== null
+  )
+    ? pendingCommitments.reduce(
+        (sum, commitment) => sum + commitment.resourceExposure!,
+        0
+      )
+    : null;
+
+  // Legacy count columns remain authoritative evidence for exact candidate
+  // conflicts even when an older query double does not supply aggregate JSON.
+  for (const row of rows) {
+    const orderSymbol = String(row.option_symbol ?? row.symbol)
+      .trim()
+      .toUpperCase();
+    const underlyingSymbol = String(row.symbol).trim().toUpperCase();
+    if (
+      Number(row.open_position_count) > 0 &&
+      !currentPositions.some(({ symbol }) => symbol === orderSymbol)
+    ) {
+      currentPositions.push({
+        id: `postgres-position:${row.candidate_id}`,
+        symbol: orderSymbol,
+        underlyingSymbol,
+        direction: row.direction,
+        resourceExposure: null
+      });
+    }
+    if (
+      Number(row.open_order_count) > 0 &&
+      !currentOpenOrders.some(({ symbol }) => symbol === orderSymbol)
+    ) {
+      currentOpenOrders.push({
+        id: `postgres-order:${row.candidate_id}`,
+        symbol: orderSymbol,
+        underlyingSymbol,
+        direction: row.direction,
+        status: "active_postgres_count",
+        resourceExposure: null
+      });
+    }
+  }
+  const compareExposureId = (
+    left: PortfolioPositionExposure,
+    right: PortfolioPositionExposure
+  ) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+  currentPositions.sort(compareExposureId);
+  currentOpenOrders.sort(compareExposureId);
+  pendingCommitments.sort(compareExposureId);
+  const buyingPowerAvailable = pendingResource === null
+    ? null
+    : Math.max(0, buyingPower - pendingResource);
+  const optionsBuyingPowerAvailable = pendingResource === null
+    ? null
+    : Math.max(0, optionsBuyingPower - pendingResource);
+  const cashAvailable = pendingResource === null
+    ? null
+    : Math.max(0, cash - cashReserve - pendingResource);
+  const portfolioCapacityAvailable = pendingResource === null
+    ? null
+    : Math.floor(Math.min(
+        buyingPowerAvailable!,
+        cashAvailable!,
+        Math.max(0, allocationRemaining - pendingResource),
+        Math.max(0, deploymentRemaining - pendingResource),
+        Math.max(0, grossRemaining - pendingResource),
+        Math.max(0, openOrderRemaining - pendingResource)
+      ) * 100) / 100;
+  // The operational max_symbol_notional rule is keyed by the exact order
+  // symbol downstream. It is not an underlying-wide limit, so do not invent a
+  // cross-contract equity/options cap from it. The pure arbitrator retains a
+  // distinct field for an authoritative underlying cap if one is added later.
+  const maxUnderlyingExposure = null;
+  const positionSnapshotAsOf =
+    timestamp(shared.position_snapshot_as_of) ?? accountSnapshotAsOf;
+  const openOrderSnapshotAsOf =
+    timestamp(shared.open_order_snapshot_as_of) ?? accountSnapshotAsOf;
+  const contextVersion = canonicalJsonHash({
+    accountSnapshotId: shared.account_snapshot_id,
+    accountFingerprint: shared.snapshot_fingerprint,
+    structuralFingerprint: shared.structural_fingerprint,
+    riskConfigFingerprint: shared.risk_config_fingerprint ?? null,
+    allocationConfigFingerprint:
+      shared.allocation_config_fingerprint ?? null,
+    exposureFingerprint:
+      shared.portfolio_exposure_fingerprint ?? null,
+    buyingPowerAvailable,
+    optionsBuyingPowerAvailable,
+    cashAvailable,
+    portfolioCapacityAvailable,
+    maxUnderlyingExposure,
+    currentPositions,
+    currentOpenOrders,
+    pendingCommitments,
+    accountSnapshotAsOf,
+    positionSnapshotAsOf,
+    openOrderSnapshotAsOf
+  });
+  return {
+    contextId: shared.account_snapshot_id,
+    contextVersion,
+    buyingPowerAvailable,
+    optionsBuyingPowerAvailable,
+    cashAvailable,
+    portfolioCapacityAvailable,
+    maxUnderlyingExposure,
+    existingPositions: currentPositions,
+    openOrders: currentOpenOrders,
+    pendingCommitments,
+    laneCapacityAvailable: {},
+    accountSnapshotAsOf,
+    positionSnapshotAsOf,
+    openOrderSnapshotAsOf
+  };
+};
+
 export const runPostgresReviewWorkflow = async (input: {
   command: string;
   query: PostgresReviewQuery;
@@ -1272,7 +1731,6 @@ export const runPostgresReviewWorkflow = async (input: {
     evidence: ReturnType<typeof validateEntryReviewEvidence>;
     leapsSizing: LeapsEntrySizingResult | null;
   }> = [];
-  const skippedRows: ReviewSourceRow[] = [];
   const blockedRows: Array<{ row: ReviewSourceRow; reason: string }> = [];
   const capacityRows: Array<{
     row: ReviewSourceRow;
@@ -1282,11 +1740,6 @@ export const runPostgresReviewWorkflow = async (input: {
   for (const row of rows) {
     if (!row.structural_fingerprint || !row.snapshot_fingerprint) {
       throw new Error("POSTGRES_REVIEW_ACCOUNT_FINGERPRINT_MISSING");
-    }
-    if (Number(row.open_position_count) > 0 || Number(row.open_order_count) > 0) {
-      skipped += 1;
-      skippedRows.push(row);
-      continue;
     }
     let evidence: ReturnType<typeof validateEntryReviewEvidence>;
     try {
@@ -1347,7 +1800,9 @@ export const runPostgresReviewWorkflow = async (input: {
     if (
       row.asset_class === "option" &&
       !leapsSizing &&
-      !Math.floor(amount / (price * 100))
+      !Math.floor(
+        amount / (price * (finite(row.contract_multiplier) ?? Number.NaN))
+      )
     ) {
       capacityBlocked += 1;
       capacityRows.push({ row, reason: "POSTGRES_REVIEW_OPTION_CAPACITY_INSUFFICIENT" });
@@ -1363,16 +1818,6 @@ export const runPostgresReviewWorkflow = async (input: {
       continue;
     }
     eligibleRows.push({ row, amount, evidence, leapsSizing });
-  }
-  for (const row of skippedRows) {
-    await persistCandidateStage({
-      query: input.query,
-      fence: input.fence,
-      candidateId: row.candidate_id,
-      status: "skipped",
-      reason: "POSTGRES_REVIEW_POSITION_OR_ORDER_EXISTS",
-      now: now.toISOString()
-    });
   }
   for (const { row, reason } of blockedRows) {
     await persistCandidateStage({
@@ -1420,8 +1865,157 @@ export const runPostgresReviewWorkflow = async (input: {
       confirmationCreated: false, paperOnly: true
     };
   }
+  const sharedContext = portfolioResourceContext(rows);
+  const firstRow = eligibleRows[0]!.row;
+  const cycleId = process.env.AUTONOMOUS_CYCLE_ID?.trim() ||
+    String(firstRow.research_run_id || input.fence.runId);
+  const arbitrationId = `portfolio_arbitration_${canonicalJsonHash({
+    cycleId,
+    accountId: firstRow.account_id,
+    accountSnapshotId: firstRow.account_snapshot_id,
+    contextVersion: sharedContext.contextVersion
+  })}`;
+  const proposals: PortfolioArbitrationProposal[] = eligibleRows.map(
+    ({ row, amount, evidence, leapsSizing }) => {
+      const option = row.asset_class === "option";
+      const shortEquity = !option && row.direction === "short";
+      const unitResource = option
+        ? evidence.price * (
+            finite(row.contract_multiplier) ?? Number.NaN
+          )
+        : shortEquity
+          ? evidence.price
+          : 0.01;
+      const requestedQuantity = option
+        ? leapsSizing?.quantity ?? Math.floor(amount / unitResource)
+        : shortEquity
+          ? Math.floor(amount / unitResource)
+          : null;
+      const resourceRequirement = option || shortEquity
+        ? unitResource * (requestedQuantity ?? 0)
+        : amount;
+      const lane = arbitrationLane(row);
+      return {
+        proposalId: row.candidate_id,
+        cycleId,
+        lane,
+        strategyPriority: arbitrationPriority(lane),
+        score: finite(row.candidate_score),
+        confidence: finite(row.confidence),
+        symbol: String(row.option_symbol ?? row.symbol).toUpperCase(),
+        underlyingSymbol: String(row.symbol).toUpperCase(),
+        contractId: option
+          ? String(row.contract_id ?? row.option_symbol ?? "")
+          : null,
+        direction: row.direction,
+        assetClass: row.asset_class,
+        requestedQuantity,
+        requestedNotional: resourceRequirement,
+        resourceRequirement,
+        unitResource,
+        resizeMode: option
+          ? "whole_contracts"
+          : shortEquity
+            ? "whole_shares"
+            : "notional"
+      };
+    }
+  );
+  const arbitration = arbitratePortfolioResources({
+    arbitrationId,
+    cycleId,
+    proposals,
+    context: sharedContext
+  });
+  await persistPortfolioArbitrationDecisions({
+    query: input.query,
+    fence: input.fence,
+    accountId: firstRow.account_id,
+    accountSnapshotId: firstRow.account_snapshot_id,
+    contextId: sharedContext.contextId,
+    decisions: arbitration.decisions,
+    createdAt: now.toISOString()
+  });
+  const decisionsByProposal = new Map(
+    arbitration.decisions.map((decision) => [decision.proposalId, decision])
+  );
+  const downstreamRows: Array<{
+    row: ReviewSourceRow;
+    amount: number;
+    evidence: ReturnType<typeof validateEntryReviewEvidence>;
+    leapsSizing: LeapsEntrySizingResult | null;
+    arbitrationDecision: (typeof arbitration.decisions)[number];
+  }> = [];
+  for (const eligible of eligibleRows) {
+    const decision = decisionsByProposal.get(eligible.row.candidate_id);
+    if (!decision) {
+      throw new Error("POSTGRES_PORTFOLIO_ARBITRATION_DECISION_MISSING");
+    }
+    if (decision.action === "skip") {
+      skipped += 1;
+      await persistCandidateStage({
+        query: input.query,
+        fence: input.fence,
+        candidateId: eligible.row.candidate_id,
+        status: "skipped",
+        reason: decision.reasonCodes[0] ??
+          "ARBITRATION_SKIPPED_NO_VALID_RESIZE",
+        now: now.toISOString()
+      });
+      continue;
+    }
+    const approvedAmount = decision.approvedResourceRequirement;
+    if (approvedAmount === null || approvedAmount <= 0) {
+      throw new Error("POSTGRES_PORTFOLIO_ARBITRATION_APPROVED_SIZE_MISSING");
+    }
+    const resizedLeaps = eligible.leapsSizing
+      ? {
+          ...eligible.leapsSizing,
+          quantity: decision.approvedQuantity ??
+            eligible.leapsSizing.quantity,
+          positionCostUsd: approvedAmount
+        }
+      : null;
+    downstreamRows.push({
+      ...eligible,
+      amount: approvedAmount,
+      leapsSizing: resizedLeaps,
+      arbitrationDecision: decision
+    });
+  }
+  const arbitrationApproved = arbitration.decisions.filter(
+    ({ action }) => action === "approve"
+  ).length;
+  const arbitrationResized = arbitration.decisions.filter(
+    ({ action }) => action === "resize"
+  ).length;
+  const arbitrationSkipped = arbitration.decisions.filter(
+    ({ action }) => action === "skip"
+  ).length;
+  if (!downstreamRows.length) {
+    return {
+      status: "completed" as const,
+      command: input.command,
+      reviewsCreated: 0,
+      pendingIntentsCreated: 0,
+      skipped,
+      capacityBlocked,
+      arbitrationDecisions: arbitration.decisions.length,
+      arbitrationApproved,
+      arbitrationResized,
+      arbitrationSkipped,
+      confirmationCreated: false,
+      paperOnly: true
+    };
+  }
   let created = 0;
-  for (const { row, amount, evidence, leapsSizing } of eligibleRows) {
+  for (const {
+    row,
+    amount,
+    evidence,
+    leapsSizing,
+    arbitrationDecision
+  } of downstreamRows) {
     const { marketTimestamp, price, underlyingSip } = evidence;
     const option = row.asset_class === "option";
     const shortEquity = !option && row.direction === "short";
@@ -1456,12 +2050,20 @@ export const runPostgresReviewWorkflow = async (input: {
         ? "equity_short"
         : "equity_long";
     const quantity = option
-      ? leapsSizing?.quantity ?? Math.floor(amount / (price * 100))
+      ? arbitrationDecision.approvedQuantity ??
+        leapsSizing?.quantity ?? Math.floor(
+          amount / (
+            price * (finite(row.contract_multiplier) ?? Number.NaN)
+          )
+        )
       : shortEquity
-        ? Math.floor(amount / price)
+        ? arbitrationDecision.approvedQuantity ?? Math.floor(amount / price)
         : null;
     const optionPositionCost = option
-      ? leapsSizing?.positionCostUsd ?? price * 100 * (quantity ?? 0)
+      ? leapsSizing?.positionCostUsd ??
+        price *
+          (finite(row.contract_multiplier) ?? Number.NaN) *
+          (quantity ?? 0)
       : null;
     const effectiveRisk = shortEquity
       ? price * (quantity ?? 0)
@@ -1513,9 +2115,17 @@ export const runPostgresReviewWorkflow = async (input: {
         leapsMaxEntryCapitalUsd: leapsSizing.configuredPerEntryAllocationUsd
       } : {})
     };
+    const portfolioArbitration = {
+      arbitrationId: arbitrationDecision.arbitrationId,
+      action: arbitrationDecision.action,
+      rank: arbitrationDecision.rank,
+      reasonCodes: arbitrationDecision.reasonCodes,
+      sharedContextVersion: arbitrationDecision.sharedContextVersion
+    };
     const payload = {
       candidateId: row.candidate_id, accountSnapshotId: row.account_snapshot_id,
       accountFingerprint: row.structural_fingerprint, orderIntent, marketEvidence,
+      portfolioArbitration,
       paperOnly: true
     };
     const payloadFingerprint = canonicalJsonHash(payload);
@@ -1541,7 +2151,8 @@ export const runPostgresReviewWorkflow = async (input: {
         JSON.stringify(marketEvidence), JSON.stringify({
           snapshotId: row.account_snapshot_id,
           portfolioFingerprint: row.snapshot_fingerprint,
-          structuralPortfolioFingerprint: row.structural_fingerprint
+          structuralPortfolioFingerprint: row.structural_fingerprint,
+          portfolioArbitration
         }), expiresAt, now.toISOString(), ...fenceValues(input.fence)]
     );
     if (review.rowCount !== 1 && review.rowCount !== 0) throw new Error("POSTGRES_REVIEW_PERSISTENCE_FAILED");
@@ -1596,6 +2207,10 @@ export const runPostgresReviewWorkflow = async (input: {
     pendingIntentsCreated: created,
     skipped,
     capacityBlocked,
+    arbitrationDecisions: arbitration.decisions.length,
+    arbitrationApproved,
+    arbitrationResized,
+    arbitrationSkipped,
     confirmationCreated: false,
     paperOnly: true
   };

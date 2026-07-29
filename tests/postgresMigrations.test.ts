@@ -100,10 +100,10 @@ test("discovers ordered, checksummed PostgreSQL migrations", async () => {
   }
 });
 
-test("repository includes the public equity research signals migration", async () => {
+test("repository includes the portfolio resource arbitration migration", async () => {
   const migrations = await listPostgresMigrations(join(process.cwd(), "src/lib/database/migrations"));
-  assert.equal(migrations.at(-1)?.version, 7);
-  assert.equal(migrations.at(-1)?.name, "public_equity_research_signals");
+  assert.equal(migrations.at(-1)?.version, 8);
+  assert.equal(migrations.at(-1)?.name, "portfolio_resource_arbitration");
 });
 
 test("applies a migration exactly once and reports the second run as idempotent", async () => {

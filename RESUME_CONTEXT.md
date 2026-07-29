@@ -1,5 +1,47 @@
 # Resume Context: Alpaca Trading Research Infra
 
+## Portfolio resource arbitration (2026-07-29)
+
+- Entry review now creates one deterministic portfolio arbitration pass after
+  candidate-scoped evidence and existing strategy sizing, but before signed
+  review or order-intent persistence. It is the narrow boundary between
+  collected eligible proposals and the unchanged downstream execution path.
+- The entry source query hydrates the current paper account snapshot,
+  positions, active non-terminal orders, unreserved pending intents, strategy
+  allocation, portfolio exposure, and active portfolio risk limits once.
+  PostgreSQL remains the sole authority; the arbitrator imports no Alpaca
+  client and creates no broker payload.
+- Ranking uses the existing explicit lane order (`equity`, `options_0dte`,
+  `options_leaps`), then stored score and confidence descending, followed by a
+  stable symbol, contract, and proposal-ID tuple. Approved and resized resource
+  amounts are reserved sequentially in memory for lower-ranked evaluations.
+- Existing sizing semantics remain authoritative: long equity retains
+  notional sizing, shorts retain whole shares, options retain whole contracts
+  and the observed multiplier, and LEAPS retains its independent per-position
+  ceiling. Arbitration can only reduce a verified size; it cannot create one
+  when the requirement is unavailable.
+- Shared conflicts are limited to verified general/options buying-power and
+  cash headroom, unreserved pending capital, configured amount/ratio
+  deployment, gross, open-order, and concentration limits, exact existing
+  positions or active orders, and duplicate/opposing same-instrument
+  proposals. Terminal orders and unrelated lanes or symbols do not block one
+  another. No delta, margin, sector, optimizer, or learned strategy-weight
+  model was added.
+- `max_symbol_notional` retains its downstream exact-order-symbol meaning. It
+  is not reused as an underlying-wide equity/options or cross-contract cap;
+  underlying-wide arbitration remains inactive unless a distinct
+  authoritative limit is supplied.
+- `portfolio_arbitration_decisions` is append-only, paper-only PostgreSQL
+  audit evidence. It stores original and approved sizes, ranking inputs,
+  reasons/conflicts, related lineage, context identity/timestamps, decision
+  fingerprint, cycle, and scheduler fence. Cycle/proposal uniqueness and
+  fingerprint matching make exact replay idempotent and conflicting replay
+  fail closed.
+- Only approved or resized proposals reach the existing signed review and
+  `order_intents` persistence. Skips create no intent. Order submission,
+  reconciliation, recovery, cancellation, and exits are unchanged; the
+  existing order manager remains the only submission authority.
+
 ## Provider-neutral public-equity research adapter (2026-07-28)
 
 - No repository provider, installed connector, or documented consumer ChatGPT
@@ -100,7 +142,8 @@
   is the floor of the lower of the per-position ceiling and independently
   validated available capital divided by that contract cost. There is no
   separate LEAPS contract, daily, cycle, position-count, lane, or aggregate
-  allocation cap; each qualified sibling is sized independently. The full
+  allocation cap. Section 9 may still resize or skip a qualified sibling when
+  it competes for verified shared portfolio headroom. The approved full
   position cost is reserved and risk-checked. Over-ceiling contracts persist
   `LEAPS_CONTRACT_COST_EXCEEDS_ALLOCATION`, and affordable ranked siblings
   continue.
