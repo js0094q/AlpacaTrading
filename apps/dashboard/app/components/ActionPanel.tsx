@@ -464,10 +464,7 @@ export function ActionPanel({ readOnly = false }: { readOnly?: boolean }) {
       <div className="action-grid">
         {actions.map((action) => {
           const state = states[action.path];
-          const actionDisabled =
-            readOnly ||
-            busy !== null ||
-            (action.requiresReviewedPayloads === true && !executeReady);
+          const actionDisabled = readOnly || busy !== null;
           return (
             <div className="action-card" key={action.path}>
               <div className="action-card-head">
@@ -490,10 +487,10 @@ export function ActionPanel({ readOnly = false }: { readOnly?: boolean }) {
                 onClick={() => runAction(action)}
                 type="button"
                 title={
-                  action.requiresReviewedPayloads && !executeReady
-                    ? "Run Review Paper Order Payloads first; no fresh eligible reviewed payload is available."
-                    : undefined
-                }
+        action.requiresReviewedPayloads
+          ? "The VPS validates the latest persisted reviewed payload when this action runs."
+          : undefined
+      }
               >
                 {busy === action.path ? "Running..." : action.label}
               </button>
