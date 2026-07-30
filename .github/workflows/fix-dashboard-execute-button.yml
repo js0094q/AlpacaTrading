@@ -1,0 +1,60 @@
+name: Fix dashboard execute button
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/fix-dashboard-execute-button.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Remove stale client-side execution gate
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('apps/dashboard/app/components/ActionPanel.tsx')
+          text = path.read_text()
+
+          old_disabled = '''          const actionDisabled =
+            readOnly ||
+            busy !== null ||
+            (action.requiresReviewedPayloads === true && !executeReady);'''
+          new_disabled = '''          const actionDisabled = readOnly || busy !== null;'''
+          if old_disabled not in text:
+              raise SystemExit('Expected actionDisabled block not found')
+          text = text.replace(old_disabled, new_disabled, 1)
+
+          old_title = '''                title={
+                  action.requiresReviewedPayloads && !executeReady
+                    ? "Run Review Paper Order Payloads first; no fresh eligible reviewed payload is available."
+                    : undefined
+                }'''
+          new_title = '''                title={
+                  action.requiresReviewedPayloads
+                    ? "The VPS validates the latest persisted reviewed payload when this action runs."
+                    : undefined
+                }'''
+          if old_title not in text:
+              raise SystemExit('Expected disabled-button title block not found')
+          text = text.replace(old_title, new_title, 1)
+
+          path.write_text(text)
+          PY
+      - name: Remove one-time workflow and commit correction
+        run: |
+          rm .github/workflows/fix-dashboard-execute-button.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add apps/dashboard/app/components/ActionPanel.tsx .github/workflows/fix-dashboard-execute-button.yml
+          git commit -m "Fix dashboard paper execution button gate"
+          git push origin main
