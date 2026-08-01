@@ -20,6 +20,7 @@ import {
 } from "./paperExplorationConfig.js";
 import { AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS } from "./autonomousFreshnessPolicy.js";
 import { selectExpressionWithPolicy } from "./strategySelectionLogic.js";
+import { optionDaysToExpiration } from "./optionSymbolService.js";
 
 type FeatureTargetWriter = Pick<
   PostgresMarketDataRepository,
@@ -57,6 +58,26 @@ const latestStockEvidence = (symbol: string, snapshots: readonly PostgresStockSn
   snapshots
     .filter((row) => normalizeSymbol(row.symbol) === symbol)
     .sort((left, right) => Date.parse(right.observedAt) - Date.parse(left.observedAt))[0] ?? null;
+
+const newYorkDate = (value: string) => {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit"
+  }).formatToParts(new Date(value));
+  const fields = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${fields.year}-${fields.month}-${fields.day}`;
+};
+
+const optionLane = (expirationDate: string, asOf: string) => {
+  if (expirationDate === newYorkDate(asOf)) return "zero_dte_spy" as const;
+  const dte = optionDaysToExpiration(expirationDate, asOf);
+  const configuredMin = Number.parseInt(String(process.env.PAPER_LEAPS_MIN_DTE || "180"), 10);
+  const configuredMax = Number.parseInt(String(process.env.PAPER_LEAPS_MAX_DTE || "730"), 10);
+  const minDte = Number.isSafeInteger(configuredMin) && configuredMin >= 180 ? configuredMin : 180;
+  const maxDte = Number.isSafeInteger(configuredMax) && configuredMax >= minDte ? configuredMax : 730;
+  return dte !== null && dte >= minDte && dte <= maxDte
+    ? "leaps" as const
+    : "standard_option" as const;
+};
 
 const stockDecisionFeatures = (snapshot: PostgresStockSnapshot | null) => {
   if (!snapshot) return {};
@@ -459,6 +480,11 @@ const buildOptionFeatures = (input: {
       } satisfies FeatureValues,
       candidate: null,
       candidates: { call: null, put: null },
+      candidatesByLane: {
+        zero_dte_spy: { call: null, put: null },
+        leaps: { call: null, put: null },
+        standard_option: { call: null, put: null }
+      },
       materialEvidence: { contracts: contractFeatures, selectedOptionSymbol: null }
     };
   }
@@ -488,9 +514,13 @@ const buildOptionFeatures = (input: {
     : ivSamples.filter((value) => value <= impliedVolatility).length / ivSamples.length;
   const evidenceTimestamp = selectedFeature.sourceObservationTimestamp ?? input.asOf;
   const contractEligible = selectedFeature.eligibility;
-  const candidateFor = (type: "call" | "put") => {
+  const candidateFor = (
+    type: "call" | "put",
+    lane?: "zero_dte_spy" | "leaps" | "standard_option"
+  ) => {
     const feature = rankedFeatures.find((row) =>
-      row.optionType === type && row.eligibility
+      row.optionType === type && row.eligibility &&
+      (!lane || optionLane(row.expirationDate, input.asOf) === lane)
     );
     if (!feature) return null;
     const row = rows.find((entry) =>
@@ -564,6 +594,11 @@ const buildOptionFeatures = (input: {
     call: candidateFor("call"),
     put: candidateFor("put")
   };
+  const candidatesByLane = {
+    zero_dte_spy: { call: candidateFor("call", "zero_dte_spy"), put: candidateFor("put", "zero_dte_spy") },
+    leaps: { call: candidateFor("call", "leaps"), put: candidateFor("put", "leaps") },
+    standard_option: { call: candidateFor("call", "standard_option"), put: candidateFor("put", "standard_option") }
+  };
 
   return {
     values: {
@@ -618,6 +653,7 @@ const buildOptionFeatures = (input: {
     } satisfies FeatureValues,
     candidate: contractEligible ? candidates[selected.contract.type] : null,
     candidates,
+    candidatesByLane,
     materialEvidence: {
       contracts: contractFeatures,
       selectedOptionSymbol: selected.contract.optionSymbol
@@ -733,7 +769,8 @@ const calculateFeatures = (input: {
       features: values,
       sourceFingerprint: fingerprint({ bar, stockSnapshot, option: option.materialEvidence }),
       optionCandidate: option.candidate,
-      optionCandidates: option.candidates
+      optionCandidates: option.candidates,
+      optionCandidatesByLane: option.candidatesByLane
     };
   });
 };
@@ -744,6 +781,7 @@ const targetFromFeature = (input: {
   learningAccuracy?: number | null;
   learningModelName?: string | null;
   decisionThresholds?: PaperExplorationThresholds;
+  optionCandidateOverride?: ReturnType<typeof calculateFeatures>[number]["optionCandidates"]["call"];
 }): PostgresTargetSnapshot => {
   const values = input.feature.features;
   const directionScore =
@@ -762,7 +800,9 @@ const targetFromFeature = (input: {
     directionScore,
     input.decisionThresholds?.directionScore
   );
-  const optionCandidate = direction === "long"
+  const optionCandidate = input.optionCandidateOverride !== undefined
+    ? input.optionCandidateOverride
+    : direction === "long"
     ? input.feature.optionCandidates.call
     : direction === "short"
       ? input.feature.optionCandidates.put
@@ -824,7 +864,11 @@ const targetFromFeature = (input: {
     `Risk profile set to ${input.riskProfile}`,
     `Learning boost from ${input.learningModelName ?? "no model"}`
   ];
-  const sourceFingerprint = fingerprint({ feature: input.feature.sourceFingerprint, riskProfile: input.riskProfile });
+  const sourceFingerprint = fingerprint({
+    feature: input.feature.sourceFingerprint,
+    riskProfile: input.riskProfile,
+    optionSymbol: optionCandidate?.optionSymbol ?? null
+  });
   return {
     symbol: input.feature.symbol,
     asOf: input.feature.observedAt,
@@ -913,15 +957,31 @@ export const buildPostgresFeaturesAndTargets = async (input: {
     optionCandidates: _candidates,
     ...feature
   }) => feature);
-  const targets = Array.from(bySymbol.keys()).map((symbol) => {
+  const targets = Array.from(bySymbol.keys()).flatMap((symbol) => {
     const latest = calculated.filter((row) => row.symbol === symbol).at(-1)!;
-    return targetFromFeature({
+    const base = targetFromFeature({
       feature: latest,
       riskProfile: input.riskProfile,
       learningAccuracy: input.learningAccuracy,
       learningModelName: input.learningModelName,
       decisionThresholds: input.decisionThresholds
     });
+    const type = base.direction === "long" ? "call" : base.direction === "short" ? "put" : null;
+    if (!type) return [base];
+    const laneCandidates = Object.values(latest.optionCandidatesByLane)
+      .map((candidates) => candidates[type])
+      .filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== null);
+    const unique = [...new Map(laneCandidates.map((candidate) => [candidate.optionSymbol, candidate])).values()];
+    return unique.length
+      ? unique.map((optionCandidateOverride) => targetFromFeature({
+          feature: latest,
+          riskProfile: input.riskProfile,
+          learningAccuracy: input.learningAccuracy,
+          learningModelName: input.learningModelName,
+          decisionThresholds: input.decisionThresholds,
+          optionCandidateOverride
+        }))
+      : [base];
   });
   await repository.upsertFeatureSnapshots(features, input.context);
   await repository.upsertTargetSnapshots(targets, input.context);

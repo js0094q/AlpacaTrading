@@ -126,9 +126,10 @@ const buildOptionFeaturesFixture = (input: {
   contracts: PostgresOptionContract[];
   snapshots: PostgresOptionSnapshot[];
   exploration?: boolean;
+  stock?: PostgresStockSnapshot;
 }) => buildPostgresFeaturesAndTargets({
   bars: bars(60),
-  stockSnapshots: [stockSnapshot()],
+  stockSnapshots: [input.stock ?? stockSnapshot()],
   optionContracts: input.contracts,
   optionSnapshots: input.snapshots,
   riskProfile: "aggressive",
@@ -165,6 +166,60 @@ test("paper exploration admits a 10 percent option spread while the baseline rem
 
   assert.equal(baseline.features.at(-1)!.features.optionContractEligible, false);
   assert.equal(exploration.features.at(-1)!.features.optionContractEligible, true);
+});
+
+test("a higher-ranked longer-dated SPY call cannot erase an eligible same-day call", async () => {
+  const zeroDteSymbol = "SPY260629C00560000";
+  const leapsSymbol = "SPY270618C00560000";
+  const result = await buildOptionFeaturesFixture({
+    exploration: true,
+    stock: {
+      ...stockSnapshot(),
+      observedAt: "2026-06-29T18:00:00.000Z",
+      sourceTimestamp: "2026-06-29T17:59:59.000Z",
+      evidence: {
+        ...stockSnapshot().evidence,
+        quoteTimestamp: "2026-06-29T17:59:59.000Z"
+      }
+    },
+    contracts: [
+      optionContractFixture(zeroDteSymbol, 560, { expirationDate: "2026-06-29" }),
+      optionContractFixture(leapsSymbol, 560, { expirationDate: "2027-06-18" })
+    ],
+    snapshots: [
+      optionSnapshotFixture(zeroDteSymbol, {
+        observedAt: "2026-06-29T18:00:00.000Z",
+        quoteTimestamp: "2026-06-29T17:59:59.000Z",
+        snapshotTimestamp: "2026-06-29T17:59:59.000Z",
+        retrievedAt: "2026-06-29T18:00:00.000Z",
+        bid: 4.5, ask: 5, midpoint: 4.75, spread: 0.5,
+        spreadPct: 0.1052631579, volume: 100, openInterest: 500
+      }),
+      optionSnapshotFixture(leapsSymbol, {
+        observedAt: "2026-06-29T18:00:00.000Z",
+        quoteTimestamp: "2026-06-29T17:59:59.000Z",
+        snapshotTimestamp: "2026-06-29T17:59:59.000Z",
+        retrievedAt: "2026-06-29T18:00:00.000Z",
+        bid: 4.95, ask: 5.05, midpoint: 5, spread: 0.1,
+        spreadPct: 0.02, volume: 5_000, openInterest: 10_000
+      })
+    ]
+  });
+
+  const selected = result.targets
+    .map((target) => target.optionsStrategy?.optionsCandidate as
+      | { optionSymbol?: string; expirationDate?: string }
+      | null)
+    .filter((candidate): candidate is { optionSymbol?: string; expirationDate?: string } =>
+      candidate !== null
+    );
+  assert.equal(selected.some((candidate) =>
+    candidate.optionSymbol === zeroDteSymbol && candidate.expirationDate === "2026-06-29"
+  ), true, JSON.stringify({
+    selected,
+    contracts: result.features.at(-1)!.features.optionContractFeatures
+  }));
+  assert.equal(selected.some((candidate) => candidate.optionSymbol === leapsSymbol), true);
 });
 
 test("existing indicators and target thresholds persist genuine PostgreSQL features and targets", async () => {

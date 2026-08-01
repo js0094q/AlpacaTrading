@@ -37,17 +37,18 @@ eligible contracts compete; it never makes an ineligible contract eligible.
 Stable score, symbol, expiration, strike, and contract-symbol ordering preserves
 determinism.
 
-### Focused pre-review evidence refresh
+### Unified evidence freshness policy
 
-Before option entry review, the workflow will use the latest PostgreSQL evidence
-for the selected contract and underlying. If either OPRA or SIP evidence is
-absent, invalid, or stale, the scheduler will invoke the existing bounded
-market-data boundary for only the selected symbols, then re-read PostgreSQL once.
+Investigation after design approval found that the observed LEAPS rejection was
+caused by a policy mismatch: autonomous evidence is documented and enforced at
+1,800 seconds, while the option quote normalizer still defaulted to 900 seconds.
+The rejected quote was 906.983 seconds old. The narrow repair aligns the option
+normalizer default with the existing autonomous 1,800-second constant.
 
-The review service remains PostgreSQL-authoritative and broker-free. Refresh
-failure, incomplete evidence, fence loss, or evidence that remains stale fails
-closed with a component-specific reason. There is no threshold extension,
-fallback feed, synthesized quote, or repeated retry.
+Research continues to refresh SIP and OPRA evidence naturally at the start of
+each cycle. Review remains PostgreSQL-authoritative and broker-free. Missing,
+invalid, or evidence older than 1,800 seconds still fails closed. There is no
+fallback feed, synthesized quote, direct review-time provider call, or retry.
 
 ### Unchanged downstream authority
 
@@ -61,8 +62,8 @@ the order manager, construct a broker payload, or submit outside that authority.
 - 0DTE distinguishes missing, ineligible, stale-OPRA, stale-SIP, and strategy
   rejection states where the canonical result contract permits it.
 - LEAPS failures remain candidate-scoped so one contract cannot block siblings.
-- Refresh telemetry identifies the underlying, contract, reuse/refresh choice,
-  and bounded result without logging credentials.
+- Existing research telemetry continues to identify SIP/OPRA refresh results
+  without logging credentials.
 
 ## Tests and acceptance criteria
 
@@ -73,9 +74,8 @@ Tests are written and observed failing before production changes.
 - Same-day classification uses `America/New_York`.
 - LEAPS and standard candidates remain independently selectable.
 - Fresh OPRA with stale SIP fails closed before intent persistence.
-- One bounded refresh followed by fresh PostgreSQL OPRA and SIP evidence permits
-  the existing review path to create an intent.
-- Failed or incomplete refresh performs no intent or broker mutation.
+- OPRA evidence at 1,800 seconds remains admissible; evidence older than 1,800
+  seconds fails before intent persistence.
 - Focused tests, full tests, lint, typecheck, and builds pass.
 - Paper/live-off and PostgreSQL-only checks pass before deployment is proposed.
 

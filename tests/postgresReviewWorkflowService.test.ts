@@ -2820,7 +2820,7 @@ test("option exit review rejects an unusable quote before persisting a close int
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO order_intents")), false);
 });
 
-test("option exit review preserves the stricter 15-minute executable quote gate", async () => {
+test("option exit review rejects executable evidence beyond the autonomous 30-minute window", async () => {
   const sql: string[] = [];
   await assert.rejects(
     runPostgresReviewWorkflow({
@@ -2832,7 +2832,7 @@ test("option exit review preserves the stricter 15-minute executable quote gate"
             return {
               rows: [repeatedExitSource(
                 "0.50",
-                "2026-07-22T16:44:59.000Z"
+                "2026-07-22T16:29:59.000Z"
               )],
               rowCount: 1
             };

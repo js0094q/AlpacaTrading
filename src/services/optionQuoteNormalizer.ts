@@ -37,7 +37,10 @@ const parsePositiveInteger = (value: string | undefined, fallback: number) => {
 };
 
 export const optionsQuoteConfig = () => ({
-  maxAgeMs: parsePositiveInteger(process.env.OPTIONS_QUOTE_MAX_AGE_MS, 15 * 60 * 1000),
+  maxAgeMs: parsePositiveInteger(
+    process.env.OPTIONS_QUOTE_MAX_AGE_MS,
+    AUTONOMOUS_MARKET_DATA_FRESHNESS_MS
+  ),
   allowLastPriceFallback: parseBoolean(process.env.ALLOW_OPTIONS_LAST_PRICE_FALLBACK),
   allow0DteOptions:
     process.env.ALLOW_0DTE_OPTIONS !== undefined
@@ -151,3 +154,4 @@ export const normalizeOptionQuote = (
 
   return rejectedQuote(base, "missing", "quote_unavailable");
 };
+import { AUTONOMOUS_MARKET_DATA_FRESHNESS_MS } from "./autonomousFreshnessPolicy.js";

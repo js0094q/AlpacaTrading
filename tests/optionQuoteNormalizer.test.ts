@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   normalizeOptionQuote,
+  optionsQuoteConfig,
   roundOptionLimitPrice
 } from "../src/services/optionQuoteNormalizer.js";
 
@@ -11,6 +12,17 @@ const freshTimestamp = "2026-07-06T14:59:00.000Z";
 const maxAgeMs = 15 * 60 * 1000;
 
 describe("option quote normalizer", () => {
+  test("defaults executable option evidence to the autonomous 30-minute window", () => {
+    const previous = process.env.OPTIONS_QUOTE_MAX_AGE_MS;
+    delete process.env.OPTIONS_QUOTE_MAX_AGE_MS;
+    try {
+      assert.equal(optionsQuoteConfig().maxAgeMs, 1_800_000);
+    } finally {
+      if (previous === undefined) delete process.env.OPTIONS_QUOTE_MAX_AGE_MS;
+      else process.env.OPTIONS_QUOTE_MAX_AGE_MS = previous;
+    }
+  });
+
   test("rejects null quote fields as unavailable", () => {
     const quote = normalizeOptionQuote({
       optionSymbol: "IWM260706C00269000",

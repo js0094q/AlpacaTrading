@@ -1,5 +1,20 @@
 # Alpaca Trading Research Infrastructure
 
+## Option lane and freshness repair (2026-08-01)
+
+PostgreSQL option feature generation now retains independently ranked eligible
+call/put candidates for same-day SPY, configured LEAPS DTE, and standard-option
+expiration buckets. A higher-ranked longer-dated SPY contract can no longer
+erase an eligible 0DTE contract before strategy-family classification.
+
+Executable option quote freshness now defaults to the shared autonomous
+1,800-second evidence window instead of the obsolete 900-second fallback.
+Research still refreshes SIP/OPRA evidence at cycle start; review remains a
+PostgreSQL-only consumer. Missing, invalid, crossed, illiquid, non-OPRA, or
+evidence older than 1,800 seconds continues to fail closed before intent
+persistence. No order, live path, fallback feed, or broker validation call was
+added.
+
 ## Bounded PostgreSQL outcome learning (2026-07-29)
 
 Section 10 adds derived, paper-only outcome evidence without changing order

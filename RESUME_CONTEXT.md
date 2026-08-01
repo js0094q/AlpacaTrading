@@ -1,5 +1,17 @@
 # Resume Context: Alpaca Trading Research Infra
 
+## Option lane and freshness repair (2026-08-01)
+
+- Option selection preserves independent same-day SPY, LEAPS-range, and
+  standard-option call/put candidates before research family classification.
+- The option normalizer fallback is aligned with the existing autonomous
+  1,800-second evidence constant. The production LEAPS rejection under
+  investigation occurred at 906.983 seconds against the obsolete 900-second
+  fallback; evidence older than 1,800 seconds remains blocked.
+- Review remains PostgreSQL-authoritative and broker-free. Research remains the
+  natural SIP/OPRA refresh boundary. No live path, validation order, fallback
+  feed, or synthesized quote was introduced.
+
 ## Bounded PostgreSQL outcome learning (2026-07-29)
 
 - Section 10 is implemented as derived, paper-only PostgreSQL evidence. It does
