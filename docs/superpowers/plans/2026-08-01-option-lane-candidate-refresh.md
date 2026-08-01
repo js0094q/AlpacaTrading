@@ -109,6 +109,6 @@ validation, and rollback boundaries in `README.md` and `RESUME_CONTEXT.md`.
 
 Run focused suites, full `npm test`, `npm run lint`, `npm run typecheck`, `npm run build`, and `npm run dashboard:build` through the explicit bundled runtime. Run `git diff --check` and verify the import graph contains no new order-manager authority.
 
-- [ ] **Step 3: Commit and push implementation**
+- [x] **Step 3: Commit and push implementation**
 
 Stage only the plan, implementation, tests, and synchronized documentation. Exclude `.codex/`. Commit with a terse repair message, push the current branch, and verify the remote SHA exactly.
