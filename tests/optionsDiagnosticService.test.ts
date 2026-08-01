@@ -43,6 +43,13 @@ const makeMockResponse = (payload: unknown, status = 200) =>
     json: async () => payload
   }) as unknown as Response;
 
+const dateOnlyFromToday = (days: number) => {
+  const date = new Date();
+  date.setUTCHours(0, 0, 0, 0);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+};
+
 const resetDatabase = () => {
   resetSqliteTestDb(getDb(), `
     DELETE FROM option_snapshots;
@@ -56,6 +63,7 @@ const setDiagnosticFetch = (
   calls: string[],
   options: { currentSnapshot?: boolean; omitFetchedQuotes?: boolean } = {}
 ) => {
+  const leapsExpiration = dateOnlyFromToday(200);
   globalThis.fetch = async (input: string | Request | URL) => {
     const target = String(input);
     calls.push(target);
@@ -74,7 +82,7 @@ const setDiagnosticFetch = (
         symbol: "SPY270115C00440000",
         underlying_symbol: "SPY",
         type: "call",
-        expiration_date: "2027-01-15",
+        expiration_date: leapsExpiration,
         strike_price: "440",
         multiplier: "100",
         tradable: true,
@@ -84,7 +92,7 @@ const setDiagnosticFetch = (
         symbol: "QQQ270115C00370000",
         underlying_symbol: "QQQ",
         type: "call",
-        expiration_date: "2027-01-15",
+        expiration_date: leapsExpiration,
         strike_price: "370",
         multiplier: "100",
         tradable: true,
