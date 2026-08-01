@@ -2,11 +2,11 @@
 
 **Status:** Approved architecture; implementation planning pending user review
 **Date:** 2026-08-01
-**Selected approach:** Approach B — one dependency-graph orchestrator with two bounded non-mutating compute slots
+**Selected approach:** Approach B — one compartmentalized orchestrator with two bounded non-mutating compute slots
 
 ## Purpose
 
-Replace the autonomous worker's predominantly linear command loop with one canonical, PostgreSQL-fenced dependency graph that invokes every enabled production workflow, uses the upgraded VPS capacity safely, preserves lane identity from evidence through learning, and keeps all broker mutation globally serialized.
+Replace the autonomous worker's predominantly linear command loop with one canonical, PostgreSQL-fenced workflow orchestrator that invokes every enabled production workflow, uses the upgraded VPS capacity safely, preserves lane identity from evidence through learning, compartmentalizes workflow failures, and keeps all broker mutation globally serialized.
 
 The design covers equity, standard options, SPY 0DTE, SPY/QQQ LEAPS, portfolio review, hedging, exits, reconciliation, cancellation, learning, recovery, and worker-state persistence. It does not authorize deployment, a service restart, environment changes, live trading, or a validation order.
 
@@ -33,25 +33,27 @@ Read-only production evidence confirms upstream inventory is not empty: PostgreS
 ## Design principles
 
 1. One supervisor owns one cycle identity.
-2. One checked-in registry declares every production workflow and dependency.
+2. One checked-in registry declares every production workflow and only its direct dependencies.
 3. Shared evidence is loaded once, frozen, versioned, and fanned out.
-4. At most two non-mutating workflows execute concurrently.
-5. Portfolio allocation runs once after proposal lanes terminate.
+4. At most two non-mutating workflows execute concurrently across independent fault compartments.
+5. Portfolio allocation runs once after every enabled proposal compartment has a terminal record; successful proposals remain eligible when another compartment fails locally.
 6. Broker mutation is globally serialized and exact-client-ID reconciled.
 7. PostgreSQL fencing remains authoritative for leases and writes.
-8. Lane failures isolate only when shared safety and state remain valid.
-9. Safety, authority, fence, persistence, and indeterminate-mutation failures stop the cycle.
+8. Each workflow compartment owns its status, timeout, retry budget, evidence, and terminal result; lane-local failures do not cancel unrelated work.
+9. Safety, authority, fence, persistence, and indeterminate-mutation failures block all later broker mutation without cancelling compartment evidence collection.
 10. Every enabled workflow emits terminal, sanitized, queryable evidence.
 
 ## Canonical workflow registry
 
-Each typed registry entry declares a stable workflow ID, command or executor, phase, dependency IDs, resource class, lane, scheduler identity, enablement predicate, required runtime flags, timeout, retry policy, expected no-action reasons, failure scope, and shared-context requirement.
+Each typed registry entry declares a stable workflow ID, command or executor, phase, direct dependency IDs, resource class, fault compartment, lane, scheduler identity, enablement predicate, required runtime flags, timeout, retry policy, expected no-action reasons, failure scope, and shared-context requirement. Registry edges are narrow data or safety prerequisites, not implicit sequencing between peer compartments.
 
 Startup compares this registry with `scripts/autonomous-worker-command-contract.json` and `package.json`. A required enabled command that is missing, unregistered, SQLite-backed, non-production, or assigned an invalid resource class fails startup closed.
 
 The initial registry must account for every command in the current production loop: `zero-dte:reconcile`, `research:daily`, `paper:options:discover`, `paper:review`, `paper:portfolio:review`, `paper:ops:review`, `hedge:review`, `paper:execute:reviewed`, `zero-dte:engine`, `paper:exit:review`, `zero-dte:exit:review`, `hedge:exit:review`, `paper:exit:execute`, `hedge:exit:execute`, `paper:order:cancel`, `paper:learn`, `system:recover`, and `worker:state`. Repeated reconciliation or recovery barriers are represented as explicit graph invocations of the same registered workflow, not as undeclared duplicate nodes. If the command contract changes, registry completeness tests must change in the same commit.
 
 ## Execution graph
+
+The graph is a readiness graph, not a failure-propagation chain. Equity, standard options, SPY 0DTE, SPY/QQQ LEAPS, hedging, exits, cancellation, reconciliation, recovery, and learning are independently scheduled compartments. A compartment becomes ready when its own direct prerequisites are satisfied. Failure, timeout, deferral, or no-action in one compartment does not cancel an unrelated ready or active compartment.
 
 ### Phase 1: preflight and recovery
 
@@ -64,7 +66,7 @@ The initial registry must account for every command in the current production lo
 
 ### Phase 2: proposal-producing analysis
 
-Eligible work shares the two compute slots:
+Eligible independent compartments share the two compute slots:
 
 - equity research and scoring;
 - standard-option evaluation;
@@ -74,11 +76,11 @@ Eligible work shares the two compute slots:
 - hedge-review inputs;
 - enabled observatory and diagnostic inputs.
 
-Every lane emits a canonical `WorkstreamResult` with evidence references and explicit success, no-action, deferred, or error reasons.
+Every compartment emits a canonical `WorkstreamResult` with evidence references and explicit success, no-action, deferred, blocked, or error reasons. The scheduler continues admitting unrelated ready compartments after a lane-local failure.
 
 ### Phase 3: portfolio decision join
 
-The orchestrator waits for every enabled proposal workflow to terminate, then runs one serialized decision stage:
+The orchestrator waits for every enabled proposal compartment to emit a terminal record, then runs one serialized decision stage over the successful proposal subset plus the complete set of failure, no-action, deferred, and blocked records:
 
 1. Normalize proposals without erasing lane identity.
 2. Validate evidence freshness and completeness.
@@ -88,7 +90,7 @@ The orchestrator waits for every enabled proposal workflow to terminate, then ru
 6. Run allocation, general paper, portfolio, paper-operations, and hedge reviews in declared order.
 7. Persist every selected, rejected, skipped, blocked, and deferred decision.
 
-Healthy independent lanes may survive a lane-local failure. Account-truth, risk-configuration, authority, fence, and paper/live failures invalidate the join and block mutation.
+Healthy independent lanes survive lane-local failure. A failed 0DTE compartment does not cancel LEAPS, equity, standard options, hedging, exits, or reconciliation; the same isolation applies in every direction. Portfolio review may approve healthy proposals when their own evidence and the shared risk state are valid. Account-truth, risk-configuration, authority, fence, and paper/live failures invalidate mutation eligibility globally, but still produce explicit compartment results and do not erase completed evidence.
 
 ### Phase 4: globally serialized mutation
 
@@ -99,10 +101,10 @@ Each mutation must reconcile state, revalidate the fence and configuration versi
 ### Phase 5: learning and completion
 
 - Collect bounded outcomes.
-- Run paper learning.
+- Run paper learning independently for each compartment with sufficient outcome evidence; an absent or failed lane yields a partial learning result rather than cancelling other learning.
 - Run final recovery inspection.
 - Persist reconciled cycle metrics.
-- Persist exactly one cycle terminal event.
+- Persist exactly one cycle terminal event with `complete`, `partial`, `blocked`, or `failed` status, plus one terminal record per enabled compartment.
 
 ## Resource classes
 
@@ -117,7 +119,7 @@ Resource class is immutable registry metadata. Runtime results cannot promote pr
 
 ## Two-slot scheduler
 
-Use a FIFO, abort-aware semaphore with default `2`, hard maximum `2`, and minimum `1`. Values outside `[1,2]` fail startup. There is no unbounded `Promise.all`, duplicate active workflow ID, or next-cycle overlap. Dependencies must reach an allowed terminal state before admission. Queue wait, duration, and effective concurrency are recorded.
+Use a FIFO, abort-aware semaphore with default `2`, hard maximum `2`, and minimum `1`. Values outside `[1,2]` fail startup. There is no unbounded `Promise.all`, duplicate active workflow ID, or next-cycle overlap. Only a workflow's declared direct prerequisites affect its admission; a peer compartment's failure cannot remove an otherwise ready workflow from the queue. Queue wait, duration, and effective concurrency are recorded.
 
 ## Automatic fallback
 
@@ -150,7 +152,9 @@ Update database constraints, repository conflict keys, types, research-evidence 
 
 ## Failure handling
 
-Lane-local provider, scoring, qualification, or evidence-availability failures may isolate only that lane when shared state remains valid. Paper/live failure, authority mismatch, lost fence, authoritative persistence failure, inconsistent account/order/position/reservation/allocation/risk truth, command-contract mismatch, indeterminate mutation, or failed mutation-process shutdown is cycle-fatal.
+Lane-local provider, scoring, qualification, evidence-availability, timeout, and retry-exhaustion failures isolate only that compartment when shared state remains valid. They cannot cancel unrelated research, exits, reconciliation, recovery, or learning. Each compartment persists its own terminal result and the cycle continues with any safe ready work.
+
+Only enumerated global invariants may block all later broker mutation: paper/live failure, authority mismatch, lost fence, authoritative persistence failure, inconsistent account/order/position/reservation/allocation/risk truth, command-contract mismatch, indeterminate mutation, or failed mutation-process shutdown. A global mutation block does not retroactively fail healthy completed compartments; the overall cycle records `blocked` or `partial` with the specific global reason.
 
 Closed market, stale closed-market evidence, no candidate, no exit trigger, no ready intent, no cancellable order, and no recoverable state remain explicit non-fatal outcomes when existing hard gates are satisfied.
 
@@ -182,11 +186,15 @@ Missing transitions become explicit blockers.
 ## Required tests
 
 - FIFO two-slot admission, hard maximum, invalid configuration, fallback, and cooldown recovery.
-- Dependency ordering, join behavior, and no duplicate admission.
+- Direct-prerequisite ordering, compartmentalized join behavior, and no duplicate admission.
 - Complete production command registry with no SQLite or retired timer path.
 - Shared context loads once and is reused.
-- Portfolio arbitration waits for all proposal lanes.
-- Lane-local versus cycle-fatal failure classification.
+- Portfolio arbitration waits for terminal records from all enabled proposal compartments but accepts healthy proposals from the successful subset.
+- Lane-local versus global-mutation-blocking failure classification.
+- Forced 0DTE failure does not stop LEAPS, equity, standard options, exits, or reconciliation.
+- Forced LEAPS failure does not stop 0DTE, equity, standard options, exits, or reconciliation.
+- Lane-local provider failure and timeout do not cancel unrelated ready or active compartments.
+- Partial learning proceeds for compartments with sufficient outcome evidence.
 - Global mutation non-overlap and indeterminate-outcome blocking.
 - Shutdown with two active process groups.
 - Lane-aware target and option-strategy persistence.
@@ -206,14 +214,14 @@ Missing transitions become explicit blockers.
 
 ## Success criteria
 
-1. Every enabled autonomous workflow is present in one dependency graph.
+1. Every enabled autonomous workflow is present in one readiness graph with only direct prerequisites.
 2. No more than two non-mutating workflows run concurrently.
 3. Pressure reduces new admission to one without killing healthy work.
 4. Equity, standard-option, 0DTE, and LEAPS targets coexist durably.
-5. Portfolio allocation observes all terminal lane results.
+5. Portfolio allocation observes all terminal compartment records and can act on the healthy proposal subset.
 6. Broker mutation remains globally serialized and idempotent.
 7. Shutdown and recovery do not duplicate work or orders.
-8. Cycle evidence explains every lane from discovery through learning.
+8. Cycle evidence explains every compartment from discovery through learning and distinguishes `complete`, `partial`, `blocked`, and `failed` cycles.
 9. Added compute reduces natural cycle duration without weakening safety.
 
 ## Authorization boundary
