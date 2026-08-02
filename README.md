@@ -1,5 +1,23 @@
 # Alpaca Trading Research Infrastructure
 
+## Lane-aware target identity migration (2026-08-02)
+
+Migration `010_lane_aware_target_identity.sql` adds the additive
+`strategy_family` and `expression_id` identity columns to target and option
+strategy snapshots, then replaces their three-column keys with the full
+five-column lane identity. Before any future production migration, stop the
+paper service so it cannot write during the migration. Verify a clearly
+disposable PostgreSQL database with:
+
+```bash
+POSTGRES_INTEGRATION_TEST_ENABLED=true tsx --test tests/postgresNeonIntegration.test.ts
+```
+
+Before a production migration, rollback is a code rollback. After migration,
+retain the additive columns and lane rows and deploy forward: dropping lane
+rows would be destructive. Migration 010 has **not** been applied to the paper
+VPS, and no service was restarted or deployed for this work.
+
 ## Option lane and freshness repair (2026-08-01)
 
 PostgreSQL option feature generation now retains independently ranked eligible

@@ -19,6 +19,7 @@ import {
   PostgresCandidateLifecycleEventRepository,
   PostgresCandidateRepository
 } from "../src/repositories/postgres/postgresCandidateRepository.js";
+import { PostgresMarketDataRepository } from "../src/repositories/postgres/postgresMarketDataRepository.js";
 import { PostgresResearchRunRepository } from "../src/repositories/postgres/postgresResearchRunRepository.js";
 import { PostgresSchedulerLeaseRepository } from "../src/repositories/postgres/postgresSchedulerLeaseRepository.js";
 import { createDecisionId } from "../src/services/marketDecisionIdentityService.js";
@@ -177,11 +178,15 @@ test("actual Neon PostgreSQL applies every migration twice and fences concurrent
     const second = await runPostgresMigrations(schemaPool, config);
     const verification = await verifyPostgresSchema(schemaPool);
 
-    assert.deepEqual(first.appliedVersions, [1, 2, 3]);
+    assert.deepEqual(first.appliedVersions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    assert.deepEqual(first.currentVersions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    assert.equal(first.latestVersion, 10);
     assert.deepEqual(second.appliedVersions, []);
+    assert.deepEqual(second.currentVersions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    assert.equal(second.latestVersion, 10);
     assert.equal(verification.verificationPassed, true);
-    assert.equal(verification.presentTableCount, 33);
-    assert.equal(verification.presentIndexCount, 69);
+    assert.equal(verification.presentTableCount, 40);
+    assert.equal(verification.presentIndexCount, 90);
     assert.equal(verification.schedulerFencingSequencePresent, true);
     assert.deepEqual(verification.missingColumns, []);
     assert.deepEqual(verification.missingConstraints, []);
@@ -323,6 +328,116 @@ test("actual Neon PostgreSQL applies every migration twice and fences concurrent
       runId: recoveryTakeover.lease.runId,
       fencingToken: recoveryTakeover.lease.fencingToken
     };
+    const marketDataRepository = new PostgresMarketDataRepository();
+    const targetAsOf = "2026-07-15T20:00:00.000Z";
+    const targetContext = (client: PoolClient) => ({
+      transaction: client,
+      operationId: "lane-target-integration",
+      actorId: recoveryFence.ownerId,
+      schedulerFence: recoveryFence
+    });
+    const laneTargets = [
+      {
+        strategyFamily: "equity" as const,
+        expressionId: "equity:shares",
+        preferredExpression: "shares",
+        optionsStrategy: null
+      },
+      {
+        strategyFamily: "standard_option" as const,
+        expressionId: "option:SPY260815C00600000",
+        preferredExpression: "long_call",
+        optionsStrategy: {
+          alternatives: ["shares"],
+          rationale: ["standard option lane"],
+          optionsCandidate: { symbol: "SPY260815C00600000" }
+        }
+      },
+      {
+        strategyFamily: "zero_dte_spy" as const,
+        expressionId: "option:SPY260715C00600000",
+        preferredExpression: "long_call",
+        optionsStrategy: {
+          alternatives: ["shares"],
+          rationale: ["zero DTE SPY lane"],
+          optionsCandidate: { symbol: "SPY260715C00600000" }
+        }
+      },
+      {
+        strategyFamily: "leaps" as const,
+        expressionId: "option:SPY271217C00600000",
+        preferredExpression: "long_call",
+        optionsStrategy: {
+          alternatives: ["shares"],
+          rationale: ["LEAPS lane"],
+          optionsCandidate: { symbol: "SPY271217C00600000" }
+        }
+      }
+    ];
+    phase = "lane_target_identity";
+    await withPostgresTransaction(schemaPool, integrationConfig, async (client) => {
+      const context = targetContext(client);
+      await marketDataRepository.upsertUniverseSymbols([{
+        symbol: "SPY",
+        assetClass: "equity",
+        source: "integration",
+        enabled: true,
+        observedAt: targetAsOf
+      }], context);
+      const result = await marketDataRepository.upsertTargetSnapshots(
+        laneTargets.map((lane) => ({
+          symbol: "SPY",
+          asOf: targetAsOf,
+          direction: "long" as const,
+          horizon: "1d",
+          entryReference: 600,
+          upsideTarget: 612,
+          downsideRisk: 594,
+          stopLoss: 594,
+          takeProfit: 612,
+          confidence: 0.8,
+          expectedReturn: 0.02,
+          volatilityAdjustedScore: 1.2,
+          riskProfile: "aggressive",
+          rationale: ["lane target integration"],
+          sourceFingerprint: `lane-target:${lane.strategyFamily}`,
+          ...lane
+        })),
+        context
+      );
+      assert.deepEqual(result, { stored: 4 });
+    });
+    const targets = await schemaPool.query<{
+      strategy_family: string;
+      expression_id: string;
+    }>(
+      `SELECT strategy_family, expression_id
+       FROM target_snapshots
+       WHERE symbol = 'SPY' AND as_of = $1 AND risk_profile = 'aggressive'
+       ORDER BY strategy_family, expression_id`,
+      [targetAsOf]
+    );
+    assert.deepEqual(targets.rows, [
+      { strategy_family: "equity", expression_id: "equity:shares" },
+      { strategy_family: "leaps", expression_id: "option:SPY271217C00600000" },
+      { strategy_family: "standard_option", expression_id: "option:SPY260815C00600000" },
+      { strategy_family: "zero_dte_spy", expression_id: "option:SPY260715C00600000" }
+    ]);
+    const optionStrategies = await schemaPool.query<{
+      strategy_family: string;
+      expression_id: string;
+    }>(
+      `SELECT strategy_family, expression_id
+       FROM options_strategy_snapshots
+       WHERE symbol = 'SPY' AND as_of = $1 AND risk_profile = 'aggressive'
+       ORDER BY strategy_family, expression_id`,
+      [targetAsOf]
+    );
+    assert.deepEqual(optionStrategies.rows, [
+      { strategy_family: "leaps", expression_id: "option:SPY271217C00600000" },
+      { strategy_family: "standard_option", expression_id: "option:SPY260815C00600000" },
+      { strategy_family: "zero_dte_spy", expression_id: "option:SPY260715C00600000" }
+    ]);
     const candidateRepository = new PostgresCandidateRepository();
     phase = "candidate_idempotency";
     const lifecycleRepository = new PostgresCandidateLifecycleEventRepository();
@@ -525,7 +640,7 @@ test("actual Neon reconciles fixed-scale partial state without candidate updates
       sessionOptions: `-c search_path=${schema}`
     });
     phase = "migrate_twice";
-    assert.deepEqual((await runPostgresMigrations(schemaPool, config)).appliedVersions, [1, 2, 3]);
+    assert.deepEqual((await runPostgresMigrations(schemaPool, config)).appliedVersions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     assert.deepEqual((await runPostgresMigrations(schemaPool, config)).appliedVersions, []);
 
     phase = "seed_partial_state";
@@ -780,13 +895,13 @@ test("actual Neon backfills and reconciles Release 4 execution state idempotentl
       sessionOptions: `-c search_path=${schema}`
     });
     phase = "migrate_twice";
-    assert.deepEqual((await runPostgresMigrations(schemaPool, config)).appliedVersions, [1, 2, 3]);
+    assert.deepEqual((await runPostgresMigrations(schemaPool, config)).appliedVersions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     assert.deepEqual((await runPostgresMigrations(schemaPool, config)).appliedVersions, []);
     assert.deepEqual(
       (await schemaPool.query<{ version: number }>(
         "SELECT version FROM schema_migrations ORDER BY version"
       )).rows.map((row) => Number(row.version)),
-      [1, 2, 3]
+      [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     );
     phase = "seed_control_plane_candidate";
     await schemaPool.query(
