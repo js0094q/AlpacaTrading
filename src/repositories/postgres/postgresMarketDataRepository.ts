@@ -431,14 +431,14 @@ const chunks = <T>(rows: readonly T[], size = POSTGRES_MARKET_DATA_WRITE_BATCH_S
   for (let index = 0; index < rows.length; index += size) result.push(rows.slice(index, index + size) as T[]);
   return result;
 };
-const dedupeStable = <T>(rows: readonly T[], keyOf: (row: T) => string) => {
+const dedupeStable = <T>(rows: readonly T[], keyOf: (row: T) => string, conflictCode = "POSTGRES_MARKET_DATA_DUPLICATE_IDENTITY_CONFLICT") => {
   const unique = new Map<string, T>();
   for (const row of rows) {
     const key = keyOf(row);
     const previous = unique.get(key);
     const fingerprint = canonicalJson(parseJsonValue(JSON.parse(JSON.stringify(row))));
     if (previous && canonicalJson(parseJsonValue(JSON.parse(JSON.stringify(previous)))) !== fingerprint) {
-      throw new Error("POSTGRES_MARKET_DATA_DUPLICATE_IDENTITY_CONFLICT");
+      throw new Error(conflictCode);
     }
     if (!previous) unique.set(key, row);
   }
@@ -1154,25 +1154,30 @@ export class PostgresMarketDataRepository {
     context: FencedPostgresRepositoryContext
   ) {
     await requireFence(context);
-    for (const row of rows) {
+    const unique = dedupeStable(
+      rows,
+      (row) => `${normalizedSymbol(row.symbol)}\\0${iso(row.asOf)}\\0${row.riskProfile}\\0${row.strategyFamily}\\0${row.expressionId}`,
+      "POSTGRES_TARGET_IDENTITY_CONFLICT"
+    );
+    for (const row of unique) {
       const values = [
-        normalizedSymbol(row.symbol), iso(row.asOf), row.direction, row.horizon,
-        row.entryReference, row.upsideTarget, row.downsideRisk, row.stopLoss,
-        row.takeProfit, row.confidence, row.expectedReturn,
-        row.volatilityAdjustedScore, row.riskProfile, row.preferredExpression,
-        json(row.rationale), row.sourceFingerprint
+        normalizedSymbol(row.symbol), iso(row.asOf), row.strategyFamily, row.expressionId,
+        row.direction, row.horizon, row.entryReference, row.upsideTarget,
+        row.downsideRisk, row.stopLoss, row.takeProfit, row.confidence,
+        row.expectedReturn, row.volatilityAdjustedScore, row.riskProfile,
+        row.preferredExpression, json(row.rationale), row.sourceFingerprint
       ];
       const result = await context.transaction.query(
         `INSERT INTO target_snapshots(
-           symbol, as_of, direction, horizon, entry_reference, upside_target,
-           downside_risk, stop_loss, take_profit, confidence, expected_return,
-           volatility_adjusted_score, risk_profile, preferred_expression,
-           rationale, source_fingerprint, created_at, updated_at
+           symbol, as_of, strategy_family, expression_id, direction, horizon,
+           entry_reference, upside_target, downside_risk, stop_loss, take_profit,
+           confidence, expected_return, volatility_adjusted_score, risk_profile,
+           preferred_expression, rationale, source_fingerprint, created_at, updated_at
          ) SELECT
            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-           $15::jsonb, $16, $2, $2
-           WHERE ${fencePredicate(17)}
-         ON CONFLICT (symbol, as_of, risk_profile) DO UPDATE SET
+           $15, $16, $17::jsonb, $18, $2, $2
+           WHERE ${fencePredicate(19)}
+         ON CONFLICT (symbol, as_of, risk_profile, strategy_family, expression_id) DO UPDATE SET
            direction = EXCLUDED.direction, horizon = EXCLUDED.horizon,
            entry_reference = EXCLUDED.entry_reference,
            upside_target = EXCLUDED.upside_target,
@@ -1192,12 +1197,12 @@ export class PostgresMarketDataRepository {
         const strategy = row.optionsStrategy;
         const strategyResult = await context.transaction.query(
           `INSERT INTO options_strategy_snapshots(
-             symbol, as_of, risk_profile, direction, preferred_expression,
-             alternatives, rationale, options_candidate, source_fingerprint,
-             created_at, updated_at
-           ) SELECT $1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8::jsonb, $9, $2, $2
-             WHERE ${fencePredicate(10)}
-           ON CONFLICT (symbol, as_of, risk_profile) DO UPDATE SET
+             symbol, as_of, risk_profile, strategy_family, expression_id, direction,
+             preferred_expression, alternatives, rationale, options_candidate,
+             source_fingerprint, created_at, updated_at
+           ) SELECT $1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10::jsonb, $11, $2, $2
+             WHERE ${fencePredicate(12)}
+           ON CONFLICT (symbol, as_of, risk_profile, strategy_family, expression_id) DO UPDATE SET
              direction = EXCLUDED.direction,
              preferred_expression = EXCLUDED.preferred_expression,
              alternatives = EXCLUDED.alternatives,
@@ -1207,16 +1212,17 @@ export class PostgresMarketDataRepository {
              updated_at = EXCLUDED.updated_at`,
           [
             normalizedSymbol(row.symbol), iso(row.asOf), row.riskProfile,
-            row.direction, row.preferredExpression,
-            json(strategy.alternatives ?? []), json(strategy.rationale ?? []),
-            json(strategy.optionsCandidate ?? null), row.sourceFingerprint,
+            row.strategyFamily, row.expressionId, row.direction,
+            row.preferredExpression, json(strategy.alternatives ?? []),
+            json(strategy.rationale ?? []), json(strategy.optionsCandidate ?? null),
+            row.sourceFingerprint,
             ...fenceValues(context.schedulerFence)
           ]
         );
         assertWritten(strategyResult.rowCount);
       }
     }
-    return { stored: rows.length };
+    return { stored: unique.length };
   }
 
   async listBars(input: {
