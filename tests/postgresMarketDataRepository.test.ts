@@ -274,6 +274,20 @@ test("target snapshot upserts preserve four same-key SPY lane identities", async
   const expectedPairs = lanes.map((lane) => [lane.strategyFamily, lane.expressionId]);
   const targetWrites = fake.queries.filter((entry) => entry.text.includes("INSERT INTO target_snapshots"));
   const optionStrategyWrites = fake.queries.filter((entry) => entry.text.includes("INSERT INTO options_strategy_snapshots"));
+  const targetSql = targetWrites[0]!.text.replace(/\s+/g, " ").trim();
+  const optionStrategySql = optionStrategyWrites[0]!.text.replace(/\s+/g, " ").trim();
+  assert.match(targetSql, /INSERT INTO target_snapshots\( symbol, as_of, strategy_family, expression_id, direction, horizon, entry_reference, upside_target, downside_risk, stop_loss, take_profit, confidence, expected_return, volatility_adjusted_score, risk_profile, preferred_expression, rationale, source_fingerprint, created_at, updated_at \) SELECT \$1, \$2, \$3, \$4, \$5, \$6, \$7, \$8, \$9, \$10, \$11, \$12, \$13, \$14, \$15, \$16, \$17::jsonb, \$18, \$2, \$2 WHERE/);
+  assert.match(optionStrategySql, /INSERT INTO options_strategy_snapshots\( symbol, as_of, risk_profile, strategy_family, expression_id, direction, preferred_expression, alternatives, rationale, options_candidate, source_fingerprint, created_at, updated_at \) SELECT \$1, \$2, \$3, \$4, \$5, \$6, \$7, \$8::jsonb, \$9::jsonb, \$10::jsonb, \$11, \$2, \$2 WHERE/);
+  assert.deepEqual(targetWrites.map((write, index) => write.values?.slice(0, 18)), lanes.map((lane) => [
+    "SPY", "2026-07-20T20:00:00.000Z", lane.strategyFamily, lane.expressionId,
+    "long", "1d", 624, 12, 6, 618, 636, 0.8, 0.02, 1.2, "aggressive",
+    lane.preferredExpression, "[\"lane target\"]", "target-source-1"
+  ]));
+  assert.deepEqual(optionStrategyWrites.map((write) => write.values?.slice(0, 11)), lanes.map((lane) => [
+    "SPY", "2026-07-20T20:00:00.000Z", "aggressive", lane.strategyFamily,
+    lane.expressionId, "long", lane.preferredExpression, "[\"shares\"]",
+    "[\"lane target\"]", "{\"symbol\":\"SPY260720C00625000\"}", "target-source-1"
+  ]));
   for (const writes of [targetWrites, optionStrategyWrites]) {
     assert.equal(writes.length, 4);
     for (const write of writes) {
@@ -323,6 +337,157 @@ test("target snapshots fail closed on a conflicting five-column identity", async
   assert.equal(fake.queries.filter((entry) => entry.text.includes("INSERT INTO target_snapshots")).length, 0);
   assert.ok(outcome instanceof Error);
   assert.equal(outcome.message, "POSTGRES_TARGET_IDENTITY_CONFLICT");
+});
+
+test("equivalent persisted target duplicates collapse after option-strategy normalization", async () => {
+  const fake = fakeClient();
+  const repository = new PostgresMarketDataRepository();
+  const context = contextFor(fake.client);
+  const target = {
+    symbol: "SPY",
+    asOf: "2026-07-20T20:00:00.000Z",
+    strategyFamily: "standard_option" as const,
+    expressionId: "option:SPY260720C00625000",
+    direction: "long" as const,
+    horizon: "1d",
+    entryReference: 624,
+    upsideTarget: 12,
+    downsideRisk: 6,
+    stopLoss: 618,
+    takeProfit: 636,
+    confidence: 0.8,
+    expectedReturn: 0.02,
+    volatilityAdjustedScore: 1.2,
+    riskProfile: "aggressive",
+    preferredExpression: "long_call",
+    rationale: ["equivalent duplicate"],
+    sourceFingerprint: "target-source-1",
+    optionsStrategy: {}
+  };
+
+  const result = await repository.upsertTargetSnapshots(
+    [target, { ...target, optionsStrategy: { alternatives: [] } }],
+    context
+  );
+
+  assert.deepEqual(result, { stored: 1 });
+  assert.equal(fake.queries.filter((entry) => entry.text.includes("INSERT INTO target_snapshots")).length, 1);
+  assert.equal(fake.queries.filter((entry) => entry.text.includes("INSERT INTO options_strategy_snapshots")).length, 1);
+});
+
+test("target snapshots reject changed material target values before writing", async () => {
+  const fake = fakeClient();
+  const repository = new PostgresMarketDataRepository();
+  const context = contextFor(fake.client);
+  const target = {
+    symbol: "SPY",
+    asOf: "2026-07-20T20:00:00.000Z",
+    strategyFamily: "equity" as const,
+    expressionId: "equity:shares",
+    direction: "long" as const,
+    horizon: "1d",
+    entryReference: 624,
+    upsideTarget: 12,
+    downsideRisk: 6,
+    stopLoss: 618,
+    takeProfit: 636,
+    confidence: 0.8,
+    expectedReturn: 0.02,
+    volatilityAdjustedScore: 1.2,
+    riskProfile: "aggressive",
+    preferredExpression: "shares",
+    rationale: ["material target"],
+    sourceFingerprint: "target-source-1",
+    optionsStrategy: null
+  };
+
+  const outcome = await repository.upsertTargetSnapshots(
+    [target, { ...target, confidence: 0.81 }],
+    context
+  ).then(() => null, (error: unknown) => error);
+
+  assert.equal(fake.queries.filter((entry) => /INSERT INTO/.test(entry.text)).length, 0);
+  assert.ok(outcome instanceof Error);
+  assert.equal(outcome.message, "POSTGRES_TARGET_IDENTITY_CONFLICT");
+});
+
+test("target snapshots reject changed persisted option-strategy values before writing", async () => {
+  const fake = fakeClient();
+  const repository = new PostgresMarketDataRepository();
+  const context = contextFor(fake.client);
+  const target = {
+    symbol: "SPY",
+    asOf: "2026-07-20T20:00:00.000Z",
+    strategyFamily: "standard_option" as const,
+    expressionId: "option:SPY260720C00625000",
+    direction: "long" as const,
+    horizon: "1d",
+    entryReference: 624,
+    upsideTarget: 12,
+    downsideRisk: 6,
+    stopLoss: 618,
+    takeProfit: 636,
+    confidence: 0.8,
+    expectedReturn: 0.02,
+    volatilityAdjustedScore: 1.2,
+    riskProfile: "aggressive",
+    preferredExpression: "long_call",
+    rationale: ["material strategy"],
+    sourceFingerprint: "target-source-1",
+    optionsStrategy: {
+      alternatives: ["shares"],
+      rationale: [],
+      optionsCandidate: { symbol: "SPY260720C00625000" }
+    }
+  };
+
+  const outcome = await repository.upsertTargetSnapshots(
+    [target, { ...target, optionsStrategy: { ...target.optionsStrategy, alternatives: ["vertical"] } }],
+    context
+  ).then(() => null, (error: unknown) => error);
+
+  assert.equal(fake.queries.filter((entry) => /INSERT INTO/.test(entry.text)).length, 0);
+  assert.ok(outcome instanceof Error);
+  assert.equal(outcome.message, "POSTGRES_TARGET_IDENTITY_CONFLICT");
+});
+
+test("target duplicate identity keys cannot collide on literal separators", async () => {
+  const fake = fakeClient();
+  const repository = new PostgresMarketDataRepository();
+  const context = contextFor(fake.client);
+  const target = {
+    symbol: "SPY",
+    asOf: "2026-07-20T20:00:00.000Z",
+    strategyFamily: "b" as never,
+    expressionId: "expression",
+    direction: "long" as const,
+    horizon: "1d",
+    entryReference: 624,
+    upsideTarget: 12,
+    downsideRisk: 6,
+    stopLoss: 618,
+    takeProfit: 636,
+    confidence: 0.8,
+    expectedReturn: 0.02,
+    volatilityAdjustedScore: 1.2,
+    riskProfile: "aggressive\\0a",
+    preferredExpression: "long_call",
+    rationale: ["separator collision"],
+    sourceFingerprint: "target-source-1",
+    optionsStrategy: null
+  };
+
+  const result = await repository.upsertTargetSnapshots([
+    target,
+    {
+      ...target,
+      riskProfile: "aggressive",
+      strategyFamily: "a\\0b" as never
+    }
+  ], context);
+
+  assert.deepEqual(result, { stored: 2 });
+  assert.equal(fake.queries.filter((entry) => entry.text.includes("INSERT INTO target_snapshots")).length, 2);
 });
 
 test("option contract and snapshot writes use bounded batches and deduplicate identities", async () => {

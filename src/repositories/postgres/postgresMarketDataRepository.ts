@@ -431,18 +431,58 @@ const chunks = <T>(rows: readonly T[], size = POSTGRES_MARKET_DATA_WRITE_BATCH_S
   for (let index = 0; index < rows.length; index += size) result.push(rows.slice(index, index + size) as T[]);
   return result;
 };
-const dedupeStable = <T>(rows: readonly T[], keyOf: (row: T) => string, conflictCode = "POSTGRES_MARKET_DATA_DUPLICATE_IDENTITY_CONFLICT") => {
+const dedupeStable = <T>(
+  rows: readonly T[],
+  keyOf: (row: T) => string,
+  conflictCode = "POSTGRES_MARKET_DATA_DUPLICATE_IDENTITY_CONFLICT",
+  fingerprintOf = (row: T) => canonicalJson(parseJsonValue(JSON.parse(JSON.stringify(row))))
+) => {
   const unique = new Map<string, T>();
   for (const row of rows) {
     const key = keyOf(row);
     const previous = unique.get(key);
-    const fingerprint = canonicalJson(parseJsonValue(JSON.parse(JSON.stringify(row))));
-    if (previous && canonicalJson(parseJsonValue(JSON.parse(JSON.stringify(previous)))) !== fingerprint) {
+    const fingerprint = fingerprintOf(row);
+    if (previous && fingerprintOf(previous) !== fingerprint) {
       throw new Error(conflictCode);
     }
     if (!previous) unique.set(key, row);
   }
   return [...unique.values()];
+};
+const targetSnapshotIdentityKey = (row: PostgresTargetSnapshot) => canonicalJson([
+  normalizedSymbol(row.symbol),
+  iso(row.asOf),
+  row.riskProfile,
+  row.strategyFamily,
+  row.expressionId
+]);
+const targetSnapshotPersistenceFingerprint = (row: PostgresTargetSnapshot) => {
+  const strategy = row.optionsStrategy;
+  return canonicalJson(parseJsonValue({
+    symbol: normalizedSymbol(row.symbol),
+    asOf: iso(row.asOf),
+    strategyFamily: row.strategyFamily,
+    expressionId: row.expressionId,
+    direction: row.direction,
+    horizon: row.horizon,
+    entryReference: row.entryReference,
+    upsideTarget: row.upsideTarget,
+    downsideRisk: row.downsideRisk,
+    stopLoss: row.stopLoss,
+    takeProfit: row.takeProfit,
+    confidence: row.confidence,
+    expectedReturn: row.expectedReturn,
+    volatilityAdjustedScore: row.volatilityAdjustedScore,
+    riskProfile: row.riskProfile,
+    preferredExpression: row.preferredExpression,
+    rationale: json(row.rationale),
+    sourceFingerprint: row.sourceFingerprint,
+    optionsStrategy: strategy ? {
+      alternatives: json(strategy.alternatives ?? []),
+      rationale: json(strategy.rationale ?? []),
+      optionsCandidate: json(strategy.optionsCandidate ?? null)
+    } : null
+  }));
 };
 
 const writeOptionSnapshotBatch = (
@@ -1156,8 +1196,9 @@ export class PostgresMarketDataRepository {
     await requireFence(context);
     const unique = dedupeStable(
       rows,
-      (row) => `${normalizedSymbol(row.symbol)}\\0${iso(row.asOf)}\\0${row.riskProfile}\\0${row.strategyFamily}\\0${row.expressionId}`,
-      "POSTGRES_TARGET_IDENTITY_CONFLICT"
+      targetSnapshotIdentityKey,
+      "POSTGRES_TARGET_IDENTITY_CONFLICT",
+      targetSnapshotPersistenceFingerprint
     );
     for (const row of unique) {
       const values = [
