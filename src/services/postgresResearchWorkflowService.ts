@@ -681,23 +681,14 @@ const persistCandidates = async (input: {
         reasons.push("CURRENT_OPTION_EVIDENCE_REQUIRED");
       }
       const optionSymbol = typeof option?.optionSymbol === "string" ? option.optionSymbol : null;
-      const expirationDate = typeof option?.expirationDate === "string" ? option.expirationDate : null;
-      const optionDte = expirationDate
+      const optionDte = typeof option?.expirationDate === "string"
         ? optionDaysToExpiration(
-            expirationDate,
+            option.expirationDate,
             `${newYorkDate(input.now)}T00:00:00.000Z`
           )
         : null;
       const leapsPolicy = postgresLeapsPolicy();
-      const strategyFamily = optionSymbol
-        ? target.symbol === "SPY" && expirationDate === newYorkDate(input.now)
-          ? "zero_dte_spy"
-          : optionDte !== null &&
-              optionDte >= leapsPolicy.minDte &&
-              optionDte <= leapsPolicy.maxDte
-            ? "leaps"
-            : "standard_option"
-        : "equity";
+      const strategyFamily = target.strategyFamily;
       const baseCandidateScore = scoreTarget(target, input.now);
       const researchLane = researchLaneForStrategyFamily(strategyFamily);
       const researchInfluence = researchLane

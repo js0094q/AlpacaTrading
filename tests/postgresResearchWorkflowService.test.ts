@@ -783,6 +783,8 @@ test("research assigns zero_dte_spy only to a matching SPY same-day option expre
   const zeroDteTarget = {
     ...target,
     preferredExpression: "long_call" as const,
+    strategyFamily: "zero_dte_spy" as const,
+    expressionId: "option:SPY260720C00555000",
     optionsStrategy: {
       alternatives: ["shares"], rationale: [],
       optionsCandidate: {
@@ -837,6 +839,8 @@ test("research classifies a production long-dated option with repository LEAPS p
   const leapsTarget = {
     ...target,
     preferredExpression: "long_put" as const,
+    strategyFamily: "leaps" as const,
+    expressionId: "option:SPY270416P00500000",
     direction: "short" as const,
     optionsStrategy: {
       alternatives: ["shares"],
@@ -997,6 +1001,68 @@ test("research keeps same-symbol zero-DTE and LEAPS evidence and candidate ident
   );
 });
 
+test("research candidates retain stored target families when current reclassification agrees", async () => {
+  const candidateWrites: Array<readonly unknown[]> = [];
+  const sharedOptionTarget = {
+    ...target,
+    sourceFingerprint: "same-target-source",
+    strategyFamily: "zero_dte_spy" as const,
+    expressionId: "option:SPY260720C00555000",
+    preferredExpression: "long_call" as const,
+    optionsStrategy: {
+      alternatives: ["shares"], rationale: [],
+      optionsCandidate: {
+        optionSymbol: "SPY260720C00555000", type: "call", expirationDate: "2026-07-20",
+        strike: 555, estimatedEntryPrice: 2, liquidityScore: 0.9
+      }
+    }
+  };
+  await runPostgresResearchWorkflow({
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("INSERT INTO candidates")) candidateWrites.push(values ?? []);
+        if (statement.includes("to_regclass('public.learning_runs')")) {
+          return { rows: [{ learning_model_relation: null }], rowCount: 1 };
+        }
+        return {
+          rows: statement.includes("INSERT INTO research_runs") ? [{ version: "1" }] : [],
+          rowCount: 1
+        };
+      }
+    },
+    fence,
+    riskProfile: "aggressive",
+    optionsEnabled: true,
+    maxCandidates: 10,
+    now: new Date("2026-07-20T18:00:00.000Z"),
+    dependencies: {
+      refreshMarketData: async () => ({
+        bars: [bar], stockSnapshots: [], optionContracts: [], optionSnapshots: [], summary: {}
+      }) as never,
+      buildFeaturesAndTargets: async () => ({
+        features: [],
+        targets: [
+          sharedOptionTarget,
+          { ...sharedOptionTarget, strategyFamily: "standard_option" as const }
+        ]
+      }),
+      symbols: ["SPY"]
+    }
+  });
+
+  assert.equal(candidateWrites.length, 2);
+  assert.equal(new Set(candidateWrites.map((values) => values[0])).size, 2);
+  assert.deepEqual(
+    candidateWrites.map((values) => [values[12], values[4]]).sort((left, right) =>
+      String(left[0]).localeCompare(String(right[0]))
+    ),
+    [
+      ["standard_option", "SPY260720C00555000"],
+      ["zero_dte_spy", "SPY260720C00555000"]
+    ]
+  );
+});
+
 const storedResearchSignal = (overrides: Record<string, unknown> = {}) => ({
   id: "research_signal_" + "a".repeat(64),
   provider: "public-equity-export",
@@ -1104,6 +1170,8 @@ test("LEAPS consumes only current long-horizon research without replacing option
     expectedReturn: 0.05,
     volatilityAdjustedScore: 0.2,
     preferredExpression: "long_call" as const,
+    strategyFamily: "leaps" as const,
+    expressionId: "option:SPY270416C00600000",
     optionsStrategy: {
       alternatives: ["shares"],
       rationale: [],
@@ -1181,6 +1249,8 @@ test("0DTE remains independent and records only a current-session catalyst", asy
       expectedReturn: 0.05,
       volatilityAdjustedScore: 0.2,
       preferredExpression: "long_call" as const,
+      strategyFamily: "zero_dte_spy" as const,
+      expressionId: "option:SPY260720C00555000",
       optionsStrategy: {
         alternatives: ["shares"],
         rationale: [],
