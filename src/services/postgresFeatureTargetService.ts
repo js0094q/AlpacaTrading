@@ -21,6 +21,7 @@ import {
 import { AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS } from "./autonomousFreshnessPolicy.js";
 import { selectExpressionWithPolicy } from "./strategySelectionLogic.js";
 import { optionDaysToExpiration } from "./optionSymbolService.js";
+import { targetIdentity } from "./targetIdentityService.js";
 
 type FeatureTargetWriter = Pick<
   PostgresMarketDataRepository,
@@ -859,6 +860,14 @@ const targetFromFeature = (input: {
       : null,
     hasOptionsData: optionCandidate !== null
   }, input.riskProfile === "aggressive", input.decisionThresholds);
+  const strategyFamily = optionCandidate
+    ? optionLane(optionCandidate.expirationDate, input.feature.observedAt)
+    : "equity";
+  const identity = targetIdentity({
+    strategyFamily,
+    preferredExpression: selector.preferredExpression,
+    optionSymbol: optionCandidate?.optionSymbol ?? null
+  });
   const rationale = [
     ...selector.rationale,
     `Risk profile set to ${input.riskProfile}`,
@@ -872,6 +881,7 @@ const targetFromFeature = (input: {
   return {
     symbol: input.feature.symbol,
     asOf: input.feature.observedAt,
+    ...identity,
     direction,
     horizon: "1d",
     entryReference: close,

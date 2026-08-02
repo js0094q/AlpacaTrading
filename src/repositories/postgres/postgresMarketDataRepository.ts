@@ -1,4 +1,5 @@
 import type { JsonValue } from "../contracts/common.js";
+import type { TargetStrategyFamily } from "../../services/targetIdentityService.js";
 import {
   postgresErrorTelemetry,
   readPostgresQueryTelemetry
@@ -139,6 +140,8 @@ export type PostgresFeatureSnapshot = {
 export type PostgresTargetSnapshot = {
   symbol: string;
   asOf: string;
+  strategyFamily: TargetStrategyFamily;
+  expressionId: string;
   direction: "long" | "short" | "neutral";
   horizon: string;
   entryReference: number;

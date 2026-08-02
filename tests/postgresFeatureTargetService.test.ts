@@ -170,6 +170,7 @@ test("paper exploration admits a 10 percent option spread while the baseline rem
 
 test("a higher-ranked longer-dated SPY call cannot erase an eligible same-day call", async () => {
   const zeroDteSymbol = "SPY260629C00560000";
+  const standardSymbol = "SPY260829C00560000";
   const leapsSymbol = "SPY270618C00560000";
   const result = await buildOptionFeaturesFixture({
     exploration: true,
@@ -184,6 +185,7 @@ test("a higher-ranked longer-dated SPY call cannot erase an eligible same-day ca
     },
     contracts: [
       optionContractFixture(zeroDteSymbol, 560, { expirationDate: "2026-06-29" }),
+      optionContractFixture(standardSymbol, 560),
       optionContractFixture(leapsSymbol, 560, { expirationDate: "2027-06-18" })
     ],
     snapshots: [
@@ -194,6 +196,12 @@ test("a higher-ranked longer-dated SPY call cannot erase an eligible same-day ca
         retrievedAt: "2026-06-29T18:00:00.000Z",
         bid: 4.5, ask: 5, midpoint: 4.75, spread: 0.5,
         spreadPct: 0.1052631579, volume: 100, openInterest: 500
+      }),
+      optionSnapshotFixture(standardSymbol, {
+        observedAt: "2026-06-29T18:00:00.000Z",
+        quoteTimestamp: "2026-06-29T17:59:59.000Z",
+        snapshotTimestamp: "2026-06-29T17:59:59.000Z",
+        retrievedAt: "2026-06-29T18:00:00.000Z"
       }),
       optionSnapshotFixture(leapsSymbol, {
         observedAt: "2026-06-29T18:00:00.000Z",
@@ -220,6 +228,15 @@ test("a higher-ranked longer-dated SPY call cannot erase an eligible same-day ca
     contracts: result.features.at(-1)!.features.optionContractFeatures
   }));
   assert.equal(selected.some((candidate) => candidate.optionSymbol === leapsSymbol), true);
+  assert.deepEqual(
+    result.targets.map(({ strategyFamily }) => strategyFamily).sort(),
+    ["leaps", "standard_option", "zero_dte_spy"].sort()
+  );
+  assert.equal(new Set(result.targets.map(({ expressionId }) => expressionId)).size, 3);
+  assert.equal(
+    result.targets.every(({ expressionId }) => expressionId.startsWith("option:SPY")),
+    true
+  );
 });
 
 test("existing indicators and target thresholds persist genuine PostgreSQL features and targets", async () => {
@@ -259,6 +276,8 @@ test("existing indicators and target thresholds persist genuine PostgreSQL featu
   assert.equal(target.direction, "long");
   assert.equal(target.riskProfile, "aggressive");
   assert.notEqual(target.preferredExpression, "none");
+  assert.equal(target.strategyFamily, "equity");
+  assert.equal(target.expressionId, "equity:shares");
   assert.equal(stored.features?.length, 60);
   assert.equal(stored.targets?.length, 1);
 });
