@@ -39,6 +39,81 @@ import {
 
 const enabled = process.env.POSTGRES_INTEGRATION_TEST_ENABLED === "true";
 
+test("PostgreSQL integration cleanup attempts every step and aggregates failures", async () => {
+  const attempted: string[] = [];
+
+  await assert.rejects(
+    runPostgresIntegrationCleanup([
+      {
+        name: "schema_pool_close",
+        run: async () => {
+          attempted.push("schema_pool_close");
+          throw new Error("schema pool close failed");
+        }
+      },
+      {
+        name: "schema_drop",
+        run: async () => {
+          attempted.push("schema_drop");
+        }
+      },
+      {
+        name: "admin_pool_close",
+        run: async () => {
+          attempted.push("admin_pool_close");
+          throw new Error("admin pool close failed");
+        }
+      },
+      {
+        name: "temporary_directory_remove",
+        run: async () => {
+          attempted.push("temporary_directory_remove");
+        }
+      }
+    ]),
+    (error: unknown) => {
+      if (!(error instanceof AggregateError) || error.errors.length !== 2) return false;
+      assert.deepEqual(
+        error.errors.map((failure) => (failure as Error).message),
+        [
+          "POSTGRES_INTEGRATION_CLEANUP_FAILED:schema_pool_close",
+          "POSTGRES_INTEGRATION_CLEANUP_FAILED:admin_pool_close"
+        ]
+      );
+      return true;
+    }
+  );
+  assert.deepEqual(attempted, [
+    "schema_pool_close",
+    "schema_drop",
+    "admin_pool_close",
+    "temporary_directory_remove"
+  ]);
+});
+
+type PostgresIntegrationCleanupStep = {
+  readonly name: string;
+  readonly run: () => Promise<void>;
+};
+
+const runPostgresIntegrationCleanup = async (
+  steps: readonly PostgresIntegrationCleanupStep[]
+) => {
+  const failures: Error[] = [];
+  for (const step of steps) {
+    try {
+      await step.run();
+    } catch (error) {
+      failures.push(new Error(`POSTGRES_INTEGRATION_CLEANUP_FAILED:${step.name}`, {
+        cause: error
+      }));
+    }
+  }
+  if (failures.length) {
+    throw new AggregateError(failures, "POSTGRES_INTEGRATION_CLEANUP_FAILED");
+  }
+};
+
 const runPackagedControlPlaneCommand = (input: {
   readonly command: "db:postgres:control-plane:backfill" | "db:postgres:control-plane:reconcile";
   readonly snapshotPath: string;
@@ -590,13 +665,18 @@ test("actual Neon PostgreSQL applies every migration twice and fences concurrent
       .replaceAll(" ", "_") || "parameter_unknown";
     failureCode = `${phase}:${safe.code || "POSTGRES_INTEGRATION_TEST_FAILED"}:${parameter}`;
   } finally {
-    try {
-      if (schemaPool) await schemaPool.end();
-      await adminPool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
-    } catch (error) {
-      failureCode ||= sanitizeDatabaseError(error).code || "POSTGRES_INTEGRATION_CLEANUP_FAILED";
+    const cleanupFailure = await runPostgresIntegrationCleanup([
+      { name: "schema_pool_close", run: async () => { if (schemaPool) await schemaPool.end(); } },
+      {
+        name: "schema_drop",
+        run: async () => { await adminPool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`); }
+      },
+      { name: "admin_pool_close", run: async () => { await adminPool.end(); } }
+    ]).then(() => null, (error: unknown) => error);
+    if (cleanupFailure) {
+      failureCode ||= sanitizeDatabaseError(cleanupFailure).code ||
+        "POSTGRES_INTEGRATION_CLEANUP_FAILED";
     }
-    await adminPool.end();
   }
 
   if (failureCode) throw new Error(`POSTGRES_INTEGRATION_TEST_FAILED:${failureCode}`);
@@ -856,14 +936,19 @@ test("actual Neon reconciles fixed-scale partial state without candidate updates
     const safe = sanitizeDatabaseError(error);
     failureCode = `${phase}:${safe.code || "POSTGRES_RECONCILIATION_TEST_FAILED"}`;
   } finally {
-    try {
-      if (schemaPool) await schemaPool.end();
-      await adminPool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
-    } catch (error) {
-      failureCode ||= sanitizeDatabaseError(error).code || "POSTGRES_INTEGRATION_CLEANUP_FAILED";
+    const cleanupFailure = await runPostgresIntegrationCleanup([
+      { name: "schema_pool_close", run: async () => { if (schemaPool) await schemaPool.end(); } },
+      {
+        name: "schema_drop",
+        run: async () => { await adminPool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`); }
+      },
+      { name: "admin_pool_close", run: async () => { await adminPool.end(); } },
+      { name: "temporary_directory_remove", run: async () => { await rm(directory, { recursive: true, force: true }); } }
+    ]).then(() => null, (error: unknown) => error);
+    if (cleanupFailure) {
+      failureCode ||= sanitizeDatabaseError(cleanupFailure).code ||
+        "POSTGRES_INTEGRATION_CLEANUP_FAILED";
     }
-    await adminPool.end();
-    await rm(directory, { recursive: true, force: true });
   }
 
   if (failureCode) throw new Error(`POSTGRES_RECONCILIATION_TEST_FAILED:${failureCode}`);
@@ -1027,14 +1112,19 @@ test("actual Neon backfills and reconciles Release 4 execution state idempotentl
     const safe = sanitizeDatabaseError(error);
     failureCode = `${phase}:${safe.code || "POSTGRES_EXECUTION_STATE_TEST_FAILED"}`;
   } finally {
-    try {
-      if (schemaPool) await schemaPool.end();
-      await adminPool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
-    } catch (error) {
-      failureCode ||= sanitizeDatabaseError(error).code || "POSTGRES_INTEGRATION_CLEANUP_FAILED";
+    const cleanupFailure = await runPostgresIntegrationCleanup([
+      { name: "schema_pool_close", run: async () => { if (schemaPool) await schemaPool.end(); } },
+      {
+        name: "schema_drop",
+        run: async () => { await adminPool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`); }
+      },
+      { name: "admin_pool_close", run: async () => { await adminPool.end(); } },
+      { name: "temporary_directory_remove", run: async () => { await rm(directory, { recursive: true, force: true }); } }
+    ]).then(() => null, (error: unknown) => error);
+    if (cleanupFailure) {
+      failureCode ||= sanitizeDatabaseError(cleanupFailure).code ||
+        "POSTGRES_INTEGRATION_CLEANUP_FAILED";
     }
-    await adminPool.end();
-    await rm(directory, { recursive: true, force: true });
   }
   if (failureCode) throw new Error(`POSTGRES_EXECUTION_STATE_TEST_FAILED:${failureCode}`);
 });
