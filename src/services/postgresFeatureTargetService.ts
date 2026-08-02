@@ -776,15 +776,10 @@ const calculateFeatures = (input: {
   });
 };
 
-const targetFromFeature = (input: {
-  feature: ReturnType<typeof calculateFeatures>[number];
-  riskProfile: RiskProfile;
-  learningAccuracy?: number | null;
-  learningModelName?: string | null;
-  decisionThresholds?: PaperExplorationThresholds;
-  optionCandidateOverride?: ReturnType<typeof calculateFeatures>[number]["optionCandidates"]["call"];
-}): PostgresTargetSnapshot => {
-  const values = input.feature.features;
+const targetDirection = (
+  values: FeatureValues,
+  decisionThresholds?: PaperExplorationThresholds
+) => {
   const directionScore =
     (values.trend === "bullish" ? 1 : values.trend === "bearish" ? -1 : 0) +
     (typeof values.rsi14 === "number" ? (values.rsi14 - 50) / 100 : 0) +
@@ -797,10 +792,22 @@ const targetFromFeature = (input: {
       : typeof values.relativeVolume === "number" ? 0.2 * (values.relativeVolume - 1) : 0) +
     (typeof values.intradayReturn === "number" ? Math.max(-0.25, Math.min(0.25, values.intradayReturn * 5)) : 0) +
     (typeof values.distanceFromVwap === "number" ? Math.max(-0.15, Math.min(0.15, values.distanceFromVwap * 3)) : 0);
-  const direction = classifyDirectionalScore(
+  return {
     directionScore,
-    input.decisionThresholds?.directionScore
-  );
+    direction: classifyDirectionalScore(directionScore, decisionThresholds?.directionScore)
+  };
+};
+
+const targetFromFeature = (input: {
+  feature: ReturnType<typeof calculateFeatures>[number];
+  riskProfile: RiskProfile;
+  learningAccuracy?: number | null;
+  learningModelName?: string | null;
+  decisionThresholds?: PaperExplorationThresholds;
+  optionCandidateOverride?: ReturnType<typeof calculateFeatures>[number]["optionCandidates"]["call"];
+}): PostgresTargetSnapshot => {
+  const values = input.feature.features;
+  const { directionScore, direction } = targetDirection(values, input.decisionThresholds);
   const optionCandidate = input.optionCandidateOverride !== undefined
     ? input.optionCandidateOverride
     : direction === "long"
@@ -969,15 +976,17 @@ export const buildPostgresFeaturesAndTargets = async (input: {
   }) => feature);
   const targets = Array.from(bySymbol.keys()).flatMap((symbol) => {
     const latest = calculated.filter((row) => row.symbol === symbol).at(-1)!;
-    const base = targetFromFeature({
-      feature: latest,
-      riskProfile: input.riskProfile,
-      learningAccuracy: input.learningAccuracy,
-      learningModelName: input.learningModelName,
-      decisionThresholds: input.decisionThresholds
-    });
-    const type = base.direction === "long" ? "call" : base.direction === "short" ? "put" : null;
-    if (!type) return [base];
+    const { direction } = targetDirection(latest.features, input.decisionThresholds);
+    const type = direction === "long" ? "call" : direction === "short" ? "put" : null;
+    if (!type) {
+      return [targetFromFeature({
+        feature: latest,
+        riskProfile: input.riskProfile,
+        learningAccuracy: input.learningAccuracy,
+        learningModelName: input.learningModelName,
+        decisionThresholds: input.decisionThresholds
+      })];
+    }
     const laneCandidates = Object.values(latest.optionCandidatesByLane)
       .map((candidates) => candidates[type])
       .filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== null);
@@ -991,7 +1000,13 @@ export const buildPostgresFeaturesAndTargets = async (input: {
           decisionThresholds: input.decisionThresholds,
           optionCandidateOverride
         }))
-      : [base];
+      : [targetFromFeature({
+          feature: latest,
+          riskProfile: input.riskProfile,
+          learningAccuracy: input.learningAccuracy,
+          learningModelName: input.learningModelName,
+          decisionThresholds: input.decisionThresholds
+        })];
   });
   await repository.upsertFeatureSnapshots(features, input.context);
   await repository.upsertTargetSnapshots(targets, input.context);
