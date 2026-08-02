@@ -22,6 +22,8 @@ const poolWith = (options: {
   invalidConstraint?: string;
   invalidIndex?: string;
   nullableColumn?: string;
+  missingPrimaryKey?: string;
+  invalidPrimaryKey?: string;
   sequence?: boolean;
 } = {}) => ({
   query: async (text: string) => {
@@ -68,6 +70,14 @@ const poolWith = (options: {
         autonomous_trade_lifecycle_transitions_intent_idx: {
           tableName: "autonomous_trade_lifecycle_transitions",
           indexdef: "CREATE INDEX autonomous_trade_lifecycle_transitions_intent_idx ON autonomous_trade_lifecycle_transitions (order_intent_id, occurred_at DESC)"
+        },
+        target_snapshots_family_as_of_idx: {
+          tableName: "target_snapshots",
+          indexdef: "CREATE INDEX target_snapshots_family_as_of_idx ON target_snapshots (strategy_family, as_of DESC, symbol)"
+        },
+        options_strategy_snapshots_family_as_of_idx: {
+          tableName: "options_strategy_snapshots",
+          indexdef: "CREATE INDEX options_strategy_snapshots_family_as_of_idx ON options_strategy_snapshots (strategy_family, as_of DESC, symbol)"
         }
       };
       return {
@@ -106,9 +116,24 @@ const poolWith = (options: {
           })
       } as unknown as QueryResult;
     }
+    if (text.includes("constraint_row.contype = 'p'")) {
+      return {
+        rows: ["target_snapshots", "options_strategy_snapshots"]
+          .filter((table_name) => table_name !== options.missingPrimaryKey)
+          .map((table_name) => ({
+            table_name,
+            definition: options.invalidPrimaryKey === table_name
+              ? "PRIMARY KEY (symbol, as_of, risk_profile)"
+              : "PRIMARY KEY (symbol, as_of, risk_profile, strategy_family, expression_id)"
+          }))
+      } as unknown as QueryResult;
+    }
     if (text.includes("pg_catalog.pg_constraint")) {
       return {
-        rows: [...POSTGRES_RELEASE_3_CONSTRAINTS, ...POSTGRES_AUTONOMOUS_LIFECYCLE_CONSTRAINTS]
+        rows: [
+          ...POSTGRES_RELEASE_3_CONSTRAINTS,
+          ...POSTGRES_AUTONOMOUS_LIFECYCLE_CONSTRAINTS
+        ]
           .filter((conname) => conname !== options.missingConstraint)
           .map((conname) => ({
             conname,
@@ -122,6 +147,10 @@ const poolWith = (options: {
                     ? "autonomous_trade_lifecycle_transitions"
                     : conname.startsWith("reservation_")
                       ? "reservation_terminal_transitions"
+                      : conname === "target_snapshots_strategy_identity_nonempty"
+                        ? "target_snapshots"
+                        : conname === "options_strategy_snapshots_strategy_identity_nonempty"
+                          ? "options_strategy_snapshots"
                       : "workstream_events",
             convalidated: options.invalidConstraint === conname ? false : true,
             definition: conname === "scheduler_leases_timestamp_order"
@@ -154,6 +183,10 @@ const poolWith = (options: {
                     ? "CHECK (btrim(release_reason) <> ''::text)"
                   : conname === "reservation_release_reason_contract"
                     ? "CHECK (release_reason = ANY (ARRAY['broker_terminal_filled'::text, 'broker_absence_established'::text]))"
+                    : conname === "target_snapshots_strategy_identity_nonempty"
+                      ? "CHECK ((btrim(strategy_family) <> ''::text) AND (btrim(expression_id) <> ''::text))"
+                      : conname === "options_strategy_snapshots_strategy_identity_nonempty"
+                        ? "CHECK ((btrim(strategy_family) <> ''::text) AND (btrim(expression_id) <> ''::text))"
                 : "CHECK ((processed_at IS NULL) OR (processing_started_at IS NULL) OR (processed_at >= processing_started_at))"
           }))
       } as unknown as QueryResult;
@@ -204,6 +237,18 @@ test("schema verification requires every operational table, index, and fencing s
   ]) {
     assert.ok(POSTGRES_RELEASE_3_COLUMNS.includes(column as never), column);
   }
+  for (const column of [
+    "target_snapshots.strategy_family",
+    "target_snapshots.expression_id",
+    "options_strategy_snapshots.strategy_family",
+    "options_strategy_snapshots.expression_id"
+  ]) {
+    assert.ok(POSTGRES_RELEASE_3_COLUMNS.includes(column as never), column);
+  }
+  assert.ok(POSTGRES_RELEASE_3_CONSTRAINTS.includes("target_snapshots_strategy_identity_nonempty"));
+  assert.ok(POSTGRES_RELEASE_3_CONSTRAINTS.includes("options_strategy_snapshots_strategy_identity_nonempty"));
+  assert.ok(POSTGRES_OPERATIONAL_INDEXES.includes("target_snapshots_family_as_of_idx"));
+  assert.ok(POSTGRES_OPERATIONAL_INDEXES.includes("options_strategy_snapshots_family_as_of_idx"));
   assert.equal(result.presentIndexCount, POSTGRES_OPERATIONAL_INDEXES.length);
   assert.deepEqual(result.missingTables, []);
   assert.deepEqual(result.missingIndexes, []);
@@ -213,6 +258,7 @@ test("schema verification requires every operational table, index, and fencing s
   assert.deepEqual(result.invalidNotNullColumns, []);
   assert.deepEqual(result.invalidIndexes, []);
   assert.deepEqual(result.invalidConstraints, []);
+  assert.deepEqual(result.invalidPrimaryKeys, []);
 });
 
 test("schema verification reports exact missing objects without connection details", async () => {
@@ -237,4 +283,36 @@ test("schema verification reports exact missing objects without connection detai
   assert.deepEqual(result.invalidIndexes, ["candidates_decision_id_idx"]);
   assert.deepEqual(result.invalidConstraints, ["scheduler_leases_timestamp_order"]);
   assert.equal(result.schedulerFencingSequencePresent, false);
+});
+
+test("schema verification rejects a missing target lane identity column", async () => {
+  const result = await verifyPostgresSchema(poolWith({
+    missingColumn: "target_snapshots.strategy_family"
+  }));
+  assert.equal(result.verificationPassed, false);
+  assert.deepEqual(result.missingColumns, ["target_snapshots.strategy_family"]);
+});
+
+test("schema verification rejects an invalid named target lane identity constraint", async () => {
+  const result = await verifyPostgresSchema(poolWith({
+    invalidConstraint: "target_snapshots_strategy_identity_nonempty"
+  }));
+  assert.equal(result.verificationPassed, false);
+  assert.deepEqual(result.invalidConstraints, ["target_snapshots_strategy_identity_nonempty"]);
+});
+
+test("schema verification rejects a missing target family and as-of index", async () => {
+  const result = await verifyPostgresSchema(poolWith({
+    missingIndex: "target_snapshots_family_as_of_idx"
+  }));
+  assert.equal(result.verificationPassed, false);
+  assert.deepEqual(result.missingIndexes, ["target_snapshots_family_as_of_idx"]);
+});
+
+test("schema verification rejects an old three-column target primary key", async () => {
+  const result = await verifyPostgresSchema(poolWith({
+    invalidPrimaryKey: "target_snapshots"
+  }));
+  assert.equal(result.verificationPassed, false);
+  assert.deepEqual(result.invalidPrimaryKeys, ["target_snapshots"]);
 });

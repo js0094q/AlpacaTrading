@@ -465,7 +465,8 @@ const persistEvidence = async (input: {
   }));
   rows.push(...input.targets.map((row) => ({
     type: "target_snapshot", symbol: row.symbol, observedAt: row.asOf,
-    table: "target_snapshots", key: `${row.symbol}:${row.asOf}:${row.riskProfile}`,
+    table: "target_snapshots",
+    key: `${row.symbol}:${row.asOf}:${row.riskProfile}:${row.strategyFamily}:${row.expressionId}`,
     fingerprint: row.sourceFingerprint, payload: row
   })));
   const uniqueById = new Map<string, Record<string, unknown>>();
@@ -779,7 +780,12 @@ const persistCandidates = async (input: {
         score, candidateScore, researchInfluence, historicalEvidence, rank,
         selected, reasons
       } = row;
-      const id = `candidate_${canonicalJsonHash({ run: input.researchRunId, source: target.sourceFingerprint })}`;
+      const id = `candidate_${canonicalJsonHash({
+        run: input.researchRunId,
+        source: target.sourceFingerprint,
+        strategyFamily,
+        expressionId: target.expressionId
+      })}`;
       const signalInputs = attachHistoricalOutcomeEvidence({
         targetSourceFingerprint: target.sourceFingerprint,
         marketEvidenceTimestamp: target.asOf,

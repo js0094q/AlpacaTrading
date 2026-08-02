@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 
 import {
+  readPostgresDashboardData,
   readPostgresWorkerHealth,
   readPostgresZeroDteDashboardSummary,
   type PostgresDashboardQuery
@@ -107,5 +108,43 @@ describe("PostgreSQL dashboard read services", () => {
     assert.equal(summary.engine.status, "blocked");
     assert.equal(summary.queue.length, 1);
     assert.deepEqual(summary.queue[0]?.blockers, ["STRATEGY_DECISION_BLOCKED", "CANDIDATE_LIFECYCLE_BLOCKED"]);
+  });
+
+  test("keeps same-cycle SPY zero-DTE and LEAPS candidate identities in dashboard plans", async () => {
+    const data = await readPostgresDashboardData(queryFor((sql) => {
+      if (sql.includes("SELECT candidate.id, candidate.id AS candidate_id")) {
+        return [
+          {
+            id: "candidate-zero-dte", candidate_id: "candidate-zero-dte", symbol: "SPY",
+            option_symbol: "SPY260722C00500000", strategy_family: "zero_dte_spy"
+          },
+          {
+            id: "candidate-leaps", candidate_id: "candidate-leaps", symbol: "SPY",
+            option_symbol: "SPY270416C00600000", strategy_family: "leaps"
+          }
+        ];
+      }
+      return [];
+    }));
+
+    assert.deepEqual(
+      data.latestPaperPlans.map((plan) => ({
+        candidateId: plan.candidate_id,
+        strategyFamily: plan.strategy_family,
+        optionSymbol: plan.option_symbol
+      })),
+      [
+        {
+          candidateId: "candidate-zero-dte",
+          strategyFamily: "zero_dte_spy",
+          optionSymbol: "SPY260722C00500000"
+        },
+        {
+          candidateId: "candidate-leaps",
+          strategyFamily: "leaps",
+          optionSymbol: "SPY270416C00600000"
+        }
+      ]
+    );
   });
 });

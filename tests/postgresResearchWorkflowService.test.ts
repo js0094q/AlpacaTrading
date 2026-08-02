@@ -32,7 +32,8 @@ const target = {
   takeProfit: 570, confidence: 0.9, expectedReturn: 1.5,
   volatilityAdjustedScore: 1.2, riskProfile: "aggressive",
   preferredExpression: "shares", rationale: ["Observed bullish trend"],
-  sourceFingerprint: "target-fingerprint", optionsStrategy: null
+  sourceFingerprint: "target-fingerprint", optionsStrategy: null,
+  strategyFamily: "equity" as const, expressionId: "equity:shares"
 };
 
 test("research persists current PostgreSQL evidence and selected candidates before completing", async () => {
@@ -905,6 +906,95 @@ test("research classifies a production long-dated option with repository LEAPS p
       "underlyingHistoricalVolatility"
     ]
   });
+});
+
+test("research keeps same-symbol zero-DTE and LEAPS evidence and candidate identities distinct", async () => {
+  const evidenceRows: Array<Record<string, unknown>> = [];
+  const candidateWrites: Array<readonly unknown[]> = [];
+  const zeroDteTarget = {
+    ...target,
+    strategyFamily: "zero_dte_spy" as const,
+    expressionId: "option:SPY260720C00555000",
+    sourceFingerprint: "same-cycle-spy-target",
+    preferredExpression: "long_call" as const,
+    optionsStrategy: {
+      alternatives: ["shares"], rationale: [],
+      optionsCandidate: {
+        optionSymbol: "SPY260720C00555000", type: "call", expirationDate: "2026-07-20",
+        strike: 555, estimatedEntryPrice: 2, liquidityScore: 0.9
+      }
+    }
+  };
+  const leapsTarget = {
+    ...target,
+    strategyFamily: "leaps" as const,
+    expressionId: "option:SPY270416C00600000",
+    sourceFingerprint: "same-cycle-spy-target",
+    preferredExpression: "long_call" as const,
+    optionsStrategy: {
+      alternatives: ["shares"], rationale: [],
+      optionsCandidate: {
+        optionSymbol: "SPY270416C00600000", type: "call", expirationDate: "2027-04-16",
+        strike: 600, estimatedEntryPrice: 20, liquidityScore: 0.9
+      }
+    }
+  };
+
+  await runPostgresResearchWorkflow({
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("INSERT INTO research_evidence")) {
+          evidenceRows.push(...JSON.parse(String(values?.[0] ?? "[]")) as Array<Record<string, unknown>>);
+          return { rows: [], rowCount: 2 };
+        }
+        if (statement.includes("INSERT INTO candidates")) {
+          candidateWrites.push(values ?? []);
+        }
+        if (statement.includes("to_regclass('public.learning_runs')")) {
+          return { rows: [{ learning_model_relation: null }], rowCount: 1 };
+        }
+        return {
+          rows: statement.includes("INSERT INTO research_runs") ? [{ version: "1" }] : [],
+          rowCount: 1
+        };
+      }
+    },
+    fence,
+    riskProfile: "aggressive",
+    optionsEnabled: true,
+    maxCandidates: 10,
+    now: new Date("2026-07-20T18:00:00.000Z"),
+    dependencies: {
+      refreshMarketData: async () => ({
+        bars: [bar], stockSnapshots: [], optionContracts: [], optionSnapshots: [], summary: {}
+      }) as never,
+      buildFeaturesAndTargets: async () => ({
+        features: [], targets: [zeroDteTarget, leapsTarget]
+      }),
+      symbols: ["SPY"]
+    }
+  });
+
+  const targetEvidence = evidenceRows.filter((row) => row.evidence_type === "target_snapshot");
+  assert.deepEqual(
+    targetEvidence.map((row) => row.source_key).sort(),
+    [
+      "SPY:2026-07-20T20:00:00.000Z:aggressive:leaps:option:SPY270416C00600000",
+      "SPY:2026-07-20T20:00:00.000Z:aggressive:zero_dte_spy:option:SPY260720C00555000"
+    ].sort()
+  );
+  assert.equal(new Set(targetEvidence.map((row) => row.id)).size, 2);
+  assert.equal(candidateWrites.length, 2);
+  assert.equal(new Set(candidateWrites.map((values) => values[0])).size, 2);
+  assert.deepEqual(
+    candidateWrites.map((values) => [values[12], values[4]]).sort((left, right) =>
+      String(left[0]).localeCompare(String(right[0]))
+    ),
+    [
+      ["leaps", "SPY270416C00600000"],
+      ["zero_dte_spy", "SPY260720C00555000"]
+    ]
+  );
 });
 
 const storedResearchSignal = (overrides: Record<string, unknown> = {}) => ({

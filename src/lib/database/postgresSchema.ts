@@ -57,6 +57,8 @@ export const POSTGRES_OPERATIONAL_INDEXES = [
   "option_snapshots_option_observed_idx",
   "feature_snapshots_symbol_observed_idx",
   "target_snapshots_profile_confidence_idx",
+  "target_snapshots_family_as_of_idx",
+  "options_strategy_snapshots_family_as_of_idx",
   "research_runs_one_active_workstream_idx",
   "research_runs_status_started_idx",
   "research_runs_request_idx",
@@ -161,8 +163,12 @@ export const POSTGRES_RELEASE_3_COLUMNS = [
   "market_data_ingestion_runs.records_rejected",
   "market_data_ingestion_runs.freshness_threshold_seconds",
   "market_data_ingestion_runs.rejection_reason",
-  "market_data_ingestion_runs.persistence_result"
-  ,"order_intents.operation",
+  "market_data_ingestion_runs.persistence_result",
+  "target_snapshots.strategy_family",
+  "target_snapshots.expression_id",
+  "options_strategy_snapshots.strategy_family",
+  "options_strategy_snapshots.expression_id",
+  "order_intents.operation",
   "order_intents.strategy_classification",
   "order_intents.lifecycle_state",
   "order_intents.review_id",
@@ -186,7 +192,9 @@ export const POSTGRES_RELEASE_3_CONSTRAINTS = [
   "workstream_events_processing_timestamp_order",
   "workstream_events_processing_started_required",
   "workstream_events_processed_timestamp_order",
-  "option_contracts_evidence_object"
+  "option_contracts_evidence_object",
+  "target_snapshots_strategy_identity_nonempty",
+  "options_strategy_snapshots_strategy_identity_nonempty"
 ] as const;
 
 /** Migration-006 constraints are registered separately from the release-3 verifier. */
@@ -249,6 +257,14 @@ const release3ConstraintDefinitions: Readonly<
   option_contracts_evidence_object: {
     table: "option_contracts",
     fragments: ["jsonb_typeof(evidence) = 'object'::text"]
+  },
+  target_snapshots_strategy_identity_nonempty: {
+    table: "target_snapshots",
+    fragments: ["btrim(strategy_family) <> ''::text", "btrim(expression_id) <> ''::text"]
+  },
+  options_strategy_snapshots_strategy_identity_nonempty: {
+    table: "options_strategy_snapshots",
+    fragments: ["btrim(strategy_family) <> ''::text", "btrim(expression_id) <> ''::text"]
   }
 };
 
@@ -299,11 +315,26 @@ const release3IndexDefinitions: Readonly<Record<string, {
     table: "reconciliation_discrepancies",
     unique: false,
     fragments: ["(domain, discrepancy_type, observed_at desc)"]
+  },
+  target_snapshots_family_as_of_idx: {
+    table: "target_snapshots",
+    unique: false,
+    fragments: ["(strategy_family, as_of desc, symbol)"]
+  },
+  options_strategy_snapshots_family_as_of_idx: {
+    table: "options_strategy_snapshots",
+    unique: false,
+    fragments: ["(strategy_family, as_of desc, symbol)"]
   }
 };
 
+const targetIdentityPrimaryKeyDefinitions = {
+  target_snapshots: "primary key (symbol, as_of, risk_profile, strategy_family, expression_id)",
+  options_strategy_snapshots: "primary key (symbol, as_of, risk_profile, strategy_family, expression_id)"
+} as const;
+
 export const verifyPostgresSchema = async (pool: Pool) => {
-  const [tables, indexes, sequences, columns, constraints, triggers] = await Promise.all([
+  const [tables, indexes, sequences, columns, constraints, primaryKeys, triggers] = await Promise.all([
     pool.query<{ tablename: string }>(
       `SELECT tablename
        FROM pg_catalog.pg_tables
@@ -362,6 +393,19 @@ export const verifyPostgresSchema = async (pool: Pool) => {
        )
          AND constraint_row.conname = ANY($1::text[])`,
       [[...POSTGRES_RELEASE_3_CONSTRAINTS, ...POSTGRES_AUTONOMOUS_LIFECYCLE_CONSTRAINTS]]
+    ),
+    pool.query<{ table_name: string; definition: string }>(
+      `SELECT table_row.relname AS table_name,
+              pg_get_constraintdef(constraint_row.oid) AS definition
+       FROM pg_catalog.pg_constraint AS constraint_row
+       JOIN pg_catalog.pg_class AS table_row
+         ON table_row.oid = constraint_row.conrelid
+       WHERE constraint_row.connamespace = (
+         SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = current_schema()
+       )
+         AND constraint_row.contype = 'p'
+         AND table_row.relname = ANY($1::text[])`,
+      [Object.keys(targetIdentityPrimaryKeyDefinitions)]
     ),
     pool.query<{
       trigger_name: string;
@@ -455,6 +499,17 @@ export const verifyPostgresSchema = async (pool: Pool) => {
     return row.table_name !== expected.table || !row.convalidated || expected.fragments.some((fragment) => !definition.includes(fragment.toLowerCase()));
   });
   const missingAutonomousConstraints = POSTGRES_AUTONOMOUS_LIFECYCLE_CONSTRAINTS.filter((name) => !constraintSet.has(name));
+  const primaryKeyTables = Object.keys(targetIdentityPrimaryKeyDefinitions) as Array<
+    keyof typeof targetIdentityPrimaryKeyDefinitions
+  >;
+  const missingPrimaryKeys = primaryKeyTables.filter(
+    (table) => !primaryKeys.rows.some((row) => row.table_name === table)
+  );
+  const invalidPrimaryKeys = primaryKeyTables.filter((table) => {
+    const row = primaryKeys.rows.find((primaryKey) => primaryKey.table_name === table);
+    if (!row) return false;
+    return row.definition.toLowerCase().replace(/\s+/g, " ") !== targetIdentityPrimaryKeyDefinitions[table];
+  });
   return {
     verificationPassed:
       missingTables.length === 0 &&
@@ -468,6 +523,8 @@ export const verifyPostgresSchema = async (pool: Pool) => {
       invalidIndexes.length === 0 &&
       invalidConstraints.length === 0 &&
       invalidAutonomousConstraints.length === 0 &&
+      missingPrimaryKeys.length === 0 &&
+      invalidPrimaryKeys.length === 0 &&
       invalidTriggers.length === 0,
     expectedTableCount: POSTGRES_OPERATIONAL_TABLES.length,
     presentTableCount: POSTGRES_OPERATIONAL_TABLES.length - missingTables.length,
@@ -484,6 +541,8 @@ export const verifyPostgresSchema = async (pool: Pool) => {
     invalidIndexes,
     invalidConstraints,
     invalidAutonomousConstraints,
+    missingPrimaryKeys,
+    invalidPrimaryKeys,
     invalidTriggers
   };
 };
