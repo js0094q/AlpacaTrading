@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -24,11 +23,14 @@ import { PostgresResearchRunRepository } from "../src/repositories/postgres/post
 import { PostgresSchedulerLeaseRepository } from "../src/repositories/postgres/postgresSchedulerLeaseRepository.js";
 import { createDecisionId } from "../src/services/marketDecisionIdentityService.js";
 import {
+  assertDurableControlPlaneCheckpoint,
   backfillControlPlaneSnapshot,
   reconcileControlPlaneSnapshot,
   readControlPlaneSnapshot
 } from "../src/services/controlPlaneMigrationService.js";
 import {
+  assertDurableExecutionStateCheckpoint,
+  backfillExecutionStateSnapshot,
   reconcileExecutionStateSnapshot
 } from "../src/services/executionStateMigrationService.js";
 import { createControlPlaneSnapshotFixture } from "./helpers/controlPlaneSnapshotFixture.js";
@@ -111,116 +113,6 @@ const runPostgresIntegrationCleanup = async (
   }
   if (failures.length) {
     throw new AggregateError(failures, "POSTGRES_INTEGRATION_CLEANUP_FAILED");
-  }
-};
-
-const runPackagedControlPlaneCommand = (input: {
-  readonly command: "db:postgres:control-plane:backfill" | "db:postgres:control-plane:reconcile";
-  readonly snapshotPath: string;
-  readonly schema: string;
-  readonly dryRun?: boolean;
-}) => {
-  const child = spawnSync(
-    "npm",
-    [
-      "run",
-      "--silent",
-      input.command,
-      "--",
-      "--snapshot",
-      input.snapshotPath,
-      ...(input.dryRun ? ["--dryRun"] : [])
-    ],
-    {
-      cwd: process.cwd(),
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        PGOPTIONS: `-c search_path=${input.schema}`,
-        DATABASE_BACKEND: "postgres",
-        POSTGRES_READS_ENABLED: "false",
-        POSTGRES_WRITES_ENABLED: "false",
-        POSTGRES_SHADOW_COMPARE_ENABLED: "false",
-        POSTGRES_CONTROL_PLANE_AUTHORITY_ENABLED: "false",
-        POSTGRES_EXECUTION_STATE_AUTHORITY_ENABLED: "false",
-        SQLITE_AUDIT_MIRROR_ENABLED: "false",
-        ALPACA_ENV: "paper",
-        TRADING_MODE: "paper",
-        ALPACA_LIVE_TRADE: "false",
-        LIVE_TRADING_ENABLED: "false"
-      }
-    }
-  );
-  if (child.error || child.status === null) {
-    throw new Error("PACKAGED_CONTROL_PLANE_PROCESS_FAILED");
-  }
-  if (child.stderr !== "") {
-    throw new Error("PACKAGED_CONTROL_PLANE_STDERR_NOT_EMPTY");
-  }
-  try {
-    return {
-      exitCode: child.status,
-      report: JSON.parse(child.stdout) as Record<string, unknown>
-    };
-  } catch {
-    throw new Error("PACKAGED_CONTROL_PLANE_REPORT_INVALID");
-  }
-};
-
-const runPackagedExecutionStateCommand = (input: {
-  readonly command:
-    | "db:postgres:execution-state:backfill"
-    | "db:postgres:execution-state:reconcile";
-  readonly snapshotPath: string;
-  readonly schema: string;
-  readonly dryRun?: boolean;
-}) => {
-  const child = spawnSync(
-    "npm",
-    [
-      "run",
-      "--silent",
-      input.command,
-      "--",
-      "--snapshot",
-      input.snapshotPath,
-      ...(input.dryRun ? ["--dryRun"] : [])
-    ],
-    {
-      cwd: process.cwd(),
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        PGOPTIONS: `-c search_path=${input.schema}`,
-        DATABASE_BACKEND: "postgres",
-        POSTGRES_READS_ENABLED: "false",
-        POSTGRES_WRITES_ENABLED: "false",
-        POSTGRES_SHADOW_COMPARE_ENABLED: "false",
-        POSTGRES_CONTROL_PLANE_AUTHORITY_ENABLED: "false",
-        POSTGRES_SCHEDULER_AUTHORITY_ENABLED: "false",
-        POSTGRES_EXECUTION_STATE_SHADOW_ENABLED: "false",
-        POSTGRES_EXECUTION_STATE_AUTHORITY_ENABLED: "false",
-        SQLITE_AUDIT_MIRROR_ENABLED: "false",
-        ALPACA_ENV: "paper",
-        TRADING_MODE: "paper",
-        ALPACA_LIVE_TRADE: "false",
-        LIVE_TRADING_ENABLED: "false"
-      }
-    }
-  );
-  if (child.error || child.status === null) {
-    throw new Error("PACKAGED_EXECUTION_STATE_PROCESS_FAILED");
-  }
-  if (child.stderr !== "") {
-    throw new Error("PACKAGED_EXECUTION_STATE_STDERR_NOT_EMPTY");
-  }
-  try {
-    return {
-      exitCode: child.status,
-      report: JSON.parse(child.stdout) as Record<string, unknown>
-    };
-  } catch {
-    throw new Error("PACKAGED_EXECUTION_STATE_REPORT_INVALID");
   }
 };
 
@@ -758,45 +650,41 @@ test("actual Neon reconciles fixed-scale partial state without candidate updates
        FROM candidates WHERE id = 'candidate-1'`
     );
 
-    phase = "packaged_resume_backfill";
-    const resumed = runPackagedControlPlaneCommand({
-      command: "db:postgres:control-plane:backfill",
+    phase = "service_resume_backfill";
+    const resumed = await backfillControlPlaneSnapshot({
       snapshotPath: sourcePath,
-      schema
+      pool: schemaPool,
+      config
     });
-    assert.equal(resumed.exitCode, 0);
-    assert.deepEqual(resumed.report.insertedRows, {
+    assert.deepEqual(resumed.insertedRows, {
       researchRuns: 0,
       candidates: 0,
       candidateLifecycleEvents: 3
     });
-    phase = "packaged_backfill_replay";
-    const replayedBackfill = runPackagedControlPlaneCommand({
-      command: "db:postgres:control-plane:backfill",
+    phase = "service_backfill_replay";
+    const replayedBackfill = await backfillControlPlaneSnapshot({
       snapshotPath: sourcePath,
-      schema
+      pool: schemaPool,
+      config
     });
-    assert.equal(replayedBackfill.exitCode, 0);
-    assert.deepEqual(replayedBackfill.report.insertedRows, {
+    assert.deepEqual(replayedBackfill.insertedRows, {
       researchRuns: 0,
       candidates: 0,
       candidateLifecycleEvents: 0
     });
-    assert.equal(replayedBackfill.report.mutationCount, 0);
-    assert.equal(replayedBackfill.report.idempotentReplay, true);
 
-    phase = "packaged_reconcile_dry_run";
-    const dryRun = runPackagedControlPlaneCommand({
-      command: "db:postgres:control-plane:reconcile",
+    phase = "service_reconcile_dry_run";
+    const dryRun = await reconcileControlPlaneSnapshot({
       snapshotPath: sourcePath,
-      schema,
+      pool: schemaPool,
+      config,
       dryRun: true
     });
-    assert.equal(dryRun.exitCode, 0);
-    assert.equal(dryRun.report.status, "dry_run_passed");
-    assert.equal(dryRun.report.mutationCount, 0);
-    assert.equal(dryRun.report.candidateMutationCount, 0);
-    assert.deepEqual(dryRun.report.candidateNumericClassification, {
+    assert.equal(dryRun.status, "passed");
+    assert.equal(dryRun.dryRun, true);
+    assert.equal(dryRun.mutationCount, 0);
+    assert.equal(dryRun.candidateMutationCount, 0);
+    assert.deepEqual(dryRun.candidateNumericClassification, {
       rowsExamined: 2,
       exactBeforeNormalization: 1,
       normalizedEquivalent: 1,
@@ -804,20 +692,20 @@ test("actual Neon reconciles fixed-scale partial state without candidate updates
       invalidNumeric: 0,
       unexplainedMismatch: 0
     });
-    assert.equal(dryRun.report.durableCheckpointVerified, false);
+    assert.equal((await schemaPool.query(
+      "SELECT COUNT(*)::text AS count FROM reconciliation_checkpoints"
+    )).rows[0]?.count, "1");
 
-    phase = "packaged_reconcile_commit";
-    const reconciliation = runPackagedControlPlaneCommand({
-      command: "db:postgres:control-plane:reconcile",
+    phase = "service_reconcile_commit";
+    const reconciliation = await reconcileControlPlaneSnapshot({
       snapshotPath: sourcePath,
-      schema
+      pool: schemaPool,
+      config
     });
-    assert.equal(reconciliation.exitCode, 0);
-    assert.equal(reconciliation.report.status, "passed");
-    assert.equal(reconciliation.report.candidateMutationCount, 0);
-    assert.equal(reconciliation.report.checkpointMutationCount, 1);
-    assert.equal(reconciliation.report.durableCheckpointVerified, true);
-    assert.equal(typeof reconciliation.report.checkpointId, "string");
+    assert.equal(reconciliation.status, "passed");
+    assert.equal(reconciliation.candidateMutationCount, 0);
+    assert.equal(reconciliation.checkpointMutationCount, 1);
+    assert.equal(typeof reconciliation.checkpointId, "string");
     const durable = await schemaPool.query<{
       status: string;
       source_checksum: string | null;
@@ -832,7 +720,11 @@ test("actual Neon reconciles fixed-scale partial state without candidate updates
               cursor_value, source_aggregates, target_aggregates,
               discrepancy_report, completed_at
        FROM reconciliation_checkpoints WHERE id = $1`,
-      [reconciliation.report.checkpointId]
+      [reconciliation.checkpointId]
+    );
+    assert.equal(
+      assertDurableControlPlaneCheckpoint(durable.rows[0], reconciliation),
+      true
     );
     assert.equal(durable.rows[0]?.status, "passed");
     assert.equal(durable.rows[0]?.source_checksum, source.inspection.sha256);
@@ -848,18 +740,17 @@ test("actual Neon reconciles fixed-scale partial state without candidate updates
     assert.deepEqual(durable.rows[0]?.discrepancy_report, { discrepancyIds: [] });
     assert.ok(durable.rows[0]?.completed_at);
 
-    phase = "packaged_reconcile_replay";
-    const replay = runPackagedControlPlaneCommand({
-      command: "db:postgres:control-plane:reconcile",
+    phase = "service_reconcile_replay";
+    const replay = await reconcileControlPlaneSnapshot({
       snapshotPath: sourcePath,
-      schema
+      pool: schemaPool,
+      config
     });
-    assert.equal(replay.exitCode, 0);
-    assert.equal(replay.report.status, "passed");
-    assert.equal(replay.report.idempotentReplay, true);
-    assert.equal(replay.report.mutationCount, 0);
-    assert.equal(replay.report.candidateMutationCount, 0);
-    assert.equal(replay.report.durableCheckpointVerified, true);
+    assert.equal(replay.status, "passed");
+    assert.equal(replay.idempotentReplay, true);
+    assert.equal(replay.mutationCount, 0);
+    assert.equal(replay.candidateMutationCount, 0);
+    assert.equal(assertDurableControlPlaneCheckpoint(durable.rows[0], replay), true);
 
     const candidateAfter = await schemaPool.query<{ xmin: string; score: string }>(
       `SELECT xmin::text AS xmin, score::text AS score
@@ -883,26 +774,22 @@ test("actual Neon reconciles fixed-scale partial state without candidate updates
       "UPDATE candidates SET score = score + 0.0000000001 WHERE id = 'candidate-1'"
     );
     phase = "unexplained_numeric_mismatch";
-    const mismatch = runPackagedControlPlaneCommand({
-      command: "db:postgres:control-plane:reconcile",
+    const mismatch = await reconcileControlPlaneSnapshot({
       snapshotPath: sourcePath,
-      schema,
+      pool: schemaPool,
+      config,
       dryRun: true
     });
-    assert.notEqual(mismatch.exitCode, 0);
-    assert.equal(mismatch.report.status, "dry_run_blocked");
-    assert.equal(mismatch.report.mutationCount, 0);
-    assert.equal(mismatch.report.candidateMutationCount, 0);
-    assert.equal(
-      (mismatch.report.candidateNumericClassification as Record<string, unknown>)
-        .unexplainedMismatch,
-      1
+    assert.equal(mismatch.status, "blocked");
+    assert.equal(mismatch.dryRun, true);
+    assert.equal(mismatch.mutationCount, 0);
+    assert.equal(mismatch.candidateMutationCount, 0);
+    assert.equal(mismatch.candidateNumericClassification.unexplainedMismatch, 1);
+    assert.equal(mismatch.discrepancyCount, 1);
+    assert.deepEqual(
+      mismatch.discrepancies.map((row) => `${row.domain}:${row.discrepancyType}`),
+      ["candidates:CANDIDATE_NUMERIC_MISMATCH"]
     );
-    assert.equal(mismatch.report.discrepancyCount, 1);
-    assert.deepEqual(mismatch.report.discrepancyCategories, {
-      "candidates:CANDIDATE_NUMERIC_MISMATCH": 1
-    });
-    assert.equal(mismatch.report.discrepancies, undefined);
 
     phase = "concurrent_checkpoint_creation";
     const concurrentObservedAt = "2026-07-15T22:00:00.000Z";
@@ -1014,90 +901,104 @@ test("actual Neon backfills and reconciles Release 4 execution state idempotentl
        )`,
       [executionStateCandidateId]
     );
-    phase = "packaged_backfill";
-    const firstBackfill = runPackagedExecutionStateCommand({
-      command: "db:postgres:execution-state:backfill",
+    phase = "service_backfill";
+    const firstBackfill = await backfillExecutionStateSnapshot({
       snapshotPath: sourcePath,
-      schema
+      pool: schemaPool,
+      config
     });
-    assert.equal(firstBackfill.exitCode, 0);
-    assert.equal(firstBackfill.report.status, "completed");
-    assert.equal(firstBackfill.report.durableBatchCheckpointsVerified, true);
-    assert.ok(Number(firstBackfill.report.rowMutationCount) > 0);
+    assert.equal(firstBackfill.status, "completed");
+    const durableBatchCheckpoints = await schemaPool.query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count
+       FROM reconciliation_checkpoints
+       WHERE workstream = 'execution_state_backfill'
+         AND status = 'passed'
+         AND source_checksum = $1
+         AND cursor_value->>'mappingVersion' = $2`,
+      [firstBackfill.snapshotSha256, firstBackfill.mappingVersion]
+    );
+    assert.ok(Number(durableBatchCheckpoints.rows[0]?.count) >= firstBackfill.batchCount);
+    assert.ok(firstBackfill.rowMutationCount > 0);
     const orderBeforeReplay = await schemaPool.query<{ xmin: string }>(
       "SELECT xmin::text AS xmin FROM orders"
     );
-    phase = "packaged_backfill_replay";
-    const secondBackfill = runPackagedExecutionStateCommand({
-      command: "db:postgres:execution-state:backfill",
+    phase = "service_backfill_replay";
+    const secondBackfill = await backfillExecutionStateSnapshot({
       snapshotPath: sourcePath,
-      schema
+      pool: schemaPool,
+      config
     });
-    assert.equal(secondBackfill.exitCode, 0);
-    assert.equal(secondBackfill.report.rowMutationCount, 0);
-    assert.equal(secondBackfill.report.checkpointMutationCount, 0);
-    assert.equal(secondBackfill.report.mutationCount, 0);
-    assert.equal(secondBackfill.report.idempotentReplay, true);
+    phase = "assert_backfill_replay";
+    assert.equal(secondBackfill.rowMutationCount, 0);
+    assert.equal(secondBackfill.checkpointMutationCount, 0);
+    assert.equal(secondBackfill.mutationCount, 0);
+    assert.equal(secondBackfill.idempotentReplay, true);
     assert.deepEqual(
       (await schemaPool.query<{ xmin: string }>(
         "SELECT xmin::text AS xmin FROM orders"
       )).rows,
       orderBeforeReplay.rows
     );
-    phase = "packaged_reconcile_dry_run";
-    const dryRun = runPackagedExecutionStateCommand({
-      command: "db:postgres:execution-state:reconcile",
+    phase = "service_reconcile_dry_run";
+    const dryRun = await reconcileExecutionStateSnapshot({
       snapshotPath: sourcePath,
-      schema,
+      pool: schemaPool,
+      config,
       dryRun: true
     });
-    assert.equal(dryRun.exitCode, 0);
-    assert.equal(dryRun.report.status, "dry_run_passed");
-    assert.equal(dryRun.report.rowMutationCount, 0);
-    assert.equal(dryRun.report.mutationCount, 0);
-    assert.equal(dryRun.report.discrepancyCount, 0);
-    assert.equal(dryRun.report.duplicateCount, 0);
-    assert.equal(dryRun.report.orphanCount, 0);
-    phase = "packaged_reconcile";
-    const reconciliation = runPackagedExecutionStateCommand({
-      command: "db:postgres:execution-state:reconcile",
+    assert.equal(dryRun.status, "passed");
+    assert.equal(dryRun.dryRun, true);
+    assert.equal(dryRun.rowMutationCount, 0);
+    assert.equal(dryRun.mutationCount, 0);
+    assert.equal(dryRun.discrepancyCount, 0);
+    assert.equal(dryRun.duplicateCount, 0);
+    assert.equal(dryRun.orphanCount, 0);
+    phase = "service_reconcile";
+    const reconciliation = await reconcileExecutionStateSnapshot({
       snapshotPath: sourcePath,
-      schema
+      pool: schemaPool,
+      config
     });
-    assert.equal(reconciliation.exitCode, 0);
-    assert.equal(reconciliation.report.status, "passed");
-    assert.equal(reconciliation.report.rowMutationCount, 0);
-    assert.equal(reconciliation.report.checkpointMutationCount, 1);
-    assert.equal(reconciliation.report.durableCheckpointVerified, true);
-    const checkpointId = String(reconciliation.report.checkpointId);
+    assert.equal(reconciliation.status, "passed");
+    assert.equal(reconciliation.rowMutationCount, 0);
+    assert.equal(reconciliation.checkpointMutationCount, 1);
+    const checkpointId = reconciliation.checkpointId;
     const durable = await schemaPool.query<{
       status: string;
       source_checksum: string | null;
       discrepancy_count: string;
       cursor_value: Record<string, unknown>;
+      source_aggregates: Record<string, unknown>;
+      target_aggregates: Record<string, unknown>;
+      discrepancy_report: Record<string, unknown>;
+      completed_at: Date | string | null;
     }>(
       `SELECT status, source_checksum, discrepancy_count::text AS discrepancy_count,
-              cursor_value
+              cursor_value, source_aggregates, target_aggregates,
+              discrepancy_report, completed_at
        FROM reconciliation_checkpoints WHERE id = $1`,
       [checkpointId]
+    );
+    assert.equal(
+      assertDurableExecutionStateCheckpoint(durable.rows[0], reconciliation),
+      true
     );
     assert.equal(durable.rows[0]?.status, "passed");
     assert.equal(durable.rows[0]?.discrepancy_count, "0");
     assert.equal(durable.rows[0]?.cursor_value.postgresMigrationVersion, 2);
     assert.equal(durable.rows[0]?.cursor_value.mappingVersion, "release-4-v1");
-    phase = "packaged_reconcile_replay";
-    const replay = runPackagedExecutionStateCommand({
-      command: "db:postgres:execution-state:reconcile",
+    phase = "service_reconcile_replay";
+    const replay = await reconcileExecutionStateSnapshot({
       snapshotPath: sourcePath,
-      schema
+      pool: schemaPool,
+      config
     });
-    assert.equal(replay.exitCode, 0);
-    assert.equal(replay.report.status, "passed");
-    assert.equal(replay.report.idempotentReplay, true);
-    assert.equal(replay.report.mutationCount, 0);
-    assert.equal(replay.report.durableCheckpointVerified, true);
+    assert.equal(replay.status, "passed");
+    assert.equal(replay.idempotentReplay, true);
+    assert.equal(replay.mutationCount, 0);
+    assert.equal(assertDurableExecutionStateCheckpoint(durable.rows[0], replay), true);
     phase = "unexplained_target_mismatch";
-    await schemaPool.query("UPDATE orders SET status = 'unexpected-target-state'");
+    await schemaPool.query("UPDATE orders SET symbol = 'QQQ'");
     const mismatch = await reconcileExecutionStateSnapshot({
       snapshotPath: sourcePath,
       pool: schemaPool,

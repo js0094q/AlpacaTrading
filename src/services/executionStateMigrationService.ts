@@ -19,6 +19,10 @@ import type { HedgeExecutionReview } from "./hedgeExecutionReviewService.js";
 import type { PaperExecutionLedgerEntry } from "./paperExecutionLedgerService.js";
 import type { PaperReviewArtifact } from "./paperReviewArtifactService.js";
 import type { PaperSubmitStateAttestation } from "./paperSubmitStateService.js";
+import {
+  lifecycleStateForBrokerStatus,
+  type AutonomousTradeLifecycleState
+} from "./autonomousTradeLifecycleService.js";
 import type { ZeroDteSubmitAttestation } from "./zeroDte/zeroDteSubmitAttestationService.js";
 import {
   asDecisionId,
@@ -126,7 +130,8 @@ const uniqueIdentitySpecs: Readonly<Record<string, UniqueIdentitySpec>> = {
   order_intents: {
     columns: ["account_id", "idempotency_key"],
     mutableColumns: [
-      "status", "ready_at", "submitted_at", "terminal_at", "version", "updated_at"
+      "status", "lifecycle_state", "ready_at", "submitted_at", "terminal_at",
+      "version", "updated_at"
     ]
   }
 };
@@ -377,7 +382,7 @@ const tableSpecs: readonly TableSpec[] = [
       "strategy_key", "symbol", "underlying_symbol", "asset_class", "side",
       "order_type", "time_in_force", "quantity", "notional", "limit_price",
       "stop_price", "estimated_premium", "max_risk", "status", "intent_fingerprint",
-      "lifecycle_fingerprint", "request_payload", "request_id", "correlation_id",
+      "lifecycle_fingerprint", "lifecycle_state", "request_payload", "request_id", "correlation_id",
       "ready_at", "submitted_at", "terminal_at", "version", "created_at", "updated_at"
     ]
   },
@@ -646,6 +651,40 @@ const intentStatus = (ledger: PaperExecutionLedgerEntry, activeReservation: bool
   return "failed";
 };
 
+const intentLifecycleState = (
+  intent: ExecutionReservationIntentInput,
+  ledger: PaperExecutionLedgerEntry,
+  status: ReturnType<typeof intentStatus>
+): AutonomousTradeLifecycleState => {
+  const exit = intent.side === "sell" || intent.side === "sell_to_close";
+  if (status === "ready_for_submission") {
+    return exit ? "exit_ready_for_submission" : "ready_for_submission";
+  }
+  if (status === "submission_pending") {
+    return exit ? "exit_submission_attempt_persisted" : "submission_attempt_persisted";
+  }
+  if (status === "ambiguous") {
+    return exit ? "exit_submission_ambiguous" : "submission_ambiguous";
+  }
+  if (status === "cancelled") {
+    return ledger.status === "expired" ? "expired" : "cancelled";
+  }
+  if (status === "failed") {
+    return ledger.status === "rejected" ? "rejected" : "failed_terminal";
+  }
+  const brokerStatus = (ledger.alpacaStatus || ledger.status).trim().toLowerCase();
+  if (
+    !ledger.alpacaOrderId &&
+    (brokerStatus === "submitted" || brokerStatus === "accepted")
+  ) {
+    return exit ? "exit_submission_ambiguous" : "submission_ambiguous";
+  }
+  return lifecycleStateForBrokerStatus(
+    exit ? "exit" : "entry",
+    brokerStatus === "partial" ? "partially_filled" : brokerStatus
+  );
+};
+
 const reservationStatus = (
   ledger: PaperExecutionLedgerEntry,
   expiresAt: string,
@@ -681,7 +720,7 @@ const normalizeJsonColumn = (row: TargetRow, spec: TableSpec) => {
 
 const comparableValue = (spec: TableSpec, column: string, value: unknown) => {
   if (value === null || value === undefined) return null;
-  if (["accounts", "risk_limits", "strategy_allocations"].includes(spec.table) && column === "version") {
+  if (column === "version") {
     try {
       return BigInt(String(value)).toString();
     } catch {
@@ -1239,6 +1278,7 @@ const intentRow = (
   activeReservation: boolean
 ) => {
   const status = intentStatus(ledger, activeReservation);
+  const lifecycleState = intentLifecycleState(intent, ledger, status);
   const submitted = ["submitted", "ambiguous", "reconciled"].includes(status);
   const terminal = ["failed", "cancelled"].includes(status);
   return {
@@ -1272,6 +1312,7 @@ const intentRow = (
     status,
     intent_fingerprint: intent.intentFingerprint,
     lifecycle_fingerprint: intent.lifecycleFingerprint,
+    lifecycle_state: lifecycleState,
     request_payload: intent.requestPayload,
     request_id: intent.requestId,
     correlation_id: intent.correlationId,

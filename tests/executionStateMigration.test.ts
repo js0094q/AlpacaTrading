@@ -33,6 +33,7 @@ test("execution-state snapshot projects every Release 4 domain with PostgreSQL s
     assert.equal(snapshot.rows.get("broker_events")?.length, 1);
     assert.equal(snapshot.rows.get("lifecycle_fingerprints")?.length, 2);
     assert.equal(snapshot.rows.get("account_snapshots")?.[0]?.cash, "4000.12345679");
+    assert.equal(snapshot.rows.get("order_intents")?.[0]?.lifecycle_state, "broker_order_accepted");
     assert.equal(snapshot.rows.get("order_intents")?.[0]?.quantity, "2.000000000000");
     assert.equal(snapshot.rows.get("order_intents")?.[0]?.limit_price, "500.12345679");
     assert.equal(snapshot.rows.get("order_intents")?.[0]?.max_risk, "1000.24691358");

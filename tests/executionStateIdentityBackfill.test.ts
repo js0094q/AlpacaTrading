@@ -405,6 +405,33 @@ test("normalizes equivalent account version representations", async () => {
   }
 });
 
+test("normalizes equivalent execution-review version representations", async () => {
+  const fixture = await makeFixture("execution-state-review-version-normalization-");
+  try {
+    const source = await readExecutionStateSnapshot(fixture.snapshotPath);
+    const sourceReview = source.rows.get("execution_reviews")?.[0];
+    assert.ok(sourceReview);
+    const fake = createFakeExecutionStatePool();
+    fake.seed("execution_reviews", {
+      ...sourceReview,
+      version: String(sourceReview.version)
+    });
+
+    const result = await backfillExecutionStateSnapshot({
+      snapshotPath: fixture.snapshotPath,
+      pool: fake.pool,
+      config: migrationConfig,
+      batchSize: 1
+    });
+
+    assert.equal(result.insertedRows.execution_reviews, 0);
+    assert.equal(result.mutableStateDifferences["execution_reviews:version"], undefined);
+    assert.equal(fake.rows.get("execution_reviews")?.length, 1);
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
 test("fails closed for a contradictory immutable account environment", async () => {
   const fixture = await makeFixture("execution-state-account-immutable-conflict-");
   try {
