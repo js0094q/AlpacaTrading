@@ -100,11 +100,12 @@ test("discovers ordered, checksummed PostgreSQL migrations", async () => {
   }
 });
 
-test("repository includes the standard-option arbitration migration after lane-aware identity", async () => {
+test("repository includes LEAPS review signals after standard-option arbitration", async () => {
   const migrations = await listPostgresMigrations(join(process.cwd(), "src/lib/database/migrations"));
-  assert.equal(migrations.at(-1)?.version, 11);
-  assert.equal(migrations.at(-1)?.name, "standard_option_arbitration_lane");
-  assert.equal(migrations.at(-2)?.name, "lane_aware_target_identity");
+  assert.equal(migrations.at(-1)?.version, 12);
+  assert.equal(migrations.at(-1)?.name, "leaps_review_signals");
+  assert.equal(migrations.at(-2)?.name, "standard_option_arbitration_lane");
+  assert.equal(migrations.at(-3)?.name, "lane_aware_target_identity");
 });
 
 test("applies a migration exactly once and reports the second run as idempotent", async () => {

@@ -74,6 +74,18 @@ export type PostgresReviewWorkflowResult = {
   confirmationCreated?: boolean;
   paperOnly?: boolean;
   leapsMonitoringSignals?: LeapsMonitoringSignal[];
+  leapsMonitoringSignalsPersisted?: number;
+  leapsMonitoringSignalsResolved?: number;
+};
+
+type PersistableLeapsMonitoringSignal = LeapsMonitoringSignal & {
+  accountId: string;
+  candidateId: string | null;
+  accountSnapshotId: string;
+  accountFingerprint: string;
+  marketTimestamp: string;
+  marketRequestId: string | null;
+  evidence: Record<string, unknown>;
 };
 
 type ReviewSourceRow = Record<string, unknown> & {
@@ -173,6 +185,162 @@ const fenceSql = (start: number) => `EXISTS (
 const fenceValues = (fence: SchedulerFence) => [
   fence.jobName, fence.workstream, fence.ownerId, fence.runId, fence.fencingToken
 ];
+
+const persistLeapsMonitoringSignals = async (input: {
+  query: PostgresReviewQuery;
+  fence: SchedulerFence;
+  now: Date;
+  signals: readonly PersistableLeapsMonitoringSignal[];
+}) => {
+  let persisted = 0;
+  for (const signal of input.signals) {
+    const signalFingerprint = canonicalJsonHash({
+      positionId: signal.positionId,
+      action: signal.action,
+      suggestedQuantity: signal.suggestedQuantity,
+      reasons: signal.reasons
+    });
+    const observationId = canonicalJsonHash({
+      runId: input.fence.runId,
+      positionId: signal.positionId,
+      action: signal.action,
+      marketTimestamp: signal.marketTimestamp
+    });
+    const id = `position_review_signal_${signalFingerprint}`;
+    const nowIso = input.now.toISOString();
+    const result = await input.query.query(
+      `WITH fence_state AS (
+         SELECT ${fenceSql(13)} AS held
+       ), resolved_previous AS (
+         UPDATE position_review_signals
+         SET status = 'resolved', resolved_at = $12, updated_at = $12
+         FROM fence_state
+         WHERE fence_state.held
+           AND position_review_signals.position_id = $3
+           AND position_review_signals.signal_fingerprint <> $10
+           AND position_review_signals.status = 'open'
+         RETURNING position_review_signals.id
+       ), upserted_signal AS (
+         INSERT INTO position_review_signals(
+           id, account_id, position_id, candidate_id, option_symbol, lane,
+           action, executable, suggested_quantity, reasons, evidence,
+           signal_fingerprint, last_observation_id, status,
+           first_observed_at, last_observed_at,
+           occurrences, created_at, updated_at
+         )
+         SELECT $1, $2, $3, $4, $5, 'options_leaps', $6, false, $7,
+                $8::jsonb, $9::jsonb, $10, $11, 'open',
+                $12, $12, 1, $12, $12
+         FROM fence_state WHERE held
+         ON CONFLICT (position_id, signal_fingerprint) DO UPDATE
+         SET last_observed_at = EXCLUDED.last_observed_at,
+             occurrences = position_review_signals.occurrences + CASE
+               WHEN position_review_signals.last_observation_id =
+                    EXCLUDED.last_observation_id THEN 0
+               ELSE 1
+             END,
+             last_observation_id = EXCLUDED.last_observation_id,
+             evidence = EXCLUDED.evidence,
+             status = CASE
+               WHEN position_review_signals.status = 'acknowledged'
+                 THEN 'acknowledged'
+               ELSE 'open'
+             END,
+             acknowledged_at = CASE
+               WHEN position_review_signals.status = 'acknowledged'
+                 THEN position_review_signals.acknowledged_at
+               ELSE NULL
+             END,
+             resolved_at = CASE
+               WHEN position_review_signals.status = 'acknowledged'
+                 THEN position_review_signals.resolved_at
+               ELSE NULL
+             END,
+             updated_at = EXCLUDED.updated_at
+         RETURNING id
+       )
+       SELECT fence_state.held AS fence_held,
+              (SELECT COUNT(*)::integer FROM upserted_signal) AS signal_count
+       FROM fence_state`,
+      [
+        id,
+        signal.accountId,
+        signal.positionId,
+        signal.candidateId,
+        signal.optionSymbol,
+        signal.action,
+        signal.suggestedQuantity,
+        JSON.stringify(signal.reasons),
+        JSON.stringify({
+          accountSnapshotId: signal.accountSnapshotId,
+          accountFingerprint: signal.accountFingerprint,
+          marketTimestamp: signal.marketTimestamp,
+          marketRequestId: signal.marketRequestId,
+          ...signal.evidence,
+          scheduler: {
+            jobName: input.fence.jobName,
+            workstream: input.fence.workstream,
+            ownerId: input.fence.ownerId,
+            runId: input.fence.runId,
+            fencingToken: input.fence.fencingToken
+          },
+          paperOnly: true,
+          brokerMutationPerformed: false
+        }),
+        signalFingerprint,
+        observationId,
+        nowIso,
+        ...fenceValues(input.fence)
+      ]
+    );
+    const outcome = result.rowCount === 1 ? result.rows[0] : undefined;
+    if (!outcome) throw new Error("POSTGRES_LEAPS_REVIEW_SIGNAL_PERSISTENCE_FAILED");
+    if (outcome.fence_held !== true) throw new Error("SCHEDULER_FENCE_LOST");
+    const count = Number(outcome.signal_count);
+    if (!Number.isInteger(count) || count !== 1) {
+      throw new Error("POSTGRES_LEAPS_REVIEW_SIGNAL_PERSISTENCE_FAILED");
+    }
+    persisted += count;
+  }
+  return persisted;
+};
+
+const resolveCurrentLeapsMonitoringSignals = async (input: {
+  query: PostgresReviewQuery;
+  fence: SchedulerFence;
+  now: Date;
+  positionIds: readonly string[];
+}) => {
+  let resolved = 0;
+  for (const positionId of input.positionIds) {
+    const result = await input.query.query(
+      `WITH fence_state AS (
+         SELECT ${fenceSql(3)} AS held
+       ), resolved_signals AS (
+         UPDATE position_review_signals
+         SET status = 'resolved', resolved_at = $2, updated_at = $2
+         FROM fence_state
+         WHERE fence_state.held
+           AND position_review_signals.position_id = $1
+           AND position_review_signals.status = 'open'
+         RETURNING position_review_signals.id
+       )
+       SELECT fence_state.held AS fence_held,
+              (SELECT COUNT(*)::integer FROM resolved_signals) AS resolved_count
+       FROM fence_state`,
+      [positionId, input.now.toISOString(), ...fenceValues(input.fence)]
+    );
+    const outcome = result.rowCount === 1 ? result.rows[0] : undefined;
+    if (!outcome) throw new Error("POSTGRES_LEAPS_REVIEW_SIGNAL_RESOLUTION_FAILED");
+    if (outcome.fence_held !== true) throw new Error("SCHEDULER_FENCE_LOST");
+    const count = Number(outcome.resolved_count);
+    if (!Number.isInteger(count) || count < 0) {
+      throw new Error("POSTGRES_LEAPS_REVIEW_SIGNAL_RESOLUTION_FAILED");
+    }
+    resolved += count;
+  }
+  return resolved;
+};
 const finite = (value: unknown) => {
   if (value === null || value === undefined) return null;
   if (typeof value === "string" && value.trim() === "") return null;
@@ -946,8 +1114,44 @@ const exitSourceSql = (command: string) => {
     paperLeapsExitConfig().severeTrendExitSma
   );
   return `WITH current_account AS (
-  SELECT * FROM accounts WHERE environment = 'paper'
+  SELECT * FROM accounts
+  WHERE broker = 'alpaca' AND environment = 'paper'
+    AND lower(status) = 'active'
   ORDER BY updated_at DESC, id LIMIT 1
+), latest_account_snapshot AS (
+  SELECT snapshot.*
+  FROM account_snapshots snapshot
+  CROSS JOIN current_account account
+  WHERE snapshot.account_id = account.id
+  ORDER BY snapshot.observed_at DESC, snapshot.id DESC
+  LIMIT 1
+), current_snapshot AS (
+  SELECT snapshot.*
+  FROM latest_account_snapshot snapshot
+  WHERE lower(snapshot.account_status) = 'active'
+    AND lower(snapshot.source) = 'alpaca'
+    AND snapshot.observed_at >= $1::timestamptz - make_interval(secs => $2::integer)
+    AND snapshot.observed_at <= $1::timestamptz + interval '1 minute'
+), resolved_terminal_signals AS (
+  UPDATE position_review_signals signal
+  SET status = 'resolved', resolved_at = $1::timestamptz,
+      updated_at = $1::timestamptz
+  FROM positions terminal_position, current_account account,
+       current_snapshot snapshot
+  WHERE ${fenceSql(3)}
+    AND signal.account_id = account.id
+    AND signal.position_id = terminal_position.id
+    AND terminal_position.account_id = account.id
+    AND terminal_position.last_reconciled_at >=
+        $1::timestamptz - make_interval(secs => $2::integer)
+    AND terminal_position.last_reconciled_at <=
+        $1::timestamptz + interval '1 minute'
+    AND signal.status = 'open'
+    AND (
+      terminal_position.status NOT IN ('open', 'closing')
+      OR COALESCE(terminal_position.available_quantity, 0) <= 0
+    )
+  RETURNING signal.id
 )
 SELECT position.id AS position_id,
        COALESCE(position.candidate_id, opening_intent.candidate_id) AS candidate_id,
@@ -969,6 +1173,12 @@ SELECT position.id AS position_id,
        allocation.status AS allocation_status,
        allocation.effective_to AS allocation_effective_to,
        account.id AS account_id, snapshot.id AS account_snapshot_id,
+       account.broker AS account_broker,
+       account.status AS account_record_status,
+       snapshot.account_status AS account_snapshot_status,
+       snapshot.source AS account_snapshot_source,
+       snapshot.observed_at AS account_snapshot_observed_at,
+       position.last_reconciled_at AS position_last_reconciled_at,
        snapshot.snapshot_fingerprint,
        snapshot.evidence->>'structuralPortfolioFingerprint' AS structural_fingerprint,
        market.market_price::text, market.market_timestamp, market.market_request_id,
@@ -990,6 +1200,7 @@ SELECT position.id AS position_id,
        sip.sip_request_id
 FROM positions position
 CROSS JOIN current_account account
+CROSS JOIN current_snapshot snapshot
 LEFT JOIN candidates candidate ON candidate.id = position.candidate_id
 LEFT JOIN orders opening_order ON opening_order.id = position.opening_order_id
 LEFT JOIN order_intents opening_intent
@@ -1023,10 +1234,6 @@ LEFT JOIN LATERAL (
   ORDER BY stock.observed_at DESC, stock.id DESC
   LIMIT 1
 ) sip ON position.option_symbol IS NOT NULL
-JOIN LATERAL (
-  SELECT * FROM account_snapshots WHERE account_id = account.id
-  ORDER BY observed_at DESC, id DESC LIMIT 1
-) snapshot ON true
 LEFT JOIN LATERAL (
   SELECT strategy_allocation.id, strategy_allocation.status,
          strategy_allocation.effective_to
@@ -1118,6 +1325,9 @@ LEFT JOIN LATERAL (
 ) leaps_trend ON position.asset_class = 'option'
 WHERE position.account_id = account.id AND position.status = 'open'
   AND position.available_quantity > 0
+  AND position.last_reconciled_at >=
+      $1::timestamptz - make_interval(secs => $2::integer)
+  AND position.last_reconciled_at <= $1::timestamptz + interval '1 minute'
   AND NOT EXISTS (
     SELECT 1
     FROM order_intents close_intent
@@ -1131,6 +1341,40 @@ WHERE position.account_id = account.id AND position.status = 'open'
 ORDER BY position.opened_at, position.id`;
 };
 
+const assertCurrentLeapsReviewAuthority = (input: {
+  row: Record<string, unknown>;
+  now: Date;
+  maxAgeSeconds: number;
+  positionId: string;
+}) => {
+  if (
+    String(input.row.account_broker ?? "").trim().toLowerCase() !== "alpaca" ||
+    String(input.row.account_record_status ?? "").trim().toLowerCase() !== "active" ||
+    String(input.row.account_snapshot_status ?? "").trim().toLowerCase() !== "active" ||
+    String(input.row.account_snapshot_source ?? "").trim().toLowerCase() !== "alpaca"
+  ) {
+    throw new Error(
+      `POSTGRES_LEAPS_REVIEW_ACCOUNT_AUTHORITY_INVALID:${input.positionId}`
+    );
+  }
+  for (const [scope, value] of [
+    ["ACCOUNT", input.row.account_snapshot_observed_at],
+    ["POSITION", input.row.position_last_reconciled_at]
+  ] as const) {
+    const timestamp = Date.parse(String(value ?? ""));
+    const age = input.now.getTime() - timestamp;
+    if (
+      !Number.isFinite(timestamp) ||
+      age < -60_000 ||
+      age > input.maxAgeSeconds * 1_000
+    ) {
+      throw new Error(
+        `POSTGRES_LEAPS_REVIEW_${scope}_AUTHORITY_STALE:${input.positionId}`
+      );
+    }
+  }
+};
+
 const runExitReview = async (input: {
   command: string;
   query: PostgresReviewQuery;
@@ -1139,8 +1383,17 @@ const runExitReview = async (input: {
   now: Date;
   maxMarketAgeSeconds: number;
 }) => {
-  const rows = (await input.query.query(exitSourceSql(input.command))).rows as Array<Record<string, unknown>>;
+  const rows = (await input.query.query(
+    exitSourceSql(input.command),
+    [
+      input.now.toISOString(),
+      input.maxMarketAgeSeconds,
+      ...fenceValues(input.fence)
+    ]
+  )).rows as Array<Record<string, unknown>>;
   const leapsMonitoringSignals: LeapsMonitoringSignal[] = [];
+  const persistableLeapsMonitoringSignals: PersistableLeapsMonitoringSignal[] = [];
+  const resolvedLeapsPositionIds: string[] = [];
   const eligible = rows.flatMap((row) => {
     const positionId = String(row.position_id ?? "").trim();
     const strategyKey = String(row.strategy_key ?? "").trim();
@@ -1235,6 +1488,14 @@ const runExitReview = async (input: {
       : null;
     const leaps = strategyClassification === "leaps_long_call" ||
       strategyClassification === "leaps_long_put";
+    if (leaps) {
+      assertCurrentLeapsReviewAuthority({
+        row,
+        now: input.now,
+        maxAgeSeconds: input.maxMarketAgeSeconds,
+        positionId
+      });
+    }
     const directionalReturnPct = Number((directionalReturn * 100).toFixed(8));
     const severeTrendBarCount = finite(row.severe_trend_bar_count);
     const underlyingClose = finite(row.underlying_close);
@@ -1262,17 +1523,53 @@ const runExitReview = async (input: {
           now: input.now.toISOString()
         }, managedLeapsRiskConfig())
       : null;
+    if (leapsReview?.action === "hold") {
+      resolvedLeapsPositionIds.push(positionId);
+    }
     if (
       leapsReview?.action === "review" ||
       leapsReview?.action === "partial_exit_review"
     ) {
-      leapsMonitoringSignals.push({
+      const accountId = String(row.account_id ?? "").trim();
+      const accountSnapshotId = String(row.account_snapshot_id ?? "").trim();
+      const accountFingerprint = String(row.structural_fingerprint ?? "").trim();
+      if (!accountId || !accountSnapshotId || !accountFingerprint) {
+        throw new Error(
+          `POSTGRES_LEAPS_REVIEW_ACCOUNT_EVIDENCE_MISSING:${positionId}`
+        );
+      }
+      const signal: LeapsMonitoringSignal = {
         positionId,
         optionSymbol: String(row.order_symbol),
         action: leapsReview.action,
         executable: false,
         suggestedQuantity: leapsReview.suggestedQuantity,
         reasons: leapsReview.reasons
+      };
+      leapsMonitoringSignals.push(signal);
+      persistableLeapsMonitoringSignals.push({
+        ...signal,
+        accountId,
+        candidateId: row.candidate_id ? String(row.candidate_id) : null,
+        accountSnapshotId,
+        accountFingerprint,
+        marketTimestamp: timestamp,
+        marketRequestId: row.market_request_id
+          ? String(row.market_request_id)
+          : null,
+        evidence: {
+          source: "postgres.option_snapshots",
+          impliedVolatility: finite(optionEvidence.impliedVolatility),
+          delta: finite(optionEvidence.delta),
+          gamma: finite(optionEvidence.gamma),
+          theta: finite(optionEvidence.theta),
+          vega: finite(optionEvidence.vega),
+          rho: finite(optionEvidence.rho),
+          directionalReturnPct,
+          currentDte,
+          observedPrice: price,
+          quantity
+        }
       });
     }
     const reason = option
@@ -1300,6 +1597,18 @@ const runExitReview = async (input: {
       underlyingSip
     }] : [];
   });
+  const leapsMonitoringSignalsPersisted = await persistLeapsMonitoringSignals({
+    query: input.query,
+    fence: input.fence,
+    now: input.now,
+    signals: persistableLeapsMonitoringSignals
+  });
+  const leapsMonitoringSignalsResolved = await resolveCurrentLeapsMonitoringSignals({
+    query: input.query,
+    fence: input.fence,
+    now: input.now,
+    positionIds: resolvedLeapsPositionIds
+  });
   if (!eligible.length) {
     return {
       status: "no_op" as const,
@@ -1307,11 +1616,18 @@ const runExitReview = async (input: {
       reviewsCreated: 0,
       pendingIntentsCreated: 0,
       capacityBlocked: 0,
-      leapsMonitoringSignals
+      leapsMonitoringSignals,
+      ...(leapsMonitoringSignals.length > 0
+        ? { leapsMonitoringSignalsPersisted }
+        : {}),
+      ...(leapsMonitoringSignalsResolved > 0
+        ? { leapsMonitoringSignalsResolved }
+        : {})
     };
   }
   let created = 0;
   let skipped = 0;
+  let fullExitSignalsResolved = 0;
   for (const item of eligible) {
     const row = item.row;
     const accountId = String(row.account_id);
@@ -1544,6 +1860,17 @@ const runExitReview = async (input: {
     ) {
       throw new Error("POSTGRES_EXIT_REVIEW_PERSISTENCE_FAILED");
     }
+    if (
+      item.strategyClassification === "leaps_long_call" ||
+      item.strategyClassification === "leaps_long_put"
+    ) {
+      fullExitSignalsResolved += await resolveCurrentLeapsMonitoringSignals({
+        query: input.query,
+        fence: input.fence,
+        now: input.now,
+        positionIds: [positionId]
+      });
+    }
     if (reviewCount === 0) {
       skipped += 1;
       continue;
@@ -1554,7 +1881,16 @@ const runExitReview = async (input: {
     status: "completed" as const, command: input.command, reviewsCreated: created,
     pendingIntentsCreated: created, skipped, capacityBlocked: 0,
     confirmationCreated: created > 0, paperOnly: true,
-    leapsMonitoringSignals
+    leapsMonitoringSignals,
+    ...(leapsMonitoringSignals.length > 0
+      ? { leapsMonitoringSignalsPersisted }
+      : {}),
+    ...(leapsMonitoringSignalsResolved + fullExitSignalsResolved > 0
+      ? {
+          leapsMonitoringSignalsResolved:
+            leapsMonitoringSignalsResolved + fullExitSignalsResolved
+        }
+      : {})
   };
 };
 

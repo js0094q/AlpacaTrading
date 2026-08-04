@@ -105,6 +105,59 @@ const observedExitOptionContract = (optionSymbol: string) => {
     allocation_effective_to: null
   };
 };
+const currentLeapsReviewAuthority = (timestamp: string) => ({
+  account_broker: "alpaca",
+  account_record_status: "ACTIVE",
+  account_snapshot_status: "ACTIVE",
+  account_snapshot_source: "alpaca",
+  account_snapshot_observed_at: timestamp,
+  position_last_reconciled_at: timestamp
+});
+const reviewOnlyLeapsSource = (overrides: Record<string, unknown> = {}) => {
+  const optionSymbol = "SPY280121C00550000";
+  return {
+    ...observedExitOptionContract(optionSymbol),
+    ...currentLeapsReviewAuthority("2026-08-04T14:00:00.000Z"),
+    opening_strategy_classification: "leaps_long_call",
+    position_id: "position-leaps-monitor",
+    candidate_id: "candidate-leaps-monitor",
+    symbol: "SPY",
+    order_symbol: optionSymbol,
+    asset_class: "option",
+    side: "long",
+    available_quantity: "3",
+    average_entry_price: "2.00",
+    strategy_key: "leaps",
+    account_id: "account-1",
+    account_snapshot_id: "snapshot-1",
+    snapshot_fingerprint: "portfolio-fingerprint",
+    structural_fingerprint: "structural-fingerprint",
+    market_price: "1.60",
+    market_timestamp: "2026-08-04T14:00:00.000Z",
+    sip_market_timestamp: "2026-08-04T14:00:00.000Z",
+    underlying_close: "510",
+    severe_trend_sma: "500",
+    severe_trend_bar_count: "200",
+    last_reviewed_at: "2026-06-01T14:00:00.000Z",
+    market_evidence: {
+      bid: 1.58,
+      ask: 1.62,
+      spreadPct: 0.025,
+      volume: 2_000,
+      openInterest: 5_000,
+      impliedVolatility: 0.35,
+      delta: 0.4,
+      gamma: null,
+      theta: -0.05,
+      vega: 1.8,
+      rho: 0.9,
+      requestedFeed: "opra",
+      effectiveFeed: "opra",
+      provider: "alpaca"
+    },
+    ...overrides
+  };
+};
 const observedLeapsCallContract = {
   ...observedOptionContract,
   contract_option_symbol: "SPY270501C00560000",
@@ -2548,6 +2601,7 @@ test("option exit retains the observed contract, open quantity cap, and immutabl
           return {
             rows: [{
               ...observedExitOptionContract(symbol),
+              ...currentLeapsReviewAuthority("2026-07-20T21:59:30.000Z"),
               contract_id: `contract-${symbol}`,
               contract_type: "put",
               contract_expiration_date: "2027-07-20",
@@ -2585,6 +2639,12 @@ test("option exit retains the observed contract, open quantity cap, and immutabl
                 provider: "alpaca"
               }
             }],
+            rowCount: 1
+          };
+        }
+        if (statement.includes("UPDATE position_review_signals")) {
+          return {
+            rows: [{ fence_held: true, resolved_count: 1 }],
             rowCount: 1
           };
         }
@@ -2683,16 +2743,19 @@ test("PostgreSQL exit review forces a genuine 0DTE long option exit in the final
 });
 
 test("PostgreSQL exit review applies the LEAPS full-profit trigger to a long-dated option", async () => {
+  const sql: string[] = [];
   let reviewOrderIntent: Record<string, unknown> | undefined;
   let trigger: Record<string, unknown> | undefined;
   const result = await runPostgresReviewWorkflow({
     command: "paper:exit:review",
     query: {
       query: async (statement: string, values?: readonly unknown[]) => {
+        sql.push(statement);
         if (statement.includes("FROM positions position")) {
           return {
             rows: [{
               ...observedExitOptionContract("SPY280121C00550000"),
+              ...currentLeapsReviewAuthority("2026-07-20T21:59:30.000Z"),
               opening_strategy_classification: "leaps_long_call",
               position_id: "position-leaps", candidate_id: "candidate-leaps",
               symbol: "SPY", order_symbol: "SPY280121C00550000", asset_class: "option",
@@ -2716,6 +2779,12 @@ test("PostgreSQL exit review applies the LEAPS full-profit trigger to a long-dat
             rowCount: 1
           };
         }
+        if (statement.includes("UPDATE position_review_signals")) {
+          return {
+            rows: [{ fence_held: true, resolved_count: 1 }],
+            rowCount: 1
+          };
+        }
         if (statement.includes("INSERT INTO execution_reviews")) {
           reviewOrderIntent = JSON.parse(String(values?.[9])) as Record<string, unknown>;
           const portfolioPayload = JSON.parse(String(values?.[11])) as Record<string, unknown>;
@@ -2734,6 +2803,14 @@ test("PostgreSQL exit review applies the LEAPS full-profit trigger to a long-dat
   assert.equal(reviewOrderIntent?.side, "sell_to_close");
   assert.equal(reviewOrderIntent?.reason, "LEAPS_FULL_PROFIT_TAKE");
   assert.equal(trigger?.reason, "LEAPS_FULL_PROFIT_TAKE");
+  assert.equal(result.leapsMonitoringSignalsResolved, 1);
+  assert.ok(
+    sql.findIndex((statement) => statement.includes("INSERT INTO execution_reviews")) <
+      sql.findIndex((statement) =>
+        statement.startsWith("WITH fence_state") &&
+        statement.includes("UPDATE position_review_signals")
+      )
+  );
 });
 
 test("PostgreSQL exit review applies the maintained LEAPS severe-trend trigger", async () => {
@@ -2746,6 +2823,7 @@ test("PostgreSQL exit review applies the maintained LEAPS severe-trend trigger",
           return {
             rows: [{
               ...observedExitOptionContract("SPY280121C00550000"),
+              ...currentLeapsReviewAuthority("2026-07-20T21:59:30.000Z"),
               opening_strategy_classification: "leaps_long_call",
               position_id: "position-leaps-trend",
               candidate_id: "candidate-leaps-trend",
@@ -2778,6 +2856,12 @@ test("PostgreSQL exit review applies the maintained LEAPS severe-trend trigger",
                 provider: "alpaca"
               }
             }],
+            rowCount: 1
+          };
+        }
+        if (statement.includes("UPDATE position_review_signals")) {
+          return {
+            rows: [{ fence_held: true, resolved_count: 1 }],
             rowCount: 1
           };
         }
@@ -2854,6 +2938,14 @@ test("option exit review rejects an unusable quote before persisting a close int
     /POSTGRES_EXIT_REVIEW_OPTION_QUOTE_INVALID:SPY260821P00550000/
   );
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO execution_reviews")), false);
+  const sourceSql = sql.find((statement) =>
+    statement.includes("FROM positions position")
+  ) ?? "";
+  assert.match(sourceSql, /broker = 'alpaca'/);
+  assert.match(sourceSql, /lower\(status\) = 'active'/);
+  assert.match(sourceSql, /current_snapshot AS/);
+  assert.match(sourceSql, /resolved_terminal_signals AS/);
+  assert.match(sourceSql, /terminal_position\.last_reconciled_at/);
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO order_intents")), false);
 });
 
@@ -3026,16 +3118,18 @@ test("PostgreSQL review cannot classify a long-dated standard-family candidate a
 
 test("PostgreSQL LEAPS monitoring surfaces review-only paid-Greek deterioration", async () => {
   const sql: string[] = [];
+  const persistedSignalValues: Array<readonly unknown[]> = [];
   const optionSymbol = "SPY280121C00550000";
   const result = await runPostgresReviewWorkflow({
     command: "paper:exit:review",
     query: {
-      query: async (statement: string) => {
+      query: async (statement: string, values?: readonly unknown[]) => {
         sql.push(statement);
         if (statement.includes("FROM positions position")) {
           return {
             rows: [{
               ...observedExitOptionContract(optionSymbol),
+              ...currentLeapsReviewAuthority("2026-08-04T14:00:00.000Z"),
               opening_strategy_classification: "leaps_long_call",
               position_id: "position-leaps-monitor",
               candidate_id: "candidate-leaps-monitor",
@@ -3077,6 +3171,13 @@ test("PostgreSQL LEAPS monitoring surfaces review-only paid-Greek deterioration"
             rowCount: 1
           };
         }
+        if (statement.includes("INSERT INTO position_review_signals")) {
+          persistedSignalValues.push(values ?? []);
+          return {
+            rows: [{ fence_held: true, signal_count: 1 }],
+            rowCount: 1
+          };
+        }
         return { rows: [], rowCount: 1 };
       }
     },
@@ -3101,6 +3202,137 @@ test("PostgreSQL LEAPS monitoring surfaces review-only paid-Greek deterioration"
     ]
   }]);
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO execution_reviews")), false);
+  assert.equal(result.leapsMonitoringSignalsPersisted, 1);
+  assert.equal(persistedSignalValues.length, 1);
+  assert.equal(
+    sql.some((statement) =>
+      statement.includes("last_observation_id = EXCLUDED.last_observation_id") &&
+      statement.includes("THEN 0")
+    ),
+    true
+  );
+  assert.equal(
+    sql.some((statement) =>
+      statement.includes("UPDATE position_review_signals") &&
+      statement.includes("signal_fingerprint <> $10") &&
+      statement.includes("status = 'resolved'")
+    ),
+    true
+  );
+  assert.equal(persistedSignalValues[0]?.includes("position-leaps-monitor"), true);
+  assert.equal(persistedSignalValues[0]?.includes(optionSymbol), true);
+  assert.equal(persistedSignalValues[0]?.includes("review"), true);
+  assert.equal(
+    persistedSignalValues[0]?.some((value) =>
+      typeof value === "string" && value.includes("LEAPS_GREEK_COVERAGE_REVIEW")
+    ),
+    true
+  );
+});
+
+test("managed LEAPS signal persistence rejects inactive Alpaca account authority", async () => {
+  const sql: string[] = [];
+  await assert.rejects(
+    runPostgresReviewWorkflow({
+      command: "paper:exit:review",
+      query: {
+        query: async (statement: string) => {
+          sql.push(statement);
+          if (statement.includes("FROM positions position")) {
+            return {
+              rows: [reviewOnlyLeapsSource({ account_record_status: "INACTIVE" })],
+              rowCount: 1
+            };
+          }
+          return { rows: [], rowCount: 1 };
+        }
+      },
+      fence,
+      signingKey: "test-signing-key-with-sufficient-length",
+      now: new Date("2026-08-04T14:00:00.000Z")
+    }),
+    /POSTGRES_LEAPS_REVIEW_ACCOUNT_AUTHORITY_INVALID:position-leaps-monitor/
+  );
+  assert.equal(
+    sql.some((statement) => statement.includes("INSERT INTO position_review_signals")),
+    false
+  );
+});
+
+test("a healthy managed LEAPS review resolves stale open monitoring signals", async () => {
+  const sql: string[] = [];
+  const optionSymbol = "SPY280121C00550000";
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:exit:review",
+    query: {
+      query: async (statement: string) => {
+        sql.push(statement);
+        if (statement.includes("FROM positions position")) {
+          return {
+            rows: [{
+              ...observedExitOptionContract(optionSymbol),
+              ...currentLeapsReviewAuthority("2026-08-04T14:00:00.000Z"),
+              opening_strategy_classification: "leaps_long_call",
+              position_id: "position-leaps-healthy",
+              candidate_id: "candidate-leaps-healthy",
+              symbol: "SPY",
+              order_symbol: optionSymbol,
+              asset_class: "option",
+              side: "long",
+              available_quantity: "2",
+              average_entry_price: "12",
+              strategy_key: "leaps",
+              account_id: "account-1",
+              account_snapshot_id: "snapshot-1",
+              snapshot_fingerprint: "portfolio-fingerprint",
+              structural_fingerprint: "structural-fingerprint",
+              market_price: "12",
+              market_timestamp: "2026-08-04T14:00:00.000Z",
+              sip_market_timestamp: "2026-08-04T14:00:00.000Z",
+              underlying_close: "510",
+              severe_trend_sma: "500",
+              severe_trend_bar_count: "200",
+              last_reviewed_at: "2026-08-04T14:00:00.000Z",
+              market_evidence: {
+                ...completeLeapsCallGreeks,
+                bid: 11.9,
+                ask: 12.1,
+                spreadPct: 0.0167,
+                volume: 2_000,
+                openInterest: 5_000,
+                requestedFeed: "opra",
+                effectiveFeed: "opra",
+                provider: "alpaca"
+              }
+            }],
+            rowCount: 1
+          };
+        }
+        if (statement.includes("UPDATE position_review_signals")) {
+          return {
+            rows: [{ fence_held: true, resolved_count: 1 }],
+            rowCount: 1
+          };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    now: new Date("2026-08-04T14:00:00.000Z")
+  });
+
+  assert.equal(result.code, "NO_POSTGRES_EXIT_TRIGGER");
+  assert.deepEqual(result.leapsMonitoringSignals, []);
+  assert.equal(result.leapsMonitoringSignalsResolved, 1);
+  assert.equal(
+    sql.some((statement) =>
+      statement.includes("UPDATE position_review_signals") &&
+      statement.includes("position_id = $1") &&
+      statement.includes("status = 'open'")
+    ),
+    true
+  );
 });
 
 test("option exit review rejects executable evidence beyond the autonomous 30-minute window", async () => {

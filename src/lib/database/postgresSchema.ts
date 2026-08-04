@@ -27,6 +27,7 @@ export const POSTGRES_OPERATIONAL_TABLES = [
   "risk_limits",
   "strategy_allocations",
   "portfolio_exposure",
+  "position_review_signals",
   "portfolio_arbitration_decisions",
   "outcome_learning_refresh_runs",
   "outcome_learning_records",
@@ -93,6 +94,8 @@ export const POSTGRES_OPERATIONAL_INDEXES = [
   "strategy_allocations_account_status_idx",
   "portfolio_exposure_account_observed_idx",
   "portfolio_exposure_scope_observed_idx",
+  "position_review_signals_open_observed_idx",
+  "position_review_signals_position_history_idx",
   "portfolio_arbitration_account_cycle_idx",
   "portfolio_arbitration_proposal_idx",
   "portfolio_arbitration_context_idx",
@@ -183,7 +186,17 @@ export const POSTGRES_RELEASE_3_COLUMNS = [
   "order_intents.symbol",
   "order_intents.quantity",
   "order_intents.limit_price",
-  "order_intents.reservation_release_reason"
+  "order_intents.reservation_release_reason",
+  "position_review_signals.action",
+  "position_review_signals.executable",
+  "position_review_signals.reasons",
+  "position_review_signals.evidence",
+  "position_review_signals.signal_fingerprint",
+  "position_review_signals.last_observation_id",
+  "position_review_signals.status",
+  "position_review_signals.first_observed_at",
+  "position_review_signals.last_observed_at",
+  "position_review_signals.occurrences"
 ] as const;
 
 export const POSTGRES_RELEASE_3_CONSTRAINTS = [
@@ -195,7 +208,18 @@ export const POSTGRES_RELEASE_3_CONSTRAINTS = [
   "option_contracts_evidence_object",
   "target_snapshots_strategy_identity_nonempty",
   "options_strategy_snapshots_strategy_identity_nonempty",
-  "portfolio_arbitration_lane_valid"
+  "portfolio_arbitration_lane_valid",
+  "position_review_signals_action_valid",
+  "position_review_signals_nonexecutable",
+  "position_review_signals_reasons_valid",
+  "position_review_signals_evidence_object",
+  "position_review_signals_fingerprint_valid",
+  "position_review_signals_observation_id_valid",
+  "position_review_signals_status_valid",
+  "position_review_signals_occurrences_positive",
+  "position_review_signals_observed_order",
+  "position_review_signals_status_timestamps_consistent",
+  "position_review_signals_identity_unique"
 ] as const;
 
 /** Migration-006 constraints are registered separately from the release-3 verifier. */
@@ -221,7 +245,17 @@ export const POSTGRES_AUTONOMOUS_LIFECYCLE_TRIGGERS = [
 export const POSTGRES_RELEASE_3_NOT_NULL_COLUMNS = [
   "candidates.decision_id",
   "option_contracts.evidence",
-  "order_intents.lifecycle_state"
+  "order_intents.lifecycle_state",
+  "position_review_signals.action",
+  "position_review_signals.executable",
+  "position_review_signals.reasons",
+  "position_review_signals.evidence",
+  "position_review_signals.signal_fingerprint",
+  "position_review_signals.last_observation_id",
+  "position_review_signals.status",
+  "position_review_signals.first_observed_at",
+  "position_review_signals.last_observed_at",
+  "position_review_signals.occurrences"
 ] as const;
 
 const release3ConstraintDefinitions: Readonly<
@@ -275,6 +309,50 @@ const release3ConstraintDefinitions: Readonly<
       "options_0dte",
       "options_leaps"
     ]
+  },
+  position_review_signals_action_valid: {
+    table: "position_review_signals",
+    fragments: ["review", "partial_exit_review"]
+  },
+  position_review_signals_nonexecutable: {
+    table: "position_review_signals",
+    fragments: ["not executable"]
+  },
+  position_review_signals_reasons_valid: {
+    table: "position_review_signals",
+    fragments: ["jsonb_typeof(reasons)", "jsonb_array_length(reasons) > 0"]
+  },
+  position_review_signals_evidence_object: {
+    table: "position_review_signals",
+    fragments: ["jsonb_typeof(evidence)", "object"]
+  },
+  position_review_signals_fingerprint_valid: {
+    table: "position_review_signals",
+    fragments: ["signal_fingerprint", "^[a-f0-9]{64}$"]
+  },
+  position_review_signals_observation_id_valid: {
+    table: "position_review_signals",
+    fragments: ["last_observation_id", "^[a-f0-9]{64}$"]
+  },
+  position_review_signals_status_valid: {
+    table: "position_review_signals",
+    fragments: ["open", "acknowledged", "resolved"]
+  },
+  position_review_signals_occurrences_positive: {
+    table: "position_review_signals",
+    fragments: ["occurrences > 0"]
+  },
+  position_review_signals_observed_order: {
+    table: "position_review_signals",
+    fragments: ["last_observed_at >= first_observed_at"]
+  },
+  position_review_signals_status_timestamps_consistent: {
+    table: "position_review_signals",
+    fragments: ["status", "acknowledged_at is null", "resolved_at is not null"]
+  },
+  position_review_signals_identity_unique: {
+    table: "position_review_signals",
+    fragments: ["unique", "position_id", "signal_fingerprint"]
   }
 };
 
@@ -335,6 +413,17 @@ const release3IndexDefinitions: Readonly<Record<string, {
     table: "options_strategy_snapshots",
     unique: false,
     fragments: ["(strategy_family, as_of desc, symbol)"]
+  },
+  position_review_signals_open_observed_idx: {
+    table: "position_review_signals",
+    unique: false,
+    fragments: ["(last_observed_at desc, position_id)"],
+    predicateFragments: ["status = 'open'::text"]
+  },
+  position_review_signals_position_history_idx: {
+    table: "position_review_signals",
+    unique: false,
+    fragments: ["(position_id, last_observed_at desc, id)"]
   }
 };
 

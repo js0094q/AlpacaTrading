@@ -13,6 +13,29 @@ import {
   verifyPostgresSchema
 } from "../src/lib/database/postgresSchema.js";
 
+const positionReviewConstraintDefinitions: Record<string, string> = {
+  position_review_signals_action_valid:
+    "CHECK (action = ANY (ARRAY['review'::text, 'partial_exit_review'::text]))",
+  position_review_signals_nonexecutable: "CHECK (NOT executable)",
+  position_review_signals_reasons_valid:
+    "CHECK ((jsonb_typeof(reasons) = 'array'::text) AND (jsonb_array_length(reasons) > 0))",
+  position_review_signals_evidence_object:
+    "CHECK (jsonb_typeof(evidence) = 'object'::text)",
+  position_review_signals_fingerprint_valid:
+    "CHECK (signal_fingerprint ~ '^[a-f0-9]{64}$'::text)",
+  position_review_signals_observation_id_valid:
+    "CHECK (last_observation_id ~ '^[a-f0-9]{64}$'::text)",
+  position_review_signals_status_valid:
+    "CHECK (status = ANY (ARRAY['open'::text, 'acknowledged'::text, 'resolved'::text]))",
+  position_review_signals_occurrences_positive: "CHECK (occurrences > 0)",
+  position_review_signals_observed_order:
+    "CHECK (last_observed_at >= first_observed_at)",
+  position_review_signals_status_timestamps_consistent:
+    "CHECK (((status = 'open'::text) AND (acknowledged_at IS NULL) AND (resolved_at IS NULL)) OR ((status = 'acknowledged'::text) AND (acknowledged_at IS NOT NULL) AND (resolved_at IS NULL)) OR ((status = 'resolved'::text) AND (resolved_at IS NOT NULL)))",
+  position_review_signals_identity_unique:
+    "UNIQUE (position_id, signal_fingerprint)"
+};
+
 const poolWith = (options: {
   missingTable?: string;
   missingIndex?: string;
@@ -79,6 +102,15 @@ const poolWith = (options: {
         options_strategy_snapshots_family_as_of_idx: {
           tableName: "options_strategy_snapshots",
           indexdef: "CREATE INDEX options_strategy_snapshots_family_as_of_idx ON options_strategy_snapshots (strategy_family, as_of DESC, symbol)"
+        },
+        position_review_signals_open_observed_idx: {
+          tableName: "position_review_signals",
+          indexdef: "CREATE INDEX position_review_signals_open_observed_idx ON position_review_signals (last_observed_at DESC, position_id)",
+          predicate: "status = 'open'::text"
+        },
+        position_review_signals_position_history_idx: {
+          tableName: "position_review_signals",
+          indexdef: "CREATE INDEX position_review_signals_position_history_idx ON position_review_signals (position_id, last_observed_at DESC, id)"
         }
       };
       return {
@@ -138,7 +170,9 @@ const poolWith = (options: {
           .filter((conname) => conname !== options.missingConstraint)
           .map((conname) => ({
             conname,
-            table_name: conname === "portfolio_arbitration_lane_valid"
+            table_name: conname.startsWith("position_review_signals_")
+              ? "position_review_signals"
+              : conname === "portfolio_arbitration_lane_valid"
               ? "portfolio_arbitration_decisions"
               : conname === "scheduler_leases_timestamp_order"
               ? "scheduler_leases"
@@ -156,7 +190,8 @@ const poolWith = (options: {
                           ? "options_strategy_snapshots"
                       : "workstream_events",
             convalidated: options.invalidConstraint === conname ? false : true,
-            definition: conname === "portfolio_arbitration_lane_valid"
+            definition: positionReviewConstraintDefinitions[conname] ??
+              (conname === "portfolio_arbitration_lane_valid"
               ? options.legacyPortfolioLaneConstraint
                 ? "CHECK (lane = ANY (ARRAY['equity'::text, 'options_0dte'::text, 'options_leaps'::text]))"
                 : "CHECK (lane = ANY (ARRAY['equity'::text, 'options_standard'::text, 'options_0dte'::text, 'options_leaps'::text]))"
@@ -194,7 +229,7 @@ const poolWith = (options: {
                       ? "CHECK ((btrim(strategy_family) <> ''::text) AND (btrim(expression_id) <> ''::text))"
                       : conname === "options_strategy_snapshots_strategy_identity_nonempty"
                         ? "CHECK ((btrim(strategy_family) <> ''::text) AND (btrim(expression_id) <> ''::text))"
-                : "CHECK ((processed_at IS NULL) OR (processing_started_at IS NULL) OR (processed_at >= processing_started_at))"
+                : "CHECK ((processed_at IS NULL) OR (processing_started_at IS NULL) OR (processed_at >= processing_started_at))")
           }))
       } as unknown as QueryResult;
     }
@@ -232,6 +267,30 @@ test("schema verification requires every operational table, index, and fencing s
   assert.ok(
     POSTGRES_OPERATIONAL_INDEXES.includes("research_signals_symbol_as_of_idx")
   );
+  assert.ok(POSTGRES_OPERATIONAL_TABLES.includes("position_review_signals"));
+  assert.ok(
+    POSTGRES_OPERATIONAL_INDEXES.includes("position_review_signals_open_observed_idx")
+  );
+  assert.ok(
+    POSTGRES_OPERATIONAL_INDEXES.includes("position_review_signals_position_history_idx")
+  );
+  for (const column of [
+    "position_review_signals.executable",
+    "position_review_signals.reasons",
+    "position_review_signals.signal_fingerprint",
+    "position_review_signals.last_observation_id",
+    "position_review_signals.status"
+  ]) {
+    assert.ok(POSTGRES_RELEASE_3_NOT_NULL_COLUMNS.includes(column as never), column);
+  }
+  for (const constraint of [
+    "position_review_signals_nonexecutable",
+    "position_review_signals_reasons_valid",
+    "position_review_signals_status_timestamps_consistent",
+    "position_review_signals_identity_unique"
+  ]) {
+    assert.ok(POSTGRES_RELEASE_3_CONSTRAINTS.includes(constraint as never), constraint);
+  }
   for (const column of [
     "option_contracts.contract_id",
     "option_contracts.status",
@@ -331,4 +390,24 @@ test("schema verification rejects an old three-column target primary key", async
   }));
   assert.equal(result.verificationPassed, false);
   assert.deepEqual(result.invalidPrimaryKeys, ["target_snapshots"]);
+});
+
+test("schema verification rejects a missing LEAPS non-executable constraint", async () => {
+  const result = await verifyPostgresSchema(poolWith({
+    missingConstraint: "position_review_signals_nonexecutable"
+  }));
+  assert.equal(result.verificationPassed, false);
+  assert.deepEqual(result.missingConstraints, [
+    "position_review_signals_nonexecutable"
+  ]);
+});
+
+test("schema verification rejects an invalid LEAPS open-signal index", async () => {
+  const result = await verifyPostgresSchema(poolWith({
+    invalidIndex: "position_review_signals_open_observed_idx"
+  }));
+  assert.equal(result.verificationPassed, false);
+  assert.deepEqual(result.invalidIndexes, [
+    "position_review_signals_open_observed_idx"
+  ]);
 });
