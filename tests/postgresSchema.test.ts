@@ -24,6 +24,7 @@ const poolWith = (options: {
   nullableColumn?: string;
   missingPrimaryKey?: string;
   invalidPrimaryKey?: string;
+  legacyPortfolioLaneConstraint?: boolean;
   sequence?: boolean;
 } = {}) => ({
   query: async (text: string) => {
@@ -137,7 +138,9 @@ const poolWith = (options: {
           .filter((conname) => conname !== options.missingConstraint)
           .map((conname) => ({
             conname,
-            table_name: conname === "scheduler_leases_timestamp_order"
+            table_name: conname === "portfolio_arbitration_lane_valid"
+              ? "portfolio_arbitration_decisions"
+              : conname === "scheduler_leases_timestamp_order"
               ? "scheduler_leases"
               : conname === "option_contracts_evidence_object"
                 ? "option_contracts"
@@ -153,7 +156,11 @@ const poolWith = (options: {
                           ? "options_strategy_snapshots"
                       : "workstream_events",
             convalidated: options.invalidConstraint === conname ? false : true,
-            definition: conname === "scheduler_leases_timestamp_order"
+            definition: conname === "portfolio_arbitration_lane_valid"
+              ? options.legacyPortfolioLaneConstraint
+                ? "CHECK (lane = ANY (ARRAY['equity'::text, 'options_0dte'::text, 'options_leaps'::text]))"
+                : "CHECK (lane = ANY (ARRAY['equity'::text, 'options_standard'::text, 'options_0dte'::text, 'options_leaps'::text]))"
+              : conname === "scheduler_leases_timestamp_order"
               ? "CHECK ((heartbeat_at >= acquired_at) AND (expires_at > heartbeat_at) AND ((released_at IS NULL) OR (released_at >= acquired_at)))"
               : conname === "workstream_events_attempts_nonnegative"
                 ? "CHECK (attempts >= 0)"
@@ -247,6 +254,7 @@ test("schema verification requires every operational table, index, and fencing s
   }
   assert.ok(POSTGRES_RELEASE_3_CONSTRAINTS.includes("target_snapshots_strategy_identity_nonempty"));
   assert.ok(POSTGRES_RELEASE_3_CONSTRAINTS.includes("options_strategy_snapshots_strategy_identity_nonempty"));
+  assert.ok(POSTGRES_RELEASE_3_CONSTRAINTS.includes("portfolio_arbitration_lane_valid" as never));
   assert.ok(POSTGRES_OPERATIONAL_INDEXES.includes("target_snapshots_family_as_of_idx"));
   assert.ok(POSTGRES_OPERATIONAL_INDEXES.includes("options_strategy_snapshots_family_as_of_idx"));
   assert.equal(result.presentIndexCount, POSTGRES_OPERATIONAL_INDEXES.length);
@@ -299,6 +307,14 @@ test("schema verification rejects an invalid named target lane identity constrai
   }));
   assert.equal(result.verificationPassed, false);
   assert.deepEqual(result.invalidConstraints, ["target_snapshots_strategy_identity_nonempty"]);
+});
+
+test("schema verification rejects the legacy arbitration lane constraint", async () => {
+  const result = await verifyPostgresSchema(poolWith({
+    legacyPortfolioLaneConstraint: true
+  }));
+  assert.equal(result.verificationPassed, false);
+  assert.deepEqual(result.invalidConstraints, ["portfolio_arbitration_lane_valid"]);
 });
 
 test("schema verification rejects a missing target family and as-of index", async () => {

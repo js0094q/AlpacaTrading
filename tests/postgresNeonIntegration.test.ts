@@ -145,12 +145,12 @@ test("actual Neon PostgreSQL applies every migration twice and fences concurrent
     const second = await runPostgresMigrations(schemaPool, config);
     const verification = await verifyPostgresSchema(schemaPool);
 
-    assert.deepEqual(first.appliedVersions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-    assert.deepEqual(first.currentVersions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-    assert.equal(first.latestVersion, 10);
+    assert.deepEqual(first.appliedVersions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    assert.deepEqual(first.currentVersions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    assert.equal(first.latestVersion, 11);
     assert.deepEqual(second.appliedVersions, []);
-    assert.deepEqual(second.currentVersions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-    assert.equal(second.latestVersion, 10);
+    assert.deepEqual(second.currentVersions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    assert.equal(second.latestVersion, 11);
     assert.equal(verification.verificationPassed, true);
     assert.equal(verification.presentTableCount, 40);
     assert.equal(verification.presentIndexCount, 90);

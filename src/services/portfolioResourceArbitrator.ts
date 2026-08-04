@@ -1,6 +1,7 @@
 import type { WorkstreamLane } from "./canonicalWorkstreamResult.js";
 import { isActiveBrokerOrderStatus } from "./brokerOrderStatusService.js";
 
+export type PortfolioArbitrationLane = WorkstreamLane | "options_standard";
 export type PortfolioArbitrationAction = "approve" | "resize" | "skip";
 export type PortfolioArbitrationResizeMode =
   | "notional"
@@ -11,7 +12,7 @@ export type PortfolioExposureDirection = "long" | "short";
 export interface PortfolioArbitrationProposal {
   readonly proposalId: string;
   readonly cycleId: string;
-  readonly lane: WorkstreamLane;
+  readonly lane: PortfolioArbitrationLane;
   /**
    * Lower values have higher priority. The caller must derive this from an
    * existing configured or explicit lane order.
@@ -66,7 +67,7 @@ export interface PortfolioResourceContext {
   readonly openOrders: readonly PortfolioOrderExposure[];
   readonly pendingCommitments: readonly PortfolioPendingCommitment[];
   readonly laneCapacityAvailable: Readonly<
-    Partial<Record<WorkstreamLane, number | null>>
+    Partial<Record<PortfolioArbitrationLane, number | null>>
   >;
   readonly accountSnapshotAsOf: string | null;
   readonly positionSnapshotAsOf: string | null;
@@ -77,7 +78,7 @@ export interface PortfolioArbitrationDecision {
   readonly arbitrationId: string;
   readonly cycleId: string;
   readonly proposalId: string;
-  readonly lane: WorkstreamLane;
+  readonly lane: PortfolioArbitrationLane;
   readonly rank: number;
   readonly action: PortfolioArbitrationAction;
   readonly originalQuantity: number | null;
@@ -321,10 +322,10 @@ export const arbitratePortfolioResources = (input: {
   let optionsBuyingPowerRemaining = optionsBuyingPower;
   let cashRemaining = cash;
   let portfolioRemaining = portfolio;
-  const laneRemaining = new Map<WorkstreamLane, number | null>(
+  const laneRemaining = new Map<PortfolioArbitrationLane, number | null>(
     Object.entries(input.context.laneCapacityAvailable).map(
       ([lane, value]) => [
-        lane as WorkstreamLane,
+        lane as PortfolioArbitrationLane,
         finiteNonnegative(value ?? null)
       ]
     )

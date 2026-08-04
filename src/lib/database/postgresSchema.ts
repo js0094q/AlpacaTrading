@@ -194,7 +194,8 @@ export const POSTGRES_RELEASE_3_CONSTRAINTS = [
   "workstream_events_processed_timestamp_order",
   "option_contracts_evidence_object",
   "target_snapshots_strategy_identity_nonempty",
-  "options_strategy_snapshots_strategy_identity_nonempty"
+  "options_strategy_snapshots_strategy_identity_nonempty",
+  "portfolio_arbitration_lane_valid"
 ] as const;
 
 /** Migration-006 constraints are registered separately from the release-3 verifier. */
@@ -265,6 +266,15 @@ const release3ConstraintDefinitions: Readonly<
   options_strategy_snapshots_strategy_identity_nonempty: {
     table: "options_strategy_snapshots",
     fragments: ["btrim(strategy_family) <> ''::text", "btrim(expression_id) <> ''::text"]
+  },
+  portfolio_arbitration_lane_valid: {
+    table: "portfolio_arbitration_decisions",
+    fragments: [
+      "equity",
+      "options_standard",
+      "options_0dte",
+      "options_leaps"
+    ]
   }
 };
 

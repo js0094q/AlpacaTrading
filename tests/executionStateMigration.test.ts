@@ -257,6 +257,7 @@ test("PostgreSQL schema contains only the validated authority migrations", async
     "007_public_equity_research_signals.sql",
     "008_portfolio_resource_arbitration.sql",
     "009_bounded_outcome_learning.sql",
-    "010_lane_aware_target_identity.sql"
+    "010_lane_aware_target_identity.sql",
+    "011_standard_option_arbitration_lane.sql"
   ]);
 });

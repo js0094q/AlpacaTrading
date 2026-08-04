@@ -18,12 +18,13 @@ const fence: SchedulerFence = {
 const decision = (
   proposalId: string,
   action: "approve" | "resize" | "skip",
-  rank: number
+  rank: number,
+  lane?: PortfolioArbitrationDecision["lane"]
 ): PortfolioArbitrationDecision => ({
   arbitrationId: "arbitration-cycle-9",
   cycleId: "cycle-9",
   proposalId,
-  lane: rank === 1 ? "equity" : rank === 2 ? "options_0dte" : "options_leaps",
+  lane: lane ?? (rank === 1 ? "equity" : rank === 2 ? "options_0dte" : "options_leaps"),
   rank,
   action,
   originalQuantity: action === "approve" ? null : 2,
@@ -62,7 +63,8 @@ test("persists every decision in one fenced, idempotent PostgreSQL batch", async
   const decisions = [
     decision("proposal-1", "approve", 1),
     decision("proposal-2", "resize", 2),
-    decision("proposal-3", "skip", 3)
+    decision("proposal-3", "skip", 3),
+    decision("proposal-4", "approve", 4, "options_standard")
   ];
 
   const result = await persistPortfolioArbitrationDecisions({
@@ -72,8 +74,8 @@ test("persists every decision in one fenced, idempotent PostgreSQL batch", async
         return {
           rows: [{
             fence_held: true,
-            inserted_count: "3",
-            matched_count: "3"
+            inserted_count: "4",
+            matched_count: "4"
           }],
           rowCount: 1
         };
@@ -88,8 +90,8 @@ test("persists every decision in one fenced, idempotent PostgreSQL batch", async
   });
 
   assert.deepEqual(result, {
-    decisionCount: 3,
-    insertedCount: 3,
+    decisionCount: 4,
+    insertedCount: 4,
     replayedCount: 0
   });
   assert.equal(queries.length, 1);
@@ -103,7 +105,11 @@ test("persists every decision in one fenced, idempotent PostgreSQL batch", async
   const payload = JSON.parse(String(queries[0]!.values[0])) as Array<
     Record<string, unknown>
   >;
-  assert.equal(payload.length, 3);
+  assert.equal(payload.length, 4);
+  assert.deepEqual(
+    payload.map(({ lane }) => lane),
+    ["equity", "options_0dte", "options_leaps", "options_standard"]
+  );
   assert.deepEqual(
     payload.map(({ action, original_quantity, approved_quantity }) => ({
       action,
@@ -113,7 +119,8 @@ test("persists every decision in one fenced, idempotent PostgreSQL batch", async
     [
       { action: "approve", original_quantity: null, approved_quantity: null },
       { action: "resize", original_quantity: 2, approved_quantity: 1 },
-      { action: "skip", original_quantity: 2, approved_quantity: null }
+      { action: "skip", original_quantity: 2, approved_quantity: null },
+      { action: "approve", original_quantity: null, approved_quantity: null }
     ]
   );
   assert.equal(

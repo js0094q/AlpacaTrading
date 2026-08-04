@@ -99,6 +99,27 @@ test("ranking is deterministic, honors strategy priority, and ignores input orde
   assert.deepEqual(first, second);
 });
 
+test("standard options participate in arbitration without becoming a research workstream lane", () => {
+  const [decision] = run([
+    proposal("standard-option", {
+      lane: "options_standard",
+      strategyPriority: 2,
+      symbol: "SPY260918C00600000",
+      underlyingSymbol: "SPY",
+      contractId: "SPY260918C00600000",
+      assetClass: "option",
+      requestedQuantity: 1,
+      requestedNotional: 100,
+      resourceRequirement: 100,
+      unitResource: 100,
+      resizeMode: "whole_contracts"
+    })
+  ]).decisions;
+
+  assert.equal(decision?.lane, "options_standard");
+  assert.equal(decision?.action, "approve");
+});
+
 test("a proposal from a different cycle fails the arbitration pass closed", () => {
   assert.throws(
     () => run([
