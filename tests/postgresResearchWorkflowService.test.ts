@@ -36,6 +36,71 @@ const target = {
   strategyFamily: "equity" as const, expressionId: "equity:shares"
 };
 
+const captureResearchRunTimes = async (timestamps: Date[]) => {
+  let startedAt: unknown;
+  let completedAt: unknown;
+
+  await runPostgresResearchWorkflow({
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("INSERT INTO research_runs")) {
+          startedAt = values?.[5];
+          return { rows: [{ version: "1" }], rowCount: 1 };
+        }
+        if (statement.includes("SET status = 'completed'")) {
+          completedAt = values?.[5];
+        }
+        if (statement.includes("to_regclass('public.learning_runs')")) {
+          return { rows: [{ learning_model_relation: null }], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    riskProfile: "aggressive",
+    optionsEnabled: false,
+    maxCandidates: 10,
+    dependencies: {
+      now: () => timestamps.shift()!,
+      refreshMarketData: async () => ({
+        bars: [bar],
+        stockSnapshots: [],
+        optionContracts: [],
+        optionSnapshots: [],
+        summary: {}
+      }) as never,
+      buildFeaturesAndTargets: async () => ({
+        features: [],
+        targets: [target]
+      }),
+      loadResearchSignals: async () => [],
+      symbols: ["SPY"]
+    }
+  });
+
+  return { startedAt, completedAt };
+};
+
+test("research persists the actual completion time after its market work finishes", async () => {
+  const { startedAt, completedAt } = await captureResearchRunTimes([
+    new Date("2026-08-04T15:01:46.668Z"),
+    new Date("2026-08-04T15:20:58.923Z")
+  ]);
+
+  assert.equal(startedAt, "2026-08-04T15:01:46.668Z");
+  assert.equal(completedAt, "2026-08-04T15:20:58.923Z");
+});
+
+test("research never persists completion before start when the wall clock moves backward", async () => {
+  const { startedAt, completedAt } = await captureResearchRunTimes([
+    new Date("2026-08-04T15:01:46.668Z"),
+    new Date("2026-08-04T15:00:00.000Z")
+  ]);
+
+  assert.equal(startedAt, "2026-08-04T15:01:46.668Z");
+  assert.equal(completedAt, "2026-08-04T15:01:46.668Z");
+});
+
 test("research persists current PostgreSQL evidence and selected candidates before completing", async () => {
   const sql: string[] = [];
   const telemetry: Record<string, unknown>[] = [];

@@ -59,6 +59,7 @@ type PostgresLearningModelCapability = {
 };
 
 type ResearchDependencies = {
+  now: () => Date;
   symbols: readonly string[];
   refreshMarketData: typeof refreshPostgresMarketData;
   buildFeaturesAndTargets: typeof buildPostgresFeaturesAndTargets;
@@ -68,6 +69,7 @@ type ResearchDependencies = {
 };
 
 const dependencies: ResearchDependencies = {
+  now: () => new Date(),
   symbols: seedUniverse,
   refreshMarketData: refreshPostgresMarketData,
   buildFeaturesAndTargets: buildPostgresFeaturesAndTargets,
@@ -944,7 +946,7 @@ export const runPostgresResearchWorkflow = async (input: {
   emitTelemetry?: (event: Record<string, unknown>) => void;
 }) => {
   const deps = { ...dependencies, ...input.dependencies };
-  const now = input.now ?? new Date();
+  const now = input.now ?? deps.now();
   const nowIso = now.toISOString();
   const runId = `research_${randomUUID()}`;
   const cycleId = input.cycleId ?? process.env.AUTONOMOUS_CYCLE_ID?.trim() ?? runId;
@@ -1082,6 +1084,9 @@ export const runPostgresResearchWorkflow = async (input: {
       cycleData: marketCycle,
       emitTelemetry: input.emitTelemetry
     });
+    const completedAtIso = input.now
+      ? nowIso
+      : new Date(Math.max(now.getTime(), deps.now().getTime())).toISOString();
     const completed = await input.query.query(
       `UPDATE research_runs
        SET status = 'completed', universe_size = $2, targets_generated = $3,
@@ -1104,7 +1109,7 @@ export const runPostgresResearchWorkflow = async (input: {
               researchUnavailableReasonCode ?? "RESEARCH_LOOKUP_COMPLETED"
           },
           explorationProfile
-        }), nowIso,
+        }), completedAtIso,
         ...fenceValues(input.fence)]
     );
     if (completed.rowCount !== 1) throw new Error("POSTGRES_RESEARCH_COMPLETION_FAILED");
