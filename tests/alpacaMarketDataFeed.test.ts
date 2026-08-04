@@ -1,8 +1,9 @@
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 
-const repoRoot = "/Users/josephstewart/Documents/Alpaca Trading";
+const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 
 const runConfigProbe = (values: Record<string, string>) => {
   const result = spawnSync(
@@ -122,9 +123,13 @@ describe("Alpaca market-data feed configuration", () => {
       return makeResponse({});
     };
 
+    let exactOptionSnapshots: Awaited<ReturnType<typeof provider.fetchOptionSnapshots>> = [];
     try {
       await provider.fetchAllBars({ symbols: ["AAPL"] });
-      await provider.fetchOptionSnapshots(["AAPL260101C00100000"]);
+      exactOptionSnapshots = await provider.fetchOptionSnapshots(
+        ["AAPL260101C00100000"],
+        { feed: "opra" }
+      );
       await provider.fetchOptionQuotes(["AAPL260101C00100000"]);
       await client.getLatestStockSnapshots(["AAPL"]);
       await client.getLatestOptionSnapshots(["AAPL260101C00100000"]);
@@ -141,6 +146,11 @@ describe("Alpaca market-data feed configuration", () => {
     assert.equal(optionUrls.length, 3);
     assert.equal(stockUrls.every((url) => new URL(url).searchParams.get("feed") === "sip"), true);
     assert.equal(optionUrls.every((url) => new URL(url).searchParams.get("feed") === "opra"), true);
+    assert.equal(exactOptionSnapshots.length, 1);
+    assert.equal(exactOptionSnapshots[0]?.requestedFeed, "opra");
+    assert.equal(exactOptionSnapshots[0]?.validationBasis, "request_feed_opra");
+    assert.equal(exactOptionSnapshots[0]?.requestId, "market-data-test-request");
+    assert.match(exactOptionSnapshots[0]?.endpoint ?? "", /symbols=AAPL260101C00100000/);
     assert.equal(calls.some((url) => url === "https://paper-api.alpaca.markets/v2/account"), true);
   });
 });

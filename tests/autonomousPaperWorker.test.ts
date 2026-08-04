@@ -1149,6 +1149,37 @@ test("expected market-data readiness conditions defer without stopping the worke
   }
 });
 
+test("selected option evidence that ages during refresh defers before review", () => {
+  const { result, calls, states } = runWorker({
+    successOutputs: {
+      "paper:evidence:refresh": JSON.stringify({
+        status: "deferred",
+        code: "POSTGRES_SELECTED_OPTION_EVIDENCE_REFRESH_INCOMPLETE",
+        staleSelectedOptionSymbols: ["AMZN280121C00300000"],
+        brokerMutationPerformed: false
+      })
+    }
+  });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.deepEqual(
+    calls.filter((call) => call.command !== "worker:state").map((call) => call.command),
+    executedCommands
+  );
+  const completion = states.find((state) =>
+    state.eventType === "workstream_completed" &&
+    state.payload.workstream === "paper:evidence:refresh"
+  );
+  assert.equal(completion?.payload.classification, "deferred");
+  assert.equal(completion?.payload.code, "WORKSTREAM_DEFERRED");
+  assert.equal(
+    completion?.payload.reasonCode,
+    "POSTGRES_SELECTED_OPTION_EVIDENCE_REFRESH_INCOMPLETE"
+  );
+  assert.equal(states.some((state) => state.eventType === "cycle_failed"), false);
+  assert.equal(states.some((state) => state.eventType === "cycle_completed"), true);
+});
+
 test("legitimate PostgreSQL empty-work outcomes are no-action completions across the full lifecycle", () => {
   const expected = {
     "paper:evidence:refresh": "NO_SELECTED_OPTION_EVIDENCE_TO_REFRESH",

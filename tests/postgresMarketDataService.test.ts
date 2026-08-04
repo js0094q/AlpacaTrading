@@ -225,6 +225,132 @@ test("the production PostgreSQL option lane requests OPRA even if an indicative 
   }
 });
 
+test("selected-contract refresh batches exact OPRA symbols and skips full contract and chain scans", async () => {
+  const optionSymbol = "AMZN280121C00300000";
+  const persistedSnapshots: PostgresOptionSnapshot[] = [];
+  const existingContract = {
+    optionSymbol,
+    underlyingSymbol: "AMZN",
+    type: "call" as const,
+    expirationDate: "2028-01-21",
+    strike: 300,
+    multiplier: 100,
+    tradable: true,
+    source: "alpaca",
+    requestId: "research-contract-AMZN",
+    observedAt: "2026-08-04T17:19:00.000Z",
+    contractId: "contract-AMZN",
+    status: "active",
+    exerciseStyle: "american",
+    openInterest: 11_500,
+    openInterestDate: "2026-08-03",
+    closePrice: 49,
+    closePriceDate: "2026-08-03",
+    evidence: { source: "prior-research" }
+  };
+  let contractListCalls = 0;
+  let chainCalls = 0;
+  const exactCalls: string[][] = [];
+  const result = await refreshPostgresMarketData({
+    symbols: ["AMZN"],
+    timeframe: "1Day",
+    start: "2025-08-04T17:20:00.000Z",
+    end: "2026-08-04T17:20:00.000Z",
+    optionsEnabled: true,
+    requiredOptionUnderlyings: ["AMZN"],
+    selectedOptionSymbols: [optionSymbol],
+    now: new Date("2026-08-04T17:20:00.000Z"),
+    repository: {
+      upsertUniverseSymbols: async (rows: unknown[]) => ({ stored: rows.length }),
+      upsertBars: async (rows: unknown[]) => ({ stored: rows.length }),
+      upsertStockSnapshots: async (rows: unknown[]) => ({ stored: rows.length }),
+      upsertOptionContracts: async () => {
+        throw new Error("selected refresh must reuse the selected persisted contract");
+      },
+      upsertOptionSnapshots: async (rows: PostgresOptionSnapshot[]) => {
+        persistedSnapshots.push(...rows);
+        return { stored: rows.length };
+      },
+      listOptionContractsBySymbols: async () => [existingContract],
+      listOptionSnapshotsByIdentity: async () => withEvidenceFingerprints(persistedSnapshots),
+      listFreshOptionStreamSnapshots: async () => []
+    } as never,
+    context,
+    dependencies: {
+      fetchAllBars: async () => [{
+        symbol: "AMZN",
+        bar: {
+          t: "2026-08-04T16:00:00.000Z",
+          o: 276,
+          h: 280,
+          l: 275,
+          c: 278.9,
+          v: 1_000_000
+        },
+        requestIds: ["bars-AMZN"]
+      }],
+      fetchStockSnapshots: async () => [{
+        symbol: "AMZN",
+        raw: {
+          ...stockRaw,
+          latestTrade: { ...stockRaw.latestTrade, p: 278.94, t: "2026-08-04T17:19:59.000Z" },
+          latestQuote: { ...stockRaw.latestQuote, bp: 278.93, ap: 278.95, t: "2026-08-04T17:19:59.000Z" },
+          minuteBar: { ...stockRaw.minuteBar, t: "2026-08-04T17:19:00.000Z" },
+          dailyBar: { ...stockRaw.dailyBar, t: "2026-08-04T17:19:00.000Z" },
+          prevDailyBar: { ...stockRaw.prevDailyBar, t: "2026-08-03T20:00:00.000Z" }
+        },
+        requestedFeed: "sip",
+        effectiveFeed: "sip",
+        currency: "USD",
+        requestId: "stock-AMZN",
+        retrievedAt: "2026-08-04T17:20:00.000Z"
+      }],
+      fetchOptionContracts: async () => {
+        contractListCalls += 1;
+        return [];
+      },
+      fetchOptionSnapshots: async (symbols, options) => {
+        exactCalls.push(symbols);
+        assert.equal((options as { feed?: string }).feed, "opra");
+        return [{
+          symbol: optionSymbol,
+          raw: {
+            snapshotTimestamp: "2026-08-04T17:19:59.000Z",
+            latestQuote: { bp: 49.5, ap: 50, bs: 10, as: 12, t: "2026-08-04T17:19:59.000Z" },
+            latestTrade: { p: 49.75, s: 1, t: "2026-08-04T17:19:58.000Z" },
+            dailyBar: { v: 1_862 },
+            impliedVolatility: 0.3837,
+            greeks: {
+              delta: 0.5806,
+              gamma: 0.003,
+              theta: -0.0597,
+              vega: 1.3202,
+              rho: 1.6458
+            }
+          },
+          requestId: "exact-AMZN",
+          endpoint: `/v1beta1/options/snapshots?symbols=${optionSymbol}&feed=opra`,
+          requestedFeed: "opra",
+          effectiveFeed: "opra",
+          validationBasis: "request_feed_opra",
+          retrievedAt: "2026-08-04T17:20:00.000Z"
+        }] as never;
+      },
+      fetchOptionChainSnapshots: async () => {
+        chainCalls += 1;
+        return { underlyingSymbol: "AMZN", pagesConsumed: 0, snapshots: [] };
+      }
+    }
+  });
+
+  assert.deepEqual(exactCalls, [[optionSymbol]]);
+  assert.equal(contractListCalls, 0);
+  assert.equal(chainCalls, 0);
+  assert.equal(result.summary.optionDataStatus, "current");
+  assert.deepEqual(result.summary.optionSnapshotsByUnderlying, { AMZN: 1 });
+  assert.equal(result.optionSnapshots[0]?.optionSymbol, optionSymbol);
+});
+
 test("refresh persists genuine SIP and OPRA evidence in PostgreSQL", async () => {
   const calls: Record<string, unknown[][]> = {};
   let readbackYielded = false;
@@ -1731,6 +1857,57 @@ test("an OPRA request without a response feed header preserves request validatio
   assert.equal(
     result.summary.optionEvidenceByUnderlying.SPY?.finalBoundedResult,
     "OPRA_EVIDENCE_CURRENT"
+  );
+});
+
+test("an explicit non-OPRA response feed cannot inherit request-only OPRA validation", async () => {
+  const result = await runSingleOptionRefresh({
+    chain: {
+      underlyingSymbol: "SPY",
+      pagesConsumed: 1,
+      snapshots: [{
+        symbol: "SPY260724C00744000",
+        raw: {
+          latestQuote: {
+            bp: 3.1,
+            ap: 3.2,
+            bs: 10,
+            as: 12,
+            t: "2026-07-21T13:41:58.000Z"
+          },
+          latestTrade: {
+            p: 3.15,
+            t: "2026-07-21T13:41:57.000Z"
+          },
+          dailyBar: { v: 321 },
+          impliedVolatility: 0.1663,
+          greeks: {
+            delta: 0.5276,
+            gamma: 0.0355,
+            theta: -0.7831,
+            vega: 0.2686,
+            rho: 0.0319
+          }
+        },
+        requestId: "rest-SPY",
+        endpoint: "/v1beta1/options/snapshots/SPY?feed=opra&limit=1000",
+        underlyingSymbol: "SPY",
+        requestedFeed: "opra",
+        effectiveFeed: "indicative",
+        validationBasis: "request_feed_opra",
+        pageToken: null,
+        retrievedAt: "2026-07-21T13:42:00.000Z"
+      }]
+    }
+  });
+
+  assert.equal(result.optionSnapshots[0]?.effectiveFeed, undefined);
+  assert.equal(result.optionSnapshots[0]?.validationBasis, null);
+  assert.equal(result.optionSnapshots[0]?.evidence.returnedFeed, "indicative");
+  assert.equal(result.summary.optionDataStatus, "degraded");
+  assert.equal(
+    result.summary.optionEvidenceByUnderlying.SPY?.finalBoundedResult,
+    "ALPACA_OPRA_DATA_UNAVAILABLE"
   );
 });
 

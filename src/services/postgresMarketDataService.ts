@@ -148,7 +148,7 @@ const optionQuoteIsUsable = (
   return (
     row.requestedFeed?.toLowerCase() === "opra" &&
     (row.effectiveFeed?.toLowerCase() === "opra" ||
-      row.validationBasis === "request_feed_opra") &&
+      (!row.effectiveFeed?.trim() && row.validationBasis === "request_feed_opra")) &&
     row.freshnessStatus === "fresh" &&
     Number.isFinite(quoteTimestamp) &&
     age >= -60_000 &&
@@ -366,6 +366,7 @@ export const refreshPostgresMarketData = async (input: {
   readonly end: string;
   readonly optionsEnabled: boolean;
   readonly requiredOptionUnderlyings?: readonly string[];
+  readonly selectedOptionSymbols?: readonly string[];
   readonly now?: Date;
   readonly maxBarAgeHours?: number;
   readonly maxOptionSnapshotAgeSeconds?: number;
@@ -388,6 +389,12 @@ export const refreshPostgresMarketData = async (input: {
     }
   }
   const requiredOptionUnderlyingSet = new Set(requiredOptionUnderlyings);
+  const selectedOptionSymbols = input.selectedOptionSymbols === undefined
+    ? null
+    : symbols(input.selectedOptionSymbols);
+  if (selectedOptionSymbols !== null && selectedOptionSymbols.length === 0) {
+    throw new Error("POSTGRES_SELECTED_OPTION_SYMBOLS_REQUIRED");
+  }
   const repository = input.repository ?? new PostgresMarketDataRepository();
   const dependencies = { ...defaults, ...input.dependencies };
 
@@ -507,111 +514,142 @@ export const refreshPostgresMarketData = async (input: {
   if (input.optionsEnabled) {
     const optionFeed = "opra" as const;
     const contractsBySymbol = new Map<string, PostgresOptionContract>();
-    for (const underlying of requestedSymbols) {
-      const requestStartedAt = nowIso;
-      let rawContracts: Awaited<ReturnType<typeof fetchOptionContracts>>;
-      try {
-        rawContracts = await dependencies.fetchOptionContracts({
-          underlyingSymbols: [underlying],
-          minDaysToExpiration: 0,
-          maxDaysToExpiration: 730,
-          status: "active",
-          limit: null,
-          signal: input.signal
-        });
-        throwIfAborted(input.signal);
-      } catch (error) {
-        if (input.signal?.aborted) {
-          throw input.signal.reason instanceof Error
-            ? input.signal.reason
-            : new Error("SCHEDULER_COMMAND_TERMINATED: option-contract refresh cancelled.");
+    if (selectedOptionSymbols !== null) {
+      const persistedSelectedContracts = await repository.listOptionContractsBySymbols({
+        optionSymbols: selectedOptionSymbols
+      }, input.context);
+      for (const row of persistedSelectedContracts) {
+        if (!requestedSymbols.includes(row.underlyingSymbol)) {
+          throw new Error(
+            `POSTGRES_SELECTED_OPTION_CONTRACT_UNDERLYING_MISMATCH:${row.optionSymbol}`
+          );
         }
-        const boundedResult = opraProviderFailureCode(error);
-        const rejectionReason = `${boundedResult}:${underlying}`;
-        optionContractsByUnderlying[underlying] = 0;
-        optionSnapshotsByUnderlying[underlying] = 0;
-        freshOptionSnapshotsByUnderlying[underlying] = 0;
-        optionDataRejectionReasons.push(rejectionReason);
-        optionEvidenceByUnderlying[underlying] = opraObservability({
-          rows: [],
-          nowMs: now.getTime(),
-          maxAgeMs: (
-            input.maxOptionSnapshotAgeSeconds ??
-            AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS
-          ) * 1_000,
-          source: "rest",
-          returnedFeed: null,
-          contractCount: 0,
-          finalBoundedResult: boundedResult
-        });
-        ingestionRuns.push({
-          cycleId: process.env.AUTONOMOUS_CYCLE_ID?.trim() || null,
-          workstream:
-            process.env.AUTONOMOUS_WORKSTREAM?.trim() ||
-            input.context.schedulerFence.workstream,
-          symbol: underlying,
-          provider: "alpaca",
-          endpoint: "/v2/options/contracts",
-          requestedFeed: null,
-          effectiveFeed: null,
-          requestStartedAt,
-          requestCompletedAt: nowIso,
-          pagesRetrieved: 0,
-          rowsReceived: 0,
-          newestProviderTimestamp: null,
-          oldestProviderTimestamp: null,
-          newestProviderAgeSeconds: null,
-          acceptedRows: 0,
-          staleRows: 0,
-          rejectedRows: 0,
-          freshnessThresholdSeconds:
-            (input.maxOptionSnapshotAgeSeconds ??
-              AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS),
-          rejectionReason,
-          persistenceResult: "not_persisted_provider_unavailable",
-          requestIds: []
-        });
-        continue;
+        contractsBySymbol.set(row.optionSymbol, row);
       }
-      for (let contractIndex = 0; contractIndex < rawContracts.length; contractIndex += 1) {
-        if (
-          contractIndex > 0 &&
-          contractIndex % COOPERATIVE_YIELD_BATCH_SIZE === 0
-        ) {
-          await yieldToEventLoop(input.signal);
-        }
-        const raw = rawContracts[contractIndex]!;
-        const row = contractRow(raw, nowIso);
-        if (!row) continue;
-        if (row.underlyingSymbol !== underlying) {
-          throw new Error(`POSTGRES_OPTION_CONTRACT_UNDERLYING_MISMATCH:${row.optionSymbol}`);
-        }
-        const existing = contractsBySymbol.get(row.optionSymbol);
-        if (existing && (
-          canonicalJsonHash(optionContractIdentityMaterial(existing)) !==
-          canonicalJsonHash(optionContractIdentityMaterial(row))
-        )) {
-          throw new Error(`POSTGRES_OPTION_CONTRACT_IDENTITY_CONFLICT:${row.optionSymbol}`);
-        }
-        if (!existing) contractsBySymbol.set(row.optionSymbol, row);
-      }
-      optionContractsByUnderlying[underlying] = [...contractsBySymbol.values()]
-        .filter((row) => row.underlyingSymbol === underlying).length;
       if (
-        requiredOptionUnderlyingSet.has(underlying) &&
-        optionContractsByUnderlying[underlying] === 0
+        contractsBySymbol.size !== selectedOptionSymbols.length ||
+        selectedOptionSymbols.some((symbol) => !contractsBySymbol.has(symbol))
       ) {
-        throw new Error(`POSTGRES_OPTION_CONTRACTS_MISSING:${underlying}`);
+        throw new Error("POSTGRES_SELECTED_OPTION_CONTRACTS_MISSING");
       }
+      for (const underlying of requestedSymbols) {
+        optionContractsByUnderlying[underlying] = [...contractsBySymbol.values()]
+          .filter((row) => row.underlyingSymbol === underlying).length;
+        if (
+          requiredOptionUnderlyingSet.has(underlying) &&
+          optionContractsByUnderlying[underlying] === 0
+        ) {
+          throw new Error(`POSTGRES_OPTION_CONTRACTS_MISSING:${underlying}`);
+        }
+      }
+      optionContracts = [...contractsBySymbol.values()];
+    } else {
+      for (const underlying of requestedSymbols) {
+        const requestStartedAt = nowIso;
+        let rawContracts: Awaited<ReturnType<typeof fetchOptionContracts>>;
+        try {
+          rawContracts = await dependencies.fetchOptionContracts({
+            underlyingSymbols: [underlying],
+            minDaysToExpiration: 0,
+            maxDaysToExpiration: 730,
+            status: "active",
+            limit: null,
+            signal: input.signal
+          });
+          throwIfAborted(input.signal);
+        } catch (error) {
+          if (input.signal?.aborted) {
+            throw input.signal.reason instanceof Error
+              ? input.signal.reason
+              : new Error("SCHEDULER_COMMAND_TERMINATED: option-contract refresh cancelled.");
+          }
+          const boundedResult = opraProviderFailureCode(error);
+          const rejectionReason = `${boundedResult}:${underlying}`;
+          optionContractsByUnderlying[underlying] = 0;
+          optionSnapshotsByUnderlying[underlying] = 0;
+          freshOptionSnapshotsByUnderlying[underlying] = 0;
+          optionDataRejectionReasons.push(rejectionReason);
+          optionEvidenceByUnderlying[underlying] = opraObservability({
+            rows: [],
+            nowMs: now.getTime(),
+            maxAgeMs: (
+              input.maxOptionSnapshotAgeSeconds ??
+              AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS
+            ) * 1_000,
+            source: "rest",
+            returnedFeed: null,
+            contractCount: 0,
+            finalBoundedResult: boundedResult
+          });
+          ingestionRuns.push({
+            cycleId: process.env.AUTONOMOUS_CYCLE_ID?.trim() || null,
+            workstream:
+              process.env.AUTONOMOUS_WORKSTREAM?.trim() ||
+              input.context.schedulerFence.workstream,
+            symbol: underlying,
+            provider: "alpaca",
+            endpoint: "/v2/options/contracts",
+            requestedFeed: null,
+            effectiveFeed: null,
+            requestStartedAt,
+            requestCompletedAt: nowIso,
+            pagesRetrieved: 0,
+            rowsReceived: 0,
+            newestProviderTimestamp: null,
+            oldestProviderTimestamp: null,
+            newestProviderAgeSeconds: null,
+            acceptedRows: 0,
+            staleRows: 0,
+            rejectedRows: 0,
+            freshnessThresholdSeconds:
+              (input.maxOptionSnapshotAgeSeconds ??
+                AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS),
+            rejectionReason,
+            persistenceResult: "not_persisted_provider_unavailable",
+            requestIds: []
+          });
+          continue;
+        }
+        for (let contractIndex = 0; contractIndex < rawContracts.length; contractIndex += 1) {
+          if (
+            contractIndex > 0 &&
+            contractIndex % COOPERATIVE_YIELD_BATCH_SIZE === 0
+          ) {
+            await yieldToEventLoop(input.signal);
+          }
+          const raw = rawContracts[contractIndex]!;
+          const row = contractRow(raw, nowIso);
+          if (!row) continue;
+          if (row.underlyingSymbol !== underlying) {
+            throw new Error(`POSTGRES_OPTION_CONTRACT_UNDERLYING_MISMATCH:${row.optionSymbol}`);
+          }
+          const existing = contractsBySymbol.get(row.optionSymbol);
+          if (existing && (
+            canonicalJsonHash(optionContractIdentityMaterial(existing)) !==
+            canonicalJsonHash(optionContractIdentityMaterial(row))
+          )) {
+            throw new Error(`POSTGRES_OPTION_CONTRACT_IDENTITY_CONFLICT:${row.optionSymbol}`);
+          }
+          if (!existing) contractsBySymbol.set(row.optionSymbol, row);
+        }
+        optionContractsByUnderlying[underlying] = [...contractsBySymbol.values()]
+          .filter((row) => row.underlyingSymbol === underlying).length;
+        if (
+          requiredOptionUnderlyingSet.has(underlying) &&
+          optionContractsByUnderlying[underlying] === 0
+        ) {
+          throw new Error(`POSTGRES_OPTION_CONTRACTS_MISSING:${underlying}`);
+        }
+      }
+      optionContracts = [...contractsBySymbol.values()];
     }
-    optionContracts = [...contractsBySymbol.values()];
     if (
       optionContracts.length === 0 &&
       optionDataRejectionReasons.length === 0
     ) {
       throw new Error("POSTGRES_OPTION_CONTRACTS_MISSING");
     }
-    if (optionContracts.length > 0) {
+    if (optionContracts.length > 0 && selectedOptionSymbols === null) {
       throwIfAborted(input.signal);
       await repository.upsertOptionContracts(optionContracts, input.context);
     }
@@ -620,12 +658,32 @@ export const refreshPostgresMarketData = async (input: {
       input.maxOptionSnapshotAgeSeconds ??
       AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS
     ) * 1_000;
-    const streamSnapshots = repository.listFreshOptionStreamSnapshots
+    const streamSnapshots = selectedOptionSymbols === null &&
+      repository.listFreshOptionStreamSnapshots
       ? await repository.listFreshOptionStreamSnapshots({
         optionSymbols: optionContracts.map((row) => row.optionSymbol),
         observedAfter: new Date(now.getTime() - maxOptionAgeMs).toISOString()
       }, input.context)
       : [];
+    let exactSelectedSnapshots: Awaited<ReturnType<typeof fetchOptionSnapshots>> | null = null;
+    let exactSelectedSnapshotError: unknown = null;
+    if (selectedOptionSymbols !== null) {
+      try {
+        exactSelectedSnapshots = await dependencies.fetchOptionSnapshots(
+          selectedOptionSymbols,
+          { feed: optionFeed, signal: input.signal }
+        );
+        throwIfAborted(input.signal);
+      } catch (error) {
+        if (input.signal?.aborted) {
+          throw input.signal.reason instanceof Error
+            ? input.signal.reason
+            : new Error("SCHEDULER_COMMAND_TERMINATED: selected option refresh cancelled.");
+        }
+        exactSelectedSnapshotError = error;
+      }
+      optionChainPageCount = Math.ceil(selectedOptionSymbols.length / 100);
+    }
     for (const underlying of requestedSymbols) {
       const currentContracts = optionContracts.filter((row) => row.underlyingSymbol === underlying);
       if (!currentContracts.length) {
@@ -709,10 +767,26 @@ export const refreshPostgresMarketData = async (input: {
       }
       let chain: Awaited<ReturnType<typeof fetchOptionChainSnapshots>>;
       try {
-        chain = await dependencies.fetchOptionChainSnapshots(underlying, {
-          feed: optionFeed,
-          signal: input.signal
-        });
+        if (selectedOptionSymbols !== null) {
+          if (exactSelectedSnapshotError) throw exactSelectedSnapshotError;
+          const currentSymbols = new Set(currentContracts.map((row) => row.optionSymbol));
+          chain = {
+            underlyingSymbol: underlying,
+            pagesConsumed: 0,
+            snapshots: (exactSelectedSnapshots ?? [])
+              .filter((row) => currentSymbols.has(row.symbol.trim().toUpperCase()))
+              .map((row) => ({
+                ...row,
+                underlyingSymbol: underlying,
+                validationBasis: row.validationBasis ?? undefined
+              }))
+          };
+        } else {
+          chain = await dependencies.fetchOptionChainSnapshots(underlying, {
+            feed: optionFeed,
+            signal: input.signal
+          });
+        }
         throwIfAborted(input.signal);
       } catch (error) {
         if (input.signal?.aborted) {
@@ -759,7 +833,9 @@ export const refreshPostgresMarketData = async (input: {
         });
         continue;
       }
-      optionChainPageCount += chain.pagesConsumed;
+      if (selectedOptionSymbols === null) {
+        optionChainPageCount += chain.pagesConsumed;
+      }
       const providerTimestamps: string[] = [];
       const requestIds = new Set<string>();
       let acceptedRows = 0;
@@ -821,11 +897,14 @@ export const refreshPostgresMarketData = async (input: {
         const stock = stockRows.find((row) => row.symbol === underlying);
         const underlyingPrice = number(stock?.evidence.midpoint) ?? number(stock?.evidence.latestTradePrice);
         const returnedFeed = fetched.effectiveFeed?.trim().toLowerCase() ?? null;
+        const validatedRequestBasis = returnedFeed === null
+          ? fetched.validationBasis ?? null
+          : null;
         const validatedEffectiveFeed =
           fetched.requestedFeed.trim().toLowerCase() === "opra" &&
           (returnedFeed === "opra" ||
             (returnedFeed === null &&
-              fetched.validationBasis === "request_feed_opra"))
+              validatedRequestBasis === "request_feed_opra"))
             ? "opra"
             : null;
         const row: PostgresOptionSnapshot = {
@@ -855,7 +934,7 @@ export const refreshPostgresMarketData = async (input: {
           freshnessStatus,
           requestedFeed: fetched.requestedFeed,
           effectiveFeed: validatedEffectiveFeed ?? undefined,
-          validationBasis: fetched.validationBasis ?? null,
+          validationBasis: validatedRequestBasis,
           endpoint: fetched.endpoint,
           pageToken: fetched.pageToken,
           retrievedAt: fetched.retrievedAt,
@@ -867,7 +946,7 @@ export const refreshPostgresMarketData = async (input: {
             requestedFeed: fetched.requestedFeed,
             effectiveFeed: validatedEffectiveFeed,
             returnedFeed,
-            validationBasis: fetched.validationBasis ?? null,
+            validationBasis: validatedRequestBasis,
             requestId: fetched.requestId,
             pageToken: fetched.pageToken,
             retrievedAt: fetched.retrievedAt,

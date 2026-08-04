@@ -658,26 +658,55 @@ export const fetchOptionContracts = async (
   return requestedLimit === null ? filtered : filtered.slice(0, requestedLimit);
 };
 
+export interface FetchedOptionSnapshot {
+  symbol: string;
+  raw: OptionSnapshotRaw;
+  requestId: string | null;
+  endpoint: string;
+  requestedFeed: string;
+  effectiveFeed: string | null;
+  validationBasis: "request_feed_opra" | null;
+  pageToken: null;
+  retrievedAt: string;
+}
+
 export const fetchOptionSnapshots = async (
   optionSymbols: string[],
-  options: { signal?: AbortSignal } = {}
-): Promise<{ symbol: string; raw: OptionSnapshotRaw }[]> => {
+  options: { signal?: AbortSignal; feed?: string } = {}
+): Promise<FetchedOptionSnapshot[]> => {
   if (!optionSymbols.length) {
     return [];
   }
-  const results: { symbol: string; raw: OptionSnapshotRaw }[] = [];
+  const requestedFeed = (options.feed || marketConfig.optionDataFeed).trim().toLowerCase();
+  const results: FetchedOptionSnapshot[] = [];
   const chunkSize = 100;
   for (let index = 0; index < optionSymbols.length; index += chunkSize) {
     const chunk = optionSymbols.slice(index, index + chunkSize);
     const endpoint = `/v1beta1/options/snapshots?${toSearchParams({
       symbols: chunk.join(","),
-      feed: marketConfig.optionDataFeed
+      feed: requestedFeed
     })}`;
     const response = await requestJson<unknown>(endpoint, { signal: options.signal });
+    const responseRecord = response.data !== null &&
+      typeof response.data === "object" &&
+      !Array.isArray(response.data)
+      ? response.data as Record<string, unknown>
+      : {};
+    const observedFeed = typeof responseRecord.feed === "string"
+      ? responseRecord.feed.trim().toLowerCase()
+      : null;
+    const retrievedAt = new Date().toISOString();
     results.push(
       ...parseOptionSnapshotPayload(response.data).map((row) => ({
         symbol: row.symbol,
-        raw: row.data
+        raw: row.data,
+        requestId: response.requestId,
+        endpoint,
+        requestedFeed,
+        effectiveFeed: observedFeed,
+        validationBasis: requestedFeed === "opra" ? "request_feed_opra" as const : null,
+        pageToken: null,
+        retrievedAt
       }))
     );
   }

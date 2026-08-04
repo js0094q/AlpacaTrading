@@ -14,7 +14,10 @@ export type PostgresSelectedEvidenceRefreshQuery = {
 
 type SelectedEvidenceRefreshDependencies = {
   refreshMarketData: (input: Parameters<typeof refreshPostgresMarketData>[0]) =>
-    Promise<Pick<Awaited<ReturnType<typeof refreshPostgresMarketData>>, "summary">>;
+    Promise<Pick<
+      Awaited<ReturnType<typeof refreshPostgresMarketData>>,
+      "summary" | "optionSnapshots"
+    >>;
 };
 
 const dependencies: SelectedEvidenceRefreshDependencies = {
@@ -47,6 +50,7 @@ export const refreshPostgresSelectedCandidateEvidence = async (input: {
   now?: Date;
   maxCandidates?: number;
   maxQuoteAgeMs?: number;
+  clock?: () => Date;
   signal?: AbortSignal;
   emitTelemetry?: (event: Record<string, unknown>) => void;
   dependencies?: Partial<SelectedEvidenceRefreshDependencies>;
@@ -78,6 +82,8 @@ export const refreshPostgresSelectedCandidateEvidence = async (input: {
       status: "no_op" as const,
       code: "NO_SELECTED_OPTION_EVIDENCE_TO_REFRESH" as const,
       selectedOptionCount: 0,
+      freshSelectedOptionCount: 0,
+      staleSelectedOptionSymbols: [] as string[],
       underlyingCount: 0,
       underlyings: [] as string[],
       optionDataStatus: "not_applicable" as const,
@@ -107,12 +113,71 @@ export const refreshPostgresSelectedCandidateEvidence = async (input: {
     start: new Date(now.getTime() - 365 * 86_400_000).toISOString(),
     end,
     optionsEnabled: true,
+    requiredOptionUnderlyings: underlyings,
+    selectedOptionSymbols: optionSymbols,
     now,
     maxOptionSnapshotAgeSeconds: maxQuoteAgeMs / 1_000,
     signal: input.signal,
     repository,
     context
   });
+  const completedAt = input.clock?.() ?? new Date();
+  const completedAtMs = completedAt.getTime();
+  if (!Number.isFinite(completedAtMs)) {
+    throw new Error("POSTGRES_SELECTED_EVIDENCE_COMPLETION_TIME_INVALID");
+  }
+  const snapshotsBySymbol = new Map(
+    market.optionSnapshots.map((row) => [normalizedSymbol(row.optionSymbol), row])
+  );
+  const staleSelectedOptionSymbols: string[] = [];
+  const completionRejectionReasons: string[] = [];
+  for (const optionSymbol of optionSymbols) {
+    const snapshot = snapshotsBySymbol.get(optionSymbol);
+    const quoteTimestampMs = snapshot?.quoteTimestamp
+      ? Date.parse(snapshot.quoteTimestamp)
+      : Number.NaN;
+    const ageMs = completedAtMs - quoteTimestampMs;
+    const provenanceValid = snapshot?.requestedFeed?.toLowerCase() === "opra" &&
+      (
+        snapshot.effectiveFeed?.toLowerCase() === "opra" ||
+        (!snapshot.effectiveFeed?.trim() &&
+          snapshot.validationBasis === "request_feed_opra")
+      );
+    const quoteValid = snapshot?.freshnessStatus === "fresh" &&
+      snapshot.bid !== null && snapshot.bid !== undefined && snapshot.bid > 0 &&
+      snapshot.ask !== null && snapshot.ask !== undefined && snapshot.ask >= snapshot.bid;
+    const timeValid = Number.isFinite(quoteTimestampMs) &&
+      ageMs >= -60_000 && ageMs <= maxQuoteAgeMs;
+    if (provenanceValid && quoteValid && timeValid) continue;
+    staleSelectedOptionSymbols.push(optionSymbol);
+    completionRejectionReasons.push(
+      Number.isFinite(quoteTimestampMs) && ageMs > maxQuoteAgeMs
+        ? `POSTGRES_SELECTED_OPTION_EVIDENCE_STALE:${optionSymbol}`
+        : `POSTGRES_SELECTED_OPTION_EVIDENCE_UNUSABLE:${optionSymbol}`
+    );
+  }
+  if (staleSelectedOptionSymbols.length > 0) {
+    input.emitTelemetry?.({
+      event: "postgres_selected_option_evidence_deferred",
+      selectedOptionCount: optionSymbols.length,
+      freshSelectedOptionCount: optionSymbols.length - staleSelectedOptionSymbols.length,
+      staleSelectedOptionSymbols,
+      optionDataRejectionReasons: completionRejectionReasons,
+      brokerMutationPerformed: false
+    });
+    return {
+      status: "deferred" as const,
+      code: "POSTGRES_SELECTED_OPTION_EVIDENCE_REFRESH_INCOMPLETE" as const,
+      selectedOptionCount: optionSymbols.length,
+      freshSelectedOptionCount: optionSymbols.length - staleSelectedOptionSymbols.length,
+      staleSelectedOptionSymbols,
+      underlyingCount: underlyings.length,
+      underlyings,
+      optionDataStatus: "degraded" as const,
+      optionDataRejectionReasons: completionRejectionReasons,
+      brokerMutationPerformed: false as const
+    };
+  }
   input.emitTelemetry?.({
     event: "postgres_selected_option_evidence_refreshed",
     selectedOptionCount: optionSymbols.length,
@@ -124,6 +189,8 @@ export const refreshPostgresSelectedCandidateEvidence = async (input: {
   return {
     status: "completed" as const,
     selectedOptionCount: optionSymbols.length,
+    freshSelectedOptionCount: optionSymbols.length,
+    staleSelectedOptionSymbols,
     underlyingCount: underlyings.length,
     underlyings,
     optionDataStatus: market.summary.optionDataStatus,
