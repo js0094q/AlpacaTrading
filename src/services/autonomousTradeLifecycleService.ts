@@ -1,5 +1,10 @@
 /** Durable, paper-only autonomous trade lifecycle contracts. */
 
+import {
+  classifyManagedOptionLane,
+  resolveManagedLeapsMinDte
+} from "./optionLanePolicy.js";
+
 export const AUTONOMOUS_TRADE_LIFECYCLE_STATES = [
   "candidate_created", "review_created", "confirmed", "ready_for_submission",
   "submission_attempt_persisted", "submission_ambiguous", "broker_order_discovered",
@@ -96,10 +101,15 @@ export function classifyOptionStrategy(contract: { expirationDate: string; optio
 export function classifyOptionStrategy(input: { observedAt: string; expiration: string; optionType: "call" | "put" }): Exclude<StrategyClassification, "equity_long" | "equity_short" | "hedge">;
 export function classifyOptionStrategy(contractOrInput: { expirationDate?: string; expiration?: string; observedAt?: string; optionType: "call" | "put" }, marketDate?: string): Exclude<StrategyClassification, "equity_long" | "equity_short" | "hedge"> {
   const contract = { expirationDate: contractOrInput.expirationDate ?? contractOrInput.expiration!, optionType: contractOrInput.optionType };
-  const date = marketDate ?? contractOrInput.observedAt!;
-  const days = Math.floor((Date.parse(`${contract.expirationDate}T00:00:00Z`) - Date.parse(`${date.slice(0, 10)}T00:00:00Z`)) / 86_400_000);
-  if (days === 0) return contract.optionType === "call" ? "zero_dte_long_call" : "zero_dte_long_put";
-  if (days >= 365) return contract.optionType === "call" ? "leaps_long_call" : "leaps_long_put";
+  const observedAt = marketDate ?? contractOrInput.observedAt!;
+  const lane = classifyManagedOptionLane({
+    expirationDate: contract.expirationDate,
+    observedAt,
+    managedLeapsMinDte: resolveManagedLeapsMinDte(process.env.LEAPS_MIN_DTE_AT_ENTRY)
+  });
+  if (lane === "expired") throw new DomainInvariantError("OPTION_EXPIRATION_BEFORE_MARKET_DATE");
+  if (lane === "options_0dte") return contract.optionType === "call" ? "zero_dte_long_call" : "zero_dte_long_put";
+  if (lane === "options_leaps") return contract.optionType === "call" ? "leaps_long_call" : "leaps_long_put";
   return contract.optionType === "call" ? "standard_long_call" : "standard_long_put";
 }
 

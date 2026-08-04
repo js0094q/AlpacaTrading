@@ -356,34 +356,51 @@ test("the execution gate preserves an integer multi-contract LEAPS quantity", ()
   assert.equal(payload.symbol, optionSymbol);
 });
 
-test("the execution gate preserves the stricter 15-minute option quote age", () => {
+test("the option execution gate uses the stricter configured freshness boundary", () => {
+  const optionIntent = intent({
+    asset_class: "option",
+    underlying_symbol: "SPY",
+    side: "buy_to_open",
+    symbol: "SPY260821C00560000",
+    market_evidence: [{
+      symbol: "SPY260821C00560000",
+      referencePrice: 2,
+      timestamp: "2026-07-20T21:40:00.000Z",
+      bid: 1.98,
+      ask: 2.02,
+      spreadPct: 0.02,
+      maximumSpreadPct: 0.15,
+      underlyingPrice: 555,
+      volume: 5_000,
+      openInterest: 8_000,
+      requestedFeed: "opra",
+      effectiveFeed: "opra",
+      source: "postgres.option_snapshots",
+      underlyingSip: optionUnderlyingSip()
+    }]
+  });
+
+  assert.doesNotThrow(() => validateAutonomousExecutionEvidence(
+    optionIntent,
+    broker,
+    new Date("2026-07-20T22:00:00.000Z"),
+    1_800
+  ));
   assert.throws(
     () => validateAutonomousExecutionEvidence(
-      intent({
-        asset_class: "option",
-        underlying_symbol: "SPY",
-        side: "buy_to_open",
-        symbol: "SPY260821C00560000",
-        market_evidence: [{
-          symbol: "SPY260821C00560000",
-          referencePrice: 2,
-          timestamp: "2026-07-20T21:40:00.000Z",
-          bid: 1.98,
-          ask: 2.02,
-          spreadPct: 0.02,
-          maximumSpreadPct: 0.15,
-          underlyingPrice: 555,
-          volume: 5_000,
-          openInterest: 8_000,
-          requestedFeed: "opra",
-          effectiveFeed: "opra",
-          source: "postgres.option_snapshots",
-          underlyingSip: optionUnderlyingSip()
-        }]
-      }),
+      optionIntent,
+      broker,
+      new Date("2026-07-20T22:11:00.000Z"),
+      1_800
+    ),
+    /POSTGRES_MARKET_EVIDENCE_STALE/
+  );
+  assert.throws(
+    () => validateAutonomousExecutionEvidence(
+      optionIntent,
       broker,
       new Date("2026-07-20T22:00:00.000Z"),
-      1_800
+      900
     ),
     /POSTGRES_MARKET_EVIDENCE_STALE/
   );
@@ -1040,6 +1057,51 @@ test("live flags block before querying PostgreSQL or Alpaca", async () => {
     if (previous === undefined) delete process.env.LIVE_TRADING_ENABLED;
     else process.env.LIVE_TRADING_ENABLED = previous;
   }
+});
+
+test("fully armed live authority cannot reach paper-specific PostgreSQL lineage", async () => {
+  await assert.rejects(
+    runAutonomousPostgresExecutionCommand({
+      command: "live:execute:reviewed",
+      query: { query: async () => { throw new Error("must not query"); } },
+      transaction: async () => { throw new Error("must not transact"); },
+      captureBrokerSnapshot: async () => { throw new Error("must not read broker"); },
+      submitOrder: async () => { throw new Error("must not submit"); },
+      safety: {
+        environment: "live",
+        tradingMode: "live",
+        liveTradingEnabled: true,
+        paperOrderExecutionEnabled: false,
+        paperOptionsExecutionEnabled: false,
+        liveOrderExecutionEnabled: true,
+        liveOptionsExecutionEnabled: true,
+        killSwitchEngaged: false,
+        brokerAccountId: "live-account-1",
+        authorizedBrokerAccountId: "live-account-1",
+        runningReleaseSha: "1111111111111111111111111111111111111111",
+        authorizedReleaseSha: "1111111111111111111111111111111111111111",
+        liveAuthorizationId: "approval-2026-08-04-a",
+        liveAuthorizationExpiresAt: "2026-08-04T14:00:00.000Z",
+        liveCanaryEnabled: true,
+        estimatedOrderNotionalUsd: 250,
+        maxOrderNotionalUsd: 500,
+        dailyRealizedPnlUsd: -50,
+        dailyLossLimitUsd: 1_000,
+        quoteMaxAgeSeconds: 60
+      },
+      confirmPaper: false,
+      confirmLive: true,
+      fence: {
+        jobName: "live-execution",
+        workstream: "live_execution",
+        ownerId: "owner",
+        runId: "run",
+        fencingToken: "10"
+      },
+      now: new Date("2026-08-04T13:00:00.000Z")
+    }),
+    /LIVE_EXECUTION_PATH_NOT_READY/
+  );
 });
 
 test("a closed paper market blocks a ready intent without account sync or submission", async () => {

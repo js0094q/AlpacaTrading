@@ -239,6 +239,108 @@ test("a higher-ranked longer-dated SPY call cannot erase an eligible same-day ca
   );
 });
 
+test("a same-day OPRA quote remains eligible when Alpaca omits 0DTE IV and Greeks", async () => {
+  const optionSymbol = "SPY260629C00560000";
+  const result = await buildOptionFeaturesFixture({
+    exploration: true,
+    stock: {
+      ...stockSnapshot(),
+      observedAt: "2026-06-29T18:00:00.000Z",
+      sourceTimestamp: "2026-06-29T17:59:59.000Z",
+      evidence: {
+        ...stockSnapshot().evidence,
+        quoteTimestamp: "2026-06-29T17:59:59.000Z"
+      }
+    },
+    contracts: [optionContractFixture(optionSymbol, 560, {
+      expirationDate: "2026-06-29"
+    })],
+    snapshots: [optionSnapshotFixture(optionSymbol, {
+      observedAt: "2026-06-29T18:00:00.000Z",
+      quoteTimestamp: "2026-06-29T17:59:59.000Z",
+      snapshotTimestamp: "2026-06-29T17:59:59.000Z",
+      retrievedAt: "2026-06-29T18:00:00.000Z",
+      impliedVolatility: null,
+      delta: null,
+      gamma: null,
+      theta: null,
+      vega: null,
+      rho: null
+    })]
+  });
+
+  const feature = (result.features.at(-1)!.features.optionContractFeatures as
+    Array<Record<string, unknown>>)[0]!;
+  assert.equal(feature.managedLane, "options_0dte");
+  assert.equal(feature.eligibility, true);
+  assert.deepEqual(feature.greekPolicy, {
+    availability: "provider_not_calculated_for_zero_dte",
+    completeness: 0,
+    eligibilityBlockers: [],
+    selectionGreekCoverageCredit: 0,
+    requiredFields: [],
+    strategyUse: "audit_only"
+  });
+  assert.equal(result.targets.some((target) => target.strategyFamily === "zero_dte_spy"), true);
+});
+
+test("managed LEAPS fails closed when any paid Greek or IV field is missing", async () => {
+  const optionSymbol = "SPY270618C00560000";
+  const result = await buildOptionFeaturesFixture({
+    exploration: true,
+    contracts: [optionContractFixture(optionSymbol, 560, {
+      expirationDate: "2027-06-18"
+    })],
+    snapshots: [optionSnapshotFixture(optionSymbol, { gamma: null })]
+  });
+
+  const feature = (result.features.at(-1)!.features.optionContractFeatures as
+    Array<Record<string, unknown>>)[0]!;
+  assert.equal(feature.managedLane, "options_leaps");
+  assert.equal(feature.eligibility, false);
+  assert.deepEqual(feature.rejectionReasons, ["leaps_gamma_missing"]);
+  assert.equal(result.targets.some((target) => target.strategyFamily === "leaps"), false);
+});
+
+test("PostgreSQL option features use the shared 270-day managed LEAPS boundary", async () => {
+  const standardSymbol = "SPY270325C00560000";
+  const leapsSymbol = "SPY270326C00560000";
+  const previousDiscoveryThreshold = process.env.PAPER_LEAPS_MIN_DTE;
+  const previousManagedThreshold = process.env.LEAPS_MIN_DTE_AT_ENTRY;
+  process.env.PAPER_LEAPS_MIN_DTE = "180";
+  process.env.LEAPS_MIN_DTE_AT_ENTRY = "270";
+  let result: Awaited<ReturnType<typeof buildOptionFeaturesFixture>>;
+  try {
+    result = await buildOptionFeaturesFixture({
+      exploration: true,
+      contracts: [
+        optionContractFixture(standardSymbol, 560, { expirationDate: "2027-03-25" }),
+        optionContractFixture(leapsSymbol, 560, { expirationDate: "2027-03-26" })
+      ],
+      snapshots: [
+        optionSnapshotFixture(standardSymbol),
+        optionSnapshotFixture(leapsSymbol)
+      ]
+    });
+  } finally {
+    if (previousDiscoveryThreshold === undefined) delete process.env.PAPER_LEAPS_MIN_DTE;
+    else process.env.PAPER_LEAPS_MIN_DTE = previousDiscoveryThreshold;
+    if (previousManagedThreshold === undefined) delete process.env.LEAPS_MIN_DTE_AT_ENTRY;
+    else process.env.LEAPS_MIN_DTE_AT_ENTRY = previousManagedThreshold;
+  }
+
+  const features = result.features.at(-1)!.features.optionContractFeatures as
+    Array<Record<string, unknown>>;
+  assert.equal(features.find((row) => row.optionSymbol === standardSymbol)?.managedLane,
+    "options_standard");
+  assert.equal(features.find((row) => row.optionSymbol === leapsSymbol)?.managedLane,
+    "options_leaps");
+  assert.deepEqual(
+    result.targets.map(({ strategyFamily }) => strategyFamily).sort(),
+    ["leaps", "standard_option"].sort()
+  );
+});
+
 test("existing indicators and target thresholds persist genuine PostgreSQL features and targets", async () => {
   const stored: { features?: unknown[]; targets?: unknown[] } = {};
   let heartbeatYielded = false;

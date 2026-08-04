@@ -23,6 +23,7 @@ import {
   type TradeOperation
 } from "./autonomousTradeLifecycleService.js";
 import type { PostgresAuthorityBrokerSnapshot } from "./postgresAuthorityBrokerSnapshot.js";
+import { evaluateTradingRuntimeAuthority } from "./tradingRuntimeAuthority.js";
 
 export {
   autonomousLifecycleContextFromRuntime,
@@ -80,6 +81,20 @@ export type AutonomousExecutionSafety = {
   readonly liveTradingEnabled: boolean;
   readonly paperOrderExecutionEnabled: boolean;
   readonly paperOptionsExecutionEnabled: boolean;
+  readonly liveOrderExecutionEnabled?: boolean;
+  readonly liveOptionsExecutionEnabled?: boolean;
+  readonly killSwitchEngaged?: boolean;
+  readonly brokerAccountId?: string;
+  readonly authorizedBrokerAccountId?: string;
+  readonly runningReleaseSha?: string;
+  readonly authorizedReleaseSha?: string;
+  readonly liveAuthorizationId?: string;
+  readonly liveAuthorizationExpiresAt?: string;
+  readonly liveCanaryEnabled?: boolean;
+  readonly estimatedOrderNotionalUsd?: number;
+  readonly maxOrderNotionalUsd?: number;
+  readonly dailyRealizedPnlUsd?: number;
+  readonly dailyLossLimitUsd?: number;
   readonly quoteMaxAgeSeconds: number;
 };
 
@@ -1679,13 +1694,53 @@ const recordReconciledSubmissionReceipt = async (
   return reconciledReceipt;
 };
 
-const assertSafety = (safety: AutonomousExecutionSafety, confirmPaper: boolean) => {
-  if (safety.environment !== "paper" || safety.tradingMode !== "paper") {
-    throw new Error("PAPER_RUNTIME_REQUIRED");
+const assertSafety = (
+  safety: AutonomousExecutionSafety,
+  confirmPaper: boolean,
+  confirmLive: boolean,
+  now: Date
+) => {
+  const environment = safety.environment === "live" ? "live" : "paper";
+  const decision = evaluateTradingRuntimeAuthority({
+    environment: safety.environment,
+    tradingMode: safety.tradingMode,
+    liveTradingEnabled: safety.liveTradingEnabled,
+    paperOrderExecutionEnabled: safety.paperOrderExecutionEnabled,
+    paperOptionsExecutionEnabled: safety.paperOptionsExecutionEnabled,
+    liveOrderExecutionEnabled: safety.liveOrderExecutionEnabled ?? false,
+    liveOptionsExecutionEnabled: safety.liveOptionsExecutionEnabled ?? false,
+    killSwitchEngaged: safety.killSwitchEngaged ?? (environment === "live"),
+    confirmation: confirmLive ? "live" : confirmPaper ? "paper" : null,
+    assetClass: "equity",
+    brokerAccountId: safety.brokerAccountId,
+    authorizedBrokerAccountId: safety.authorizedBrokerAccountId,
+    runningReleaseSha: safety.runningReleaseSha,
+    authorizedReleaseSha: safety.authorizedReleaseSha,
+    liveAuthorizationId: safety.liveAuthorizationId,
+    liveAuthorizationExpiresAt: safety.liveAuthorizationExpiresAt,
+    liveCanaryEnabled: safety.liveCanaryEnabled,
+    estimatedOrderNotionalUsd: safety.estimatedOrderNotionalUsd,
+    maxOrderNotionalUsd: safety.maxOrderNotionalUsd,
+    dailyRealizedPnlUsd: safety.dailyRealizedPnlUsd,
+    dailyLossLimitUsd: safety.dailyLossLimitUsd,
+    now
+  });
+  if (!decision.authorized) {
+    const blocker = decision.blockers[0] ?? "TRADING_RUNTIME_AUTHORITY_BLOCKED";
+    if (blocker === "PAPER_TRADING_MODE_REQUIRED") {
+      throw new Error("PAPER_RUNTIME_REQUIRED");
+    }
+    if (
+      blocker === "PAPER_LIVE_EXECUTION_MUST_BE_DISABLED" &&
+      safety.liveTradingEnabled
+    ) {
+      throw new Error("LIVE_TRADING_MUST_BE_DISABLED");
+    }
+    throw new Error(blocker);
   }
-  if (safety.liveTradingEnabled) throw new Error("LIVE_TRADING_MUST_BE_DISABLED");
-  if (!safety.paperOrderExecutionEnabled) throw new Error("PAPER_ORDER_EXECUTION_DISABLED");
-  if (!confirmPaper) throw new Error("PAPER_CONFIRMATION_REQUIRED");
+  if (decision.environment === "live") {
+    throw new Error("LIVE_EXECUTION_PATH_NOT_READY");
+  }
 };
 
 export const runAutonomousPostgresExecutionCommand = async <
@@ -1711,6 +1766,7 @@ export const runAutonomousPostgresExecutionCommand = async <
   readonly fence: SchedulerFence;
   readonly safety: AutonomousExecutionSafety;
   readonly confirmPaper: boolean;
+  readonly confirmLive?: boolean;
   readonly confirmationSigningKey?: string;
   readonly expectedPayloadSignature?: string;
   readonly lifecycleContext?: {
@@ -1719,7 +1775,8 @@ export const runAutonomousPostgresExecutionCommand = async <
   };
   readonly now?: Date;
 }) => {
-  assertSafety(input.safety, input.confirmPaper);
+  const now = input.now ?? new Date();
+  assertSafety(input.safety, input.confirmPaper, input.confirmLive ?? false, now);
   const filter = commandFilter(input.command);
   const countResult = await input.query.query(
     `SELECT
@@ -1779,7 +1836,6 @@ export const runAutonomousPostgresExecutionCommand = async <
     };
   }
 
-  const now = input.now ?? new Date();
   const broker = await input.captureBrokerSnapshot();
   await input.persistBrokerSnapshot?.(broker);
   let promotion: Awaited<ReturnType<typeof promoteNextConfirmedPostgresIntent>> | undefined;

@@ -20,8 +20,12 @@ import {
 } from "./paperExplorationConfig.js";
 import { AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS } from "./autonomousFreshnessPolicy.js";
 import { selectExpressionWithPolicy } from "./strategySelectionLogic.js";
-import { optionDaysToExpiration } from "./optionSymbolService.js";
 import { targetIdentity } from "./targetIdentityService.js";
+import {
+  classifyManagedOptionLane,
+  resolveManagedLeapsMinDte
+} from "./optionLanePolicy.js";
+import { evaluateOptionGreekUtilization } from "./optionGreekUtilizationPolicy.js";
 
 type FeatureTargetWriter = Pick<
   PostgresMarketDataRepository,
@@ -60,24 +64,20 @@ const latestStockEvidence = (symbol: string, snapshots: readonly PostgresStockSn
     .filter((row) => normalizeSymbol(row.symbol) === symbol)
     .sort((left, right) => Date.parse(right.observedAt) - Date.parse(left.observedAt))[0] ?? null;
 
-const newYorkDate = (value: string) => {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit"
-  }).formatToParts(new Date(value));
-  const fields = Object.fromEntries(parts.map((part) => [part.type, part.value]));
-  return `${fields.year}-${fields.month}-${fields.day}`;
-};
+const managedOptionLane = (expirationDate: string, asOf: string) =>
+  classifyManagedOptionLane({
+    expirationDate,
+    observedAt: asOf,
+    managedLeapsMinDte: resolveManagedLeapsMinDte(process.env.LEAPS_MIN_DTE_AT_ENTRY)
+  });
 
 const optionLane = (expirationDate: string, asOf: string) => {
-  if (expirationDate === newYorkDate(asOf)) return "zero_dte_spy" as const;
-  const dte = optionDaysToExpiration(expirationDate, asOf);
-  const configuredMin = Number.parseInt(String(process.env.PAPER_LEAPS_MIN_DTE || "180"), 10);
-  const configuredMax = Number.parseInt(String(process.env.PAPER_LEAPS_MAX_DTE || "730"), 10);
-  const minDte = Number.isSafeInteger(configuredMin) && configuredMin >= 180 ? configuredMin : 180;
-  const maxDte = Number.isSafeInteger(configuredMax) && configuredMax >= minDte ? configuredMax : 730;
-  return dte !== null && dte >= minDte && dte <= maxDte
-    ? "leaps" as const
-    : "standard_option" as const;
+  const lane = managedOptionLane(expirationDate, asOf);
+  return lane === "options_0dte"
+    ? "zero_dte_spy" as const
+    : lane === "options_leaps"
+      ? "leaps" as const
+      : "standard_option" as const;
 };
 
 const stockDecisionFeatures = (snapshot: PostgresStockSnapshot | null) => {
@@ -149,6 +149,7 @@ const OPTION_FIELD_CLASSIFICATIONS = {
   sourceObservationTimestamp: "audit_only",
   persistenceTimestamp: "audit_only",
   daysToExpiration: "derived_feature_input",
+  managedLane: "decision_input",
   hoursToExpiration: "derived_feature_input",
   moneyness: "derived_feature_input",
   intrinsicValue: "derived_feature_input",
@@ -162,6 +163,7 @@ const OPTION_FIELD_CLASSIFICATIONS = {
   vega: "decision_input",
   rho: "decision_input",
   greekCoverage: "derived_feature_input",
+  greekPolicy: "decision_input",
   quoteAgeSeconds: "derived_feature_input",
   quoteFreshnessStatus: "execution_gate",
   tradable: "execution_gate",
@@ -284,12 +286,23 @@ const deriveOptionContractFeature = (input: {
     ? [snapshot.delta, snapshot.gamma, snapshot.theta, snapshot.vega, snapshot.rho]
       .filter((value) => value !== null && value !== undefined).length / 5
     : 0;
+  const managedLane = managedOptionLane(contract.expirationDate, input.asOf);
+  const greekPolicy = evaluateOptionGreekUtilization({
+    lane: managedLane === "expired" ? "options_standard" : managedLane,
+    impliedVolatility: snapshot?.impliedVolatility ?? null,
+    delta: snapshot?.delta ?? null,
+    gamma: snapshot?.gamma ?? null,
+    theta: snapshot?.theta ?? null,
+    vega: snapshot?.vega ?? null,
+    rho: snapshot?.rho ?? null
+  });
   const spreadSignal = spreadPct === null ? 0 : 1 - Math.min(1, Math.abs(spreadPct));
   const liquidityScore =
     Math.max(0, Math.min(1, input.activeRowsAtExpiration / 10)) * 0.6 +
     Math.min(1, (liquidity ?? 0) / 10_000) * 0.4 +
     spreadSignal * 0.2;
-  const decisionLiquidityScore = liquidityScore + greekCoverage * 0.1;
+  const decisionLiquidityScore =
+    liquidityScore + greekPolicy.selectionGreekCoverageCredit * 0.1;
   const delta = snapshot?.delta ?? null;
   const deltaQuality = delta === null
     ? 0
@@ -303,15 +316,20 @@ const deriveOptionContractFeature = (input: {
     : 1 - Math.min(1, Math.abs(moneyness) / 0.15);
   const volumeQuality = Math.min(1, (volume ?? 0) / 5_000);
   const openInterestQuality = Math.min(1, (openInterest ?? 0) / 10_000);
-  const selectionScore =
-    Math.min(1, decisionLiquidityScore) * 0.25 +
-    Math.max(0, spreadSignal) * 0.2 +
-    volumeQuality * 0.15 +
-    openInterestQuality * 0.15 +
-    deltaQuality * 0.12 +
-    greekCoverage * 0.05 +
-    impliedVolatilityQuality * 0.04 +
-    moneynessQuality * 0.04;
+  const selectionScore = managedLane === "options_0dte"
+    ? Math.min(1, liquidityScore) * 0.3 +
+      Math.max(0, spreadSignal) * 0.25 +
+      volumeQuality * 0.2 +
+      openInterestQuality * 0.15 +
+      moneynessQuality * 0.1
+    : Math.min(1, decisionLiquidityScore) * 0.25 +
+      Math.max(0, spreadSignal) * 0.2 +
+      volumeQuality * 0.15 +
+      openInterestQuality * 0.15 +
+      deltaQuality * 0.12 +
+      greekPolicy.selectionGreekCoverageCredit * 0.05 +
+      impliedVolatilityQuality * 0.04 +
+      moneynessQuality * 0.04;
   const activeStatus = contract.status === "active";
   const rejectionReasons: string[] = [];
   if (!activeStatus) rejectionReasons.push("not_active");
@@ -330,6 +348,7 @@ const deriveOptionContractFeature = (input: {
   if (spreadPct === null) rejectionReasons.push("spread_missing");
   else if (spreadPct > input.maximumOptionSpreadPct) rejectionReasons.push("spread_too_wide");
   if (entryPrice === null) rejectionReasons.push("entry_price_missing");
+  rejectionReasons.push(...greekPolicy.eligibilityBlockers);
   const eligibility = rejectionReasons.length === 0;
   const evidenceTimestamp = quoteTimestamp ?? snapshot?.snapshotTimestamp ??
     snapshot?.tradeTimestamp ?? snapshot?.observedAt ?? null;
@@ -365,6 +384,7 @@ const deriveOptionContractFeature = (input: {
     sourceObservationTimestamp: evidenceTimestamp,
     persistenceTimestamp: snapshot?.persistedAt ?? null,
     daysToExpiration,
+    managedLane,
     hoursToExpiration,
     moneyness,
     intrinsicValue,
@@ -378,6 +398,7 @@ const deriveOptionContractFeature = (input: {
     vega: snapshot?.vega ?? null,
     rho: snapshot?.rho ?? null,
     greekCoverage,
+    greekPolicy,
     quoteAgeSeconds,
     quoteFreshnessStatus,
     requestedFeed: typeof requestedFeed === "string" ? requestedFeed : null,
@@ -569,6 +590,7 @@ const buildOptionFeatures = (input: {
         vega: row.snapshot.vega ?? null,
         rho: row.snapshot.rho ?? null,
         impliedVolatility: row.snapshot.impliedVolatility,
+        greekPolicy: feature.greekPolicy,
         volume: feature.dailyVolume,
         openInterest: feature.openInterest,
         openInterestDate: row.contract.openInterestDate ?? null,

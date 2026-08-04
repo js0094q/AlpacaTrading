@@ -36,8 +36,41 @@ test("exposes the exact lifecycle domain contracts", () => {
 
 test("classifies options from observed UTC date-only expiration", () => {
   assert.equal(classifyOptionStrategy({ observedAt: "2026-07-24T14:00:00.000Z", expiration: "2026-07-24", optionType: "call" }), "zero_dte_long_call");
+  assert.equal(classifyOptionStrategy({ observedAt: "2026-07-25T01:00:00.000Z", expiration: "2026-07-24", optionType: "put" }), "zero_dte_long_put");
+  assert.equal(classifyOptionStrategy({ observedAt: "2026-07-24T14:00:00.000Z", expiration: "2027-04-20", optionType: "call" }), "leaps_long_call");
   assert.equal(classifyOptionStrategy({ observedAt: "2026-07-24T14:00:00.000Z", expiration: "2027-07-24", optionType: "put" }), "leaps_long_put");
   assert.equal(classifyOptionStrategy({ observedAt: "2026-07-24T14:00:00.000Z", expiration: "2026-08-21", optionType: "call" }), "standard_long_call");
+});
+
+test("classifies date-only observations identically through both overloads", () => {
+  for (const date of ["2026-07-24", "2026-03-08", "2026-11-01"]) {
+    assert.equal(
+      classifyOptionStrategy({ expirationDate: date, optionType: "call" }, date),
+      "zero_dte_long_call"
+    );
+    assert.equal(
+      classifyOptionStrategy({ observedAt: date, expiration: date, optionType: "put" }),
+      "zero_dte_long_put"
+    );
+  }
+});
+
+test("shares the configured managed LEAPS threshold with lifecycle classification", () => {
+  const previous = process.env.LEAPS_MIN_DTE_AT_ENTRY;
+  process.env.LEAPS_MIN_DTE_AT_ENTRY = "365";
+  try {
+    assert.equal(
+      classifyOptionStrategy({ observedAt: "2026-01-01", expiration: "2026-12-31", optionType: "call" }),
+      "standard_long_call"
+    );
+    assert.equal(
+      classifyOptionStrategy({ observedAt: "2026-01-01", expiration: "2027-01-01", optionType: "call" }),
+      "leaps_long_call"
+    );
+  } finally {
+    if (previous === undefined) delete process.env.LEAPS_MIN_DTE_AT_ENTRY;
+    else process.env.LEAPS_MIN_DTE_AT_ENTRY = previous;
+  }
 });
 
 test("requires domain close operations before broker-side mapping", () => {

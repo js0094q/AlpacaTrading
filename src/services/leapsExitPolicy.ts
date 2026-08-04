@@ -1,3 +1,5 @@
+import { resolveManagedLeapsMinDte } from "./optionLanePolicy.js";
+
 const integer = (value: string | undefined, fallback: number) => {
   const parsed = Number.parseInt(value || "", 10);
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -9,10 +11,7 @@ const number = (value: string | undefined, fallback: number) => {
 };
 
 export const paperLeapsExitConfig = () => ({
-  minDteAtEntry: Math.max(
-    1,
-    integer(process.env.LEAPS_MIN_DTE_AT_ENTRY, 270)
-  ),
+  minDteAtEntry: resolveManagedLeapsMinDte(process.env.LEAPS_MIN_DTE_AT_ENTRY),
   dteExitThreshold: Math.max(
     0,
     integer(process.env.LEAPS_DTE_EXIT_THRESHOLD, 180)
