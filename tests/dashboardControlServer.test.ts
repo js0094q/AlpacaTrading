@@ -73,6 +73,30 @@ const zeroDteSummary = {
   blockers: ["NO_CURRENT_POSTGRES_ZERO_DTE_CANDIDATES"]
 };
 
+const dashboardRisk = {
+  effectiveStatus: "monitoring" as const,
+  environment: "paper" as const,
+  paperOnly: true as const,
+  liveTradingEnabled: false as const,
+  brokerMutationPerformed: false as const,
+  decision: "review_required" as const,
+  asOf: "2026-07-22T15:00:00.000Z",
+  sourceSnapshotId: "account-snapshot-1",
+  dataQualityStatus: "complete" as const,
+  blockers: [],
+  portfolioGreeks: {
+    quality: "complete" as const,
+    positionCount: 1,
+    totals: { deltaShares: 60, deltaDollars: 30_000, thetaDollarsPerDay: -8 },
+    coverage: {},
+    blockers: [],
+    evidenceReferences: [],
+    byLane: {}
+  },
+  openLeapsReviewCount: 1,
+  openLeapsReviewSignals: [{ signalId: "signal-1", optionSymbol: "SPY280121C00550000" }]
+};
+
 let scheduledCommands: string[];
 let server: Server;
 let port = 0;
@@ -119,6 +143,7 @@ beforeEach(() => {
     dashboardData: async () => dashboardData,
     workerHealth: async () => workerHealth,
     zeroDteSummary: async () => zeroDteSummary,
+    dashboardRisk: async () => dashboardRisk as never,
     scheduledCommand: async (command) => {
       scheduledCommands.push(command);
       return {
@@ -209,6 +234,23 @@ describe("PostgreSQL-only dashboard control", () => {
     assert.equal(data.paperOnly, true);
     assert.equal((data.engine as Record<string, unknown>).status, "blocked");
     assert.deepEqual(data.blockers, ["NO_CURRENT_POSTGRES_ZERO_DTE_CANDIDATES"]);
+  });
+
+  test("serves bounded PostgreSQL Greeks and open LEAPS review evidence without scheduling work", async () => {
+    const recommendation = await call("/api/v1/hedge/recommendation");
+    assert.equal(recommendation.status, 200);
+    assert.deepEqual(recommendation.payload.data, dashboardRisk);
+
+    const risk = await call("/api/v1/hedge/risk");
+    assert.equal(risk.status, 200);
+    assert.deepEqual(risk.payload.data, dashboardRisk.portfolioGreeks);
+
+    const summary = await call("/api/v1/summary");
+    assert.deepEqual(
+      ((summary.payload.data as Record<string, unknown>).hedge as Record<string, unknown>).data,
+      dashboardRisk
+    );
+    assert.deepEqual(scheduledCommands, []);
   });
 
   test("action routes require the control token", async () => {

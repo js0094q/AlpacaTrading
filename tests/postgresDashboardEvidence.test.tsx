@@ -4,6 +4,7 @@ import test from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
 
 import { PostgresEvidencePanel } from "../apps/dashboard/app/components/PostgresEvidencePanel.js";
+import { HedgePanel } from "../apps/dashboard/app/components/HedgePanel.js";
 import {
   readPostgresDashboardData,
   type PostgresDashboardQuery
@@ -465,4 +466,113 @@ test("dashboard labels running, interrupted, and terminal cycle evidence without
     assert.match(html, new RegExp(expected));
   }
   assert.doesNotMatch(html, /Latest completed autonomous cycle/);
+});
+
+test("hedge panel renders PostgreSQL portfolio Greeks and review-only LEAPS signals", () => {
+  const html = renderToStaticMarkup(
+    <HedgePanel
+      recommendation={{
+        effectiveStatus: "monitoring",
+        environment: "paper",
+        paperOnly: true,
+        liveTradingEnabled: false,
+        brokerMutationPerformed: false,
+        decision: "review_required",
+        dataQualityStatus: "complete",
+        sourceSnapshotId: "account-snapshot-1",
+        portfolioGreeks: {
+          quality: "complete",
+          positionCount: 1,
+          totals: {
+            deltaShares: 60,
+            deltaDollars: 30_000,
+            gammaSharesPerDollar: 0.4,
+            thetaDollarsPerDay: -8,
+            vegaDollarsPerVolPoint: 180,
+            rhoDollarsPerRatePoint: 90,
+            weightedImpliedVolatility: 0.35
+          },
+          coverage: {
+            contracts: { total: 1, deltaShares: 1, theta: 1 },
+            marketValue: { total: 1200, deltaShares: 1200, theta: 1200 }
+          },
+          blockers: [],
+          byLane: {
+            options_0dte: { quality: "complete", positionCount: 0 },
+            options_leaps: { quality: "complete", positionCount: 1 }
+          }
+        },
+        openLeapsReviewCount: 1,
+        openLeapsReviewSignals: [{
+          signalId: "signal-1",
+          positionId: "position-leaps",
+          optionSymbol: "SPY280121C00550000",
+          action: "review",
+          suggestedQuantity: null,
+          reasons: ["LEAPS_DELTA_DETERIORATION"],
+          firstObservedAt: "2026-08-04T13:30:00.000Z",
+          lastObservedAt: "2026-08-04T14:00:00.000Z",
+          occurrences: 2,
+          marketTimestamp: "2026-08-04T14:00:00.000Z",
+          directionalReturnPct: -20,
+          currentDte: 535,
+          observedPrice: 12,
+          greeks: { delta: 0.4, gamma: 0.004, theta: -0.08, vega: 1.8, rho: 0.9 }
+        }]
+      } as never}
+    />
+  );
+
+  for (const expected of [
+    "PostgreSQL Portfolio Greeks",
+    "MONITORING",
+    "Delta shares",
+    "60",
+    "$30,000",
+    "Theta dollars per day",
+    "-$8",
+    "options_0dte",
+    "options_leaps",
+    "SPY280121C00550000",
+    "LEAPS_DELTA_DETERIORATION",
+    "Review only",
+    "Paper only"
+  ]) {
+    assert.match(html, new RegExp(expected.replace("$", "\\$")));
+  }
+  assert.doesNotMatch(html, /Trim recommendation|submit|execute|must-not-render/i);
+});
+
+test("hedge panel labels incomplete PostgreSQL Greek authority as blocked", () => {
+  const html = renderToStaticMarkup(
+    <HedgePanel
+      recommendation={{
+        effectiveStatus: "blocked",
+        environment: "paper",
+        paperOnly: true,
+        liveTradingEnabled: false,
+        brokerMutationPerformed: false,
+        portfolioGreeks: {
+          quality: "incomplete",
+          positionCount: 1,
+          totals: {},
+          blockers: ["PORTFOLIO_OPRA_FEED_INVALID"]
+        },
+        openLeapsReviewCount: 1,
+        returnedLeapsReviewCount: 1,
+        openLeapsReviewTruncated: false,
+        openLeapsReviewSignals: [{
+          signalId: "signal-stale",
+          optionSymbol: "SPY280121C00550000",
+          reasons: ["LEAPS_DELTA_DETERIORATION"]
+        }]
+      } as never}
+    />
+  );
+
+  assert.match(html, /BLOCKED/);
+  assert.match(html, /OPRA authority is incomplete/);
+  assert.match(html, /PORTFOLIO_OPRA_FEED_INVALID/);
+  assert.match(html, /SPY280121C00550000/);
+  assert.doesNotMatch(html, /current paid OPRA evidence/i);
 });

@@ -33,6 +33,7 @@ import {
   type PostgresWorkerHealth,
   type PostgresZeroDteDashboardSummary
 } from "../../src/services/postgresDashboardReadService.js";
+import { readPostgresDashboardRisk } from "../../src/services/postgresDashboardRiskService.js";
 
 type RiskProfile = "moderate" | "aggressive" | "conservative";
 type AssetClass = "all" | "equity" | "option";
@@ -85,6 +86,7 @@ type ControlDependencies = {
   workerHealth?: () => Promise<PostgresWorkerHealth>;
   dashboardData?: (limit?: number) => Promise<Awaited<ReturnType<typeof readPostgresDashboardData>>>;
   zeroDteSummary?: (limit?: number) => Promise<PostgresZeroDteDashboardSummary>;
+  dashboardRisk?: (limit?: number) => Promise<Awaited<ReturnType<typeof readPostgresDashboardRisk>>>;
   scheduledCommand?: (
     command: string,
     context: ControlContext
@@ -152,6 +154,10 @@ const defaultDependencies = (): ControlDependencies => ({
   workerHealth: () => readPostgresWorkerHealth(queryAdapter(postgresPool())),
   dashboardData: (limit = 25) => readPostgresDashboardData(queryAdapter(postgresPool()), limit),
   zeroDteSummary: (limit = 25) => readPostgresZeroDteDashboardSummary({
+    query: queryAdapter(postgresPool()),
+    limit
+  }),
+  dashboardRisk: (limit = 25) => readPostgresDashboardRisk({
     query: queryAdapter(postgresPool()),
     limit
   })
@@ -257,13 +263,14 @@ const queryFor = () => dependencies().query?.() || queryAdapter(postgresPool());
 
 const readCurrentSummary = async () => {
   const runtime = dependencies();
-  const [authority, account, positions, openOrders, dashboard, worker] = await Promise.all([
+  const [authority, account, positions, openOrders, dashboard, worker, dashboardRisk] = await Promise.all([
     runtime.authorityStatus(),
     runtime.account(),
     runtime.positions(),
     runtime.openOrders(),
     runtime.dashboardData?.(25) || readPostgresDashboardData(queryFor(), 25),
-    runtime.workerHealth?.() || readPostgresWorkerHealth(queryFor())
+    runtime.workerHealth?.() || readPostgresWorkerHealth(queryFor()),
+    runtime.dashboardRisk?.(25) || readPostgresDashboardRisk({ query: queryFor(), limit: 25 })
   ]);
   const readyIntentCount = dashboard.readyIntentCount;
   return {
@@ -319,7 +326,7 @@ const readCurrentSummary = async () => {
     hedge: {
       ok: true,
       label: "hedge",
-      data: { paperOnly: true, status: "blocked", blockers: ["NO_POSTGRES_HEDGE_STATE"] }
+      data: dashboardRisk
     }
   };
 };
@@ -575,13 +582,24 @@ const actionHandlers: Record<string, ActionConfig> = {
     method: "GET",
     requireAdminToken: false,
     action: "hedge.recommendation",
-    handler: async () => blockedResult("NO_POSTGRES_HEDGE_STATE")
+    handler: async () => {
+      await authorityStatus();
+      return dependencies().dashboardRisk
+        ? dependencies().dashboardRisk!(25)
+        : readPostgresDashboardRisk({ query: queryFor(), limit: 25 });
+    }
   },
   "/api/v1/hedge/risk": {
     method: "GET",
     requireAdminToken: false,
     action: "hedge.risk",
-    handler: async () => blockedResult("NO_POSTGRES_HEDGE_STATE")
+    handler: async () => {
+      await authorityStatus();
+      const dashboardRisk = dependencies().dashboardRisk
+        ? await dependencies().dashboardRisk!(25)
+        : await readPostgresDashboardRisk({ query: queryFor(), limit: 25 });
+      return dashboardRisk.portfolioGreeks;
+    }
   },
   "/api/v1/hedge/regime": {
     method: "GET",

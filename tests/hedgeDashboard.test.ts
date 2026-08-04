@@ -33,6 +33,7 @@ let serverModule: {
     requireAdminToken: boolean;
     handler: () => Promise<unknown>;
   }>;
+  setControlDependenciesForTests: (value: Record<string, unknown> | null) => void;
 };
 
 before(async () => {
@@ -55,23 +56,63 @@ test("dashboard hedge route files expose GET only", () => {
   }
 });
 
-test("control hedge reads return PostgreSQL-only blocked results instead of falling back to SQLite", async () => {
-  for (const path of [
-    "/api/v1/hedge/risk",
-    "/api/v1/hedge/regime",
-    "/api/v1/hedge/recommendation"
-  ]) {
-    assert.equal(serverModule.ACTION_HANDLERS[path]?.method, "GET");
-    const result = await serverModule.ACTION_HANDLERS[path]!.handler();
-    assert.deepEqual(result, {
-      paperOnly: true,
-      environment: "paper",
-      liveTradingEnabled: false,
-      status: "blocked",
-      code: "NO_POSTGRES_HEDGE_STATE",
-      blockers: ["NO_POSTGRES_HEDGE_STATE"],
-      mutationAttempted: false
-    });
+test("control hedge reads expose bounded PostgreSQL risk while unsupported domains remain blocked", async () => {
+  const portfolioGreeks = {
+    quality: "complete",
+    positionCount: 1,
+    totals: { deltaShares: 60 },
+    coverage: {},
+    blockers: [],
+    evidenceReferences: [],
+    byLane: {}
+  };
+  const dashboardRisk = {
+    effectiveStatus: "current",
+    paperOnly: true,
+    environment: "paper",
+    liveTradingEnabled: false,
+    brokerMutationPerformed: false,
+    portfolioGreeks,
+    openLeapsReviewCount: 0,
+    openLeapsReviewSignals: []
+  };
+  serverModule.setControlDependenciesForTests({
+    authorityStatus: async () => ({ authority: "postgres" }),
+    account: async () => ({}),
+    positions: async () => ({}),
+    openOrders: async () => ({}),
+    dashboardRisk: async () => dashboardRisk
+  });
+  try {
+    for (const path of [
+      "/api/v1/hedge/risk",
+      "/api/v1/hedge/regime",
+      "/api/v1/hedge/recommendation"
+    ]) {
+      assert.equal(serverModule.ACTION_HANDLERS[path]?.method, "GET");
+    }
+    assert.deepEqual(
+      await serverModule.ACTION_HANDLERS["/api/v1/hedge/risk"]!.handler(),
+      portfolioGreeks
+    );
+    assert.deepEqual(
+      await serverModule.ACTION_HANDLERS["/api/v1/hedge/recommendation"]!.handler(),
+      dashboardRisk
+    );
+    assert.deepEqual(
+      await serverModule.ACTION_HANDLERS["/api/v1/hedge/regime"]!.handler(),
+      {
+        paperOnly: true,
+        environment: "paper",
+        liveTradingEnabled: false,
+        status: "blocked",
+        code: "NO_POSTGRES_HEDGE_STATE",
+        blockers: ["NO_POSTGRES_HEDGE_STATE"],
+        mutationAttempted: false
+      }
+    );
+  } finally {
+    serverModule.setControlDependenciesForTests(null);
   }
 });
 

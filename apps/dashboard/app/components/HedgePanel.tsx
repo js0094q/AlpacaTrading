@@ -22,6 +22,16 @@ type PartialMetricCoverage = DeepPartial<
   NonNullable<PortfolioRiskSnapshot["options"]["coverage"]>["delta"]
 >;
 
+type PostgresGreekTotals = {
+  deltaShares?: number | null;
+  deltaDollars?: number | null;
+  gammaSharesPerDollar?: number | null;
+  thetaDollarsPerDay?: number | null;
+  vegaDollarsPerVolPoint?: number | null;
+  rhoDollarsPerRatePoint?: number | null;
+  weightedImpliedVolatility?: number | null;
+};
+
 export interface HedgeDashboardRecommendation {
   recommendationId?: string;
   effectiveStatus: HedgeDashboardStatus;
@@ -78,6 +88,47 @@ export interface HedgeDashboardRecommendation {
   warnings?: string[];
   blockers?: string[];
   integrityWarnings?: string[];
+  brokerMutationPerformed?: boolean;
+  portfolioGreeks?: {
+    quality?: string;
+    positionCount?: number;
+    totals?: PostgresGreekTotals;
+    coverage?: {
+      contracts?: Record<string, number | null | undefined>;
+      marketValue?: Record<string, number | null | undefined>;
+    };
+    blockers?: string[];
+    byLane?: Record<string, {
+      quality?: string;
+      positionCount?: number;
+      totals?: PostgresGreekTotals;
+    }>;
+  };
+  openLeapsReviewCount?: number;
+  returnedLeapsReviewCount?: number;
+  openLeapsReviewTruncated?: boolean;
+  openLeapsReviewSignals?: Array<{
+    signalId?: string | null;
+    positionId?: string | null;
+    optionSymbol?: string | null;
+    action?: string | null;
+    suggestedQuantity?: number | null;
+    reasons?: string[];
+    firstObservedAt?: string | null;
+    lastObservedAt?: string | null;
+    occurrences?: number | null;
+    marketTimestamp?: string | null;
+    directionalReturnPct?: number | null;
+    currentDte?: number | null;
+    observedPrice?: number | null;
+    greeks?: {
+      delta?: number | null;
+      gamma?: number | null;
+      theta?: number | null;
+      vega?: number | null;
+      rho?: number | null;
+    };
+  }>;
 }
 
 const money = (value: number | null | undefined) =>
@@ -246,6 +297,119 @@ export const HedgePanel = ({
     recommendation.liveTradingEnabled === false
       ? "Paper only — Live trading disabled"
       : "Unavailable";
+
+  if (recommendation.portfolioGreeks) {
+    const portfolioGreeks = recommendation.portfolioGreeks;
+    const totals = portfolioGreeks.totals;
+    const contractCoverage = portfolioGreeks.coverage?.contracts;
+    const marketValueCoverage = portfolioGreeks.coverage?.marketValue;
+    const lanes = Object.entries(portfolioGreeks.byLane ?? {});
+    const reviewSignals = recommendation.openLeapsReviewSignals ?? [];
+    return (
+      <div className="panel full hedge-panel">
+        <div className="hedge-header">
+          <div>
+            <h2>PostgreSQL Portfolio Greeks</h2>
+            <p className={portfolioGreeks.quality === "incomplete" ? "warning" : "subtle"}>
+              {portfolioGreeks.quality === "complete"
+                ? "Read-only risk observation from current paid OPRA evidence. No order recommendation or broker mutation."
+                : portfolioGreeks.quality === "incomplete"
+                  ? "Read-only risk observation. OPRA authority is incomplete; values remain unavailable until evidence is current and validated. No order recommendation or broker mutation."
+                  : "Read-only risk observation. No open option exposure requires Greek aggregation. No order recommendation or broker mutation."}
+            </p>
+          </div>
+          <span className={`hedge-status hedge-status-${status}`}>
+            {formatLabel(rawStatus)}
+          </span>
+        </div>
+
+        <div className="hedge-metrics">
+          <div>
+            {metric("Delta shares", numeric(totals?.deltaShares))}
+            {metric("Delta dollars", money(totals?.deltaDollars))}
+            {metric("Gamma shares per $1 underlying move", numeric(totals?.gammaSharesPerDollar))}
+            {metric("Theta dollars per day", money(totals?.thetaDollarsPerDay))}
+          </div>
+          <div>
+            {metric("Vega dollars per volatility point", money(totals?.vegaDollarsPerVolPoint))}
+            {metric("Rho dollars per rate point", money(totals?.rhoDollarsPerRatePoint))}
+            {metric("Market-value weighted IV", percent(totals?.weightedImpliedVolatility))}
+            {metric("Option positions", numeric(portfolioGreeks.positionCount))}
+          </div>
+          <div>
+            {metric("Data quality", portfolioGreeks.quality ?? "incomplete")}
+            {metric("Open LEAPS reviews", numeric(recommendation.openLeapsReviewCount))}
+            {metric("Source snapshot", recommendation.sourceSnapshotId ?? "-")}
+            {metric("Trading state", tradingState)}
+            {metric(
+              "Broker mutation",
+              recommendation.brokerMutationPerformed === false ? "No" : "Unavailable"
+            )}
+          </div>
+        </div>
+
+        <section>
+          <h3>Greek evidence coverage</h3>
+          <div className="hedge-metrics">
+            <div>
+              {metric("Contracts total", numeric(contractCoverage?.total))}
+              {metric("Delta contracts measured", numeric(contractCoverage?.deltaShares))}
+              {metric("Theta contracts measured", numeric(contractCoverage?.theta))}
+            </div>
+            <div>
+              {metric("Market value total", money(marketValueCoverage?.total))}
+              {metric("Delta market value measured", money(marketValueCoverage?.deltaShares))}
+              {metric("Theta market value measured", money(marketValueCoverage?.theta))}
+            </div>
+          </div>
+        </section>
+
+        <section>
+          <h3>Managed option lanes</h3>
+          <div className="list">
+            {lanes.map(([lane, laneRisk]) => (
+              <div className="row" key={lane}>
+                <strong>{lane}</strong>
+                <span>{laneRisk.quality ?? "incomplete"}</span>
+                <span className="mono">positions {numeric(laneRisk.positionCount)}</span>
+              </div>
+            ))}
+            {!lanes.length ? <p className="subtle">No managed option lane evidence available.</p> : null}
+          </div>
+        </section>
+
+        <section>
+          <h3>Open managed-LEAPS review signals</h3>
+          <div className="list">
+            {reviewSignals.map((signal) => (
+              <div className="row" key={signal.signalId ?? signal.optionSymbol ?? "review-signal"}>
+                <strong>{signal.optionSymbol ?? "Unknown option"}</strong>
+                <span>Review only</span>
+                <span>{(signal.reasons ?? []).join(", ") || "Reason unavailable"}</span>
+                <span className="mono">
+                  DTE {numeric(signal.currentDte)} · return {numeric(signal.directionalReturnPct)}% · delta {numeric(signal.greeks?.delta)}
+                </span>
+                <span className="mono">
+                  observed {signal.marketTimestamp ?? signal.lastObservedAt ?? "Unavailable"}
+                </span>
+              </div>
+            ))}
+            {!reviewSignals.length ? <p className="subtle">No open managed-LEAPS reviews.</p> : null}
+          </div>
+          {recommendation.openLeapsReviewTruncated ? (
+            <p className="warning">
+              Showing {numeric(recommendation.returnedLeapsReviewCount)} of {numeric(recommendation.openLeapsReviewCount)} open reviews.
+            </p>
+          ) : null}
+        </section>
+
+        {portfolioGreeks.blockers?.length
+          ? <p className="danger">Blockers: {portfolioGreeks.blockers.join(", ")}</p>
+          : null}
+        <p className="subtle">Paper only. Observation and human review only.</p>
+      </div>
+    );
+  }
 
   return (
     <div className="panel full hedge-panel">
