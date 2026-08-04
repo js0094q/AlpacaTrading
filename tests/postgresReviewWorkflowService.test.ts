@@ -25,6 +25,19 @@ const paperLeapsEnvironment = {
   LIVE_TRADING_ENABLED: "false",
   LEAPS_MAX_ENTRY_CAPITAL_USD: "5000"
 };
+const completeLeapsCallGreeks = {
+  impliedVolatility: 0.35,
+  delta: 0.62,
+  gamma: 0.004,
+  theta: -0.08,
+  vega: 1.8,
+  rho: 0.9
+};
+const completeLeapsPutGreeks = {
+  ...completeLeapsCallGreeks,
+  delta: -0.62,
+  rho: -0.9
+};
 
 const candidate = {
   candidate_id: "candidate-1", research_run_id: "research-run-1",
@@ -91,6 +104,12 @@ const observedExitOptionContract = (optionSymbol: string) => {
     allocation_status: "active",
     allocation_effective_to: null
   };
+};
+const observedLeapsCallContract = {
+  ...observedOptionContract,
+  contract_option_symbol: "SPY270501C00560000",
+  contract_id: "option-contract-SPY270501C00560000",
+  contract_expiration_date: "2027-05-01"
 };
 
 test("entry review persists signed PostgreSQL review and unconfirmed pending intent", async () => {
@@ -591,6 +610,8 @@ for (const [label, sipOverride, expected] of [
         marketDecisionInputs: {
           currentTradablePrice: 555,
           option: {
+            bid: 1.98,
+            ask: 2.02,
             selectionScore: 0.6,
             liquidityScore: 0.8,
             spreadPct: 0.02,
@@ -657,6 +678,8 @@ for (const [label, marketEvidence] of [
         marketDecisionInputs: {
           currentTradablePrice: 555,
           option: {
+            bid: 1.98,
+            ask: 2.02,
             selectionScore: 0.6,
             liquidityScore: 0.8,
             spreadPct: 0.02,
@@ -912,7 +935,7 @@ test("entry review classifies same-day expiration against the New York trading d
           return {
             rows: [{
               ...candidate,
-              ...observedOptionContract,
+              ...observedLeapsCallContract,
               candidate_id: "zero-dte-new-york-date",
               candidate_strategy_family: "zero_dte_spy",
               asset_class: "option",
@@ -921,8 +944,8 @@ test("entry review classifies same-day expiration against the New York trading d
               contract_expiration_date: "2026-07-20",
               preferred_expression: "option",
               market_price: "2",
-              market_timestamp: "2026-07-21T00:29:30.000Z",
-              sip_market_timestamp: "2026-07-21T00:29:30.000Z",
+              market_timestamp: "2026-07-20T14:29:30.000Z",
+              sip_market_timestamp: "2026-07-20T14:29:30.000Z",
               market_evidence: {
                 bid: 1.98,
                 ask: 2.02,
@@ -934,6 +957,11 @@ test("entry review classifies same-day expiration against the New York trading d
                 requestedFeed: "opra",
                 effectiveFeed: "opra",
                 provider: "alpaca"
+              },
+              signal_inputs: {
+                marketDecisionInputs: {
+                  option: { moneyness: 0.005, liquidityScore: 0.9 }
+                }
               }
             }],
             rowCount: 1
@@ -949,7 +977,7 @@ test("entry review classifies same-day expiration against the New York trading d
     },
     fence,
     signingKey: "test-signing-key-with-sufficient-length",
-    now: new Date("2026-07-21T00:30:00.000Z")
+    now: new Date("2026-07-20T14:30:00.000Z")
   });
 
   assert.equal(orderIntent?.strategyClassification, "zero_dte_long_call");
@@ -983,6 +1011,7 @@ test("entry review preserves the LEAPS lane classification and evidence profile 
               max_position_notional: "10000",
               max_symbol_notional: "10000",
               market_evidence: {
+                ...completeLeapsPutGreeks,
                 bid: 19.9,
                 ask: 20.1,
                 midpoint: 20,
@@ -1055,16 +1084,17 @@ test("LEAPS uses the independent $5,000 ceiling and persists an integer contract
           return {
             rows: [{
               ...candidate,
-              ...observedOptionContract,
+              ...observedLeapsCallContract,
               candidate_id: "leaps-3000",
               candidate_strategy_family: "leaps",
               asset_class: "option",
-              option_symbol: "SPY260821C00560000",
+              option_symbol: "SPY270501C00560000",
               preferred_expression: "option",
               market_price: "30",
               max_position_notional: "10000",
               max_symbol_notional: "10000",
               market_evidence: {
+                ...completeLeapsCallGreeks,
                 bid: 29.9,
                 ask: 30.1,
                 midpoint: 30,
@@ -1121,11 +1151,11 @@ test("an exactly $5,000 LEAPS contract produces one contract", async () => {
           return {
             rows: [{
               ...candidate,
-              ...observedOptionContract,
+              ...observedLeapsCallContract,
               candidate_id: "leaps-5000",
               candidate_strategy_family: "leaps",
               asset_class: "option",
-              option_symbol: "SPY260821C00560000",
+              option_symbol: "SPY270501C00560000",
               preferred_expression: "option",
               market_price: "50",
               buying_power: "100000",
@@ -1137,6 +1167,7 @@ test("an exactly $5,000 LEAPS contract produces one contract", async () => {
               max_deployment_amount: "100000",
               cash_reserve_amount: "0",
               market_evidence: {
+                ...completeLeapsCallGreeks,
                 bid: 49.9,
                 ask: 50.1,
                 midpoint: 50,
@@ -1180,11 +1211,11 @@ test("a $1,000 LEAPS contract produces five contracts and reserves the full $5,0
           return {
             rows: [{
               ...candidate,
-              ...observedOptionContract,
+              ...observedLeapsCallContract,
               candidate_id: "leaps-five-contracts",
               candidate_strategy_family: "leaps",
               asset_class: "option",
-              option_symbol: "SPY260821C00560000",
+              option_symbol: "SPY270501C00560000",
               preferred_expression: "option",
               market_price: "10",
               buying_power: "100000",
@@ -1196,6 +1227,7 @@ test("a $1,000 LEAPS contract produces five contracts and reserves the full $5,0
               max_deployment_amount: "100000",
               cash_reserve_amount: "0",
               market_evidence: {
+                ...completeLeapsCallGreeks,
                 bid: 9.9,
                 ask: 10.1,
                 midpoint: 10,
@@ -1252,11 +1284,11 @@ test("validated buying power reduces LEAPS quantity without creating a fractiona
           return {
             rows: [{
               ...candidate,
-              ...observedOptionContract,
+              ...observedLeapsCallContract,
               candidate_id: "leaps-buying-power-reduces-quantity",
               candidate_strategy_family: "leaps",
               asset_class: "option",
-              option_symbol: "SPY260821C00560000",
+              option_symbol: "SPY270501C00560000",
               preferred_expression: "option",
               market_price: "10",
               buying_power: "2500",
@@ -1268,6 +1300,7 @@ test("validated buying power reduces LEAPS quantity without creating a fractiona
               max_deployment_amount: "100000",
               cash_reserve_amount: "0",
               market_evidence: {
+                ...completeLeapsCallGreeks,
                 bid: 9.9,
                 ask: 10.1,
                 midpoint: 10,
@@ -1334,11 +1367,11 @@ test("LEAPS concentration and portfolio limits remain authoritative sizing input
             return {
               rows: [{
                 ...candidate,
-                ...observedOptionContract,
+                ...observedLeapsCallContract,
                 candidate_id: scenario.candidateId,
                 candidate_strategy_family: "leaps",
                 asset_class: "option",
-                option_symbol: "SPY260821C00560000",
+                option_symbol: "SPY270501C00560000",
                 preferred_expression: "option",
                 market_price: "10",
                 buying_power: "100000",
@@ -1350,6 +1383,7 @@ test("LEAPS concentration and portfolio limits remain authoritative sizing input
                 max_deployment_amount: scenario.maxDeploymentAmount,
                 cash_reserve_amount: "0",
                 market_evidence: {
+                  ...completeLeapsCallGreeks,
                   bid: 9.9,
                   ask: 10.1,
                   midpoint: 10,
@@ -1398,7 +1432,7 @@ test("multiple independently qualified LEAPS positions create separate same-cycl
   const persistedQuantities: unknown[] = [];
   const optionRow = {
     ...candidate,
-    ...observedOptionContract,
+    ...observedLeapsCallContract,
     candidate_strategy_family: "leaps",
     asset_class: "option" as const,
     preferred_expression: "option",
@@ -1411,6 +1445,7 @@ test("multiple independently qualified LEAPS positions create separate same-cycl
     max_deployment_amount: "100000",
     cash_reserve_amount: "0",
     market_evidence: {
+      ...completeLeapsCallGreeks,
       bid: 9.9,
       ask: 10.1,
       midpoint: 10,
@@ -1433,16 +1468,16 @@ test("multiple independently qualified LEAPS positions create separate same-cycl
               {
                 ...optionRow,
                 candidate_id: "leaps-position-one",
-                option_symbol: "SPY260821C00560000",
-                contract_option_symbol: "SPY260821C00560000",
+                option_symbol: "SPY270501C00560000",
+                contract_option_symbol: "SPY270501C00560000",
                 contract_id: "contract-leaps-position-one",
                 market_price: "10"
               },
               {
                 ...optionRow,
                 candidate_id: "leaps-position-two",
-                option_symbol: "SPY260821C00570000",
-                contract_option_symbol: "SPY260821C00570000",
+                option_symbol: "SPY270501C00570000",
+                contract_option_symbol: "SPY270501C00570000",
                 contract_id: "contract-leaps-position-two",
                 market_price: "24",
                 market_evidence: {
@@ -1493,11 +1528,11 @@ test("buying power still rejects an otherwise allocation-affordable LEAPS contra
           return {
             rows: [{
               ...candidate,
-              ...observedOptionContract,
+              ...observedLeapsCallContract,
               candidate_id: "leaps-buying-power-block",
               candidate_strategy_family: "leaps",
               asset_class: "option",
-              option_symbol: "SPY260821C00560000",
+              option_symbol: "SPY270501C00560000",
               preferred_expression: "option",
               market_price: "30",
               buying_power: "2500",
@@ -1509,6 +1544,7 @@ test("buying power still rejects an otherwise allocation-affordable LEAPS contra
               max_deployment_amount: "100000",
               cash_reserve_amount: "0",
               market_evidence: {
+                ...completeLeapsCallGreeks,
                 bid: 29.9,
                 ask: 30.1,
                 midpoint: 30,
@@ -1550,7 +1586,7 @@ test("an unaffordable higher-ranked LEAPS contract is explicit and does not supp
   const orderIntents: Array<Record<string, unknown>> = [];
   const optionRow = {
     ...candidate,
-    ...observedOptionContract,
+    ...observedLeapsCallContract,
     candidate_strategy_family: "leaps",
     asset_class: "option" as const,
     preferred_expression: "option",
@@ -1563,6 +1599,7 @@ test("an unaffordable higher-ranked LEAPS contract is explicit and does not supp
     max_deployment_amount: "100000",
     cash_reserve_amount: "0",
     market_evidence: {
+      ...completeLeapsCallGreeks,
       bid: 29.9,
       ask: 30.1,
       midpoint: 30,
@@ -1585,8 +1622,8 @@ test("an unaffordable higher-ranked LEAPS contract is explicit and does not supp
               {
                 ...optionRow,
                 candidate_id: "leaps-unaffordable",
-                option_symbol: "SPY260821C00600000",
-                contract_option_symbol: "SPY260821C00600000",
+                option_symbol: "SPY270501C00600000",
+                contract_option_symbol: "SPY270501C00600000",
                 market_price: "50.01",
                 market_evidence: {
                   ...optionRow.market_evidence,
@@ -1598,8 +1635,8 @@ test("an unaffordable higher-ranked LEAPS contract is explicit and does not supp
               {
                 ...optionRow,
                 candidate_id: "leaps-affordable",
-                option_symbol: "SPY260821C00560000",
-                contract_option_symbol: "SPY260821C00560000",
+                option_symbol: "SPY270501C00560000",
+                contract_option_symbol: "SPY270501C00560000",
                 market_price: "30"
               }
             ],
@@ -1625,7 +1662,7 @@ test("an unaffordable higher-ranked LEAPS contract is explicit and does not supp
 
   assert.equal(result.reviewsCreated, 1);
   assert.equal(result.capacityBlocked, 1);
-  assert.equal(orderIntents[0]?.symbol, "SPY260821C00560000");
+  assert.equal(orderIntents[0]?.symbol, "SPY270501C00560000");
   assert.equal(orderIntents[0]?.quantity, 1);
   assert.equal(candidateUpdates.some((values) =>
     values[0] === "leaps-unaffordable" &&
@@ -2818,6 +2855,252 @@ test("option exit review rejects an unusable quote before persisting a close int
   );
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO execution_reviews")), false);
   assert.equal(sql.some((statement) => statement.includes("INSERT INTO order_intents")), false);
+});
+
+test("PostgreSQL review blocks a family and expiration lane mismatch", async () => {
+  let candidateUpdate: readonly unknown[] = [];
+  const optionSymbol = "SPY260804C00555000";
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("FROM candidates candidate")) {
+          return {
+            rows: [{
+              ...candidate,
+              ...observedExitOptionContract(optionSymbol),
+              candidate_id: "candidate-0dte-window",
+              candidate_strategy_family: "standard_option",
+              option_symbol: optionSymbol,
+              asset_class: "option",
+              preferred_expression: "long_call",
+              direction: "long",
+              market_price: "2.50",
+              market_timestamp: "2026-08-04T13:34:50.000Z",
+              sip_market_timestamp: "2026-08-04T13:34:50.000Z",
+              market_evidence: {
+                bid: 2.45,
+                ask: 2.55,
+                spreadPct: 0.04,
+                volume: 2_000,
+                openInterest: 5_000,
+                requestedFeed: "opra",
+                effectiveFeed: "opra",
+                provider: "alpaca"
+              },
+              signal_inputs: {
+                marketDecisionInputs: {
+                  option: { moneyness: 0.005, liquidityScore: 0.9 }
+                }
+              }
+            }],
+            rowCount: 1
+          };
+        }
+        if (statement.includes("UPDATE candidates")) candidateUpdate = values ?? [];
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    now: new Date("2026-08-04T13:34:59.000Z")
+  });
+
+  assert.equal(result.reviewsCreated, 0);
+  assert.equal(result.pendingIntentsCreated, 0);
+  assert.equal(candidateUpdate[1], "blocked");
+  assert.equal(candidateUpdate[2], "OPTION_LANE_FAMILY_DTE_MISMATCH");
+});
+
+test("PostgreSQL review blocks managed LEAPS with nondurable delta", async () => {
+  let candidateUpdate: readonly unknown[] = [];
+  const optionSymbol = "SPY270501C00550000";
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("FROM candidates candidate")) {
+          return {
+            rows: [{
+              ...candidate,
+              ...observedExitOptionContract(optionSymbol),
+              candidate_id: "candidate-leaps-delta",
+              candidate_strategy_family: "leaps",
+              option_symbol: optionSymbol,
+              asset_class: "option",
+              preferred_expression: "long_call",
+              direction: "long",
+              market_price: "12",
+              market_timestamp: "2026-08-04T14:00:00.000Z",
+              sip_market_timestamp: "2026-08-04T14:00:00.000Z",
+              market_evidence: {
+                bid: 11.9,
+                ask: 12.1,
+                spreadPct: 0.0167,
+                volume: 2_000,
+                openInterest: 5_000,
+                impliedVolatility: 0.35,
+                delta: 0.3,
+                gamma: 0.004,
+                theta: -0.08,
+                vega: 1.8,
+                rho: 0.9,
+                requestedFeed: "opra",
+                effectiveFeed: "opra",
+                provider: "alpaca"
+              },
+              signal_inputs: {
+                marketDecisionInputs: {
+                  option: { ...completeLeapsCallGreeks, delta: 0.62 }
+                }
+              }
+            }],
+            rowCount: 1
+          };
+        }
+        if (statement.includes("UPDATE candidates")) candidateUpdate = values ?? [];
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    leapsEntryAllocationEnv: paperLeapsEnvironment,
+    now: new Date("2026-08-04T14:00:00.000Z")
+  });
+
+  assert.equal(result.reviewsCreated, 0);
+  assert.equal(candidateUpdate[1], "blocked");
+  assert.equal(candidateUpdate[2], "LEAPS_DELTA_BELOW_ENTRY_MINIMUM");
+});
+
+test("PostgreSQL review cannot classify a long-dated standard-family candidate as LEAPS", async () => {
+  let candidateUpdate: readonly unknown[] = [];
+  const optionSymbol = "SPY270501C00550000";
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("FROM candidates candidate")) {
+          return {
+            rows: [{
+              ...candidate,
+              ...observedExitOptionContract(optionSymbol),
+              candidate_id: "candidate-long-dated-standard-family",
+              candidate_strategy_family: "standard_option",
+              option_symbol: optionSymbol,
+              asset_class: "option",
+              preferred_expression: "long_call",
+              direction: "long",
+              market_price: "12",
+              market_timestamp: "2026-08-04T14:00:00.000Z",
+              sip_market_timestamp: "2026-08-04T14:00:00.000Z",
+              market_evidence: {
+                ...completeLeapsCallGreeks,
+                bid: 11.9,
+                ask: 12.1,
+                spreadPct: 0.0167,
+                volume: 2_000,
+                openInterest: 5_000,
+                requestedFeed: "opra",
+                effectiveFeed: "opra",
+                provider: "alpaca"
+              }
+            }],
+            rowCount: 1
+          };
+        }
+        if (statement.includes("UPDATE candidates")) candidateUpdate = values ?? [];
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    leapsEntryAllocationEnv: paperLeapsEnvironment,
+    now: new Date("2026-08-04T14:00:00.000Z")
+  });
+
+  assert.equal(result.reviewsCreated, 0);
+  assert.equal(candidateUpdate[1], "blocked");
+  assert.equal(candidateUpdate[2], "OPTION_LANE_FAMILY_DTE_MISMATCH");
+});
+
+test("PostgreSQL LEAPS monitoring surfaces review-only paid-Greek deterioration", async () => {
+  const sql: string[] = [];
+  const optionSymbol = "SPY280121C00550000";
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:exit:review",
+    query: {
+      query: async (statement: string) => {
+        sql.push(statement);
+        if (statement.includes("FROM positions position")) {
+          return {
+            rows: [{
+              ...observedExitOptionContract(optionSymbol),
+              opening_strategy_classification: "leaps_long_call",
+              position_id: "position-leaps-monitor",
+              candidate_id: "candidate-leaps-monitor",
+              symbol: "SPY",
+              order_symbol: optionSymbol,
+              asset_class: "option",
+              side: "long",
+              available_quantity: "3",
+              average_entry_price: "2.00",
+              strategy_key: "leaps",
+              account_id: "account-1",
+              account_snapshot_id: "snapshot-1",
+              snapshot_fingerprint: "portfolio-fingerprint",
+              structural_fingerprint: "structural-fingerprint",
+              market_price: "1.60",
+              market_timestamp: "2026-08-04T14:00:00.000Z",
+              sip_market_timestamp: "2026-08-04T14:00:00.000Z",
+              underlying_close: "510",
+              severe_trend_sma: "500",
+              severe_trend_bar_count: "200",
+              last_reviewed_at: "2026-06-01T14:00:00.000Z",
+              market_evidence: {
+                bid: 1.58,
+                ask: 1.62,
+                spreadPct: 0.025,
+                volume: 2_000,
+                openInterest: 5_000,
+                impliedVolatility: 0.35,
+                delta: 0.4,
+                gamma: null,
+                theta: -0.05,
+                vega: 1.8,
+                rho: 0.9,
+                requestedFeed: "opra",
+                effectiveFeed: "opra",
+                provider: "alpaca"
+              }
+            }],
+            rowCount: 1
+          };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    now: new Date("2026-08-04T14:00:00.000Z")
+  });
+
+  assert.equal(result.code, "NO_POSTGRES_EXIT_TRIGGER");
+  assert.deepEqual(result.leapsMonitoringSignals, [{
+    positionId: "position-leaps-monitor",
+    optionSymbol,
+    action: "review",
+    executable: false,
+    suggestedQuantity: null,
+    reasons: [
+      "LEAPS_REVIEW_LOSS_WARNING",
+      "LEAPS_DELTA_DETERIORATION",
+      "LEAPS_THETA_CARRY_REVIEW",
+      "LEAPS_GREEK_COVERAGE_REVIEW",
+      "LEAPS_PERIODIC_REVIEW_DUE"
+    ]
+  }]);
+  assert.equal(sql.some((statement) => statement.includes("INSERT INTO execution_reviews")), false);
 });
 
 test("option exit review rejects executable evidence beyond the autonomous 30-minute window", async () => {

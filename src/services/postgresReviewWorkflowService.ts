@@ -5,6 +5,12 @@ import type { SchedulerFence } from "../repositories/contracts/common.js";
 import { AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS } from "./autonomousFreshnessPolicy.js";
 import { paperLeapsExitConfig } from "./leapsExitPolicy.js";
 import {
+  evaluateManagedLeapsEntryRisk,
+  evaluateManagedLeapsPositionReview,
+  type ManagedLeapsRiskConfig
+} from "./leapsRiskPolicy.js";
+import { evaluateZeroDteDecision } from "./zeroDteDecisionPolicy.js";
+import {
   LEAPS_CONTRACT_MULTIPLIER,
   resolveLeapsEntryAllocation,
   sizeLeapsEntry,
@@ -14,8 +20,8 @@ import {
   optionDaysToExpiration,
   parseOptionSymbol
 } from "./optionSymbolService.js";
+import { classifyManagedOptionLane } from "./optionLanePolicy.js";
 import {
-  classifyOptionStrategy,
   type StrategyClassification,
   type TradeOperation
 } from "./autonomousTradeLifecycleService.js";
@@ -42,6 +48,32 @@ export type PostgresReviewQuery = {
     rows: Record<string, unknown>[];
     rowCount: number | null;
   }>;
+};
+
+export type LeapsMonitoringSignal = {
+  positionId: string;
+  optionSymbol: string;
+  action: "review" | "partial_exit_review";
+  executable: false;
+  suggestedQuantity: number | null;
+  reasons: string[];
+};
+
+export type PostgresReviewWorkflowResult = {
+  status: "no_op" | "completed";
+  code?: string;
+  command?: string;
+  reviewsCreated: number;
+  pendingIntentsCreated: number;
+  capacityBlocked: number;
+  skipped?: number;
+  arbitrationDecisions?: number;
+  arbitrationApproved?: number;
+  arbitrationResized?: number;
+  arbitrationSkipped?: number;
+  confirmationCreated?: boolean;
+  paperOnly?: boolean;
+  leapsMonitoringSignals?: LeapsMonitoringSignal[];
 };
 
 type ReviewSourceRow = Record<string, unknown> & {
@@ -177,6 +209,141 @@ const optionDecisionInputs = (row: ReviewSourceRow) => {
   const marketDecisionInputs = jsonRecord(signalInputs.marketDecisionInputs);
   return jsonRecord(marketDecisionInputs.option);
 };
+const authoritativeOptionEvidence = (row: ReviewSourceRow) => {
+  const candidate = optionDecisionInputs(row);
+  const snapshot = jsonRecord(row.market_evidence);
+  const merged = { ...candidate, ...snapshot };
+  for (const field of [
+    "bid", "ask", "midpoint", "last", "volume", "openInterest",
+    "impliedVolatility", "delta", "gamma", "theta", "vega", "rho",
+    "spread", "spreadPct", "underlyingPrice", "requestedFeed",
+    "effectiveFeed", "provider", "transport", "bidSize", "askSize",
+    "lastTrade", "lastTradeTimestamp", "spreadDollars", "quoteTimestamp",
+    "quoteAgeSeconds", "quoteFreshnessStatus", "providerTimestamp",
+    "receiptTimestamp", "persistenceTimestamp", "requestId", "endpoint",
+    "pageToken", "retrievedAt", "feed", "environment"
+  ]) {
+    merged[field] = Object.prototype.hasOwnProperty.call(snapshot, field)
+      ? snapshot[field]
+      : null;
+  }
+  return merged;
+};
+const managedLeapsRiskConfig = (): ManagedLeapsRiskConfig => {
+  const config = paperLeapsExitConfig();
+  return {
+    minimumEntryDelta: config.minDeltaEntry,
+    maximumEntryDelta: config.maxDeltaEntry,
+    minimumReviewDelta: config.minDeltaReview,
+    maximumThetaPctOfPremium: config.maxThetaPctOfPremium,
+    maximumImpliedVolatility: config.maxImpliedVolatility,
+    reviewLossPct: config.reviewLossPct,
+    hardStopLossPct: config.hardStopLossPct,
+    partialProfitTakePct: config.partialProfitTakePct,
+    fullProfitTakePct: config.fullProfitTakePct,
+    dteExitThreshold: config.dteExitThreshold,
+    severeTrendExitSma: config.severeTrendExitSma,
+    reviewIntervalDays: config.reviewIntervalDays
+  };
+};
+type OptionLaneDecision =
+  | ReturnType<typeof evaluateZeroDteDecision>
+  | ReturnType<typeof evaluateManagedLeapsEntryRisk>
+  | {
+      eligible: false;
+      action: "blocked";
+      score: 0;
+      blockers: string[];
+      inputsUsed: Record<string, unknown>;
+    };
+type CanonicalOptionLane = "options_0dte" | "options_standard" | "options_leaps";
+type OptionLaneResolution = {
+  canonicalLane: CanonicalOptionLane;
+  laneDecision: OptionLaneDecision | null;
+};
+const evaluateOptionLaneEntry = (input: {
+  row: ReviewSourceRow;
+  executablePremium: number;
+  now: Date;
+}): OptionLaneResolution | null => {
+  if (input.row.asset_class !== "option") return null;
+  const family = String(input.row.candidate_strategy_family ?? "")
+    .trim()
+    .toLowerCase();
+  const optionType = String(input.row.contract_type ?? "") as "call" | "put";
+  const evidence = authoritativeOptionEvidence(input.row);
+  const classifiedLane = classifyManagedOptionLane({
+    expirationDate: isoDateOnly(input.row.contract_expiration_date),
+    observedAt: input.now,
+    managedLeapsMinDte: paperLeapsExitConfig().minDteAtEntry
+  });
+  if (classifiedLane === "expired") {
+    return {
+      canonicalLane: "options_standard",
+      laneDecision: {
+        eligible: false,
+        action: "blocked",
+        score: 0,
+        blockers: ["OPTION_CONTRACT_EXPIRED"],
+        inputsUsed: {
+          family,
+          expirationDate: isoDateOnly(input.row.contract_expiration_date)
+        }
+      }
+    };
+  }
+  const canonicalLane = classifiedLane;
+  const expectedFamily = canonicalLane === "options_0dte"
+    ? "zero_dte_spy"
+    : canonicalLane === "options_leaps"
+      ? "leaps"
+      : "standard_option";
+  if (family && family !== expectedFamily) {
+    return {
+      canonicalLane,
+      laneDecision: {
+        eligible: false,
+        action: "blocked",
+        score: 0,
+        blockers: ["OPTION_LANE_FAMILY_DTE_MISMATCH"],
+        inputsUsed: {
+          actualFamily: family || null,
+          expectedFamily,
+          canonicalLane,
+          expirationDate: isoDateOnly(input.row.contract_expiration_date)
+        }
+      }
+    };
+  }
+  if (canonicalLane === "options_0dte") {
+    return { canonicalLane, laneDecision: evaluateZeroDteDecision({
+      underlyingSymbol: input.row.symbol,
+      expirationDate: isoDateOnly(input.row.contract_expiration_date),
+      optionType,
+      direction: input.row.direction,
+      observedAt: input.now.toISOString(),
+      bid: finite(evidence.bid),
+      ask: finite(evidence.ask),
+      volume: finite(evidence.volume),
+      openInterest: finite(evidence.openInterest),
+      moneyness: finite(evidence.moneyness),
+      liquidityScore: finite(evidence.liquidityScore)
+    }) };
+  }
+  if (canonicalLane === "options_leaps") {
+    return { canonicalLane, laneDecision: evaluateManagedLeapsEntryRisk({
+      optionType,
+      premium: input.executablePremium,
+      impliedVolatility: finite(evidence.impliedVolatility),
+      delta: finite(evidence.delta),
+      gamma: finite(evidence.gamma),
+      theta: finite(evidence.theta),
+      vega: finite(evidence.vega),
+      rho: finite(evidence.rho)
+    }, managedLeapsRiskConfig()) };
+  }
+  return { canonicalLane, laneDecision: null };
+};
 const executableOptionEvidence = (input: {
   evidence: Record<string, unknown>;
   maximumSpreadPct: number;
@@ -216,10 +383,7 @@ const assertExecutableOptionReviewEvidence = (
 ) => {
   if (row.asset_class !== "option") return;
   if (!executableOptionEvidence({
-    evidence: {
-      ...jsonRecord(row.market_evidence),
-      ...optionDecisionInputs(row)
-    },
+    evidence: authoritativeOptionEvidence(row),
     maximumSpreadPct,
     underlyingPrice: row.sip_market_price
   })) {
@@ -791,6 +955,7 @@ SELECT position.id AS position_id,
        opening_intent.id AS opening_intent_id,
        COALESCE(opening_intent.review_id, opening_intent.execution_review_id)
          AS opening_review_id,
+       opening_review.created_at AS last_reviewed_at,
        opening_intent.strategy_classification AS opening_strategy_classification,
        opening_intent.contract_id AS opening_contract_id,
        opening_intent.authorization_snapshot_id
@@ -829,6 +994,11 @@ LEFT JOIN candidates candidate ON candidate.id = position.candidate_id
 LEFT JOIN orders opening_order ON opening_order.id = position.opening_order_id
 LEFT JOIN order_intents opening_intent
   ON opening_intent.id = opening_order.order_intent_id
+LEFT JOIN execution_reviews opening_review
+  ON opening_review.id = COALESCE(
+    opening_intent.review_id,
+    opening_intent.execution_review_id
+  )
 LEFT JOIN option_contracts contract
   ON contract.option_symbol = position.option_symbol
 LEFT JOIN LATERAL (
@@ -884,6 +1054,12 @@ JOIN LATERAL (
              'last', option_snapshot.last,
              'volume', option_snapshot.volume,
              'openInterest', option_snapshot.open_interest,
+             'impliedVolatility', option_snapshot.implied_volatility,
+             'delta', option_snapshot.delta,
+             'gamma', option_snapshot.gamma,
+             'theta', option_snapshot.theta,
+             'vega', option_snapshot.vega,
+             'rho', option_snapshot.rho,
              'underlyingPrice', option_snapshot.evidence->'underlyingPrice',
              'requestedFeed', option_snapshot.evidence->>'requestedFeed',
              'effectiveFeed', option_snapshot.evidence->>'effectiveFeed',
@@ -964,6 +1140,7 @@ const runExitReview = async (input: {
   maxMarketAgeSeconds: number;
 }) => {
   const rows = (await input.query.query(exitSourceSql(input.command))).rows as Array<Record<string, unknown>>;
+  const leapsMonitoringSignals: LeapsMonitoringSignal[] = [];
   const eligible = rows.flatMap((row) => {
     const positionId = String(row.position_id ?? "").trim();
     const strategyKey = String(row.strategy_key ?? "").trim();
@@ -1056,36 +1233,53 @@ const runExitReview = async (input: {
     const currentDte = parsedOption?.ok
       ? optionDaysToExpiration(parsedOption.expirationDate, input.now.toISOString())
       : null;
-    const leapsConfig = paperLeapsExitConfig();
     const leaps = strategyClassification === "leaps_long_call" ||
       strategyClassification === "leaps_long_put";
-    const directionalReturnPct = directionalReturn * 100;
+    const directionalReturnPct = Number((directionalReturn * 100).toFixed(8));
     const severeTrendBarCount = finite(row.severe_trend_bar_count);
     const underlyingClose = finite(row.underlying_close);
     const severeTrendSma = finite(row.severe_trend_sma);
-    const severeTrendBreak = leaps &&
-      parsedOption?.ok === true &&
-      severeTrendBarCount !== null &&
-      severeTrendBarCount >= leapsConfig.severeTrendExitSma &&
-      underlyingClose !== null &&
-      severeTrendSma !== null &&
-      (
-        (parsedOption.optionType === "call" &&
-          underlyingClose < severeTrendSma) ||
-        (parsedOption.optionType === "put" &&
-          underlyingClose > severeTrendSma)
-      );
+    const optionEvidence = jsonRecord(row.market_evidence);
+    const leapsReview = leaps && parsedOption?.ok === true
+      ? evaluateManagedLeapsPositionReview({
+          optionType: parsedOption.optionType,
+          premium: price,
+          quantity,
+          directionalReturnPct,
+          currentDte,
+          underlyingClose,
+          severeTrendSma,
+          severeTrendBarCount,
+          impliedVolatility: finite(optionEvidence.impliedVolatility),
+          delta: finite(optionEvidence.delta),
+          gamma: finite(optionEvidence.gamma),
+          theta: finite(optionEvidence.theta),
+          vega: finite(optionEvidence.vega),
+          rho: finite(optionEvidence.rho),
+          lastReviewedAt: row.last_reviewed_at
+            ? String(row.last_reviewed_at)
+            : null,
+          now: input.now.toISOString()
+        }, managedLeapsRiskConfig())
+      : null;
+    if (
+      leapsReview?.action === "review" ||
+      leapsReview?.action === "partial_exit_review"
+    ) {
+      leapsMonitoringSignals.push({
+        positionId,
+        optionSymbol: String(row.order_symbol),
+        action: leapsReview.action,
+        executable: false,
+        suggestedQuantity: leapsReview.suggestedQuantity,
+        reasons: leapsReview.reasons
+      });
+    }
     const reason = option
       ? leaps
-        ? directionalReturnPct <= leapsConfig.hardStopLossPct
-          ? "LEAPS_HARD_STOP_LOSS"
-          : directionalReturnPct >= leapsConfig.fullProfitTakePct
-            ? "LEAPS_FULL_PROFIT_TAKE"
-            : currentDte !== null && currentDte <= leapsConfig.dteExitThreshold
-              ? "LEAPS_DTE_EXIT_WINDOW"
-              : severeTrendBreak
-                ? "LEAPS_SEVERE_TREND_BREAK"
-                : null
+        ? leapsReview?.action === "full_exit"
+          ? leapsReview.reasons[0] ?? null
+          : null
         : forceZeroDteExit
           ? "ODTE_FORCE_EXIT_BEFORE_CLOSE"
           : directionalReturn <= -0.5
@@ -1107,7 +1301,14 @@ const runExitReview = async (input: {
     }] : [];
   });
   if (!eligible.length) {
-    return { status: "no_op" as const, code: "NO_POSTGRES_EXIT_TRIGGER", reviewsCreated: 0, pendingIntentsCreated: 0, capacityBlocked: 0 };
+    return {
+      status: "no_op" as const,
+      code: "NO_POSTGRES_EXIT_TRIGGER",
+      reviewsCreated: 0,
+      pendingIntentsCreated: 0,
+      capacityBlocked: 0,
+      leapsMonitoringSignals
+    };
   }
   let created = 0;
   let skipped = 0;
@@ -1352,7 +1553,8 @@ const runExitReview = async (input: {
   return {
     status: "completed" as const, command: input.command, reviewsCreated: created,
     pendingIntentsCreated: created, skipped, capacityBlocked: 0,
-    confirmationCreated: created > 0, paperOnly: true
+    confirmationCreated: created > 0, paperOnly: true,
+    leapsMonitoringSignals
   };
 };
 
@@ -1418,16 +1620,12 @@ const timestamp = (value: unknown): string | null => {
 };
 
 const arbitrationLane = (
-  row: ReviewSourceRow
+  row: ReviewSourceRow,
+  canonicalLane: CanonicalOptionLane | null
 ): PortfolioArbitrationProposal["lane"] => {
-  const family = String(row.candidate_strategy_family ?? "")
-    .trim()
-    .toLowerCase();
-  return family === "zero_dte_spy"
-    ? "options_0dte"
-    : family === "leaps"
-      ? "options_leaps"
-      : "equity";
+  return row.asset_class === "option"
+    ? canonicalLane ?? "options_standard"
+    : "equity";
 };
 
 const arbitrationPriority = (
@@ -1675,7 +1873,7 @@ export const runPostgresReviewWorkflow = async (input: {
   maxCandidates?: number;
   explorationThresholds?: PaperExplorationThresholds;
   leapsEntryAllocationEnv?: NodeJS.ProcessEnv;
-}) => {
+}): Promise<PostgresReviewWorkflowResult> => {
   if (!ENTRY_REVIEW_COMMANDS.has(input.command) && !EXIT_REVIEW_COMMANDS.has(input.command)) {
     return { status: "no_op" as const, code: "NO_POSTGRES_REVIEW_SCOPE", reviewsCreated: 0, pendingIntentsCreated: 0, capacityBlocked: 0 };
   }
@@ -1730,6 +1928,8 @@ export const runPostgresReviewWorkflow = async (input: {
     amount: number;
     evidence: ReturnType<typeof validateEntryReviewEvidence>;
     leapsSizing: LeapsEntrySizingResult | null;
+    laneDecision: OptionLaneDecision | null;
+    canonicalLane: CanonicalOptionLane | null;
   }> = [];
   const blockedRows: Array<{ row: ReviewSourceRow; reason: string }> = [];
   const capacityRows: Array<{
@@ -1758,9 +1958,21 @@ export const runPostgresReviewWorkflow = async (input: {
       continue;
     }
     const price = evidence.price;
-    const isLeaps = row.asset_class === "option" &&
-      String(row.candidate_strategy_family ?? "").trim().toLowerCase() ===
-        "leaps";
+    const laneResolution = evaluateOptionLaneEntry({
+      row,
+      executablePremium: price,
+      now
+    });
+    const laneDecision = laneResolution?.laneDecision ?? null;
+    const canonicalLane = laneResolution?.canonicalLane ?? null;
+    if (laneDecision && !laneDecision.eligible) {
+      blockedRows.push({
+        row,
+        reason: laneDecision.blockers[0] ?? "POSTGRES_OPTION_LANE_POLICY_BLOCKED"
+      });
+      continue;
+    }
+    const isLeaps = canonicalLane === "options_leaps";
     let leapsSizing: LeapsEntrySizingResult | null = null;
     let amount: number | null;
     if (isLeaps) {
@@ -1817,7 +2029,14 @@ export const runPostgresReviewWorkflow = async (input: {
       capacityRows.push({ row, reason: "POSTGRES_REVIEW_SHORT_CAPACITY_INSUFFICIENT" });
       continue;
     }
-    eligibleRows.push({ row, amount, evidence, leapsSizing });
+    eligibleRows.push({
+      row,
+      amount,
+      evidence,
+      leapsSizing,
+      laneDecision,
+      canonicalLane
+    });
   }
   for (const { row, reason } of blockedRows) {
     await persistCandidateStage({
@@ -1876,7 +2095,7 @@ export const runPostgresReviewWorkflow = async (input: {
     contextVersion: sharedContext.contextVersion
   })}`;
   const proposals: PortfolioArbitrationProposal[] = eligibleRows.map(
-    ({ row, amount, evidence, leapsSizing }) => {
+    ({ row, amount, evidence, leapsSizing, canonicalLane }) => {
       const option = row.asset_class === "option";
       const shortEquity = !option && row.direction === "short";
       const unitResource = option
@@ -1894,7 +2113,7 @@ export const runPostgresReviewWorkflow = async (input: {
       const resourceRequirement = option || shortEquity
         ? unitResource * (requestedQuantity ?? 0)
         : amount;
-      const lane = arbitrationLane(row);
+      const lane = arbitrationLane(row, canonicalLane);
       return {
         proposalId: row.candidate_id,
         cycleId,
@@ -1944,6 +2163,8 @@ export const runPostgresReviewWorkflow = async (input: {
     amount: number;
     evidence: ReturnType<typeof validateEntryReviewEvidence>;
     leapsSizing: LeapsEntrySizingResult | null;
+    laneDecision: OptionLaneDecision | null;
+    canonicalLane: CanonicalOptionLane | null;
     arbitrationDecision: (typeof arbitration.decisions)[number];
   }> = [];
   for (const eligible of eligibleRows) {
@@ -2014,6 +2235,8 @@ export const runPostgresReviewWorkflow = async (input: {
     amount,
     evidence,
     leapsSizing,
+    laneDecision,
+    canonicalLane,
     arbitrationDecision
   } of downstreamRows) {
     const { marketTimestamp, price, underlyingSip } = evidence;
@@ -2027,25 +2250,18 @@ export const runPostgresReviewWorkflow = async (input: {
     const optionType = option
       ? String(row.contract_type) as "call" | "put"
       : null;
-    const candidateStrategyFamily = String(
-      row.candidate_strategy_family ?? ""
-    ).trim().toLowerCase();
     const strategyClassification: StrategyClassification = option
-      ? candidateStrategyFamily === "leaps"
+      ? canonicalLane === "options_leaps"
         ? optionType === "call"
           ? "leaps_long_call"
           : "leaps_long_put"
-        : candidateStrategyFamily === "zero_dte_spy"
+        : canonicalLane === "options_0dte"
           ? optionType === "call"
             ? "zero_dte_long_call"
             : "zero_dte_long_put"
-          : classifyOptionStrategy(
-              {
-                expirationDate: isoDateOnly(row.contract_expiration_date),
-                optionType: optionType!
-              },
-              newYorkTradingDate(now)
-            )
+          : optionType === "call"
+            ? "standard_long_call"
+            : "standard_long_put"
       : shortEquity
         ? "equity_short"
         : "equity_long";
@@ -2071,18 +2287,18 @@ export const runPostgresReviewWorkflow = async (input: {
     const orderSymbol = row.option_symbol ?? row.symbol;
     const clientOrderId = `pg-${canonicalJsonHash({ account: row.account_id, candidate: row.candidate_id, snapshot: row.account_snapshot_id }).slice(0, 32)}`;
     const marketEvidence = [{
+      ...(option ? authoritativeOptionEvidence(row) : jsonRecord(row.market_evidence)),
       symbol: orderSymbol,
       underlyingSymbol: row.symbol,
       referencePrice: price,
       timestamp: marketTimestamp,
       requestId: row.market_request_id,
       source: option ? "postgres.option_snapshots" : "postgres.stock_snapshots",
-      ...jsonRecord(row.market_evidence),
-      ...(option ? optionDecisionInputs(row) : {}),
       ...(option ? {
         underlyingPrice: underlyingSip?.referencePrice,
         underlyingSip,
         maximumSpreadPct: exploration.maximumOptionSpreadPct,
+        ...(laneDecision ? { optionLaneDecision: laneDecision } : {}),
         ...(leapsSizing ? { leapsSizing } : {})
       } : {})
     }];

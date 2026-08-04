@@ -42,6 +42,22 @@ export const paperLeapsExitConfig = () => ({
     0,
     number(process.env.LEAPS_MIN_DELTA_REVIEW, 0.45)
   ),
+  minDeltaEntry: Math.max(
+    0,
+    number(process.env.LEAPS_MIN_DELTA_ENTRY, 0.45)
+  ),
+  maxDeltaEntry: Math.max(
+    0,
+    number(process.env.LEAPS_MAX_DELTA_ENTRY, 0.85)
+  ),
+  maxThetaPctOfPremium: Math.max(
+    0,
+    number(process.env.LEAPS_MAX_THETA_PCT_OF_PREMIUM, 1.5)
+  ),
+  maxImpliedVolatility: Math.max(
+    0,
+    number(process.env.LEAPS_MAX_IMPLIED_VOLATILITY, 2)
+  ),
   reviewIntervalDays: Math.max(
     1,
     integer(process.env.LEAPS_REVIEW_INTERVAL_DAYS, 30)
