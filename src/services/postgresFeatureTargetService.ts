@@ -889,22 +889,33 @@ const targetFromFeature = (input: {
       : null,
     hasOptionsData: optionCandidate !== null
   }, input.riskProfile === "aggressive", input.decisionThresholds);
+  const preferredExpression = selector.preferredExpression === "call_spread" &&
+      optionCandidate?.type === "call"
+    ? "long_call" as const
+    : selector.preferredExpression === "put_spread" && optionCandidate?.type === "put"
+      ? "long_put" as const
+      : selector.preferredExpression;
+  const normalizedToSingleLeg = preferredExpression !== selector.preferredExpression;
   const strategyFamily = optionCandidate
     ? optionLane(optionCandidate.expirationDate, input.feature.observedAt)
     : "equity";
   const identity = targetIdentity({
     strategyFamily,
-    preferredExpression: selector.preferredExpression,
+    preferredExpression,
     optionSymbol: optionCandidate?.optionSymbol ?? null
   });
   const rationale = [
     ...selector.rationale,
+    ...(normalizedToSingleLeg
+      ? [`PostgreSQL autonomous execution normalized ${selector.preferredExpression} to evidenced single-leg ${preferredExpression}`]
+      : []),
     `Risk profile set to ${input.riskProfile}`,
     `Learning boost from ${input.learningModelName ?? "no model"}`
   ];
   const sourceFingerprint = fingerprint({
     feature: input.feature.sourceFingerprint,
     riskProfile: input.riskProfile,
+    preferredExpression,
     optionSymbol: optionCandidate?.optionSymbol ?? null
   });
   return {
@@ -922,12 +933,15 @@ const targetFromFeature = (input: {
     expectedReturn,
     volatilityAdjustedScore: volatilityAdjusted,
     riskProfile: input.riskProfile,
-    preferredExpression: selector.preferredExpression,
+    preferredExpression,
     rationale,
     sourceFingerprint,
     optionsStrategy: {
-      alternatives: selector.alternatives,
-      rationale: selector.rationale,
+      alternatives: [...new Set([
+        ...(normalizedToSingleLeg ? [selector.preferredExpression] : []),
+        ...selector.alternatives
+      ])].filter((entry) => entry !== preferredExpression),
+      rationale,
       optionsCandidate: optionCandidateWithUnderlyingContext,
       decisionInputs: {
         currentTradablePrice: values.currentTradablePrice,

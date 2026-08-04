@@ -126,16 +126,18 @@ const buildOptionFeaturesFixture = (input: {
   contracts: PostgresOptionContract[];
   snapshots: PostgresOptionSnapshot[];
   exploration?: boolean;
+  decisionThresholds?: ReturnType<typeof paperExplorationThresholds>;
+  marketBars?: PostgresMarketBar[];
   stock?: PostgresStockSnapshot;
 }) => buildPostgresFeaturesAndTargets({
-  bars: bars(60),
+  bars: input.marketBars ?? bars(60),
   stockSnapshots: [input.stock ?? stockSnapshot()],
   optionContracts: input.contracts,
   optionSnapshots: input.snapshots,
   riskProfile: "aggressive",
   optionsEnabled: true,
-  ...(input.exploration ? {
-    decisionThresholds: paperExplorationThresholds({
+  ...(input.exploration || input.decisionThresholds ? {
+    decisionThresholds: input.decisionThresholds ?? paperExplorationThresholds({
       ALPACA_ENV: "paper",
       TRADING_MODE: "paper",
       ALPACA_LIVE_TRADE: "false",
@@ -281,7 +283,106 @@ test("a same-day OPRA quote remains eligible when Alpaca omits 0DTE IV and Greek
     requiredFields: [],
     strategyUse: "audit_only"
   });
-  assert.equal(result.targets.some((target) => target.strategyFamily === "zero_dte_spy"), true);
+  const target = result.targets.find((entry) => entry.strategyFamily === "zero_dte_spy");
+  assert.ok(target);
+  assert.equal(target.preferredExpression, "long_call");
+  const strategy = target.optionsStrategy as {
+    alternatives: string[];
+    rationale: string[];
+    optionsCandidate: { optionSymbol: string } | null;
+  };
+  assert.equal(strategy.optionsCandidate?.optionSymbol, optionSymbol);
+  assert.equal(strategy.alternatives.includes("call_spread"), true);
+  assert.equal(
+    target.rationale.some((reason) => reason.includes("normalized call_spread")),
+    true
+  );
+  assert.equal(
+    strategy.rationale.some((reason) => reason.includes("normalized call_spread")),
+    true
+  );
+});
+
+test("bearish same-day evidence normalizes an unconstructable put spread to the observed put", async () => {
+  const optionSymbol = "SPY260629P00560000";
+  const marketBars = bars(60).map((bar, index) => {
+    const close = 620 - index;
+    return { ...bar, open: close + 1, high: close + 2, low: close - 2, close };
+  });
+  const result = await buildOptionFeaturesFixture({
+    exploration: true,
+    marketBars,
+    stock: stockSnapshot({
+      dailyOpen: 565,
+      dailyHigh: 566,
+      dailyLow: 559,
+      dailyClose: 560,
+      dailyVwap: 562,
+      dailyReturn: -0.01,
+      returnFromOpen: -0.0088495575,
+      distanceFromVwap: -0.0035587189
+    }),
+    contracts: [optionContractFixture(optionSymbol, 560, {
+      type: "put",
+      expirationDate: "2026-06-29"
+    })],
+    snapshots: [optionSnapshotFixture(optionSymbol, {
+      delta: null,
+      gamma: null,
+      theta: null,
+      vega: null,
+      rho: null,
+      impliedVolatility: null
+    })]
+  });
+
+  const target = result.targets.find((entry) => entry.strategyFamily === "zero_dte_spy");
+  assert.ok(target);
+  assert.equal(target.preferredExpression, "long_put");
+  const strategy = target.optionsStrategy as {
+    alternatives: string[];
+    rationale: string[];
+    optionsCandidate: { optionSymbol: string } | null;
+  };
+  assert.equal(strategy.optionsCandidate?.optionSymbol, optionSymbol);
+  assert.equal(strategy.alternatives.includes("put_spread"), true);
+  assert.equal(
+    strategy.rationale.some((reason) => reason.includes("normalized put_spread")),
+    true
+  );
+});
+
+test("target fingerprint binds the effective PostgreSQL autonomous expression", async () => {
+  const optionSymbol = "SPY260829C00560000";
+  const evidence = {
+    contracts: [optionContractFixture(optionSymbol, 560)],
+    snapshots: [optionSnapshotFixture(optionSymbol)]
+  };
+  const explorationThresholds = paperExplorationThresholds({
+    ALPACA_ENV: "paper",
+    TRADING_MODE: "paper",
+    ALPACA_LIVE_TRADE: "false",
+    LIVE_TRADING_ENABLED: "false"
+  });
+  const optionResult = await buildOptionFeaturesFixture({
+    ...evidence,
+    decisionThresholds: explorationThresholds
+  });
+  const sharesResult = await buildOptionFeaturesFixture({
+    ...evidence,
+    decisionThresholds: {
+      ...explorationThresholds,
+      minimumLongOptionConfidence: 1,
+      minimumAggressiveOptionConfidence: 1,
+      minimumDefinedRiskConfidence: 1
+    }
+  });
+  const optionTarget = optionResult.targets[0]!;
+  const sharesTarget = sharesResult.targets[0]!;
+
+  assert.equal(optionTarget.preferredExpression, "long_call");
+  assert.equal(sharesTarget.preferredExpression, "shares");
+  assert.notEqual(optionTarget.sourceFingerprint, sharesTarget.sourceFingerprint);
 });
 
 test("managed LEAPS fails closed when any paid Greek or IV field is missing", async () => {
