@@ -72,6 +72,10 @@ import { importResearchSignals } from "./repositories/postgres/postgresResearchS
 import { readBoundedResearchImportJson } from "./services/researchImportInputService.js";
 import { runPostgresReviewWorkflow } from "./services/postgresReviewWorkflowService.js";
 import {
+  isPostgresPortfolioGreekReviewCommand,
+  runPostgresPortfolioGreekReview
+} from "./services/postgresPortfolioRiskService.js";
+import {
   parseOutcomeLearningWindow,
   readBoundedHistoricalOutcomeAggregates,
   readBoundedOutcomeLearningRecords,
@@ -538,6 +542,17 @@ const run = async (scheduledContext?: PostgresScheduledCommandOperationContext) 
     } finally {
       await alpacaDataHub.stop();
     }
+    return;
+  }
+
+  if (isPostgresPortfolioGreekReviewCommand(command)) {
+    const context = requireScheduledContext(scheduledContext);
+    const result = await runPostgresPortfolioGreekReview({
+      command,
+      query: queryAdapter(context.pool),
+      cycleId: process.env.AUTONOMOUS_CYCLE_ID?.trim() || context.fence.runId
+    });
+    print({ ...paperEnvelope(), ...result });
     return;
   }
 
