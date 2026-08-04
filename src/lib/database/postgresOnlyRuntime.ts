@@ -15,6 +15,7 @@ const SAFE_PRODUCTION_CLI_COMMANDS = new Set([
   "hedge:exit:review",
   "hedge:review",
   "paper:execute:reviewed",
+  "paper:evidence:refresh",
   "paper:exit:execute",
   "paper:exit:review",
   "paper:learn",

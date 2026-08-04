@@ -21,6 +21,7 @@ const workerPath = join(repoRoot, "scripts/autonomous-paper-worker.mjs");
 const workstreams = [
   "zero-dte:reconcile",
   "research:daily",
+  "paper:evidence:refresh",
   "paper:options:discover",
   "paper:review",
   "paper:portfolio:review",
@@ -44,6 +45,7 @@ const workstreams = [
 const executedCommands = [
   "zero-dte:reconcile",
   "research:daily",
+  "paper:evidence:refresh",
   "paper:options:discover",
   "paper:review",
   "paper:portfolio:review",
@@ -648,7 +650,7 @@ test("approved worker validates the production contract and persists a complete 
       .filter((state) => state.eventType === "workstream_started")
       .map((state) => state.payload.workstream),
     workstreams,
-    "internal reconciliation must not increase the 20 public workstream states"
+    "internal reconciliation must not increase the 21 public workstream states"
   );
   assert.match(states[0]!.cycleId, /^[0-9a-f-]{36}$/i);
   assert.ok(states.every((state) => Number.isFinite(Date.parse(state.occurredAt))));
@@ -747,10 +749,10 @@ test("a cycle-start response-selection failure remains cycle-scoped in one worke
   assert.doesNotMatch(result.stdout + result.stderr, /"event":"worker_failed"/);
 });
 
-test("the 20 public workstreams enforce lifecycle phase order and publish dashboard-ready state", () => {
+test("the 21 public workstreams enforce lifecycle phase order and publish dashboard-ready state", () => {
   const { result, calls, states } = runWorker();
   assert.equal(result.status, 0, result.stderr || result.stdout);
-  assert.equal(workstreams.length, 20);
+  assert.equal(workstreams.length, 21);
   assert.deepEqual(
     calls
       .filter((call) => call.command !== "worker:state")
@@ -1074,10 +1076,18 @@ test("an ordinary workstream failure fails fast with durable terminal state", ()
   assert.notEqual(result.status, 0, result.stderr || result.stdout);
   assert.deepEqual(
     calls.filter((call) => call.command !== "worker:state").map((call) => call.command),
-    ["zero-dte:reconcile", "research:daily", "paper:options:discover", "paper:review"]
+    [
+      "zero-dte:reconcile",
+      "research:daily",
+      "paper:evidence:refresh",
+      "paper:options:discover",
+      "paper:review"
+    ]
   );
   assert.deepEqual(states.map((state) => state.eventType), [
     "cycle_started",
+    "workstream_started",
+    "workstream_completed",
     "workstream_started",
     "workstream_completed",
     "workstream_started",
@@ -1141,6 +1151,7 @@ test("expected market-data readiness conditions defer without stopping the worke
 
 test("legitimate PostgreSQL empty-work outcomes are no-action completions across the full lifecycle", () => {
   const expected = {
+    "paper:evidence:refresh": "NO_SELECTED_OPTION_EVIDENCE_TO_REFRESH",
     "paper:review": "NO_ELIGIBLE_POSTGRES_CANDIDATES",
     "paper:exit:review": "NO_POSTGRES_EXIT_TRIGGER",
     "paper:execute:reviewed": "NO_READY_POSTGRES_ORDER_INTENTS",

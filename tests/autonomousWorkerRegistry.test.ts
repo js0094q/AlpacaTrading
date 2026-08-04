@@ -90,7 +90,7 @@ const readRepositoryContract = () => ({
 const directDependencies = {
   "reconcile.initial": [],
   "research.prepare": ["reconcile.initial"],
-  "options.discover": ["reconcile.initial"],
+  "options.discover": ["evidence.refresh"],
   "proposal.equity": ["research.prepare"],
   "proposal.standard_option": ["research.prepare"],
   "proposal.zero_dte": ["research.prepare"],
@@ -102,6 +102,7 @@ const directDependencies = {
     "proposal.zero_dte",
     "proposal.leaps"
   ],
+  "evidence.refresh": ["research.finalize"],
   "exit.review.paper": ["reconcile.initial"],
   "exit.review.zero_dte": ["reconcile.initial"],
   "exit.review.hedge": ["reconcile.initial"],
@@ -131,6 +132,7 @@ const directDependencies = {
     "proposal.zero_dte",
     "proposal.leaps",
     "research.finalize",
+    "evidence.refresh",
     "exit.review.paper",
     "exit.review.zero_dte",
     "exit.review.hedge",
@@ -153,6 +155,7 @@ const directDependencies = {
 const requiredCommands = new Set([
   "zero-dte:reconcile",
   "research:daily",
+  "paper:evidence:refresh",
   "paper:options:discover",
   "paper:review",
   "paper:portfolio:review",

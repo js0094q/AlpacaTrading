@@ -19,6 +19,7 @@ const BROKER_MUTATION_COMMANDS = deepFreeze([
 const EXPECTED_COMMANDS = new Set([
   "zero-dte:reconcile",
   "research:daily",
+  "paper:evidence:refresh",
   "paper:options:discover",
   "paper:review",
   "paper:portfolio:review",
@@ -55,6 +56,7 @@ const RETRYABLE_REASON_CODES = new Set([
   "WORKFLOW_TIMEOUT"
 ]);
 const EXPECTED_NO_ACTION_REASONS = new Set([
+  "NO_SELECTED_OPTION_EVIDENCE_TO_REFRESH",
   "NO_ELIGIBLE_POSTGRES_CANDIDATES",
   "NO_POSTGRES_EXIT_TRIGGER",
   "NO_READY_POSTGRES_ORDER_INTENTS",
@@ -162,7 +164,7 @@ const AUTONOMOUS_WORKFLOW_REGISTRY = deepFreeze([
     compartment: "options_discovery",
     lane: "options_0dte",
     phase: "discover",
-    dependencies: ["reconcile.initial"],
+    dependencies: ["evidence.refresh"],
     resourceClass: "compute_readonly",
     enableWhen: "options_enabled",
     expectedNoActionReasons: noAction("NO_ELIGIBLE_POSTGRES_CANDIDATES")
@@ -246,6 +248,21 @@ const AUTONOMOUS_WORKFLOW_REGISTRY = deepFreeze([
     enableWhen: "always",
     sharedContextPhase: "finalize",
     inputBindings: researchBinding()
+  }),
+  workflow({
+    id: "evidence.refresh",
+    schedulerIdentity: "evidence.refresh",
+    command: "paper:evidence:refresh",
+    args: ["--maxCandidates=25", "--format=json"],
+    compartment: "market_data",
+    lane: "shared",
+    phase: "selected_evidence",
+    dependencies: ["research.finalize"],
+    resourceClass: "postgres_serial",
+    enableWhen: "options_enabled",
+    expectedNoActionReasons: noAction(
+      "NO_SELECTED_OPTION_EVIDENCE_TO_REFRESH"
+    )
   }),
   workflow({
     id: "exit.review.paper",
@@ -502,6 +519,7 @@ const AUTONOMOUS_WORKFLOW_REGISTRY = deepFreeze([
       "proposal.zero_dte",
       "proposal.leaps",
       "research.finalize",
+      "evidence.refresh",
       "exit.review.paper",
       "exit.review.zero_dte",
       "exit.review.hedge",

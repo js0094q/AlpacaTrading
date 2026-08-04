@@ -2,6 +2,7 @@
   "version": 1,
   "commands": {
     "research:daily": { "allowed": true, "entry": "tsx src/postgresOnlyCli.ts research:daily", "persistence": "postgres", "production": true, "noOp": false, "schedulerRegistered": true, "sqliteFreeImportGraph": true, "required": true },
+    "paper:evidence:refresh": { "allowed": true, "entry": "tsx src/postgresOnlyCli.ts paper:evidence:refresh", "persistence": "postgres", "production": true, "noOp": false, "schedulerRegistered": true, "sqliteFreeImportGraph": true, "required": true },
     "paper:review": { "allowed": true, "entry": "tsx src/postgresOnlyCli.ts paper:review", "persistence": "postgres", "production": true, "noOp": false, "schedulerRegistered": true, "sqliteFreeImportGraph": true, "required": true },
     "paper:portfolio:review": { "allowed": true, "entry": "tsx src/postgresOnlyCli.ts paper:portfolio:review", "persistence": "postgres", "production": true, "noOp": false, "schedulerRegistered": true, "sqliteFreeImportGraph": true, "required": true },
     "paper:options:discover": { "allowed": true, "entry": "tsx src/postgresOnlyCli.ts paper:options:discover", "persistence": "postgres", "production": true, "noOp": false, "schedulerRegistered": true, "sqliteFreeImportGraph": true, "required": true },

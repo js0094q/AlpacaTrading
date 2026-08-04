@@ -27,6 +27,7 @@
     "paper:monitor": "node scripts/paper-monitor-runner.mjs",
     "paper:autonomous": "node scripts/autonomous-paper-worker.mjs",
     "research:daily": "tsx src/postgresOnlyCli.ts research:daily",
+    "paper:evidence:refresh": "tsx src/postgresOnlyCli.ts paper:evidence:refresh",
     "research:import": "tsx src/postgresOnlyCli.ts research:import",
     "paper:review": "tsx src/postgresOnlyCli.ts paper:review",
     "paper:portfolio:review": "tsx src/postgresOnlyCli.ts paper:portfolio:review",

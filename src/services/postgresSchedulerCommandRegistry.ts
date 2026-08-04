@@ -76,7 +76,7 @@ export const POSTGRES_SCHEDULER_COMMAND_REGISTRY = [
   },
   {
     job: POSTGRES_SCHEDULER_JOBS.marketDataRefresh,
-    aliases: ["data:ingest", "options:ingest"]
+    aliases: ["data:ingest", "options:ingest", "paper:evidence:refresh"]
   },
   {
     job: POSTGRES_SCHEDULER_JOBS.universeLifecycle,

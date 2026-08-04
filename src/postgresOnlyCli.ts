@@ -68,6 +68,7 @@ import {
   runPostgresPaperOrderCancellation
 } from "./services/postgresOrderCancellationService.js";
 import { runPostgresResearchWorkflow } from "./services/postgresResearchWorkflowService.js";
+import { refreshPostgresSelectedCandidateEvidence } from "./services/postgresSelectedEvidenceRefreshService.js";
 import { importResearchSignals } from "./repositories/postgres/postgresResearchSignalRepository.js";
 import { readBoundedResearchImportJson } from "./services/researchImportInputService.js";
 import { runPostgresReviewWorkflow } from "./services/postgresReviewWorkflowService.js";
@@ -542,6 +543,23 @@ const run = async (scheduledContext?: PostgresScheduledCommandOperationContext) 
     } finally {
       await alpacaDataHub.stop();
     }
+    return;
+  }
+
+  if (command === "paper:evidence:refresh") {
+    const context = requireScheduledContext(scheduledContext);
+    const maxCandidates = Math.max(
+      1,
+      Math.min(25, Number.parseInt(String(args.maxCandidates || "25"), 10) || 25)
+    );
+    const result = await refreshPostgresSelectedCandidateEvidence({
+      query: queryAdapter(context.pool),
+      fence: context.fence,
+      maxCandidates,
+      signal: context.signal,
+      emitTelemetry: emitRuntimeTelemetry
+    });
+    print({ ...paperEnvelope(), command, ...result });
     return;
   }
 

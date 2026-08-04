@@ -126,6 +126,7 @@ test("production CLI allows only broker reads, PostgreSQL authority, and audited
   assert.doesNotThrow(() => assertPostgresOnlyCliCommand("db:postgres:authority:status"));
   assert.doesNotThrow(() => assertPostgresOnlyCliCommand("paper:reconcile:external-order"));
   assert.doesNotThrow(() => assertPostgresOnlyCliCommand("paper:order:cancel"));
+  assert.doesNotThrow(() => assertPostgresOnlyCliCommand("paper:evidence:refresh"));
   for (const command of [
     "db:migrate",
     "db:postgres:control-plane:backfill",
@@ -141,7 +142,7 @@ test("production CLI allows only broker reads, PostgreSQL authority, and audited
     );
   }
   const autonomous = new Set([
-    "research:daily", "research:import", "paper:review", "paper:portfolio:review",
+    "research:daily", "research:import", "paper:evidence:refresh", "paper:review", "paper:portfolio:review",
     "paper:options:discover", "paper:ops:review", "paper:exit:review",
     "paper:exit:execute", "paper:execute:reviewed", "hedge:review",
     "hedge:exit:review", "hedge:exit:execute", "zero-dte:engine",

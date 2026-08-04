@@ -28,6 +28,7 @@ const SUCCESSFUL_NO_ACTION_REASON_CODES = new Set([
   "NO_RECONCILIABLE_POSTGRES_ORDERS",
   "NO_BOUNDED_OUTCOME_SOURCES",
   "OUTCOME_LEARNING_REPLAY_UNCHANGED",
+  "NO_SELECTED_OPTION_EVIDENCE_TO_REFRESH",
   "NO_RECOVERABLE_POSTGRES_STATE"
 ]);
 const BROKER_MUTATION_WORKSTREAMS = new Set([
@@ -89,6 +90,7 @@ const PAPER_EXPLORATION_MAX_CANDIDATES =
 const WORKSTREAMS = [
   ["zero-dte:reconcile", ["--format=json"]],
   ["research:daily", ["--riskProfile=aggressive", "--optionsEnabled=true", `--maxCandidates=${PAPER_EXPLORATION_MAX_CANDIDATES}`, "--assetClass=all", "--format=json"]],
+  ["paper:evidence:refresh", [`--maxCandidates=${PAPER_EXPLORATION_MAX_CANDIDATES}`, "--format=json"]],
   ["paper:options:discover", ["--underlying=SPY", "--dte=0", "--format=json"]],
   ["paper:review", ["--riskProfile=aggressive", "--optionsEnabled=true", `--maxCandidates=${PAPER_EXPLORATION_MAX_CANDIDATES}`, "--format=json"]],
   ["paper:portfolio:review", ["--format=json"]],

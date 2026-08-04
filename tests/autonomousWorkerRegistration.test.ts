@@ -7,6 +7,7 @@ import { resolvePostgresSchedulerJob } from "../src/services/postgresSchedulerCo
 
 const REQUIRED_COMMANDS = [
   "research:daily",
+  "paper:evidence:refresh",
   "paper:review",
   "paper:portfolio:review",
   "paper:options:discover",
