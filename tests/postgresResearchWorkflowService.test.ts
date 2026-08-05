@@ -3,7 +3,10 @@ import test from "node:test";
 
 import { paperExplorationThresholds } from "../src/services/paperExplorationConfig.js";
 import { historicalOutcomeEvidenceConfig } from "../src/services/historicalOutcomeEvidenceService.js";
-import { runPostgresResearchWorkflow } from "../src/services/postgresResearchWorkflowService.js";
+import {
+  resolvePostgresResearchLaneRequest,
+  runPostgresResearchWorkflow
+} from "../src/services/postgresResearchWorkflowService.js";
 
 const paperEnv = {
   ALPACA_ENV: "paper",
@@ -19,6 +22,17 @@ const fence = {
   runId: "lease-run",
   fencingToken: "12"
 };
+
+test("the registered LEAPS lane enables OPRA and selects only LEAPS research", () => {
+  assert.deepEqual(
+    resolvePostgresResearchLaneRequest({
+      stage: "lane",
+      lane: "options_leaps",
+      explicitOptionsEnabled: false
+    }),
+    { requestedLane: "options_leaps", optionsEnabled: true }
+  );
+});
 
 const bar = {
   symbol: "SPY", timeframe: "1Day", observedAt: "2026-07-20T20:00:00.000Z",
@@ -1262,11 +1276,12 @@ test("LEAPS consumes only current long-horizon research without replacing option
     }
   };
 
-  await runPostgresResearchWorkflow({
+  const result = await runPostgresResearchWorkflow({
     query: researchAwareQuery((values) => { candidateValues = values; }),
     fence,
     riskProfile: "aggressive",
     optionsEnabled: true,
+    requestedLane: "options_leaps",
     maxCandidates: 10,
     now: new Date("2026-07-20T18:00:00.000Z"),
     dependencies: {
@@ -1289,6 +1304,10 @@ test("LEAPS consumes only current long-horizon research without replacing option
   });
 
   const signalInputs = JSON.parse(String(candidateValues[25]));
+  assert.deepEqual(
+    result.workstreamResults.map(({ lane }) => lane),
+    ["options_leaps"]
+  );
   assert.equal(candidateValues[12], "leaps");
   assert.equal(signalInputs.researchEvidence.state, "current");
   assert.equal(signalInputs.researchEvidence.scoreAdjustment, 3);
@@ -1302,6 +1321,131 @@ test("LEAPS consumes only current long-horizon research without replacing option
       "underlyingHistoricalVolatility"
     ]
   });
+});
+
+test("the explicit LEAPS lane persists its option-backed target as a LEAPS option", async () => {
+  let candidateValues: readonly unknown[] = [];
+  const optionBackedSharesTarget = {
+    ...target,
+    preferredExpression: "shares" as const,
+    strategyFamily: "leaps" as const,
+    expressionId: "option:SPY270416C00600000",
+    optionsStrategy: {
+      alternatives: ["long_call"],
+      rationale: ["Option candidate selected for the explicit LEAPS lane"],
+      optionsCandidate: {
+        optionSymbol: "SPY270416C00600000",
+        type: "call",
+        expirationDate: "2027-04-16",
+        strike: 600,
+        estimatedEntryPrice: 20,
+        liquidityScore: 0.9,
+        decisionInputs: {
+          bid: 19.75,
+          ask: 20.25,
+          requestedFeed: "opra",
+          effectiveFeed: "opra",
+          provider: "alpaca"
+        }
+      }
+    }
+  };
+
+  await runPostgresResearchWorkflow({
+    query: researchAwareQuery((values) => { candidateValues = values; }),
+    fence,
+    riskProfile: "aggressive",
+    optionsEnabled: true,
+    requestedLane: "options_leaps",
+    maxCandidates: 10,
+    now: new Date("2026-07-20T18:00:00.000Z"),
+    dependencies: {
+      refreshMarketData: async () => ({
+        bars: [bar],
+        stockSnapshots: [],
+        optionContracts: [],
+        optionSnapshots: [],
+        summary: {}
+      }) as never,
+      buildFeaturesAndTargets: async () => ({
+        features: [],
+        targets: [optionBackedSharesTarget]
+      }),
+      loadResearchSignals: async () => [],
+      symbols: ["SPY"]
+    }
+  });
+
+  assert.equal(candidateValues[4], "SPY270416C00600000");
+  assert.equal(candidateValues[5], "option");
+  assert.equal(candidateValues[11], "long_call");
+  assert.equal(candidateValues[12], "leaps");
+});
+
+test("the explicit 0DTE lane persists only the SPY same-day option target", async () => {
+  const candidateWrites: Array<readonly unknown[]> = [];
+  const optionBackedTarget = (symbol: string, optionSymbol: string) => ({
+    ...target,
+    symbol,
+    preferredExpression: "shares" as const,
+    strategyFamily: "zero_dte_spy" as const,
+    expressionId: `option:${optionSymbol}`,
+    optionsStrategy: {
+      alternatives: ["long_call"],
+      rationale: ["Same-day option candidate"],
+      optionsCandidate: {
+        optionSymbol,
+        type: "call",
+        expirationDate: "2026-07-20",
+        strike: symbol === "SPY" ? 555 : 60,
+        estimatedEntryPrice: 2,
+        liquidityScore: 0.9,
+        decisionInputs: {
+          bid: 1.98,
+          ask: 2.02,
+          requestedFeed: "opra",
+          effectiveFeed: "opra",
+          provider: "alpaca"
+        }
+      }
+    }
+  });
+
+  const result = await runPostgresResearchWorkflow({
+    query: researchAwareQuery((values) => { candidateWrites.push(values); }),
+    fence,
+    riskProfile: "aggressive",
+    optionsEnabled: true,
+    requestedLane: "options_0dte",
+    maxCandidates: 10,
+    now: new Date("2026-07-20T18:00:00.000Z"),
+    dependencies: {
+      refreshMarketData: async () => ({
+        bars: [bar],
+        stockSnapshots: [],
+        optionContracts: [],
+        optionSnapshots: [],
+        summary: {}
+      }) as never,
+      buildFeaturesAndTargets: async () => ({
+        features: [],
+        targets: [
+          optionBackedTarget("SPY", "SPY260720C00555000"),
+          optionBackedTarget("XLF", "XLF260720C00060000")
+        ]
+      }),
+      loadResearchSignals: async () => [],
+      symbols: ["SPY", "XLF"]
+    }
+  });
+
+  assert.equal(result.candidatesSelected, 1);
+  assert.equal(candidateWrites.length, 1);
+  assert.equal(candidateWrites[0]?.[2], "SPY");
+  assert.equal(candidateWrites[0]?.[4], "SPY260720C00555000");
+  assert.equal(candidateWrites[0]?.[5], "option");
+  assert.equal(candidateWrites[0]?.[11], "long_call");
+  assert.equal(candidateWrites[0]?.[12], "zero_dte_spy");
 });
 
 test("0DTE remains independent and records only a current-session catalyst", async () => {

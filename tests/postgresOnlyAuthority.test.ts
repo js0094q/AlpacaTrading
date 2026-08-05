@@ -387,7 +387,15 @@ test("authority maps an explicit external broker observation without an order in
 test("authority projection preserves the full current broker position state", () => {
   const snapshot: PostgresAuthorityBrokerSnapshot = {
     capturedAt: "2026-07-20T12:00:00.000Z",
+    accountId: "paper-account-1",
     accountIdentityHash: "account-hash",
+    sourceRequestIds: {
+      account: "request-account",
+      positions: "request-positions",
+      openOrders: "request-open-orders",
+      recentOrders: "request-recent-orders",
+      marketClock: "request-clock"
+    },
     account: {
       status: "ACTIVE",
       currency: "USD",
@@ -439,6 +447,11 @@ test("authority projection preserves the full current broker position state", ()
       unrealizedPnl: 20
     }],
     orders: [],
+    recentOrders: [],
+    marketClock: {
+      observedAt: "2026-07-20T12:00:00.000Z",
+      isOpen: true
+    },
     structuralPortfolioFingerprint: "structural-fingerprint",
     portfolioFingerprint: "portfolio-fingerprint"
   };

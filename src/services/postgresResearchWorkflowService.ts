@@ -82,13 +82,39 @@ const INVESTMENT_LANE_FAMILIES = [
   ["options_0dte", "zero_dte_spy"],
   ["options_leaps", "leaps"]
 ] as const;
+export type PostgresResearchLane = (typeof INVESTMENT_LANE_FAMILIES)[number][0];
+export const resolvePostgresResearchLaneRequest = (input: {
+  stage: string;
+  lane: string;
+  explicitOptionsEnabled: boolean;
+}): {
+  requestedLane: PostgresResearchLane | undefined;
+  optionsEnabled: boolean;
+} => {
+  const requestedLane = input.stage === "lane" &&
+    (["equity", "options_0dte", "options_leaps"] as const).includes(
+      input.lane as PostgresResearchLane
+    )
+    ? input.lane as PostgresResearchLane
+    : undefined;
+  return {
+    requestedLane,
+    optionsEnabled:
+      input.explicitOptionsEnabled ||
+      requestedLane === "options_0dte" ||
+      requestedLane === "options_leaps"
+  };
+};
 const RESEARCH_READINESS_DEFERRALS = new Set([
   "POSTGRES_STOCK_SNAPSHOT_STALE",
   "POSTGRES_OPTION_SNAPSHOTS_CURRENT_MISSING",
   "POSTGRES_DECISION_MARKET_SESSION_INELIGIBLE"
 ]);
-const investmentLaneEnabled = (lane: string, optionsEnabled: boolean) =>
-  lane === "equity" || optionsEnabled;
+const investmentLaneEnabled = (
+  lane: PostgresResearchLane,
+  optionsEnabled: boolean,
+  requestedLane?: PostgresResearchLane
+) => requestedLane ? lane === requestedLane : lane === "equity" || optionsEnabled;
 
 const OPRA_BOUNDED_RESULTS = new Set([
   "ALPACA_OPRA_NOT_AUTHORIZED",
@@ -380,6 +406,50 @@ const executableOption = (target: FeatureTargetResult["targets"][number]) => {
     : null;
 };
 
+const requestedOptionLaneOption = (
+  target: FeatureTargetResult["targets"][number],
+  requestedLane: PostgresResearchLane | undefined,
+  now: Date
+) => {
+  const isLeaps = requestedLane === "options_leaps" &&
+    target.strategyFamily === "leaps";
+  const isZeroDte = requestedLane === "options_0dte" &&
+    target.strategyFamily === "zero_dte_spy" &&
+    target.symbol === "SPY";
+  if (!isLeaps && !isZeroDte) {
+    return null;
+  }
+  const raw = target.optionsStrategy?.optionsCandidate;
+  const option = raw && typeof raw === "object"
+    ? raw as Record<string, unknown>
+    : null;
+  const optionSymbol = String(option?.optionSymbol ?? "").trim().toUpperCase();
+  const expirationDate = String(option?.expirationDate ?? "").trim();
+  const expectedType = target.direction === "long"
+    ? "call"
+    : target.direction === "short"
+      ? "put"
+      : null;
+  if (
+    !optionSymbol ||
+    !expectedType ||
+    option?.type !== expectedType ||
+    target.expressionId !== `option:${optionSymbol}` ||
+    (isZeroDte && optionDaysToExpiration(
+      expirationDate,
+      `${newYorkDate(now)}T00:00:00.000Z`
+    ) !== 0)
+  ) {
+    return null;
+  }
+  return {
+    option,
+    preferredExpression: expectedType === "call"
+      ? "long_call" as const
+      : "long_put" as const
+  };
+};
+
 const scoreTarget = (target: FeatureTargetResult["targets"][number], now: Date) => {
   const ageDays = Math.max(0, (now.getTime() - Date.parse(target.asOf)) / 86_400_000);
   const freshness = clamp(15 - clamp(ageDays * 0.8, 0, 15), 0, 15);
@@ -661,6 +731,7 @@ const persistCandidates = async (input: {
   researchRunId: string;
   cycleId: string;
   optionsEnabled: boolean;
+  requestedLane?: PostgresResearchLane;
   targets: FeatureTargetResult["targets"];
   maxCandidates: number;
   now: Date;
@@ -673,13 +744,27 @@ const persistCandidates = async (input: {
   cycleData: AlpacaDataCycle<MarketResult>;
   emitTelemetry?: (event: Record<string, unknown>) => void;
 }) => {
+  const requestedFamily = input.requestedLane
+    ? INVESTMENT_LANE_FAMILIES.find(([lane]) => lane === input.requestedLane)?.[1]
+    : undefined;
   const evaluated = input.targets
+    .filter((target) =>
+      (requestedFamily === undefined || target.strategyFamily === requestedFamily) &&
+      (input.requestedLane !== "options_0dte" || target.symbol === "SPY")
+    )
     .map((target) => {
-      const option = executableOption(target);
+      const preferredOption = executableOption(target);
+      const laneOption = preferredOption
+        ? null
+        : requestedOptionLaneOption(target, input.requestedLane, input.now);
+      const option = preferredOption ?? laneOption?.option ?? null;
+      const resolvedTarget = laneOption
+        ? { ...target, preferredExpression: laneOption.preferredExpression }
+        : target;
       const reasons: string[] = [];
-      if (target.direction === "neutral") reasons.push("DIRECTION_THRESHOLD_NOT_MET");
-      if (target.preferredExpression === "none") reasons.push("STRATEGY_ELIGIBILITY_NOT_MET");
-      if (target.preferredExpression !== "shares" && !option) {
+      if (resolvedTarget.direction === "neutral") reasons.push("DIRECTION_THRESHOLD_NOT_MET");
+      if (resolvedTarget.preferredExpression === "none") reasons.push("STRATEGY_ELIGIBILITY_NOT_MET");
+      if (resolvedTarget.preferredExpression !== "shares" && !option) {
         reasons.push("CURRENT_OPTION_EVIDENCE_REQUIRED");
       }
       const optionSymbol = typeof option?.optionSymbol === "string" ? option.optionSymbol : null;
@@ -690,8 +775,8 @@ const persistCandidates = async (input: {
           )
         : null;
       const leapsPolicy = postgresLeapsPolicy();
-      const strategyFamily = target.strategyFamily;
-      const baseCandidateScore = scoreTarget(target, input.now);
+      const strategyFamily = resolvedTarget.strategyFamily;
+      const baseCandidateScore = scoreTarget(resolvedTarget, input.now);
       const researchLane = researchLaneForStrategyFamily(strategyFamily);
       const researchInfluence = researchLane
         ? buildLaneResearchInfluence({
@@ -725,7 +810,7 @@ const persistCandidates = async (input: {
         )
       };
       return {
-        target,
+        target: resolvedTarget,
         option,
         optionSymbol,
         optionDte,
@@ -896,7 +981,11 @@ const persistCandidates = async (input: {
     loadSharedContext: async () => decisions,
     lanes: INVESTMENT_LANE_FAMILIES.map(([lane, family]) => ({
       lane,
-      enabled: investmentLaneEnabled(lane, input.optionsEnabled),
+      enabled: investmentLaneEnabled(
+        lane,
+        input.optionsEnabled,
+        input.requestedLane
+      ),
       execute: (sharedDecisions) => {
         const laneDecisions = sharedDecisions.filter(
           (row) => row.strategyFamily === family
@@ -937,6 +1026,7 @@ export const runPostgresResearchWorkflow = async (input: {
   fence: SchedulerFence;
   riskProfile: RiskProfile;
   optionsEnabled: boolean;
+  requestedLane?: PostgresResearchLane;
   maxCandidates: number;
   cycleId?: string;
   now?: Date;
@@ -1071,6 +1161,7 @@ export const runPostgresResearchWorkflow = async (input: {
       query: input.query, fence: input.fence, researchRunId: runId,
       cycleId,
       optionsEnabled: input.optionsEnabled,
+      requestedLane: input.requestedLane,
       targets: generated.targets, maxCandidates: input.maxCandidates, now,
       explorationThresholds: {
         ...explorationThresholds,
@@ -1141,7 +1232,11 @@ export const runPostgresResearchWorkflow = async (input: {
         loadSharedContext: async () => ({ reasonCode }),
         lanes: INVESTMENT_LANE_FAMILIES.map(([lane]) => ({
           lane,
-          enabled: investmentLaneEnabled(lane, input.optionsEnabled),
+          enabled: investmentLaneEnabled(
+            lane,
+            input.optionsEnabled,
+            input.requestedLane
+          ),
           execute: async (context) => ({
             proposals: [],
             reason_codes: [context.reasonCode],

@@ -10,7 +10,15 @@ import {
   PAPER_EXPLORATION_V2_THRESHOLDS,
   paperExplorationThresholds
 } from "../src/services/paperExplorationConfig.js";
+import {
+  validateAutonomousExecutionEvidence,
+  type AutonomousExecutionIntentRow
+} from "../src/services/autonomousPostgresExecutionService.js";
 import { runPostgresReviewWorkflow } from "../src/services/postgresReviewWorkflowService.js";
+import {
+  portfolioStatePacketFingerprint,
+  type PortfolioStatePacket
+} from "../src/services/postgresPortfolioStatePacketService.js";
 import { selectExpressionWithPolicy } from "../src/services/strategySelectionLogic.js";
 
 const fence = {
@@ -39,6 +47,92 @@ const completeLeapsPutGreeks = {
   rho: -0.9
 };
 
+const basePortfolioStatePacket = (() => {
+  const packet: PortfolioStatePacket = {
+    schemaVersion: "portfolio-state-v1",
+    packetId: "psp-base-review-fixture",
+    packetFingerprint: "",
+    generatedAt: "2026-07-20T21:59:50.000Z",
+    validUntil: "2026-07-20T22:01:50.000Z",
+    authority: {
+      environment: "paper",
+      paperOnly: true,
+      postgresOnly: true,
+      sqliteRuntimeRole: "none",
+      authenticatedBrokerReads: true,
+      opraRequired: true,
+      opraAvailable: true
+    },
+    account: {
+      accountId: "paper-account-1",
+      equity: 20_000,
+      cash: 8_000,
+      buyingPower: 10_000,
+      optionsBuyingPower: 10_000,
+      reservedCapital: 0,
+      availableValidatedCapital: 8_000,
+      observedAt: "2026-07-20T21:59:45.000Z",
+      reconciledAt: "2026-07-20T21:59:50.000Z"
+    },
+    positions: [],
+    orders: {
+      open: [],
+      recent: [],
+      duplicateHeldContract: false,
+      duplicateOpenOrder: false
+    },
+    risk: {
+      grossExposure: 0,
+      netExposure: 0,
+      directEquityExposure: 0,
+      directOptionPremiumExposure: 0,
+      etfLookThroughExposure: null,
+      etfLookThroughStatus: "unavailable",
+      strategyCapitalAllocation: { leaps: 5_000, zero_dte_spy: 750 },
+      existingLeapsExposure: 0,
+      existingZeroDteExposure: 0,
+      concentrationLimitStatus: "unavailable",
+      concentrationLimitPct: null,
+      observedConcentrationPct: null,
+      capitalAvailableForProposedTrade: 8_000,
+      eventRestrictionStatus: "unavailable",
+      eventRestrictionReasons: [],
+      marketOpen: true,
+      marketClockTimestamp: "2026-07-20T21:59:49.000Z"
+    },
+    proposedTrade: { contractIdentifier: null },
+    reconciliation: {
+      status: "matched",
+      positionsMatched: true,
+      openOrdersMatched: true,
+      recentStrategyOrdersMatched: true,
+      brokerStructuralPortfolioFingerprint: "structural-fingerprint",
+      reconciledStructuralPortfolioFingerprint: "structural-fingerprint"
+    },
+    lineage: {
+      marketEvidenceId: null,
+      candidateId: null,
+      strategyReviewId: null,
+      executionIntentId: null,
+      accountSnapshotId: "snapshot-1",
+      structuralPortfolioFingerprint: "structural-fingerprint"
+    }
+  };
+  packet.packetFingerprint = portfolioStatePacketFingerprint(packet);
+  return packet;
+})();
+const portfolioStatePacketForReviewAt = (generatedAt: string) => {
+  const packet = structuredClone(basePortfolioStatePacket);
+  const generated = new Date(generatedAt);
+  packet.generatedAt = generated.toISOString();
+  packet.validUntil = new Date(generated.getTime() + 120_000).toISOString();
+  packet.account.observedAt = generated.toISOString();
+  packet.account.reconciledAt = generated.toISOString();
+  packet.risk.marketClockTimestamp = generated.toISOString();
+  packet.packetFingerprint = portfolioStatePacketFingerprint(packet);
+  return packet;
+};
+
 const candidate = {
   candidate_id: "candidate-1", research_run_id: "research-run-1",
   candidate_rank: "1", candidate_score: "0.9",
@@ -46,9 +140,11 @@ const candidate = {
   option_symbol: null, preferred_expression: "shares", direction: "long",
   confidence: "0.9", candidate_as_of: "2026-07-20T20:00:00.000Z",
   account_id: "account-1", account_snapshot_id: "snapshot-1",
+  broker_account_id: "paper-account-1",
   account_snapshot_as_of: "2026-07-20T21:59:45.000Z",
   snapshot_fingerprint: "portfolio-fingerprint",
   structural_fingerprint: "structural-fingerprint", buying_power: "10000",
+  portfolio_state_packet: basePortfolioStatePacket,
   options_buying_power: "10000", cash: "8000", equity: "20000",
   strategy_key: "baseline",
   allocation_amount: "5000", allocation_ratio: null, reserved_amount: "0",
@@ -216,6 +312,83 @@ test("entry review persists signed PostgreSQL review and unconfirmed pending int
     sourceSql,
     /WHEN broker_order\.asset_class = 'option'\s+THEN COALESCE\(\s*intent\.max_risk,\s*intent\.estimated_premium\s*\)/
   );
+});
+
+test("entry review records the exact packet blocker and creates no review or intent", async () => {
+  const cases = [
+    {
+      name: "missing",
+      packet: undefined,
+      expected: "PORTFOLIO_STATE_PACKET_MISSING"
+    },
+    {
+      name: "stale",
+      packet: portfolioStatePacketForReviewAt("2026-07-20T21:55:00.000Z"),
+      expected: "PORTFOLIO_STATE_STALE"
+    },
+    {
+      name: "broker mismatch",
+      packet: (() => {
+        const packet = structuredClone(basePortfolioStatePacket);
+        packet.reconciliation.status = "mismatched";
+        packet.reconciliation.openOrdersMatched = false;
+        packet.packetFingerprint = portfolioStatePacketFingerprint(packet);
+        return packet;
+      })(),
+      expected: "PORTFOLIO_STATE_RECONCILIATION_MISMATCH"
+    },
+    {
+      name: "capital",
+      packet: (() => {
+        const packet = structuredClone(basePortfolioStatePacket);
+        packet.account.availableValidatedCapital = 100;
+        packet.risk.capitalAvailableForProposedTrade = 100;
+        packet.packetFingerprint = portfolioStatePacketFingerprint(packet);
+        return packet;
+      })(),
+      expected: "PORTFOLIO_STATE_CAPITAL_UNAVAILABLE"
+    }
+  ] as const;
+
+  for (const testCase of cases) {
+    const writes: string[] = [];
+    let blocker = "";
+    const result = await runPostgresReviewWorkflow({
+      command: "paper:review",
+      query: {
+        query: async (statement: string, values?: readonly unknown[]) => {
+          if (statement.includes("FROM candidates candidate")) {
+            return {
+              rows: [{ ...candidate, portfolio_state_packet: testCase.packet }],
+              rowCount: 1
+            };
+          }
+          writes.push(statement);
+          if (statement.includes("UPDATE candidates")) {
+            blocker = String(values?.[2] ?? "");
+          }
+          return { rows: [], rowCount: 1 };
+        }
+      },
+      fence,
+      signingKey: "test-signing-key-with-sufficient-length",
+      now: new Date("2026-07-20T22:00:00.000Z")
+    });
+
+    assert.equal(result.reviewsCreated, 0, testCase.name);
+    assert.equal(result.pendingIntentsCreated, 0, testCase.name);
+    assert.equal(blocker, testCase.expected, testCase.name);
+    assert.equal(
+      writes.some((statement) => statement.includes("INSERT INTO execution_reviews")),
+      false,
+      testCase.name
+    );
+    assert.equal(
+      writes.some((statement) => statement.includes("INSERT INTO order_intents")),
+      false,
+      testCase.name
+    );
+  }
 });
 
 test("a PostgreSQL Date option expiration propagates into an order intent", async () => {
@@ -980,6 +1153,8 @@ test("option capacity insufficiency blocks only that candidate and preserves pre
 
 test("entry review classifies same-day expiration against the New York trading date", async () => {
   let orderIntent: Record<string, unknown> | undefined;
+  let reviewPacket: PortfolioStatePacket | undefined;
+  let intentPacket: PortfolioStatePacket | undefined;
   await runPostgresReviewWorkflow({
     command: "paper:review",
     query: {
@@ -995,6 +1170,9 @@ test("entry review classifies same-day expiration against the New York trading d
               option_symbol: "SPY260720C00560000",
               contract_option_symbol: "SPY260720C00560000",
               contract_expiration_date: "2026-07-20",
+              portfolio_state_packet: portfolioStatePacketForReviewAt(
+                "2026-07-20T14:29:50.000Z"
+              ),
               preferred_expression: "option",
               market_price: "2",
               market_timestamp: "2026-07-20T14:29:30.000Z",
@@ -1024,6 +1202,16 @@ test("entry review classifies same-day expiration against the New York trading d
           orderIntent = JSON.parse(
             String(values?.[9])
           ) as Record<string, unknown>;
+          const portfolioEvidence = JSON.parse(
+            String(values?.[11])
+          ) as Record<string, unknown>;
+          reviewPacket = portfolioEvidence.portfolioStatePacket as PortfolioStatePacket;
+        }
+        if (statement.includes("INSERT INTO order_intents")) {
+          const requestPayload = JSON.parse(
+            String(values?.[19])
+          ) as Record<string, unknown>;
+          intentPacket = requestPayload.portfolioStatePacket as PortfolioStatePacket;
         }
         return { rows: [], rowCount: 1 };
       }
@@ -1034,13 +1222,20 @@ test("entry review classifies same-day expiration against the New York trading d
   });
 
   assert.equal(orderIntent?.strategyClassification, "zero_dte_long_call");
-  assert.match(String(orderIntent?.clientOrderId), /^pg-[a-f0-9]{32}$/);
+  assert.match(String(orderIntent?.clientOrderId), /^pg-0dte-[a-f0-9]{32}$/);
+  assert.equal(reviewPacket?.lineage.candidateId, "zero-dte-new-york-date");
+  assert.equal(reviewPacket?.lineage.strategyReviewId?.startsWith("review_"), true);
+  assert.equal(reviewPacket?.lineage.executionIntentId?.startsWith("intent_"), true);
+  assert.equal(reviewPacket?.proposedTrade.contractIdentifier, "SPY260720C00560000");
+  assert.equal(reviewPacket?.packetFingerprint, intentPacket?.packetFingerprint);
 });
 
 test("entry review preserves the LEAPS lane classification and evidence profile in order lineage", async () => {
   let orderIntent: Record<string, unknown> | undefined;
   let marketEvidence: Array<Record<string, unknown>> = [];
   let persistedIntentValues: readonly unknown[] = [];
+  let reviewPacket: PortfolioStatePacket | undefined;
+  let intentPacket: PortfolioStatePacket | undefined;
   await runPostgresReviewWorkflow({
     command: "paper:review",
     query: {
@@ -1104,9 +1299,17 @@ test("entry review preserves the LEAPS lane classification and evidence profile 
           marketEvidence = JSON.parse(
             String(values?.[10])
           ) as Array<Record<string, unknown>>;
+          const portfolioEvidence = JSON.parse(
+            String(values?.[11])
+          ) as Record<string, unknown>;
+          reviewPacket = portfolioEvidence.portfolioStatePacket as PortfolioStatePacket;
         }
         if (statement.includes("INSERT INTO order_intents")) {
           persistedIntentValues = values ?? [];
+          const requestPayload = JSON.parse(
+            String(values?.[19])
+          ) as Record<string, unknown>;
+          intentPacket = requestPayload.portfolioStatePacket as PortfolioStatePacket;
         }
         return { rows: [], rowCount: 1 };
       }
@@ -1118,12 +1321,162 @@ test("entry review preserves the LEAPS lane classification and evidence profile 
   });
 
   assert.equal(orderIntent?.strategyClassification, "leaps_long_put");
-  assert.match(String(orderIntent?.clientOrderId), /^pg-[a-f0-9]{32}$/);
+  assert.match(String(orderIntent?.clientOrderId), /^pg-leaps-[a-f0-9]{32}$/);
+  assert.equal(reviewPacket?.lineage.candidateId, "leaps-profile-lineage");
+  assert.equal(reviewPacket?.proposedTrade.contractIdentifier, "SPY270416P00500000");
+  assert.equal(reviewPacket?.packetFingerprint, intentPacket?.packetFingerprint);
   assert.equal(persistedIntentValues.includes("leaps_long_put"), true);
   assert.equal(
     (marketEvidence[0]?.evidenceProfile as Record<string, unknown>)?.lane,
     "options_leaps"
   );
+});
+
+test("LEAPS persisted research evidence can reach review while exact-contract execution evidence remains fresh-only", async () => {
+  const optionSymbol = "SPY270416C00500000";
+  let sourceSql = "";
+  let sourceValues: readonly unknown[] = [];
+  let orderIntent: Record<string, unknown> | undefined;
+  let marketEvidence: Array<Record<string, unknown>> = [];
+  let reviewPacket: PortfolioStatePacket | undefined;
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("FROM candidates candidate")) {
+          sourceSql = statement;
+          sourceValues = values ?? [];
+          return {
+            rows: [{
+              ...candidate,
+              ...observedOptionContract,
+              candidate_id: "leaps-research-evidence-window",
+              candidate_strategy_family: "leaps",
+              asset_class: "option",
+              option_symbol: optionSymbol,
+              contract_option_symbol: optionSymbol,
+              contract_id: `option-contract-${optionSymbol}`,
+              contract_type: "call",
+              contract_expiration_date: "2027-04-16",
+              preferred_expression: "long_call",
+              market_price: "20",
+              market_timestamp: "2026-07-20T21:15:00.000Z",
+              sip_market_timestamp: "2026-07-20T21:59:30.000Z",
+              market_evidence: {
+                ...completeLeapsCallGreeks,
+                bid: 19.9,
+                ask: 20.1,
+                midpoint: 20,
+                spreadPct: 0.01,
+                volume: 5_000,
+                openInterest: 8_000,
+                underlyingPrice: 555,
+                requestedFeed: "opra",
+                effectiveFeed: "opra",
+                provider: "alpaca"
+              }
+            }],
+            rowCount: 1
+          };
+        }
+        if (statement.includes("INSERT INTO execution_reviews")) {
+          orderIntent = JSON.parse(String(values?.[9])) as Record<string, unknown>;
+          marketEvidence = JSON.parse(
+            String(values?.[10])
+          ) as Array<Record<string, unknown>>;
+          const portfolioEvidence = JSON.parse(
+            String(values?.[11])
+          ) as Record<string, unknown>;
+          reviewPacket = portfolioEvidence.portfolioStatePacket as PortfolioStatePacket;
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    researchRunId: "research-run-leaps-completed",
+    leapsEntryAllocationEnv: paperLeapsEnvironment,
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.reviewsCreated, 1);
+  assert.equal(result.pendingIntentsCreated, 1);
+  assert.deepEqual(sourceValues, ["research-run-leaps-completed"]);
+  assert.match(sourceSql, /id = \$1/);
+  assert.match(sourceSql, /POSTGRES_REVIEW_MARKET_EVIDENCE_STALE:%/);
+  assert.equal(marketEvidence[0]?.timestamp, "2026-07-20T21:15:00.000Z");
+  assert.ok(orderIntent);
+  assert.ok(reviewPacket);
+
+  const currentPacket = structuredClone(basePortfolioStatePacket);
+  currentPacket.packetFingerprint = portfolioStatePacketFingerprint(currentPacket);
+  const executionIntent: AutonomousExecutionIntentRow = {
+    order_intent_id: String(reviewPacket.lineage.executionIntentId),
+    candidate_id: "leaps-research-evidence-window",
+    account_id: "account-1",
+    broker_account_id: "paper-account-1",
+    account_snapshot_fingerprint: "portfolio-fingerprint",
+    review_account_fingerprint: "structural-fingerprint",
+    reservation_id: "reservation-1",
+    execution_review_id: String(reviewPacket.lineage.strategyReviewId),
+    review_type: "entry",
+    confirmation_evidence_id: "confirmation-1",
+    client_order_id: String(orderIntent.clientOrderId),
+    strategy_key: "baseline",
+    symbol: optionSymbol,
+    underlying_symbol: "SPY",
+    asset_class: "option",
+    side: "buy_to_open",
+    order_type: "limit",
+    time_in_force: "day",
+    quantity: String(orderIntent.quantity),
+    notional: null,
+    limit_price: String(orderIntent.limitPrice),
+    stop_price: null,
+    intent_version: "1",
+    operation: "buy_to_open",
+    strategy_classification: "leaps_long_call",
+    market_evidence: marketEvidence,
+    review_portfolio_state_packet: reviewPacket,
+    intent_portfolio_state_packet: reviewPacket,
+    current_portfolio_state_packet: currentPacket
+  };
+  const executionBroker = {
+    capturedAt: "2026-07-20T22:00:00.000Z",
+    accountIdentityHash: "paper-account-1",
+    brokerAccountId: "paper-account-1",
+    portfolioFingerprint: "portfolio-fingerprint",
+    structuralPortfolioFingerprint: "structural-fingerprint"
+  };
+  assert.throws(
+    () => validateAutonomousExecutionEvidence(
+      executionIntent,
+      executionBroker,
+      new Date("2026-07-20T22:00:00.000Z"),
+      1_800
+    ),
+    /POSTGRES_MARKET_EVIDENCE_STALE/
+  );
+  for (const unusable of [
+    { bid: null },
+    { ask: null },
+    { bid: 20.2, ask: 20.1 }
+  ]) {
+    const freshEvidence = [{
+      ...marketEvidence[0],
+      ...unusable,
+      timestamp: "2026-07-20T21:59:30.000Z"
+    }];
+    assert.throws(
+      () => validateAutonomousExecutionEvidence(
+        { ...executionIntent, market_evidence: freshEvidence },
+        executionBroker,
+        new Date("2026-07-20T22:00:00.000Z"),
+        1_800
+      ),
+      /POSTGRES_OPTION_MARKET_EVIDENCE_UNUSABLE/
+    );
+  }
 });
 
 test("LEAPS uses the independent $5,000 ceiling and persists an integer contract quantity", async () => {
@@ -3690,5 +4043,5 @@ test("0DTE discovery scopes PostgreSQL candidates to the requested underlying an
   assert.equal(result.status, "no_op");
   assert.match(sourceSql, /JOIN option_contracts/);
   assert.match(sourceSql, /contract\.expiration_date/);
-  assert.deepEqual(sourceValues, ["SPY", "2026-07-20T18:00:00.000Z", 0]);
+  assert.deepEqual(sourceValues, [null, "SPY", "2026-07-20T18:00:00.000Z", 0]);
 });

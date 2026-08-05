@@ -15,11 +15,13 @@ const fence = {
 
 test("refreshes only selected option underlyings with the configured quote-age limit before review", async () => {
   const statements: string[] = [];
+  const statementValues: Array<readonly unknown[]> = [];
   const refreshInputs: Array<Record<string, unknown>> = [];
   const result = await refreshPostgresSelectedCandidateEvidence({
     query: {
-      query: async (sql: string) => {
+      query: async (sql: string, values?: readonly unknown[]) => {
         statements.push(sql);
+        statementValues.push(values ?? []);
         return {
           rows: [
             { symbol: "SPY", option_symbol: "SPY260804C00769000" },
@@ -31,6 +33,7 @@ test("refreshes only selected option underlyings with the configured quote-age l
       }
     },
     fence,
+    researchRunId: "research-run-leaps-completed",
     now: new Date("2026-08-04T17:20:00.000Z"),
     clock: () => new Date("2026-08-04T17:20:01.000Z"),
     maxCandidates: 25,
@@ -91,8 +94,10 @@ test("refreshes only selected option underlyings with the configured quote-age l
   });
 
   assert.equal(statements.length, 1);
-  assert.match(statements[0]!, /latest_research/);
+  assert.match(statements[0]!, /selected_research/);
   assert.match(statements[0]!, /candidate\.decision = 'selected'/);
+  assert.match(statements[0]!, /POSTGRES_REVIEW_MARKET_EVIDENCE_STALE:%/);
+  assert.deepEqual(statementValues[0], ["research-run-leaps-completed", 25]);
   assert.deepEqual(refreshInputs[0]?.symbols, ["AMZN", "SPY"]);
   assert.deepEqual(refreshInputs[0]?.requiredOptionUnderlyings, ["AMZN", "SPY"]);
   assert.deepEqual(refreshInputs[0]?.selectedOptionSymbols, [

@@ -42,6 +42,11 @@ import {
 import {
   persistPortfolioArbitrationDecisions
 } from "./postgresPortfolioArbitrationService.js";
+import {
+  scopePostgresPortfolioStatePacket,
+  validatePostgresPortfolioStatePacket,
+  type PortfolioStatePacket
+} from "./postgresPortfolioStatePacketService.js";
 
 export type PostgresReviewQuery = {
   query: (sql: string, values?: readonly unknown[]) => Promise<{
@@ -105,6 +110,7 @@ type ReviewSourceRow = Record<string, unknown> & {
   account_snapshot_as_of: Date | string;
   snapshot_fingerprint: string;
   structural_fingerprint: string;
+  portfolio_state_packet?: unknown;
   buying_power: string | number;
   options_buying_power?: string | number | null;
   cash: string | number;
@@ -666,12 +672,27 @@ const validateEntryReviewEvidence = (input: {
 }) => {
   const marketTimestamp = new Date(input.row.market_timestamp).toISOString();
   const age = input.now.getTime() - Date.parse(marketTimestamp);
-  const maxAge = Math.min(
-    input.maxMarketAgeSeconds,
-    input.row.asset_class === "option"
-      ? optionsQuoteConfig().maxAgeMs / 1_000
-      : Number.POSITIVE_INFINITY
-  ) * 1_000;
+  const managedLeapsResearchEvidence =
+    input.row.asset_class === "option" &&
+    String(input.row.candidate_strategy_family ?? "").trim().toLowerCase() ===
+      "leaps" &&
+    classifyManagedOptionLane({
+      expirationDate: isoDateOnly(input.row.contract_expiration_date),
+      observedAt: input.now,
+      managedLeapsMinDte: paperLeapsExitConfig().minDteAtEntry
+    }) === "options_leaps";
+  // The observed LEAPS research-to-review path takes about 34 minutes. Keep
+  // persisted research evidence valid for one hour; submission still uses the
+  // unchanged exact-contract execution freshness gate.
+  const maxAgeSeconds = managedLeapsResearchEvidence
+    ? 60 * 60
+    : Math.min(
+        input.maxMarketAgeSeconds,
+        input.row.asset_class === "option"
+          ? optionsQuoteConfig().maxAgeMs / 1_000
+          : Number.POSITIVE_INFINITY
+      );
+  const maxAge = maxAgeSeconds * 1_000;
   if (!Number.isFinite(age) || age < -60_000 || age > maxAge) {
     throw new Error(
       `POSTGRES_REVIEW_MARKET_EVIDENCE_STALE:${input.row.symbol}`
@@ -780,7 +801,9 @@ const persistCandidateStage = async (input: {
 };
 
 const entrySourceSql = (command: string, maxCandidates: number) => `WITH latest_research AS (
-  SELECT id FROM research_runs WHERE status = 'completed'
+  SELECT id FROM research_runs
+  WHERE status = 'completed'
+    AND ($1::text IS NULL OR id = $1)
   ORDER BY completed_at DESC, id DESC LIMIT 1
 ), current_account AS (
   SELECT * FROM accounts WHERE environment = 'paper'
@@ -915,10 +938,13 @@ SELECT candidate.id AS candidate_id,
        candidate.strategy_family AS candidate_strategy_family,
        candidate.as_of AS candidate_as_of,
        candidate.signal_inputs,
-       account.id AS account_id, snapshot.id AS account_snapshot_id,
+       account.id AS account_id,
+       account.broker_account_id AS broker_account_id,
+       snapshot.id AS account_snapshot_id,
        snapshot.observed_at AS account_snapshot_as_of,
        snapshot.snapshot_fingerprint,
        snapshot.evidence->>'structuralPortfolioFingerprint' AS structural_fingerprint,
+       snapshot.evidence->'portfolioStatePacket' AS portfolio_state_packet,
        snapshot.buying_power::text, snapshot.options_buying_power::text,
        snapshot.cash::text, snapshot.equity::text,
        allocation.strategy_key, allocation.allocation_amount::text,
@@ -1092,7 +1118,14 @@ JOIN LATERAL (
   LIMIT 1
 ) market ON market.market_price > 0 AND market.market_timestamp IS NOT NULL
 WHERE candidate.decision = 'selected'
-  AND candidate.lifecycle_status NOT IN ('closed','expired','rejected','skipped','blocked')
+  AND (
+    candidate.lifecycle_status NOT IN ('closed','expired','rejected','skipped','blocked')
+    OR (
+      $1::text IS NOT NULL
+      AND candidate.lifecycle_status = 'blocked'
+      AND candidate.decision_reason LIKE 'POSTGRES_REVIEW_MARKET_EVIDENCE_STALE:%'
+    )
+  )
   AND NOT EXISTS (
     SELECT 1 FROM execution_reviews existing_review
     WHERE existing_review.account_id = account.id
@@ -1102,8 +1135,8 @@ WHERE candidate.decision = 'selected'
       AND existing_review.client_order_id IS NOT NULL
   )
   ${command === "paper:options:discover" ? `AND candidate.option_symbol IS NOT NULL
-    AND candidate.symbol = $1
-    AND contract.expiration_date = (($2::timestamptz AT TIME ZONE 'America/New_York')::date + $3::integer)` : ""}
+    AND candidate.symbol = $2
+    AND contract.expiration_date = (($3::timestamptz AT TIME ZONE 'America/New_York')::date + $4::integer)` : ""}
   ${command === "hedge:review" ? "AND candidate.strategy_family ILIKE '%hedge%'" : ""}
 ORDER BY candidate.rank, candidate.id
 LIMIT ${maxCandidates}`;
@@ -2206,6 +2239,7 @@ export const runPostgresReviewWorkflow = async (input: {
   maxMarketAgeSeconds?: number;
   underlying?: string;
   dte?: number;
+  researchRunId?: string;
   maxCandidates?: number;
   explorationThresholds?: PaperExplorationThresholds;
   leapsEntryAllocationEnv?: NodeJS.ProcessEnv;
@@ -2237,7 +2271,11 @@ export const runPostgresReviewWorkflow = async (input: {
         AUTONOMOUS_MARKET_DATA_FRESHNESS_SECONDS
     });
   }
-  let sourceValues: readonly unknown[] = [];
+  const researchRunId = String(input.researchRunId ?? "").trim() || null;
+  if (researchRunId && researchRunId.length > 200) {
+    throw new Error("POSTGRES_REVIEW_RESEARCH_RUN_ID_INVALID");
+  }
+  let sourceValues: readonly unknown[] = [researchRunId];
   if (input.command === "paper:options:discover") {
     const underlying = String(input.underlying ?? "").trim().toUpperCase();
     if (!/^[A-Z][A-Z.]{0,14}$/.test(underlying)) {
@@ -2246,7 +2284,7 @@ export const runPostgresReviewWorkflow = async (input: {
     if (!Number.isSafeInteger(input.dte) || input.dte! < 0 || input.dte! > 730) {
       throw new Error("POSTGRES_OPTION_DISCOVERY_DTE_INVALID");
     }
-    sourceValues = [underlying, now.toISOString(), input.dte!];
+    sourceValues = [researchRunId, underlying, now.toISOString(), input.dte!];
   }
   const rows = (await input.query.query(
     entrySourceSql(input.command, maxCandidates),
@@ -2266,6 +2304,10 @@ export const runPostgresReviewWorkflow = async (input: {
     leapsSizing: LeapsEntrySizingResult | null;
     laneDecision: OptionLaneDecision | null;
     canonicalLane: CanonicalOptionLane | null;
+    clientOrderId: string;
+    reviewId: string;
+    intentId: string;
+    portfolioStatePacket: PortfolioStatePacket;
   }> = [];
   const blockedRows: Array<{ row: ReviewSourceRow; reason: string }> = [];
   const capacityRows: Array<{
@@ -2365,13 +2407,95 @@ export const runPostgresReviewWorkflow = async (input: {
       capacityRows.push({ row, reason: "POSTGRES_REVIEW_SHORT_CAPACITY_INSUFFICIENT" });
       continue;
     }
+    const orderSymbol = String(row.option_symbol ?? row.symbol).toUpperCase();
+    const clientOrderPrefix = canonicalLane === "options_leaps"
+      ? "pg-leaps-"
+      : canonicalLane === "options_0dte"
+        ? "pg-0dte-"
+        : "pg-";
+    const clientOrderId = `${clientOrderPrefix}${canonicalJsonHash({
+      account: row.account_id,
+      candidate: row.candidate_id,
+      snapshot: row.account_snapshot_id
+    }).slice(0, 32)}`;
+    const basePacket = row.portfolio_state_packet as PortfolioStatePacket | null;
+    if (!basePacket || typeof basePacket !== "object") {
+      blockedRows.push({
+        row,
+        reason: "PORTFOLIO_STATE_PACKET_MISSING"
+      });
+      continue;
+    }
+    const reviewId = `review_${canonicalJsonHash({
+      accountId: row.account_id,
+      candidateId: row.candidate_id,
+      accountSnapshotId: row.account_snapshot_id,
+      clientOrderId,
+      basePacketFingerprint: basePacket.packetFingerprint
+    })}`;
+    const intentId = `intent_${canonicalJsonHash({
+      reviewId,
+      clientOrderId,
+      candidateId: row.candidate_id
+    })}`;
+    let portfolioStatePacket: PortfolioStatePacket;
+    try {
+      portfolioStatePacket = scopePostgresPortfolioStatePacket({
+        basePacket,
+        proposedContractIdentifier: row.asset_class === "option"
+          ? orderSymbol
+          : null,
+        marketEvidenceId: `market_evidence_${canonicalJsonHash({
+          candidateId: row.candidate_id,
+          symbol: orderSymbol,
+          timestamp: evidence.marketTimestamp,
+          requestId: row.market_request_id,
+          evidence: row.market_evidence
+        })}`,
+        candidateId: row.candidate_id,
+        strategyReviewId: reviewId,
+        executionIntentId: intentId
+      });
+    } catch (error) {
+      blockedRows.push({
+        row,
+        reason: error instanceof Error
+          ? error.message.split(":", 1)[0]!
+          : "PORTFOLIO_STATE_PACKET_INVALID"
+      });
+      continue;
+    }
+    const packetValidation = validatePostgresPortfolioStatePacket({
+      packet: portfolioStatePacket,
+      now: now.toISOString(),
+      expectedAccountId: String(row.broker_account_id),
+      expectedCandidateId: row.candidate_id,
+      expectedContractIdentifier: row.asset_class === "option"
+        ? orderSymbol
+        : null,
+      expectedStructuralPortfolioFingerprint: row.structural_fingerprint,
+      requiredCapital: amount,
+      requireMarketOpen: true,
+      requireOpra: row.asset_class === "option"
+    });
+    if (!packetValidation.valid) {
+      blockedRows.push({
+        row,
+        reason: packetValidation.blockers[0] ?? "PORTFOLIO_STATE_PACKET_INVALID"
+      });
+      continue;
+    }
     eligibleRows.push({
       row,
       amount,
       evidence,
       leapsSizing,
       laneDecision,
-      canonicalLane
+      canonicalLane,
+      clientOrderId,
+      reviewId,
+      intentId,
+      portfolioStatePacket
     });
   }
   for (const { row, reason } of blockedRows) {
@@ -2501,6 +2625,10 @@ export const runPostgresReviewWorkflow = async (input: {
     leapsSizing: LeapsEntrySizingResult | null;
     laneDecision: OptionLaneDecision | null;
     canonicalLane: CanonicalOptionLane | null;
+    clientOrderId: string;
+    reviewId: string;
+    intentId: string;
+    portfolioStatePacket: PortfolioStatePacket;
     arbitrationDecision: (typeof arbitration.decisions)[number];
   }> = [];
   for (const eligible of eligibleRows) {
@@ -2573,7 +2701,11 @@ export const runPostgresReviewWorkflow = async (input: {
     leapsSizing,
     laneDecision,
     canonicalLane,
-    arbitrationDecision
+    arbitrationDecision,
+    clientOrderId,
+    reviewId,
+    intentId,
+    portfolioStatePacket
   } of downstreamRows) {
     const { marketTimestamp, price, underlyingSip } = evidence;
     const option = row.asset_class === "option";
@@ -2621,7 +2753,6 @@ export const runPostgresReviewWorkflow = async (input: {
       ? price * (quantity ?? 0)
       : optionPositionCost ?? amount;
     const orderSymbol = row.option_symbol ?? row.symbol;
-    const clientOrderId = `pg-${canonicalJsonHash({ account: row.account_id, candidate: row.candidate_id, snapshot: row.account_snapshot_id }).slice(0, 32)}`;
     const marketEvidence = [{
       ...(option ? authoritativeOptionEvidence(row) : jsonRecord(row.market_evidence)),
       symbol: orderSymbol,
@@ -2678,11 +2809,11 @@ export const runPostgresReviewWorkflow = async (input: {
       candidateId: row.candidate_id, accountSnapshotId: row.account_snapshot_id,
       accountFingerprint: row.structural_fingerprint, orderIntent, marketEvidence,
       portfolioArbitration,
+      portfolioStatePacket,
       paperOnly: true
     };
     const payloadFingerprint = canonicalJsonHash(payload);
     const configFingerprint = canonicalJsonHash(configuration);
-    const reviewId = `review_${payloadFingerprint}`;
     const signature = createHmac("sha256", signingKey).update(payloadFingerprint).digest("hex");
     const expiresAt = new Date(now.getTime() + 15 * 60_000).toISOString();
     const review = await input.query.query(
@@ -2704,12 +2835,16 @@ export const runPostgresReviewWorkflow = async (input: {
           snapshotId: row.account_snapshot_id,
           portfolioFingerprint: row.snapshot_fingerprint,
           structuralPortfolioFingerprint: row.structural_fingerprint,
-          portfolioArbitration
+          portfolioArbitration,
+          portfolioStatePacket
         }), expiresAt, now.toISOString(), ...fenceValues(input.fence)]
     );
     if (review.rowCount !== 1 && review.rowCount !== 0) throw new Error("POSTGRES_REVIEW_PERSISTENCE_FAILED");
-    const intentFingerprint = canonicalJsonHash({ reviewId, orderIntent });
-    const intentId = `intent_${intentFingerprint}`;
+    const intentFingerprint = canonicalJsonHash({
+      reviewId,
+      orderIntent,
+      portfolioStatePacketFingerprint: portfolioStatePacket.packetFingerprint
+    });
     const intentResult = await input.query.query(
       `INSERT INTO order_intents(
          id, account_id, candidate_id, execution_review_id, environment,
@@ -2733,7 +2868,7 @@ export const runPostgresReviewWorkflow = async (input: {
         option || shortEquity ? null : amount,
         option ? price : null, optionPositionCost,
         effectiveRisk, intentFingerprint, canonicalJsonHash({ status: "created", at: now.toISOString() }),
-        JSON.stringify(orderIntent), now.toISOString(), operation,
+        JSON.stringify({ orderIntent, portfolioStatePacket }), now.toISOString(), operation,
         strategyClassification, option ? String(row.contract_id) : null,
         row.account_snapshot_id,
         process.env.AUTONOMOUS_CYCLE_ID?.trim() || input.fence.runId,

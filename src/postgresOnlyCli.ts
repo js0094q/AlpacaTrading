@@ -67,7 +67,10 @@ import {
   runAutonomousPostgresPaperOrderCancellation,
   runPostgresPaperOrderCancellation
 } from "./services/postgresOrderCancellationService.js";
-import { runPostgresResearchWorkflow } from "./services/postgresResearchWorkflowService.js";
+import {
+  resolvePostgresResearchLaneRequest,
+  runPostgresResearchWorkflow
+} from "./services/postgresResearchWorkflowService.js";
 import { refreshPostgresSelectedCandidateEvidence } from "./services/postgresSelectedEvidenceRefreshService.js";
 import { importResearchSignals } from "./repositories/postgres/postgresResearchSignalRepository.js";
 import { readBoundedResearchImportJson } from "./services/researchImportInputService.js";
@@ -525,6 +528,14 @@ const run = async (scheduledContext?: PostgresScheduledCommandOperationContext) 
       ? String(args.riskProfile) as "aggressive" | "moderate" | "conservative"
       : "moderate";
     const maxCandidates = Math.max(1, Math.min(25, Number.parseInt(String(args.maxCandidates || "10"), 10) || 10));
+    const requestedLaneValue = String(args.lane || "").trim();
+    const { requestedLane, optionsEnabled } = resolvePostgresResearchLaneRequest({
+      stage: String(args.stage || "").trim(),
+      lane: requestedLaneValue,
+      explicitOptionsEnabled: ["true", "1"].includes(
+        String(args.optionsEnabled).toLowerCase()
+      )
+    });
     await alpacaDataHub.start();
     try {
       const [result] = await Promise.all([
@@ -532,7 +543,8 @@ const run = async (scheduledContext?: PostgresScheduledCommandOperationContext) 
           query: researchQuery,
           fence: context.fence,
           riskProfile,
-          optionsEnabled: ["true", "1"].includes(String(args.optionsEnabled).toLowerCase()),
+          optionsEnabled,
+          requestedLane,
           maxCandidates,
           signal: context.signal,
           emitTelemetry: emitRuntimeTelemetry
@@ -555,6 +567,7 @@ const run = async (scheduledContext?: PostgresScheduledCommandOperationContext) 
     const result = await refreshPostgresSelectedCandidateEvidence({
       query: queryAdapter(context.pool),
       fence: context.fence,
+      researchRunId: String(args.researchRunId || "").trim() || undefined,
       maxCandidates,
       signal: context.signal,
       emitTelemetry: emitRuntimeTelemetry
@@ -584,6 +597,7 @@ const run = async (scheduledContext?: PostgresScheduledCommandOperationContext) 
       command,
       query: queryAdapter(context.pool),
       fence: context.fence,
+      researchRunId: String(args.researchRunId || "").trim() || undefined,
       maxCandidates,
       ...(command === "paper:options:discover"
         ? {

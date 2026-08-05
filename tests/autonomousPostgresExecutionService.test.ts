@@ -9,6 +9,96 @@ import {
   validateAutonomousExecutionEvidence,
   type AutonomousExecutionIntentRow
 } from "../src/services/autonomousPostgresExecutionService.js";
+import {
+  portfolioStatePacketFingerprint,
+  type PortfolioStatePacket
+} from "../src/services/postgresPortfolioStatePacketService.js";
+
+const executionPortfolioPacket = (input: {
+  candidateId: string | null;
+  reviewId: string | null;
+  intentId: string | null;
+  contractIdentifier?: string | null;
+  accountId?: string;
+  generatedAt?: string;
+  validUntil?: string;
+}): PortfolioStatePacket => {
+  const generatedAt = input.generatedAt ?? "2026-07-20T21:59:50.000Z";
+  const packet: PortfolioStatePacket = {
+    schemaVersion: "portfolio-state-v1",
+    packetId: `psp-${input.intentId ?? "current"}`,
+    packetFingerprint: "",
+    generatedAt,
+    validUntil: input.validUntil ?? "2026-07-20T22:01:50.000Z",
+    authority: {
+      environment: "paper",
+      paperOnly: true,
+      postgresOnly: true,
+      sqliteRuntimeRole: "none",
+      authenticatedBrokerReads: true,
+      opraRequired: true,
+      opraAvailable: true
+    },
+    account: {
+      accountId: input.accountId ?? "broker-account-1",
+      equity: 20_000,
+      cash: 10_000,
+      buyingPower: 20_000,
+      optionsBuyingPower: 10_000,
+      reservedCapital: 0,
+      availableValidatedCapital: 10_000,
+      observedAt: generatedAt,
+      reconciledAt: generatedAt
+    },
+    positions: [],
+    orders: {
+      open: [],
+      recent: [],
+      duplicateHeldContract: false,
+      duplicateOpenOrder: false
+    },
+    risk: {
+      grossExposure: 0,
+      netExposure: 0,
+      directEquityExposure: 0,
+      directOptionPremiumExposure: 0,
+      etfLookThroughExposure: null,
+      etfLookThroughStatus: "unavailable",
+      strategyCapitalAllocation: { baseline: 5_000 },
+      existingLeapsExposure: 0,
+      existingZeroDteExposure: 0,
+      concentrationLimitStatus: "pass",
+      concentrationLimitPct: 10,
+      observedConcentrationPct: 0,
+      capitalAvailableForProposedTrade: 10_000,
+      eventRestrictionStatus: "unavailable",
+      eventRestrictionReasons: [],
+      marketOpen: true,
+      marketClockTimestamp: generatedAt
+    },
+    proposedTrade: {
+      contractIdentifier: input.contractIdentifier ?? null
+    },
+    reconciliation: {
+      status: "matched",
+      positionsMatched: true,
+      openOrdersMatched: true,
+      recentStrategyOrdersMatched: true,
+      brokerStructuralPortfolioFingerprint: "structural-fingerprint",
+      reconciledStructuralPortfolioFingerprint: "structural-fingerprint"
+    },
+    lineage: {
+      marketEvidenceId: input.candidateId ? "market-evidence-1" : null,
+      candidateId: input.candidateId,
+      strategyReviewId: input.reviewId,
+      executionIntentId: input.intentId,
+      accountSnapshotId: "snapshot-1",
+      structuralPortfolioFingerprint: "structural-fingerprint"
+    }
+  };
+  packet.packetFingerprint = portfolioStatePacketFingerprint(packet);
+  return packet;
+};
 
 const intent = (
   overrides: Partial<AutonomousExecutionIntentRow> = {}
@@ -23,6 +113,7 @@ const intent = (
     reservation_id: "reservation-1",
     execution_review_id: "review-1",
     review_type: "entry",
+    max_risk: "200",
     confirmation_evidence_id: "confirmation-1",
     client_order_id: "worker-order-1",
     strategy_key: "baseline",
@@ -52,6 +143,19 @@ const intent = (
     }],
     ...overrides
   };
+  const reviewPortfolioStatePacket = executionPortfolioPacket({
+    candidateId: row.candidate_id,
+    reviewId: row.execution_review_id,
+    intentId: row.order_intent_id,
+    contractIdentifier: row.asset_class === "option" ? row.symbol : null,
+    accountId: row.broker_account_id ?? "broker-account-1"
+  });
+  const currentPortfolioStatePacket = executionPortfolioPacket({
+    candidateId: null,
+    reviewId: null,
+    intentId: null,
+    accountId: row.broker_account_id ?? "broker-account-1"
+  });
   return {
     ...row,
     review_client_order_id:
@@ -74,7 +178,60 @@ const intent = (
             notional: row.notional,
             limitPrice: row.limit_price,
             stopPrice: row.stop_price
-          }
+          },
+    review_portfolio_state_packet:
+      Object.prototype.hasOwnProperty.call(overrides, "review_portfolio_state_packet")
+        ? overrides.review_portfolio_state_packet
+        : reviewPortfolioStatePacket,
+    intent_portfolio_state_packet:
+      Object.prototype.hasOwnProperty.call(overrides, "intent_portfolio_state_packet")
+        ? overrides.intent_portfolio_state_packet
+        : reviewPortfolioStatePacket,
+    current_portfolio_state_packet:
+      Object.prototype.hasOwnProperty.call(overrides, "current_portfolio_state_packet")
+        ? overrides.current_portfolio_state_packet
+        : currentPortfolioStatePacket
+  };
+};
+
+const confirmableIntent = (
+  overrides: Record<string, unknown> = {}
+): Record<string, unknown> => {
+  const row = {
+    order_intent_id: "intent-created",
+    candidate_id: "candidate-1",
+    account_id: "account-1",
+    broker_account_id: "broker-account-1",
+    account_snapshot_id: "snapshot-1",
+    authorization_snapshot_id: "snapshot-1",
+    review_account_fingerprint: "structural-fingerprint",
+    strategy_key: "baseline",
+    symbol: "AAPL",
+    asset_class: "equity",
+    side: "buy",
+    max_risk: "100",
+    execution_review_id: "review-1",
+    review_type: "entry",
+    review_payload_fingerprint: "review-payload",
+    review_signature: "review-signature",
+    review_expires_at: "2026-07-20T22:15:00.000Z",
+    ...overrides
+  };
+  const reviewedPacket = executionPortfolioPacket({
+    candidateId: String(row.candidate_id),
+    reviewId: String(row.execution_review_id),
+    intentId: String(row.order_intent_id)
+  });
+  const currentPacket = executionPortfolioPacket({
+    candidateId: null,
+    reviewId: null,
+    intentId: null
+  });
+  return {
+    ...row,
+    review_portfolio_state_packet: reviewedPacket,
+    intent_portfolio_state_packet: reviewedPacket,
+    current_portfolio_state_packet: currentPacket
   };
 };
 
@@ -234,6 +391,110 @@ test("the execution gate still rejects material portfolio structure changes", ()
   );
 });
 
+test("the execution packet gate fails closed for missing, mismatched, stale, duplicate, underfunded, and unreconciled state", () => {
+  const reviewPacket = executionPortfolioPacket({
+    candidateId: "candidate-1",
+    reviewId: "review-1",
+    intentId: "intent-1"
+  });
+  const changedIntentPacket = structuredClone(reviewPacket);
+  changedIntentPacket.packetId = "psp-intent-mismatch";
+  changedIntentPacket.packetFingerprint = portfolioStatePacketFingerprint(changedIntentPacket);
+  const stalePacket = structuredClone(reviewPacket);
+  stalePacket.generatedAt = "2026-07-20T21:50:00.000Z";
+  stalePacket.validUntil = "2026-07-20T21:52:00.000Z";
+  stalePacket.account.observedAt = "2026-07-20T21:50:00.000Z";
+  stalePacket.account.reconciledAt = "2026-07-20T21:50:00.000Z";
+  stalePacket.risk.marketClockTimestamp = "2026-07-20T21:50:00.000Z";
+  stalePacket.packetFingerprint = portfolioStatePacketFingerprint(stalePacket);
+  const duplicatePacket = structuredClone(reviewPacket);
+  duplicatePacket.orders.duplicateHeldContract = true;
+  duplicatePacket.packetFingerprint = portfolioStatePacketFingerprint(duplicatePacket);
+  const underfundedPacket = structuredClone(reviewPacket);
+  underfundedPacket.account.availableValidatedCapital = 100;
+  underfundedPacket.risk.capitalAvailableForProposedTrade = 100;
+  underfundedPacket.packetFingerprint = portfolioStatePacketFingerprint(underfundedPacket);
+  const underfundedCurrentPacket = executionPortfolioPacket({
+    candidateId: null,
+    reviewId: null,
+    intentId: null
+  });
+  underfundedCurrentPacket.account.availableValidatedCapital = 100;
+  underfundedCurrentPacket.risk.capitalAvailableForProposedTrade = 100;
+  underfundedCurrentPacket.packetFingerprint = portfolioStatePacketFingerprint(
+    underfundedCurrentPacket
+  );
+  const unreconciledCurrentPacket = executionPortfolioPacket({
+    candidateId: null,
+    reviewId: null,
+    intentId: null
+  });
+  unreconciledCurrentPacket.reconciliation.status = "mismatched";
+  unreconciledCurrentPacket.reconciliation.openOrdersMatched = false;
+  unreconciledCurrentPacket.packetFingerprint = portfolioStatePacketFingerprint(
+    unreconciledCurrentPacket
+  );
+
+  const cases: Array<{
+    row: AutonomousExecutionIntentRow;
+    code: RegExp;
+  }> = [
+    {
+      row: intent({ review_portfolio_state_packet: null }),
+      code: /PORTFOLIO_STATE_PACKET_MISSING/
+    },
+    {
+      row: intent({ intent_portfolio_state_packet: changedIntentPacket }),
+      code: /PORTFOLIO_STATE_PACKET_MISMATCH/
+    },
+    {
+      row: intent({
+        review_portfolio_state_packet: stalePacket,
+        intent_portfolio_state_packet: stalePacket
+      }),
+      code: /PORTFOLIO_STATE_STALE/
+    },
+    {
+      row: intent({
+        review_portfolio_state_packet: duplicatePacket,
+        intent_portfolio_state_packet: duplicatePacket
+      }),
+      code: /PORTFOLIO_STATE_DUPLICATE_HELD_CONTRACT/
+    },
+    {
+      row: intent({
+        review_portfolio_state_packet: underfundedPacket,
+        intent_portfolio_state_packet: underfundedPacket,
+        max_risk: "200"
+      }),
+      code: /PORTFOLIO_STATE_CAPITAL_UNAVAILABLE/
+    },
+    {
+      row: intent({
+        current_portfolio_state_packet: underfundedCurrentPacket,
+        max_risk: "200"
+      }),
+      code: /PORTFOLIO_STATE_CAPITAL_UNAVAILABLE/
+    },
+    {
+      row: intent({ current_portfolio_state_packet: unreconciledCurrentPacket }),
+      code: /PORTFOLIO_STATE_RECONCILIATION_MISMATCH/
+    }
+  ];
+
+  for (const testCase of cases) {
+    assert.throws(
+      () => validateAutonomousExecutionEvidence(
+        testCase.row,
+        broker,
+        new Date("2026-07-20T22:00:00.000Z"),
+        60
+      ),
+      testCase.code
+    );
+  }
+});
+
 test("the execution gate accepts complete fresh paper evidence without synthesizing fields", () => {
   const payload = validateAutonomousExecutionEvidence(
     intent(),
@@ -386,9 +647,30 @@ test("the option execution gate uses the stricter configured freshness boundary"
     new Date("2026-07-20T22:00:00.000Z"),
     1_800
   ));
+  const reviewedPacket = executionPortfolioPacket({
+    candidateId: optionIntent.candidate_id,
+    reviewId: optionIntent.execution_review_id,
+    intentId: optionIntent.order_intent_id,
+    contractIdentifier: optionIntent.symbol,
+    generatedAt: "2026-07-20T22:10:50.000Z",
+    validUntil: "2026-07-20T22:12:50.000Z"
+  });
+  const currentPacket = executionPortfolioPacket({
+    candidateId: null,
+    reviewId: null,
+    intentId: null,
+    generatedAt: "2026-07-20T22:10:50.000Z",
+    validUntil: "2026-07-20T22:12:50.000Z"
+  });
+  const packetFreshIntent = {
+    ...optionIntent,
+    review_portfolio_state_packet: reviewedPacket,
+    intent_portfolio_state_packet: reviewedPacket,
+    current_portfolio_state_packet: currentPacket
+  };
   assert.throws(
     () => validateAutonomousExecutionEvidence(
-      optionIntent,
+      packetFreshIntent,
       broker,
       new Date("2026-07-20T22:11:00.000Z"),
       1_800
@@ -645,22 +927,7 @@ test("confirmation promotion atomically readies an entry intent with a buying-po
         values.push(parameters ?? []);
         if (sql.includes("intent.status = 'created'")) {
           return {
-            rows: [{
-              order_intent_id: "intent-created",
-              candidate_id: "candidate-1",
-              account_id: "account-1",
-              account_snapshot_id: "snapshot-1",
-              strategy_key: "baseline",
-              symbol: "AAPL",
-              asset_class: "equity",
-              side: "buy",
-              max_risk: "100",
-              execution_review_id: "review-1",
-              review_type: "entry",
-              review_payload_fingerprint: "review-payload",
-              review_signature: "review-signature",
-              review_expires_at: "2026-07-20T22:15:00.000Z"
-            }],
+            rows: [confirmableIntent()],
             rowCount: 1
           };
         }
@@ -707,6 +974,48 @@ test("confirmation promotion atomically readies an entry intent with a buying-po
   assert.equal(values[confirmationInsert]?.[5], "autonomous_worker_confirm_paper");
 });
 
+test("confirmation promotion rejects a missing portfolio packet before reserving capital", async () => {
+  const statements: string[] = [];
+  await assert.rejects(
+    () => promoteNextConfirmedPostgresIntent({
+      command: "paper:execute:reviewed",
+      query: {
+        query: async (sql: string) => {
+          statements.push(sql);
+          if (sql.includes("intent.status = 'created'")) {
+            return {
+              rows: [{
+                ...confirmableIntent(),
+                review_portfolio_state_packet: null
+              }],
+              rowCount: 1
+            };
+          }
+          return { rows: [], rowCount: 1 };
+        }
+      },
+      fence: {
+        jobName: "paper-execution",
+        workstream: "paper_execution",
+        ownerId: "owner",
+        runId: "run",
+        fencingToken: "10"
+      },
+      signingKey: "test-signing-key-with-sufficient-length",
+      now: new Date("2026-07-20T22:00:00.000Z")
+    }),
+    /PORTFOLIO_STATE_PACKET_MISSING/
+  );
+  assert.equal(
+    statements.some((sql) => sql.includes("INSERT INTO confirmation_evidence")),
+    false
+  );
+  assert.equal(
+    statements.some((sql) => sql.includes("INSERT INTO buying_power_reservations")),
+    false
+  );
+});
+
 test("paper execution promotes a confirmed created intent before broker submission", async () => {
   let countReads = 0;
   let countSql = "";
@@ -731,22 +1040,7 @@ test("paper execution promotes a confirmed created intent before broker submissi
         transactionStatements.push(sql);
         if (sql.includes("intent.status = 'created'")) {
           return {
-            rows: [{
-              order_intent_id: "intent-created",
-              candidate_id: "candidate-1",
-              account_id: "account-1",
-              account_snapshot_id: "snapshot-1",
-              strategy_key: "baseline",
-              symbol: "AAPL",
-              asset_class: "equity",
-              side: "buy",
-              max_risk: "100",
-              execution_review_id: "review-1",
-              review_type: "entry",
-              review_payload_fingerprint: "review-payload",
-              review_signature: "review-signature",
-              review_expires_at: "2026-07-20T22:15:00.000Z"
-            }],
+            rows: [confirmableIntent()],
             rowCount: 1
           };
         }
@@ -843,22 +1137,7 @@ test("paper execution persists one captured broker snapshot before promotion and
         if (sql.includes("intent.status = 'created'")) {
           sequence.push("promotion");
           return {
-            rows: [{
-              order_intent_id: "intent-created",
-              candidate_id: "candidate-1",
-              account_id: "account-1",
-              account_snapshot_id: "snapshot-1",
-              strategy_key: "baseline",
-              symbol: "AAPL",
-              asset_class: "equity",
-              side: "buy",
-              max_risk: "100",
-              execution_review_id: "review-1",
-              review_type: "entry",
-              review_payload_fingerprint: "review-payload",
-              review_signature: "review-signature",
-              review_expires_at: "2026-07-20T22:15:00.000Z"
-            }],
+            rows: [confirmableIntent()],
             rowCount: 1
           };
         }

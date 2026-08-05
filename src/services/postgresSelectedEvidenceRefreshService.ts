@@ -24,22 +24,30 @@ const dependencies: SelectedEvidenceRefreshDependencies = {
   refreshMarketData: refreshPostgresMarketData
 };
 
-const SELECTED_OPTION_UNDERLYINGS_SQL = `WITH latest_research AS (
+const SELECTED_OPTION_UNDERLYINGS_SQL = `WITH selected_research AS (
   SELECT id
   FROM research_runs
   WHERE status = 'completed'
+    AND ($1::text IS NULL OR id = $1)
   ORDER BY completed_at DESC, id DESC
   LIMIT 1
 )
 SELECT candidate.symbol, candidate.option_symbol
 FROM candidates candidate
-JOIN latest_research research ON research.id = candidate.research_run_id
+JOIN selected_research research ON research.id = candidate.research_run_id
 WHERE candidate.decision = 'selected'
-  AND candidate.lifecycle_status = 'selected'
+  AND (
+    candidate.lifecycle_status = 'selected'
+    OR (
+      $1::text IS NOT NULL
+      AND candidate.lifecycle_status = 'blocked'
+      AND candidate.decision_reason LIKE 'POSTGRES_REVIEW_MARKET_EVIDENCE_STALE:%'
+    )
+  )
   AND candidate.asset_class = 'option'
   AND candidate.option_symbol IS NOT NULL
 ORDER BY candidate.rank, candidate.id
-LIMIT $1`;
+LIMIT $2`;
 
 const normalizedSymbol = (value: unknown) =>
   String(value ?? "").trim().toUpperCase();
@@ -48,6 +56,7 @@ export const refreshPostgresSelectedCandidateEvidence = async (input: {
   query: PostgresSelectedEvidenceRefreshQuery;
   fence: SchedulerFence;
   now?: Date;
+  researchRunId?: string;
   maxCandidates?: number;
   maxQuoteAgeMs?: number;
   clock?: () => Date;
@@ -56,6 +65,10 @@ export const refreshPostgresSelectedCandidateEvidence = async (input: {
   dependencies?: Partial<SelectedEvidenceRefreshDependencies>;
 }) => {
   const now = input.now ?? new Date();
+  const researchRunId = String(input.researchRunId ?? "").trim() || null;
+  if (researchRunId && researchRunId.length > 200) {
+    throw new Error("POSTGRES_SELECTED_EVIDENCE_RESEARCH_RUN_ID_INVALID");
+  }
   const maxCandidates = Math.max(
     1,
     Math.min(
@@ -65,7 +78,7 @@ export const refreshPostgresSelectedCandidateEvidence = async (input: {
   );
   const selected = (await input.query.query(
     SELECTED_OPTION_UNDERLYINGS_SQL,
-    [maxCandidates]
+    [researchRunId, maxCandidates]
   )).rows;
   const optionSymbols = Array.from(new Set(
     selected

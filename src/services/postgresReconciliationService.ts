@@ -16,6 +16,11 @@ import {
   capturePostgresAuthorityBrokerSnapshot,
   type PostgresAuthorityBrokerSnapshot
 } from "./postgresAuthorityBrokerSnapshot.js";
+import {
+  buildPostgresPortfolioStatePacket,
+  validatePostgresPortfolioStatePacket,
+  type PortfolioStateStrategyFamily
+} from "./postgresPortfolioStatePacketService.js";
 
 type ReconciliationQuery = {
   query: (sql: string, values?: readonly unknown[]) => Promise<{
@@ -65,6 +70,23 @@ const required = (value: unknown, code: string) => {
 const optional = (value: unknown) => value === null || value === undefined || value === ""
   ? null
   : String(value);
+const finiteNumber = (value: unknown, code: string) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) throw new Error(code);
+  return parsed;
+};
+const packetStrategyFamily = (
+  value: unknown,
+  assetClass: unknown
+): PortfolioStateStrategyFamily => {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (normalized.includes("leaps")) return "leaps";
+  if (normalized.includes("zero_dte") || normalized.includes("0dte")) {
+    return "zero_dte";
+  }
+  if (String(assetClass ?? "").trim().toLowerCase() === "equity") return "equity";
+  return "external_or_unattributed";
+};
 
 const targetsSql = `SELECT intent.id AS order_intent_id, intent.candidate_id,
        intent.account_id,
@@ -164,10 +186,13 @@ const syncBrokerAccountAndPositions = async (input: {
   })}`;
   const evidence = {
     source: "alpaca_paper_api",
+    accountId: snapshot.accountId ?? null,
+    sourceRequestIds: snapshot.sourceRequestIds ?? null,
     configurationFingerprint: snapshot.configurationFingerprint,
     structuralPortfolioFingerprint: snapshot.structuralPortfolioFingerprint,
     portfolioFingerprint: snapshot.portfolioFingerprint,
     brokerOpenOrderCount: snapshot.orders.length,
+    brokerRecentOrderCount: snapshot.recentOrders?.length ?? 0,
     brokerPositionCount: snapshot.positions.length,
     reconciledAt: snapshot.capturedAt
   };
@@ -410,6 +435,285 @@ const syncBrokerAccountAndPositions = async (input: {
       throw new Error("POSTGRES_RECONCILIATION_POSITION_PERSISTENCE_FAILED");
     }
     positionsUpserted += 1;
+  }
+
+  const positionLineageResult = await input.query.query(
+    `SELECT position.broker_position_key, position.asset_class,
+            candidate.strategy_family
+     FROM positions position
+     LEFT JOIN candidates candidate ON candidate.id = position.candidate_id
+     WHERE position.account_id = $1 AND position.status IN ('open', 'closing')`,
+    [accountId]
+  );
+  const positionLineage = Object.fromEntries(
+    positionLineageResult.rows.map((row) => [
+      required(
+        row.broker_position_key,
+        "POSTGRES_RECONCILIATION_POSITION_LINEAGE_KEY_MISSING"
+      ),
+      packetStrategyFamily(row.strategy_family, row.asset_class)
+    ])
+  );
+  const reservationResult = await input.query.query(
+    `SELECT COALESCE(SUM(amount), 0)::text AS reserved_capital
+     FROM buying_power_reservations
+     WHERE account_id = $1 AND status IN ('active', 'committed')
+       AND (status = 'committed' OR expires_at > $2::timestamptz)`,
+    [accountId, snapshot.capturedAt]
+  );
+  const reservedCapital = finiteNumber(
+    reservationResult.rows[0]?.reserved_capital ?? 0,
+    "POSTGRES_RECONCILIATION_RESERVED_CAPITAL_INVALID"
+  );
+  if (reservedCapital < 0) {
+    throw new Error("POSTGRES_RECONCILIATION_RESERVED_CAPITAL_INVALID");
+  }
+  const allocationResult = await input.query.query(
+    `SELECT strategy_key,
+            COALESCE(
+              allocation_amount,
+              $2::numeric * allocation_ratio,
+              0
+            )::text AS capital_allocation
+     FROM strategy_allocations
+     WHERE account_id = $1 AND status = 'active'
+       AND effective_from <= $3::timestamptz
+       AND (effective_to IS NULL OR effective_to > $3::timestamptz)
+     ORDER BY strategy_key`,
+    [accountId, snapshot.account.equity, snapshot.capturedAt]
+  );
+  const strategyCapitalAllocation = Object.fromEntries(
+    allocationResult.rows.map((row) => [
+      required(
+        row.strategy_key,
+        "POSTGRES_RECONCILIATION_STRATEGY_ALLOCATION_KEY_MISSING"
+      ),
+      finiteNumber(
+        row.capital_allocation,
+        "POSTGRES_RECONCILIATION_STRATEGY_ALLOCATION_INVALID"
+      )
+    ])
+  );
+  const orderReconciliationResult = await input.query.query(
+    `WITH observed AS (
+       SELECT * FROM jsonb_to_recordset($2::jsonb) AS broker_order(
+         broker_order_id text, client_order_id text
+       )
+     )
+     SELECT COUNT(*)::text AS observed_count,
+            COUNT(*) FILTER (WHERE
+              EXISTS (
+                SELECT 1 FROM orders authority_order
+                WHERE authority_order.account_id = $1
+                  AND (
+                    authority_order.broker_order_id = observed.broker_order_id
+                    OR authority_order.client_order_id = observed.client_order_id
+                  )
+              )
+              OR EXISTS (
+                SELECT 1 FROM broker_events event
+                WHERE event.account_id = $1
+                  AND event.event_type = 'external_order_observed'
+                  AND event.broker_order_id = observed.broker_order_id
+              )
+            )::text AS matched_count
+     FROM observed`,
+    [
+      accountId,
+      JSON.stringify(snapshot.orders.map((order) => ({
+        broker_order_id: order.brokerOrderId,
+        client_order_id: order.clientOrderId
+      })))
+    ]
+  );
+  const openOrderObservedCount = finiteNumber(
+    orderReconciliationResult.rows[0]?.observed_count ?? 0,
+    "POSTGRES_RECONCILIATION_OPEN_ORDER_COUNT_INVALID"
+  );
+  const openOrderMatchedCount = finiteNumber(
+    orderReconciliationResult.rows[0]?.matched_count ?? 0,
+    "POSTGRES_RECONCILIATION_OPEN_ORDER_MATCH_COUNT_INVALID"
+  );
+  const recentStrategyOrders = (snapshot.recentOrders ?? []).filter((order) =>
+    order.clientOrderId.startsWith("pg-")
+  );
+  const recentOrderReconciliationResult = await input.query.query(
+    `WITH observed AS (
+       SELECT * FROM jsonb_to_recordset($2::jsonb) AS broker_order(
+         broker_order_id text, client_order_id text
+       )
+     )
+     SELECT COUNT(*)::text AS observed_count,
+            COUNT(*) FILTER (WHERE
+              EXISTS (
+                SELECT 1 FROM orders authority_order
+                WHERE authority_order.account_id = $1
+                  AND (
+                    authority_order.broker_order_id = observed.broker_order_id
+                    OR authority_order.client_order_id = observed.client_order_id
+                  )
+              )
+              OR EXISTS (
+                SELECT 1 FROM broker_events event
+                WHERE event.account_id = $1
+                  AND event.broker_order_id = observed.broker_order_id
+              )
+            )::text AS matched_count
+     FROM observed`,
+    [
+      accountId,
+      JSON.stringify(recentStrategyOrders.map((order) => ({
+        broker_order_id: order.brokerOrderId,
+        client_order_id: order.clientOrderId
+      })))
+    ]
+  );
+  const recentOrderObservedCount = finiteNumber(
+    recentOrderReconciliationResult.rows[0]?.observed_count ?? 0,
+    "POSTGRES_RECONCILIATION_RECENT_ORDER_COUNT_INVALID"
+  );
+  const recentOrderMatchedCount = finiteNumber(
+    recentOrderReconciliationResult.rows[0]?.matched_count ?? 0,
+    "POSTGRES_RECONCILIATION_RECENT_ORDER_MATCH_COUNT_INVALID"
+  );
+  const opraResult = await input.query.query(
+    `WITH latest_option_research AS MATERIALIZED (
+       SELECT research.id
+       FROM research_runs research
+       WHERE research.status = 'completed'
+         AND research.options_enabled = true
+         AND research.completed_at <= $1::timestamptz
+       ORDER BY research.completed_at DESC, research.id DESC
+       LIMIT 1
+     ), latest_candidate_option_snapshots AS MATERIALIZED (
+       SELECT candidate.id AS candidate_id,
+              candidate.option_symbol,
+              option_snapshot.evidence_fingerprint,
+              option_snapshot.bid,
+              option_snapshot.ask,
+              option_snapshot.evidence,
+              COALESCE(
+                option_snapshot.quote_timestamp,
+                option_snapshot.snapshot_timestamp,
+                option_snapshot.observed_at
+              ) AS evidence_timestamp
+       FROM latest_option_research research
+       JOIN candidates candidate ON candidate.research_run_id = research.id
+       LEFT JOIN LATERAL (
+         SELECT option_snapshot.*
+         FROM option_snapshots option_snapshot
+         WHERE option_snapshot.option_symbol = candidate.option_symbol
+           AND option_snapshot.observed_at <= $1::timestamptz
+         ORDER BY option_snapshot.observed_at DESC
+         LIMIT 1
+       ) option_snapshot ON true
+       WHERE candidate.decision = 'selected'
+         AND candidate.strategy_family IN (
+           'zero_dte_spy', 'standard_option', 'leaps'
+         )
+     )
+     SELECT COALESCE(BOOL_AND(
+       snapshot.option_symbol IS NOT NULL
+       AND snapshot.evidence_fingerprint IS NOT NULL
+       AND lower(COALESCE(snapshot.evidence->>'requestedFeed', '')) = 'opra'
+       AND lower(COALESCE(snapshot.evidence->>'effectiveFeed', '')) = 'opra'
+       AND snapshot.bid IS NOT NULL AND snapshot.ask IS NOT NULL
+       AND snapshot.bid >= 0 AND snapshot.ask > 0 AND snapshot.bid <= snapshot.ask
+       AND snapshot.evidence_timestamp
+         BETWEEN $1::timestamptz - ($2::numeric * interval '1 second')
+             AND $1::timestamptz
+     ), false) AS opra_available,
+     CASE WHEN COALESCE(BOOL_AND(
+       snapshot.option_symbol IS NOT NULL
+       AND snapshot.evidence_fingerprint IS NOT NULL
+       AND lower(COALESCE(snapshot.evidence->>'requestedFeed', '')) = 'opra'
+       AND lower(COALESCE(snapshot.evidence->>'effectiveFeed', '')) = 'opra'
+       AND snapshot.bid IS NOT NULL AND snapshot.ask IS NOT NULL
+       AND snapshot.bid >= 0 AND snapshot.ask > 0 AND snapshot.bid <= snapshot.ask
+       AND snapshot.evidence_timestamp
+         BETWEEN $1::timestamptz - ($2::numeric * interval '1 second')
+             AND $1::timestamptz
+     ), false) THEN (
+       ARRAY_AGG(
+         snapshot.evidence_fingerprint
+         ORDER BY snapshot.evidence_timestamp DESC
+       )
+     )[1] ELSE NULL END AS opra_evidence_id
+     FROM latest_candidate_option_snapshots snapshot`,
+    [snapshot.capturedAt, snapshot.configuration.quoteMaxAgeSeconds ?? 45]
+  );
+  const requestIds = snapshot.sourceRequestIds ?? {} as PostgresAuthorityBrokerSnapshot["sourceRequestIds"];
+  const authenticatedBrokerReads = [
+    requestIds.account,
+    requestIds.positions,
+    requestIds.openOrders,
+    requestIds.recentOrders,
+    requestIds.marketClock
+  ].every((value) => typeof value === "string" && value.trim().length > 0);
+  const packet = buildPostgresPortfolioStatePacket({
+    now: snapshot.capturedAt,
+    accountId: snapshot.accountId ?? accountId,
+    brokerSnapshot: snapshot,
+    recentOrders: snapshot.recentOrders ?? [],
+    authority: {
+      authenticatedBrokerReads,
+      postgresOnly: true,
+      sqliteRuntimeRole: "none",
+      opraAvailable: opraResult.rows[0]?.opra_available === true
+    },
+    marketClock: snapshot.marketClock ?? {
+      observedAt: snapshot.capturedAt,
+      isOpen: false
+    },
+    reconciledAt: snapshot.capturedAt,
+    reconciledStructuralPortfolioFingerprint: snapshot.structuralPortfolioFingerprint,
+    reservedCapital,
+    proposedContractIdentifier: null,
+    positionLineage,
+    strategyCapitalAllocation,
+    concentrationLimit: {
+      status: "unavailable",
+      limitPct: null,
+      observedPct: null
+    },
+    eventRestrictions: { status: "unavailable", reasons: [] },
+    positionsReconciled: positionsUpserted === snapshot.positions.length,
+    openOrdersReconciled:
+      openOrderObservedCount === snapshot.orders.length &&
+      openOrderMatchedCount === openOrderObservedCount,
+    recentStrategyOrdersReconciled:
+      recentOrderObservedCount === recentStrategyOrders.length &&
+      recentOrderMatchedCount === recentOrderObservedCount,
+    lineage: {
+      marketEvidenceId: optional(opraResult.rows[0]?.opra_evidence_id),
+      candidateId: null,
+      strategyReviewId: null,
+      executionIntentId: null,
+      accountSnapshotId: persistedAccountSnapshotId
+    }
+  });
+  const packetValidation = validatePostgresPortfolioStatePacket({
+    packet,
+    now: snapshot.capturedAt
+  });
+  const packetEvidenceUpdate = await input.query.query(
+    `UPDATE account_snapshots
+     SET evidence = evidence || jsonb_build_object(
+       'portfolioStatePacket', $2::jsonb,
+       'portfolioStatePacketValidation', $3::jsonb,
+       'portfolioStatePacketPersistedAt', $4::text
+     )
+     WHERE id = $1 AND ${fenceSql(5)}`,
+    [
+      persistedAccountSnapshotId,
+      JSON.stringify(packet),
+      JSON.stringify(packetValidation),
+      snapshot.capturedAt,
+      ...fenceValues(input.fence)
+    ]
+  );
+  if (packetEvidenceUpdate.rowCount !== 1) {
+    throw new Error("POSTGRES_RECONCILIATION_PORTFOLIO_PACKET_PERSISTENCE_FAILED");
   }
   return {
     accountId,

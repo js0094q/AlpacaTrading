@@ -1356,6 +1356,18 @@ test("reconciliation synchronizes broker account and positions into PostgreSQL a
         if (sql.includes("FROM order_intents intent")) {
           return { rows: [], rowCount: 0 };
         }
+        if (sql.includes("FROM buying_power_reservations")) {
+          return { rows: [{ reserved_capital: "100" }], rowCount: 1 };
+        }
+        if (sql.includes("FROM strategy_allocations")) {
+          return {
+            rows: [{ strategy_key: "leaps", capital_allocation: "5000" }],
+            rowCount: 1
+          };
+        }
+        if (sql.includes("AS opra_available")) {
+          return { rows: [{ opra_available: true }], rowCount: 1 };
+        }
         return { rows: [], rowCount: 1 };
       }
     },
@@ -1363,7 +1375,15 @@ test("reconciliation synchronizes broker account and positions into PostgreSQL a
     now: new Date("2026-07-20T22:00:00.000Z"),
     captureBrokerSnapshot: async () => ({
       capturedAt: "2026-07-20T22:00:00.000Z",
+      accountId: "paper-account-1",
       accountIdentityHash: "paper-account-hash",
+      sourceRequestIds: {
+        account: "request-account",
+        positions: "request-positions",
+        openOrders: "request-open-orders",
+        recentOrders: "request-recent-orders",
+        marketClock: "request-clock"
+      },
       account: {
         status: "ACTIVE",
         currency: "USD",
@@ -1397,6 +1417,11 @@ test("reconciliation synchronizes broker account and positions into PostgreSQL a
         unrealizedPnl: 2
       }],
       orders: [],
+      recentOrders: [],
+      marketClock: {
+        observedAt: "2026-07-20T21:59:59.000Z",
+        isOpen: true
+      },
       structuralPortfolioFingerprint: "structural-fingerprint",
       portfolioFingerprint: "portfolio-fingerprint"
     }) as never
@@ -1421,6 +1446,32 @@ test("reconciliation synchronizes broker account and positions into PostgreSQL a
   assert.ok(positionInsert);
   assert.equal(positionInsert.values[5], "AAPL");
   assert.equal(positionInsert.values[9], "short");
+  const packetUpdate = statements.find(({ sql }) =>
+    sql.includes("UPDATE account_snapshots") && sql.includes("portfolioStatePacket")
+  );
+  assert.ok(packetUpdate, "the reconciled account snapshot must receive the authoritative packet");
+  const packet = JSON.parse(String(packetUpdate.values[1])) as Record<string, unknown>;
+  assert.equal(packet.schemaVersion, "portfolio-state-v1");
+  assert.equal((packet.authority as Record<string, unknown>).paperOnly, true);
+  assert.equal((packet.authority as Record<string, unknown>).postgresOnly, true);
+  assert.equal((packet.account as Record<string, unknown>).reservedCapital, 100);
+  assert.equal((packet.account as Record<string, unknown>).availableValidatedCapital, 9900);
+  assert.equal((packet.reconciliation as Record<string, unknown>).status, "matched");
+  assert.deepEqual((packet.orders as Record<string, unknown>).open, []);
+  const opraLookup = statements.find(({ sql }) => sql.includes("AS opra_available"));
+  assert.ok(opraLookup, "reconciliation must verify current OPRA evidence");
+  assert.match(opraLookup.sql, /latest_option_research/);
+  assert.match(
+    opraLookup.sql,
+    /option_snapshot\.option_symbol = candidate\.option_symbol/
+  );
+  assert.match(opraLookup.sql, /LEFT JOIN LATERAL/);
+  assert.match(opraLookup.sql, /BOOL_AND/);
+  assert.match(opraLookup.sql, /SELECT option_snapshot\.\*/);
+  assert.doesNotMatch(
+    opraLookup.sql,
+    /FROM option_snapshots snapshot\s+WHERE lower/
+  );
 });
 
 test("duplicate broker snapshots reuse the existing canonical ID for positions", async () => {

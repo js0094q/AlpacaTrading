@@ -23,6 +23,11 @@ import {
   type TradeOperation
 } from "./autonomousTradeLifecycleService.js";
 import type { PostgresAuthorityBrokerSnapshot } from "./postgresAuthorityBrokerSnapshot.js";
+import {
+  portfolioStatePacketFingerprint,
+  validatePostgresPortfolioStatePacket,
+  type PortfolioStatePacket
+} from "./postgresPortfolioStatePacketService.js";
 import { evaluateTradingRuntimeAuthority } from "./tradingRuntimeAuthority.js";
 
 export {
@@ -40,6 +45,9 @@ export type AutonomousExecutionIntentRow = {
   reservation_id: string | null;
   execution_review_id: string;
   review_type: "entry" | "exit";
+  max_risk?: string | null;
+  authorization_snapshot_id?: string | null;
+  current_account_snapshot_id?: string | null;
   confirmation_evidence_id: string;
   review_signature?: string | null;
   payload_fingerprint?: string | null;
@@ -59,6 +67,9 @@ export type AutonomousExecutionIntentRow = {
   stop_price: string | null;
   intent_version: string | number;
   market_evidence: unknown;
+  review_portfolio_state_packet?: unknown;
+  intent_portfolio_state_packet?: unknown;
+  current_portfolio_state_packet?: unknown;
   operation?: TradeOperation | null;
   strategy_classification?: StrategyClassification | null;
   parent_position_id?: string | null;
@@ -177,6 +188,111 @@ const decimalText = (value: unknown) => {
   return `${negative ? "-" : ""}${normalizedWhole}${
     normalizedFraction ? `.${normalizedFraction}` : ""
   }`;
+};
+
+const portfolioStatePacket = (value: unknown): PortfolioStatePacket | null => {
+  if (typeof value === "string") {
+    try {
+      return portfolioStatePacket(JSON.parse(value));
+    } catch {
+      return null;
+    }
+  }
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as PortfolioStatePacket
+    : null;
+};
+
+const executionRequiredCapital = (intent: AutonomousExecutionIntentRow) => {
+  if (intent.review_type !== "entry") return undefined;
+  const explicitRisk = positive(intent.max_risk);
+  if (explicitRisk !== null) return explicitRisk;
+  const notional = positive(intent.notional);
+  if (notional !== null) return notional;
+  const quantity = positive(intent.quantity);
+  const limitPrice = positive(intent.limit_price);
+  if (quantity === null || limitPrice === null) return Number.NaN;
+  return quantity * limitPrice * (intent.asset_class === "option" ? 100 : 1);
+};
+
+const assertPortfolioStateExecutionAuthority = (
+  intent: AutonomousExecutionIntentRow,
+  now: Date
+) => {
+  const reviewPacket = portfolioStatePacket(
+    intent.review_portfolio_state_packet
+  );
+  const intentPacket = portfolioStatePacket(
+    intent.intent_portfolio_state_packet
+  );
+  const currentPacket = portfolioStatePacket(
+    intent.current_portfolio_state_packet
+  );
+  if (!reviewPacket || !intentPacket || !currentPacket) {
+    throw new Error("PORTFOLIO_STATE_PACKET_MISSING");
+  }
+  if (
+    reviewPacket.packetFingerprint !== intentPacket.packetFingerprint ||
+    reviewPacket.packetFingerprint !== portfolioStatePacketFingerprint(reviewPacket) ||
+    intentPacket.packetFingerprint !== portfolioStatePacketFingerprint(intentPacket)
+  ) {
+    throw new Error("PORTFOLIO_STATE_PACKET_MISMATCH");
+  }
+  if (
+    reviewPacket.lineage.candidateId !== intent.candidate_id ||
+    reviewPacket.lineage.strategyReviewId !== intent.execution_review_id ||
+    reviewPacket.lineage.executionIntentId !== intent.order_intent_id ||
+    (
+      intent.authorization_snapshot_id &&
+      reviewPacket.lineage.accountSnapshotId !== intent.authorization_snapshot_id
+    )
+  ) {
+    throw new Error("PORTFOLIO_STATE_LINEAGE_MISMATCH");
+  }
+  if (
+    intent.current_account_snapshot_id &&
+    currentPacket.lineage.accountSnapshotId !== intent.current_account_snapshot_id
+  ) {
+    throw new Error("PORTFOLIO_STATE_RECONCILIATION_MISMATCH");
+  }
+  const expectedContractIdentifier = intent.asset_class === "option"
+    ? intent.symbol
+    : null;
+  const requiredCapital = executionRequiredCapital(intent);
+  const reviewedValidation = validatePostgresPortfolioStatePacket({
+    packet: reviewPacket,
+    now: now.toISOString(),
+    expectedAccountId: intent.broker_account_id,
+    expectedCandidateId: intent.candidate_id ?? undefined,
+    expectedContractIdentifier,
+    expectedStructuralPortfolioFingerprint: intent.review_account_fingerprint,
+    requiredCapital,
+    requireMarketOpen: true,
+    requireOpra: intent.asset_class === "option"
+  });
+  if (!reviewedValidation.valid) {
+    throw new Error(
+      reviewedValidation.blockers[0] ?? "PORTFOLIO_STATE_PACKET_INVALID"
+    );
+  }
+  const currentValidation = validatePostgresPortfolioStatePacket({
+    packet: currentPacket,
+    now: now.toISOString(),
+    expectedAccountId: intent.broker_account_id,
+    expectedStructuralPortfolioFingerprint: intent.review_account_fingerprint,
+    requiredCapital,
+    requireMarketOpen: true,
+    requireOpra: intent.asset_class === "option"
+  });
+  if (!currentValidation.valid) {
+    throw new Error(
+      currentValidation.blockers[0] ?? "PORTFOLIO_STATE_PACKET_INVALID"
+    );
+  }
+  return {
+    reviewPacketFingerprint: reviewPacket.packetFingerprint,
+    currentPacketFingerprint: currentPacket.packetFingerprint
+  };
 };
 
 const assertExactReviewAuthorization = (
@@ -313,6 +429,9 @@ export const validateAutonomousExecutionEvidence = (
   now: Date,
   quoteMaxAgeSeconds: number
 ): AlpacaPaperOrderRequest => {
+  if (intent.review_type === "entry") {
+    assertPortfolioStateExecutionAuthority(intent, now);
+  }
   const brokerAccountIdentity = broker.brokerAccountId ?? broker.accountIdentityHash;
   if (brokerAccountIdentity !== intent.broker_account_id) {
     throw new Error("POSTGRES_BROKER_ACCOUNT_IDENTITY_CONFLICT");
@@ -542,7 +661,10 @@ type ConfirmableIntentRow = {
   order_intent_id: string;
   candidate_id: string | null;
   account_id: string;
+  broker_account_id: string;
   account_snapshot_id: string;
+  authorization_snapshot_id: string | null;
+  review_account_fingerprint: string;
   strategy_key: string;
   symbol: string;
   asset_class: "equity" | "option";
@@ -553,6 +675,85 @@ type ConfirmableIntentRow = {
   review_payload_fingerprint: string;
   review_signature: string;
   review_expires_at: string | Date;
+  review_portfolio_state_packet: unknown;
+  intent_portfolio_state_packet: unknown;
+  current_portfolio_state_packet: unknown;
+};
+
+const assertConfirmablePortfolioStateAuthority = (
+  intent: ConfirmableIntentRow,
+  now: Date
+) => {
+  const reviewPacket = portfolioStatePacket(
+    intent.review_portfolio_state_packet
+  );
+  const intentPacket = portfolioStatePacket(
+    intent.intent_portfolio_state_packet
+  );
+  const currentPacket = portfolioStatePacket(
+    intent.current_portfolio_state_packet
+  );
+  if (!reviewPacket || !intentPacket || !currentPacket) {
+    throw new Error("PORTFOLIO_STATE_PACKET_MISSING");
+  }
+  if (
+    reviewPacket.packetFingerprint !== intentPacket.packetFingerprint ||
+    reviewPacket.packetFingerprint !== portfolioStatePacketFingerprint(reviewPacket) ||
+    intentPacket.packetFingerprint !== portfolioStatePacketFingerprint(intentPacket)
+  ) {
+    throw new Error("PORTFOLIO_STATE_PACKET_MISMATCH");
+  }
+  if (
+    reviewPacket.lineage.candidateId !== intent.candidate_id ||
+    reviewPacket.lineage.strategyReviewId !== intent.execution_review_id ||
+    reviewPacket.lineage.executionIntentId !== intent.order_intent_id ||
+    reviewPacket.lineage.accountSnapshotId !== intent.authorization_snapshot_id
+  ) {
+    throw new Error("PORTFOLIO_STATE_LINEAGE_MISMATCH");
+  }
+  if (currentPacket.lineage.accountSnapshotId !== intent.account_snapshot_id) {
+    throw new Error("PORTFOLIO_STATE_RECONCILIATION_MISMATCH");
+  }
+  const expectedContractIdentifier = intent.asset_class === "option"
+    ? intent.symbol
+    : null;
+  const requiredCapital = intent.review_type === "entry"
+    ? positive(intent.max_risk) ?? Number.NaN
+    : undefined;
+  const reviewedValidation = validatePostgresPortfolioStatePacket({
+    packet: reviewPacket,
+    now: now.toISOString(),
+    expectedAccountId: intent.broker_account_id,
+    expectedCandidateId: intent.candidate_id ?? undefined,
+    expectedContractIdentifier,
+    expectedStructuralPortfolioFingerprint: intent.review_account_fingerprint,
+    requiredCapital,
+    requireMarketOpen: true,
+    requireOpra: intent.asset_class === "option"
+  });
+  if (!reviewedValidation.valid) {
+    throw new Error(
+      reviewedValidation.blockers[0] ?? "PORTFOLIO_STATE_PACKET_INVALID"
+    );
+  }
+  const currentValidation = validatePostgresPortfolioStatePacket({
+    packet: currentPacket,
+    now: now.toISOString(),
+    expectedAccountId: intent.broker_account_id,
+    expectedStructuralPortfolioFingerprint: intent.review_account_fingerprint,
+    requiredCapital,
+    requireMarketOpen: true,
+    requireOpra: intent.asset_class === "option"
+  });
+  if (!currentValidation.valid) {
+    throw new Error(
+      currentValidation.blockers[0] ?? "PORTFOLIO_STATE_PACKET_INVALID"
+    );
+  }
+  return {
+    reviewPacketFingerprint: reviewPacket.packetFingerprint,
+    currentPacketFingerprint: currentPacket.packetFingerprint
+  };
 };
 
 const capacityAllowed = (row: Record<string, unknown> | undefined) =>
@@ -578,12 +779,22 @@ export const promoteNextConfirmedPostgresIntent = async (input: {
   const nowIso = input.now.toISOString();
   const selected = await input.query.query(
     `SELECT intent.id AS order_intent_id, intent.candidate_id, intent.account_id,
-            snapshot.id AS account_snapshot_id, intent.strategy_key, intent.symbol,
+            account.broker_account_id,
+            snapshot.id AS account_snapshot_id, intent.authorization_snapshot_id,
+            review.account_fingerprint AS review_account_fingerprint,
+            intent.strategy_key, intent.symbol,
             intent.asset_class, intent.side, intent.max_risk::text AS max_risk,
             intent.execution_review_id, review.review_type,
             review.payload_fingerprint AS review_payload_fingerprint,
-            review.signature AS review_signature, review.expires_at AS review_expires_at
+            review.signature AS review_signature, review.expires_at AS review_expires_at,
+            review.portfolio_evidence->'portfolioStatePacket'
+              AS review_portfolio_state_packet,
+            intent.request_payload->'portfolioStatePacket'
+              AS intent_portfolio_state_packet,
+            snapshot.evidence->'portfolioStatePacket'
+              AS current_portfolio_state_packet
      FROM order_intents intent
+     JOIN accounts account ON account.id = intent.account_id
      JOIN execution_reviews review ON review.id = intent.execution_review_id
      JOIN LATERAL (
        SELECT current_snapshot.id, current_snapshot.snapshot_fingerprint,
@@ -611,6 +822,9 @@ export const promoteNextConfirmedPostgresIntent = async (input: {
   );
   const intent = selected.rows[0] as ConfirmableIntentRow | undefined;
   if (!intent) return { status: "none" as const };
+  const portfolioStateAuthority = intent.review_type === "entry"
+    ? assertConfirmablePortfolioStateAuthority(intent, input.now)
+    : null;
 
   const reservationRequired = intent.review_type === "entry";
   const amount = positive(intent.max_risk);
@@ -715,6 +929,7 @@ export const promoteNextConfirmedPostgresIntent = async (input: {
   const confirmationEvidence = {
     command: input.command,
     confirmPaper: true,
+    ...(portfolioStateAuthority ? { portfolioState: portfolioStateAuthority } : {}),
     scheduler: {
       jobName: input.fence.jobName,
       workstream: input.fence.workstream,
@@ -865,7 +1080,14 @@ export const promoteNextConfirmedPostgresIntent = async (input: {
       intent.candidate_id,
       intent.order_intent_id,
       lifecycleFingerprint,
-      JSON.stringify({ confirmationId, reservationId, command: input.command }),
+      JSON.stringify({
+        confirmationId,
+        reservationId,
+        command: input.command,
+        ...(portfolioStateAuthority
+          ? { portfolioState: portfolioStateAuthority }
+          : {})
+      }),
       nowIso,
       ...fenceValues(input.fence)
     ]
@@ -935,6 +1157,9 @@ const claimIntent = async (
             account.broker_account_id,
             snapshot.snapshot_fingerprint AS account_snapshot_fingerprint,
             review.account_fingerprint AS review_account_fingerprint,
+            intent.max_risk::text AS max_risk,
+            intent.authorization_snapshot_id,
+            snapshot.id AS current_account_snapshot_id,
             intent.reservation_id, intent.execution_review_id, review.review_type,
             intent.confirmation_evidence_id, review.signature AS review_signature,
             review.payload_fingerprint,
@@ -947,7 +1172,14 @@ const claimIntent = async (
             intent.quantity::text AS quantity, intent.notional::text AS notional,
             intent.limit_price::text AS limit_price,
             intent.stop_price::text AS stop_price, intent.version AS intent_version,
-            review.market_evidence, intent.operation,
+            review.market_evidence,
+            review.portfolio_evidence->'portfolioStatePacket'
+              AS review_portfolio_state_packet,
+            intent.request_payload->'portfolioStatePacket'
+              AS intent_portfolio_state_packet,
+            snapshot.evidence->'portfolioStatePacket'
+              AS current_portfolio_state_packet,
+            intent.operation,
             intent.strategy_classification, intent.parent_position_id,
             intent.opening_intent_id, intent.contract_id,
             parent_position.side AS position_side,
@@ -1093,6 +1325,9 @@ const claimIntent = async (
   const intent = selected.rows[0] as AutonomousExecutionIntentRow | undefined;
   if (!intent) throw new Error("POSTGRES_EXECUTION_EVIDENCE_GATE_FAILED");
   assertExactReviewAuthorization(intent);
+  if (intent.review_type === "entry") {
+    assertPortfolioStateExecutionAuthority(intent, now);
+  }
   if (
     expectedPayloadSignature &&
     intent.review_signature !== expectedPayloadSignature &&

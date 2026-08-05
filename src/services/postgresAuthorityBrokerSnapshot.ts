@@ -1,5 +1,10 @@
 import { canonicalJsonHash } from "../lib/canonicalJson.js";
 import { getAlpacaAccountSnapshot } from "./alpacaAccountService.js";
+import {
+  listRecentPaperOrders,
+  type AlpacaSubmittedOrder
+} from "./alpacaClient.js";
+import { getAlpacaMarketClock } from "./alpacaMarketClockService.js";
 import { listAlpacaOpenOrders } from "./alpacaOrderReadService.js";
 import { listAlpacaPositions } from "./alpacaPositionService.js";
 import {
@@ -37,6 +42,11 @@ export type AuthorityBrokerOrder = {
   limitPrice: number | null;
 };
 
+export type AuthorityBrokerRecentOrder = AuthorityBrokerOrder & {
+  filledQuantity: number | null;
+  submittedAt: string | null;
+};
+
 export type AuthorityBrokerAccount = {
   status: string;
   currency: string;
@@ -51,14 +61,35 @@ export type AuthorityBrokerAccount = {
 
 export type PostgresAuthorityBrokerSnapshot = {
   capturedAt: string;
+  accountId: string;
   accountIdentityHash: string;
+  sourceRequestIds: {
+    account: string;
+    positions: string;
+    openOrders: string;
+    recentOrders: string;
+    marketClock: string;
+  };
   account: AuthorityBrokerAccount;
   configuration: PaperSubmitConfiguration;
   configurationFingerprint: string;
   positions: AuthorityBrokerPosition[];
   orders: AuthorityBrokerOrder[];
+  recentOrders: AuthorityBrokerRecentOrder[];
+  marketClock: {
+    observedAt: string;
+    isOpen: boolean;
+  };
   structuralPortfolioFingerprint: string;
   portfolioFingerprint: string;
+};
+
+type BrokerSnapshotDependencies = {
+  getAccount?: typeof getAlpacaAccountSnapshot;
+  listPositions?: typeof listAlpacaPositions;
+  listOpenOrders?: typeof listAlpacaOpenOrders;
+  listRecentOrders?: typeof listRecentPaperOrders;
+  getMarketClock?: typeof getAlpacaMarketClock;
 };
 
 const requiredText = (value: unknown, code: string) => {
@@ -114,7 +145,8 @@ export const buildStructuralPortfolioFingerprint = (
 });
 
 export const capturePostgresAuthorityBrokerSnapshot = async (
-  capturedAt = new Date().toISOString()
+  capturedAt = new Date().toISOString(),
+  dependencies: BrokerSnapshotDependencies = {}
 ): Promise<PostgresAuthorityBrokerSnapshot> => {
   const configuration = paperSubmitConfiguration();
   if (
@@ -125,12 +157,59 @@ export const capturePostgresAuthorityBrokerSnapshot = async (
     throw new Error("PAPER_RUNTIME_REQUIRED");
   }
 
-  const [accountResult, positionResult, orderResult] = await Promise.all([
-    getAlpacaAccountSnapshot(),
-    listAlpacaPositions(),
-    listAlpacaOpenOrders()
+  const capturedDate = new Date(capturedAt);
+  if (!Number.isFinite(capturedDate.getTime())) {
+    throw new Error("CURRENT_BROKER_CAPTURE_TIMESTAMP_INVALID");
+  }
+  const recentAfter = `${capturedAt.slice(0, 10)}T00:00:00.000Z`;
+  const [
+    accountResult,
+    positionResult,
+    orderResult,
+    recentOrderResult,
+    marketClockResult
+  ] = await Promise.all([
+    (dependencies.getAccount ?? getAlpacaAccountSnapshot)(),
+    (dependencies.listPositions ?? listAlpacaPositions)(),
+    (dependencies.listOpenOrders ?? listAlpacaOpenOrders)(),
+    (dependencies.listRecentOrders ?? listRecentPaperOrders)({
+      limit: 500,
+      after: recentAfter
+    }),
+    (dependencies.getMarketClock ?? getAlpacaMarketClock)()
   ]);
   const accountId = requiredText(accountResult.id, "CURRENT_PAPER_ACCOUNT_ID_MISSING");
+  const sourceRequestIds = {
+    account: requiredText(
+      accountResult.requestId,
+      "CURRENT_PAPER_ACCOUNT_REQUEST_ID_MISSING"
+    ),
+    positions: requiredText(
+      positionResult.requestId,
+      "CURRENT_BROKER_POSITIONS_REQUEST_ID_MISSING"
+    ),
+    openOrders: requiredText(
+      orderResult.requestId,
+      "CURRENT_BROKER_OPEN_ORDERS_REQUEST_ID_MISSING"
+    ),
+    recentOrders: requiredText(
+      recentOrderResult.requestId,
+      "CURRENT_BROKER_RECENT_ORDERS_REQUEST_ID_MISSING"
+    ),
+    marketClock: requiredText(
+      marketClockResult.requestId,
+      "CURRENT_BROKER_MARKET_CLOCK_REQUEST_ID_MISSING"
+    )
+  };
+  const marketClock = {
+    observedAt: requiredText(
+      marketClockResult.timestamp,
+      "CURRENT_BROKER_MARKET_CLOCK_TIMESTAMP_MISSING"
+    ),
+    isOpen: typeof marketClockResult.isOpen === "boolean"
+      ? marketClockResult.isOpen
+      : (() => { throw new Error("CURRENT_BROKER_MARKET_CLOCK_STATUS_MISSING"); })()
+  };
   const account = {
     status: requiredText(accountResult.status, "CURRENT_PAPER_ACCOUNT_STATUS_MISSING"),
     currency: requiredText(accountResult.currency, "CURRENT_PAPER_ACCOUNT_CURRENCY_MISSING"),
@@ -213,6 +292,69 @@ export const capturePostgresAuthorityBrokerSnapshot = async (
     };
   }).sort((left, right) => left.brokerOrderId.localeCompare(right.brokerOrderId));
 
+  if (!Array.isArray(recentOrderResult.data)) {
+    throw new Error("CURRENT_BROKER_RECENT_ORDERS_RESPONSE_INVALID");
+  }
+  const recentOrders: AuthorityBrokerRecentOrder[] = recentOrderResult.data.map(
+    (raw: AlpacaSubmittedOrder) => {
+      const symbol = requiredText(
+        raw.symbol,
+        "CURRENT_BROKER_RECENT_ORDER_SYMBOL_MISSING"
+      ).toUpperCase();
+      const kind = assetClass(raw.asset_class, symbol);
+      return {
+        brokerOrderId: requiredText(
+          raw.id,
+          "CURRENT_BROKER_RECENT_ORDER_ID_MISSING"
+        ),
+        clientOrderId: requiredText(
+          raw.client_order_id,
+          "CURRENT_BROKER_RECENT_CLIENT_ORDER_ID_MISSING"
+        ),
+        symbol,
+        assetClass: kind,
+        side: requiredText(
+          raw.position_intent || raw.side,
+          "CURRENT_BROKER_RECENT_ORDER_SIDE_MISSING"
+        ).toLowerCase(),
+        orderType: requiredText(
+          raw.type,
+          "CURRENT_BROKER_RECENT_ORDER_TYPE_MISSING"
+        ).toLowerCase(),
+        timeInForce: requiredText(
+          raw.time_in_force,
+          "CURRENT_BROKER_RECENT_ORDER_TIME_IN_FORCE_MISSING"
+        ).toLowerCase(),
+        status: requiredText(
+          raw.status,
+          "CURRENT_BROKER_RECENT_ORDER_STATUS_MISSING"
+        ).toLowerCase(),
+        quantity: optionalNumber(
+          raw.qty,
+          "CURRENT_BROKER_RECENT_ORDER_QUANTITY_INVALID"
+        ),
+        notional: optionalNumber(
+          raw.notional,
+          "CURRENT_BROKER_RECENT_ORDER_NOTIONAL_INVALID"
+        ),
+        limitPrice: optionalNumber(
+          raw.limit_price,
+          "CURRENT_BROKER_RECENT_ORDER_LIMIT_PRICE_INVALID"
+        ),
+        filledQuantity: optionalNumber(
+          raw.filled_qty,
+          "CURRENT_BROKER_RECENT_ORDER_FILLED_QUANTITY_INVALID"
+        ),
+        submittedAt: raw.submitted_at
+          ? requiredText(
+              raw.submitted_at,
+              "CURRENT_BROKER_RECENT_ORDER_SUBMITTED_AT_INVALID"
+            )
+          : null
+      };
+    }
+  ).sort((left, right) => left.brokerOrderId.localeCompare(right.brokerOrderId));
+
   const accountIdentityHash = canonicalJsonHash({ accountId });
   const structuralPortfolioFingerprint = buildStructuralPortfolioFingerprint(
     accountIdentityHash,
@@ -228,12 +370,16 @@ export const capturePostgresAuthorityBrokerSnapshot = async (
   };
   return {
     capturedAt,
+    accountId,
     accountIdentityHash,
+    sourceRequestIds,
     account,
     configuration,
     configurationFingerprint: canonicalJsonHash(configuration),
     positions,
     orders,
+    recentOrders,
+    marketClock,
     structuralPortfolioFingerprint,
     portfolioFingerprint: canonicalJsonHash(portfolioState)
   };
