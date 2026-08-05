@@ -719,7 +719,8 @@ const validateEntryReviewEvidence = (input: {
 };
 const REVIEW_PROPOSAL_ERROR_PREFIXES = [
   "POSTGRES_REVIEW_MARKET_EVIDENCE_STALE:",
-  "POSTGRES_REVIEW_OPTION_CONTRACT_INVALID:"
+  "POSTGRES_REVIEW_OPTION_CONTRACT_INVALID:",
+  "POSTGRES_REVIEW_OPTION_QUOTE_INVALID:"
 ] as const;
 const scopedReviewProposalReason = (error: unknown) => {
   const message = error instanceof Error ? error.message : String(error);

@@ -750,7 +750,7 @@ const persistCandidates = async (input: {
   const evaluated = input.targets
     .filter((target) =>
       (requestedFamily === undefined || target.strategyFamily === requestedFamily) &&
-      (input.requestedLane !== "options_0dte" || target.symbol === "SPY")
+      (target.strategyFamily !== "zero_dte_spy" || target.symbol === "SPY")
     )
     .map((target) => {
       const preferredOption = executableOption(target);

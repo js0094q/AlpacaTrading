@@ -1448,6 +1448,69 @@ test("the explicit 0DTE lane persists only the SPY same-day option target", asyn
   assert.equal(candidateWrites[0]?.[12], "zero_dte_spy");
 });
 
+test("the normal options cycle persists zero_dte_spy only for SPY", async () => {
+  const candidateWrites: Array<readonly unknown[]> = [];
+  const zeroDteTarget = (symbol: string, optionSymbol: string) => ({
+    ...target,
+    symbol,
+    preferredExpression: "long_call" as const,
+    strategyFamily: "zero_dte_spy" as const,
+    expressionId: `option:${optionSymbol}`,
+    optionsStrategy: {
+      alternatives: ["long_call"],
+      rationale: ["Same-day option candidate"],
+      optionsCandidate: {
+        optionSymbol,
+        type: "call",
+        expirationDate: "2026-07-20",
+        strike: symbol === "SPY" ? 555 : 300,
+        estimatedEntryPrice: 2,
+        liquidityScore: 0.9,
+        decisionInputs: {
+          bid: 1.98,
+          ask: 2.02,
+          requestedFeed: "opra",
+          effectiveFeed: "opra",
+          provider: "alpaca"
+        }
+      }
+    }
+  });
+
+  const result = await runPostgresResearchWorkflow({
+    query: researchAwareQuery((values) => { candidateWrites.push(values); }),
+    fence,
+    riskProfile: "aggressive",
+    optionsEnabled: true,
+    maxCandidates: 10,
+    now: new Date("2026-07-20T18:00:00.000Z"),
+    dependencies: {
+      refreshMarketData: async () => ({
+        bars: [bar],
+        stockSnapshots: [],
+        optionContracts: [],
+        optionSnapshots: [],
+        summary: {}
+      }) as never,
+      buildFeaturesAndTargets: async () => ({
+        features: [],
+        targets: [
+          zeroDteTarget("AMZN", "AMZN260720C00300000"),
+          zeroDteTarget("SPY", "SPY260720C00555000")
+        ]
+      }),
+      loadResearchSignals: async () => [],
+      symbols: ["AMZN", "SPY"]
+    }
+  });
+
+  assert.equal(result.candidatesSelected, 1);
+  assert.equal(candidateWrites.length, 1);
+  assert.equal(candidateWrites[0]?.[2], "SPY");
+  assert.equal(candidateWrites[0]?.[4], "SPY260720C00555000");
+  assert.equal(candidateWrites[0]?.[12], "zero_dte_spy");
+});
+
 test("0DTE remains independent and records only a current-session catalyst", async () => {
   const run = async (signals: readonly unknown[]) => {
     let candidateValues: readonly unknown[] = [];

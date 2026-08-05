@@ -880,8 +880,9 @@ for (const [label, marketEvidence] of [
   ["crossed quote", { bid: 2.02, ask: 1.98, midpoint: 2 }],
   ["non-executable quote", { bid: 0, ask: 0, midpoint: 0 }]
 ] as const) {
-  test(`option review rejects fresh option evidence with ${label} before persistence`, async () => {
+  test(`option review blocks fresh option evidence with ${label} before order persistence`, async () => {
     const sql: string[] = [];
+    const candidateUpdates: Array<readonly unknown[]> = [];
     const optionCandidate = {
       ...candidate,
       ...observedOptionContract,
@@ -915,28 +916,119 @@ for (const [label, marketEvidence] of [
       }
     };
 
-    await assert.rejects(
-      runPostgresReviewWorkflow({
-        command: "paper:review",
-        query: {
-          query: async (statement: string) => {
-            sql.push(statement);
-            if (statement.includes("FROM candidates candidate")) {
-              return { rows: [optionCandidate], rowCount: 1 };
-            }
-            return { rows: [], rowCount: 1 };
+    const result = await runPostgresReviewWorkflow({
+      command: "paper:review",
+      query: {
+        query: async (statement: string, values?: readonly unknown[]) => {
+          sql.push(statement);
+          if (statement.includes("FROM candidates candidate")) {
+            return { rows: [optionCandidate], rowCount: 1 };
           }
-        },
-        fence,
-        signingKey: "test-signing-key-with-sufficient-length",
-        now: new Date("2026-07-20T22:00:00.000Z")
-      }),
-      /POSTGRES_REVIEW_OPTION_QUOTE_INVALID:SPY260821C00560000/
-    );
+          if (statement.includes("UPDATE candidates")) {
+            candidateUpdates.push(values ?? []);
+          }
+          return { rows: [], rowCount: 1 };
+        }
+      },
+      fence,
+      signingKey: "test-signing-key-with-sufficient-length",
+      now: new Date("2026-07-20T22:00:00.000Z")
+    });
+
+    assert.equal(result.status, "no_op");
+    assert.equal(result.code, "NO_ELIGIBLE_POSTGRES_CANDIDATES");
+    assert.equal(candidateUpdates.some((values) =>
+      values[0] === optionCandidate.candidate_id &&
+      values[1] === "blocked" &&
+      values[2] === "POSTGRES_REVIEW_OPTION_QUOTE_INVALID:SPY260821C00560000"
+    ), true);
     assert.equal(sql.some((statement) => statement.includes("INSERT INTO execution_reviews")), false);
     assert.equal(sql.some((statement) => statement.includes("INSERT INTO order_intents")), false);
   });
 }
+
+test("over-spread option evidence blocks only that candidate and preserves a valid sibling", async () => {
+  const sql: string[] = [];
+  const candidateUpdates: Array<readonly unknown[]> = [];
+  const overSpreadOption = {
+    ...candidate,
+    ...observedOptionContract,
+    candidate_id: "candidate-option-over-spread",
+    asset_class: "option" as const,
+    option_symbol: "SPY260821C00560000",
+    preferred_expression: "long_call",
+    market_price: "2",
+    market_evidence: {
+      bid: 1.8,
+      ask: 2.2,
+      midpoint: 2,
+      spreadPct: 0.2,
+      volume: 5_000,
+      openInterest: 8_000,
+      impliedVolatility: 0.3,
+      requestedFeed: "opra",
+      effectiveFeed: "opra",
+      provider: "alpaca",
+      underlyingPrice: 555
+    },
+    signal_inputs: {
+      marketDecisionInputs: {
+        currentTradablePrice: 555,
+        option: {
+          bid: 1.8,
+          ask: 2.2,
+          selectionScore: 0.6,
+          liquidityScore: 0.8,
+          spreadPct: 0.2,
+          volume: 5_000,
+          openInterest: 8_000,
+          feed: "opra"
+        }
+      }
+    }
+  };
+
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        sql.push(statement);
+        if (statement.includes("FROM candidates candidate")) {
+          return {
+            rows: [
+              { ...candidate, candidate_id: "valid-equity", symbol: "QQQ" },
+              overSpreadOption
+            ],
+            rowCount: 2
+          };
+        }
+        if (statement.includes("UPDATE candidates")) {
+          candidateUpdates.push(values ?? []);
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    now: new Date("2026-07-20T22:00:00.000Z")
+  });
+
+  assert.equal(result.status, "completed");
+  assert.equal(result.reviewsCreated, 1);
+  assert.equal(result.pendingIntentsCreated, 1);
+  assert.equal(
+    sql.filter((statement) => statement.includes("INSERT INTO execution_reviews")).length,
+    1
+  );
+  assert.equal(
+    candidateUpdates.some((values) =>
+      values[0] === "candidate-option-over-spread" &&
+      values[1] === "blocked" &&
+      values[2] === "POSTGRES_REVIEW_OPTION_QUOTE_INVALID:SPY260821C00560000"
+    ),
+    true
+  );
+});
 
 test("invalid option contract blocks only that proposal and preserves valid equity work", async () => {
   const sql: string[] = [];
