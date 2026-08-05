@@ -90,7 +90,57 @@ test("research authority executes inside a fenced runtime context", async () => 
     )
   );
   assert.equal(result, "completed");
-  assert.deepEqual(calls, ["lease:research", "operation", "pool:end"]);
+  assert.deepEqual(calls, ["lease:research", "operation", "pool:end", "pool:end"]);
+});
+
+test("isolates scheduler heartbeat connections from the research workload pool", async () => {
+  const calls: string[] = [];
+  const pools: Pool[] = [];
+  let schedulerPool: Pool | undefined;
+  let workloadPool: Pool | undefined;
+  const deps = dependencies(
+    configFor({
+      controlPlaneAuthority: true,
+      schedulerAuthority: true
+    }),
+    calls
+  );
+  deps.createPool = () => {
+    const poolNumber = pools.length + 1;
+    const pool = {
+      end: async () => calls.push(`pool:${poolNumber}:end`)
+    } as unknown as Pool;
+    pools.push(pool);
+    return pool;
+  };
+  deps.runWithLease = async (input) => {
+    schedulerPool = input.pool;
+    return input.operation({
+      fence: {
+        jobName: input.job.jobName,
+        workstream: input.job.workstream,
+        ownerId: input.ownerId,
+        runId: input.runId,
+        fencingToken: "17"
+      },
+      signal: new AbortController().signal
+    });
+  };
+
+  await runPostgresScheduledCommand(
+    {
+      command: "research:daily",
+      operation: async (context) => {
+        workloadPool = context?.pool;
+        return "completed";
+      }
+    },
+    deps
+  );
+
+  assert.equal(pools.length, 2);
+  assert.notEqual(schedulerPool, workloadPool);
+  assert.deepEqual(calls, ["pool:2:end", "pool:1:end"]);
 });
 
 test("registered commands forward an external termination signal to the scheduler lease", async () => {
@@ -130,7 +180,7 @@ test("registered commands forward an external termination signal to the schedule
     deps
   );
   assert.equal(result, "completed");
-  assert.deepEqual(calls, ["lease:research", "operation", "pool:end"]);
+  assert.deepEqual(calls, ["lease:research", "operation", "pool:end", "pool:end"]);
 });
 
 test("every registered mutating workstream uses PostgreSQL scheduler authority", async () => {
@@ -163,6 +213,7 @@ test("every registered mutating workstream uses PostgreSQL scheduler authority",
     assert.deepEqual(calls, [
       `lease:${workstream}`,
       `operation:${command}`,
+      "pool:end",
       "pool:end"
     ]);
   }
@@ -196,6 +247,7 @@ test("shadow lease failure is reported but cannot block the SQLite-authoritative
   assert.deepEqual(calls, [
     "lease:attempt",
     "shadow:POSTGRES_SCHEDULER_SHADOW_FAILED",
+    "pool:end",
     "pool:end"
   ]);
 });
@@ -232,6 +284,7 @@ test("shadow release failure does not rerun an operation that already completed"
     "lease:attempt",
     "operation",
     "shadow:POSTGRES_SCHEDULER_SHADOW_FAILED",
+    "pool:end",
     "pool:end"
   ]);
 });
@@ -253,5 +306,5 @@ test("shadow mode never retries an operation that started and failed", async () 
     ),
     (error) => error === domainError
   );
-  assert.deepEqual(calls, ["lease:research", "operation", "pool:end"]);
+  assert.deepEqual(calls, ["lease:research", "operation", "pool:end", "pool:end"]);
 });

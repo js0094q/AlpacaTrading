@@ -67,7 +67,14 @@ export const runPostgresScheduledCommand = async <T>(
     config.features.shadowComparison || config.features.schedulerAuthority;
   if (!schedulerEnabled) return input.operation(undefined);
 
-  const pool = dependencies.createPool(config);
+  const operationPool = dependencies.createPool(config);
+  let schedulerPool: Pool;
+  try {
+    schedulerPool = dependencies.createPool(config);
+  } catch (error) {
+    await operationPool.end();
+    throw error;
+  }
   const schedulerInvocationId = dependencies.invocationId();
   const requestId = process.env.RESEARCH_REQUEST_ID?.trim() || null;
   const correlationId = process.env.RESEARCH_CORRELATION_ID?.trim() || null;
@@ -77,7 +84,7 @@ export const runPostgresScheduledCommand = async <T>(
   try {
     try {
       return await dependencies.runWithLease({
-        pool,
+        pool: schedulerPool,
         config,
         job,
         ownerId: dependencies.ownerId(),
@@ -92,7 +99,7 @@ export const runPostgresScheduledCommand = async <T>(
           withControlPlaneRuntimeContext(
             {
               config,
-              pool,
+              pool: operationPool,
               fence,
               signal,
               operationId: `scheduler:${schedulerInvocationId}`,
@@ -103,7 +110,12 @@ export const runPostgresScheduledCommand = async <T>(
             async () => {
               assertControlPlaneFenceActive();
               operationStarted = true;
-              const result = await input.operation({ pool, config, fence, signal });
+              const result = await input.operation({
+                pool: operationPool,
+                config,
+                fence,
+                signal
+              });
               operationResult = result;
               operationCompleted = true;
               assertControlPlaneFenceActive();
@@ -123,6 +135,10 @@ export const runPostgresScheduledCommand = async <T>(
       return input.operation(undefined);
     }
   } finally {
-    await pool.end();
+    try {
+      await schedulerPool.end();
+    } finally {
+      await operationPool.end();
+    }
   }
 };
