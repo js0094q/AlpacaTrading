@@ -437,6 +437,54 @@ const syncBrokerAccountAndPositions = async (input: {
     positionsUpserted += 1;
   }
 
+  const allocationDeploymentRefresh = await input.query.query(
+    `WITH current_allocation AS MATERIALIZED (
+       SELECT allocation.id
+       FROM strategy_allocations allocation
+       WHERE allocation.account_id = $1
+         AND allocation.status = 'active'
+         AND allocation.effective_to IS NULL
+       ORDER BY allocation.updated_at DESC, allocation.id
+       LIMIT 1
+     ), current_position_exposure AS MATERIALIZED (
+       SELECT COALESCE(SUM(
+         ABS(COALESCE(position.market_value, position.cost_basis, 0))
+       ), 0)::numeric AS amount
+       FROM positions position
+       WHERE position.account_id = $1
+         AND position.status IN ('open', 'closing')
+     ), refreshed AS (
+       UPDATE strategy_allocations allocation
+       SET deployed_amount = current_position_exposure.amount,
+           updated_at = $2,
+           version = allocation.version + 1
+       FROM current_allocation, current_position_exposure
+       WHERE allocation.id = current_allocation.id
+         AND allocation.account_id = $1
+         AND allocation.status = 'active'
+         AND allocation.effective_to IS NULL
+         AND allocation.deployed_amount IS DISTINCT FROM
+             current_position_exposure.amount
+         AND ${fenceSql(3)}
+       RETURNING allocation.id
+     )
+     SELECT COUNT(*)::text AS refreshed_count FROM refreshed`,
+    [accountId, snapshot.capturedAt, ...fenceValues(input.fence)]
+  );
+  const allocationDeploymentRefreshCount = finiteNumber(
+    allocationDeploymentRefresh.rows[0]?.refreshed_count ?? 0,
+    "POSTGRES_RECONCILIATION_ALLOCATION_DEPLOYMENT_REFRESH_INVALID"
+  );
+  if (
+    !Number.isSafeInteger(allocationDeploymentRefreshCount) ||
+    allocationDeploymentRefreshCount < 0 ||
+    allocationDeploymentRefreshCount > 1
+  ) {
+    throw new Error(
+      "POSTGRES_RECONCILIATION_ALLOCATION_DEPLOYMENT_REFRESH_INVALID"
+    );
+  }
+
   const positionLineageResult = await input.query.query(
     `SELECT position.broker_position_key, position.asset_class,
             candidate.strategy_family

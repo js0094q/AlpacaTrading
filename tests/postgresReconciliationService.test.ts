@@ -1474,6 +1474,157 @@ test("reconciliation synchronizes broker account and positions into PostgreSQL a
   );
 });
 
+test("broker reconciliation resets stale deployed allocation to current open position exposure", async () => {
+  const statements: Array<{ sql: string; values: readonly unknown[] }> = [];
+  let deployedAmount = 29_999.99;
+  let persistedSnapshotId = "";
+  let accountSnapshotStored = false;
+  let positionPersistenceCount = 0;
+  const refreshCounts: number[] = [];
+  const reconciliationInput = {
+    query: {
+      query: async (sql: string, values?: readonly unknown[]) => {
+        statements.push({ sql, values: values ?? [] });
+        if (sql.includes("INSERT INTO account_snapshots")) {
+          if (accountSnapshotStored) {
+            return { rows: [], rowCount: 0 };
+          }
+          accountSnapshotStored = true;
+          persistedSnapshotId = String(values?.[0] ?? "");
+          return { rows: [], rowCount: 1 };
+        }
+        if (sql.includes("SELECT id FROM account_snapshots")) {
+          return { rows: [{ id: persistedSnapshotId }], rowCount: 1 };
+        }
+        if (sql.includes("INSERT INTO positions")) {
+          positionPersistenceCount += 1;
+          return { rows: [], rowCount: 1 };
+        }
+        if (sql.includes("current_position_exposure")) {
+          assert.ok(
+            positionPersistenceCount > 0,
+            "allocation refresh must follow broker-position persistence"
+          );
+          assert.deepEqual(values, [
+            "account_paper-account-hash",
+            "2026-08-05T18:00:00.000Z",
+            "reconciliation",
+            "reconciliation",
+            "worker",
+            "run",
+            "7"
+          ]);
+          const currentPositionExposure = 420;
+          const refreshed = deployedAmount === currentPositionExposure ? 0 : 1;
+          deployedAmount = currentPositionExposure;
+          refreshCounts.push(refreshed);
+          return {
+            rows: [{ refreshed_count: String(refreshed) }],
+            rowCount: 1
+          };
+        }
+        if (sql.includes("FROM buying_power_reservations")) {
+          return { rows: [{ reserved_capital: "0" }], rowCount: 1 };
+        }
+        if (sql.includes("FROM strategy_allocations") &&
+            sql.includes("capital_allocation")) {
+          return {
+            rows: [{ strategy_key: "baseline-v1", capital_allocation: "30000" }],
+            rowCount: 1
+          };
+        }
+        if (sql.includes("AS opra_available")) {
+          return { rows: [{ opra_available: true }], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    snapshot: {
+      capturedAt: "2026-08-05T18:00:00.000Z",
+      accountId: "paper-account-1",
+      accountIdentityHash: "paper-account-hash",
+      sourceRequestIds: {
+        account: "request-account",
+        positions: "request-positions",
+        openOrders: "request-open-orders",
+        recentOrders: "request-recent-orders",
+        marketClock: "request-clock"
+      },
+      account: {
+        status: "ACTIVE",
+        currency: "USD",
+        cash: 98_000,
+        equity: 93_000,
+        buyingPower: 350_000,
+        optionsBuyingPower: 87_000,
+        optionsApprovalLevel: 3,
+        tradingBlocked: false,
+        accountBlocked: false
+      },
+      configuration: {
+        environment: "paper",
+        tradingMode: "paper",
+        liveTradingEnabled: false
+      },
+      configurationFingerprint: "configuration-fingerprint",
+      positions: [{
+        brokerPositionKey: "equity:AAPL",
+        symbol: "AAPL",
+        underlyingSymbol: null,
+        optionSymbol: null,
+        assetClass: "equity",
+        side: "long",
+        quantity: 2,
+        availableQuantity: 2,
+        averageEntryPrice: 200,
+        currentPrice: 210,
+        marketValue: 420,
+        costBasis: 400,
+        unrealizedPnl: 20
+      }],
+      orders: [],
+      recentOrders: [],
+      marketClock: {
+        observedAt: "2026-08-05T17:59:59.000Z",
+        isOpen: true
+      },
+      structuralPortfolioFingerprint: "structural-fingerprint",
+      portfolioFingerprint: "portfolio-fingerprint"
+    } as never
+  };
+  await persistPostgresAuthorityBrokerSnapshot(reconciliationInput);
+  await persistPostgresAuthorityBrokerSnapshot(reconciliationInput);
+
+  assert.equal(deployedAmount, 420);
+  assert.deepEqual(refreshCounts, [1, 0]);
+
+  const deployedCapitalRefresh = statements.find(({ sql }) =>
+    sql.includes("UPDATE strategy_allocations allocation") &&
+    sql.includes("current_position_exposure")
+  );
+  assert.ok(
+    deployedCapitalRefresh,
+    "reconciliation must replace the cumulative allocation ledger with current broker-backed exposure"
+  );
+  assert.match(
+    deployedCapitalRefresh.sql,
+    /position\.status IN \('open', 'closing'\)/
+  );
+  assert.match(
+    deployedCapitalRefresh.sql,
+    /ABS\(COALESCE\(position\.market_value, position\.cost_basis, 0\)\)/
+  );
+  assert.match(
+    deployedCapitalRefresh.sql,
+    /deployed_amount = current_position_exposure\.amount/
+  );
+  assert.doesNotMatch(
+    deployedCapitalRefresh.sql,
+    /position\.status = 'closed'/
+  );
+});
+
 test("duplicate broker snapshots reuse the existing canonical ID for positions", async () => {
   const existingSnapshotId = "snapshot-existing";
   let referencedSnapshotId = "";
