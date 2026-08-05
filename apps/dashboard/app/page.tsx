@@ -170,6 +170,34 @@ const optionCategoryCount = (
   category: OptionContractRow["displayCategory"]
 ) => rows.filter((row) => row.displayCategory === category).length;
 
+const StatusSignal = ({
+  label,
+  value,
+  tone,
+  detail
+}: {
+  label: string;
+  value: string;
+  tone: "healthy" | "warning" | "danger" | "neutral";
+  detail: string;
+}) => (
+  <div className={`status-signal ${tone}`}>
+    <span className="status-dot" aria-hidden="true" />
+    <span>
+      <small>{label}</small>
+      <strong>{value}</strong>
+      <span className="sr-only">. {detail}</span>
+    </span>
+  </div>
+);
+
+const DetailHeader = ({ title, description }: { title: string; description: string }) => (
+  <span className="detail-header">
+    <strong>{title}</strong>
+    <span>{description}</span>
+  </span>
+);
+
 export default async function DashboardPage() {
   let snapshot: DashboardSnapshot | null = null;
   let guardError: string | null = null;
@@ -232,307 +260,276 @@ export default async function DashboardPage() {
     ? snapshot?.promotionReadiness
     : []) as PromotionReadinessRow[];
   const vercelReadOnly = snapshot?.mode === "vercel-read-only";
+  const workerRunning = Boolean(
+    worker?.ok && worker.data.active && worker.data.status === "running"
+  );
+  const workerStatus = worker?.ok ? worker.data.status || "unknown" : "unavailable";
+  const reviewStatus = review?.ok ? review.data.review.status : "unavailable";
+  const reviewBlockers = review?.ok ? review.data.review.blockers : [];
+  const zeroDteBlockers = zeroDteSummary?.blockers || [];
+  const postgresReady = Boolean(snapshot && !loadError && snapshot.paperOnly);
 
   return (
-    <main className="shell">
-      <header className="topbar">
-        <div>
-          <h1 className="title">Alpaca Paper Dashboard</h1>
-          <div className="subtle">
-            {snapshot?.generatedAt || new Date().toISOString()}
+    <div className="app-shell">
+      <aside className="sidebar" aria-label="Dashboard navigation">
+        <a className="brand" href="#overview">Alpaca Paper</a>
+        <nav>
+          <a className="active" href="#overview">Overview</a>
+          <a href="#portfolio">Portfolio</a>
+          <a href="#orders">Orders</a>
+          <a href="#research">Research</a>
+          <a href="#zero-dte">0DTE</a>
+          <a href="#evidence">Evidence</a>
+          <a href="#controls">Controls</a>
+        </nav>
+        <div className="sidebar-safety">
+          <strong>Paper environment</strong>
+          <span>Live trading is off</span>
+        </div>
+      </aside>
+
+      <main className="shell">
+        <header className="topbar">
+          <div>
+            <h1 className="title">Alpaca Paper Operations</h1>
+            <p>Monitor the paper runtime, account, readiness, and evidence.</p>
           </div>
-        </div>
-        <span className="badge">PAPER ONLY</span>
-      </header>
-
-      {loadError ? (
-        <section className="grid">
-          <div className="panel full">
-            <h2>{loadError.title}</h2>
-            <p className="danger">{loadError.message}</p>
+          <div className="topbar-actions">
+            <span className="last-refresh">Updated {snapshot?.generatedAt || new Date().toISOString()}</span>
+            <span className="badge">PAPER ONLY</span>
+            <a className="refresh-button" href="/">Refresh</a>
           </div>
-        </section>
-      ) : null}
+        </header>
 
-      {snapshot?.historicalDataAvailable === false ? (
-        <section className="grid">
-          <div className="panel full">
-            <h2>Runtime History</h2>
-            <p className="warning">{snapshot.historicalWarning}</p>
-            <p className="subtle">{snapshot.durableStorageWarning}</p>
+        {loadError ? (
+          <section className="inline-alert danger-alert">
+            <strong>{loadError.title}</strong>
+            <span>{loadError.message}</span>
+          </section>
+        ) : null}
+
+        {snapshot?.historicalDataAvailable === false ? (
+          <section className="inline-alert warning-alert">
+            <strong>Runtime history is limited</strong>
+            <span>{snapshot.historicalWarning}</span>
+          </section>
+        ) : null}
+
+        <section className="overview" id="overview">
+          <h2 className="sr-only">Operations overview</h2>
+          <div className="status-rail">
+            <StatusSignal
+              label="Control API"
+              value={loadError ? "UNAVAILABLE" : "HEALTHY"}
+              tone={loadError ? "danger" : "healthy"}
+              detail="Dashboard control bridge status"
+            />
+            <StatusSignal
+              label="Autonomous worker"
+              value={workerRunning ? "RUNNING" : workerStatus.toUpperCase()}
+              tone={workerRunning ? "healthy" : "warning"}
+              detail={workerRunning ? "Paper worker is active" : "Paper worker is not running"}
+            />
+            <StatusSignal
+              label="PostgreSQL authority"
+              value={postgresReady ? "PASSED" : "UNAVAILABLE"}
+              tone={postgresReady ? "healthy" : "danger"}
+              detail="Dashboard state is PostgreSQL authoritative"
+            />
+            <StatusSignal
+              label="Live trading"
+              value={snapshot?.liveTradingEnabled ? "ON" : "OFF"}
+              tone={snapshot?.liveTradingEnabled ? "danger" : "neutral"}
+              detail="Live trading must remain disabled"
+            />
           </div>
-        </section>
-      ) : null}
 
-      <section className="grid">
-        <ActionPanel readOnly={vercelReadOnly} />
-
-        <ZeroDtePanel summary={zeroDteSummary} error={zeroDteError} />
-
-        <div className="panel">
-          <h2>Environment</h2>
-          <Metric label="Alpaca env" value={snapshot?.environment || "-"} />
-          <Metric label="Live trading enabled" value={String(Boolean(snapshot?.liveTradingEnabled))} />
-          <Metric label="Paper only" value={String(Boolean(snapshot?.paperOnly))} />
-        </div>
-
-        <div className="panel">
-          <h2>Autonomous Worker</h2>
-          {worker?.ok ? (
-            <>
-              <Metric label="Status" value={worker.data.status || "unknown"} />
-              <Metric label="Active" value={String(Boolean(worker.data.active))} />
-              <Metric label="Current cycle" value={worker.data.cycleId || "-"} />
-              <Metric label="Last event" value={worker.data.lastEventType || "-"} />
-              <Metric label="Last event at" value={worker.data.lastEventAt || "-"} />
-              <Metric
-                label="Last completed cycle"
-                value={worker.data.lastCycleCompletedAt || "-"}
-              />
-            </>
-          ) : (
-            <p className="warning">{worker?.error || "Unavailable"}</p>
-          )}
-        </div>
-
-        <div className="panel">
-          <h2>Paper Account</h2>
-          {account?.ok ? (
-            <>
-              <Metric label="Status" value={account.data.status || "-"} />
-              <Metric label="Equity" value={dashboardMoney(account.data.equity)} />
-              <Metric label="Cash" value={dashboardMoney(account.data.cash)} />
-              <Metric label="Buying power" value={dashboardMoney(account.data.buyingPower)} />
-            </>
-          ) : (
-            <p className="warning">{account?.error || "Unavailable"}</p>
-          )}
-        </div>
-
-        <HedgePanel
-          recommendation={hedge?.ok ? hedge.data : null}
-          error={hedge && !hedge.ok ? hedge.error : null}
-        />
-
-        <div className="panel">
-          <h2>Open Orders</h2>
-          {openOrders?.ok ? (
-            <div className="list">
-              {openOrderRows.slice(0, 12).map((order) => (
-                <div className="row" key={order.id || order.clientOrderId}>
-                  <strong>{order.symbol || "-"}</strong>
-                  <span>{order.side || "-"}</span>
-                  <span>{order.status || "-"}</span>
-                  <span className="mono">{order.qty || order.notional || "-"}</span>
-                </div>
-              ))}
-              {!openOrderRows.length ? <p className="subtle">No open orders.</p> : null}
-            </div>
-          ) : (
-            <p className="warning">{openOrders?.error || "Unavailable"}</p>
-          )}
-        </div>
-
-        <div className="panel">
-          <h2>Execution Readiness</h2>
-          {review?.ok ? (
-            <>
-              <Metric label="Review status" value={review.data.review.status} />
-              <Metric label="Blockers" value={review.data.review.blockers.length} />
-              <Metric label="Warnings" value={review.data.review.warnings.length} />
-              <Metric label="Planned orders" value={review.data.planSummary.plannedOrders} />
-            </>
-          ) : (
-            <p className="warning">{review?.error || "Unavailable"}</p>
-          )}
-        </div>
-
-        <PostgresEvidencePanel
-          plans={snapshot?.latestPaperPlans || []}
-          intents={snapshot?.orderIntents || []}
-          lifecycle={snapshot?.autonomousLifecycle || []}
-        />
-
-        <div className="panel wide">
-          <h2>Learning Ledger</h2>
-          {learningSummary?.ok ? (
-            <>
-              <div className="option-counts">
-                <Metric label="Pending" value={learningSummary.data.pending ?? 0} />
-                <Metric label="Evaluated" value={learningSummary.data.evaluated ?? 0} />
-                <Metric label="Promoted" value={learningSummary.data.promoted ?? 0} />
-                <Metric label="Rejected" value={learningSummary.data.rejected ?? 0} />
-              </div>
-              <div className="list">
-                {promotionReadiness.map((entry) => (
-                  <div className="row" key={entry.strategyFamily}>
-                    <strong>{entry.strategyFamily || "-"}</strong>
-                    <span>{String(Boolean(entry.eligibleForLiveReview))}</span>
-                    <span className="mono">
-                      {entry.evaluatedTrades ?? 0}/{entry.totalTrades ?? 0}
-                    </span>
-                    <span className="mono">PF {entry.profitFactorLiveLike ?? 0}</span>
-                    <span>{entry.blockReasons?.join(", ") || "none"}</span>
+          <div className="overview-layout">
+            <div className="overview-primary">
+              <section className="ops-panel account-panel">
+                <div className="panel-heading">
+                  <div>
+                    <h2>Account summary</h2>
+                    <p>Current Alpaca paper-account values.</p>
                   </div>
-                ))}
-                {!promotionReadiness.length ? <p className="subtle">No promotion analytics yet.</p> : null}
-              </div>
-            </>
-          ) : (
-            <p className="warning">{learningSummary?.error || "Unavailable"}</p>
-          )}
-        </div>
-
-        <div className="panel wide">
-          <h2>Latest Plan</h2>
-          {plan?.ok ? (
-            <div className="list">
-              {plan.data.plan.slice(0, 8).map((entry) => (
-                <div className="row" key={`${entry.symbol}-${entry.latestRank}`}>
-                  <strong>{entry.symbol}</strong>
-                  <span>{entry.decision} {entry.strategy ? `- ${entry.strategy}` : ""}</span>
-                  <span className="mono">{dashboardMoney(entry.estimatedNotional)}</span>
+                  <span className="text-state healthy-text">{account?.ok ? account.data.status || "ACTIVE" : "UNAVAILABLE"}</span>
                 </div>
-              ))}
-              {!plan.data.plan.length ? <p className="subtle">No current plan rows.</p> : null}
-            </div>
-          ) : (
-            <p className="warning">{plan?.error || "Unavailable"}</p>
-          )}
-        </div>
+                {account?.ok ? (
+                  <div className="account-metrics">
+                    <Metric label="Equity" value={dashboardMoney(account.data.equity)} />
+                    <Metric label="Cash" value={dashboardMoney(account.data.cash)} />
+                    <Metric label="Buying power" value={dashboardMoney(account.data.buyingPower)} />
+                  </div>
+                ) : (
+                  <p className="warning">{account?.error || "Unavailable"}</p>
+                )}
+              </section>
 
-        <div className="panel">
-          <h2>Dry Run</h2>
-          {dryRun?.ok ? (
-            <>
-              <Metric label="Would submit" value={dryRun.data.summary.wouldSubmitCount} />
-              <Metric label="Blocked payloads" value={dryRun.data.summary.payloadsBlocked} />
-              <Metric label="Asset filter" value={dryRun.data.assetClass} />
-            </>
-          ) : (
-            <p className="warning">{dryRun?.error || "Unavailable"}</p>
-          )}
-        </div>
-
-        <div className="panel">
-          <h2>Positions</h2>
-          {positions?.ok ? (
-            <div className="list">
-              {positions.data.positions.slice(0, 6).map((position) => (
-                <div className="row" key={position.symbol}>
-                  <strong>{position.symbol}</strong>
-                  <span>qty {position.qty || "-"}</span>
-                  <span className="mono">{dashboardMoney(position.marketValue)}</span>
+              <section className="ops-panel readiness-panel">
+                <div className="panel-heading">
+                  <div>
+                    <h2>Execution readiness</h2>
+                    <p>Review state and paper-order prerequisites.</p>
+                  </div>
+                  <span className={`text-state ${reviewStatus === "ready" ? "healthy-text" : "danger-text"}`}>
+                    {reviewStatus.toUpperCase()}
+                  </span>
                 </div>
-              ))}
-              {!positions.data.positions.length ? <p className="subtle">No open paper positions.</p> : null}
-            </div>
-          ) : (
-            <p className="warning">{positions?.error || "Unavailable"}</p>
-          )}
-        </div>
+                <div className="readiness-layout">
+                  <div className="readiness-summary">
+                    <strong>{reviewStatus === "ready" ? "Paper execution is ready." : "Paper execution is blocked."}</strong>
+                    <span>{review?.ok ? `${review.data.planSummary.plannedOrders} planned orders` : review?.error || "Review unavailable"}</span>
+                  </div>
+                  <div className="blocker-list">
+                    <h3>Top blockers</h3>
+                    {reviewBlockers.slice(0, 4).map((blocker) => <span key={blocker}>{blocker}</span>)}
+                    {!reviewBlockers.length ? <span>No persisted blockers.</span> : null}
+                  </div>
+                </div>
+              </section>
 
-        <div className="panel">
-          <h2>Latest Research</h2>
-          <div className="list">
-            {(snapshot?.latestResearch || []).map((row) => {
-              const researchRow = row as Record<string, unknown>;
-              return <div className="row" key={String(researchRow.id || "research")}>
-                <strong>{String(researchRow.risk_profile || "-")}</strong>
-                <span>{String(researchRow.status || "-")}</span>
-                <span className="mono">{String(researchRow.candidates_selected ?? "-")}</span>
-              </div>
-            })}
-            {!snapshot?.latestResearch?.length ? <p className="subtle">Successful-empty: no research runs are available.</p> : null}
+              <section className="ops-panel" id="orders">
+                <div className="panel-heading">
+                  <div><h2>Open orders</h2><p>Current broker-backed paper orders.</p></div>
+                  <strong>{openOrderRows.length}</strong>
+                </div>
+                {openOrders?.ok ? (
+                  <div className="ops-table" role="table" aria-label="Open paper orders">
+                    <div className="ops-table-row ops-table-head" role="row">
+                      <span>Symbol</span><span>Side</span><span>Quantity</span><span>Status</span>
+                    </div>
+                    {openOrderRows.slice(0, 8).map((order) => (
+                      <div className="ops-table-row" role="row" key={order.id || order.clientOrderId}>
+                        <strong>{order.symbol || "-"}</strong>
+                        <span>{order.side || "-"}</span>
+                        <span className="mono">{order.qty || order.notional || "-"}</span>
+                        <span>{order.status || "-"}</span>
+                      </div>
+                    ))}
+                    {!openOrderRows.length ? <p className="empty-state">No open paper orders.</p> : null}
+                  </div>
+                ) : <p className="warning">{openOrders?.error || "Unavailable"}</p>}
+              </section>
+
+              <section className="ops-panel" id="portfolio">
+                <div className="panel-heading">
+                  <div><h2>Positions</h2><p>Current paper holdings and market value.</p></div>
+                  <strong>{positions?.ok ? positions.data.positions.length : "-"}</strong>
+                </div>
+                {positions?.ok ? (
+                  <div className="ops-table" role="table" aria-label="Paper positions">
+                    <div className="ops-table-row position-row ops-table-head" role="row">
+                      <span>Symbol</span><span>Quantity</span><span>Market value</span>
+                    </div>
+                    {positions.data.positions.slice(0, 8).map((position) => (
+                      <div className="ops-table-row position-row" role="row" key={position.symbol}>
+                        <strong>{position.symbol}</strong>
+                        <span className="mono">{position.qty || "-"}</span>
+                        <span className="mono">{dashboardMoney(position.marketValue)}</span>
+                      </div>
+                    ))}
+                    {!positions.data.positions.length ? <p className="empty-state">No open paper positions.</p> : null}
+                  </div>
+                ) : <p className="warning">{positions?.error || "Unavailable"}</p>}
+              </section>
+            </div>
+
+            <aside className="overview-rail" aria-label="Attention and next steps">
+              <section className="ops-panel attention-panel">
+                <div className="panel-heading"><h2>Needs attention</h2></div>
+                <div className="attention-list">
+                  {!workerRunning ? (
+                    <a href="#controls"><strong>Paper worker is {workerStatus}</strong><span>Autonomous paper processing is not active.</span></a>
+                  ) : null}
+                  {reviewStatus !== "ready" ? (
+                    <a href="#research"><strong>Execution review is {reviewStatus}</strong><span>Refresh and review before any paper action.</span></a>
+                  ) : null}
+                  {zeroDteBlockers.length ? (
+                    <a href="#zero-dte"><strong>No current 0DTE candidates</strong><span>{zeroDteBlockers[0]}</span></a>
+                  ) : null}
+                  <div className="attention-info"><strong>Live trading is off</strong><span>Paper operations only.</span></div>
+                </div>
+              </section>
+
+              <section className="ops-panel next-steps-panel">
+                <div className="panel-heading"><h2>Safe next steps</h2></div>
+                <a href="#portfolio"><span><strong>Review portfolio risk</strong><small>Inspect holdings and hedge state</small></span><b>Open</b></a>
+                <a href="#research"><span><strong>Refresh research</strong><small>Review candidates and learning</small></span><b>Open</b></a>
+                <a href="#zero-dte"><span><strong>Inspect 0DTE</strong><small>Queue, blockers, and simulated state</small></span><b>Open</b></a>
+                <a href="#evidence"><span><strong>View system checks</strong><small>PostgreSQL lineage and execution evidence</small></span><b>View</b></a>
+              </section>
+
+              <section className="ops-panel activity-panel">
+                <div className="panel-heading"><h2>Recent activity</h2></div>
+                <div className="activity-list">
+                  <span><i className="healthy-dot" /><time>{snapshot?.generatedAt || "-"}</time><strong>Control API snapshot loaded</strong></span>
+                  <span><i className={workerRunning ? "healthy-dot" : "warning-dot"} /><time>{worker?.ok ? worker.data.lastEventAt || "-" : "-"}</time><strong>{worker?.ok ? worker.data.lastEventType || "Worker state checked" : "Worker unavailable"}</strong></span>
+                  <span><i className="healthy-dot" /><time>{worker?.ok ? worker.data.lastCycleCompletedAt || "-" : "-"}</time><strong>Last completed worker cycle</strong></span>
+                </div>
+              </section>
+            </aside>
           </div>
-        </div>
+        </section>
 
-        <div className="panel full">
-          <h2>Execution Ledger</h2>
-          {executions?.ok ? (
-            <div className="list">
-              {executions.data.slice(0, 12).map((entry) => (
-                <div className="row" key={entry.id || entry.broker_order_id || entry.clientOrderId}>
-                  <strong>{entry.symbol || "-"}</strong>
-                  <span>{entry.status || "-"} {entry.strategy ? `- ${entry.strategy}` : ""}</span>
-                  <span className="mono">{entry.broker_order_id || entry.clientOrderId || "-"}</span>
-                  <span>intent {entry.order_intent_id || "-"}</span>
-                  <span>position {entry.position_id || "-"}</span>
-                  <span>fill {entry.filled_quantity ?? "-"} @ {entry.filled_average_price ?? "-"}</span>
-                  <span>reconciled {entry.last_reconciled_at || "-"}</span>
-                </div>
-              ))}
-              {!executions.data.length ? <p className="subtle">No ledger rows yet.</p> : null}
+        <details className="detail-section" id="portfolio-details">
+          <summary><DetailHeader title="Portfolio risk and hedge review" description="Detailed risk measurements, scenarios, and hedge evidence." /></summary>
+          <div className="detail-grid">
+            <HedgePanel recommendation={hedge?.ok ? hedge.data : null} error={hedge && !hedge.ok ? hedge.error : null} />
+            <div className="panel wide">
+              <h2>Latest plan</h2>
+              {plan?.ok ? <div className="list">
+                {plan.data.plan.slice(0, 8).map((entry) => <div className="row" key={`${entry.symbol}-${entry.latestRank}`}><strong>{entry.symbol}</strong><span>{entry.decision} {entry.strategy ? `- ${entry.strategy}` : ""}</span><span className="mono">{dashboardMoney(entry.estimatedNotional)}</span></div>)}
+                {!plan.data.plan.length ? <p className="subtle">No current plan rows.</p> : null}
+              </div> : <p className="warning">{plan?.error || "Unavailable"}</p>}
             </div>
-          ) : (
-            <p className="warning">{executions?.error || "Unavailable"}</p>
-          )}
-        </div>
-
-        <div className="panel wide">
-          <h2>Option Contracts</h2>
-          <div className="option-counts">
-            <Metric label="Discovered" value={optionCategoryCount(optionRows, "Discovered")} />
-            <Metric label="Quoted" value={optionCategoryCount(optionRows, "Quoted")} />
-            <Metric label="Executable" value={optionCategoryCount(optionRows, "Executable")} />
-            <Metric label="Rejected" value={optionCategoryCount(optionRows, "Rejected")} />
           </div>
-          <div className="option-table">
-            <div className="option-row option-head">
-              <span>Category</span>
-              <span>Contract</span>
-              <span>Quote Status</span>
-              <span>Executable</span>
-              <span>Reject Reason</span>
-              <span>Executable Price</span>
-              <span>Price Source</span>
+        </details>
+
+        <details className="detail-section" id="zero-dte">
+          <summary><DetailHeader title="0DTE operations" description="Ranked queue, paper positions, lifecycle, and simulated alternatives." /></summary>
+          <div className="detail-grid"><ZeroDtePanel summary={zeroDteSummary} error={zeroDteError} /></div>
+        </details>
+
+        <details className="detail-section" id="research">
+          <summary><DetailHeader title="Research and learning" description="Latest research, learning ledger, promotion evidence, and dry-run state." /></summary>
+          <div className="detail-grid">
+            <div className="panel wide">
+              <h2>Learning ledger</h2>
+              {learningSummary?.ok ? <>
+                <div className="option-counts"><Metric label="Pending" value={learningSummary.data.pending ?? 0} /><Metric label="Evaluated" value={learningSummary.data.evaluated ?? 0} /><Metric label="Promoted" value={learningSummary.data.promoted ?? 0} /><Metric label="Rejected" value={learningSummary.data.rejected ?? 0} /></div>
+                <div className="list">{promotionReadiness.map((entry) => <div className="row" key={entry.strategyFamily}><strong>{entry.strategyFamily || "-"}</strong><span>{String(Boolean(entry.eligibleForLiveReview))}</span><span className="mono">{entry.evaluatedTrades ?? 0}/{entry.totalTrades ?? 0}</span><span className="mono">PF {entry.profitFactorLiveLike ?? 0}</span><span>{entry.blockReasons?.join(", ") || "none"}</span></div>)}{!promotionReadiness.length ? <p className="subtle">No promotion analytics yet.</p> : null}</div>
+              </> : <p className="warning">{learningSummary?.error || "Unavailable"}</p>}
             </div>
-            {optionRows.slice(0, 10).map((entry) => (
-              <div key={entry.option_symbol}>
-                <div className="option-row">
-                  <span>{entry.displayCategory}</span>
-                  <strong>{entry.option_symbol}</strong>
-                  <span>{entry.quoteStatus}</span>
-                  <span>{String(entry.executable)}</span>
-                  <span>{entry.rejectionReason || "-"}</span>
-                  <span className="mono">{optionPrice(entry.executablePrice)}</span>
-                  <span>{entry.executablePriceSource || "-"}</span>
-                </div>
-                <div className="option-evidence-grid">
-                  <span><b>Underlying Price</b>{formatOptionDecisionField(entry.decisionUse.underlyingPrice)}</span>
-                  <span><b>Strike</b>{formatOptionDecisionField(entry.decisionUse.strike)}</span>
-                  <span><b>Days to Expiration</b>{formatOptionDecisionField(entry.decisionUse.daysToExpiration)}</span>
-                  <span><b>Delta</b>{formatOptionDecisionField(entry.decisionUse.delta)}</span>
-                  <span><b>Gamma</b>{formatOptionDecisionField(entry.decisionUse.gamma)}</span>
-                  <span><b>Theta</b>{formatOptionDecisionField(entry.decisionUse.theta)}</span>
-                  <span><b>Vega</b>{formatOptionDecisionField(entry.decisionUse.vega)}</span>
-                  <span><b>Rho</b>{formatOptionDecisionField(entry.decisionUse.rho)}</span>
-                  <span><b>Implied Volatility</b>{formatOptionDecisionField(entry.decisionUse.impliedVolatility)}</span>
-                  <span><b>Bid</b>{formatOptionDecisionField(entry.decisionUse.bid)}</span>
-                  <span><b>Ask</b>{formatOptionDecisionField(entry.decisionUse.ask)}</span>
-                  <span><b>Midpoint</b>{formatOptionDecisionField(entry.decisionUse.midpoint)}</span>
-                  <span><b>Last Price</b>{formatOptionDecisionField(entry.decisionUse.last)}</span>
-                  <span><b>Spread %</b>{formatOptionDecisionField(entry.decisionUse.spreadPercentage, "%")}</span>
-                  <span><b>Open Interest</b>{formatOptionDecisionField(entry.decisionUse.openInterest)}</span>
-                  <span><b>Volume</b>{formatOptionDecisionField(entry.decisionUse.volume)}</span>
-                  <span><b>Quote Timestamp</b>{formatOptionEvidenceValue(entry.quoteTimestamp, entry.decisionSnapshot.availability.quote)}</span>
-                  <span><b>Quote Age</b>{formatOptionDecisionField(entry.decisionUse.quoteAgeMs, " ms")}</span>
-                  <span><b>Data Source</b>{entry.sourceFeed || entry.source || formatOptionEvidenceValue(null, entry.decisionSnapshot.availability.snapshot)}</span>
-                  <span><b>Greek Status</b>{entry.greekAvailability} · {entry.dataQualityStatus}</span>
-                  <span><b>Decision Use</b>Each value includes used, retrieved-but-unused, unavailable, stale, or invalid status.</span>
-                  <span className="option-evidence-reason"><b>Rejection Reason</b>{entry.rejectionReasons.join(", ") || "-"}</span>
-                </div>
-              </div>
-            ))}
-            {!optionRows.length ? <p className="subtle">No option contracts discovered.</p> : null}
+            <div className="panel">
+              <h2>Latest research</h2>
+              <div className="list">{(snapshot?.latestResearch || []).map((row) => { const researchRow = row as Record<string, unknown>; return <div className="row" key={String(researchRow.id || "research")}><strong>{String(researchRow.risk_profile || "-")}</strong><span>{String(researchRow.status || "-")}</span><span className="mono">{String(researchRow.candidates_selected ?? "-")}</span></div>; })}{!snapshot?.latestResearch?.length ? <p className="subtle">Successful-empty: no research runs are available.</p> : null}</div>
+            </div>
+            <div className="panel">
+              <h2>Dry run</h2>
+              {dryRun?.ok ? <><Metric label="Would submit" value={dryRun.data.summary.wouldSubmitCount} /><Metric label="Blocked payloads" value={dryRun.data.summary.payloadsBlocked} /><Metric label="Asset filter" value={dryRun.data.assetClass} /></> : <p className="warning">{dryRun?.error || "Unavailable"}</p>}
+            </div>
           </div>
-        </div>
+        </details>
 
-        <div className="panel">
-          <h2>Recent Request IDs</h2>
-          <pre>{JSON.stringify(snapshot?.requestIds || [], null, 2)}</pre>
-        </div>
-      </section>
-    </main>
+        <details className="detail-section" id="evidence">
+          <summary><DetailHeader title="PostgreSQL evidence" description="Durable lineage, execution ledger, option evidence, and request IDs." /></summary>
+          <div className="detail-grid">
+            <PostgresEvidencePanel plans={snapshot?.latestPaperPlans || []} intents={snapshot?.orderIntents || []} lifecycle={snapshot?.autonomousLifecycle || []} />
+            <div className="panel full"><h2>Execution ledger</h2>{executions?.ok ? <div className="list">{executions.data.slice(0, 12).map((entry) => <div className="row" key={entry.id || entry.broker_order_id || entry.clientOrderId}><strong>{entry.symbol || "-"}</strong><span>{entry.status || "-"} {entry.strategy ? `- ${entry.strategy}` : ""}</span><span className="mono">{entry.broker_order_id || entry.clientOrderId || "-"}</span><span>intent {entry.order_intent_id || "-"}</span><span>position {entry.position_id || "-"}</span><span>fill {entry.filled_quantity ?? "-"} @ {entry.filled_average_price ?? "-"}</span><span>reconciled {entry.last_reconciled_at || "-"}</span></div>)}{!executions.data.length ? <p className="subtle">No ledger rows yet.</p> : null}</div> : <p className="warning">{executions?.error || "Unavailable"}</p>}</div>
+            <div className="panel wide">
+              <h2>Option contracts</h2>
+              <div className="option-counts"><Metric label="Discovered" value={optionCategoryCount(optionRows, "Discovered")} /><Metric label="Quoted" value={optionCategoryCount(optionRows, "Quoted")} /><Metric label="Executable" value={optionCategoryCount(optionRows, "Executable")} /><Metric label="Rejected" value={optionCategoryCount(optionRows, "Rejected")} /></div>
+              <div className="option-table"><div className="option-row option-head"><span>Category</span><span>Contract</span><span>Quote Status</span><span>Executable</span><span>Reject Reason</span><span>Executable Price</span><span>Source</span></div>{optionRows.slice(0, 10).map((entry) => <div key={entry.option_symbol}><div className="option-row"><span>{entry.displayCategory}</span><strong>{entry.option_symbol}</strong><span>{entry.quoteStatus}</span><span>{String(entry.executable)}</span><span>{entry.rejectionReason || "-"}</span><span className="mono">{optionPrice(entry.executablePrice)}</span><span>{entry.executablePriceSource || "-"}</span></div><div className="option-evidence-grid"><span><b>Underlying price</b>{formatOptionDecisionField(entry.decisionUse.underlyingPrice)}</span><span><b>Strike</b>{formatOptionDecisionField(entry.decisionUse.strike)}</span><span><b>DTE</b>{formatOptionDecisionField(entry.decisionUse.daysToExpiration)}</span><span><b>Delta</b>{formatOptionDecisionField(entry.decisionUse.delta)}</span><span><b>Gamma</b>{formatOptionDecisionField(entry.decisionUse.gamma)}</span><span><b>Theta</b>{formatOptionDecisionField(entry.decisionUse.theta)}</span><span><b>Vega</b>{formatOptionDecisionField(entry.decisionUse.vega)}</span><span><b>Rho</b>{formatOptionDecisionField(entry.decisionUse.rho)}</span><span><b>IV</b>{formatOptionDecisionField(entry.decisionUse.impliedVolatility)}</span><span><b>Bid</b>{formatOptionDecisionField(entry.decisionUse.bid)}</span><span><b>Ask</b>{formatOptionDecisionField(entry.decisionUse.ask)}</span><span><b>Midpoint</b>{formatOptionDecisionField(entry.decisionUse.midpoint)}</span><span><b>Last</b>{formatOptionDecisionField(entry.decisionUse.last)}</span><span><b>Spread %</b>{formatOptionDecisionField(entry.decisionUse.spreadPercentage, "%")}</span><span><b>Open interest</b>{formatOptionDecisionField(entry.decisionUse.openInterest)}</span><span><b>Volume</b>{formatOptionDecisionField(entry.decisionUse.volume)}</span><span><b>Quote time</b>{formatOptionEvidenceValue(entry.quoteTimestamp, entry.decisionSnapshot.availability.quote)}</span><span><b>Quote age</b>{formatOptionDecisionField(entry.decisionUse.quoteAgeMs, " ms")}</span><span><b>Source</b>{entry.sourceFeed || entry.source || formatOptionEvidenceValue(null, entry.decisionSnapshot.availability.snapshot)}</span><span><b>Greek status</b>{entry.greekAvailability} · {entry.dataQualityStatus}</span><span className="option-evidence-reason"><b>Rejection reason</b>{entry.rejectionReasons.join(", ") || "-"}</span></div></div>)}{!optionRows.length ? <p className="subtle">No option contracts discovered.</p> : null}</div>
+            </div>
+            <div className="panel"><h2>Recent request IDs</h2><pre>{JSON.stringify(snapshot?.requestIds || [], null, 2)}</pre></div>
+          </div>
+        </details>
+
+        <details className="guarded-actions" id="controls">
+          <summary><DetailHeader title="Guarded actions" description="High-impact paper actions are hidden by default. Expand deliberately." /></summary>
+          <ActionPanel readOnly={vercelReadOnly} />
+        </details>
+      </main>
+    </div>
   );
 }

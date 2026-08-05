@@ -95,6 +95,9 @@ const actions: ActionConfig[] = [
   }
 ];
 
+const routineActions = actions.filter((action) => !action.submit);
+const executionActions = actions.filter((action) => action.submit);
+
 type DashboardControlPayload = {
   ok: boolean;
   status?: ActionStatus | string;
@@ -447,74 +450,101 @@ export function ActionPanel({ readOnly = false }: { readOnly?: boolean }) {
     }
   };
 
-  return (
-    <div className="panel full">
-      <h2>Paper Trading Controls</h2>
-      <p className="warning">Paper only. Live trading disabled required. Guarded VPS actions only.</p>
-      <label className="subtle">
-        Dashboard admin token
-        <input
-          type="password"
-          value={adminToken}
-          onChange={(event) => setAdminToken(event.target.value)}
-          placeholder="DASHBOARD_ADMIN_TOKEN"
-          autoComplete="off"
-        />
-      </label>
-      <div className="action-grid">
-        {actions.map((action) => {
-          const state = states[action.path];
-          const actionDisabled = readOnly || busy !== null;
-          return (
-            <div className="action-card" key={action.path}>
-              <div className="action-card-head">
-                <h3>{action.label}</h3>
-                <span className={`state-pill ${state.status}`}>{state.status}</span>
-              </div>
-              <p className="subtle">{action.description}</p>
-              {action.warning ? <p className="warning">{action.warning}</p> : null}
-              <div className="action-meta">
-                <span>Last run</span>
-                <strong>{state.lastRunAt || "-"}</strong>
-                <span>Request ID</span>
-                <strong>{state.requestId || "-"}</strong>
-                <span>Correlation ID</span>
-                <strong>{state.correlationId || "-"}</strong>
-              </div>
-              <button
-                className={`action-button${action.submit ? " submit" : ""}`}
-                disabled={actionDisabled}
-                onClick={() => runAction(action)}
-                type="button"
-                title={
-        action.requiresReviewedPayloads
-          ? "The VPS validates the latest persisted reviewed payload when this action runs."
-          : undefined
-      }
-              >
-                {busy === action.path ? "Running..." : action.label}
-              </button>
-              <p className="status">{state.summary}</p>
-              {state.details.length ? (
-                <ul className="subtle">
-                  {state.details.map((entry) => (
-                    <li key={`${action.path}-${entry}`}>{entry}</li>
-                  ))}
-                </ul>
-              ) : null}
-              <details>
-                <summary>Raw JSON details</summary>
-                <pre>{JSON.stringify(state.raw, null, 2)}</pre>
-              </details>
-            </div>
-          );
-        })}
+  const renderAction = (action: ActionConfig) => {
+    const state = states[action.path];
+    const actionDisabled = readOnly || busy !== null;
+    return (
+      <div className={`action-row${action.submit ? " execution-action" : ""}`} key={action.path}>
+        <div className="action-copy">
+          <div className="action-card-head">
+            <h3>{action.label}</h3>
+            <span className={`state-pill ${state.status}`}>{state.status}</span>
+          </div>
+          <p>{action.description}</p>
+          {action.warning ? <strong className="danger">{action.warning}</strong> : null}
+          <span className="action-summary">{state.summary}</span>
+        </div>
+        <button
+          className={`action-button${action.submit ? " submit" : ""}`}
+          disabled={actionDisabled}
+          onClick={() => runAction(action)}
+          type="button"
+          title={
+            action.requiresReviewedPayloads
+              ? "The VPS validates the latest persisted reviewed payload when this action runs."
+              : undefined
+          }
+        >
+          {busy === action.path ? "Running..." : action.label}
+        </button>
+        <details className="action-details">
+          <summary>Run details</summary>
+          <div className="action-meta">
+            <span>Last run</span><strong>{state.lastRunAt || "-"}</strong>
+            <span>Request ID</span><strong>{state.requestId || "-"}</strong>
+            <span>Correlation ID</span><strong>{state.correlationId || "-"}</strong>
+          </div>
+          {state.details.length ? (
+            <ul className="subtle">
+              {state.details.map((entry) => <li key={`${action.path}-${entry}`}>{entry}</li>)}
+            </ul>
+          ) : null}
+          <details>
+            <summary>Raw JSON</summary>
+            <pre>{JSON.stringify(state.raw, null, 2)}</pre>
+          </details>
+        </details>
       </div>
-      <p className="status">{busy ? "Working..." : status}</p>
-      <details>
-        <summary>Recent operation history</summary>
-        <pre>{JSON.stringify(history, null, 2)}</pre>
+    );
+  };
+
+  return (
+    <div className="control-panel">
+      <div className="control-panel-header">
+        <div>
+          <h2>Paper Trading Controls</h2>
+          <p>Paper only. Live trading disabled required. Guarded VPS actions only.</p>
+        </div>
+        <label>
+          <span>Dashboard admin token</span>
+          <input
+            type="password"
+            value={adminToken}
+            onChange={(event) => setAdminToken(event.target.value)}
+            placeholder="DASHBOARD_ADMIN_TOKEN"
+            autoComplete="off"
+          />
+        </label>
+      </div>
+
+      <section className="action-group">
+        <div className="action-group-heading">
+          <h3>Routine paper workflows</h3>
+          <p>Research, review, discovery, and learning actions. These do not submit orders.</p>
+        </div>
+        <div className="action-list">{routineActions.map(renderAction)}</div>
+      </section>
+
+      <details className="execution-actions">
+        <summary>
+          <span>
+            <strong>Paper-mutating execution controls</strong>
+            <small>Collapsed by default. Every action retains confirmation and paper-only gates.</small>
+          </span>
+          <span className={executeReady ? "healthy-text" : "danger-text"}>
+            {executeReady ? "REVIEW READY" : "NOT READY"}
+          </span>
+        </summary>
+        <div className="action-list">{executionActions.map(renderAction)}</div>
       </details>
+
+      <div className="control-footer">
+        <p className="status" aria-live="polite">{busy ? "Working..." : status}</p>
+        <details>
+          <summary>Recent operation history</summary>
+          <pre>{JSON.stringify(history, null, 2)}</pre>
+        </details>
+      </div>
     </div>
   );
 }
