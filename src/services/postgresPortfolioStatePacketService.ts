@@ -5,7 +5,7 @@ import type {
   PostgresAuthorityBrokerSnapshot
 } from "./postgresAuthorityBrokerSnapshot.js";
 
-export const PORTFOLIO_STATE_PACKET_VALIDITY_MS = 120_000;
+export const PORTFOLIO_STATE_PACKET_VALIDITY_MS = 180_000;
 
 export type PortfolioStateStrategyFamily =
   | "leaps"

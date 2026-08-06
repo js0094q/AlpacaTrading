@@ -194,7 +194,7 @@ test("builds an authoritative packet with literal capital, exposure, option iden
   assert.match(packet.packetId, /^psp-[a-f0-9]{32}$/);
   assert.equal(packet.packetFingerprint, portfolioStatePacketFingerprint(packet));
   assert.equal(packet.generatedAt, now);
-  assert.equal(packet.validUntil, "2026-08-05T14:02:00.000Z");
+  assert.equal(packet.validUntil, "2026-08-05T14:03:00.000Z");
   assert.deepEqual(packet.authority, {
     environment: "paper",
     paperOnly: true,
@@ -377,9 +377,15 @@ test("validation is fail closed for authority, freshness, reconciliation, duplic
     assert.equal(result.blockers.includes(entry.code), true, entry.name);
   }
 
+  const withinExtendedWindow = validatePostgresPortfolioStatePacket({
+    packet: validPacket,
+    now: "2026-08-05T14:02:08.000Z"
+  });
+  assert.equal(withinExtendedWindow.blockers.includes("PORTFOLIO_STATE_STALE"), false);
+
   const stale = validatePostgresPortfolioStatePacket({
     packet: validPacket,
-    now: "2026-08-05T14:02:01.000Z"
+    now: "2026-08-05T14:03:01.000Z"
   });
   assert.equal(stale.blockers.includes("PORTFOLIO_STATE_STALE"), true);
 
