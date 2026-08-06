@@ -1454,6 +1454,10 @@ test("reconciliation synchronizes broker account and positions into PostgreSQL a
   assert.equal(packet.schemaVersion, "portfolio-state-v1");
   assert.equal((packet.authority as Record<string, unknown>).paperOnly, true);
   assert.equal((packet.authority as Record<string, unknown>).postgresOnly, true);
+  assert.equal(
+    (packet.account as Record<string, unknown>).accountId,
+    "paper-account-hash"
+  );
   assert.equal((packet.account as Record<string, unknown>).reservedCapital, 100);
   assert.equal((packet.account as Record<string, unknown>).availableValidatedCapital, 9900);
   assert.equal((packet.reconciliation as Record<string, unknown>).status, "matched");

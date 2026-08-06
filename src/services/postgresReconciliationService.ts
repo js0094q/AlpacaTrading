@@ -700,7 +700,7 @@ const syncBrokerAccountAndPositions = async (input: {
   ].every((value) => typeof value === "string" && value.trim().length > 0);
   const packet = buildPostgresPortfolioStatePacket({
     now: snapshot.capturedAt,
-    accountId: snapshot.accountId ?? accountId,
+    accountId: snapshot.accountIdentityHash,
     brokerSnapshot: snapshot,
     recentOrders: snapshot.recentOrders ?? [],
     authority: {
