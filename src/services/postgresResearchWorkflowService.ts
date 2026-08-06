@@ -732,6 +732,7 @@ const persistCandidates = async (input: {
   cycleId: string;
   optionsEnabled: boolean;
   requestedLane?: PostgresResearchLane;
+  excludeZeroDte?: boolean;
   targets: FeatureTargetResult["targets"];
   maxCandidates: number;
   now: Date;
@@ -750,7 +751,8 @@ const persistCandidates = async (input: {
   const evaluated = input.targets
     .filter((target) =>
       (requestedFamily === undefined || target.strategyFamily === requestedFamily) &&
-      (target.strategyFamily !== "zero_dte_spy" || target.symbol === "SPY")
+      (target.strategyFamily !== "zero_dte_spy" || target.symbol === "SPY") &&
+      !(input.excludeZeroDte && target.strategyFamily === "zero_dte_spy")
     )
     .map((target) => {
       const preferredOption = executableOption(target);
@@ -981,11 +983,9 @@ const persistCandidates = async (input: {
     loadSharedContext: async () => decisions,
     lanes: INVESTMENT_LANE_FAMILIES.map(([lane, family]) => ({
       lane,
-      enabled: investmentLaneEnabled(
-        lane,
-        input.optionsEnabled,
-        input.requestedLane
-      ),
+      enabled:
+        !(input.excludeZeroDte && lane === "options_0dte") &&
+        investmentLaneEnabled(lane, input.optionsEnabled, input.requestedLane),
       execute: (sharedDecisions) => {
         const laneDecisions = sharedDecisions.filter(
           (row) => row.strategyFamily === family
@@ -1027,6 +1027,7 @@ export const runPostgresResearchWorkflow = async (input: {
   riskProfile: RiskProfile;
   optionsEnabled: boolean;
   requestedLane?: PostgresResearchLane;
+  excludeZeroDte?: boolean;
   maxCandidates: number;
   cycleId?: string;
   now?: Date;
@@ -1036,6 +1037,9 @@ export const runPostgresResearchWorkflow = async (input: {
   emitTelemetry?: (event: Record<string, unknown>) => void;
 }) => {
   const deps = { ...dependencies, ...input.dependencies };
+  const researchSymbols = input.requestedLane === "options_0dte"
+    ? ["SPY"]
+    : deps.symbols;
   const now = input.now ?? deps.now();
   const nowIso = now.toISOString();
   const runId = `research_${randomUUID()}`;
@@ -1049,6 +1053,7 @@ export const runPostgresResearchWorkflow = async (input: {
   const config = {
     riskProfile: input.riskProfile,
     optionsEnabled: input.optionsEnabled,
+    excludeZeroDte: input.excludeZeroDte === true,
     maxCandidates: input.maxCandidates,
     barLookbackDays: 365,
     marketDataAuthority: "postgres",
@@ -1105,7 +1110,7 @@ export const runPostgresResearchWorkflow = async (input: {
       reason: "startup",
       feed: "sip",
       load: () => deps.refreshMarketData({
-        symbols: deps.symbols,
+        symbols: researchSymbols,
         timeframe: "1Day",
         start: new Date(now.getTime() - 365 * 86_400_000).toISOString(),
         end: nowIso,
@@ -1162,6 +1167,7 @@ export const runPostgresResearchWorkflow = async (input: {
       cycleId,
       optionsEnabled: input.optionsEnabled,
       requestedLane: input.requestedLane,
+      excludeZeroDte: input.excludeZeroDte,
       targets: generated.targets, maxCandidates: input.maxCandidates, now,
       explorationThresholds: {
         ...explorationThresholds,
@@ -1184,7 +1190,7 @@ export const runPostgresResearchWorkflow = async (input: {
            candidates_selected = $4, summary = $5::jsonb, completed_at = $6,
            heartbeat_at = $6, updated_at = $6, version = version + 1
        WHERE id = $1 AND status = 'running' AND ${fenceSql(7)}`,
-      [runId, deps.symbols.length, generated.targets.length, candidateDecisions.selected,
+      [runId, researchSymbols.length, generated.targets.length, candidateDecisions.selected,
         JSON.stringify({
           ...market.summary,
           evidenceStored,
@@ -1207,7 +1213,7 @@ export const runPostgresResearchWorkflow = async (input: {
     return {
       status: "completed" as const,
       runId,
-      universeSize: deps.symbols.length,
+      universeSize: researchSymbols.length,
       targetsGenerated: generated.targets.length,
       candidatesSelected: candidateDecisions.selected,
       candidatesRejected: candidateDecisions.rejected,

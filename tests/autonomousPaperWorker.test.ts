@@ -20,16 +20,16 @@ const workerPath = join(repoRoot, "scripts/autonomous-paper-worker.mjs");
 
 const workstreams = [
   "zero-dte:reconcile",
+  "paper:options:discover",
+  "zero-dte:engine",
+  "zero-dte:reconcile",
   "research:daily",
   "paper:evidence:refresh",
-  "paper:options:discover",
   "paper:review",
   "paper:portfolio:review",
   "paper:ops:review",
   "hedge:review",
   "paper:execute:reviewed",
-  "zero-dte:engine",
-  "zero-dte:reconcile",
   "paper:exit:review",
   "zero-dte:exit:review",
   "hedge:exit:review",
@@ -44,16 +44,16 @@ const workstreams = [
 
 const executedCommands = [
   "zero-dte:reconcile",
+  "paper:options:discover",
+  "zero-dte:engine",
+  "zero-dte:reconcile",
   "research:daily",
   "paper:evidence:refresh",
-  "paper:options:discover",
   "paper:review",
   "paper:portfolio:review",
   "paper:ops:review",
   "hedge:review",
   "paper:execute:reviewed",
-  "zero-dte:reconcile",
-  "zero-dte:engine",
   "zero-dte:reconcile",
   "paper:exit:review",
   "zero-dte:exit:review",
@@ -598,11 +598,21 @@ test("approved worker validates the production contract and persists a complete 
   assert.deepEqual(workstreamCalls.map((call) => call.command), executedCommands);
   assert.ok(workstreamCalls.every((call) => call.cycleId === states[0]?.cycleId));
   assert.ok(workstreamCalls.every((call) => call.workstream === call.command));
-  assert.equal(
-    workstreamCalls.find((call) => call.command === "research:daily")
-      ?.args.includes("--maxCandidates=25"),
-    true
+  const researchCalls = workstreamCalls.filter((call) => call.command === "research:daily");
+  assert.equal(researchCalls.length, 1);
+  const generalResearch = researchCalls[0];
+  assert.equal(generalResearch?.args.includes("--maxCandidates=25"), true);
+  assert.equal(generalResearch?.args.includes("--excludeZeroDte=true"), true);
+  assert.ok(
+    workstreamCalls.findIndex((call) => call.command === "paper:options:discover") <
+      workstreamCalls.indexOf(generalResearch!),
+    "the dedicated 0DTE path must run before general research"
   );
+  const zeroDteDiscoveryIndex = workstreamCalls.findIndex(
+    (call) => call.command === "paper:options:discover"
+  );
+  assert.equal(workstreamCalls[zeroDteDiscoveryIndex + 1]?.command, "zero-dte:engine");
+  assert.equal(workstreamCalls[zeroDteDiscoveryIndex + 2]?.command, "zero-dte:reconcile");
   assert.ok(calls.every((call) => call.safety.alpacaEnv === "paper"));
   assert.ok(calls.every((call) => call.safety.tradingMode === "paper"));
   assert.ok(calls.every((call) => call.safety.alpacaLiveTrade === "false"));
@@ -916,8 +926,13 @@ test("a 0DTE lane failure is isolated while other broker mutation failures remai
       0,
       `${mutation}: ${result.stderr || result.stdout}`
     );
+    const callsAfterFailureReconciliation = invoked.slice(mutationIndex + 2);
     for (const laterMutation of brokerMutations.slice(mutationPosition + 1)) {
-      assert.equal(invoked.includes(laterMutation), false, laterMutation);
+      assert.equal(
+        callsAfterFailureReconciliation.includes(laterMutation),
+        false,
+        laterMutation
+      );
     }
     assert.equal(states.at(-2)?.eventType, "workstream_failed", mutation);
     assert.equal(states.at(-2)?.payload.workstream, mutation, mutation);
@@ -1061,7 +1076,7 @@ test("successful workstreams forward structured PostgreSQL telemetry with cycle 
   );
   assert.ok(batch, result.stdout);
   assert.equal(batch.cycle, 1);
-  assert.equal(batch.position, 2);
+  assert.equal(batch.position, 5);
   assert.equal(batch.workstream, "research:daily");
   assert.match(String(batch.cycleId), /^[0-9a-f-]{36}$/i);
   assert.equal(batch.batchNumber, 1);
@@ -1078,14 +1093,20 @@ test("an ordinary workstream failure fails fast with durable terminal state", ()
     calls.filter((call) => call.command !== "worker:state").map((call) => call.command),
     [
       "zero-dte:reconcile",
+      "paper:options:discover",
+      "zero-dte:engine",
+      "zero-dte:reconcile",
       "research:daily",
       "paper:evidence:refresh",
-      "paper:options:discover",
       "paper:review"
     ]
   );
   assert.deepEqual(states.map((state) => state.eventType), [
     "cycle_started",
+    "workstream_started",
+    "workstream_completed",
+    "workstream_started",
+    "workstream_completed",
     "workstream_started",
     "workstream_completed",
     "workstream_started",

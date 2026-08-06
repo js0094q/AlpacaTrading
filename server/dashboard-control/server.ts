@@ -374,10 +374,32 @@ const runScheduledCommand = async (command: string, context: ControlContext) => 
           maxCandidates: context.input.maxCandidates
         });
       }
+      if (command === "paper:options:discover") {
+        const research = await runPostgresResearchWorkflow({
+          query,
+          fence: scheduledContext.fence,
+          riskProfile: "aggressive",
+          optionsEnabled: true,
+          requestedLane: "options_0dte",
+          maxCandidates: context.input.maxCandidates
+        });
+        const review = await runPostgresReviewWorkflow({
+          command,
+          query,
+          fence: scheduledContext.fence,
+          researchRunId: research.runId,
+          underlying: "SPY",
+          dte: 0
+        });
+        return {
+          researchRunId: research.runId,
+          candidatesSelected: research.candidatesSelected,
+          ...review
+        };
+      }
       if ([
         "paper:review",
         "paper:portfolio:review",
-        "paper:options:discover",
         "paper:ops:review",
         "paper:exit:review",
         "hedge:review",

@@ -146,7 +146,6 @@ const AUTONOMOUS_INSPECTION_COMMANDS = new Set([
 const AUTONOMOUS_REVIEW_COMMANDS = new Set([
   "paper:review",
   "paper:portfolio:review",
-  "paper:options:discover",
   "paper:ops:review",
   "paper:exit:review",
   "hedge:review",
@@ -545,6 +544,9 @@ const run = async (scheduledContext?: PostgresScheduledCommandOperationContext) 
           riskProfile,
           optionsEnabled,
           requestedLane,
+          excludeZeroDte: ["true", "1"].includes(
+            String(args.excludeZeroDte).toLowerCase()
+          ),
           maxCandidates,
           signal: context.signal,
           emitTelemetry: emitRuntimeTelemetry
@@ -587,6 +589,41 @@ const run = async (scheduledContext?: PostgresScheduledCommandOperationContext) 
     return;
   }
 
+  if (command === "paper:options:discover") {
+    const context = requireScheduledContext(scheduledContext);
+    const query = queryAdapter(context.pool);
+    const maxCandidates = Math.max(
+      1,
+      Math.min(25, Number.parseInt(String(args.maxCandidates || "25"), 10) || 25)
+    );
+    const research = await runPostgresResearchWorkflow({
+      query,
+      fence: context.fence,
+      riskProfile: "aggressive",
+      optionsEnabled: true,
+      requestedLane: "options_0dte",
+      maxCandidates,
+      signal: context.signal,
+      emitTelemetry: emitRuntimeTelemetry
+    });
+    const review = await runPostgresReviewWorkflow({
+      command,
+      query,
+      fence: context.fence,
+      researchRunId: research.runId,
+      underlying: "SPY",
+      dte: 0
+    });
+    print({
+      ...paperEnvelope(),
+      command,
+      researchRunId: research.runId,
+      candidatesSelected: research.candidatesSelected,
+      ...review
+    });
+    return;
+  }
+
   if (command && AUTONOMOUS_REVIEW_COMMANDS.has(command)) {
     const context = requireScheduledContext(scheduledContext);
     const maxCandidates = Math.max(
@@ -598,13 +635,7 @@ const run = async (scheduledContext?: PostgresScheduledCommandOperationContext) 
       query: queryAdapter(context.pool),
       fence: context.fence,
       researchRunId: String(args.researchRunId || "").trim() || undefined,
-      maxCandidates,
-      ...(command === "paper:options:discover"
-        ? {
-            underlying: String(args.underlying || ""),
-            dte: Number.parseInt(String(args.dte ?? ""), 10)
-          }
-        : {})
+      maxCandidates
     });
     print({ ...paperEnvelope(), command, ...result });
     return;

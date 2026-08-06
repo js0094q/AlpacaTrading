@@ -1384,6 +1384,7 @@ test("the explicit LEAPS lane persists its option-backed target as a LEAPS optio
 
 test("the explicit 0DTE lane persists only the SPY same-day option target", async () => {
   const candidateWrites: Array<readonly unknown[]> = [];
+  let refreshedSymbols: readonly string[] = [];
   const optionBackedTarget = (symbol: string, optionSymbol: string) => ({
     ...target,
     symbol,
@@ -1420,13 +1421,16 @@ test("the explicit 0DTE lane persists only the SPY same-day option target", asyn
     maxCandidates: 10,
     now: new Date("2026-07-20T18:00:00.000Z"),
     dependencies: {
-      refreshMarketData: async () => ({
-        bars: [bar],
-        stockSnapshots: [],
-        optionContracts: [],
-        optionSnapshots: [],
-        summary: {}
-      }) as never,
+      refreshMarketData: async (input) => {
+        refreshedSymbols = input.symbols;
+        return {
+          bars: [bar],
+          stockSnapshots: [],
+          optionContracts: [],
+          optionSnapshots: [],
+          summary: {}
+        } as never;
+      },
       buildFeaturesAndTargets: async () => ({
         features: [],
         targets: [
@@ -1440,6 +1444,7 @@ test("the explicit 0DTE lane persists only the SPY same-day option target", asyn
   });
 
   assert.equal(result.candidatesSelected, 1);
+  assert.deepEqual(refreshedSymbols, ["SPY"]);
   assert.equal(candidateWrites.length, 1);
   assert.equal(candidateWrites[0]?.[2], "SPY");
   assert.equal(candidateWrites[0]?.[4], "SPY260720C00555000");
@@ -1509,6 +1514,38 @@ test("the normal options cycle persists zero_dte_spy only for SPY", async () => 
   assert.equal(candidateWrites[0]?.[2], "SPY");
   assert.equal(candidateWrites[0]?.[4], "SPY260720C00555000");
   assert.equal(candidateWrites[0]?.[12], "zero_dte_spy");
+
+  candidateWrites.length = 0;
+  const withoutZeroDte = await runPostgresResearchWorkflow({
+    query: researchAwareQuery((values) => { candidateWrites.push(values); }),
+    fence,
+    riskProfile: "aggressive",
+    optionsEnabled: true,
+    excludeZeroDte: true,
+    maxCandidates: 10,
+    now: new Date("2026-07-20T18:00:00.000Z"),
+    dependencies: {
+      refreshMarketData: async () => ({
+        bars: [bar],
+        stockSnapshots: [],
+        optionContracts: [],
+        optionSnapshots: [],
+        summary: {}
+      }) as never,
+      buildFeaturesAndTargets: async () => ({
+        features: [],
+        targets: [
+          zeroDteTarget("AMZN", "AMZN260720C00300000"),
+          zeroDteTarget("SPY", "SPY260720C00555000")
+        ]
+      }),
+      loadResearchSignals: async () => [],
+      symbols: ["AMZN", "SPY"]
+    }
+  });
+
+  assert.equal(withoutZeroDte.candidatesSelected, 0);
+  assert.equal(candidateWrites.length, 0);
 });
 
 test("0DTE remains independent and records only a current-session catalyst", async () => {
