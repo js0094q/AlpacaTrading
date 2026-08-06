@@ -111,6 +111,12 @@ do not consume current context, and unrelated symbols or lanes continue. No
 delta, margin, sector, optimizer, or learned strategy-weight model is
 inferred.
 
+When the PostgreSQL review source supplies its aggregate position packet, that
+exact-symbol aggregate is authoritative. The scalar position count remains a
+compatibility fallback only for callers that omit the aggregate. As a result,
+SPY equity does not impersonate a distinct SPY 0DTE contract, while an existing
+position in the same exact option contract still blocks a duplicate entry.
+
 The current `max_symbol_notional` policy remains keyed to the exact order
 symbol, matching the downstream execution gate. It is not repurposed as an
 underlying-wide equity/options or cross-contract cap. The pure arbitrator can
@@ -431,7 +437,7 @@ result. Same-day SPY expiration is evaluated against the
 `America/New_York` trading date and remains DTE zero.
 
 New autonomous LEAPS entries use the independent paper-only
-`LEAPS_MAX_ENTRY_CAPITAL_USD=5000` ceiling for each independently qualified
+`LEAPS_MAX_ENTRY_CAPITAL_USD=7500` ceiling for each independently qualified
 position. Contract cost is executable premium times the observed standard
 multiplier of 100 exactly once, and quantity is the integer floor of the lower
 of that per-position ceiling and independently validated available capital,
@@ -617,7 +623,7 @@ PAPER_EQUITY_NOTIONAL_PER_ORDER=1000
 PAPER_EQUITY_MAX_NOTIONAL_PER_ORDER=5000
 PAPER_EQUITY_MAX_PORTFOLIO_DEPLOY_PCT=50
 PAPER_EQUITY_MAX_POSITION_PCT=10
-LEAPS_MAX_ENTRY_CAPITAL_USD=5000
+LEAPS_MAX_ENTRY_CAPITAL_USD=7500
 PAPER_EQUITY_MIN_CASH_RESERVE_PCT=20
 PAPER_OPTION_MAX_PREMIUM_PER_CONTRACT=1500
 PAPER_OPTION_MAX_ORDER_NOTIONAL=1500

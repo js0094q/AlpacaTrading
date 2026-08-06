@@ -17,7 +17,7 @@ const paperEnvironment = (
   ...overrides
 });
 
-test("defaults the independent paper LEAPS per-position allocation to $5,000", () => {
+test("defaults the independent paper LEAPS per-position allocation to $7,500", () => {
   const result = resolveLeapsEntryAllocation(paperEnvironment());
 
   assert.deepEqual(result, {
@@ -26,7 +26,7 @@ test("defaults the independent paper LEAPS per-position allocation to $5,000", (
     source: "paper_default",
     reason: null
   });
-  assert.equal(DEFAULT_LEAPS_MAX_ENTRY_CAPITAL_USD, 5_000);
+  assert.equal(DEFAULT_LEAPS_MAX_ENTRY_CAPITAL_USD, 7_500);
 });
 
 test("accepts an explicit paper LEAPS allocation at or below the phase ceiling", () => {
@@ -43,14 +43,14 @@ test("accepts an explicit paper LEAPS allocation at or below the phase ceiling",
   );
   assert.equal(
     resolveLeapsEntryAllocation(
-      paperEnvironment({ LEAPS_MAX_ENTRY_CAPITAL_USD: "5000" })
+      paperEnvironment({ LEAPS_MAX_ENTRY_CAPITAL_USD: "7500" })
     ).ok,
     true
   );
 });
 
 test("fails closed for explicit invalid, nonpositive, or over-boundary allocations", () => {
-  for (const value of ["", "not-a-number", "0", "-1", "5000.01"]) {
+  for (const value of ["", "not-a-number", "0", "-1", "7500.01"]) {
     const result = resolveLeapsEntryAllocation(
       paperEnvironment({ LEAPS_MAX_ENTRY_CAPITAL_USD: value })
     );
@@ -83,18 +83,19 @@ test("fails closed unless every execution gate is explicitly paper-only", () => 
   }
 });
 
-test("sizes each LEAPS position from the $5,000 ceiling without an artificial contract cap", () => {
+test("sizes each LEAPS position from the $7,500 ceiling without an artificial contract cap", () => {
   for (const [executablePremium, expectedQuantity] of [
-    [10, 5],
-    [15, 3],
-    [24, 2],
-    [30, 1],
-    [50, 1]
+    [10, 7],
+    [15, 5],
+    [24, 3],
+    [30, 2],
+    [50, 1],
+    [75, 1]
   ] as const) {
     const result = sizeLeapsEntry({
       executablePremium,
       contractMultiplier: LEAPS_CONTRACT_MULTIPLIER,
-      maxEntryCapitalUsd: 5_000,
+      maxEntryCapitalUsd: 7_500,
       independentlyValidatedAvailableCapitalUsd: 10_000
     });
 
@@ -112,13 +113,13 @@ test("applies the standard multiplier exactly once and returns an integer quanti
   const result = sizeLeapsEntry({
     executablePremium: 10,
     contractMultiplier: LEAPS_CONTRACT_MULTIPLIER,
-    maxEntryCapitalUsd: 5_000,
+    maxEntryCapitalUsd: 7_500,
     independentlyValidatedAvailableCapitalUsd: 100_000
   });
 
   assert.equal(LEAPS_CONTRACT_MULTIPLIER, 100);
   assert.equal(result.contractCostUsd, 1_000);
-  assert.equal(result.quantity, 5);
+  assert.equal(result.quantity, 7);
   assert.equal(Number.isInteger(result.quantity), true);
 });
 
@@ -126,7 +127,7 @@ test("fails closed when a positive premium would produce an unsafe integer quant
   const result = sizeLeapsEntry({
     executablePremium: 1e-320,
     contractMultiplier: LEAPS_CONTRACT_MULTIPLIER,
-    maxEntryCapitalUsd: 5_000,
+    maxEntryCapitalUsd: 7_500,
     independentlyValidatedAvailableCapitalUsd: 100_000
   });
 
@@ -137,13 +138,13 @@ test("fails closed when a positive premium would produce an unsafe integer quant
 
 test("classifies a contract over the LEAPS allocation explicitly", () => {
   const result = sizeLeapsEntry({
-    executablePremium: 50.01,
+    executablePremium: 76,
     contractMultiplier: LEAPS_CONTRACT_MULTIPLIER,
-    maxEntryCapitalUsd: 5_000,
+    maxEntryCapitalUsd: 7_500,
     independentlyValidatedAvailableCapitalUsd: 100_000
   });
 
-  assert.equal(result.contractCostUsd, 5_001);
+  assert.equal(result.contractCostUsd, 7_600);
   assert.equal(result.positionCostUsd, 0);
   assert.equal(result.quantity, 0);
   assert.equal(result.reason, "LEAPS_CONTRACT_COST_EXCEEDS_ALLOCATION");
@@ -153,7 +154,7 @@ test("validated available capital can reduce a LEAPS position below the allocati
   const result = sizeLeapsEntry({
     executablePremium: 10,
     contractMultiplier: LEAPS_CONTRACT_MULTIPLIER,
-    maxEntryCapitalUsd: 5_000,
+    maxEntryCapitalUsd: 7_500,
     independentlyValidatedAvailableCapitalUsd: 2_500
   });
 
@@ -167,7 +168,7 @@ test("keeps the existing validated capital boundary independently binding", () =
   const result = sizeLeapsEntry({
     executablePremium: 30,
     contractMultiplier: LEAPS_CONTRACT_MULTIPLIER,
-    maxEntryCapitalUsd: 5_000,
+    maxEntryCapitalUsd: 7_500,
     independentlyValidatedAvailableCapitalUsd: 2_999.99
   });
 
@@ -185,35 +186,35 @@ test("rejects nonstandard multipliers and invalid sizing inputs without a quanti
     {
       executablePremium: 30,
       contractMultiplier: 50,
-      maxEntryCapitalUsd: 5_000,
-      independentlyValidatedAvailableCapitalUsd: 5_000,
+      maxEntryCapitalUsd: 7_500,
+      independentlyValidatedAvailableCapitalUsd: 7_500,
       reason: "LEAPS_CONTRACT_MULTIPLIER_INVALID"
     },
     {
       executablePremium: 0,
       contractMultiplier: 100,
-      maxEntryCapitalUsd: 5_000,
-      independentlyValidatedAvailableCapitalUsd: 5_000,
+      maxEntryCapitalUsd: 7_500,
+      independentlyValidatedAvailableCapitalUsd: 7_500,
       reason: "LEAPS_EXECUTABLE_PREMIUM_INVALID"
     },
     {
       executablePremium: Number.MAX_VALUE,
       contractMultiplier: 100,
-      maxEntryCapitalUsd: 5_000,
-      independentlyValidatedAvailableCapitalUsd: 5_000,
+      maxEntryCapitalUsd: 7_500,
+      independentlyValidatedAvailableCapitalUsd: 7_500,
       reason: "LEAPS_EXECUTABLE_PREMIUM_INVALID"
     },
     {
       executablePremium: 30,
       contractMultiplier: 100,
       maxEntryCapitalUsd: 0,
-      independentlyValidatedAvailableCapitalUsd: 5_000,
+      independentlyValidatedAvailableCapitalUsd: 7_500,
       reason: "LEAPS_ENTRY_ALLOCATION_INVALID"
     },
     {
       executablePremium: 30,
       contractMultiplier: 100,
-      maxEntryCapitalUsd: 5_000,
+      maxEntryCapitalUsd: 7_500,
       independentlyValidatedAvailableCapitalUsd: -1,
       reason: "LEAPS_VALIDATED_AVAILABLE_CAPITAL_INVALID"
     }

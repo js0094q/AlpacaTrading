@@ -2106,6 +2106,8 @@ const portfolioResourceContext = (
   const currentPositions = jsonRecords(shared.current_positions)
     .map(positionExposure)
     .filter((value): value is PortfolioPositionExposure => Boolean(value));
+  const aggregatePositionsAvailable = shared.current_positions !== undefined &&
+    shared.current_positions !== null;
   const currentOpenOrders = jsonRecords(shared.current_open_orders)
     .map(orderExposure)
     .filter((value): value is PortfolioOrderExposure => Boolean(value));
@@ -2124,14 +2126,15 @@ const portfolioResourceContext = (
       )
     : null;
 
-  // Legacy count columns remain authoritative evidence for exact candidate
-  // conflicts even when an older query double does not supply aggregate JSON.
+  // Legacy count columns remain fail-closed compatibility evidence only when
+  // an older caller does not supply the authoritative aggregate JSON.
   for (const row of rows) {
     const orderSymbol = String(row.option_symbol ?? row.symbol)
       .trim()
       .toUpperCase();
     const underlyingSymbol = String(row.symbol).trim().toUpperCase();
     if (
+      !aggregatePositionsAvailable &&
       Number(row.open_position_count) > 0 &&
       !currentPositions.some(({ symbol }) => symbol === orderSymbol)
     ) {

@@ -1,5 +1,19 @@
 # Resume Context: Alpaca Trading Research Infra
 
+## 0DTE exact-contract exposure and LEAPS allocation (2026-08-06)
+
+- An authoritative aggregate position packet now controls exact-position
+  arbitration. The legacy scalar `open_position_count` synthesizes a position
+  only when an older caller omits that aggregate. SPY equity therefore does not
+  block a distinct SPY 0DTE option contract; the same exact option contract,
+  active orders, pending commitments, cash, buying power, portfolio capacity,
+  and risk limits remain binding.
+- The independent paper LEAPS per-entry ceiling is now exactly `$7,500` through
+  `LEAPS_MAX_ENTRY_CAPITAL_USD=7500`. Whole-contract sizing and independently
+  validated available capital remain unchanged.
+- This change performs no broker mutation and does not authorize deployment,
+  live trading, or a worker restart.
+
 ## Lane-aware target identity migration (2026-08-02)
 
 - Migration `010_lane_aware_target_identity.sql` changes target and option
@@ -158,7 +172,7 @@
   `zero_dte_long_call`/`zero_dte_long_put` or
   `leaps_long_call`/`leaps_long_put` order-intent metadata. The deterministic
   client-order-ID contract, PostgreSQL lineage, paper-only gates, OPRA
-  authority, LEAPS `$5,000` ceiling/multi-contract sizing, and equity sizing
+  authority, LEAPS `$7,500` ceiling/multi-contract sizing, and equity sizing
   remain unchanged.
 
 ## Autonomous worker-state persistence continuity (2026-07-28)
@@ -201,7 +215,7 @@
 - Same-day expiration uses the `America/New_York` trading date and remains DTE
   zero.
 - New paper LEAPS entries use independent per-position
-  `LEAPS_MAX_ENTRY_CAPITAL_USD=5000` sizing. Executable premium is multiplied
+  `LEAPS_MAX_ENTRY_CAPITAL_USD=7500` sizing. Executable premium is multiplied
   by the observed standard multiplier 100 exactly once, and integer quantity
   is the floor of the lower of the per-position ceiling and independently
   validated available capital divided by that contract cost. There is no

@@ -31,7 +31,7 @@ const paperLeapsEnvironment = {
   TRADING_MODE: "paper",
   ALPACA_LIVE_TRADE: "false",
   LIVE_TRADING_ENABLED: "false",
-  LEAPS_MAX_ENTRY_CAPITAL_USD: "5000"
+  LEAPS_MAX_ENTRY_CAPITAL_USD: "7500"
 };
 const completeLeapsCallGreeks = {
   impliedVolatility: 0.35,
@@ -259,6 +259,50 @@ const observedLeapsCallContract = {
   contract_option_symbol: "SPY270501C00560000",
   contract_id: "option-contract-SPY270501C00560000",
   contract_expiration_date: "2027-05-01"
+};
+
+const zeroDteEntryCandidate = (
+  candidateId: string,
+  currentPositions: readonly Record<string, unknown>[]
+) => {
+  const optionSymbol = "SPY260720C00560000";
+  return {
+    ...candidate,
+    ...observedLeapsCallContract,
+    candidate_id: candidateId,
+    candidate_strategy_family: "zero_dte_spy",
+    asset_class: "option" as const,
+    option_symbol: optionSymbol,
+    contract_option_symbol: optionSymbol,
+    contract_id: `option-contract-${optionSymbol}`,
+    contract_expiration_date: "2026-07-20",
+    preferred_expression: "option",
+    portfolio_state_packet: portfolioStatePacketForReviewAt(
+      "2026-07-20T14:29:50.000Z"
+    ),
+    market_price: "2",
+    market_timestamp: "2026-07-20T14:29:30.000Z",
+    sip_market_timestamp: "2026-07-20T14:29:30.000Z",
+    market_evidence: {
+      bid: 1.98,
+      ask: 2.02,
+      midpoint: 2,
+      spreadPct: 0.02,
+      volume: 5_000,
+      openInterest: 8_000,
+      underlyingPrice: 555,
+      requestedFeed: "opra",
+      effectiveFeed: "opra",
+      provider: "alpaca"
+    },
+    signal_inputs: {
+      marketDecisionInputs: {
+        option: { moneyness: 0.005, liquidityScore: 0.9 }
+      }
+    },
+    current_positions: currentPositions,
+    open_position_count: "1"
+  };
 };
 
 test("entry review persists signed PostgreSQL review and unconfirmed pending intent", async () => {
@@ -1322,6 +1366,84 @@ test("entry review classifies same-day expiration against the New York trading d
   assert.equal(reviewPacket?.packetFingerprint, intentPacket?.packetFingerprint);
 });
 
+test("0DTE exact-contract arbitration does not treat SPY equity as the held option", async () => {
+  const candidateUpdates: Array<readonly unknown[]> = [];
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("FROM candidates candidate")) {
+          return {
+            rows: [zeroDteEntryCandidate("zero-dte-with-spy-equity", [{
+                id: "position-spy-equity",
+                symbol: "SPY",
+                underlyingSymbol: "SPY",
+                direction: "long",
+                resourceExposure: 555
+              }])],
+            rowCount: 1
+          };
+        }
+        if (statement.includes("UPDATE candidates")) {
+          candidateUpdates.push(values ?? []);
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    now: new Date("2026-07-20T14:30:00.000Z")
+  });
+
+  assert.equal(result.status, "completed");
+  assert.equal(result.reviewsCreated, 1);
+  assert.equal(result.pendingIntentsCreated, 1);
+  assert.equal(candidateUpdates.some((values) =>
+    values[0] === "zero-dte-with-spy-equity" &&
+    values[2] === "ARBITRATION_SKIPPED_SYMBOL_EXPOSURE"
+  ), false);
+});
+
+test("0DTE exact-contract arbitration still rejects the held option contract", async () => {
+  const optionSymbol = "SPY260720C00560000";
+  const candidateUpdates: Array<readonly unknown[]> = [];
+  const result = await runPostgresReviewWorkflow({
+    command: "paper:review",
+    query: {
+      query: async (statement: string, values?: readonly unknown[]) => {
+        if (statement.includes("FROM candidates candidate")) {
+          return {
+            rows: [zeroDteEntryCandidate("zero-dte-exact-contract-held", [{
+                id: "position-spy-option",
+                symbol: optionSymbol,
+                underlyingSymbol: "SPY",
+                direction: "long",
+                resourceExposure: 200
+              }])],
+            rowCount: 1
+          };
+        }
+        if (statement.includes("UPDATE candidates")) {
+          candidateUpdates.push(values ?? []);
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    },
+    fence,
+    signingKey: "test-signing-key-with-sufficient-length",
+    now: new Date("2026-07-20T14:30:00.000Z")
+  });
+
+  assert.equal(result.status, "completed");
+  assert.equal(result.reviewsCreated, 0);
+  assert.equal(result.pendingIntentsCreated, 0);
+  assert.equal(candidateUpdates.some((values) =>
+    values[0] === "zero-dte-exact-contract-held" &&
+    values[1] === "skipped" &&
+    values[2] === "ARBITRATION_SKIPPED_SYMBOL_EXPOSURE"
+  ), true);
+});
+
 test("entry review preserves the LEAPS lane classification and evidence profile in order lineage", async () => {
   let orderIntent: Record<string, unknown> | undefined;
   let marketEvidence: Array<Record<string, unknown>> = [];
@@ -1571,7 +1693,7 @@ test("LEAPS persisted research evidence can reach review while exact-contract ex
   }
 });
 
-test("LEAPS uses the independent $5,000 ceiling and persists an integer contract quantity", async () => {
+test("LEAPS uses the independent $7,500 ceiling and persists an integer contract quantity", async () => {
   let orderIntent: Record<string, unknown> | undefined;
   let marketEvidence: Array<Record<string, unknown>> = [];
   const result = await runPostgresReviewWorkflow({
@@ -1589,8 +1711,14 @@ test("LEAPS uses the independent $5,000 ceiling and persists an integer contract
               option_symbol: "SPY270501C00560000",
               preferred_expression: "option",
               market_price: "30",
+              buying_power: "100000",
+              cash: "100000",
+              equity: "100000",
+              allocation_amount: "100000",
               max_position_notional: "10000",
               max_symbol_notional: "10000",
+              max_deployment_amount: "100000",
+              cash_reserve_amount: "0",
               market_evidence: {
                 ...completeLeapsCallGreeks,
                 bid: 29.9,
@@ -1624,11 +1752,11 @@ test("LEAPS uses the independent $5,000 ceiling and persists an integer contract
   });
 
   assert.equal(result.reviewsCreated, 1);
-  assert.equal(orderIntent?.quantity, 1);
+  assert.equal(orderIntent?.quantity, 2);
   assert.equal(Number.isInteger(Number(orderIntent?.quantity)), true);
   assert.equal(marketEvidence[0]?.leapsSizing &&
     (marketEvidence[0].leapsSizing as Record<string, unknown>).configuredPerEntryAllocationUsd,
-  5_000);
+    7_500);
   assert.equal(
     (marketEvidence[0]?.leapsSizing as Record<string, unknown>)?.contractCostUsd,
     3_000
@@ -1639,7 +1767,7 @@ test("LEAPS uses the independent $5,000 ceiling and persists an integer contract
   );
 });
 
-test("an exactly $5,000 LEAPS contract produces one contract", async () => {
+test("an exactly $7,500 LEAPS contract produces one contract", async () => {
   let orderIntent: Record<string, unknown> | undefined;
   const result = await runPostgresReviewWorkflow({
     command: "paper:review",
@@ -1650,12 +1778,12 @@ test("an exactly $5,000 LEAPS contract produces one contract", async () => {
             rows: [{
               ...candidate,
               ...observedLeapsCallContract,
-              candidate_id: "leaps-5000",
+              candidate_id: "leaps-7500",
               candidate_strategy_family: "leaps",
               asset_class: "option",
               option_symbol: "SPY270501C00560000",
               preferred_expression: "option",
-              market_price: "50",
+              market_price: "75",
               buying_power: "100000",
               cash: "100000",
               equity: "100000",
@@ -1666,10 +1794,10 @@ test("an exactly $5,000 LEAPS contract produces one contract", async () => {
               cash_reserve_amount: "0",
               market_evidence: {
                 ...completeLeapsCallGreeks,
-                bid: 49.9,
-                ask: 50.1,
-                midpoint: 50,
-                spreadPct: 0.004,
+                bid: 74.9,
+                ask: 75.1,
+                midpoint: 75,
+                spreadPct: 0.00267,
                 volume: 5_000,
                 openInterest: 8_000,
                 underlyingPrice: 555,
@@ -1697,7 +1825,7 @@ test("an exactly $5,000 LEAPS contract produces one contract", async () => {
   assert.equal(orderIntent?.quantity, 1);
 });
 
-test("a $1,000 LEAPS contract produces five contracts and reserves the full $5,000 position cost", async () => {
+test("a $1,000 LEAPS contract produces seven contracts and reserves the full $7,000 position cost", async () => {
   let orderIntent: Record<string, unknown> | undefined;
   let marketEvidence: Array<Record<string, unknown>> = [];
   let persistedIntentValues: readonly unknown[] = [];
@@ -1710,7 +1838,7 @@ test("a $1,000 LEAPS contract produces five contracts and reserves the full $5,0
             rows: [{
               ...candidate,
               ...observedLeapsCallContract,
-              candidate_id: "leaps-five-contracts",
+              candidate_id: "leaps-seven-contracts",
               candidate_strategy_family: "leaps",
               asset_class: "option",
               option_symbol: "SPY270501C00560000",
@@ -1760,14 +1888,14 @@ test("a $1,000 LEAPS contract produces five contracts and reserves the full $5,0
   });
 
   assert.equal(result.reviewsCreated, 1);
-  assert.equal(orderIntent?.quantity, 5);
+  assert.equal(orderIntent?.quantity, 7);
   assert.equal(Number.isInteger(Number(orderIntent?.quantity)), true);
-  assert.equal(persistedIntentValues[12], 5);
-  assert.equal(persistedIntentValues[15], 5_000);
-  assert.equal(persistedIntentValues[16], 5_000);
+  assert.equal(persistedIntentValues[12], 7);
+  assert.equal(persistedIntentValues[15], 7_000);
+  assert.equal(persistedIntentValues[16], 7_000);
   assert.equal(
     (marketEvidence[0]?.leapsSizing as Record<string, unknown>)?.positionCostUsd,
-    5_000
+    7_000
   );
 });
 
@@ -2011,9 +2139,9 @@ test("multiple independently qualified LEAPS positions create separate same-cycl
   assert.equal(result.pendingIntentsCreated, 2);
   assert.deepEqual(
     orderIntents.map((intent) => intent.quantity),
-    [5, 2]
+    [7, 1]
   );
-  assert.deepEqual(persistedQuantities, [5, 2]);
+  assert.deepEqual(persistedQuantities, [7, 1]);
 });
 
 test("buying power still rejects an otherwise allocation-affordable LEAPS contract", async () => {
@@ -2122,12 +2250,12 @@ test("an unaffordable higher-ranked LEAPS contract is explicit and does not supp
                 candidate_id: "leaps-unaffordable",
                 option_symbol: "SPY270501C00600000",
                 contract_option_symbol: "SPY270501C00600000",
-                market_price: "50.01",
+                market_price: "100",
                 market_evidence: {
                   ...optionRow.market_evidence,
-                  bid: 50,
-                  ask: 50.02,
-                  midpoint: 50.01
+                  bid: 99.9,
+                  ask: 100.1,
+                  midpoint: 100
                 }
               },
               {
@@ -2161,7 +2289,7 @@ test("an unaffordable higher-ranked LEAPS contract is explicit and does not supp
   assert.equal(result.reviewsCreated, 1);
   assert.equal(result.capacityBlocked, 1);
   assert.equal(orderIntents[0]?.symbol, "SPY270501C00560000");
-  assert.equal(orderIntents[0]?.quantity, 1);
+  assert.equal(orderIntents[0]?.quantity, 2);
   assert.equal(candidateUpdates.some((values) =>
     values[0] === "leaps-unaffordable" &&
     values[1] === "blocked" &&

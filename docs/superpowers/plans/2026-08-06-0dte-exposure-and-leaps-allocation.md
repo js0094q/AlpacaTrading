@@ -124,4 +124,3 @@ for credential-shaped material without printing environment files or secrets.
 Request read-only review of the exact diff. Correct any validated finding,
 rerun affected gates, then create one verified implementation commit and report
 its exact SHA. Do not deploy it.
-

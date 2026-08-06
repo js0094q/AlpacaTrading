@@ -43,5 +43,4 @@ $7,500.
 5. The checked-in worker explicitly supplies
    `LEAPS_MAX_ENTRY_CAPITAL_USD=7500`.
 6. Focused tests, typecheck, production build, diff validation, and a secret
-   scan pass against the exact worktree.
-
+  scan pass against the exact worktree.
