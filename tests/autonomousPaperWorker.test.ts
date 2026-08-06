@@ -23,6 +23,8 @@ const workstreams = [
   "paper:options:discover",
   "zero-dte:engine",
   "zero-dte:reconcile",
+  "paper:options:discover",
+  "paper:execute:reviewed",
   "research:daily",
   "paper:evidence:refresh",
   "paper:review",
@@ -46,6 +48,9 @@ const executedCommands = [
   "zero-dte:reconcile",
   "paper:options:discover",
   "zero-dte:engine",
+  "zero-dte:reconcile",
+  "paper:options:discover",
+  "paper:execute:reviewed",
   "zero-dte:reconcile",
   "research:daily",
   "paper:evidence:refresh",
@@ -603,6 +608,7 @@ test("approved worker validates the production contract and persists a complete 
   const generalResearch = researchCalls[0];
   assert.equal(generalResearch?.args.includes("--maxCandidates=25"), true);
   assert.equal(generalResearch?.args.includes("--excludeZeroDte=true"), true);
+  assert.equal(generalResearch?.args.includes("--excludeLeaps=true"), true);
   assert.ok(
     workstreamCalls.findIndex((call) => call.command === "paper:options:discover") <
       workstreamCalls.indexOf(generalResearch!),
@@ -613,6 +619,21 @@ test("approved worker validates the production contract and persists a complete 
   );
   assert.equal(workstreamCalls[zeroDteDiscoveryIndex + 1]?.command, "zero-dte:engine");
   assert.equal(workstreamCalls[zeroDteDiscoveryIndex + 2]?.command, "zero-dte:reconcile");
+  const leapsDiscoveryIndex = workstreamCalls.findIndex(
+    (call) => call.command === "paper:options:discover" &&
+      call.args.includes("--lane=options_leaps")
+  );
+  assert.ok(leapsDiscoveryIndex > zeroDteDiscoveryIndex);
+  const leapsExecution = workstreamCalls[leapsDiscoveryIndex + 1];
+  assert.equal(leapsExecution?.command, "paper:execute:reviewed");
+  assert.equal(leapsExecution?.args.includes("--confirmPaper"), true);
+  assert.equal(leapsExecution?.args.includes("--sections=optionBuys"), true);
+  assert.equal(leapsExecution?.args.includes("--strategyFamily=leaps"), true);
+  assert.equal(workstreamCalls[leapsDiscoveryIndex + 2]?.command, "zero-dte:reconcile");
+  assert.ok(
+    leapsDiscoveryIndex < workstreamCalls.indexOf(generalResearch!),
+    "the dedicated LEAPS path must run before general research"
+  );
   assert.ok(calls.every((call) => call.safety.alpacaEnv === "paper"));
   assert.ok(calls.every((call) => call.safety.tradingMode === "paper"));
   assert.ok(calls.every((call) => call.safety.alpacaLiveTrade === "false"));
@@ -629,7 +650,10 @@ test("approved worker validates the production contract and persists a complete 
   }
   const cancellation = workstreamCalls.find((call) => call.command === "paper:order:cancel");
   assert.equal(cancellation?.args.includes("--autonomous"), true);
-  const entryExecution = workstreamCalls.find((call) => call.command === "paper:execute:reviewed");
+  const entryExecution = workstreamCalls.find(
+    (call) => call.command === "paper:execute:reviewed" &&
+      call.args.includes("--sections=equityBuys,equityAdds,optionBuys")
+  );
   assert.equal(
     entryExecution?.args.includes("--sections=equityBuys,equityAdds,optionBuys"),
     true
@@ -640,7 +664,10 @@ test("approved worker validates the production contract and persists a complete 
   );
   assert.ok(
     workstreamCalls.findIndex((call) => call.command === "paper:ops:review") <
-      workstreamCalls.findIndex((call) => call.command === "paper:execute:reviewed"),
+      workstreamCalls.findIndex(
+        (call) => call.command === "paper:execute:reviewed" &&
+          call.args.includes("--sections=equityBuys,equityAdds,optionBuys")
+      ),
     "the signed reviewed artifact must be refreshed before entry execution"
   );
 
@@ -660,7 +687,7 @@ test("approved worker validates the production contract and persists a complete 
       .filter((state) => state.eventType === "workstream_started")
       .map((state) => state.payload.workstream),
     workstreams,
-    "internal reconciliation must not increase the 21 public workstream states"
+    "internal reconciliation must not increase the 23 public workstream states"
   );
   assert.match(states[0]!.cycleId, /^[0-9a-f-]{36}$/i);
   assert.ok(states.every((state) => Number.isFinite(Date.parse(state.occurredAt))));
@@ -759,10 +786,10 @@ test("a cycle-start response-selection failure remains cycle-scoped in one worke
   assert.doesNotMatch(result.stdout + result.stderr, /"event":"worker_failed"/);
 });
 
-test("the 21 public workstreams enforce lifecycle phase order and publish dashboard-ready state", () => {
+test("the 23 public workstreams enforce lifecycle phase order and publish dashboard-ready state", () => {
   const { result, calls, states } = runWorker();
   assert.equal(result.status, 0, result.stderr || result.stdout);
-  assert.equal(workstreams.length, 21);
+  assert.equal(workstreams.length, 23);
   assert.deepEqual(
     calls
       .filter((call) => call.command !== "worker:state")
@@ -791,7 +818,7 @@ test("the 21 public workstreams enforce lifecycle phase order and publish dashbo
   );
   assert.ok(
     executedCommands.indexOf("paper:ops:review") <
-      executedCommands.indexOf("paper:execute:reviewed")
+      executedCommands.lastIndexOf("paper:execute:reviewed")
   );
 
   const dashboardRefresh = states.find(
@@ -1076,7 +1103,7 @@ test("successful workstreams forward structured PostgreSQL telemetry with cycle 
   );
   assert.ok(batch, result.stdout);
   assert.equal(batch.cycle, 1);
-  assert.equal(batch.position, 5);
+  assert.equal(batch.position, 7);
   assert.equal(batch.workstream, "research:daily");
   assert.match(String(batch.cycleId), /^[0-9a-f-]{36}$/i);
   assert.equal(batch.batchNumber, 1);
@@ -1096,6 +1123,9 @@ test("an ordinary workstream failure fails fast with durable terminal state", ()
       "paper:options:discover",
       "zero-dte:engine",
       "zero-dte:reconcile",
+      "paper:options:discover",
+      "paper:execute:reviewed",
+      "zero-dte:reconcile",
       "research:daily",
       "paper:evidence:refresh",
       "paper:review"
@@ -1103,18 +1133,10 @@ test("an ordinary workstream failure fails fast with durable terminal state", ()
   );
   assert.deepEqual(states.map((state) => state.eventType), [
     "cycle_started",
-    "workstream_started",
-    "workstream_completed",
-    "workstream_started",
-    "workstream_completed",
-    "workstream_started",
-    "workstream_completed",
-    "workstream_started",
-    "workstream_completed",
-    "workstream_started",
-    "workstream_completed",
-    "workstream_started",
-    "workstream_completed",
+    ...Array.from(
+      { length: 8 },
+      () => ["workstream_started", "workstream_completed"]
+    ).flat(),
     "workstream_started",
     "workstream_failed",
     "cycle_failed"

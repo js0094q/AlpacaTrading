@@ -567,9 +567,19 @@ export const validateAutonomousExecutionEvidence = (
   return payload;
 };
 
-const commandFilter = (command: string) => {
+const commandFilter = (command: string, strategyFamily?: string) => {
+  const normalizedFamily = strategyFamily?.trim();
+  if (strategyFamily !== undefined && normalizedFamily !== "leaps") {
+    throw new Error("POSTGRES_EXECUTION_STRATEGY_FAMILY_UNSUPPORTED");
+  }
+  if (normalizedFamily === "leaps" && command !== "paper:execute:reviewed") {
+    throw new Error("POSTGRES_EXECUTION_STRATEGY_FAMILY_COMMAND_INVALID");
+  }
   if (command === "paper:execute:reviewed") {
-    return "review.review_type = 'entry' AND intent.operation IN ('buy_to_open', 'sell_to_open')";
+    const entryFilter = "review.review_type = 'entry' AND intent.operation IN ('buy_to_open', 'sell_to_open')";
+    return normalizedFamily === "leaps"
+      ? `${entryFilter} AND intent.asset_class = 'option' AND intent.strategy_classification IN ('leaps_long_call', 'leaps_long_put')`
+      : entryFilter;
   }
   if (command === "paper:exit:execute") {
     return "review.review_type = 'exit' AND intent.operation IN ('sell_to_close', 'buy_to_cover')";
@@ -768,6 +778,7 @@ const capacityAllowed = (row: Record<string, unknown> | undefined) =>
 
 export const promoteNextConfirmedPostgresIntent = async (input: {
   readonly command: string;
+  readonly strategyFamily?: string;
   readonly query: AutonomousExecutionQuery;
   readonly fence: SchedulerFence;
   readonly signingKey: string;
@@ -809,7 +820,7 @@ export const promoteNextConfirmedPostgresIntent = async (input: {
       AND allocation.strategy_key = intent.strategy_key
       AND allocation.status = 'active' AND allocation.effective_to IS NULL
      WHERE intent.status = 'created' AND intent.environment = 'paper'
-       AND ${commandFilter(input.command)}
+       AND ${commandFilter(input.command, input.strategyFamily)}
        AND review.status = 'valid' AND review.environment = 'paper'
        AND review.paper_only AND NOT review.live_trading_enabled
        AND review.expires_at > $1
@@ -1150,7 +1161,8 @@ const claimIntent = async (
   command: string,
   fence: SchedulerFence,
   now: Date,
-  expectedPayloadSignature?: string
+  expectedPayloadSignature?: string,
+  strategyFamily?: string
 ) => {
   const selected = await query.query(
     `SELECT intent.id AS order_intent_id, intent.candidate_id, intent.account_id,
@@ -1263,7 +1275,7 @@ const claimIntent = async (
          AND current_position.status IN ('open', 'closing')
      ) position_state ON true
      WHERE intent.status = 'ready_for_submission' AND intent.environment = 'paper'
-       AND ${commandFilter(command)}
+       AND ${commandFilter(command, strategyFamily)}
        AND review.status = 'valid' AND review.environment = 'paper'
        AND review.paper_only AND NOT review.live_trading_enabled
        AND review.expires_at > $1
@@ -1982,6 +1994,7 @@ export const runAutonomousPostgresExecutionCommand = async <
   BrokerSnapshot extends AutonomousExecutionBrokerSnapshot
 >(input: {
   readonly command: string;
+  readonly strategyFamily?: string;
   readonly query: AutonomousExecutionQuery;
   readonly transaction: AutonomousExecutionTransaction;
   readonly marketOpen?: () => Promise<boolean>;
@@ -2012,7 +2025,7 @@ export const runAutonomousPostgresExecutionCommand = async <
 }) => {
   const now = input.now ?? new Date();
   assertSafety(input.safety, input.confirmPaper, input.confirmLive ?? false, now);
-  const filter = commandFilter(input.command);
+  const filter = commandFilter(input.command, input.strategyFamily);
   const countResult = await input.query.query(
     `SELECT
        COUNT(*) FILTER (
@@ -2081,6 +2094,7 @@ export const runAutonomousPostgresExecutionCommand = async <
     promotion = await input.transaction((query) =>
       promoteNextConfirmedPostgresIntent({
         command: input.command,
+        strategyFamily: input.strategyFamily,
         query,
         fence: input.fence,
         signingKey,
@@ -2104,7 +2118,14 @@ export const runAutonomousPostgresExecutionCommand = async <
     readyCount = 1;
   }
   const intent = await input.transaction((query) =>
-    claimIntent(query, input.command, input.fence, now, input.expectedPayloadSignature)
+    claimIntent(
+      query,
+      input.command,
+      input.fence,
+      now,
+      input.expectedPayloadSignature,
+      input.strategyFamily
+    )
   );
   let payload: AlpacaPaperOrderRequest;
   try {

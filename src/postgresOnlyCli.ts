@@ -68,6 +68,7 @@ import {
   runPostgresPaperOrderCancellation
 } from "./services/postgresOrderCancellationService.js";
 import {
+  resolvePostgresOptionDiscoveryRequest,
   resolvePostgresResearchLaneRequest,
   runPostgresResearchWorkflow
 } from "./services/postgresResearchWorkflowService.js";
@@ -547,6 +548,9 @@ const run = async (scheduledContext?: PostgresScheduledCommandOperationContext) 
           excludeZeroDte: ["true", "1"].includes(
             String(args.excludeZeroDte).toLowerCase()
           ),
+          excludeLeaps: ["true", "1"].includes(
+            String(args.excludeLeaps).toLowerCase()
+          ),
           maxCandidates,
           signal: context.signal,
           emitTelemetry: emitRuntimeTelemetry
@@ -596,23 +600,24 @@ const run = async (scheduledContext?: PostgresScheduledCommandOperationContext) 
       1,
       Math.min(25, Number.parseInt(String(args.maxCandidates || "25"), 10) || 25)
     );
+    const discovery = resolvePostgresOptionDiscoveryRequest(String(args.lane || ""));
     const research = await runPostgresResearchWorkflow({
       query,
       fence: context.fence,
       riskProfile: "aggressive",
       optionsEnabled: true,
-      requestedLane: "options_0dte",
+      requestedLane: discovery.requestedLane,
       maxCandidates,
       signal: context.signal,
       emitTelemetry: emitRuntimeTelemetry
     });
     const review = await runPostgresReviewWorkflow({
-      command,
+      command: discovery.reviewCommand,
       query,
       fence: context.fence,
       researchRunId: research.runId,
-      underlying: "SPY",
-      dte: 0
+      maxCandidates,
+      ...discovery.reviewScope
     });
     print({
       ...paperEnvelope(),
@@ -787,7 +792,10 @@ const run = async (scheduledContext?: PostgresScheduledCommandOperationContext) 
         paperOptionsExecutionEnabled: safety.paperOptionsExecutionEnabled,
         quoteMaxAgeSeconds: safety.quoteMaxAgeSeconds
       },
-      confirmPaper: Object.prototype.hasOwnProperty.call(args, "confirmPaper")
+      confirmPaper: Object.prototype.hasOwnProperty.call(args, "confirmPaper"),
+      strategyFamily: Object.prototype.hasOwnProperty.call(args, "strategyFamily")
+        ? String(args.strategyFamily)
+        : undefined
     });
     print({ ...paperEnvelope(), command, ...result });
     return;

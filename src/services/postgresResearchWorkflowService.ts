@@ -61,6 +61,7 @@ type PostgresLearningModelCapability = {
 type ResearchDependencies = {
   now: () => Date;
   symbols: readonly string[];
+  leapsUnderlyings: () => readonly string[];
   refreshMarketData: typeof refreshPostgresMarketData;
   buildFeaturesAndTargets: typeof buildPostgresFeaturesAndTargets;
   loadResearchSignals: typeof loadResearchSignalsForSymbols;
@@ -68,9 +69,17 @@ type ResearchDependencies = {
   dataHub: Pick<typeof alpacaDataHub, "hydrateCycle">;
 };
 
+const configuredLeapsUnderlyings = () => Array.from(new Set(
+  (process.env.PAPER_LEAPS_UNDERLYINGS?.trim() || "SPY,QQQ")
+    .split(",")
+    .map((entry) => entry.trim().toUpperCase())
+    .filter(Boolean)
+));
+
 const dependencies: ResearchDependencies = {
   now: () => new Date(),
   symbols: seedUniverse,
+  leapsUnderlyings: configuredLeapsUnderlyings,
   refreshMarketData: refreshPostgresMarketData,
   buildFeaturesAndTargets: buildPostgresFeaturesAndTargets,
   loadResearchSignals: loadResearchSignalsForSymbols,
@@ -104,6 +113,24 @@ export const resolvePostgresResearchLaneRequest = (input: {
       requestedLane === "options_0dte" ||
       requestedLane === "options_leaps"
   };
+};
+export const resolvePostgresOptionDiscoveryRequest = (lane: string) => {
+  const requested = lane.trim();
+  if (!requested || requested === "options_0dte") {
+    return {
+      requestedLane: "options_0dte" as const,
+      reviewCommand: "paper:options:discover" as const,
+      reviewScope: { underlying: "SPY", dte: 0 }
+    };
+  }
+  if (requested === "options_leaps") {
+    return {
+      requestedLane: "options_leaps" as const,
+      reviewCommand: "paper:review" as const,
+      reviewScope: {}
+    };
+  }
+  throw new Error("POSTGRES_OPTION_DISCOVERY_LANE_INVALID");
 };
 const RESEARCH_READINESS_DEFERRALS = new Set([
   "POSTGRES_STOCK_SNAPSHOT_STALE",
@@ -733,6 +760,7 @@ const persistCandidates = async (input: {
   optionsEnabled: boolean;
   requestedLane?: PostgresResearchLane;
   excludeZeroDte?: boolean;
+  excludeLeaps?: boolean;
   targets: FeatureTargetResult["targets"];
   maxCandidates: number;
   now: Date;
@@ -752,7 +780,8 @@ const persistCandidates = async (input: {
     .filter((target) =>
       (requestedFamily === undefined || target.strategyFamily === requestedFamily) &&
       (target.strategyFamily !== "zero_dte_spy" || target.symbol === "SPY") &&
-      !(input.excludeZeroDte && target.strategyFamily === "zero_dte_spy")
+      !(input.excludeZeroDte && target.strategyFamily === "zero_dte_spy") &&
+      !(input.excludeLeaps && target.strategyFamily === "leaps")
     )
     .map((target) => {
       const preferredOption = executableOption(target);
@@ -985,6 +1014,7 @@ const persistCandidates = async (input: {
       lane,
       enabled:
         !(input.excludeZeroDte && lane === "options_0dte") &&
+        !(input.excludeLeaps && lane === "options_leaps") &&
         investmentLaneEnabled(lane, input.optionsEnabled, input.requestedLane),
       execute: (sharedDecisions) => {
         const laneDecisions = sharedDecisions.filter(
@@ -1028,6 +1058,7 @@ export const runPostgresResearchWorkflow = async (input: {
   optionsEnabled: boolean;
   requestedLane?: PostgresResearchLane;
   excludeZeroDte?: boolean;
+  excludeLeaps?: boolean;
   maxCandidates: number;
   cycleId?: string;
   now?: Date;
@@ -1039,7 +1070,9 @@ export const runPostgresResearchWorkflow = async (input: {
   const deps = { ...dependencies, ...input.dependencies };
   const researchSymbols = input.requestedLane === "options_0dte"
     ? ["SPY"]
-    : deps.symbols;
+    : input.requestedLane === "options_leaps"
+      ? deps.leapsUnderlyings()
+      : deps.symbols;
   const now = input.now ?? deps.now();
   const nowIso = now.toISOString();
   const runId = `research_${randomUUID()}`;
@@ -1054,6 +1087,7 @@ export const runPostgresResearchWorkflow = async (input: {
     riskProfile: input.riskProfile,
     optionsEnabled: input.optionsEnabled,
     excludeZeroDte: input.excludeZeroDte === true,
+    excludeLeaps: input.excludeLeaps === true,
     maxCandidates: input.maxCandidates,
     barLookbackDays: 365,
     marketDataAuthority: "postgres",
@@ -1168,6 +1202,7 @@ export const runPostgresResearchWorkflow = async (input: {
       optionsEnabled: input.optionsEnabled,
       requestedLane: input.requestedLane,
       excludeZeroDte: input.excludeZeroDte,
+      excludeLeaps: input.excludeLeaps,
       targets: generated.targets, maxCandidates: input.maxCandidates, now,
       explorationThresholds: {
         ...explorationThresholds,
@@ -1239,10 +1274,9 @@ export const runPostgresResearchWorkflow = async (input: {
         lanes: INVESTMENT_LANE_FAMILIES.map(([lane]) => ({
           lane,
           enabled: investmentLaneEnabled(
-            lane,
-            input.optionsEnabled,
-            input.requestedLane
-          ),
+            lane, input.optionsEnabled, input.requestedLane
+          ) && !(input.excludeZeroDte && lane === "options_0dte") &&
+            !(input.excludeLeaps && lane === "options_leaps"),
           execute: async (context) => ({
             proposals: [],
             reason_codes: [context.reasonCode],

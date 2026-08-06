@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -1254,6 +1255,101 @@ test("an execution command with no ready PostgreSQL intent makes no broker call"
   assert.equal(result.status, "no_op");
   assert.equal(result.submittedOrderCount, 0);
   assert.equal(brokerCalls, 0);
+});
+
+test("LEAPS-scoped reviewed execution excludes every other entry classification", async () => {
+  let countSql = "";
+  const result = await runAutonomousPostgresExecutionCommand({
+    command: "paper:execute:reviewed",
+    strategyFamily: "leaps",
+    query: {
+      query: async (sql: string) => {
+        countSql = sql;
+        return {
+          rows: [{ ready_count: "0", confirmable_count: "0" }],
+          rowCount: 1
+        };
+      }
+    },
+    transaction: async () => { throw new Error("transaction must not run"); },
+    captureBrokerSnapshot: async () => { throw new Error("broker must not run"); },
+    submitOrder: async () => { throw new Error("submit must not run"); },
+    safety: {
+      environment: "paper",
+      tradingMode: "paper",
+      liveTradingEnabled: false,
+      paperOrderExecutionEnabled: true,
+      paperOptionsExecutionEnabled: true,
+      quoteMaxAgeSeconds: 60
+    },
+    confirmPaper: true,
+    fence: {
+      jobName: "paper-execution",
+      workstream: "paper_execution",
+      ownerId: "owner",
+      runId: "run",
+      fencingToken: "10"
+    }
+  });
+
+  assert.equal(result.status, "no_op");
+  assert.match(
+    countSql,
+    /intent\.strategy_classification IN \('leaps_long_call', 'leaps_long_put'\)/
+  );
+  assert.doesNotMatch(countSql, /standard_long_call|equity_long|hedge/);
+});
+
+test("an explicitly invalid execution family fails closed before PostgreSQL or Alpaca", async () => {
+  for (const strategyFamily of ["", "   ", "standard_options"]) {
+    let queryCalls = 0;
+    await assert.rejects(
+      runAutonomousPostgresExecutionCommand({
+        command: "paper:execute:reviewed",
+        strategyFamily,
+        query: {
+          query: async () => {
+            queryCalls += 1;
+            return { rows: [], rowCount: 0 };
+          }
+        },
+        transaction: async () => { throw new Error("transaction must not run"); },
+        captureBrokerSnapshot: async () => { throw new Error("broker must not run"); },
+        submitOrder: async () => { throw new Error("submit must not run"); },
+        safety: {
+          environment: "paper",
+          tradingMode: "paper",
+          liveTradingEnabled: false,
+          paperOrderExecutionEnabled: true,
+          paperOptionsExecutionEnabled: true,
+          quoteMaxAgeSeconds: 60
+        },
+        confirmPaper: true,
+        fence: {
+          jobName: "paper-execution",
+          workstream: "paper_execution",
+          ownerId: "owner",
+          runId: "run",
+          fencingToken: "10"
+        }
+      }),
+      /POSTGRES_EXECUTION_STRATEGY_FAMILY_UNSUPPORTED/,
+      strategyFamily || "empty"
+    );
+    assert.equal(queryCalls, 0, strategyFamily || "empty");
+  }
+});
+
+test("the production CLI preserves an explicitly blank execution-family selector", () => {
+  const source = readFileSync("src/postgresOnlyCli.ts", "utf8");
+  assert.match(
+    source,
+    /hasOwnProperty\.call\(args, "strategyFamily"\)[\s\S]*\? String\(args\.strategyFamily\)[\s\S]*: undefined/
+  );
+  assert.doesNotMatch(
+    source,
+    /strategyFamily:\s*String\(args\.strategyFamily \|\| ""\)\.trim\(\) \|\| undefined/
+  );
 });
 
 test("reviewed execution rejects a mismatched persisted review artifact", async () => {

@@ -4,6 +4,7 @@ import test from "node:test";
 import { paperExplorationThresholds } from "../src/services/paperExplorationConfig.js";
 import { historicalOutcomeEvidenceConfig } from "../src/services/historicalOutcomeEvidenceService.js";
 import {
+  resolvePostgresOptionDiscoveryRequest,
   resolvePostgresResearchLaneRequest,
   runPostgresResearchWorkflow
 } from "../src/services/postgresResearchWorkflowService.js";
@@ -31,6 +32,23 @@ test("the registered LEAPS lane enables OPRA and selects only LEAPS research", (
       explicitOptionsEnabled: false
     }),
     { requestedLane: "options_leaps", optionsEnabled: true }
+  );
+});
+
+test("options discovery binds each dedicated lane to its exact review scope", () => {
+  assert.deepEqual(resolvePostgresOptionDiscoveryRequest(""), {
+    requestedLane: "options_0dte",
+    reviewCommand: "paper:options:discover",
+    reviewScope: { underlying: "SPY", dte: 0 }
+  });
+  assert.deepEqual(resolvePostgresOptionDiscoveryRequest("options_leaps"), {
+    requestedLane: "options_leaps",
+    reviewCommand: "paper:review",
+    reviewScope: {}
+  });
+  assert.throws(
+    () => resolvePostgresOptionDiscoveryRequest("options_standard"),
+    /POSTGRES_OPTION_DISCOVERY_LANE_INVALID/
   );
 });
 
@@ -1325,6 +1343,7 @@ test("LEAPS consumes only current long-horizon research without replacing option
 
 test("the explicit LEAPS lane persists its option-backed target as a LEAPS option", async () => {
   let candidateValues: readonly unknown[] = [];
+  let refreshedSymbols: readonly string[] = [];
   const optionBackedSharesTarget = {
     ...target,
     preferredExpression: "shares" as const,
@@ -1360,22 +1379,27 @@ test("the explicit LEAPS lane persists its option-backed target as a LEAPS optio
     maxCandidates: 10,
     now: new Date("2026-07-20T18:00:00.000Z"),
     dependencies: {
-      refreshMarketData: async () => ({
-        bars: [bar],
-        stockSnapshots: [],
-        optionContracts: [],
-        optionSnapshots: [],
-        summary: {}
-      }) as never,
+      refreshMarketData: async (input) => {
+        refreshedSymbols = input.symbols;
+        return {
+          bars: [bar],
+          stockSnapshots: [],
+          optionContracts: [],
+          optionSnapshots: [],
+          summary: {}
+        } as never;
+      },
       buildFeaturesAndTargets: async () => ({
         features: [],
         targets: [optionBackedSharesTarget]
       }),
       loadResearchSignals: async () => [],
-      symbols: ["SPY"]
+      symbols: ["SPY", "QQQ", "XLF"],
+      leapsUnderlyings: () => ["SPY", "QQQ"]
     }
   });
 
+  assert.deepEqual(refreshedSymbols, ["SPY", "QQQ"]);
   assert.equal(candidateValues[4], "SPY270416C00600000");
   assert.equal(candidateValues[5], "option");
   assert.equal(candidateValues[11], "long_call");
@@ -1455,6 +1479,32 @@ test("the explicit 0DTE lane persists only the SPY same-day option target", asyn
 
 test("the normal options cycle persists zero_dte_spy only for SPY", async () => {
   const candidateWrites: Array<readonly unknown[]> = [];
+  const leapsTarget = {
+    ...target,
+    symbol: "QQQ",
+    preferredExpression: "long_call" as const,
+    strategyFamily: "leaps" as const,
+    expressionId: "option:QQQ270416C00600000",
+    optionsStrategy: {
+      alternatives: ["long_call"],
+      rationale: ["Long-dated option candidate"],
+      optionsCandidate: {
+        optionSymbol: "QQQ270416C00600000",
+        type: "call",
+        expirationDate: "2027-04-16",
+        strike: 600,
+        estimatedEntryPrice: 20,
+        liquidityScore: 0.9,
+        decisionInputs: {
+          bid: 19.75,
+          ask: 20.25,
+          requestedFeed: "opra",
+          effectiveFeed: "opra",
+          provider: "alpaca"
+        }
+      }
+    }
+  };
   const zeroDteTarget = (symbol: string, optionSymbol: string) => ({
     ...target,
     symbol,
@@ -1522,6 +1572,7 @@ test("the normal options cycle persists zero_dte_spy only for SPY", async () => 
     riskProfile: "aggressive",
     optionsEnabled: true,
     excludeZeroDte: true,
+    excludeLeaps: true,
     maxCandidates: 10,
     now: new Date("2026-07-20T18:00:00.000Z"),
     dependencies: {
@@ -1536,7 +1587,8 @@ test("the normal options cycle persists zero_dte_spy only for SPY", async () => 
         features: [],
         targets: [
           zeroDteTarget("AMZN", "AMZN260720C00300000"),
-          zeroDteTarget("SPY", "SPY260720C00555000")
+          zeroDteTarget("SPY", "SPY260720C00555000"),
+          leapsTarget
         ]
       }),
       loadResearchSignals: async () => [],
